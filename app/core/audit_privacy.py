@@ -169,10 +169,10 @@ _IDENTIFIER_KEYS = (
     # row ids and counts, never a row's values), and the seals an acknowledgment names
     "kinds", "messages", "seq", "hour", "acknowledges", "failures",
     # the host's commands on the chain: the seals they accept or discard and where discarded rows were saved,
-    # the key ids a key change moves between, what a restore lost and the bundle it came from, and the day,
-    # hours and cutoff hour of rows an older release removed
+    # the key ids a key change moves between, what a restore lost and the bundle it came from, the retention
+    # values and request seals it seals again, and the day, hours and cutoff hour of rows an older release removed
     "seals", "saved", "from_key", "to_key", "cause", "lost_through_seq", "deleted_through_seq", "bundle",
-    "late_rows", "day", "hours", "cutoff",
+    "resealed", "resealed_cancels", "late_rows", "day", "hours", "cutoff",
     # how many archived days an export read
     "archived_days",
     # a per-person erase: its request and the placeholder it writes (never the name it removes)

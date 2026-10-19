@@ -382,6 +382,15 @@ def superseded_changes(db, view, settings: Dict[str, object]) -> List[list]:
     return out
 
 
+def restore_changes(settings: Dict[str, object], cancels: List[int], superseded: List[list]) -> dict:
+    """What a restore changes in the retention settings, for its own audit row, so that the Activity page alone
+    shows it: the values sealed again and stored in managed_settings, the requests whose lost cancels are sealed
+    again, and the waiting changes those values supersede (their change rows end as superseded). The policy and
+    cancel seals record the same in the chain."""
+    return {"resealed": {k: v for k, v in sorted(settings.items())}, "resealed_cancels": list(cancels),
+            "superseded": [c for _s, _n, c in superseded]}
+
+
 def _superseded_lines(superseded: List[list]) -> List[str]:
     if not superseded:
         return []
@@ -560,7 +569,8 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
                     "lost": {"policy": lost["policy"], "cancels": lost["cancels"], "erases": lost["erases"]},
                     "by": "host"}
         host_audit_row(w.db, RESTORED_ACTION, {"cause": "database", "lost_through_seq": restored["lost_through_seq"],
-                                               "deleted_through_seq": deleted})
+                                               "deleted_through_seq": deleted,
+                                               **restore_changes(settings, cancels, superseded)})
         w.st.view = view
         w.st.own.clear()
         w.st.pending_after = []
@@ -773,7 +783,8 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
             return {"state": token(state), "lines": lines}
         check_expected(state, expect)
         host_audit_row(w.db, RESTORED_ACTION, {"cause": "backup", "bundle": mark.get("bundle"),
-                                               "acknowledges": window})
+                                               "acknowledges": window,
+                                               **restore_changes(settings, cancels, superseded)})
         new_generation = max(int(record.get("generation") or 1), int((replaced or {}).get("generation") or 1)) + 1
         # The replaced record's seals the restored database does not hold: an anchor taken from them is
         # reported against this seal.

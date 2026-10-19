@@ -79,7 +79,8 @@ def test_a_cut_tail_is_accepted_and_the_server_takes_the_new_generation(env):
     assert fmt.parse_time_text(seal.detail["grace_until"]) - seal.sealed_at == timedelta(days=done["grace_days"])
     assert done["generation"] == 2
     assert host_rows(env, restore.RESTORED_ACTION) == [{"cause": "database", "lost_through_seq": newest,
-                                                        "deleted_through_seq": None}]
+                                                        "deleted_through_seq": None, "resealed": {},
+                                                        "resealed_cancels": [], "superseded": []}]
     env.clock.advance(hours=1)
     assert env.seal().stopped is None                    # the same process, no restart
     assert env.st.view.generation == 2
@@ -186,6 +187,9 @@ def test_a_lost_cancel_and_a_lost_hold_are_sealed_again(env):
     assert env.seal().stopped == "head-record-mismatch"
     seen, done = _accept(env)
     assert done["cancels"] == [req] and done["resealed"] == ["logs_hold"]
+    # Its audit row names what it changes in the retention settings, as the policy and cancel seals do.
+    (row,) = host_rows(env, restore.RESTORED_ACTION)
+    assert (row["resealed"], row["resealed_cancels"], row["superseded"]) == ({"logs_hold": True}, [req], [])
     assert any("Lost: the cancel" in ln for ln in seen["lines"])
     kinds = [s.kind for s in env.seals()[-3:]]
     assert kinds == ["restore", "policy", "cancel"]
@@ -236,6 +240,8 @@ def test_a_lost_cancel_of_a_request_the_resealed_raise_supersedes_is_not_sealed_
     assert named is database_older, seen["lines"]
     assert done["resealed"] == ["audit_min_days"] and done["cancels"] == []
     assert done["superseded"] == ([str(outcome.change.id)] if database_older else [])
+    (row,) = host_rows(env, restore.RESTORED_ACTION)
+    assert (row["resealed"], row["resealed_cancels"], row["superseded"]) ==         ({"audit_min_days": 60}, [], done["superseded"])
     assert [s.kind for s in env.seals()[-2:]] == ["restore", "policy"]
     with env.session() as db:
         change = db.get(ManagedSettingChange, outcome.change.id)
@@ -384,7 +390,8 @@ def test_a_whole_backup_restored_holds_deletion_until_accepted_and_names_what_it
     done = restore.accept_restore(env.engine, _host(env), expect=seen["state"])
     assert done["cancels"] == [req]
     assert host_rows(env, restore.RESTORED_ACTION) == [{"cause": "backup", "bundle": "dockvault-test-1",
-                                                        "acknowledges": done["acknowledged"]}]
+                                                        "acknowledges": done["acknowledged"], "resealed": {},
+                                                        "resealed_cancels": [req], "superseded": []}]
     assert hr.read_mark(env.st.head_store().path) is None
     seal = [s for s in env.seals() if s.kind == "restore"][0]
     assert seal.detail["cause"] == "backup" and seal.detail["grace_until"]
@@ -445,6 +452,8 @@ def test_a_waiting_change_the_raise_a_whole_backup_restore_undid_superseded_ends
     assert any(f"request {req} (audit_min_days)" in ln for ln in seen["lines"]), seen["lines"]
     done = restore.accept_restore(env.engine, _host(env), expect=seen["state"])
     assert done["resealed"] == ["audit_min_days"] and done["superseded"] == [str(waiting.change.id)]
+    (row,) = host_rows(env, restore.RESTORED_ACTION)
+    assert (row["resealed"], row["resealed_cancels"], row["superseded"]) ==         ({"audit_min_days": 60}, [], [str(waiting.change.id)])
     with env.session() as db:
         assert db.get(ManagedSettingChange, waiting.change.id).status == sc.SUPERSEDED
         assert db.get(ManagedSettingChange, other.change.id).status == sc.PENDING
