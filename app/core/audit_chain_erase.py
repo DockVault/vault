@@ -499,7 +499,7 @@ def _progress(row, through: str, now: datetime, changed: int) -> None:
 
 def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[dict] = None) -> tuple:
     """One transaction of the erase of request ``seq``: (outcome, rows changed, the notice's details when it
-    completed, the reason it waits). Writes nothing unless it returns ERASED (or DONE after a veto). ``cache`` keeps
+    completed, the reason it waits, or what holds it when it stops on a finding). Writes nothing unless it returns ERASED (or DONE after a veto). ``cache`` keeps
     the hours that hold the name for the rest of the pass, so the audit table is read once a pass and not once an
     hour; the run's last unit is decided on the table as it is then."""
     from app.core import audit_archive as arc
@@ -518,7 +518,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
         row, name = name_of(db, st.cfg(), view, seq)
     except InputProblem as exc:
         findings["unjustified-input"] = str(exc)
-        return STOP, 0, None, None
+        return STOP, 0, None, held_by("unjustified-input")
     if name is None:
         # The database holds it back (removed, ended, or its name gone): a veto, sealed as a cancel by the database
         # (at most once a day, as every veto), which the host acknowledges.
@@ -557,7 +557,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
                     return WAIT, 0, None, (f"It waits: {day.isoformat()} is archived in a later release's block "
                                            "format, which this release does not change.")
                 findings[nv.kind] = f"{nv}; the erase of request seal {seq} waits"
-                return STOP, 0, None, None
+                return STOP, 0, None, held_by(nv.kind)
             return SCANNED, 0, None, None
     with_rows = [day for day in days if st.erase_scans[(seq, day)][1]]
     cache = cache if cache is not None else {}
@@ -589,7 +589,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
         if (kind, unit) in tried:
             findings["unjustified"] = (f"the erase of request seal {seq} found nothing to change where it found the "
                                        f"name ({unit}); it waits")
-            return STOP, 0, None, None
+            return STOP, 0, None, held_by("unjustified")
         tried.add((kind, unit))
         final = len(units) == 1
         templates = route_templates()
@@ -603,7 +603,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
         except NotErased as ne:
             if ne.kind:
                 findings[ne.kind] = str(ne)
-                return STOP, 0, None, None
+                return STOP, 0, None, held_by(ne.kind)
             return WAIT, 0, None, f"It waits: {ne}."
         if not changed:
             # Nothing of the name was left in that archived day: it is read again.
@@ -616,6 +616,13 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
             return ERASED, changed, None, None
     _progress(row, through, now, 0)
     return ERASED, changed, finish(w, row, seq, d, name, now, fp), None
+
+
+def held_by(kind: str) -> str:
+    """What the request says while a finding of the audit log's check holds it: a reason given before the finding
+    (a wait for the sealer, say) would no longer be true."""
+    return (f"It is held: the audit log's check found a fault ({kind}) where it would erase, and it waits until "
+            "that is resolved.")
 
 
 def _note_waiting(session_factory, request_id, why: Optional[str]) -> None:
@@ -656,7 +663,7 @@ def run_job(p):
                     w.written = []
                     w.db.rollback()
             result.cleared += changed
-            if outcome == WAIT:
+            if outcome == WAIT or (outcome == STOP and why):
                 _note_waiting(p.session_factory, st.view.requests[seq].get("request"), why)
                 break
             if outcome == ERASED and done is None:

@@ -249,6 +249,66 @@ def test_a_row_added_to_an_hour_sealed_long_ago_is_a_finding_and_not_a_wait(hot)
     assert "rows-altered" in _recorded_failures(env)
 
 
+def test_a_row_added_to_an_hour_whose_seal_is_past_the_late_window_but_hours_old_is_a_finding_at_once(hot):
+    """The hour's seal about nine hours old when the erase reaches it (past the six hours of the late window, well
+    within a day), and a row added to it: the sealer no longer seals it late, so the erase reports rows-altered at
+    once and does not say it waits for the sealer."""
+    env = hot
+    _put(env, T0 - timedelta(hours=30), username="alice")
+    env.run_until_sealed()
+    asked = env.ask("eve")
+    not_before = fmt.parse_time_text(env.view().requests[asked["request_seq"]]["not_before"])
+    while env.clock() < not_before - timedelta(hours=9):
+        env.clock.advance(hours=1)
+        env.seal()
+    rid = _put(env, env.clock() - timedelta(minutes=10))
+    hour = ai.hour_floor(env.clock() - timedelta(minutes=10))
+    while env.clock() < not_before + timedelta(minutes=30):
+        env.clock.advance(hours=1)
+        env.seal()
+    age = env.clock() - env.view().entry_for(hour).root.sealed_at
+    assert ai.LATE_WINDOW < age < 2 * ai.LATE_WINDOW, age
+    _put(env, hour + timedelta(minutes=55), username="alice")
+    env.erase_job()
+    waiting = env.request_row(asked["id"]).waiting or ""
+    assert _row(env, rid).username == "eve" and env.erase_seals() == []
+    assert "rows-altered" in _recorded_failures(env)
+    assert "the sealer seals them first" not in waiting and "(rows-altered)" in waiting
+
+
+def test_once_the_late_window_closes_the_request_says_a_finding_holds_it_not_that_it_waits_for_the_sealer(hot):
+    """A late row beside a sealed row someone changed, in the hour the erase reaches: inside the six hours the request
+    says it waits for the sealer; once they have passed, the erase's own check reports rows-altered, and the request
+    says that a finding holds it instead of the wait that is no longer true."""
+    env = hot
+    _put(env, T0 - timedelta(hours=30), username="alice")
+    env.run_until_sealed()
+    asked = env.ask("eve")
+    not_before = fmt.parse_time_text(env.view().requests[asked["request_seq"]]["not_before"])
+    while env.clock() < not_before - timedelta(hours=3):
+        env.clock.advance(hours=1)
+        env.seal()
+    rid = _put(env, env.clock() - timedelta(minutes=10))
+    alice = _put(env, env.clock() - timedelta(minutes=9), username="alice")
+    hour = ai.hour_floor(env.clock() - timedelta(minutes=10))
+    while env.clock() < not_before + timedelta(minutes=30):
+        env.clock.advance(hours=1)
+        env.seal()
+    assert env.clock() - env.view().entry_for(hour).root.sealed_at < ai.LATE_WINDOW
+    _put(env, hour + timedelta(minutes=55), username="alice")     # a late row
+    _edit(env, alice, ip_address="198.51.100.7")                  # and a sealed row changed
+    env.erase_job()
+    first = env.request_row(asked["id"]).waiting or ""
+    assert "the sealer seals them first" in first and "rows-altered" not in _recorded_failures(env)
+    env.clock.advance(hours=7)                                    # the late window has closed
+    env.erase_job()
+    then = env.request_row(asked["id"]).waiting or ""
+    assert _row(env, rid).username == "eve" and env.erase_seals() == []
+    assert "rows-altered" in _recorded_failures(env)
+    assert then == ae.held_by("rows-altered") and "the sealer" not in then
+    assert env.request_row(asked["id"]).status in (pe.PENDING, pe.RUNNING)
+
+
 def test_once_an_erase_has_begun_the_protected_minimum_is_not_asked_again(hot, monkeypatch):
     """ERASE_BLOCKED_BY_PROTECTED_MINIMUM holds an erase before it begins; a run that has begun completes, even when
     the minimum is raised while it runs."""
