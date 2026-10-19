@@ -1,0 +1,341 @@
+"""A public file link gives back its use when the server fails before the first byte of the file.
+
+Redeeming a link spends one of its uses and mints a single-use grant; the download spends the grant.
+When the server then cannot start the file (no transfer slot, the stored file missing, unreadable or
+changed while it was read, its checksum wrong, any other error) the person received nothing, so the
+use is given back and they can try again: exactly one, atomically, never below zero, and recorded in
+the audit log. Once a byte of the file is on its way, or when the client leaves, the use stays spent,
+which is what keeps a link capped at N from delivering more than N.
+
+The real download handler runs here against a stand-in database that applies the two updates it may
+send (the refund, and the completed-download count) to an in-memory link, and a stand-in for the stored
+file that fails where each case says. tests/test_api_public_links_refund.py does the same live.
+"""
+import types
+import uuid
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.dialects import postgresql
+
+from _async_run import run_coroutine
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
+
+import app.api.api_server as S  # noqa: E402
+from app.core import rate_limiter as R  # noqa: E402
+from app.core.security import EncryptionError, ObjectChangedDuringRead  # noqa: E402
+from app.core.transfer_admission import TransferAdmission, TransferBusy  # noqa: E402
+from app.services.download_stream import ChecksumMismatch  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+ADDRESS = "192.0.2.10"
+PIECES = [b"a" * 1000, b"b" * 1000, b"c" * 500]
+
+REFUND_SQL = ("UPDATE public_links SET use_count=(public_links.use_count - 1) "
+              "WHERE public_links.id = '{id}' AND public_links.use_count > 0")
+
+
+class _Store:
+    def __init__(self):
+        self.data = {}
+
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.data:
+            return None
+        self.data[key] = value.encode()
+        return True
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def delete(self, key):
+        return 1 if self.data.pop(key, None) is not None else 0
+
+
+class _Rows:
+    def __init__(self, row):
+        self._row = row
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self._row
+
+
+class _DB:
+    """Reads come from the link and file rows; each update is compiled to SQL and applied to the link,
+    so a test sees what the statement would do in the database, not only that one was sent."""
+
+    def __init__(self, link, file_row):
+        self.link, self.file_row, self.statements = link, file_row, []
+
+    def query(self, model, *more):
+        return _Rows({S.PublicLink: self.link, S.File: self.file_row}.get(model))
+
+    def execute(self, statement, *args, **kwargs):
+        sql = str(statement.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        sql = " ".join(sql.split())
+        self.statements.append(sql)
+        if sql == REFUND_SQL.format(id=self.link.id):
+            if self.link.use_count > 0:
+                self.link.use_count -= 1
+                return types.SimpleNamespace(rowcount=1)
+            return types.SimpleNamespace(rowcount=0)
+        if sql.startswith("UPDATE public_links SET download_count=(public_links.download_count + 1)"):
+            self.link.download_count += 1
+            return types.SimpleNamespace(rowcount=1)
+        raise AssertionError(f"unexpected statement: {sql}")
+
+    def add(self, obj):
+        pass
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+class _Stored:
+    """The opened file: its pieces, failing with `exc` at piece `fail_at` when given."""
+
+    def __init__(self, pieces, fail_at=None, exc=None):
+        self._pieces, self._fail_at, self._exc = pieces, fail_at, exc
+        self.name, self.mime_type = "report.bin", "application/octet-stream"
+        self.total_length = sum(len(p) for p in pieces)
+        self.closed = False
+
+    def chunks(self):
+        for i, piece in enumerate(self._pieces):
+            if i == self._fail_at:
+                raise self._exc
+            yield piece
+        if self._fail_at == len(self._pieces):
+            raise self._exc
+
+    def close(self):
+        self.closed = True
+
+
+class _Request:
+    def __init__(self, gone_after=None):
+        self.checks, self.gone_after = 0, gone_after
+
+    async def is_disconnected(self):
+        self.checks += 1
+        return self.gone_after is not None and self.checks > self.gone_after
+
+
+@pytest.fixture
+def harness(monkeypatch):
+    R._cb_record_success()
+    store = _Store()
+    monkeypatch.setattr(R.rate_limiter, "redis", store, raising=False)
+    monkeypatch.setattr(R.rate_limiter, "check_rate_limit", lambda *a, **k: (True, 0, 0))
+    monkeypatch.setattr(S, "get_client_ip", lambda request: ADDRESS)
+    monkeypatch.setattr(S.note_link_policy, "public_file_links_enabled", lambda blob: True)
+    monkeypatch.setattr(S, "folder_ancestry", lambda db, vault_id, folder_id: [])
+    vault = types.SimpleNamespace(id=uuid.uuid4(), type="standard", password_hash=None)
+    monkeypatch.setattr(S, "_publiclink_resolve_live", lambda db, link: (vault, object()))
+    monkeypatch.setattr(S, "PermissionService", lambda db: object())
+    audit = []
+
+    class _Audit:
+        def __init__(self, db):
+            pass
+
+        def log_action(self, **row):
+            audit.append(row)
+
+    monkeypatch.setattr(S, "AuditLogger", _Audit)
+    admission = TransferAdmission(limit=2, max_waiting=0, wait_seconds=0)
+    monkeypatch.setattr(S, "transfer_admission", admission)
+    opened = {}
+
+    def run(stored=None, open_error=None, busy=False, request=None, use_count=1):
+        file_id = uuid.uuid4()
+        token = "tok-" + uuid.uuid4().hex
+        link = types.SimpleNamespace(
+            id=uuid.uuid4(), token_hash=S._publiclink_token_hash(token), revoked=False, expires_at=None,
+            max_uses=1, use_count=use_count, download_count=0, bytes_served=0, target_type="file",
+            target_file_id=file_id, target_folder_id=None)
+        file_row = types.SimpleNamespace(id=file_id, folder_id=None, password_hash=None)
+        db = _DB(link, file_row)
+
+        class _Service:
+            def __init__(self, db, permissions):
+                pass
+
+            def _open_stored_file(self, file, vault_, file_id_, whole=True):
+                assert whole is False
+                if open_error is not None:
+                    raise open_error
+                opened["file"] = stored
+                return stored
+
+        monkeypatch.setattr(S, "VaultService", _Service)
+        if busy:
+            async def refuse():
+                raise TransferBusy(retry_after=5, waiting=0, limit=2)
+            monkeypatch.setattr(admission, "acquire", refuse)
+        grant = S._publiclink_issue_grant(link.id, ADDRESS)
+        request = request or _Request()
+        out = types.SimpleNamespace(link=link, db=db, store=store, audit=audit, admission=admission,
+                                    status=None, body=b"", error=None, token=token, file_id=file_id,
+                                    grant=grant)
+
+        async def go():
+            try:
+                response = await S.download_public_link(token, file_id, request, db, x_download_grant=grant)
+            except HTTPException as refused:
+                out.status, out.error = refused.status_code, refused
+                return
+            out.status = response.status_code
+            sent = []
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                sent.append(message)
+
+            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+            out.body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+
+        run_coroutine(go())
+        out.refunds = [r for r in audit if r["action"] == "public_link_use_refunded"]
+        out.completed = [r for r in audit if r["action"] == "public_link_download_completed"]
+        return out
+
+    return run
+
+
+# name -> (how the server fails, the reason the refund records, the status the person gets)
+BEFORE_THE_FIRST_BYTE = {
+    "the stored file is missing": (dict(open_error=S.FileNotFoundError("gone")), "file_missing", 404),
+    "it cannot be decrypted": (dict(open_error=S.FileServiceError("Failed to decrypt file")), "unreadable", 404),
+    "its first record fails authentication": (
+        dict(stored=_Stored(PIECES, 0, EncryptionError("tag"))), "unreadable", 404),
+    "its one record does not match its checksum": (
+        dict(stored=_Stored(PIECES[:1], 0, ChecksumMismatch("sum"))), "checksum_mismatch", 404),
+    "an empty file does not match its checksum": (
+        dict(stored=_Stored([], 0, ChecksumMismatch("sum"))), "checksum_mismatch", 404),
+    "it was replaced while it was read": (
+        dict(stored=_Stored(PIECES, 0, ObjectChangedDuringRead("moved"))), "changed_during_read", 404),
+    "the disk refuses the read": (dict(open_error=PermissionError(13, "denied")), "read_error", 404),
+    "an internal error": (dict(open_error=RuntimeError("a bug")), "internal_error", 404),
+    "no transfer slot is free": (dict(busy=True), "busy", 503),
+}
+
+
+@pytest.mark.parametrize("case", list(BEFORE_THE_FIRST_BYTE))
+def test_a_server_failure_before_the_first_byte_gives_back_exactly_one_use(harness, case):
+    how, reason, status = BEFORE_THE_FIRST_BYTE[case]
+    out = harness(**how)
+    assert out.status == status, case
+    assert out.body == b""
+    assert out.link.use_count == 0, "the use was not given back"
+    assert out.db.statements.count(REFUND_SQL.format(id=out.link.id)) == 1
+    assert [r["status"] for r in out.refunds] == ["success"]
+    assert out.refunds[0]["details"]["reason"] == reason
+    assert out.refunds[0]["details"]["public_link_id"] == str(out.link.id)
+    assert out.refunds[0]["ip_address"] == ADDRESS
+    assert out.store.data == {}, "the grant must stay used: a retry redeems again"
+    assert not out.admission._live, "the transfer slot was not given back"
+    stored = how.get("stored")
+    if stored is not None:
+        assert stored.closed
+    if status == 404:
+        assert out.error.detail == "This file is not available."
+
+
+def test_a_completed_download_keeps_its_use_and_counts_the_download(harness):
+    stored = _Stored(PIECES)
+    out = harness(stored=stored)
+    assert out.status == 200 and out.body == b"".join(PIECES)
+    assert (out.link.use_count, out.link.download_count) == (1, 1)
+    assert out.refunds == []
+    assert [r["details"]["outcome"] for r in out.completed] == ["completed"]
+    assert stored.closed and not out.admission._live
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3])
+def test_a_failure_once_the_first_byte_is_on_its_way_keeps_the_use_spent(harness, fail_at):
+    # Including the hold-back's checksum failure at the end of a file of several records: the person
+    # has part of the file, so the use is not given back (that is what keeps a capped link capped).
+    exc = ChecksumMismatch("sum") if fail_at == 3 else EncryptionError("tag")
+    out = harness(stored=_Stored(PIECES, fail_at, exc))
+    assert out.status == 200
+    assert out.body == b"".join(PIECES[:fail_at])
+    assert (out.link.use_count, out.link.download_count) == (1, 0)
+    assert out.refunds == [] and REFUND_SQL.format(id=out.link.id) not in out.db.statements
+    assert [r["details"]["outcome"] for r in out.completed] == [type(exc).__name__]
+
+
+@pytest.mark.parametrize("gone_after", [0, 1, 2])
+def test_a_client_that_leaves_keeps_the_use_spent(harness, gone_after):
+    # gone_after=0: it left before the first byte went out; 1 and 2: after one or two pieces.
+    out = harness(stored=_Stored(PIECES), request=_Request(gone_after=gone_after))
+    assert out.status == 200
+    assert out.body == b"".join(PIECES[:gone_after])
+    assert (out.link.use_count, out.link.download_count) == (1, 0)
+    assert out.refunds == []
+    assert [r["details"]["outcome"] for r in out.completed] == ["disconnected"]
+    assert not out.admission._live
+
+
+def test_a_refund_never_takes_the_count_below_zero(harness):
+    # A count already at zero (an earlier refund, an edit in the database): the guarded update matches
+    # nothing, nothing is given back, and the audit row says the refund did not happen.
+    out = harness(open_error=S.FileNotFoundError("gone"), use_count=0)
+    assert out.status == 404
+    assert out.link.use_count == 0
+    assert [r["status"] for r in out.refunds] == ["failure"]
+
+
+def test_a_used_grant_cannot_earn_a_second_refund(harness):
+    # The same grant sent again is refused at the grant, before anything that could give a use back:
+    # one grant, one use spent, at most one use returned.
+    out = harness(open_error=S.FileNotFoundError("gone"), use_count=2)
+    assert out.link.use_count == 1 and len(out.refunds) == 1
+
+    async def retry():
+        try:
+            await S.download_public_link(out.token, out.file_id, _Request(), out.db,
+                                         x_download_grant=out.grant)
+        except HTTPException as refused:
+            return refused.status_code
+
+    assert run_coroutine(retry()) == 404
+    assert len([r for r in out.audit if r["action"] == "public_link_use_refunded"]) == 1
+    assert out.link.use_count == 1
+
+
+def test_the_response_cleans_up_when_its_body_never_starts(harness, monkeypatch):
+    # A client gone before the headers went out: the body's generator never runs, so its own finally
+    # never does. The response's close still frees the slot, closes the file and records the outcome,
+    # and gives nothing back.
+    stored = _Stored(PIECES)
+    seen = {}
+    real = S._ClosingStreamingResponse.__call__
+
+    async def headers_fail(self, scope, receive, send):
+        async def broken(message):
+            raise OSError("the client went away")
+        seen["called"] = True
+        try:
+            await real(self, scope, receive, broken)
+        except Exception:
+            pass
+
+    monkeypatch.setattr(S._ClosingStreamingResponse, "__call__", headers_fail)
+    out = harness(stored=stored)
+    assert seen["called"] and out.status == 200
+    assert stored.closed and not out.admission._live
+    assert (out.link.use_count, out.link.download_count) == (1, 0)
+    assert out.refunds == []
+    assert [r["details"]["outcome"] for r in out.completed] == ["incomplete"]

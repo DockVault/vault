@@ -13067,6 +13067,83 @@ def _publiclink_discard_grant(grant: str) -> None:
         pass
 
 
+def _publiclink_failure_reason(exc: BaseException) -> str:
+    """What a download that failed before its first byte records as the reason for the use it gave
+    back: the stored file is missing, it could not be read or decrypted, it changed while it was being
+    read, its checksum did not match, the server had no transfer slot, or anything else."""
+    from app.core.security import EncryptionError, ObjectChangedDuringRead
+    from app.services.download_stream import ChecksumMismatch
+    if isinstance(exc, TransferBusy):
+        return "busy"
+    if isinstance(exc, FileNotFoundError):
+        return "file_missing"
+    if isinstance(exc, ChecksumMismatch):
+        return "checksum_mismatch"
+    if isinstance(exc, ObjectChangedDuringRead):
+        return "changed_during_read"
+    if isinstance(exc, (EncryptionError, FileServiceError)):
+        return "unreadable"
+    if isinstance(exc, OSError):
+        return "read_error"
+    return "internal_error"
+
+
+def _publiclink_refund_use(db, link_id, vault_id, file_id, reason: str, client_ip: str) -> bool:
+    """Give back the use a redeem spent, for a download the SERVER failed before the first byte of the
+    file went out (the grant was used, nothing was delivered). Never for a client that left, and never
+    once a byte is on its way: those keep the use spent.
+
+    One guarded update, so it is atomic and can never take the count below zero; and each refund
+    follows a grant that this download alone used up (the grant's single-winner delete), each grant
+    follows one use its redeem recorded, so the uses given back never exceed the uses spent, and a link
+    capped at N still delivers at most N. Recorded in the audit log either way, so the owner's counts
+    can be read against what happened. Returns whether a use was given back."""
+    from sqlalchemy import update as _sa_update
+    try:
+        db.rollback()        # whatever failed may have left the session's transaction unusable
+    except Exception:
+        pass
+    refunded = False
+    try:
+        res = db.execute(_sa_update(PublicLink)
+                         .where(PublicLink.id == link_id, PublicLink.use_count > 0)
+                         .values(use_count=PublicLink.use_count - 1))
+        db.commit()
+        refunded = (res.rowcount or 0) == 1
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    try:
+        AuditLogger(db).log_action(
+            action="public_link_use_refunded", status="success" if refunded else "failure", user=None,
+            resource_type="file", resource_id=str(file_id),
+            details={"vault_id": str(vault_id), "public_link_id": str(link_id), "reason": reason},
+            ip_address=client_ip)
+    except Exception:
+        pass
+    return refunded
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that calls ``on_close`` once it has been sent or abandoned, including when
+    it ends before its body was ever started (a client gone before the headers went out), which a
+    ``finally`` inside the body's generator never sees: an async generator that was never started has
+    no frame to run it in."""
+
+    def __init__(self, *args, on_close=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._on_close is not None:
+                self._on_close()
+
+
 def _link_owner_if_live(db, owner_id):
     """The owner of an anonymous link (note, file or upload link), or None when that owner may no
     longer publish through one: the account is gone, deactivated, or locked by an administrator.
@@ -13824,7 +13901,8 @@ async def download_public_link(
     still holds READ, target present + not password-protected), requires the grant to have been minted
     before the link expired, and confines the requested file_id to the link's target subtree
     (id_scope). Any failure is the uniform 404. No principal is synthesised: the blob is opened
-    directly once every gate passes."""
+    directly once every gate passes. When the server fails after the grant is used and before the
+    first byte of the file goes out, the redeem's use is given back (_publiclink_refund_use)."""
     import time as _t
     from app.core.id_scope import id_in_scope
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
@@ -13893,7 +13971,6 @@ async def download_public_link(
     # Everything authorized: open the blob for streaming (no principal — the equivalent of the authed
     # path's _resolve_download checks have all been done above) and serve it under a transfer slot.
     import asyncio
-    from fastapi.responses import StreamingResponse
     from app.core.security import EncryptionError, ObjectChangedDuringRead
     from app.services.download_stream import ChecksumMismatch
 
@@ -13901,19 +13978,58 @@ async def download_public_link(
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
 
+    # From here the use the redeem spent belongs to this download, and the grant is gone. Until the first
+    # byte of the file is on its way, a failure is the server's (no slot, a missing blob, a read or
+    # decryption error, anything else), so the use is given back and the person can try again; once a
+    # byte is on its way, or when the client leaves, it stays spent. The first piece is read here, before
+    # the response exists, so a failure in it is still an error status rather than a 200 cut short.
+    transfer_slot = None
+    download = None
     try:
-        transfer_slot = await transfer_admission.acquire()
-    except TransferBusy as busy:
-        raise _busy_response(busy)
-
-    try:
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            _publiclink_refund_use(db, link.id, vault.id, file_id, "busy", client_ip)
+            raise _busy_response(busy)
         download = vault_service._open_stored_file(file_record, vault, file_id, whole=False)
-    except Exception:
-        transfer_admission.release(transfer_slot)
+        pieces = download.chunks()
+        first = next(pieces, None)
+        file_name = download.name or "download"
+        mime_type = download.mime_type
+        headers = {
+            "Content-Disposition": _content_disposition(file_name),
+            "Content-Length": str(download.total_length),
+            "Cache-Control": "no-store",
+            "X-Robots-Tag": "noindex, nofollow",
+        }
+        media_type = _safe_media_type(mime_type)
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        # The request was abandoned (the client left while it waited for a slot): not a server failure.
+        if download is not None:
+            download.close()
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
+        raise
+    except Exception as exc:
+        if download is not None:
+            try:
+                download.close()
+            except Exception:
+                pass
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
+        reason = _publiclink_failure_reason(exc)
+        _publiclink_refund_use(db, link.id, vault.id, file_id, reason, client_ip)
+        if reason == "internal_error":
+            # Not a stored file that could not be served: say where, for the operator (the class and
+            # the place, never the message, which can carry values), and answer as for any other.
+            from app.core.safe_log import exception_outline
+            print(f"[ERROR] Public link download failed before its first byte: {type(exc).__name__}")
+            print(exception_outline(exc))
         _deny()
 
-    file_name = download.name or "download"
-    mime_type = download.mime_type
     try:
         audit_logger.log_action(
             action="public_link_download", status="authorized", user=None,
@@ -13923,62 +14039,76 @@ async def download_public_link(
     except Exception:
         pass
 
+    state = {"served": 0, "disconnected": False, "terminal_success": False, "failure": None,
+             "finished": False}
+    total_size = download.total_length
+
+    def finish():
+        """Close the file, free the slot, and record what the transfer did, exactly once: from the
+        body's own end, or from the response's when the body never ran to one."""
+        if state["finished"]:
+            return
+        state["finished"] = True
+        try:
+            download.close()
+        except Exception:
+            pass
+        transfer_admission.release(transfer_slot)
+        if state["terminal_success"]:
+            # Count only a completed transfer against the owner's card + oversight counters.
+            try:
+                from sqlalchemy import update as _sa_update2
+                db.execute(_sa_update2(PublicLink).where(PublicLink.id == link.id).values(
+                    download_count=PublicLink.download_count + 1,
+                    bytes_served=PublicLink.bytes_served + state["served"]))
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        failure = state["failure"]
+        try:
+            audit_logger.log_action(
+                action="public_link_download_completed",
+                status="success" if state["terminal_success"] else "failed", user=None,
+                resource_type="file", resource_id=str(file_id),
+                details={"vault_id": str(vault.id), "public_link_id": str(link.id),
+                         "bytes_sent": state["served"], "total_bytes": total_size,
+                         "outcome": ("completed" if state["terminal_success"]
+                                     else "disconnected" if state["disconnected"]
+                                     else type(failure).__name__ if failure is not None
+                                     else "incomplete")},
+                ip_address=client_ip)
+        except Exception:
+            pass
+
     async def file_streamer():
-        served = 0
-        total_size = download.total_length
-        disconnected = False
-        terminal_success = False
-        failure = None
         try:
             try:
-                for piece in download.chunks():
+                if first is not None:
                     if await request.is_disconnected():
-                        disconnected = True
-                        break
-                    yield piece
-                    served += len(piece)
-                    await asyncio.sleep(0)
-                terminal_success = (not disconnected and served == total_size)
+                        state["disconnected"] = True
+                    else:
+                        yield first
+                        state["served"] += len(first)
+                        await asyncio.sleep(0)
+                if not state["disconnected"]:
+                    for piece in pieces:
+                        if await request.is_disconnected():
+                            state["disconnected"] = True
+                            break
+                        yield piece
+                        state["served"] += len(piece)
+                        await asyncio.sleep(0)
+                state["terminal_success"] = (not state["disconnected"] and state["served"] == total_size)
             except (ChecksumMismatch, ObjectChangedDuringRead, EncryptionError) as exc:
-                failure = exc
+                state["failure"] = exc
         finally:
-            download.close()
-            transfer_admission.release(transfer_slot)
-            if terminal_success:
-                # Count only a completed transfer against the owner's card + oversight counters.
-                try:
-                    from sqlalchemy import update as _sa_update2
-                    db.execute(_sa_update2(PublicLink).where(PublicLink.id == link.id).values(
-                        download_count=PublicLink.download_count + 1,
-                        bytes_served=PublicLink.bytes_served + served))
-                    db.commit()
-                except Exception:
-                    try:
-                        db.rollback()
-                    except Exception:
-                        pass
-            try:
-                audit_logger.log_action(
-                    action="public_link_download_completed",
-                    status="success" if terminal_success else "failed", user=None,
-                    resource_type="file", resource_id=str(file_id),
-                    details={"vault_id": str(vault.id), "public_link_id": str(link.id),
-                             "bytes_sent": served, "total_bytes": total_size,
-                             "outcome": ("completed" if terminal_success
-                                         else "disconnected" if disconnected
-                                         else type(failure).__name__ if failure is not None
-                                         else "incomplete")},
-                    ip_address=client_ip)
-            except Exception:
-                pass
+            finish()
 
-    headers = {
-        "Content-Disposition": _content_disposition(file_name),
-        "Content-Length": str(download.total_length),
-        "Cache-Control": "no-store",
-        "X-Robots-Tag": "noindex, nofollow",
-    }
-    return StreamingResponse(file_streamer(), media_type=_safe_media_type(mime_type), headers=headers)
+    return _ClosingStreamingResponse(file_streamer(), media_type=media_type, headers=headers,
+                                     on_close=finish)
 
 
 # ---------------------------------------------------------------------------

@@ -254,7 +254,14 @@ through the existing filename hardening. One redemption = one use = one grant = 
 folder link therefore counts one use per file fetched (Q3 again). The redeem spends the use, so the
 download does not ask whether the link has a use left: a link capped at N delivers N downloads. A
 redeem whose conditional update finds the use already gone (a concurrent redeem took it) deletes the
-grant it minted before it answers 404, so no grant exists without a use behind it. The IP binding is only as good as the
+grant it minted before it answers 404, so no grant exists without a use behind it. When the server
+fails after the grant is used and before the first byte of the file goes out (no transfer slot, the
+stored file missing, unreadable or replaced while it was read, its checksum wrong, any other error),
+the person received nothing, so the use is given back: one guarded update (`use_count - 1` where it
+is above zero), recorded as `public_link_use_refunded` with the reason. The first piece is read before
+the response is built, so such a failure is an error status, not a 200 cut short. A client that
+leaves, or a transfer that fails after its first byte, keeps the use spent; since a grant is used
+once and earns at most one refund, a link capped at N still delivers at most N. The IP binding is only as good as the
 deployment's trusted-proxy configuration (`ClientIPMiddleware`), which the public page's documentation
 must say.
 
