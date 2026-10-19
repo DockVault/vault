@@ -696,6 +696,32 @@ def test_rows_left_in_an_archived_hour_are_reported_and_nothing_of_the_day_is_re
     assert _values(env)[kept] == ("203.0.113.9", "Mozilla/5.0 test")
 
 
+def test_a_row_put_back_into_the_last_hour_of_a_part_of_a_day_archived_in_part_is_reported(env, monkeypatch):
+    """A day archived over two passes: its first part ends with the hour before its 09:00 rows. A row put back into
+    that part's last hour: the removal reports row-in-archived-day for the day, rewrites nothing in it, and does not
+    complete (the check reaches every hour of a part, its last one too)."""
+    _early, _late = _half_archived(env, monkeypatch)
+    asked = env.ask_removal()
+    _idle_archive(monkeypatch)
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    (part,) = env.st.view.archives[DAY].parts
+    assert part.last_hour == _at(8)                  # the part ends with the hour before the 09:00 rows
+    stray = env.put(_at(8, 40))
+    with env.session() as db:
+        payload = db.query(AuditArchiveBlock).one().payload
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    env.removal_job()
+    assert f"nothing in {DAY.isoformat()} was rewritten" in seen.get("row-in-archived-day", "")
+    with env.session() as db:
+        assert db.query(AuditArchiveBlock).one().payload == payload
+    assert env.get(stray).ip_address == "203.0.113.9" and env.rewrite_seals() == []
+    assert env.removal_row(asked["id"]).status == vr.PENDING
+    assert env.removal_row(asked["id"]).waiting == vr.held_by("row-in-archived-day")
+
+
 def test_rows_dated_before_the_chains_first_hour_hold_a_removal_which_can_still_be_cancelled(env, monkeypatch):
     """Rows dated before the chain's first hour, which no seal covers (verify: row-before-genesis): the removal
     reports them and waits there, since it must reach every row it covers, and its row says a finding holds it. It
@@ -719,6 +745,16 @@ def test_rows_dated_before_the_chains_first_hour_hold_a_removal_which_can_still_
     assert out["status"] == vr.CANCELLED
     env.ask_removal()                                # and a new one may be asked for
     assert "row-before-genesis" in failures(env.verify())
+
+
+def test_a_waiting_erase_does_not_hold_a_removal_back(env):
+    """Only a waiting removal holds a new removal back: a per-person erase waiting its delay does not."""
+    env.put(T0 - timedelta(days=3), username="bob")
+    env.run_until_sealed()
+    env.ask("bob")
+    assert any(d.get("what") == "erase" for d in env.st.view.pending_requests().values())
+    assert vr.waiting(env.st.view) is None
+    assert env.ask_removal()["status"] == vr.PENDING
 
 
 def test_a_day_a_later_release_archived_holds_a_removal_and_its_card_says_so(env, monkeypatch):
