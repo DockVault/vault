@@ -6551,8 +6551,15 @@ class DockVault:
         and move the chain to it at once with `audit rekey --old-key-stdin --now`, the old key handed over on
         standard input (never on a command line or in a container's environment, where `ps` or `docker inspect`
         would show it). Sealing waits only for the seconds between the restart and that command. Until the move
-        is done the old key is kept beside .env (mode 600), and removed once the chain is under the new one."""
+        is done the old key is kept beside .env (mode 600), and removed once the chain is under the new one.
+
+        While that kept file is there, an earlier change is not finished: the chain may still be under the key it
+        holds, which is then in no other file. A new change is refused, naming the command that finishes the
+        earlier one, and the kept file is never written over."""
         pal = self.pal
+        kept_path = os.path.join(self.root, ".audit-chain-key.previous")
+        if os.path.lexists(kept_path):
+            self._unfinished_key_change(kept_path)
         env = self._load_env()
         old = (env.get("AUDIT_CHAIN_KEY") or "").strip()
         interactive = not getattr(args, "yes", False)
@@ -6562,15 +6569,27 @@ class DockVault:
             return
         kept = None
         if old:
-            kept = os.path.join(self.root, ".audit-chain-key.previous")
+            kept = kept_path
+            created = False
             try:
-                fd = os.open(kept, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                # Created here or not at all: an existing kept file holds a key no other file may hold.
+                fd = os.open(kept, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(old + "\n")
                 tighten_secret_file(kept)
                 # On the disk, file and name, before .env changes: a power cut then keeps the old key beside the new.
                 sync_to_disk(kept)
+            except FileExistsError:
+                self._unfinished_key_change(kept)
             except OSError as exc:
+                if created:
+                    # .env still holds the old key: the copy begun here is not needed, and a copy left behind
+                    # would refuse the next change for a change that never happened.
+                    try:
+                        os.remove(kept)
+                    except OSError:
+                        pass
                 self._fail("could not keep the old key aside before changing it (%s): nothing changed" % exc)
         self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
         print(pal.paint("  Wrote the new AUDIT_CHAIN_KEY; recreating the stack ...", "cyan"))
@@ -6584,14 +6603,24 @@ class DockVault:
         done = self._audit_tool("rekey", "--old-key-stdin", "--now", input_text=old + "\n")
         if not done.get("ok"):
             print(pal.paint("  The chain was not moved: %s" % server_text(done.get("error")), "red"))
-            print(pal.paint("  Sealing waits until it is: python dockvault.py audit rekey --old-key-file %s\n" % kept,
+            print(pal.paint("  Sealing waits until it is: python dockvault.py audit rekey --old-key-file %s\n"
+                            "  then remove %s (a new key change is refused while it is there).\n" % (kept, kept),
                             "yellow"))
             raise SystemExit(1)
         try:
             os.remove(kept)
-        except OSError:
-            pass
+        except OSError as exc:
+            print(pal.paint("  Could not remove %s (%s): remove it yourself, as the key it holds is no longer in "
+                            "use (a new key change is refused while it is there)." % (kept, exc), "yellow"))
         print(pal.paint("  The chain is under the new key (seal %s).\n" % server_text(done.get("sealed")), "green"))
+
+    def _unfinished_key_change(self, kept):
+        """Refuse a key change while an earlier one is not finished, naming the commands that finish it."""
+        self._fail("an earlier change of AUDIT_CHAIN_KEY is not finished: the key the audit log's chain may still "
+                   "be under is kept in %s, and in no other file. Finish that change first:\n"
+                   "  python dockvault.py audit rekey --old-key-file %s\n"
+                   "Once the chain is under the current key (the rekey says so, or says there is nothing to do), "
+                   "remove %s and run audit change-key again. Nothing changed." % (kept, kept, kept))
 
     def _db_free_bytes(self):
         """The free space of the database volume, in bytes, as the database container sees it, or None."""

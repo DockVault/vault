@@ -6,7 +6,8 @@
   right after it, before any other volume, holding the head record it replaced and the one it restored;
 - an update to a release with the chain offers AUDIT_CHAIN_KEY (yes by default; --no-chain-key declines);
 - the key change writes the new key, recreates the stack and moves the chain with the old key on standard
-  input, keeping the old key aside (mode 600) until the move is done;
+  input, keeping the old key aside (mode 600) until the move is done; while that kept file is there, a new key
+  change is refused and the kept file is never written over;
 - the split layout's SFTP container never gets the chain's key and mounts the keys volume read-only; the web
   server writes the SSH host key it needs.
 
@@ -256,6 +257,75 @@ def test_a_key_change_that_cannot_move_the_chain_keeps_the_old_key_aside(tmp_pat
     with pytest.raises(SystemExit):
         tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
     assert (tmp_path / ".audit-chain-key.previous").read_text(encoding="utf-8") == env["AUDIT_CHAIN_KEY"] + "\n"
+
+
+def _key_change_with_a_failed_move(tmp_path, monkeypatch):
+    """A key change whose move failed: .env holds the new key, the kept file the key the chain is under."""
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, **k: {"ok": False, "error": "busy"})
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    kept = tmp_path / ".audit-chain-key.previous"
+    assert kept.read_text(encoding="utf-8") == env["AUDIT_CHAIN_KEY"] + "\n"
+    assert _chain_key(tmp_path) != env["AUDIT_CHAIN_KEY"]
+    return env["AUDIT_CHAIN_KEY"], _chain_key(tmp_path), kept
+
+
+def test_a_second_key_change_after_a_failed_move_is_refused_and_keeps_the_key_the_chain_is_under(
+        tmp_path, monkeypatch, capsys):
+    """The kept file holds the only copy of the key the chain is under: a second change would have kept the first
+    change's new key over it (never in force), and the chain could then be moved only without a proof. It is
+    refused before anything is asked, naming the command that finishes the first change."""
+    under, written, kept = _key_change_with_a_failed_move(tmp_path, monkeypatch)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, **k: pytest.fail("the chain was asked to move"))
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: pytest.fail("asked before refusing"))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key"]))
+    out = capsys.readouterr().out
+    assert kept.read_text(encoding="utf-8") == under + "\n"
+    assert _chain_key(tmp_path) == written
+    assert "not finished" in out and f"audit rekey --old-key-file {kept}" in out and "Nothing changed" in out
+
+
+def test_a_key_change_never_writes_over_a_kept_file_it_did_not_see(tmp_path, monkeypatch, capsys):
+    """A kept file that appears between the check and the write (another run of the tool) is never truncated:
+    the file is created by this run or not at all."""
+    import os
+    under, written, kept = _key_change_with_a_failed_move(tmp_path, monkeypatch)
+    real = os.path.lexists
+    monkeypatch.setattr(os.path, "lexists", lambda p: False if str(p) == str(kept) else real(p))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    assert kept.read_text(encoding="utf-8") == under + "\n"
+    assert _chain_key(tmp_path) == written
+    assert "not finished" in capsys.readouterr().out
+
+
+def test_a_kept_file_this_run_could_not_finish_writing_is_removed_with_nothing_changed(tmp_path, monkeypatch):
+    """When the old key cannot be kept aside, .env still holds it: the copy begun is removed, so the next change is
+    not refused for a change that never happened."""
+    import errno
+    import os
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+
+    def broken(fd):
+        raise OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(os, "fsync", broken)
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    assert _chain_key(tmp_path) == env["AUDIT_CHAIN_KEY"]
+    assert not (tmp_path / ".audit-chain-key.previous").exists()
 
 
 @pytest.mark.parametrize("compose", ["deploy/docker-compose.yml", "deploy/docker-compose.secure.yml"])
