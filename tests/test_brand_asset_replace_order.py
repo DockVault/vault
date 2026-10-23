@@ -146,6 +146,39 @@ def test_a_save_that_fails_leaves_the_old_image_and_drops_the_new_one(brand):
     assert out.files == [OLD], "the old image must stay, and the new one no setting names must go"
 
 
+@pytest.mark.parametrize("where", ["open", "sync_file", "replace", "sync_directory"])
+def test_a_failed_write_of_the_image_already_shown_keeps_it(brand, monkeypatch, where):
+    # The same image uploaded again: its final name is the file the setting names. A write that fails
+    # at any step must remove only its temporary file, never that name, or the image shown is deleted
+    # while the setting still points at it.
+    first = brand.upload(PNG)
+    shown = _name(PNG, "png")
+    assert first.error is None and first.files == [shown]
+    brand.setting["logo_url"] = first.result["url"]
+    brand.seen.at_update = None
+
+    def fail(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    if where == "open":
+        real_open = open
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            if "w" in mode:
+                raise OSError(28, "No space left on device")
+            return real_open(path, mode, *args, **kwargs)
+        monkeypatch.setattr("builtins.open", failing_open)
+    elif where == "replace":
+        monkeypatch.setattr(S.os, "replace", fail)
+    else:
+        monkeypatch.setattr(durable_write, where, fail)
+    again = brand.upload(PNG)
+    assert isinstance(again.error, HTTPException) and again.error.status_code == 503, again.error
+    assert brand.seen.at_update is None and not again.db.committed
+    assert again.files == [shown], "a failed write removed the image the setting still names"
+    assert (brand.folder / shown).read_bytes() == PNG
+
+
 def test_uploading_the_image_already_shown_keeps_it(brand):
     first = brand.upload(PNG)
     assert first.files == [_name(PNG, "png")]

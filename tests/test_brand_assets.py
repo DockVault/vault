@@ -210,3 +210,35 @@ def test_a_new_logo_replaces_the_old_one_only_once_it_is_written(admin, anon):
     finally:
         _in_api(f"rmdir '{blocker}' 2>/dev/null || true")
         _reset_assets(admin)
+
+
+def test_a_failed_upload_of_the_logo_already_shown_keeps_it(admin, anon):
+    """The same logo uploaded again has the name of the file the setting names. When its write fails (a
+    directory planted at its temporary name), the upload is refused and nothing but the temporary file
+    may be removed: the logo shown stays on the disk, served whole and still named."""
+    import hashlib
+
+    _reset_assets(admin)
+    folder = _in_api("python -c \"import os; print(os.environ.get('BRAND_ASSET_DIR', '/app/brand'))\"")
+    name = f"logo.{hashlib.sha256(_PNG_1x1).hexdigest()[:8]}.png"
+    blocker = f"{folder}/{name}.tmp"
+    try:
+        first = admin.post("/settings/brand/asset/logo", files={"file": ("logo.png", _PNG_1x1, "image/png")})
+        assert first.status_code == 200, first.text
+        shown_url = first.json()["url"]
+        assert shown_url == f"/brand-assets/{name}"
+
+        _in_api(f"mkdir '{blocker}'")
+        try:
+            refused = admin.post("/settings/brand/asset/logo", files={"file": ("logo.png", _PNG_1x1, "image/png")})
+        finally:
+            _in_api(f"rmdir '{blocker}'")
+        assert refused.status_code == 503, refused.text
+        assert anon.get("/branding").json()["logo_url"] == shown_url
+        shown = anon.get(shown_url)
+        assert shown.status_code == 200 and shown.content == _PNG_1x1, "the failed upload deleted the logo shown"
+        logos = [n for n in _in_api(f"ls -a '{folder}'").split() if n.startswith("logo.")]
+        assert logos == [name], f"expected only the logo shown, found {logos}"
+    finally:
+        _in_api(f"rmdir '{blocker}' 2>/dev/null || true")
+        _reset_assets(admin)
