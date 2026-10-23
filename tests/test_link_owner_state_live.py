@@ -113,6 +113,14 @@ def test_a_note_link_stops_with_its_owner(admin, owner, links_on, tags, change):
     anon = ApiClient(BASE_URL)
 
     def check(expected):
+        # The page's peek first: it must answer like the redeem, or it would tell a link whose owner
+        # was taken out from a live one.
+        p = anon.post(f"/note-links/{token}/redeem", json={"peek": True})
+        assert p.status_code == expected, ("peek", expected, p.status_code, p.text)
+        if expected == 200:
+            assert p.json() == {"available": True, "secret_kind": "none"}, p.text
+        else:
+            assert p.json()["detail"] == "This link is not available.", p.text
         r = anon.post(f"/note-links/{token}/redeem", json={})
         assert r.status_code == expected, (expected, r.status_code, r.text)
         if expected == 200:
@@ -144,6 +152,8 @@ def test_a_protected_note_link_of_a_locked_owner_answers_404_not_a_secret_prompt
     try:
         r = anon.post(f"/note-links/{token}/redeem", json={})
         assert r.status_code == _UNAVAILABLE, r.text
+        r = anon.post(f"/note-links/{token}/redeem", json={"peek": True})
+        assert r.status_code == _UNAVAILABLE, "a peek must not prompt for the PIN of a locked owner's link"
         r = anon.post(f"/note-links/{token}/redeem", json={"secret": "4321"})
         assert r.status_code == _UNAVAILABLE, "the right PIN must not open a locked owner's link"
     finally:

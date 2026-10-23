@@ -14,6 +14,7 @@ tests/test_ui_note_link_show_on_click.py.
 import re
 import types
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -75,13 +76,15 @@ def redeem(monkeypatch):
     monkeypatch.setattr(security, "verify_password", lambda secret, hashed: checked.append(secret) or True)
     owner = types.SimpleNamespace(id=uuid.uuid4(), is_active=True, is_locked=False, locked_until=None)
 
-    def run(secret_kind="none", **payload):
+    def run(secret_kind="none", owner_state=None, **payload):
         token = "tok-" + uuid.uuid4().hex
         link = types.SimpleNamespace(
             id=uuid.uuid4(), token_hash=S._notelink_token_hash(token), owner_id=owner.id, revoked=False,
             expires_at=None, max_uses=1, use_count=0, secret_kind=secret_kind,
             password_hash=None if secret_kind == "none" else "a-hash", title_snapshot="T", body_snapshot="the note")
-        db = _DB({S.NoteLink: link, S.User: owner})
+        account = owner if owner_state is None else (
+            None if owner_state == "gone" else types.SimpleNamespace(id=owner.id, **OWNER_STATES[owner_state]))
+        db = _DB({S.NoteLink: link, S.User: account})
         out = types.SimpleNamespace(db=db, checked=checked, body=None, refused=None)
         try:
             out.body = run_coroutine(S.redeem_note_link(token, S.NoteLinkRedeem(**payload), None, db))
@@ -111,6 +114,38 @@ def test_a_peek_at_a_protected_link_prompts_and_never_checks_a_secret(redeem, ki
     assert out.refused.status_code == 401
     assert out.refused.detail == {"error": "secret_required", "secret_kind": kind}
     assert out.db.updates == 0 and out.checked == []
+
+
+# The owner's account as the link sees it: taken out by an administrator, or not.
+OWNER_STATES = {
+    "deactivated": dict(is_active=False, is_locked=False, locked_until=None),
+    "locked by an administrator": dict(is_active=True, is_locked=True, locked_until=None),
+    # The timed lock wrong passwords arm leaves the links working (the control: a peek still answers).
+    "locked for a while": dict(is_active=True, is_locked=True,
+                               locked_until=datetime.utcnow() + timedelta(minutes=15)),
+}
+
+
+@pytest.mark.parametrize("kind", ["none", "pin", "password"])
+@pytest.mark.parametrize("owner_state", ["deactivated", "locked by an administrator", "gone"])
+def test_a_peek_at_a_link_whose_owner_is_out_answers_like_a_missing_link(redeem, kind, owner_state):
+    # A peek must not tell a link whose owner was taken out from one that is still live: it gets the
+    # same 404 as a missing link, before anything that would say the link exists (its "available", its
+    # prompt).
+    out = redeem(secret_kind=kind, owner_state=owner_state, peek=True)
+    assert out.body is None, f"a peek answered {out.body!r} for a link whose owner is {owner_state}"
+    assert out.refused.status_code == 404 and out.refused.detail == "This link is not available."
+    assert out.db.updates == 0 and out.checked == []
+
+
+@pytest.mark.parametrize("kind, answer", [("none", None), ("pin", 401), ("password", 401)])
+def test_a_peek_still_answers_while_the_timed_lock_holds(redeem, kind, answer):
+    out = redeem(secret_kind=kind, owner_state="locked for a while", peek=True)
+    if answer is None:
+        assert out.body == {"available": True, "secret_kind": "none"}
+    else:
+        assert out.refused.status_code == answer
+    assert out.db.updates == 0
 
 
 @pytest.mark.parametrize("kind", ["pin", "password"])
