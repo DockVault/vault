@@ -64,9 +64,18 @@ def ensure_host_key(path: Union[str, Path]) -> bool:
     try:
         if path.exists():
             return False
+    except OSError:
+        return False
+    try:
         generate_ed25519_host_key(path)
         return True
     except OSError:
+        # A key that could not be synced (EIO) may not be on the disk: it is removed, so no later start keeps a key
+        # file whose bytes may be lost, and the next start writes one again.
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return False
 
 

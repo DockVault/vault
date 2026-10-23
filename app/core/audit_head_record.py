@@ -37,10 +37,11 @@ What it holds:
 Not secret and not MAC'd: whoever can write the file can read .env in the same container.
 
 Writes happen after the seal's transaction commits, under an exclusive lock on a file beside it, held from the
-read of the file through its replace: a temporary file in the same directory, fsync, os.replace, fsync of the
-directory. Every write is a merge: failures keep their earliest first sighting and latest last one, positions
-and counts never move back, lists only grow (an acknowledgment only marks what it names), and hour summaries
-are dropped only once older than 30 days.
+read of the file through its replace, through app/core/durable_write.py: the directory made with its name synced,
+a temporary file in it given its owner and synced, os.replace, then the directory synced; a failed sync raises, so
+the record is not taken for written (HeadStore.write says why, ``unwritable``). Every write is a merge: failures
+keep their earliest first sighting and latest last one, positions and counts never move back, lists only grow (an
+acknowledgment only marks what it names), and hour summaries are dropped only once older than 30 days.
 """
 from __future__ import annotations
 
@@ -52,6 +53,8 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+
+from app.core import durable_write
 
 VERSION = 1
 SUMMARY_DAYS = 30
@@ -84,19 +87,13 @@ def write_mark(path: str, mark: Dict[str, Any]) -> None:
 
 
 def remove_mark(path: str) -> None:
+    """Remove the restore mark beside the record at ``path``, and sync its directory: a removal the disk lost would
+    bring the mark back. Raises OSError when the directory cannot be synced (the mark may still be there)."""
     try:
         os.unlink(mark_path(path))
     except FileNotFoundError:
         return
-    directory = os.path.dirname(path) or "."
-    try:
-        dfd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+    durable_write.sync_directory(os.path.dirname(path) or ".")
 
 
 def empty() -> Dict[str, Any]:
@@ -132,7 +129,7 @@ def _owned_like_directory(path: str) -> None:
 def _file_lock(path: str):
     """An exclusive lock on ``path`` + '.lock', between processes."""
     lock_path = path + ".lock"
-    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    durable_write.make_directories(os.path.dirname(lock_path) or ".")
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     _owned_like_directory(lock_path)
     try:
@@ -177,8 +174,12 @@ def read_file(path: str) -> Optional[Dict[str, Any]]:
 
 
 def _write_file(path: str, record: Dict[str, Any]) -> None:
+    """Write ``record`` to ``path`` in place of what is there: the directory made (each new one synced into its
+    parent), a temporary file beside it given its owner and synced, renamed over the old file, and the directory
+    synced, so the new record and its name are on the disk when this returns. Raises OSError (EIO from a sync
+    too); the temporary file is then removed."""
     directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
+    durable_write.make_directories(directory)
     fd, tmp = tempfile.mkstemp(prefix=".audit-chain-head.", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -186,7 +187,7 @@ def _write_file(path: str, record: Dict[str, Any]) -> None:
             fh.flush()
             # Its owner before the sync, so the file synced is the final one, owner and all.
             _owned_like_directory(tmp)
-            os.fsync(fh.fileno())
+            durable_write.sync_file(fh)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -194,14 +195,7 @@ def _write_file(path: str, record: Dict[str, Any]) -> None:
         except OSError:
             pass
         raise
-    try:
-        dfd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass   # not every platform can fsync a directory
+    durable_write.sync_directory(directory)
 
 
 # --------------------------------------------------------------------------- merging

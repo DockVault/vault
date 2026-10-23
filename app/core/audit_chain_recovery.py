@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 from app.core import audit_chain_format as fmt
 from app.core import audit_chain_host as host
 from app.core import audit_chain_keys as keys
+from app.core import durable_write
 from app.core.audit_chain_host import Refused, chain_state, check_expected, describe_seal, host_audit_row, token
 
 KEY_ACTION = "audit_chain_key_changed"
@@ -233,11 +234,14 @@ def _save_discarded(path: str, db, first: int, now: datetime) -> str:
         saved.append(item)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     target = f"{path}.discarded-{stamp}-{first}.json"
+    # The copy and its name are on the disk before the seals' deletion commits: a sync that fails raises, and the
+    # discard is abandoned with every seal still in place.
     with open(target, "w", encoding="utf-8") as fh:
         json.dump(saved, fh, indent=1, sort_keys=True)
         fh.flush()
         _owned_like_directory(target)          # before the sync: the file synced is the final one, owner and all
-        os.fsync(fh.fileno())
+        durable_write.sync_file(fh)
+    durable_write.sync_directory(os.path.dirname(target) or ".")
     return target
 
 

@@ -825,8 +825,18 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
             rec["restore"] = {"at": fmt.time_text(now), "cause": "backup", "bundle": mark.get("bundle")}
             return rec
         w.after_record_change = change
-    hr.remove_mark(st.head_store().path)
+    unsure = None
+    try:
+        hr.remove_mark(st.head_store().path)
+    except OSError as exc:
+        unsure = exc
     if cancels:
         _reseal_cancels(engine, st, cancels)
+    if unsure is not None:
+        # The restore seal is written and the lost cancels sealed again; the mark may still be on the disk, which
+        # keeps the pruner from deleting, erasing or rewriting anything until it is gone.
+        raise Refused(f"the restore is accepted (restore seal {seal.seq}), but its mark could not be removed for "
+                      f"certain ({type(unsure).__name__}: {unsure}): until {hr.mark_path(st.head_store().path)} is "
+                      "gone the pruner deletes nothing; remove it by hand once the disk answers")
     return {"restored": seal.seq, "acknowledged": window, "grace_days": grace, "resealed": sorted(settings),
             "cancels": cancels, "superseded": [c for _s, _n, c in superseded]}

@@ -217,7 +217,9 @@ def test_the_saved_seals_of_a_discard_are_handed_to_their_owner_before_they_are_
         target = recovery._save_discarded(str(tmp_path / "audit-chain-head.json"), db, 1, env.clock())
     with open(target, encoding="utf-8") as fh:
         assert json.load(fh)
-    assert [e[0] for e in events] == ["chown", "fsync"] and events[0][1] == target, events
+    # Then its name, the directory, before the deletion of the seals commits (not on Windows).
+    assert [e[0] for e in events] == ["chown", "fsync"] + (["fsync"] if os.name != "nt" else []), events
+    assert events[0][1] == target
 
 
 def test_a_discard_that_fails_leaves_the_seals_and_writes_no_ack(env, monkeypatch):

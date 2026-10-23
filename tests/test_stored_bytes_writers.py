@@ -53,6 +53,15 @@ SYNCED = {
     # The SFTP host key: its directory made, the key synced, its name synced.
     ("app/sftp/host_key.py", "generate_ed25519_host_key"): (
         ["os.open"], "generate_ed25519_host_key", {"make_directories", "sync_file", "sync_directory"}),
+    # The audit chain's head record and the restore mark: a temporary file in the record's directory (made with
+    # its name synced), given its owner and synced, renamed over the old one, the directory synced.
+    ("app/core/audit_head_record.py", "_write_file"): (
+        ["tempfile.mkstemp", "os.fdopen", "os.replace"], "_write_file",
+        {"make_directories", "sync_file", "sync_directory"}),
+    # The seals a discard deletes, saved beside the head record: the copy and its name synced before the deletion
+    # commits.
+    ("app/core/audit_chain_recovery.py", "_save_discarded"): (
+        ["open"], "_save_discarded", {"sync_file", "sync_directory"}),
 }
 
 HELPER = "durable_write itself: the directory make_directories creates, synced into its parent there"
@@ -65,6 +74,7 @@ RESUME_HINT = ("a chunk's digest, a hint for a resuming client: lost or emptied,
                "chunk again, which is slower and never wrong")
 IN_MEMORY = "the case export's ZIP, built in memory as it streams to the client: never stored"
 NOT_A_FILE = "not a file: an in-memory cache's replace()"
+LOCK = "the head record's lock file: empty, it holds only the lock (its directory made through durable_write)"
 
 # (file, enclosing function) -> (the writing calls in it that hold no stored bytes, and why).
 NO_STORED_BYTES = {
@@ -78,6 +88,7 @@ NO_STORED_BYTES = {
     ("app/api/api_server.py", "upload_chunk"): (["hash_path.write_text"], RESUME_HINT),
     ("app/core/case_export.py", "ExportStream._pieces"): (["zipfile.ZipFile", "archive.open"], IN_MEMORY),
     ("app/api/api_server.py", "update_settings"): (["_api_rate_limit_policy_cache.replace"], NOT_A_FILE),
+    ("app/core/audit_head_record.py", "_file_lock"): (["os.open"], LOCK),
 }
 
 # --------------------------------------------------------------------------- the scan
@@ -366,4 +377,5 @@ def test_each_synced_writer_is_synced_through_durable_write_where_its_entry_says
 
 def test_every_entry_says_why():
     for key, (calls, reason) in NO_STORED_BYTES.items():
-        assert calls and reason in (HELPER, LOG, LIVENESS, WRITE_TEST, SCRATCH, RESUME_HINT, IN_MEMORY, NOT_A_FILE), key
+        assert calls and reason in (HELPER, LOG, LIVENESS, WRITE_TEST, SCRATCH, RESUME_HINT, IN_MEMORY, NOT_A_FILE,
+                                    LOCK), key

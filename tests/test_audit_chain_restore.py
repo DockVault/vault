@@ -404,6 +404,37 @@ def test_a_whole_backup_restored_holds_deletion_until_accepted_and_names_what_it
         assert (change.status, change.decided_by_name) == ("cancelled", "operator@host")
 
 
+def test_a_restore_mark_whose_removal_is_not_on_the_disk_is_said_and_the_lost_cancel_still_sealed(env, monkeypatch):
+    """The restore seal is written, then the mark's removal fails to reach the disk (its directory's sync): accept-
+    restore says so, naming the seal and the mark, after it has sealed the lost cancel again, and the mark keeps the
+    pruner from deleting until it is gone."""
+    import errno
+    env.row(T0 - timedelta(days=60))
+    env.run_until_sealed()
+    admin = _admin(env)
+    outcome = _change(env, admin, "audit_max_days", 30)
+    req = [s for s in env.seals() if s.kind == "request"][-1].seq
+    snap = _snapshot(env)
+    with ps.change_transaction(env.engine) as w:
+        ps.cancel(w, outcome.change.id, admin)
+    _run_to(env, env.clock() + timedelta(days=8))
+    _restore_bundle(env, snap)
+    seen = restore.accept_restore(env.engine, _host(env), read=True)
+
+    def unsynced(path):
+        raise OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(hr, "remove_mark", unsynced)
+    with pytest.raises(host.Refused) as refused:
+        restore.accept_restore(env.engine, _host(env), expect=seen["state"])
+    seal = [s for s in env.seals() if s.kind == "restore"][0]
+    assert f"the restore is accepted (restore seal {seal.seq}), but its mark could not be removed" in str(
+        refused.value)
+    assert hr.mark_path(env.st.head_store().path) in str(refused.value)
+    assert [s.detail["cancels"] for s in env.seals() if s.kind == "cancel" and s.seq > seal.seq] == [req]
+    assert hr.read_mark(env.st.head_store().path) is not None
+    assert env.st.holds_deletion() == "a restore is not finished: run dockvault.py audit accept-restore"
+
+
 def test_a_raise_a_whole_backup_restore_undid_is_sealed_again_and_stored(env):
     env.row(T0 - timedelta(days=60))
     env.run_until_sealed()
