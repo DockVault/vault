@@ -815,6 +815,28 @@ def write_env(path, lines):
     return tighten_secret_file(path)
 
 
+def sync_to_disk(path):
+    """Force a file just written, and its name in its directory, to the disk (the standard library's fsync, as the
+    app's durable writes do), so a power cut right after cannot lose it. Windows, and a filesystem that cannot sync
+    a directory (EINVAL, EBADF), skip the directory; any other error (EIO) raises OSError."""
+    import errno
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if os.name == "nt":
+        return
+    dfd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dfd)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.EBADF):
+            raise
+    finally:
+        os.close(dfd)
+
+
 def tighten_secret_file(path):
     """Restrict a secrets file to the current user - chmod 600 on POSIX, icacls on Windows. Returns
     True ONLY if the tightening actually succeeded, so a caller never falsely reports a secrets file
@@ -6545,9 +6567,11 @@ class DockVault:
                 fd = os.open(kept, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(old + "\n")
+                tighten_secret_file(kept)
+                # On the disk, file and name, before .env changes: a power cut then keeps the old key beside the new.
+                sync_to_disk(kept)
             except OSError as exc:
                 self._fail("could not keep the old key aside before changing it (%s): nothing changed" % exc)
-            tighten_secret_file(kept)
         self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
         print(pal.paint("  Wrote the new AUDIT_CHAIN_KEY; recreating the stack ...", "cyan"))
         if not self._recreate_stack(build=False):

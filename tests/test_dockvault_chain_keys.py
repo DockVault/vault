@@ -205,6 +205,48 @@ def test_the_key_change_moves_the_chain_with_the_old_key_on_standard_input(tmp_p
     assert not (tmp_path / ".audit-chain-key.previous").exists()
 
 
+@pytest.mark.skipif(not hasattr(__import__("os"), "O_DIRECTORY"), reason="a directory cannot be synced here")
+def test_the_old_key_is_on_the_disk_with_its_name_before_env_changes(tmp_path, monkeypatch):
+    """The old key kept beside .env is synced, then its directory, before .env is rewritten: a power cut then keeps
+    the old key beside the new one, and the chain can still be moved with a proof."""
+    import os
+    import stat
+    _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    events = []
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        events.append(("dir" if stat.S_ISDIR(st.st_mode) else "file", st.st_ino))
+        return real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", fsync)
+    real_set = tool._set_env_key
+    monkeypatch.setattr(tool, "_set_env_key", lambda *a, **k: (events.append(("env",)), real_set(*a, **k))[1])
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, **k: {"ok": False, "error": "key-unverified"})
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    kept = tmp_path / ".audit-chain-key.previous"
+    assert events[:3] == [("file", kept.stat().st_ino), ("dir", tmp_path.stat().st_ino), ("env",)], events
+
+
+def test_a_key_change_whose_old_key_cannot_be_synced_changes_nothing(tmp_path, monkeypatch):
+    import errno
+    import os
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+
+    def broken(fd):
+        raise OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(os, "fsync", broken)
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    assert _chain_key(tmp_path) == env["AUDIT_CHAIN_KEY"]
+
+
 def test_a_key_change_that_cannot_move_the_chain_keeps_the_old_key_aside(tmp_path, monkeypatch):
     env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
