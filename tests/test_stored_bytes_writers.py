@@ -3,9 +3,10 @@
 Stored bytes reach the disk before a row or an answer says they exist (app/core/durable_write.py): every
 writer of stored bytes syncs the file, its name in its directory, and each directory it makes, before
 the commit. That holds only while no writer is added that skips it, so this lists every call in app/
-that writes a file -- an open for writing, write_bytes and write_text, a rename or a replace into place,
-a shutil copy or move, a temporary file that is kept, a log file handler, a directory made -- by the
-function it is in, and requires each one to be either:
+that writes a file -- an open for writing (open, io.FileIO, the gzip, bz2, lzma and tar files, a file
+database), write_bytes and write_text, a rename or a replace into place, a shutil copy or move, a
+temporary file that is kept, a log file handler, a directory made, any of them called through another
+name an assignment gives it -- by the function it is in, and requires each one to be either:
 
 - a writer of stored bytes, synced through durable_write: the entry names the function that syncs it
   and the durable_write calls made there, and the test checks that they are; or
@@ -94,8 +95,13 @@ NO_STORED_BYTES = {
 # --------------------------------------------------------------------------- the scan
 
 _MODE = re.compile(r"^[rwxabtU+]{1,5}$")
-# Functions that open a file by name, with the mode as their second argument.
-_OPENERS = {"open", "io.open", "os.fdopen", "codecs.open", "gzip.open", "bz2.open", "lzma.open", "tarfile.open"}
+# Functions and classes that open a file by name, with the mode as their second argument.
+_OPENERS = {"open", "builtins.open", "io.open", "io.FileIO", "os.fdopen", "codecs.open", "gzip.open", "gzip.GzipFile",
+            "bz2.open", "bz2.BZ2File", "lzma.open", "lzma.LZMAFile", "tarfile.open", "tarfile.TarFile"}
+# Databases kept in a file, with their flag as the second argument and the flag they take when given none: they
+# write unless opened read-only ("r").
+_FLAGGED_OPENERS = {"shelve.open": "c", "dbm.open": "r", "dbm.gnu.open": "r", "dbm.ndbm.open": "r",
+                    "dbm.dumb.open": "c", "dbm.sqlite3.open": "r"}
 _WRITE_FLAGS = {"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC", "O_EXCL", "O_TMPFILE"}
 # Functions that write, whatever their arguments.
 _WRITERS = {
@@ -131,6 +137,26 @@ def _qualified(func, imports) -> str:
     return text
 
 
+def _aliases(tree) -> dict:
+    """Name -> the expressions bound to it, for a name or an attribute given a callable by assignment anywhere in
+    the module (``o = open``, ``self.save = os.replace``, ``w = functools.partial(open, mode="w")``): a call
+    through it is judged as a call of what it names."""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not isinstance(value, (ast.Name, ast.Attribute, ast.Call)):
+            continue
+        for target in targets:
+            if isinstance(target, (ast.Name, ast.Attribute)):
+                out.setdefault(ast.unparse(target), []).append(value)
+    return out
+
+
 def _keyword(call, name):
     return next((k.value for k in call.keywords if k.arg == name), None)
 
@@ -139,7 +165,7 @@ def _writes_in_mode(mode) -> bool:
     if mode is None:
         return False                                    # the default mode reads
     if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
-        return any(c in mode.value for c in "wax+")
+        return any(c in mode.value.split(":", 1)[0] for c in "wax+")    # tarfile's "r:xz" reads
     return True                                         # a mode the scan cannot read counts as a write
 
 
@@ -152,8 +178,33 @@ def _flags_write(flags) -> bool:
     return bool(flags_named & _WRITE_FLAGS) or not flags_named
 
 
-def is_writer(call: ast.Call, imports: dict) -> bool:
+def _through(bound, call: ast.Call) -> ast.Call:
+    """``call`` made through a name bound to ``bound``: the call of what it names, a partial's own arguments first."""
+    if isinstance(bound, ast.Call):
+        return ast.Call(func=bound.args[0], args=list(bound.args[1:]) + list(call.args),
+                        keywords=list(bound.keywords) + list(call.keywords))
+    return ast.Call(func=bound, args=list(call.args), keywords=list(call.keywords))
+
+
+def _bindings(func, imports: dict, aliases: dict) -> list:
+    """What ``func`` is bound to by an assignment the scan can follow: callables, and partials of one."""
+    out = []
+    for bound in aliases.get(ast.unparse(func), ()):
+        if isinstance(bound, ast.Call):
+            if _qualified(bound.func, imports) in ("functools.partial", "partial") and bound.args:
+                out.append(bound)
+        elif ast.unparse(bound) != ast.unparse(func):
+            out.append(bound)
+    return out
+
+
+def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 0) -> bool:
     func = call.func
+    if aliases and depth < 5:
+        # A writer called through another name: `o = open` then `o(p, "w")`.
+        if any(is_writer(_through(bound, call), imports, aliases, depth + 1)
+               for bound in _bindings(func, imports, aliases)):
+            return True
     name = _qualified(func, imports)
     if name == "os.open":
         return len(call.args) < 2 or _flags_write(call.args[1])
@@ -162,6 +213,16 @@ def is_writer(call: ast.Call, imports: dict) -> bool:
         if mode is None and len(call.args) > 1:
             mode = call.args[1]
         return _writes_in_mode(mode)
+    if name in _FLAGGED_OPENERS:
+        flag = _keyword(call, "flag")
+        if flag is None:
+            flag = call.args[1] if len(call.args) > 1 else ast.Constant(_FLAGGED_OPENERS[name])
+        if isinstance(flag, ast.Constant) and isinstance(flag.value, str):
+            return any(c in flag.value for c in "wcn")
+        return True
+    if name == "sqlite3.connect":                       # creates its database file, but for one in memory
+        target = call.args[0] if call.args else _keyword(call, "database")
+        return not (isinstance(target, ast.Constant) and target.value == ":memory:")
     if name in _WRITERS:
         return True
     if name == "tempfile.NamedTemporaryFile":
@@ -176,6 +237,12 @@ def is_writer(call: ast.Call, imports: dict) -> bool:
             if mode is None:
                 mode = next((a for a in call.args if isinstance(a, ast.Constant) and isinstance(a.value, str)
                              and _MODE.match(a.value)), None)
+            if mode is None and len(call.args) > 1:
+                mode = call.args[1]                     # ZipFile.open(name, mode), aiofiles.open(file, mode)
+            elif mode is None and len(call.args) == 1 and not isinstance(call.args[0], ast.Constant):
+                # Path.open(mode) with the mode in a variable (or a ZipFile member named by one: the scan cannot
+                # tell them apart, so it counts as a write, as any mode it cannot read does).
+                mode = call.args[0]
             return _writes_in_mode(mode)
         if func.attr in _WRITING_METHODS:
             return True
@@ -190,6 +257,7 @@ def writers(source: str) -> dict:
     """{enclosing function's dotted name: [callee text, ...]} of every call in ``source`` that writes a file."""
     tree = ast.parse(source)
     imports = _imports(tree)
+    aliases = _aliases(tree)
     found = {}
 
     def visit(node, scope):
@@ -197,7 +265,7 @@ def writers(source: str) -> dict:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 visit(child, scope + [child.name])
                 continue
-            if isinstance(child, ast.Call) and is_writer(child, imports):
+            if isinstance(child, ast.Call) and is_writer(child, imports, aliases):
                 found.setdefault(".".join(scope) or "<module>", []).append(ast.unparse(child.func))
             visit(child, scope)
 
@@ -317,6 +385,61 @@ def test_the_scan_leaves_reads_and_other_objects_alone():
         "    durable_write.make_directories(p); durable_write.sync_file(p)\n"
     )
     assert writers(source) == {}
+
+
+def test_the_scan_finds_writers_through_other_openers_other_names_and_a_mode_in_a_variable():
+    source = (
+        "import io, gzip, bz2, lzma, functools, shelve, sqlite3, tarfile\n"
+        "from functools import partial\n"
+        "def w(p, mode, flag):\n"
+        "    io.FileIO(p, 'w'); gzip.GzipFile(p, 'wb'); bz2.BZ2File(p, 'w'); lzma.LZMAFile(p, mode='w')\n"
+        "    tarfile.TarFile(p, 'w')\n"
+        "    o = open\n"
+        "    o(p, 'w')\n"
+        "    save = functools.partial(open, mode='w')\n"
+        "    save(p)\n"
+        "    later = partial(io.FileIO)\n"
+        "    later(p, 'a')\n"
+        "    p.open(mode)\n"
+        "    shelve.open(p); shelve.open(p, flag); sqlite3.connect(p)\n"
+        "class Box:\n"
+        "    def __init__(self):\n"
+        "        self.writer = io.open\n"
+        "    def m(self, p):\n"
+        "        self.writer(p, 'wb')\n"
+    )
+    assert writers(source) == {
+        "w": ["io.FileIO", "gzip.GzipFile", "bz2.BZ2File", "lzma.LZMAFile", "tarfile.TarFile", "o", "save", "later",
+              "p.open", "shelve.open", "shelve.open", "sqlite3.connect"],
+        "Box.m": ["self.writer"],
+    }
+
+
+def test_reads_through_other_openers_and_other_names_stay_reads():
+    source = (
+        "import io, gzip, shelve, sqlite3, dbm, tarfile\n"
+        "def r(p):\n"
+        "    io.FileIO(p); gzip.GzipFile(p); gzip.GzipFile(p, 'rb'); tarfile.open(p, 'r:xz')\n"
+        "    o = open\n"
+        "    o(p); o(p, 'rb')\n"
+        "    shelve.open(p, 'r'); dbm.open(p); sqlite3.connect(':memory:')\n"
+        "    p = p\n"
+        "    p.open()\n"
+    )
+    assert writers(source) == {}
+
+
+@pytest.mark.parametrize("form", [
+    "io.FileIO(path, 'w')", "gzip.GzipFile(path, 'wb')", "bz2.BZ2File(path, 'w')", "lzma.LZMAFile(path, 'w')",
+    "o = open\n    o(path, 'w')", "Path(path).open(mode)"])
+def test_a_writer_of_each_such_form_added_to_the_application_is_in_no_list(form):
+    rel = "app/sftp/heartbeat.py"
+    source = (ROOT / rel).read_text(encoding="utf-8") + (
+        "\n\ndef added_writer(path, mode):\n    import io, gzip, bz2, lzma\n    from pathlib import Path\n"
+        f"    {form}\n")
+    found = dict(_all_writers())
+    found.update({(rel, scope): calls for scope, calls in writers(source).items()})
+    assert (rel, "added_writer") in unclassified(found)
 
 
 def test_a_new_writer_in_no_list_fails_and_so_does_a_listed_one_that_is_gone():
