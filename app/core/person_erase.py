@@ -182,11 +182,12 @@ def name_problem(name) -> Optional[str]:
 
 def system_names() -> frozenset:
     """The names the app writes into the records for itself, which are no person's: the host's operator, the
-    server's own configuration, and the server acting from .env."""
+    server's own configuration, the server acting from .env, and the steps compliance access takes on its own."""
     from app.core.audit_chain_policy_seals import SERVER_NAME
     from app.core.audit_privacy import SERVER_CONFIGURATION
     from app.core.credential_changes import HOST_OPERATOR
-    return frozenset({HOST_OPERATOR, SERVER_CONFIGURATION, SERVER_NAME})
+    from app.core.legal_holds import SYSTEM
+    return frozenset({HOST_OPERATOR, SERVER_CONFIGURATION, SERVER_NAME, SYSTEM})
 
 
 def holder(db, name: str, now: datetime) -> Optional[str]:
@@ -504,6 +505,13 @@ AUDIT_ROWS = "the audit log: the person's rows are erased under the integrity ch
 DELETED = "deleted with the account"
 IDS_ONLY = "holds account ids only, cleared or deleted with the account; no name"
 NO_PERSON = "holds no person's name"
+# Compliance access keeps who asked for, approved, confirmed, rejected, released or closed a case, a legal hold or an
+# auditor's right, and who revealed a name or was told: the record of an investigation, kept for the case's record
+# floor (COMPLIANCE_RECORD_MIN_DAYS), which an erase does not change. An auditor's account cannot be deleted while a
+# case names it, so its name is never erased.
+COMPLIANCE_RECORD = ("the record of compliance access (who asked, approved, confirmed, rejected, released or closed), "
+                     "kept for the case's record floor: an erase does not change it")
+HELD = "what a legal hold keeps of a vault (ids, names sealed at rest), until the purge after its release"
 COVERAGE: Dict[str, str] = {
     "audit_logs": AUDIT_ROWS,
     "audit_archive_blocks": AUDIT_ROWS,
@@ -548,6 +556,11 @@ COVERAGE: Dict[str, str] = {
     "second_factor_actions": NO_PERSON, "email_actions": NO_PERSON, "email_profiles": NO_PERSON,
     "email_templates": NO_PERSON, "email_resources": NO_PERSON, "ecc_registration_challenges": IDS_ONLY,
     "ecc_key_update_challenges": IDS_ONLY, "data_requirements": NO_PERSON,
+    "compliance_cases": COMPLIANCE_RECORD, "legal_hold_vaults": COMPLIANCE_RECORD, "auditor_grants": COMPLIANCE_RECORD,
+    "compliance_reveals": COMPLIANCE_RECORD, "compliance_notice_outbox": COMPLIANCE_RECORD,
+    "compliance_exports": IDS_ONLY, "compliance_case_people": IDS_ONLY, "compliance_case_scopes": IDS_ONLY,
+    "compliance_case_vaults": IDS_ONLY, "compliance_case_counters": NO_PERSON,
+    "held_files": HELD, "held_folders": HELD, "held_name_history": HELD,
     # Outside the database (the data inventory's other sections).
     "cache": "entries expire on their own within a day (a lock on a name that is no account: 30 days), and those "
              "about names typed at sign-in hold only a keyed stand-in",

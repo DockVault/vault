@@ -405,8 +405,11 @@ def test_the_routes_select_the_case_and_record_before_sending(monkeypatch):
     import inspect
     events = inspect.getsource(api.activity_events)
     assert "_activity_case(db, current_user, case, request)" in events and "**_case_filters(selection)" in events
-    names_at = events.index("_case_names(db, selection, current_user, events, rows)")
-    assert names_at < events.index('out["events"] = events')
+    # The rows are read by the page reader (from audit_logs, or with the archive), which the selection is handed.
+    assert events.count("selection)") == 2 and "_activity_events_page(" in events
+    page = inspect.getsource(api._activity_events_page)
+    names_at = page.index("_case_names(db, selection, current_user, events, rows)")
+    assert names_at < page.index('out["events"] = events')
     one = inspect.getsource(api.activity_event)
     assert "_case_names(db, selection, current_user, [event], [row])" in one
     assert "**_case_filters(selection)" in one

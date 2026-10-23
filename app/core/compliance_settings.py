@@ -88,9 +88,10 @@ STRICTER: dict = {
 
 
 def _spec(key: str, kind: str, default: Any, label: str, help: str = "", **kw) -> registry.SettingSpec:
+    # Advanced, on the page of the other records' settings: only .env sets them, and few deployments change them.
     return registry.register(registry.SettingSpec(
         key=key, kind=kind, default=default, env=key, editable=registry.ENV_ONLY, lockable=True, group=GROUP,
-        label=label, help=help, since="0.34.0", **kw))
+        label=label, help=help, since="0.34.0", level=registry.ADVANCED, page=registry.MANAGED_PAGE, **kw))
 
 
 _spec(ACCESS, "enum", ENABLED, "Compliance access", choices=(ENABLED, DISABLED),
@@ -124,9 +125,11 @@ _spec(RECORD_MIN_DAYS, "int", 2190, "Keep case records after the case closes for
 KEYS: tuple = tuple(STRICTER)
 
 
-@registry.register_contract
+@registry.register_contract(beyond_chain_inputs=True)
 def _contract(settings) -> list:
-    """What in .env makes the compliance settings impossible to honour together, in plain words."""
+    """What in .env makes the compliance settings impossible to honour together, in plain words. The audit chain
+    records PLAN_LOG_MAX_DAYS but not the compliance settings, so an env seal is not judged by this (the server
+    checks it at every start)."""
     def number(name):
         value = getattr(settings, name, None)
         return value if isinstance(value, int) and not isinstance(value, bool) else None

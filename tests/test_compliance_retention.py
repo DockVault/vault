@@ -4,7 +4,8 @@ A positive audit retention deletes no row written under a case while the case is
 stands, nor before COMPLIANCE_RECORD_MIN_DAYS (and the case's own floor) after it closed; rows of the
 compliance category are kept that long after they were written. The size cap never deletes them either.
 After the floor they follow the audit log's retention like any other row. The rules are registered with
-the pruner when it is imported, so every pass reads them.
+the pruner when it is imported, so every pass reads them. The audit job deletes only rows of sealed hours,
+through the audit log's integrity chain, which runs on each test's database.
 """
 import tempfile
 import uuid
@@ -25,8 +26,9 @@ from app.core import audit_retention as ar  # noqa: E402
 from app.core import compliance_retention as cr  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (AuditLog, ComplianceCase, LegalHoldVault, ManagedSetting,  # noqa: E402
-                             ManagedSettingChange, SystemSetting, User)
+from app.core.models import (AuditArchiveBlock, AuditLog, AuditSeal, ComplianceCase,  # noqa: E402
+                             LegalHoldVault, ManagedSetting, ManagedSettingChange, SystemSetting, User)
+from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -66,8 +68,8 @@ def factory(monkeypatch):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'audit.db'}")
         copies = sa.MetaData()
-        for model in (User, AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting, ComplianceCase,
-                      LegalHoldVault):
+        for model in (User, AuditLog, AuditSeal, AuditArchiveBlock, ManagedSetting, ManagedSettingChange,
+                      SystemSetting, ComplianceCase, LegalHoldVault):
             _copy(model, copies)
         copies.create_all(engine)
         make = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -115,8 +117,37 @@ def _left(factory, ids):
     return {r.id for r in factory().query(AuditLog.id).filter(AuditLog.id.in_(list(ids))).all()}
 
 
-def _prune(factory, numbers):
-    return ar.prune(retention.Pass(factory, now=NOW), numbers)
+_CHAIN = []
+
+
+@pytest.fixture(autouse=True)
+def chain(request, monkeypatch, tmp_path):
+    """The audit chain on the test's database, when the test has one."""
+    if "factory" not in request.fixturenames:
+        yield None
+        return
+    c = Chain(monkeypatch, tmp_path, request.getfixturevalue("env"), request.getfixturevalue("factory"), NOW)
+    _CHAIN.append(c)
+    yield c
+    _CHAIN.clear()
+
+
+def _prune(factory, numbers, now=NOW):
+    """The audit job with these numbers, once every hour that may be sealed at ``now`` is sealed."""
+    _CHAIN[-1].seal_all(now)
+    return ar.prune(retention.Pass(factory, now=now), numbers)
+
+
+def _prune_sized(factory, numbers):
+    """The audit job with these numbers once a delay of sealing has run since the rows were sealed: the size cap
+    counts an hour's bytes only from then."""
+    c = _CHAIN[-1]
+    until = NOW + timedelta(days=7, hours=2)
+    c.seal_all(NOW)
+    while c.clock() + timedelta(hours=6) <= until:
+        c.seal_all(c.clock() + timedelta(hours=6))
+    c.seal_all(until)
+    return ar.prune(retention.Pass(factory, now=until), numbers)
 
 
 def test_the_rules_are_registered_with_the_pruner_when_it_is_imported():
@@ -187,14 +218,16 @@ def test_the_size_cap_never_deletes_a_row_a_case_keeps(env, factory):
     db = factory()
     case = _case(db)
     quarter = ar.MB // 4 - 200                          # four rows fit in a megabyte
-    # The kept rows are the oldest: without the rules the cap would delete them first.
+    # The cap keeps the newest rows that fit and cuts what is older. The kept rows lie in what it cuts, among rows
+    # that may go: without the rules it would delete them with those.
+    newest = [_row(db, d, size=quarter) for d in (30, 31, 32, 33)]
     keep = [_row(db, d, case_id=case, size=quarter) for d in (50, 51, 52)]
     keep.append(_row(db, 53, action="case_approved", size=quarter))
-    plain = [_row(db, d, size=quarter) for d in (30, 31, 32, 33)]
-    _prune(factory, ar.Numbers(0, 0, 0, 1))
-    left = _left(factory, keep + plain)
-    assert set(keep) <= left
-    assert not set(plain) & left
+    older = [_row(db, d, size=quarter) for d in (54, 55, 56, 57)]
+    _prune_sized(factory, ar.Numbers(0, 0, 0, 1))
+    left = _left(factory, newest + keep + older)
+    assert set(keep) <= left and set(newest) <= left
+    assert not set(older) & left
 
 
 def test_without_a_maximum_nothing_is_deleted_and_after_the_floor_case_rows_go_like_the_rest(env, factory):

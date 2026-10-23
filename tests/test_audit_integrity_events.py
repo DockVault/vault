@@ -384,9 +384,17 @@ def test_only_failed_sign_ins_carry_a_typed_name():
             if value in ("username", "None") or "HOST_OPERATOR" in value or "user.username" in value:
                 continue
             found.append(f"{path.name}: {value}")
-    # A failed sign-in's name, and the server's own configuration rows (named as such, never an account).
+    # A failed sign-in's name, the server's own configuration rows (named as such, never an account), and compliance
+    # access's steps without an actor: the host's operator, or the steps it takes on its own (legal_holds.SYSTEM),
+    # both left out by the check's user-unlinked; a step caused by an account's change names that account with its id.
     assert sorted(found) == ["audit_logger.py: recorded_name",
-                             "audit_privacy.py: None if user is not None else by_name"], found
+                             "audit_privacy.py: None if user is not None else by_name",
+                             "auditor_rights.py: None if actor is not None else username",
+                             "auditor_rights.py: by_name",
+                             "cases.py: None if actor is not None else actor_name",
+                             "legal_holds.py: None if actor is not None else actor_name",
+                             "legal_holds.py: None if getattr(actor",
+                             "owner_notices.py: actor_name"], found
 
 
 # --------------------------------------------------------------------------- the head, shown and exported

@@ -1087,8 +1087,13 @@ def _outside(db, view, report: Report, now: datetime) -> None:
         if a.name in accountish:
             names.extend((a.name,) + a.aliases)
     excluded = [HOST_OPERATOR] + ([SERVER_CONFIGURATION] if SERVER_CONFIGURATION else [])
+    # And the steps compliance access takes on its own, named by legal_holds.SYSTEM: its own actions only, so the rows
+    # of an account that happens to have that name are still checked.
+    from sqlalchemy import and_, not_
+    from app.core.legal_holds import SYSTEM
+    own_steps = and_(A.username == SYSTEM, A.action.in_(audit_catalog.stored_names(["compliance"])))
     unlinked = db.query(func.count()).select_from(A).join(U, U.username == A.username).filter(
-        A.user_id.is_(None), A.action.in_(names), A.username.notin_(excluded),
+        A.user_id.is_(None), A.action.in_(names), A.username.notin_(excluded), not_(own_steps),
         U.created_at <= A.timestamp).scalar() or 0
     if unlinked:
         report.add(FAILURE, "user-unlinked", f"{unlinked} rows of an account that still exists were unlinked from it")

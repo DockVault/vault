@@ -119,9 +119,10 @@ def settings_from_inputs(inputs: Dict[str, Optional[str]]):
 
 def contract_problems(inputs: Dict[str, Optional[str]]) -> list:
     """What the server's startup contract refuses in these inputs (the server never starts with them), and
-    a delay under one day."""
+    a delay under one day. A check that also reads settings the inputs do not hold is left out: the settings
+    object gives those their defaults, not the values the server ran with."""
     ns = settings_from_inputs(inputs)
-    problems = list(registry.check_contract(ns))
+    problems = list(registry.check_contract(ns, chain_inputs_only=True))
     delay = getattr(ns, "retention_reduction_delay_days", None)
     if not isinstance(delay, int) or isinstance(delay, bool) or delay < 1:
         problems.append("the reduction delay is under one day")

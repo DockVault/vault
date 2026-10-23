@@ -292,6 +292,10 @@ def test_the_approval_writes_everything_in_one_transaction(db, people, told):
     assert len(holds_rows) == 3
     for h in holds_rows:
         assert h.placed_by == people.uma.id and h.confirmed_by == people.bob.id and h.confirmed_at == case.approved_at
+    # Each hold's audit row names the auditor's account with the auditor's name (the audit log's check takes a row
+    # naming an account it is not linked to for one a database writer unlinked).
+    placed = _rows(db, "hold_placed")
+    assert len(placed) == 3 and {(r.user_id, r.username) for r in placed} == {(people.uma.id, "uma")}
     # Each owner told once (olga for two vaults), in the app and through the outbox, and recorded.
     notes = db.query(m.Notification).filter(m.Notification.type == "compliance_access").all()
     assert sorted((n.user_id, n.title) for n in notes) == sorted([

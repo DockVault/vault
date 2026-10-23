@@ -211,6 +211,10 @@ _LISTED: dict[str, ListedKey] = {}
 _LOCK_GROUPS: dict[str, LockGroup] = {}
 _FIELDS: dict[str, FieldEntry] = {}
 _CONTRACTS: list = []
+# The checks that also read settings outside the audit chain's inputs (the compliance boundary, for one): the
+# startup contract applies them to the deployment's settings, and the chain does not judge an env seal by them,
+# since the seal does not record what they read (check_contract(..., chain_inputs_only=True)).
+_BEYOND_CHAIN_INPUTS: list = []
 _modules_loaded = False
 _modules_lock = threading.Lock()
 
@@ -304,11 +308,17 @@ def register_field(key: str, *, page: str, level: str, since: str) -> FieldEntry
     return entry
 
 
-def register_contract(check: Callable[[Any], list]) -> Callable[[Any], list]:
-    """Add a check to the startup contract: ``check(settings)`` returns what contradicts, in plain words."""
-    if check not in _CONTRACTS:
-        _CONTRACTS.append(check)
-    return check
+def register_contract(check: Optional[Callable[[Any], list]] = None, *, beyond_chain_inputs: bool = False):
+    """Add a check to the startup contract: ``check(settings)`` returns what contradicts, in plain words. With
+    ``beyond_chain_inputs``, it reads settings the audit chain does not record, and an env seal is not judged by it.
+    A decorator, with or without its keyword."""
+    def add(fn: Callable[[Any], list]) -> Callable[[Any], list]:
+        if fn not in _CONTRACTS:
+            _CONTRACTS.append(fn)
+        if beyond_chain_inputs and fn not in _BEYOND_CHAIN_INPUTS:
+            _BEYOND_CHAIN_INPUTS.append(fn)
+        return fn
+    return add(check) if check is not None else add
 
 
 def _load_spec_modules() -> None:
@@ -643,8 +653,10 @@ def describe(keys: Optional[Iterable[str]] = None) -> list[dict]:
     return rows
 
 
-def check_contract(settings=None) -> list[str]:
-    """Everything that makes a spec impossible to honour with this deployment's .env, in plain words."""
+def check_contract(settings=None, *, chain_inputs_only: bool = False) -> list[str]:
+    """Everything that makes a spec impossible to honour with this deployment's .env, in plain words. With
+    ``chain_inputs_only``, leave out the checks that read settings the audit chain does not record (an env seal's
+    inputs are judged without them)."""
     settings = settings if settings is not None else _deployment_settings()
     problems = []
     for spec in all_specs():
@@ -664,6 +676,8 @@ def check_contract(settings=None) -> list[str]:
         if floor is not None and ceiling is not None and _rank(spec, floor) > _rank(spec, ceiling):
             problems.append(f"{spec.key}: the floor ({floor}) is above the ceiling ({ceiling})")
     for check in list(_CONTRACTS):
+        if chain_inputs_only and check in _BEYOND_CHAIN_INPUTS:
+            continue
         problems.extend(check(settings))
     return problems
 

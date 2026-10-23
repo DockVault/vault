@@ -533,12 +533,16 @@ def approve(db, case, *, approver=None, now: Optional[datetime] = None):
            details={"vaults": len(rows), "days": case.access_days, "hold": case.hold_requested,
                     "by_operator": approver is None})
     if case.hold_requested:
+        # The auditor places the holds the case asked for: their row names their account (the audit log's check
+        # takes a row naming an account it is not linked to for one a database writer unlinked).
+        from app.core.models import User
+        auditor = db.get(User, case.auditor_id)
         for row in rows:
             db.add(LegalHoldVault(case_id=case.id, vault_id=row.vault_id, placed_by=case.auditor_id,
                                   placed_by_username=case.auditor_username, placed_at=now,
                                   confirmed_by=case.approved_by, confirmed_by_username=name, confirmed_at=now))
-            legal_holds._audit(db, "hold_placed", case, actor_name=case.auditor_username, vault_id=row.vault_id,
-                               details={"by_approval": True})
+            legal_holds._audit(db, "hold_placed", case, actor=auditor, actor_name=case.auditor_username,
+                               vault_id=row.vault_id, details={"by_approval": True})
             legal_holds._audit(db, "hold_confirmed", case, actor=approver, actor_name=name, vault_id=row.vault_id,
                                details={"by_approval": True})
         db.flush()
