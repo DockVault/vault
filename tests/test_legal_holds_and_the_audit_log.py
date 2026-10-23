@@ -13,6 +13,7 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py) and th
   erase, a removal or the shortening would change them; the archive leaves a day that holds one as rows, and takes
   it once they may go; the audit job's prune of an archived day keeps them in its blocks.
 """
+import json
 import subprocess
 import sys
 import uuid
@@ -125,6 +126,16 @@ def _held(env):
 
 def _at(day, hour, minute=0):
     return (T0 - timedelta(days=day)).replace(hour=hour, minute=minute)
+
+
+def _archived_rows(env):
+    """Every archived row, by id, as its block holds it now."""
+    with env.session() as db:
+        out = {}
+        for day, entry in env.st.view.archives.items():
+            for part in entry.parts:
+                out.update({r["id"]: r for r in arc.PartReader(db, env.st.view, day, part).rows()})
+        return out
 
 
 # --------------------------------------------------------------------------- the rule
@@ -313,6 +324,25 @@ def test_a_cases_rows_in_an_archived_day_are_not_erased(env, monkeypatch):
     assert failures(env.verify()) == []
 
 
+def test_an_archived_day_whose_only_rows_of_the_name_must_be_kept_is_not_a_unit_of_the_erase(env):
+    """An archived day whose rows of the name are all a case's rows that must be kept holds nothing the erase may
+    change: it is not counted as a day with rows of the name (else the erase would try it, change nothing, and
+    stop on a day it cannot finish), and the erase completes with the rest of the name erased."""
+    case = _case(env, closed_days=FLOOR_DAYS + 30)
+    kept = env.put(_at(120, 3), username="eve", case_id=case)
+    other = env.put(_at(120, 4))
+    hot = env.put(T0 - timedelta(hours=30), username="eve")
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    env.settings.compliance_record_min_days = FLOOR_DAYS + 200
+    asked = env.ask("eve")
+    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
+    assert env.get(hot).username == asked["placeholder"]
+    rows = _archived_rows(env)
+    assert rows[kept]["username"] == "eve" and rows[other]["username"] == "alice"
+    assert failures(env.verify()) == []
+
+
 # --------------------------------------------------------------------------- an erase's sealed name
 
 def test_a_cancel_under_a_hold_keeps_the_sealed_name_until_the_erase_job_finds_nothing_holding_it(env):
@@ -450,6 +480,32 @@ def test_the_shortening_leaves_a_cases_rows_that_must_be_kept_as_they_are(env30)
     rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     assert env.get(kept).ip_address == "203.0.113.9"
     assert env.get(gone).ip_address is None
+    assert failures(env.verify()) == []
+
+
+@pytest.mark.parametrize("change, fixture", [("removal", "env"), ("shortening", "env30")],
+                         ids=["removal", "shortening"])
+def test_a_removal_and_the_shortening_leave_a_cases_rows_in_an_archived_day_as_they_are(request, change, fixture):
+    """A case row archived while nothing kept it (its case closed long ago), then kept again (the floor raised): the
+    rewrite of the archived day changes the day's other row and leaves that one as its block holds it."""
+    env = request.getfixturevalue(fixture)
+    case = _case(env, closed_days=FLOOR_DAYS + 30)
+    kept = env.put(_at(120, 3), case_id=case, details={"email": "a@example.com"})
+    gone = env.put(_at(120, 3, 20), details={"email": "b@example.com"})
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept) is None and _blocks(env) == 1
+    env.settings.compliance_record_min_days = FLOOR_DAYS + 200
+    if change == "removal":
+        asked = env.ask_removal()
+        assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    else:
+        rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    rows = _archived_rows(env)
+    assert rows[kept]["ip_address"] == "203.0.113.9" and json.loads(rows[kept]["details"]) == {"email": "a@example.com"}
+    assert rows[gone]["ip_address"] is None
+    if change == "removal":
+        assert "email" not in json.loads(rows[gone]["details"] or "{}")
     assert failures(env.verify()) == []
 
 
