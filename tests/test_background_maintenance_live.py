@@ -125,20 +125,25 @@ def _failed_sign_in_takes(seconds_limit: float) -> float:
 
 
 def test_an_index_is_built_concurrently_while_audit_writes_carry_on():
-    holder = _holder(_WRITER.format(s=12))
+    # The writer stays open until the test ends it, however slowly the host runs the steps before (a writer that
+    # ended on its own after a few seconds could end before the check that the build waits for it).
+    holder = _holder(_WRITER.format(s=300))
     build = None
     try:
         # An open writer on the audit log: the concurrent build creates its index and then waits for it.
         _wait(lambda: _psql("SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%maint-probe-holder%' "
                             "AND state = 'active' AND pid <> pg_backend_pid()") == "1", 20, "the open writer")
-        build = subprocess.Popen(_run_args(30000, IDX, CREATE, "create"), stdout=subprocess.PIPE,
+        build = subprocess.Popen(_run_args(120000, IDX, CREATE, "create"), stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
-        _wait(lambda: _state() == "invalid", 30, "the build to start")
+        _wait(lambda: _state() == "invalid", 60, "the build to start")
         # While it waits, the app's audit writes go through, promptly. A plain CREATE INDEX would hold them
         # behind the open writer until it ended.
         for _ in range(3):
             _failed_sign_in_takes(5)
         assert _state() == "invalid" and build.poll() is None, "the build did not wait for the open writer"
+        # The writer ends (its transaction rolled back, so it leaves no row): the build goes on and completes.
+        _end_holders(holder)
+        holder = None
         out, err = build.communicate(timeout=120)
         assert build.returncode == 0, err[-800:]
         assert 'OUTCOME={"idx_maint_probe": "built"}' in out, out[-800:]
@@ -146,7 +151,8 @@ def test_an_index_is_built_concurrently_while_audit_writes_carry_on():
     finally:
         if build is not None and build.poll() is None:
             build.kill()
-        _end_holders(holder)
+        if holder is not None:
+            _end_holders(holder)
 
 
 def test_a_build_that_times_out_leaves_an_invalid_index_that_the_next_start_rebuilds():

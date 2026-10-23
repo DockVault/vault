@@ -32,7 +32,7 @@ retention period suits your organisation, are yours to decide.
 | [Database](#database) | PostgreSQL, volume `vault_pg_data` | Per table, below. |
 | [Cache](#cache-redis) | Redis. The shipped compose files keep its data in memory only (`/data` is a tmpfs). | Each key expires on its own, from minutes to a day (30 days for a lock with no end on a name that is no account). A restart of the Redis container empties it. |
 | [Files](#files) | Volume `vault_storage` | The file is deleted or expires. |
-| [Logs](#logs) | The container output, and a size-capped file in volume `vault_logs` | Rotation (the file) or your Docker logging settings (the output). |
+| [Logs](#logs) | The container output, and a size-capped file in volume `vault_logs` | Rotation: the file at a third of `LOG_PULL_SINK_MAX_MB` (5 MB by default), the output at `DOCKER_LOG_MAX_SIZE` (10m) per file and `DOCKER_LOG_MAX_FILE` (5) files per container. |
 | [Email](#email) | Your SMTP server and the recipients' mailboxes | Outside DockVault. It keeps no copy of what it sends. |
 | [Exports and backups](#exports-backups-and-host-tools) | Wherever the person who made them saves them | Outside DockVault. |
 | [The browser](#the-browser) | Each person's browser storage | Sign-out, or the person clearing it. |
@@ -57,9 +57,9 @@ account cannot be deleted while it owns vaults: transfer or delete them first.
 | `sign_in_lockouts` **New in 0.33.0** | The account, the source address (an IPv6 address as its /64, or `*` for the account-wide count), failure count, window start, last failure, lock start and end. | Automatic locks: wrong passwords from one address lock new sign-ins from that address, and past a higher count from all addresses together over about 24 hours, from everywhere. | An address count with no lock: a day after its last failure. The account-wide count: at most a day after its last failure, by when it has lost every one (it loses one every 24 hours divided by the backstop, every 72 minutes by default). A right password adds nothing here. A lock: until it ends (`ACCOUNT_LOCKOUT_MINUTES`, 15 by default; the account-wide pause lasts until its count has lost a failure, if that is later), or until an administrator clears it when that setting is 0. | The periodic cleanup; an administrator's unlock (deletes every row for the account); deleted with the account. |
 | `temporary_credentials`, `temp_credential_vault_access` | The generated username, a hash of the credential, the owner's note about it (free text), its scope and passcode hash, times, creator. | Delegated, time-limited access. | Until the owner deletes it: an expired credential stays listed. | The owner deleting it; deleted with the account. |
 | `devices`, `device_grants` | Device label, secret hashes, last seen, created, expiry; which vaults it syncs. | Desktop sync. | Until revoked and deleted. | The person deleting the device; deleted with the account. |
-| `password_reset_tokens` | The account, token hash, times, who created it (an administrator, or a user given the permission to manage users). **New in 0.33.0:** whether another account made it. | Password reset. | An unused token is replaced when a new one is issued; a used one is kept. **New in 0.33.0:** a token another account made is deleted when it is used or looked up after its maker could no longer make it (demoted, deactivated, locked, deleted, the permission taken away), and when its account is made an administrator and its maker is not one. | Deleted with the account. |
-| `otp_codes`, `email_change_codes` | The account, the new email address a code was sent to, code hash, attempts, times. | Confirming an email change. | An unused code is replaced when a new one is issued; a used one is kept. | Deleted with the account. |
-| `account_invitations` | The invitee's username, email address and role, token hash, times, who created it, the account it became; **new in 0.33.0**, for an administrator's invitation, the ids of the inviter and of the administrators the inviter descends from, as they stood when it was made. | Inviting someone to create an account; the ids keep the two-administrator rule's lineage if the inviter is demoted or deleted before it is accepted. | Kept after it is accepted, revoked or expired. The app never deletes it. | The database only (see [Erasing a person](#erasing-a-person)). |
+| `password_reset_tokens` | The account, token hash, times, who created it (an administrator, or a user given the permission to manage users). **New in 0.33.0:** whether another account made it. | Password reset. | An unused token is replaced when a new one is issued; a used one is kept. **New in 0.34.0:** a used or expired token is deleted 30 days after it ends, by the pruner. **New in 0.33.0:** a token another account made is deleted when it is used or looked up after its maker could no longer make it (demoted, deactivated, locked, deleted, the permission taken away), and when its account is made an administrator and its maker is not one. | Deleted with the account. |
+| `otp_codes`, `email_change_codes` | The account, the new email address a code was sent to, code hash, attempts, times. | Confirming an email change. | An unused code is replaced when a new one is issued; a used one is kept. **New in 0.34.0:** a used or expired code is deleted 30 days after it ends, by the pruner. | Deleted with the account. |
+| `account_invitations` | The invitee's username, email address and role, token hash, times, who created it, the account it became; **new in 0.33.0**, for an administrator's invitation, the ids of the inviter and of the administrators the inviter descends from, as they stood when it was made. | Inviting someone to create an account; the ids keep the two-administrator rule's lineage if the inviter is demoted or deleted before it is accepted. | Kept after it is accepted, revoked or expired. **Changed in 0.34.0:** deleted 30 days after it ends (it is accepted, revoked or expires, whichever comes first), by the pruner; a pending invitation is kept. The lineage an administrator's invitation kept is copied into `admin_grants` when it is accepted, so it outlasts the row. | The pruner; until then the database only (see [Erasing a person](#erasing-a-person)). |
 
 ### Access and collaboration
 
@@ -101,11 +101,15 @@ Visits to a link and uploads through one are also in the audit log.
 | `rate_limit_records` | An address (**changed in 0.34.0:** as its throttle subject, an IPv6 address as its /64 and an IPv4 address written as IPv6 as the IPv4 one); for a password sign-in, a keyed stand-in for the name typed, with the address (**changed in 0.33.0**: it was the name as typed); for an SFTP key sign-in, the address and the name as typed; a device's id. Counts and times. | Sign-in throttling while Redis is unavailable. | An hour. | The pruner. |
 | `credential_changes` **New in 0.33.0** | The account changed; the kind of change; the requesting and deciding administrators' usernames; times; a summary, which can hold the new email address, or an SSH key's name and fingerprint; while a request waits, what it would set (a password hash, an address or a key), and the ids of the administrator who asked, of the administrators that administrator's grant descends from, and of those who had changed the account in the 14 days before; and for an email change that was made, the address before and after. | A second change to someone's sign-in within 14 days waits for another administrator; for 14 days after an administrator changes someone's email address, a self-service reset link goes to the address before. | A request still waiting: until it is decided or expires (at most 7 days), when what it would set is cleared. A change made, or a request denied, withdrawn or expired: 14 days after that. | The pruner (every `LOG_PRUNE_INTERVAL_MINUTES`, 15 by default); deleted with the changed account. An administrator's username stays on the rows of the accounts they changed until then. The audit log keeps the history. |
 | `admin_grants` **New in 0.33.0** | For each administrator: who made them one (the administrator's id and username, or the server's operator), when, and the ids of the administrators that grant descends from. | Who may approve a held change: neither the administrator who asked nor the approver may have made the other one, directly or through administrators they made, and the approver must have been one for 14 days before the request. | While the account is an administrator. | A demotion; deleted with the account. The maker's username stays on it after the maker's account is deleted. |
-| `notifications` | The recipient, type, title and text, read state. The text can name other people. **New in 0.33.0:** notices of every administrator's change to a person's account (lock, unlock, deactivation, role, password, reset link, second factor, email, SSH key) and of credential-change requests, whose text holds the old and new email address, an SSH key's name and fingerprint, and the administrator's username; and to every other administrator, that an account became an administrator and who made it one. | Telling people what happened. | Until the person deletes it. | The person; deleted with the account. |
+| `notifications` | The recipient, type, title and text, read state. The text can name other people. **New in 0.33.0:** notices of every administrator's change to a person's account (lock, unlock, deactivation, role, password, reset link, second factor, email, SSH key) and of credential-change requests, whose text holds the old and new email address, an SSH key's name and fingerprint, and the administrator's username; and to every other administrator, that an account became an administrator and who made it one. | Telling people what happened. | Until the person deletes it. **New in 0.34.0:** with `NOTIFICATION_RETENTION_DAYS` (or the panel's "Delete notifications after", 30 to 3650 days) a notification is deleted that long after it arrives, read or not; 0, the default, keeps it. | The person; the pruner; deleted with the account. |
 | `activity_saved_searches` **New in 0.33.0** | An administrator's saved Activity filters, at most 50 each: a name, and filters that can hold other people's usernames (names typed at sign-in included), addresses and free text. **Changed in 0.34.0:** the person filter keeps a name the audit log holds in full (an account's username, or a name recorded in full under earlier levels) as typed; any other name, one typed at a failed sign-in, is kept as the recording levels keep those: in full, as its fingerprint, or, at "not recorded", not at all (such a search cannot be saved). The free text and addresses are kept as typed. | Reusing a search. | Until deleted. | The administrator; deleted with the administrator's account. |
 | `user_preferences` | Display choices only, from fixed lists. **New in 0.33.0:** "Hide note text" is kept here (it used to be in the browser), with the Activity page's page size, live updates and range. | Remembering a person's choices. | Until changed. | Deleted with the account. |
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
-| `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
+| `audit_seals` **New in 0.34.0** | The audit log's integrity chain: one seal per closed hour of audit rows (two hashes over the hour's rows and the ids of its rows), and one per retention change, cancel, acknowledgment and deletion of audit rows. A retention change's seal names the setting, its values, the change's id and the administrator's account id; an acknowledgment's names the seals it acknowledges. An hour's seal also keeps the 16-byte ids of its rows, and, for rows written without a nonce, a random value per hour from which their nonces are derived. No username, address, name or text of a row: those enter only as a hash, under each row's random nonce. | Finding changes made to the audit log in the database. | For ever: seals are never deleted, and they stay when the rows they cover are deleted. | Nothing deletes a seal. Deleting rows writes a seal that says so; an erase destroys the rows' nonces, so the old hashes reveal nothing. |
+| `audit_archive_blocks` **New in 0.34.0** | Audit rows older than the row window (`AUDIT_HOT_DAYS`, 90 days by default), compressed: each block is a part of one UTC day and holds every column of every row it took from `audit_logs`, so the same personal data as those rows (see [The audit log](#the-audit-log)), and the per-hour values from which the nonces of rows written without one are derived. A count of rows and bytes by action, status and channel, and by hour, and of rows by hour, action, status and channel, per block, for the summaries and the size cap. The Activity page and its exports read archived days for a time range that reaches them, through a temporary table that goes with the request. | The audit log, kept compressed: it is kept for ever by default. Archiving starts `AUDIT_ARCHIVE_START_AFTER_DAYS` (14) days after 0.34.0 first ran here (when it began sealing the audit log); a day `audit unarchive` put back stays rows that long again. While any block exists, a row in `data_requirements` keeps 0.33.1 and later from starting. | As long as the audit rows it holds: the audit log's retention applies to archived rows as to the others (the maximum, the size cap, the protected minimums, the hold). | The pruner deletes archived rows by the audit log's retention, rewriting the block; `dockvault.py audit unarchive` puts days back as rows and removes their blocks. **Not** deleted with the account: a block keeps the account id of a deleted account (a restored row has it cleared, as the database clears it on a row, and the Activity page shows it cleared). |
+| `audit_value_removals` **New in 0.34.0** | For each removal of values recorded under earlier recording levels: the levels it brings rows down to and the time before which its rows were written, who asked for it and who cancelled it (id and username), when, why it waits, and how many rows it changed (counts). | The removal waits its delay before it runs, and any administrator can cancel it meanwhile. | For ever, as a record alongside the audit log. | Nothing deletes a row. The account ids are cleared when the account is deleted. |
+| `erase_requests` **New in 0.34.0** | For each per-person erase: the name it removes, only sealed (AES-256-GCM under a key derived from `ENCRYPTION_KEY`, bound to the request), the placeholder it writes, who asked for it and who cancelled it (id and username), when, why it waits, and what it changed in each place (counts). | The erase waits its delay before it runs, and any administrator can cancel it meanwhile. | For ever, as a record alongside the audit log; the sealed name is deleted when the erase completes or is cancelled. | Nothing deletes a row. The sealed name is deleted with the erase's end; the account ids are cleared when the account is deleted. |
+| `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. What waits, and what the pruner applies, is the audit log's integrity chain's: the retention screen lists the waiting changes from it, not from this table. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
 
 ### Compliance access (new in 0.34.0)
 
@@ -204,21 +208,34 @@ Each row of `audit_logs` holds:
   their seals, are shown and exported only to administrators who can read the vault.
   `privacy_version` says which version of the levels a row was recorded under (none: an earlier release;
   -1: recorded without its personal values because deciding failed, with an alert). Changing the levels
-  never rewrites older rows;
-- **New in 0.34.0, and empty on every row so far:** `seal_nonce` (a random value per row for the log's
-  integrity chain), `ip_via` (how the address was learned) and `case_id` (a compliance case).
-  `security_alerts` gains the same `ip_via`, also empty.
+  rewrites no older row by itself. An administrator can then ask, on the same page, to remove the values
+  recorded under earlier levels: once `RETENTION_REDUCTION_DELAY_DAYS` has passed (any administrator can
+  cancel it meanwhile, and every administrator is told), every row written before the request, archived or
+  not, keeps only what the levels in force record (`audit_value_removals`). With `AUDIT_IP_FULL_DAYS` (the
+  panel's "Keep full addresses in audit rows for"; no limit by default) an address recorded in full is
+  shortened to its /24 or /48 once its row is that many days old (in a day the archive holds, once the whole
+  day is: up to a day later). Either change gives each changed row a new
+  `seal_nonce`, and the integrity chain records it and still verifies;
+- **New in 0.34.0:** `seal_nonce`, 16 random bytes on every row written from 0.34.0 on, under which the
+  log's integrity chain hashes the row's personal values (`audit_seals`), so that once it is destroyed the
+  hash reveals nothing about them. **Empty on every row so far:** `ip_via` (how the address was learned)
+  and `case_id` (a compliance case). `security_alerts` gains the same `ip_via`, also empty.
 
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is
 kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_DAYS=0` every row is
 kept for ever. A positive value makes the pruner delete rows older than that many days, on a timer, unless
 the hold switch is on (`RETENTION_HOLD`, or the panel). Administration and security rows are kept at least
 `AUDIT_PROTECTED_MIN_DAYS` (365 days by default) whatever the maximum, and a size cap (`AUDIT_LOG_MAX_MB`)
-never deletes them. An administrator can change the maximum, the minimums and the cap in the panel,
+never deletes them. The size cap counts each hour's bytes as the integrity chain sealed them, and only once
+`RETENTION_REDUCTION_DELAY_DAYS` of running time have passed since the hour was sealed. An administrator can change the maximum, the minimums and the cap in the panel,
 within the limits `.env` sets; a change that deletes sooner waits `RETENTION_REDUCTION_DELAY_DAYS` and
 every administrator is told. After an upgrade from a release that deleted only when an administrator's
 dashboard loaded, a positive `AUDIT_LOG_RETENTION_DAYS` first waits in the same way. The application only
-adds rows and deletes old ones; anyone with database access can change the table.
+adds rows and deletes old ones; anyone with database access can change the table, but from 0.34.0 every
+closed hour is sealed (`audit_seals`), and a change made in the database without the server's key to an
+hour already sealed is found by `python dockvault.py audit verify` and by the server's daily check. It is not
+found when it is made by whoever holds the key (`AUDIT_CHAIN_KEY`, or `ENCRYPTION_KEY` when that is unset),
+nor before the row's hour is sealed (about two hours).
 
 Names typed at failed sign-ins appear on the Activity page (filtered as "no account", which also lists a
 failed sign-in for an account or a temporary credential, as its row has no account id) and in its exports. The summary charts' "most active people" leaves them out, and the page's username search
@@ -273,15 +290,17 @@ files except to serve them, and cannot read zero-knowledge ones.
   address or free text) reached this log; now only the names are, a WebSocket handshake's line
   included, and a line read back through log access from before the change serves only the names too,
   except an older line whose query held nothing but bare, name-like parts, which is served as it was
-  written.
-  How long Docker
-  keeps this is set by the host's Docker logging
-  configuration; the shipped compose files set no limit, so set `max-size` and `max-file` for the
-  logging driver if you need one.
+  written. The shipped compose files rotate it (**new in 0.34.0**): Docker's `json-file` driver keeps at
+  most `DOCKER_LOG_MAX_FILE` files (5) of `DOCKER_LOG_MAX_SIZE` (10m) per container, so the oldest lines go
+  as new ones arrive. A deployment that updates only by pulling images keeps the compose files it was set
+  up with, which never rotate it, until it updates its checkout. A host whose Docker sends container output
+  to journald, syslog or a log shipper keeps it there only once the block is removed (README,
+  "Container logs").
 - **The log-access file** (volume `vault_logs`, `LOG_PULL_SINK_PATH`): the same web lines, and the
-  SFTP server's in the combined single-container mode. It rotates at 5 MB and keeps two older files,
-  about 15 MB in all, so the oldest lines go as new ones arrive. Administrators can read it through
-  Settings, Log access, when `PLAN_LOG_PULL` is on.
+  SFTP server's in the combined single-container mode. It rotates at a third of `LOG_PULL_SINK_MAX_MB`
+  (**new in 0.34.0**; 15 by default, so 5 MB) and keeps two older files, `LOG_PULL_SINK_MAX_MB` in all,
+  so the oldest lines go as new ones arrive. Administrators can read the newest lines (at most the newest
+  5 MB) through Settings, Log access, when `PLAN_LOG_PULL` is on.
 
 ## Email
 
@@ -307,6 +326,26 @@ the recipients' mailboxes.
   details and error. No vault, file or folder names. Each export is itself audited
   (`audit_exported`, with its filters). The file is personal data wherever it is saved.
 - **Log access**: an administrator's download of the log-access file.
+- **The audit chain's head record** **New in 0.34.0**: a file on the keys volume (`AUDIT_CHAIN_HEAD_FILE`)
+  that holds the newest seal's number and hash, the chain's key ids, the hour summaries of the last 30
+  days (counts and hashes, and the salt of an hour whose rows have no nonce), a digest per older day, the
+  retention checkpoints (the newest retention state, the cancels, and the ids of completed erases: request
+  ids and seal numbers, never a name), and the integrity check's findings (kinds, times, seal numbers and
+  row ids, never a row's values). Kept with the keys volume, in every backup, which archives the keys volume
+  before the database. A restore of a backup leaves a mark beside it until `python dockvault.py audit
+  accept-restore`. **`python dockvault.py audit verify`** prints the findings and the chain's head on the
+  host's terminal; an export of the Activity page ends with that head. A head kept elsewhere is checked with
+  `audit verify --anchor <head>`, and `--no-key` checks as someone holding no key would (reading nothing
+  beyond the database's own tables). **`python dockvault.py audit
+  acknowledge`** and the other host commands (`rekey`, `after-record`, `accept-database-head`,
+  `accept-restore`, `acknowledge-removed-before`, `change-key`) write their seals audited as the host
+  operator; `after-record --discard` saves the seals it deletes in a file beside the head record.
+  **`python dockvault.py audit retention`** (**new in 0.34.0**) prints how long each kind of record is kept,
+  as the server has it, and where each value comes from, and the changes waiting with the username of the
+  administrator who asked for each (not audited, like the other reads on the host); with `--set NAME=VALUE`
+  it changes a line of `.env` once the server has checked it. `audit unarchive` restores archived
+  days as audit rows; `audit compact` gives the audit tables' free space back to the system (both are on
+  the `audit` menu too).
 - **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
   erased.
@@ -366,24 +405,43 @@ and the unlock state.
    Cache entries expire on their own within a day (a lock with no end on a name that is no account:
    30 days); those about names typed at sign-in hold only a keyed stand-in.
 3. **Removing what stays**, if you decide it must go (audit records are often kept to establish or
-   defend legal claims; that is your decision): set `AUDIT_LOG_RETENTION_DAYS`, or delete rows in the
-   database. For example, in the database container:
+   defend legal claims; that is your decision): **erase the name** (Settings, Activity and records,
+   "Erase a person's records"; new in 0.34.0). Type the name exactly as the records hold it: a deleted
+   account's username, or a name typed at a failed sign-in. The preview counts what it would change in
+   each place below, lists the near misses (the same name in another case or another form, each erased
+   only by an erase of its own), and says what it does not reach. Asking asks for your password, and the
+   erase waits `RETENTION_REDUCTION_DELAY_DAYS` (7 days by default); any administrator can cancel it
+   until it begins, and every administrator is told. It is refused while an account, a temporary
+   credential or an invitation still waiting has the name, and for any name that starts with `erased-`.
 
-   ```sql
-   -- Back up first. These deletions are not themselves audited.
-   DELETE FROM audit_logs WHERE username = 'the-username';
-   DELETE FROM security_alerts WHERE username = 'the-username';
-   DELETE FROM security_records WHERE name = 'the-username';
-   DELETE FROM account_invitations WHERE username = 'the-username';
-   ```
+   When it runs, every row of the audit log whose username is exactly that name, and every archived row,
+   gets a placeholder (`erased-` and 8 random characters) in its place: its address, browser
+   description, temporary credential's name, error text and `recorded` values are cleared, and of its
+   details only ids, counts and the other values always recorded stay, never one that holds the name.
+   The integrity chain records each changed row (its hash before and after) and still verifies. The same
+   run gives the placeholder to the name in `security_records` (its address is cleared too),
+   `security_alerts` (its address too), `credential_changes`, `admin_grants`, ended
+   `account_invitations` (the email address is cleared), other administrators' saved searches,
+   notifications, received notes, `managed_setting_changes`, `managed_settings`,
+   `audit_privacy_policies`, `user_ssh_keys`, `erase_requests` and `audit_value_removals`. The name it
+   removes is kept only
+   sealed in `erase_requests` until then, and deleted when the erase completes or is cancelled; the
+   audit rows of the request, the cancel and the completion name the placeholder, never the person.
 
-   The same statements remove a name typed at sign-in that is no account. A name can also appear
-   inside other rows' `details`; search them with `details::text LIKE '%the-username%'` before
-   deciding.
+   It waits while the hold switch is on, while a restore is not finished, and, with
+   `ERASE_BLOCKED_BY_PROTECTED_MINIMUM=true` (for deployments whose records must be kept intact), until
+   every audit row it would change is older than the protected minimum for its kind.
 
-There is no built-in per-person erasure yet.
+   **What an erase does not reach:** backups, exports and copies made before it (and the database's own
+   files until their space is reused: the erase runs a plain VACUUM, and `dockvault.py audit compact`
+   rewrites the tables); container output and the log-access file; email already sent; other people's
+   audit rows that name the person in their details (an administrator's row recording the deletion of
+   their account, for example); and audit rows with no time.
 
 ## Retention settings
+
+`python dockvault.py audit retention` prints these as the running server has them, and changes a `.env`
+line after checking it; Settings, Activity and records shows them in the panel.
 
 | Setting | Default | Governs |
 |---|---|---|
@@ -394,8 +452,14 @@ There is no built-in per-person erasure yet.
 | `PLAN_LOG_MAX_DAYS`, `PLAN_LOG_MAX_MB` | `-1` (none) | Ceilings on the audit log's maximum days and size cap. |
 | `RETENTION_REDUCTION_DELAY_DAYS` | `7` | How long a change that deletes sooner waits; any administrator can cancel it meanwhile. |
 | `RETENTION_HOLD` | `false` | When `true`, nothing deletes audit rows, security records or alerts, and the panel cannot turn the hold off. |
-| `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records. |
+| `AUDIT_HOT_DAYS` | `90` | Audit rows older than this (31 to 3650) are moved into compressed daily blocks, `audit_archive_blocks`; nothing is deleted. |
+| `AUDIT_ARCHIVE_START_AFTER_DAYS` | `14` | Archiving starts this long (0 to 90) after 0.34.0 first ran. |
+| `AUDIT_IP_FULL_DAYS` | `0` (keep) | Addresses in audit rows: one recorded in full is shortened to its /24 or /48 once its row is this many days old, and in a day the archive holds once the whole day is that old (1 to 36500; the panel can change it). |
+| `ERASE_BLOCKED_BY_PROTECTED_MINIMUM` | `false` | When `true`, a per-person erase waits until every audit row it would change is older than the protected minimum for its kind. |
+| `LOG_PRUNE_INTERVAL_MINUTES` | `15` | How often the pruner deletes old records (and seals the audit log's hours). At most 360 take effect: the integrity chain needs a seal at least every 12 hours. |
 | `SECURITY_ALERT_RETENTION_DAYS` | `90` | Resolved security alerts. |
+| `NOTIFICATION_RETENTION_DAYS` | `0` (keep) | Notifications, read or not, after they arrive (30 to 3650 days; the panel can change it). |
+| `LOG_PULL_SINK_MAX_MB` | `15` | The log-access file and its two older copies, in all (3 to 1000). |
 | `SECURITY_RECORD_DAYS` | `30` | Failed sign-ins kept in full, and the names and addresses in security alerts (between `SECURITY_RECORD_MIN_DAYS`, 7, and `SECURITY_RECORD_MAX_DAYS`, 365). |
 | `ACCOUNT_LOCKOUT_MINUTES` | `15` | Automatic locks, and the phantom-name counters in Redis. |
 | `RATE_LIMIT_LOGIN_WINDOW_SECONDS` | `300` | Sign-in counters. |
@@ -404,9 +468,10 @@ There is no built-in per-person erasure yet.
 | Per vault and per upload link | Off | How long files are kept. |
 | Fixed | 30 days | Finished sessions and pending sign-ins. |
 | Fixed | 14 days | Credential-change records, after the change is made or the request ends. |
+| Fixed | 30 days | Invitations, after they are accepted, revoked or expire (**new in 0.34.0**). |
+| Fixed | 30 days | Password reset links, one-time codes and email-change codes, after they are used or expire (**new in 0.34.0**). |
 | Fixed | About a day | Failed sign-in counts with no lock, after their last failure (database and cache). |
 | Fixed | About a day | Resumable-upload sessions and an upload-link sender's address. |
-| Fixed | About 15 MB | The log-access file. |
 
 ## What 0.33.0 added
 
@@ -457,3 +522,30 @@ There is no built-in per-person erasure yet.
 - Changed: the web app's forms are sent only by its scripts, never by the browser itself, so what is
   typed into them (a username and password at sign-in included) no longer reaches an address, the
   browser history or a reverse proxy's log when a form is sent before the page has finished loading.
+
+## What 0.34.0 added
+
+How long records are kept, the audit log's integrity, its archive and erasing a person:
+
+- Timed deletion: the pruner deletes on a timer, in the web container only, never when a page is read.
+  Audit rows are still kept for ever by default; a positive `AUDIT_LOG_RETENTION_DAYS` from an earlier
+  release first waits `RETENTION_REDUCTION_DELAY_DAYS` with notice. Administration and security rows are kept
+  at least `AUDIT_PROTECTED_MIN_DAYS` (365). The panel can change the numbers within `.env`'s limits; a
+  change that deletes sooner waits and every administrator is told (`managed_settings`,
+  `managed_setting_changes`). The hold switch (`RETENTION_HOLD`) stops every deletion of logs.
+- `security_records`: each failed sign-in in full for `SECURITY_RECORD_DAYS` (30); security alerts lose
+  their names and addresses after the same time, and their messages no longer spell them out.
+- `audit_seals` and `audit_logs.seal_nonce`: the integrity chain, and the head record on the keys volume.
+- `audit_archive_blocks`: audit rows older than `AUDIT_HOT_DAYS` (90), compressed, from
+  `AUDIT_ARCHIVE_START_AFTER_DAYS` (14) after the upgrade. They hold the same personal data as the rows they
+  replace. `python dockvault.py audit unarchive` restores them; an earlier release cannot read them.
+- `erase_requests`: a per-person erase, with its name only sealed; see [Erasing a person](#erasing-a-person)
+  and what it does not reach.
+- `audit_value_removals`: a removal of the values recorded under earlier recording levels, asked for after a
+  level is lowered; and `AUDIT_IP_FULL_DAYS`, how long an address stays in full in an audit row (see
+  [The audit log](#the-audit-log)).
+- Working records: invitations, and used or expired reset links, one-time codes and email-change codes, are
+  deleted 30 days after they end (they were kept); notifications after `NOTIFICATION_RETENTION_DAYS` when
+  set (0 keeps them, as before). The log-access file holds `LOG_PULL_SINK_MAX_MB` (15) in all.
+- Container output rotates in the shipped compose files (`DOCKER_LOG_MAX_SIZE`, `DOCKER_LOG_MAX_FILE`), on
+  installs whose compose files come from 0.34.0.

@@ -10,6 +10,7 @@ can't pass as merely disabled. The save/reload test restores the settings it cha
 """
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -47,6 +48,7 @@ def _open_accounts_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.click('#settings-section .tab-btn[data-tab="accounts"]')
+    show_advanced(page, "accounts")
     expect(page.locator(TAB)).to_be_visible()
     # The settings load fills the form after the tab shows, and resets anything touched before it
     # lands. This field starts empty and the load always fills it, so it says the load has landed.

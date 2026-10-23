@@ -24,7 +24,8 @@ this one.
 The hold switch. ``logs_hold`` (the deployment's value is RETENTION_HOLD; with RETENTION_HOLD=true the panel
 cannot turn it off) stops every job over logs and security records while it is on. The jobs over working
 records (finished sessions, expired key-proof challenges, credential-change records, the sign-in throttle's
-fallback rows, waiting settings changes) keep running. Turning the hold off deletes sooner, so it waits like any such change
+fallback rows, ended invitations, used or expired reset links and one-time codes, old notifications, waiting
+settings changes) keep running. Turning the hold off deletes sooner, so it waits like any such change
 (app/core/setting_changes.py).
 """
 from __future__ import annotations
@@ -57,29 +58,37 @@ INTERVAL_KEY = "log_prune_interval_minutes"
 BATCH_KEY = "log_prune_batch_rows"
 
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=HOLD_KEY, kind="bool", default=False, env="retention_hold", reduction=registry.LOWER,
     floor="retention_hold",
     group="retention", label="Hold all deletion of logs",
     help="While on, nothing deletes audit rows, security records or security alerts: for an incident, or "
          "while records must be kept. Turning it off deletes sooner, so it waits before it takes effect."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=INTERVAL_KEY, kind="int", default=15, env="log_prune_interval_minutes", minimum=1, maximum=1440,
     editable=registry.ENV_ONLY, group="retention", unit="minutes",
-    label="Time between two passes of the pruner"))
+    label="Time between two passes of the pruner",
+    help="At most 360 minutes take effect: the audit log's integrity chain needs a seal at least every 12 "
+         "hours, or every pending reduction waits the time between two passes longer."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key=BATCH_KEY, kind="int", default=5000, env="log_prune_batch_rows", minimum=100, maximum=100000,
     editable=registry.ENV_ONLY, group="retention", unit="rows",
     label="Rows the pruner deletes in one transaction"))
 # Fixed windows, listed so the panel can say what the vault keeps and for how long. Each is tied to a rule.
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key="session_records_days", kind="int", default=30, editable=registry.FIXED, group="working_records",
     unit="days", label="Finished sessions and sign-ins waiting for a second factor",
     help="Kept 30 days after they end (longer when a sign-in's token lives longer), then deleted."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key="credential_change_records_days", kind="int", default=14, editable=registry.FIXED,
     group="working_records", unit="days", label="Records of changes to people's sign-in details",
     help="Kept 14 days after the change, or after the request was decided, then deleted."))
 registry.register(registry.SettingSpec(
+    level=registry.ADVANCED, since="0.34.0",
     key="rate_limit_records_hours", kind="int", default=1, editable=registry.FIXED, group="working_records",
     unit="hours", label="Sign-in throttle records kept while the cache is unavailable",
     help="Deleted an hour after their window starts."))
@@ -91,7 +100,42 @@ def utcnow() -> datetime:
 
 
 def hold_in_force() -> bool:
+    """The hold switch as the stored settings give it (the database's value, or the deployment's)."""
     return bool(registry.resolve(HOLD_KEY))
+
+
+def chain_holds(session_factory: Optional[Callable] = None) -> bool:
+    """Whether the audit chain holds every job over logs back: its honoured hold switch (a hold turned on in
+    the chain counts at once, whatever the database says), a restore of a whole backup not finished, or the
+    grace after a restore. Read together with hold_in_force(): the pruner takes the more conservative, so
+    neither the database nor the chain alone can let records go. Holds when it cannot tell: a chain in the
+    database this process has not read (sealing stopped before it could) holds too; only a chain not started
+    yet holds nothing."""
+    try:
+        from app.core import audit_chain_honour as honour
+        from app.core import audit_integrity
+        st = audit_integrity.state()
+        if st.holds_deletion():
+            return True
+        if st.view.newest_policy() is None:
+            return _chain_in_database(session_factory)
+        state = honour.honoured_state(st.view, st.known_record(), st.clock())
+        return bool((state.get(HOLD_KEY) or {}).get("value"))
+    except Exception as exc:  # noqa: BLE001 -- keeping records is the safe side
+        _say(f"Warning: the audit chain's hold could not be read ({type(exc).__name__}); the jobs over logs wait")
+        return True
+
+
+def _chain_in_database(session_factory: Optional[Callable] = None) -> bool:
+    """Whether the database holds any seal of the audit chain."""
+    from app.core import audit_integrity
+    if session_factory is None:
+        from app.core.database import started_session as session_factory
+    db = session_factory()
+    try:
+        return audit_integrity.newest_seq(db) > 0
+    finally:
+        db.close()
 
 
 def _say(message: str) -> None:
@@ -115,7 +159,8 @@ def register_keep(table: str, rule: Callable) -> Callable:
 def keep_clauses(model, now: datetime) -> list:
     """The conditions of the rows of ``model``'s table the row-keep rules keep, as of ``now``."""
     clauses = []
-    for rule in KEEP_RULES.get(model.__tablename__, []):
+    # A model mapped to another table holding the same rows (the archive's) names the table whose rules apply.
+    for rule in KEEP_RULES.get(getattr(model, "__keep_rules_of__", model.__tablename__), []):
         clause = rule(model, now)
         if clause is not None:
             clauses.append(clause)
@@ -236,10 +281,33 @@ def _settings():
     return settings
 
 
+def seal_audit_rows(p: Pass) -> JobResult:
+    """The audit log's integrity chain (app/core/audit_integrity.py): every hour that may be sealed, the late
+    rows of the last 6 hours, the cheap checks, and once a day the whole check. Deletes nothing; never held."""
+    from app.core import audit_chain_verify, audit_integrity
+    audit_integrity.seal_pass(p.session_factory, now=p.now, time_left=p.time_left)
+    if p.time_left() and audit_integrity.state().stopped is None:
+        audit_chain_verify.daily_check(p.session_factory)
+    return JobResult()
+
+
 def apply_waiting_changes(p: Pass) -> JobResult:
-    """Waiting settings changes that are due (app/core/setting_changes.py). Deletes nothing itself."""
-    from app.core import setting_changes
-    setting_changes.apply_due(p.session_factory, now=p.now, limit_statements=limit_statements)
+    """Waiting settings changes that are due, as the audit chain's request seals say, and the database's
+    values compared with the chain (app/core/audit_chain_policy_seals.py). Deletes nothing itself. Before the
+    chain has started, or while sealing is stopped, nothing applies."""
+    from app.core import audit_chain_policy_seals as ps
+    from app.core import audit_integrity
+    st = audit_integrity.state()
+    if st.stopped is not None or st.view.newest_policy() is None:
+        _say("Waiting settings changes wait for the audit chain")
+        return JobResult()
+    engine = audit_integrity._engine_of(p.session_factory)
+    ps.apply_due(engine, st, p.now)
+    found = ps.backstop(engine, st, p.now, p.session_factory)
+    failures = {k: v for k, v in found.items() if k in audit_integrity.FAILURE_KINDS}
+    warnings = {k: v for k, v in found.items() if k not in audit_integrity.FAILURE_KINDS}
+    if failures or warnings:
+        audit_integrity.report_failures(st, p.session_factory, failures, warnings)
     return JobResult()
 
 
@@ -344,6 +412,24 @@ def prune_rate_limit_records(p: Pass) -> JobResult:
         RateLimitRecord.window_start)
 
 
+def prune_invitations(p: Pass) -> JobResult:
+    """Invitations accepted, revoked or expired 30 days ago (app/core/working_records.py)."""
+    from app.core import working_records
+    return working_records.prune_invitations(p)
+
+
+def prune_one_time_proofs(p: Pass) -> JobResult:
+    """Password reset links, one-time codes and email-change codes used or expired 30 days ago."""
+    from app.core import working_records
+    return working_records.prune_one_time_proofs(p)
+
+
+def prune_notifications(p: Pass) -> JobResult:
+    """Notifications older than notification_retention_days; none while it is 0, the default."""
+    from app.core import working_records
+    return working_records.prune_notifications(p)
+
+
 def prune_resolved_alerts(p: Pass) -> JobResult:
     """Security alerts resolved more than SECURITY_ALERT_RETENTION_DAYS ago. Unresolved alerts stay."""
     from app.core import security_records
@@ -385,7 +471,36 @@ def prune_audit_logs(p: Pass) -> JobResult:
     return audit_retention.prune(p)
 
 
+def run_person_erases(p: Pass) -> JobResult:
+    """Per-person erases whose delay has run (app/core/audit_chain_erase.py): a name given a placeholder in the audit
+    log, its archive and the other records, under the audit chain. Held by the hold switch."""
+    from app.core import audit_chain_erase
+    return audit_chain_erase.run_job(p)
+
+
+def shorten_audit_addresses(p: Pass) -> JobResult:
+    """Addresses in audit rows older than audit_ip_full_days, shortened to their network under the audit chain
+    (app/core/audit_rewrite.py). Held by the hold switch."""
+    from app.core import audit_rewrite
+    return audit_rewrite.shorten_job(p)
+
+
+def run_value_removals(p: Pass) -> JobResult:
+    """Removals of values recorded under earlier recording levels whose delay has run (app/core/audit_value_removal.py),
+    under the audit chain. Held by the hold switch."""
+    from app.core import audit_value_removal
+    return audit_value_removal.run_job(p)
+
+
+def archive_audit_rows(p: Pass) -> JobResult:
+    """Audit days older than the row window, moved whole into compressed daily blocks once checked against
+    their seals (app/core/audit_archive.py). Deletes nothing, so the hold does not stop it."""
+    from app.core import audit_archive
+    return audit_archive.archive_job(p)
+
+
 JOBS: list[Job] = [
+    Job("audit_seals", "Sealing of audit rows", seal_audit_rows),
     Job("setting_changes", "Waiting settings changes that are due", apply_waiting_changes),
     Job("sessions", "Finished sessions and sign-ins", prune_sessions),
     Job("key_proof_challenges", "Expired key-proof challenges", prune_key_proof_challenges),
@@ -399,11 +514,18 @@ JOBS: list[Job] = [
     Job("owner_notices", "Notices to vaults' owners outside a case, once delivered and past the record floor",
         prune_owner_notices, held=True),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),
+    Job("invitations", "Invitations that ended 30 days ago", prune_invitations),
+    Job("one_time_proofs", "Reset links and one-time codes that ended 30 days ago", prune_one_time_proofs),
+    Job("notifications", "Notifications older than their window", prune_notifications),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),
     Job("security_alert_values", "Names and addresses in old security alerts", clear_alert_values, held=True),
     Job("audit_env_retention", "A retention set in .env before timed deletion", schedule_env_audit_retention),
+    Job("person_erase", "Per-person erases that are due", run_person_erases, held=True),
+    Job("audit_value_removal", "Removals of values recorded under earlier levels", run_value_removals, held=True),
+    Job("audit_ip_shortening", "Full addresses in audit rows past their days", shorten_audit_addresses, held=True),
     Job("audit_logs", "Audit rows", prune_audit_logs, held=True),
+    Job("audit_archive", "Audit days moved into compressed daily blocks", archive_audit_rows),
 ]
 
 
@@ -456,11 +578,15 @@ def run_pass(session_factory: Optional[Callable] = None, *, engine=None, now: Op
         # The settings as they stand now, not as this process's copy had them up to seconds ago: a hold
         # turned on stops the very next pass.
         registry.refresh(session_factory)
-        hold = hold_in_force()
+        # The hold is decided at the first job over logs, once the sealing job (the first) has read the chain:
+        # a process's first pass knows the chain's hold and the grace after a restore only once it has read them.
+        hold = None
         done = []
         for job in JOBS:
             if not p.time_left():
                 break
+            if job.held and hold is None:
+                hold = hold_in_force() or chain_holds(session_factory)
             if job.held and hold:
                 done.append((job.name, None))
                 continue
@@ -485,8 +611,24 @@ def executor() -> ThreadPoolExecutor:
     return _executor
 
 
+# While the audit chain's first-start backlog is being sealed, passes follow each other this closely.
+BACKLOG_PAUSE_SECONDS = 5.0
+
+
+# The longest time between two passes: the audit chain counts a stop of more than 12 hours between two seals
+# as a gap, which no delay counts (app/core/audit_chain_policy.py); passes further apart would make every
+# reduction, and every erase, wait for ever.
+MAX_INTERVAL_MINUTES = 360
+
+
 def interval_seconds() -> float:
-    return float(registry.resolve(INTERVAL_KEY)) * 60.0
+    try:
+        from app.core import audit_integrity
+        if audit_integrity.state().backlog:
+            return BACKLOG_PAUSE_SECONDS
+    except Exception:  # noqa: BLE001 -- the normal interval
+        pass
+    return float(min(int(registry.resolve(INTERVAL_KEY)), MAX_INTERVAL_MINUTES)) * 60.0
 
 
 async def run_forever(*, first_delay: float = FIRST_PASS_SECONDS, interval: Optional[Callable[[], float]] = None,

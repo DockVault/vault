@@ -37,16 +37,24 @@ def _q(v):
     return "'" + str(v).replace("'", "''") + "'"
 
 
+def restorable(snap):
+    """``snap`` as a PUT /settings can put it back: a password toggle the settings never held reads as None, which
+    PUT refuses (a toggle is true or false), so it goes back as off, which is what an absent toggle means. A
+    minimum length never held goes back as None, which PUT stores and the policy reads as the floor."""
+    return {k: (False if k.startswith("require_") and v is None else v) for k, v in snap.items()}
+
+
 @pytest.fixture
 def invites_on(admin):
     before = admin.get("/settings").json()
-    snap = {k: before.get(k) for k in (ACCOUNT_KEYS + PW_KEYS)}
+    snap = restorable({k: before.get(k) for k in (ACCOUNT_KEYS + PW_KEYS)})
     r = admin.put("/settings", json={
         "invite_enabled": True, "invite_ttl_hours": 48,
         "email_requirement": "optional", "signup_email_domain_mode": "off", "signup_email_domains": []})
     assert r.status_code == 200, r.text
     yield
-    admin.put("/settings", json=snap)
+    r = admin.put("/settings", json=snap)
+    assert r.status_code == 200, r.text
 
 
 def _mint(admin, **body):

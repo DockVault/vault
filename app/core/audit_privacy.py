@@ -194,6 +194,18 @@ _IDENTIFIER_KEYS = (
     # a recorded name revealed outside a case: the event, and the reason's category from a fixed list (its text is
     # sealed in compliance_reveals, never here)
     "event_id", "reason_category",
+    # the audit log's integrity chain: the kinds of what a check found and what it says (seal numbers, hours,
+    # row ids and counts, never a row's values), and the seals an acknowledgment names
+    "kinds", "messages", "seq", "hour", "acknowledges", "failures",
+    # the host's commands on the chain: the seals they accept or discard and where discarded rows were saved,
+    # the key ids a key change moves between, what a restore lost and the bundle it came from, the retention
+    # values and request seals it seals again, and the day, hours and cutoff hour of rows an older release removed
+    "seals", "saved", "from_key", "to_key", "cause", "lost_through_seq", "deleted_through_seq", "bundle",
+    "resealed", "resealed_cancels", "late_rows", "day", "hours", "cutoff",
+    # how many archived days an export read
+    "archived_days",
+    # a per-person erase: its request and the placeholder it writes (never the name it removes)
+    "request_id", "placeholder",
     # numbers and times
     "added", "removed", "kept", "count", "rows", "total", "bytes", "bytes_sent", "bytes_uploaded", "chunk_size",
     "file_size", "file_type", "size", "size_limit", "granted_bytes", "previous_bytes", "max_total_bytes",
@@ -250,6 +262,9 @@ DETAIL_KEYS.update({
     "filters.to_date": IDENTIFIER, "filters.case": IDENTIFIER,
     "filters.user": SIGNIN_NAME, "filters.q": SIGNIN_NAME, "filters.temp_credential": SIGNIN_NAME,
     "filters.ip": ADDRESS,
+    # what a per-person erase changed in each store: the store's name, then a count
+    "stores": NESTED,
+    "stores.*": COUNT,
 })
 
 
@@ -928,7 +943,17 @@ def _reset_for_tests() -> None:
 # The lock names this group, so that SETTINGS_LOCKED_KEYS=audit_levels makes each .env limit the level.
 def _register() -> None:
     from app.core import settings_registry
-    settings_registry.register_lock_group(LOCK_GROUP, "Recording levels")
+    settings_registry.register_lock_group(
+        LOCK_GROUP, label="Recording levels", level=settings_registry.ADVANCED, since="0.34.0", page="records",
+        help="What the audit log keeps of the personal data that comes with an event, each at most its .env "
+             "limit.",
+        env=", ".join(ENV_NAMES[key] for key in POLICY_KEYS), shown=_limits_in_words)
+
+
+def _limits_in_words() -> str:
+    """The level of each kind while the levels are locked: its .env limit."""
+    limits = env_limits()
+    return "; ".join(f"{LABELS[key]}: {limits[key]}" for key in POLICY_KEYS)
 
 
 _register()

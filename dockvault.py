@@ -54,6 +54,7 @@ MENU = [
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
     ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change"),
     ("cases", "Cases - compliance access: approve an auditor right or a case when no administrator can"),
+    ("audit", "Audit log - retention, verify the integrity chain, unarchive, compact"),
 ]
 
 
@@ -251,13 +252,22 @@ REQUIRED_SECRET_KEYS = ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "VAULT_DB_PASSWORD")
 # name, the app's default): written only when they differ from the default, and kept across a fresh volume
 # set (see .env.example).
 RETENTION_ENV_KEYS = (
+    # The audit log's maximum days, and how long resolved security alerts are kept (both older than the rest).
+    ("audit_log_retention_days", "AUDIT_LOG_RETENTION_DAYS", "0"),
+    ("security_alert_retention_days", "SECURITY_ALERT_RETENTION_DAYS", "90"),
     ("retention_reduction_delay_days", "RETENTION_REDUCTION_DELAY_DAYS", "7"),
     ("log_prune_interval_minutes", "LOG_PRUNE_INTERVAL_MINUTES", "15"),
     ("log_prune_batch_rows", "LOG_PRUNE_BATCH_ROWS", "5000"),
     ("retention_hold", "RETENTION_HOLD", "false"),
+    # Working records: how long notifications are kept (0 keeps them), and the log-access file's size.
+    ("notification_retention_days", "NOTIFICATION_RETENTION_DAYS", "0"),
+    # How many days an address in an audit row stays in full before it is shortened (0 keeps it as recorded).
+    ("audit_ip_full_days", "AUDIT_IP_FULL_DAYS", "0"),
+    ("log_pull_sink_max_mb", "LOG_PULL_SINK_MAX_MB", "15"),
     ("audit_min_retention_days", "AUDIT_MIN_RETENTION_DAYS", "0"),
     ("audit_protected_min_days", "AUDIT_PROTECTED_MIN_DAYS", "365"),
     ("audit_log_max_mb", "AUDIT_LOG_MAX_MB", "0"),
+    ("erase_blocked_by_protected_minimum", "ERASE_BLOCKED_BY_PROTECTED_MINIMUM", "false"),
     ("plan_log_max_days", "PLAN_LOG_MAX_DAYS", "-1"),
     ("plan_log_max_mb", "PLAN_LOG_MAX_MB", "-1"),
     ("security_record_days", "SECURITY_RECORD_DAYS", "30"),
@@ -269,6 +279,12 @@ RETENTION_ENV_KEYS = (
     ("audit_max_emails", "AUDIT_MAX_EMAILS", "full"),
     ("audit_max_ip", "AUDIT_MAX_IP", "full"),
     ("audit_max_user_agent", "AUDIT_MAX_USER_AGENT", "full"),
+    # The audit log's integrity chain: when an hour is sealed, and where the head record lives.
+    ("audit_seal_lag_minutes", "AUDIT_SEAL_LAG_MINUTES", "60"),
+    ("audit_chain_head_file", "AUDIT_CHAIN_HEAD_FILE", "/app/keys/audit-chain-head.json"),
+    # The audit log's archive: the days kept as rows, and how long after this release first ran it begins.
+    ("audit_hot_days", "AUDIT_HOT_DAYS", "90"),
+    ("audit_archive_start_after_days", "AUDIT_ARCHIVE_START_AFTER_DAYS", "14"),
 )
 
 # The boundary of compliance access and legal holds, set only in .env (see .env.example), as (config key, .env
@@ -290,6 +306,169 @@ COMPLIANCE_ENV_KEYS = (
     ("compliance_auditor_grant_days", "COMPLIANCE_AUDITOR_GRANT_DAYS", "365"),
     ("compliance_record_min_days", "COMPLIANCE_RECORD_MIN_DAYS", "2190"),
 )
+
+# How much container output (`docker logs`) Docker keeps: every service of the shipped compose files rotates it
+# (json-file, at most DOCKER_LOG_MAX_FILE files of DOCKER_LOG_MAX_SIZE). (config key, .env name, the compose
+# files' default): written only when they differ from the default, and kept across a fresh volume set.
+CONTAINER_LOG_ENV_KEYS = (
+    ("docker_log_max_size", "DOCKER_LOG_MAX_SIZE", "10m"),
+    ("docker_log_max_file", "DOCKER_LOG_MAX_FILE", "5"),
+)
+# A size as Docker reads it (a number, then k/m/g/t/p, optionally "i" and "b"; decimal units).
+_LOG_SIZE = re.compile(r"^(\d+(?:\.\d+)?) ?([kmgtp])?i?b?$", re.IGNORECASE)
+_LOG_SIZE_UNITS = {None: 1, "k": 10 ** 3, "m": 10 ** 6, "g": 10 ** 9, "t": 10 ** 12, "p": 10 ** 15}
+
+
+# ${NAME}, ${NAME:-default}, ${NAME-default}, $NAME, and $$ (a dollar sign), as docker compose replaces them in .env.
+_ENV_REFERENCE = re.compile(r"\$\$|\$\{(\w+)(?:(:?)-([^}]*))?\}|\$(\w+)")
+_DOUBLE_QUOTE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "$": "$$"}
+
+
+def without_bom(text):
+    """``text`` (.env's) without a byte order mark at its start, which an editor may write there (Windows
+    PowerShell 5.1 writes UTF-8 with one): docker compose reads past it, so every reader of .env here does too,
+    and the first line keeps its name."""
+    text = text or ""
+    return text[1:] if text.startswith("\ufeff") else text
+
+
+def _env_replace(value, lookup):
+    def one(m):
+        if m.group(0) == "$$":
+            return "$"
+        name = m.group(1) or m.group(4)
+        found = lookup(name)
+        if m.group(1) and m.group(3) is not None and (found is None or (m.group(2) and found == "")):
+            return m.group(3)
+        return found or ""
+    return _ENV_REFERENCE.sub(one, value)
+
+
+def _env_line_value(rest, lookup):
+    """The value of one .env line after its "=", as docker compose reads it, or None for a quote never closed."""
+    rest = rest.strip(" \t")
+    if rest[:1] == "'":
+        end = rest.find("'", 1)
+        return None if end < 0 else rest[1:end]
+    if rest[:1] == '"':
+        out, i = [], 1
+        while i < len(rest):
+            c = rest[i]
+            if c == "\\" and i + 1 < len(rest):
+                out.append(_DOUBLE_QUOTE_ESCAPES.get(rest[i + 1], c + rest[i + 1]))
+                i += 2
+                continue
+            if c == '"':
+                return _env_replace("".join(out), lookup)
+            out.append(c)
+            i += 1
+        return None
+    comment = rest.find(" #")
+    if comment >= 0:
+        rest = rest[:comment]
+    return _env_replace(rest.strip(" \t"), lookup)
+
+
+def compose_env_values(text, names, environ=None):
+    """The values of ``names`` as docker compose gives them to the compose files, from .env's ``text`` and the
+    process environment ``environ`` (os.environ when None), which compose prefers to .env. .env is read by compose's
+    rules (docker compose 2.40): blank lines and lines starting with # are skipped, "export " is allowed, and the
+    last line of a name wins; a value in single quotes is taken as it stands; one in double quotes with its escapes
+    and its ${...} replaced, anything after the closing quote ignored; an unquoted one is cut at " #" (a space, then
+    #), trimmed, and its ${...} replaced, from the process environment or the lines above it. parse_env differs on
+    purpose: it keeps what the setup scripts wrote. A value whose quote is never closed is None: compose refuses
+    the file. A byte order mark at the start of the file is read past, as compose does."""
+    environ = os.environ if environ is None else environ
+    read = {}
+
+    def lookup(name):
+        return environ[name] if name in environ else read.get(name)
+
+    for raw in without_bom(text).splitlines():
+        line = raw.strip(" \t\r")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export ") or line.startswith("export\t"):
+            line = line[7:].lstrip(" \t")
+        key, sep, rest = line.partition("=")
+        key = key.strip(" \t")
+        if not sep or not key:
+            continue
+        read[key] = _env_line_value(rest, lookup)
+    return {name: (environ[name] if name in environ else read[name]) for name in names
+            if name in environ or name in read}
+
+
+def _shown(value):
+    return value if value == value.strip() and value.isprintable() else json.dumps(value)
+
+
+def container_log_problems(env):
+    """What in ``env`` (DOCKER_LOG_MAX_SIZE and DOCKER_LOG_MAX_FILE as docker compose gives them to the compose
+    files: compose_env_values) Docker would refuse as the rotation of container output: [] when nothing. Docker
+    starts no container whose log size is not a positive size, or whose file count is below 1, and a space before
+    or after either is not one, so a stack recreated with one would not come back. An empty value takes the
+    compose files' default; a quote never closed is named, since compose refuses the file."""
+    problems = []
+    for name in ("DOCKER_LOG_MAX_SIZE", "DOCKER_LOG_MAX_FILE"):
+        if name in env and env[name] is None:
+            problems.append("%s has a quote that is never closed, so docker compose cannot read .env" % name)
+    size = env.get("DOCKER_LOG_MAX_SIZE") or ""
+    if size:
+        m = _LOG_SIZE.fullmatch(size)
+        if not m or int(float(m.group(1)) * _LOG_SIZE_UNITS[(m.group(2) or "").lower() or None]) < 1:
+            problems.append("DOCKER_LOG_MAX_SIZE=%s is not a size Docker reads (for example 10m, 50m, 1g)"
+                            % _shown(size))
+    count = env.get("DOCKER_LOG_MAX_FILE") or ""
+    if count and not (re.fullmatch(r"\+?\d+", count) and int(count) >= 1):
+        problems.append("DOCKER_LOG_MAX_FILE=%s is not a whole number of files, 1 or more" % _shown(count))
+    return problems
+
+
+def host_log_driver(run=None):
+    """The Docker daemon's default logging driver ("json-file", "journald", ...), or None when it cannot be read."""
+    run = run or subprocess.run
+    try:
+        r = run(["docker", "info", "--format", "{{.LoggingDriver}}"], capture_output=True, text=True, timeout=25,
+                stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    driver = (getattr(r, "stdout", "") or "").strip()
+    return driver if getattr(r, "returncode", 1) == 0 and driver else None
+
+
+def compose_sets_logging(root):
+    """Whether the secure compose file under ``root`` gives its services a ``logging:`` block: True, False (a
+    checkout from before the rotation, or one whose operator removed it to keep the host's own driver), or None
+    when there is no such file."""
+    try:
+        with open(os.path.join(root, "deploy", "docker-compose.secure.yml"), encoding="utf-8") as handle:
+            return re.search(r"^\s+logging:", handle.read(), re.MULTILINE) is not None
+    except OSError:
+        return None
+
+
+def container_log_note(root, run=None):
+    """A note for the operator about where container output goes, or None when there is nothing to say: the
+    checkout's compose files rotate nothing (they predate the rotation, or it was removed), or they rotate it in
+    json-file files while the host's Docker sends container output to another driver by default (which then no
+    longer gets DockVault's)."""
+    sets = compose_sets_logging(root)
+    if sets is None:
+        return None
+    driver = host_log_driver(run)
+    if not sets:
+        if driver not in (None, "json-file"):
+            return None      # the host's own driver keeps the output: the reason to remove the block
+        return ("The compose files of this checkout do not rotate container output, so Docker keeps it as this "
+                "host's settings say (with Docker's defaults, without limit). Update the checkout to get the rotation "
+                "(README, \"Container logs\").")
+    if driver in (None, "json-file"):
+        return None
+    return ("This host's Docker sends container output to '%s' by default, but DockVault's compose files keep "
+            "their containers' output in rotated json-file files instead (DOCKER_LOG_MAX_SIZE x DOCKER_LOG_MAX_FILE), "
+            "so '%s' does not get it. To keep '%s' for DockVault, see README, \"Container logs\"."
+            % (driver, driver, driver))
 
 # What the audit log may record of personal data at most: setup offers three presets for the AUDIT_MAX_* limits
 # (see .env.example). The panel then chooses the levels at or below them. "full" is the app's default (nothing is
@@ -348,10 +527,11 @@ def gen_hex(nbytes):
 
 def parse_env(text):
     """Parse a KEY=VALUE .env into a dict. First occurrence of a key wins; a single surrounding
-    matching quote pair is stripped; tolerant of CRLF + whitespace around the key/'='. Pure —
-    mirrors the setup scripts' read_env so a re-run reads its own output back correctly."""
+    matching quote pair is stripped; tolerant of CRLF + whitespace around the key/'=', and of a byte
+    order mark at the start (without_bom). Pure — mirrors the setup scripts' read_env so a re-run reads
+    its own output back correctly."""
     out = {}
-    for raw in (text or "").splitlines():
+    for raw in without_bom(text).splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -451,7 +631,8 @@ def build_env_lines(cfg):
     the setup scripts' dotenv quoting. `cfg` keys: server_name, encryption_key, jwt_secret_key,
     vault_db_password, redis_password, admin_username, admin_email, admin_password, compose_profiles,
     run_sftp (bool), update_check_enabled (bool), plan_log_pull (bool), log_token_pepper (str),
-    invite_token_pepper (str), audit_fingerprint_key (str; written only when set), enforce_file_expiry and
+    invite_token_pepper (str), audit_fingerprint_key and audit_chain_key (str; each written only when set),
+    enforce_file_expiry and
     zk_key_proof_enforce (raw strings; only a false value is written), max_single_request_upload_mb (int or
     None; written only when set), settings_locked_keys (str; written only when set)."""
     lines = []
@@ -592,6 +773,10 @@ def build_env_lines(cfg):
     for _cfg_key, _env_name, _default in COMPLIANCE_ENV_KEYS:
         if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
             bare(_env_name, str(cfg[_cfg_key]).strip())
+    # And how much container output Docker keeps, same rule.
+    for _cfg_key, _env_name, _default in CONTAINER_LOG_ENV_KEYS:
+        if str(cfg.get(_cfg_key) or "").strip() not in ("", _default):
+            bare(_env_name, str(cfg[_cfg_key]).strip())
     # A dedicated pepper for account-invitation token hashes. Always written so invitation hashes are
     # decoupled from the JWT secret (the app falls back to the JWT secret only when this is absent).
     if cfg.get("invite_token_pepper"):
@@ -600,6 +785,10 @@ def build_env_lines(cfg):
     # generated derives one from ENCRYPTION_KEY, and keeps doing so until a key is added here.
     if cfg.get("audit_fingerprint_key"):
         bare("AUDIT_FINGERPRINT_KEY", "'%s'" % cfg["audit_fingerprint_key"])
+    # The audit log's integrity chain key. Written when there is one: an install set up before it was
+    # generated derives the chain's key from ENCRYPTION_KEY until one is added here.
+    if cfg.get("audit_chain_key"):
+        bare("AUDIT_CHAIN_KEY", "'%s'" % cfg["audit_chain_key"])
     return lines
 
 
@@ -1375,9 +1564,13 @@ def new_set_config(current_env, new_prefix, new_id):
         # And the boundary of compliance access and legal holds.
         **{cfg_key: (current_env.get(env_name) or "").strip() or None
            for cfg_key, env_name, _default in COMPLIANCE_ENV_KEYS},
+        # And how much container output Docker keeps.
+        **{cfg_key: (current_env.get(env_name) or "").strip() or None
+           for cfg_key, env_name, _default in CONTAINER_LOG_ENV_KEYS},
         "invite_token_pepper": (current_env.get("INVITE_TOKEN_PEPPER") or "").strip() or gen_hex(32),
-        # A new set is new data: its audit fingerprints get a key of their own.
+        # A new set is new data: its audit fingerprints get a key of their own, and so does its audit chain.
         "audit_fingerprint_key": gen_hex(32),
+        "audit_chain_key": gen_hex(32),
         # A fresh volume set is still the same deployment: keep whatever storage ceiling the
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
@@ -1419,7 +1612,11 @@ def plan_volume_action(choice):
 # bundle is sensitive), a tar.gz per data volume, and manifest.json. The manifest carries NO secret -
 # only a salted one-way commitment over the .env's two random per-set secrets, so restore can confirm
 # the .env in the bundle really is the one those volumes were created with (a swapped/wrong .env fails).
-BACKUP_ROLES = ("pg", "storage", "keys", "brand")   # order restored in; brand is optional
+# The order archived in, and restored in; brand is optional. The keys volume comes first: it holds the audit
+# chain's head record, and a database archived after it can only be ahead of its record (by the seals written
+# meanwhile, which the server lists and the host acknowledges), never behind it, which would stop sealing as a
+# cut tail does. The database is paused while its volume is archived, so the copy is one moment's.
+BACKUP_ROLES = ("keys", "pg", "storage", "brand")
 # The three that carry data. A bundle without them is not a backup, whatever else it contains,
 # and saying so is load-bearing now that an upgrade takes one on the operator's behalf and
 # proceeds with an irreversible change on the strength of it.
@@ -1573,6 +1770,47 @@ def clear_volume(volume, run=subprocess.run):
         r = run(["docker", "run", "--rm", "-v", "%s:/v" % volume, "busybox", "sh", "-c",
                  "rm -rf /v/..?* /v/.[!.]* /v/* 2>/dev/null"],
                 capture_output=True, text=True, timeout=300)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
+def chain_head_relpath(env):
+    """Where the audit chain's head record lies inside the keys volume (AUDIT_CHAIN_HEAD_FILE under
+    /app/keys), or None when .env puts it elsewhere (then a restore writes no mark: the operator's path)."""
+    path = (env or {}).get("AUDIT_CHAIN_HEAD_FILE") or "/app/keys/audit-chain-head.json"
+    path = path.strip().strip("'\"")
+    prefix = "/app/keys/"
+    if not path.startswith(prefix) or ".." in path.split("/"):
+        return None
+    rel = path[len(prefix):]
+    return rel if rel and re.match(r"^[A-Za-z0-9._/-]+$", rel) else None
+
+
+def read_volume_json(volume, rel, run=subprocess.run):
+    """The JSON file `rel` inside a docker volume, through a throwaway busybox (read-only mount), or None."""
+    try:
+        r = run(["docker", "run", "--rm", "-v", "%s:/v:ro" % volume, "busybox", "cat", "/v/%s" % rel],
+                capture_output=True, text=True, timeout=120)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    try:
+        data = json.loads(getattr(r, "stdout", "") or "")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_volume_file(volume, rel, text, run=subprocess.run):
+    """Write `text` to `rel` inside a docker volume (mode 600, owned like the volume's top directory, so the
+    app's user reads it), through a throwaway busybox fed on its standard input. True on success."""
+    script = ('cat > "/v/$1.tmp" && chown "$(stat -c %u:%g /v)" "/v/$1.tmp" && chmod 600 "/v/$1.tmp" '
+              '&& mv "/v/$1.tmp" "/v/$1" && sync')
+    try:
+        r = run(["docker", "run", "--rm", "-i", "-v", "%s:/v" % volume, "busybox", "sh", "-c", script, "sh", rel],
+                input=text, capture_output=True, text=True, timeout=120)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return getattr(r, "returncode", 1) == 0
@@ -3014,6 +3252,17 @@ def parse_operator_answer(stdout):
     return answer if isinstance(answer, dict) and "ok" in answer else None
 
 
+def parse_df_available(stdout):
+    """The available bytes `df -Pk <path>` prints for its one filesystem, or None."""
+    lines = [ln.split() for ln in (stdout or "").splitlines() if ln.strip()]
+    if len(lines) < 2 or len(lines[-1]) < 4:
+        return None
+    try:
+        return int(lines[-1][3]) * 1024
+    except ValueError:
+        return None
+
+
 def server_text(value, default=""):
     """A string the account tool read from the server, made safe to print on this terminal.
 
@@ -3045,6 +3294,96 @@ def case_reference_problem(typed):
     if not (typed or "").strip():
         return "type the case's reference again with --confirm-case (list shows it)"
     return None
+
+
+# The audit menu: what `audit` does when it is chosen from the top menu (each is also `audit <action>`).
+AUDIT_MENU = (
+    ("retention", "Retention - how long records are kept, and change a .env limit"),
+    ("verify", "Verify - check the integrity chain and print its head to keep elsewhere"),
+    ("unarchive", "Unarchive - restore archived days as rows (checks the free space first)"),
+    ("compact", "Compact - give the audit tables' free space back to the system (locks them while it runs)"),
+)
+# The headings of the retention settings' groups, as the Settings page names them.
+RETENTION_GROUPS = (("audit_retention", "Audit log"), ("retention", "Other records"),
+                    ("audit_integrity", "Sealing"), ("working_records", "Fixed periods"))
+_RETENTION_SOURCES = {"default": "default", "env": "from .env", "admin": "set in the panel",
+                      "locked": "locked by .env"}
+_ENV_LINE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def parse_retention_sets(texts):
+    """--set NAME=VALUE texts as [(NAME, VALUE)], or raise ValueError naming the first that is not of that form
+    (an upper-case .env name, a value without a line break) or that repeats a name. Which names are lines of
+    the retention settings, and which values the server accepts, the server says (audit retention)."""
+    out, seen = [], set()
+    for text in texts or []:
+        name, sep, value = (text or "").partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not _ENV_LINE.match(name) or not value or "\n" in value or "\r" in value:
+            raise ValueError("%r is not NAME=VALUE (an upper-case .env name)" % (text,))
+        if name in seen:
+            raise ValueError("%s is given twice" % name)
+        seen.add(name)
+        out.append((name, value))
+    return out
+
+
+def retention_value_text(row, value):
+    """A retention setting's value as words: on/off, no limit (no cap, for a size), or the number and unit."""
+    if value is None:
+        return "not set"
+    if row.get("kind") == "bool" or isinstance(value, bool):
+        return "on" if value else "off"
+    if row.get("unlimited") is not None and value == row.get("unlimited"):
+        return "no cap" if row.get("unit") == "MB" else "no limit"
+    unit = server_text(row.get("unit"))
+    if value == 1 and unit.endswith("s"):
+        unit = unit[:-1]                                  # 1 hour, 1 day
+    return ("%s %s" % (server_text(value), unit)).strip()
+
+
+def describe_retention(answer):
+    """The lines `audit retention` prints for the server's answer: each group's settings with the value in
+    force, where it comes from and the .env lines that set and bound it; then the changes waiting."""
+    rows = answer.get("settings") or []
+    lines = []
+    for group, heading in RETENTION_GROUPS:
+        mine = [r for r in rows if r.get("group") == group]
+        if not mine:
+            continue
+        lines.append("  %s" % heading)
+        for r in mine:
+            how = [_RETENTION_SOURCES.get(r.get("source"), server_text(r.get("source")))]
+            if r.get("editable") == "fixed":
+                how = ["fixed"]
+            elif r.get("env"):
+                how.append("set by %s" % server_text(r.get("env")))
+            if r.get("kind") == "bool":
+                if r.get("floor") is True and r.get("floor_env"):
+                    how.append("kept on by %s" % server_text(r.get("floor_env")))
+            elif r.get("floor") is not None and r.get("floor_env"):
+                how.append("at least %s (%s)" % (retention_value_text(r, r.get("floor")),
+                                                 server_text(r.get("floor_env"))))
+            if r.get("ceiling") is not None and r.get("ceiling_env"):
+                how.append("at most %s (%s)" % (retention_value_text(r, r.get("ceiling")),
+                                                server_text(r.get("ceiling_env"))))
+            if r.get("editable") == "env_only":
+                how.append("only .env changes it")
+            lines.append("    %-58s %s" % (server_text(r.get("label") or r.get("key")),
+                                           retention_value_text(r, r.get("value"))))
+            lines.append("    %-58s %s" % ("", "; ".join(how)))
+    pending = answer.get("pending") or []
+    if pending:
+        lines.append("  Waiting (any administrator can cancel them in Settings, Activity and records)")
+        for p in pending:
+            lines.append("    %s: %s -> %s from %s, asked by %s" % (
+                server_text(p.get("label") or p.get("key")), server_text(p.get("old"), "the deployment's"),
+                server_text(p.get("new"), "the deployment's"), server_text(p.get("effective_at"), "?"),
+                server_text(p.get("requested_by"), "?")))
+    if answer.get("chain_unreadable"):
+        lines.append("  The audit chain could not be read (%s): the values are the database's, not necessarily "
+                     "what the pruner acts on." % server_text(answer.get("chain_unreadable")))
+    return lines
 
 
 def username_confirmation_problem(username, typed_again):
@@ -3453,7 +3792,10 @@ class DockVault:
     def restart(self, args=None):
         """Recreate the deployment (compose down + start, health-checked) so a changed .env takes
         effect. Data volumes are untouched. No prompt: this is an explicit in-place action, not the
-        standalone `down`."""
+        standalone `down`. A container-log rotation Docker would refuse stops it before anything is
+        taken down."""
+        if not self._container_logs_readable():
+            raise SystemExit(1)
         self._tear_down_containers()
         self.start(args)
 
@@ -3596,6 +3938,7 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
+        self._note_host_log_driver()
         # PROVE the container can read the TLS pair before starting anything. Host permissions do not
         # predict the container's view, and getting this wrong costs an endless restart loop whose
         # only symptom is uvicorn's "PermissionError: [Errno 13]" buried in the logs.
@@ -3834,6 +4177,7 @@ class DockVault:
             "log_token_pepper": gen_hex(32) if log_pull else "",
             "invite_token_pepper": gen_hex(32),
             "audit_fingerprint_key": gen_hex(32),
+            "audit_chain_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.
@@ -3874,10 +4218,11 @@ class DockVault:
         return (mode or "selfsigned", email, cpath, kpath)
 
     def _set_env_key(self, path, key, value):
-        """Replace/append KEY=value in .env (bare value), preserving perms."""
+        """Replace/append KEY=value in .env (bare value), preserving perms. A byte order mark at the start is
+        read past (without_bom) and not written back."""
         lines, found = [], False
         if os.path.exists(path):
-            for raw in open(path, encoding="utf-8").read().splitlines():
+            for raw in without_bom(open(path, encoding="utf-8").read()).splitlines():
                 if re.match(r"^\s*%s\s*=" % re.escape(key), raw):
                     lines.append("%s=%s" % (key, value)); found = True
                 else:
@@ -3890,12 +4235,13 @@ class DockVault:
 
     def _remove_env_keys(self, path, keys):
         """Remove any KEY= lines for the given keys from .env (preserving perms). Returns True if any
-        line was removed. Comments and every other line are kept verbatim."""
+        line was removed. Comments and every other line are kept verbatim; a byte order mark at the start is
+        read past (without_bom), and not written back when a line is removed."""
         if not os.path.exists(path):
             return False
         keyset = set(keys)
         out, removed = [], False
-        for raw in open(path, encoding="utf-8").read().splitlines():
+        for raw in without_bom(open(path, encoding="utf-8").read()).splitlines():
             m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", raw)
             if m and m.group(1) in keyset:
                 removed = True
@@ -4077,9 +4423,37 @@ class DockVault:
         without the check the documented "re-run setup to upgrade" path would rebuild over a
         release image an operator deliberately chose — the same clobber the Update menu's pull path
         already avoids."""
+        if not self._container_logs_readable():
+            return False
         if uses_release_image(self._load_env()):
             return self._pull_release_image() and self._recreate_stack(build=False)
         return self._recreate_stack(build=True)
+
+    def _container_logs_readable(self):
+        """False, having said why, when .env sets a container-log rotation Docker would refuse: the stack is
+        then left as it is, rather than recreated into containers that cannot be created."""
+        problems = container_log_problems(self._container_log_values())
+        for problem in problems:
+            print(self.pal.paint("  %s; fix it in .env (or remove the line for the default). Nothing was "
+                                 "recreated." % problem, "red"))
+        return not problems
+
+    def _container_log_values(self):
+        """DOCKER_LOG_MAX_SIZE and DOCKER_LOG_MAX_FILE as docker compose will give them to the compose files: read
+        from .env by compose's rules, the process environment first (compose_env_values)."""
+        text = ""
+        try:
+            with open(self._env_path(), encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            pass
+        return compose_env_values(text, ("DOCKER_LOG_MAX_SIZE", "DOCKER_LOG_MAX_FILE"))
+
+    def _note_host_log_driver(self):
+        """Say where container output goes when the operator may not expect it (container_log_note)."""
+        note = container_log_note(self.root)
+        if note:
+            print(self.pal.paint("  Note: " + note, "yellow"))
 
     def _pull_release_image(self):
         """Pull the release image .env pins. Reports the remedy itself, since a failure here is
@@ -4101,6 +4475,8 @@ class DockVault:
         """Recreate the stack. build=True builds the local Dockerfile (setup / from-source update);
         build=False recreates from the already-present image (the pull-update path - must NOT rebuild,
         or it would overwrite the just-pulled release image with a local build)."""
+        if not self._container_logs_readable():
+            return False
         if not self._remove_inactive_profile():
             return False
         args = ["up", "-d", "--force-recreate", "--remove-orphans"]
@@ -4662,7 +5038,13 @@ class DockVault:
                 continue                                     # e.g. brand isn't always present
             archive = "%s.tar.gz" % VOLUME_BASENAMES[role]
             print(pal.paint("  archiving %s ..." % vol, "cyan"))
-            if not tar_volume(vol, bundle, archive):
+            paused = self._pause_database() if role == "pg" else False
+            try:
+                archived = tar_volume(vol, bundle, archive)
+            finally:
+                if paused:
+                    self._unpause_database()
+            if not archived:
                 self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
             entries.append({"role": role, "name": vol, "archive": archive})
 
@@ -4712,6 +5094,25 @@ class DockVault:
         else:
             print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
                             "somewhere safe (off-host), or re-run with --lock to seal it. ***\n", "yellow"))
+
+    def _pause_database(self):
+        """Pause the running database container while its volume is archived, so the copy is one moment's (a
+        tar of a running data directory is not: Postgres keeps writing pages behind it). True when paused."""
+        if not container_running(DB_CONTAINER):
+            return False
+        print(self.pal.paint("  pausing the database while its volume is copied ...", "cyan"))
+        try:
+            r = self._run_dc("pause", "vault-db", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return getattr(r, "returncode", 1) == 0
+
+    def _unpause_database(self):
+        try:
+            self._run_dc("unpause", "vault-db", timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(self.pal.paint("  WARNING: the database could not be resumed (%s): run docker compose unpause "
+                                 "vault-db" % type(exc).__name__, "red"))
 
     def _seal_bundle_env(self, bundle, args):
         """Seal bundle/env -> bundle/env.enc (envelope encryption; passphrase + one-time recovery key),
@@ -4854,11 +5255,18 @@ class DockVault:
             self._fail("the backup's volume_prefix %r is not a valid name - refusing to restore" % prefix)
         names = set_volume_names(prefix)
         plan = []
+        roles = []
         for e in (manifest.get("volumes") or []):
             role = e.get("role") if isinstance(e, dict) else None
             if role not in VOLUME_BASENAMES:
                 self._fail("the backup manifest lists an unknown volume role %r - refusing to restore" % role)
+            roles.append(role)
+        # Restored in BACKUP_ROLES order whatever order the manifest lists them in (an older bundle archived
+        # the keys volume last): keys first, so the restore mark lands before any other volume.
+        order = {role: i for i, role in enumerate(BACKUP_ROLES)}
+        for role in sorted(roles, key=lambda r: order.get(r, len(order))):
             plan.append((names[role], "%s.tar.gz" % VOLUME_BASENAMES[role]))
+        head_rel = chain_head_relpath(bundle_env)
         force = bool(getattr(args, "force", False)) if args else False
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
@@ -4897,8 +5305,14 @@ class DockVault:
         if container_running(DB_CONTAINER):
             self._fail("could not stop the running deployment before restore (the database is still "
                        "up) - aborting; your data is intact. Stop the stack and retry.")
+        # The head record of the keys volume about to be replaced (a restore over the same set), kept for the
+        # restore mark: what it knew the restore then undoes.
+        replaced_record = None
+        if head_rel and volume_exists(names["keys"]):
+            replaced_record = read_volume_json(names["keys"], head_rel)
         # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
         # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
+        marked = False
         for vol, archive in plan:
             print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
             # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
@@ -4910,6 +5324,20 @@ class DockVault:
             if not untar_volume(vol, bundle, archive):
                 self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
                            "bundle and retry." % (vol, archive))
+            if vol == names["keys"] and head_rel:
+                # Right after the keys volume, before any other volume or .env: the restore mark. While it is
+                # there the audit pruner deletes nothing, until `audit accept-restore` (run below once the
+                # stack is up, or by hand) accepts the restore. A restore stopped part way leaves it in place.
+                restored_record = read_volume_json(vol, head_rel)
+                if restored_record is not None or replaced_record is not None:
+                    import datetime as _dt
+                    mark = {"at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "bundle": os.path.basename(os.path.normpath(bundle)), "record": replaced_record,
+                            "restored_record": restored_record}
+                    if not write_volume_file(vol, head_rel + ".restore-pending", json.dumps(mark)):
+                        self._fail("could not write the restore mark into %s - the deployment is stopped; "
+                                   "retry the restore" % vol)
+                    marked = True
         # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
         # the plaintext was decrypted into memory above; write those exact bytes.
         if sealed_env_bytes is not None:
@@ -4935,8 +5363,19 @@ class DockVault:
             self._tail_logs(self._web_service(profiles))
             print(pal.paint("  Restored and started, but the vault did NOT report healthy yet - "
                             "logs above.\n", "red"))
-        else:
-            print(pal.paint("  Restored and healthy.\n", "green"))
+            if marked:
+                print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: python "
+                                "dockvault.py audit accept-restore\n", "yellow"))
+            return
+        print(pal.paint("  Restored and healthy.\n", "green"))
+        if marked:
+            if interactive:
+                print(pal.paint("  Finishing the restore of the audit log's integrity chain:", "cyan"))
+                self._audit_host_command(argparse.Namespace(no_reseal=False, yes=False, confirm=None,
+                                                            old_key_file=None), "accept-restore")
+            else:
+                print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: python "
+                                "dockvault.py audit accept-restore\n", "yellow"))
 
     def _load_env(self):
         """Parse the current .env (best-effort: {} if absent or unreadable)."""
@@ -5228,6 +5667,8 @@ class DockVault:
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
+        if not self._container_logs_readable():
+            raise SystemExit(1)
         env = self._load_env()
         current, version_source = self._running_version(env.get("COMPOSE_PROFILES", "combined"))
         interactive = not (args and getattr(args, "non_interactive", False))
@@ -5242,6 +5683,7 @@ class DockVault:
                 "  %s is set in .env: this deployment starts even on data a newer version changed "
                 "in a way it cannot read. Remove it once you are back on that version or have "
                 "undone the change." % NEWER_DATA_ESCAPE, "yellow"))
+        self._note_host_log_driver()
 
         tag = getattr(args, "tag", None) if args else None
         from_source = bool(getattr(args, "source", False)) if args else False
@@ -5526,6 +5968,8 @@ class DockVault:
                 % (len(legs), "a release" if len(legs) == 2 else "some releases",
                    " -> ".join(legs)), "cyan"))
 
+        self._offer_chain_key(args, interactive, legs[-1])
+
         for index, leg_version in enumerate(legs, start=1):
             leg_tag = leg_version if leg_version.startswith("v") else "v" + leg_version
             if len(legs) > 1:
@@ -5536,6 +5980,31 @@ class DockVault:
         healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
         print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
                         "green" if healthy else "red"))
+
+    def _offer_chain_key(self, args, interactive, target):
+        """Before a release with the audit log's integrity chain first starts: a chain key of its own. Without
+        AUDIT_CHAIN_KEY the chain's key is derived from ENCRYPTION_KEY, which everyone who holds that key holds
+        too. Offered with yes as the default answer; --no-chain-key declines (the status then says key-shared).
+        Set later on an install whose chain already runs, the chain moves to it on its own, with a proof."""
+        pal = self.pal
+        if (self._load_env().get("AUDIT_CHAIN_KEY") or "").strip():
+            return
+        try:
+            if parse_semver(str(target).lstrip("vV")) < parse_semver("0.34.0"):
+                return
+        except (TypeError, ValueError):
+            return
+        if args is not None and getattr(args, "no_chain_key", False):
+            print(pal.paint("  AUDIT_CHAIN_KEY left unset: the audit log's chain key is derived from "
+                            "ENCRYPTION_KEY (the status shows key-shared).", "yellow"))
+            return
+        if interactive and not confirm("Give the audit log's integrity chain a key of its own (AUDIT_CHAIN_KEY, "
+                                       "recommended)?", pal, default=True):
+            print(pal.paint("  Left unset: the chain's key is derived from ENCRYPTION_KEY.", "yellow"))
+            return
+        self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
+        print(pal.paint("  Wrote AUDIT_CHAIN_KEY to .env (it is in every backup with .env; keep it as you keep "
+                        "ENCRYPTION_KEY).", "green"))
 
     def _downgrade_blockers(self, target):
         """What the running deployment says stops it going back to `target`: (offered, blockers).
@@ -5852,6 +6321,434 @@ class DockVault:
         print("  role:          %s%s" % (server_text(account.get("role")), "" if account.get("active") else "  (deactivated)"))
         print("  last sign-in:  %s" % (server_text(account.get("last_login")) or "never"))
         print("  second factor: %s" % ("set up" if account.get("second_factor") else "not set up"))
+
+    def audit(self, args=None):
+        """Verify the audit log's integrity chain in the running web container, and print every finding and
+        the chain's head. Keep the head somewhere else (a ticket, a printout): a later change to the history
+        before it then shows. Exit status: 0 clean, 1 failures or warnings, 2 the check could not run.
+
+        From the top menu (no arguments) it asks first: how long records are kept, verify, unarchive or
+        compact. The other actions are commands only (audit <action>)."""
+        pal = self.pal
+        if args is None:
+            print(pal.paint("\n  Audit log", "cyan"))
+            for i, (_key, label) in enumerate(AUDIT_MENU, 1):
+                print("  %s) %s" % (pal.paint(str(i), "bold"), label))
+            try:
+                choice = parse_menu_choice(input(pal.paint("\nChoose: ", "cyan")), len(AUDIT_MENU))
+            except EOFError:
+                choice = 0
+            if not choice:
+                print(pal.paint("  Nothing done.\n", "yellow"))
+                return
+            action = AUDIT_MENU[choice - 1][0]
+            if action == "retention":
+                return self._audit_retention(None)
+            if action == "unarchive":
+                return self._audit_unarchive(self._ask_unarchive_days())
+            if action == "compact":
+                return self._audit_compact(None)
+        action = getattr(args, "audit_action", "verify") if args is not None else "verify"
+        if action == "retention":
+            return self._audit_retention(args)
+        if action == "verify" and getattr(args, "acknowledge_removed_before", None):
+            # The same command, spelled as a check's option: audit verify --acknowledge-removed-before <time>.
+            args.before = args.acknowledge_removed_before
+            action = "acknowledge-removed-before"
+        if action == "acknowledge":
+            return self._audit_acknowledge(args)
+        if action in ("rekey", "after-record", "accept-database-head", "accept-restore",
+                      "acknowledge-removed-before"):
+            return self._audit_host_command(args, action)
+        if action == "change-key":
+            return self._audit_change_key(args)
+        if action == "unarchive":
+            return self._audit_unarchive(args)
+        if action == "compact":
+            return self._audit_compact(args)
+        tool_args = ["verify", "--json"]
+        for flag, name in (("--from", "audit_from"), ("--to", "audit_to"), ("--anchor", "anchor")):
+            value = getattr(args, name, None) if args else None
+            if value:
+                tool_args += [flag, value]
+        if args is not None and getattr(args, "no_key", False):
+            tool_args.append("--no-key")
+        ok, why = docker_available()
+        if not ok:
+            self._fail("Docker is not available: %s" % why)
+        answer = None
+        for service in ("vault", "vault-api"):
+            try:
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.audit_integrity", *tool_args,
+                                 timeout=3600)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("could not run the audit check: %s" % type(exc).__name__)
+            answer = parse_operator_answer(getattr(r, "stdout", ""))
+            if answer is not None:
+                break
+        if answer is None:
+            self._fail("the audit check did not answer. Is the deployment running? (python dockvault.py status)")
+        if not answer.get("ok"):
+            print(pal.paint("  The audit check could not run: %s" % server_text(answer.get("error")), "red"))
+            raise SystemExit(2)
+        findings = answer.get("findings") or []
+        colour = {"failure": "red", "warning": "yellow"}
+        for f in findings:
+            where = (" (seal %s)" % f["seq"]) if f.get("seq") else ""
+            where += (" [%s]" % server_text(f.get("hour"))) if f.get("hour") else ""
+            print(pal.paint("  %-12s %s%s: %s" % (server_text(f.get("severity")).upper(), server_text(f.get("kind")),
+                                                   where, server_text(f.get("message"))),
+                            colour.get(f.get("severity"), "")))
+        if not findings:
+            print(pal.paint("  The audit log's chain verifies clean.", "green"))
+        print("  Seals: %s" % server_text(answer.get("seals")))
+        if answer.get("head"):
+            print(pal.paint("\n  Head (keep it somewhere else):", "cyan"))
+            print("  %s" % server_text(answer.get("head")))
+            print("  at %s, key %s\n" % (server_text(answer.get("head_at")), server_text(answer.get("key_id"))))
+        code = int(answer.get("exit_code") or 0)
+        if code:
+            raise SystemExit(code)
+
+    def _audit_tool(self, *tool_args, input_text=None):
+        """Run `python -m app.core.audit_integrity ...` in the running web container; its JSON answer. With
+        ``input_text`` the command reads it on standard input (an old key: never on a command line, where `ps`
+        or `docker inspect` would show it). `exec` asks Compose no volume question, so this one call may feed
+        its standard input."""
+        ok, why = docker_available()
+        if not ok:
+            self._fail("Docker is not available: %s" % why)
+        for service in ("vault", "vault-api"):
+            cmd = ("exec", "-T", service, "python", "-m", "app.core.audit_integrity") + tuple(tool_args)
+            try:
+                if input_text is None:
+                    r = self._run_dc(*cmd, timeout=3600)
+                else:
+                    r = subprocess.run(self._dc(*cmd), input=input_text, text=True, capture_output=True,
+                                       cwd=self.root, timeout=3600)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail("could not run the audit tool: %s" % type(exc).__name__)
+            answer = parse_operator_answer(getattr(r, "stdout", ""))
+            if answer is not None:
+                return answer
+        self._fail("the audit tool did not answer. Is the deployment running? (python dockvault.py status)")
+
+    def _audit_old_key(self, args):
+        """The old AUDIT_CHAIN_KEY from --old-key-file, read here on the host and handed to the tool on its
+        standard input, or None."""
+        path = getattr(args, "old_key_file", None) if args else None
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError as exc:
+            self._fail("could not read %s: %s" % (path, exc))
+        if not text:
+            self._fail("%s is empty" % path)
+        return text + "\n"
+
+    def _audit_two_phase(self, args, tool_args, what, check=None):
+        """Every host command that writes a seal runs in two steps: read the chain and show what will be
+        written, ask, then write with the state that was shown, so nothing changed in between is written over
+        unseen. What the read asks to confirm by name must be typed (or given with --confirm). ``check``, when
+        given, sees the read's answer before anything is asked, and may refuse."""
+        pal = self.pal
+        key = self._audit_old_key(args)
+        extra = ["--old-key-stdin"] if key is not None else []
+        seen = self._audit_tool(*(list(tool_args) + extra + ["--read"]), input_text=key)
+        if not seen.get("ok"):
+            self._fail(server_text(seen.get("error")) or "the chain could not be read")
+        for line in seen.get("lines") or []:
+            print("  " + server_text(line))
+        if check is not None:
+            check(seen)
+        given = list(getattr(args, "confirm", None) or [])
+        interactive = not getattr(args, "yes", False)
+        for name in seen.get("confirm") or []:
+            if name in given:
+                continue
+            if not interactive:
+                self._fail("confirm %s first: --confirm %s" % (name, name))
+            try:
+                typed = input(pal.paint("  Type %s to confirm it: " % server_text(name), "cyan"))
+            except EOFError:
+                typed = ""
+            if typed.strip() != name:
+                print(pal.paint("  Nothing written.\n", "yellow"))
+                return None
+            given.append(name)
+        if interactive:
+            try:
+                answer = input(pal.paint("  %s? Type yes: " % what, "cyan"))
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() != "yes":
+                print(pal.paint("  Nothing written.\n", "yellow"))
+                return None
+        confirms = []
+        for name in given:
+            confirms += ["--confirm", name]
+        done = self._audit_tool(*(list(tool_args) + extra + ["--expect", seen["state"]] + confirms),
+                                input_text=key)
+        if not done.get("ok"):
+            self._fail(server_text(done.get("error")) or "refused")
+        return done
+
+    def _audit_acknowledge(self, args):
+        """acknowledge: warnings by seal (--seqs), failures (--failures), rows holding a value no release writes
+        (--rows), or rows added to a sealed hour after its window (--late-rows <hour>)."""
+        pal = self.pal
+        seqs = (getattr(args, "seqs", None) or "").strip()
+        failures = bool(getattr(args, "failures", False))
+        rows = (getattr(args, "rows", None) or "").strip()
+        late = (getattr(args, "late_rows", None) or "").strip()
+        if not (seqs or failures or rows or late):
+            self._fail("say what to acknowledge: --seqs, --failures, --rows or --late-rows")
+        tool = ["acknowledge"]
+        if late:
+            tool += ["--late-rows", late]
+        else:
+            tool += (["--seqs", seqs] if seqs else []) + (["--failures"] if failures else []) + \
+                (["--rows", rows] if rows else [])
+        done = self._audit_two_phase(args, tool, "Acknowledge these")
+        if done is None:
+            return
+        if late:
+            print(pal.paint("  Sealed %s rows of %s (seal %s)\n" % (server_text(done.get("added")),
+                                                                  server_text(done.get("hour")),
+                                                                  server_text(done.get("sealed"))), "green"))
+            return
+        print(pal.paint("  Acknowledged: seals %s; failures %s; rows %s\n" % (
+            ", ".join(map(str, done.get("acknowledged") or [])) or "none",
+            ", ".join(server_text(k) for k in (done.get("failures") or [])) or "none",
+            ", ".join(server_text(r) for r in (done.get("rows") or [])) or "none"), "green"))
+
+    def _audit_change_key(self, args):
+        """Give the audit log's integrity chain a new AUDIT_CHAIN_KEY: write it into .env, recreate the stack,
+        and move the chain to it at once with `audit rekey --old-key-stdin --now`, the old key handed over on
+        standard input (never on a command line or in a container's environment, where `ps` or `docker inspect`
+        would show it). Sealing waits only for the seconds between the restart and that command. Until the move
+        is done the old key is kept beside .env (mode 600), and removed once the chain is under the new one."""
+        pal = self.pal
+        env = self._load_env()
+        old = (env.get("AUDIT_CHAIN_KEY") or "").strip()
+        interactive = not getattr(args, "yes", False)
+        if interactive and not confirm("Write a new AUDIT_CHAIN_KEY and move the audit log's chain to it now?", pal,
+                                       default=False):
+            print(pal.paint("  Nothing changed.\n", "yellow"))
+            return
+        kept = None
+        if old:
+            kept = os.path.join(self.root, ".audit-chain-key.previous")
+            try:
+                fd = os.open(kept, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(old + "\n")
+            except OSError as exc:
+                self._fail("could not keep the old key aside before changing it (%s): nothing changed" % exc)
+            tighten_secret_file(kept)
+        self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
+        print(pal.paint("  Wrote the new AUDIT_CHAIN_KEY; recreating the stack ...", "cyan"))
+        if not self._recreate_stack(build=False):
+            self._fail("the stack did not come up with the new key; the old key is in %s" % (kept or "(none)"))
+        self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
+        if not old:
+            print(pal.paint("  The chain was under the key derived from ENCRYPTION_KEY: it moves to the new key on "
+                            "its own, with a proof, at the next sealing pass.\n", "green"))
+            return
+        done = self._audit_tool("rekey", "--old-key-stdin", "--now", input_text=old + "\n")
+        if not done.get("ok"):
+            print(pal.paint("  The chain was not moved: %s" % server_text(done.get("error")), "red"))
+            print(pal.paint("  Sealing waits until it is: python dockvault.py audit rekey --old-key-file %s\n" % kept,
+                            "yellow"))
+            raise SystemExit(1)
+        try:
+            os.remove(kept)
+        except OSError:
+            pass
+        print(pal.paint("  The chain is under the new key (seal %s).\n" % server_text(done.get("sealed")), "green"))
+
+    def _db_free_bytes(self):
+        """The free space of the database volume, in bytes, as the database container sees it, or None."""
+        try:
+            r = self._run_dc("exec", "-T", DB_CONTAINER, "df", "-Pk", "/var/lib/postgresql/data", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return parse_df_available(getattr(r, "stdout", "") or "")
+
+    def _audit_unarchive(self, args):
+        """unarchive: restore archived audit days as rows (--from and --to, days), once they fit. The read says
+        how much the days take restored, 7 to 12 times their compressed size; this refuses, with the numbers,
+        unless the larger figure fits in the database volume's free space. Then the two steps of every host
+        command that writes a seal."""
+        pal = self.pal
+        tool = ["unarchive"]
+        for flag, name in (("--from", "audit_from"), ("--to", "audit_to")):
+            value = (getattr(args, name, None) or "").strip() if args else ""
+            if value:
+                tool += [flag, value[:10]]
+
+        def fits(seen):
+            est = seen.get("estimate") or {}
+            need = int(est.get("restored_high_bytes") or 0)
+            free = self._db_free_bytes()
+            if free is None:
+                self._fail("could not read the free space of the database volume (df in %s): nothing restored"
+                           % DB_CONTAINER)
+            print("  The database volume has %s free; restored, these days take about %s to %s."
+                  % (format_bytes(free), format_bytes(int(est.get("restored_low_bytes") or 0)), format_bytes(need)))
+            if need > free:
+                print(pal.paint("  That would not fit: up to %s needed, %s free. Free some space, or restore fewer "
+                                "days with --from and --to; nothing restored." % (format_bytes(need),
+                                                                                  format_bytes(free)), "red"))
+                raise SystemExit(1)
+
+        done = self._audit_two_phase(args, tool, "Restore these days as rows", check=fits)
+        if done is None:
+            return
+        days = done.get("days") or []
+        print(pal.paint("  Restored %s rows of %s days: %s" % (
+            server_text(done.get("rows")), len(days), ", ".join(server_text(d) for d in days) or "none"), "green"))
+
+    def _audit_compact(self, args):
+        """compact: VACUUM FULL of the audit tables, which gives their free space back to the system. It locks
+        them while it runs: audit writes wait, and fail after a few seconds."""
+        pal = self.pal
+        print(pal.paint("  audit compact rewrites audit_logs and audit_archive_blocks to give their free space back "
+                        "to the system. While it runs both tables are locked: every action the vault records "
+                        "waits and then fails, sign-ins and file actions included. Run it when nobody uses the "
+                        "vault.", "yellow"))
+        if not getattr(args, "yes", False):
+            try:
+                answer = input(pal.paint("  Compact the audit tables now? Type yes: ", "cyan"))
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() != "yes":
+                print(pal.paint("  Nothing done.", "yellow"))
+                return
+        done = self._audit_tool("compact")
+        if not done.get("ok"):
+            self._fail(server_text(done.get("error")) or "the audit tables were not compacted")
+        for t in done.get("tables") or []:
+            before, after = t.get("before_bytes"), t.get("after_bytes")
+            print(pal.paint("  %s: %s -> %s" % (server_text(t.get("table")),
+                                               format_bytes(before) if isinstance(before, int) else "?",
+                                               format_bytes(after) if isinstance(after, int) else "?"), "green"))
+
+    def _ask_unarchive_days(self):
+        """The days `unarchive` restores, asked in the menu: blank keeps the oldest, or the newest."""
+        pal = self.pal
+        first = ask("First day to restore (YYYY-MM-DD, blank for the oldest)", pal, default="")
+        last = ask("Last day to restore (YYYY-MM-DD, blank for the newest)", pal, default="")
+        return argparse.Namespace(audit_from=(first or "").strip() or None, audit_to=(last or "").strip() or None,
+                                  yes=False, confirm=None, old_key_file=None)
+
+    def _audit_retention(self, args):
+        """retention: how long records are kept, as the running server has it (the value in force, where it
+        comes from, the .env lines that set and bound it, the changes waiting). With --set NAME=VALUE, the
+        server first checks the lines (the names, that it would start with them, what changes and what deletes
+        sooner); then they are written to .env, after a confirmation, and take effect when the deployment is
+        recreated (python dockvault.py restart). A change of .env does not wait the panel's delay: one that
+        deletes sooner deletes at the restart, so it is confirmed by typing yes, or with --yes."""
+        pal = self.pal
+        interactive = args is None
+        texts = list(getattr(args, "audit_set", None) or []) if args is not None else []
+        try:
+            wanted = parse_retention_sets(texts)
+        except ValueError as exc:
+            self._fail(str(exc))
+        answer = self._audit_tool("retention", *[a for n, v in wanted for a in ("--set", "%s=%s" % (n, v))])
+        if not answer.get("ok"):
+            self._fail(server_text(answer.get("error")) or "the retention settings could not be read")
+        print(pal.paint("\n  How long records are kept (the value in force, and where it comes from)", "cyan"))
+        for line in describe_retention(answer):
+            print(line)
+        if interactive:
+            typed = ask("Change a .env line? NAME=VALUE (blank to leave everything as it is)", pal, default="")
+            if not (typed or "").strip():
+                print(pal.paint("  Nothing changed.\n", "yellow"))
+                return
+            try:
+                wanted = parse_retention_sets([typed])
+            except ValueError as exc:
+                self._fail(str(exc))
+            answer = self._audit_tool("retention", "--set", "%s=%s" % wanted[0])
+            if not answer.get("ok"):
+                self._fail(server_text(answer.get("error")) or "the line could not be checked")
+        if not wanted:
+            print()
+            return
+        checked = answer.get("check") or {}
+        problems = checked.get("problems") or []
+        if problems:
+            for p in problems:
+                print(pal.paint("  %s" % server_text(p), "red"))
+            print(pal.paint("  The server would not start with that: nothing written.", "red"))
+            raise SystemExit(2)
+        changes = checked.get("changes") or []
+        sooner = set(checked.get("deletes_sooner") or [])
+        for c in changes:
+            print(pal.paint("  %s: %s -> %s%s" % (
+                server_text(c.get("label") or c.get("key")), retention_value_text(c, c.get("before")),
+                retention_value_text(c, c.get("after")), "  (deletes sooner)" if c.get("key") in sooner else ""),
+                "yellow" if c.get("key") in sooner else ""))
+        if not changes:
+            print("  No value in force changes (an administrator's value in the panel, or a bound, keeps it).")
+        if sooner:
+            print(pal.paint("  This deletes records sooner, at the restart: a change of .env does not wait the "
+                            "delay a change in the panel waits.", "yellow"))
+        if self._is_locked():
+            self._fail(".env is locked: unlock it first (python dockvault.py unlock)")
+        if not getattr(args, "yes", False):
+            try:
+                ok = input(pal.paint("  Write %s to .env? Type yes: " % ", ".join(n for n, _v in wanted),
+                                     "cyan"))
+            except EOFError:
+                ok = ""
+            if ok.strip().lower() != "yes":
+                print(pal.paint("  Nothing written.\n", "yellow"))
+                return
+        for name, value in wanted:
+            self._set_env_key(self._env_path(), name, value)
+        print(pal.paint("  Written to .env. Recreate the deployment to apply it: python dockvault.py restart\n",
+                        "green"))
+
+    def _audit_host_command(self, args, action):
+        """rekey, after-record, accept-database-head, accept-restore, acknowledge-removed-before: in two steps,
+        recorded as the host operator."""
+        pal = self.pal
+        tool = [action]
+        if action == "rekey":
+            if getattr(args, "accept_unverified_history", False):
+                tool.append("--accept-unverified-history")
+            if getattr(args, "confirm_return", False):
+                tool.append("--confirm-return")
+            what = "Write the key seal"
+        elif action == "after-record":
+            if getattr(args, "discard", False):
+                tool.append("--discard")
+                if getattr(args, "discard_from", None):
+                    tool += ["--from", str(args.discard_from)]
+            if getattr(args, "confirm_unverified", False):
+                tool.append("--confirm-unverified")
+            what = "Discard these seals" if getattr(args, "discard", False) else "Accept these seals"
+        elif action in ("accept-database-head", "accept-restore"):
+            if getattr(args, "no_reseal", False):
+                tool.append("--no-reseal")
+            what = "Accept this restore"
+        else:
+            before = getattr(args, "before", None)
+            days = getattr(args, "retention_days", None)
+            if not before or not days:
+                self._fail("acknowledge-removed-before needs --before <time> and --retention-days <days>")
+            tool += [before, "--retention-days", str(days)]
+            what = "Seal over this removal"
+        done = self._audit_two_phase(args, tool, what)
+        if done is None:
+            return
+        shown = ", ".join("%s %s" % (k, server_text(v)) for k, v in sorted(done.items()) if k != "ok")
+        print(pal.paint("  Done: %s\n" % shown, "green"))
 
     def accounts(self, args=None):
         """Act on an account as the person who runs the server: reset a password or a second factor,
@@ -6365,6 +7262,8 @@ def build_parser():
                          "changed (the older one then starts only with %s=true). Not accepted for a "
                          "version older than %s, which has no such check and would start on that data "
                          "regardless" % (NEWER_DATA_ESCAPE, FIRST_NEWER_DATA_CHECK))
+    up.add_argument("--no-chain-key", dest="no_chain_key", action="store_true",
+                    help="do not write AUDIT_CHAIN_KEY: the audit log's chain key stays derived from ENCRYPTION_KEY")
     up.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
 
     lp = parsers["logs"]
@@ -6396,6 +7295,66 @@ def build_parser():
     cs.add_argument("--reason", dest="reason", help="reject: why (the auditor sees it); revoke-auditor: optional")
     cs.add_argument("--target", dest="target", help="downgrade-blockers: the version to go back to (X.Y.Z)")
     cs.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags, never prompt")
+
+    au = parsers["audit"]
+    au.add_argument("audit_action", nargs="?", default="verify",
+                    choices=("verify", "acknowledge", "rekey", "after-record", "accept-database-head",
+                             "accept-restore", "acknowledge-removed-before", "change-key", "unarchive", "compact",
+                             "retention"),
+                    help="verify (the default): check the chain and print its head; acknowledge: acknowledge "
+                         "warnings (--seqs), failures (--failures), rows (--rows) or late rows (--late-rows) once "
+                         "you have looked at them; rekey: move the chain to the current AUDIT_CHAIN_KEY; "
+                         "after-record: accept or discard the seals after the head record; accept-database-head: "
+                         "accept a restored database or a lost head record; accept-restore: finish a restore of a "
+                         "backup; acknowledge-removed-before: seal over rows an older release removed by age; "
+                         "change-key: give the chain a new AUDIT_CHAIN_KEY; unarchive: restore archived days as "
+                         "rows (--from, --to: days) once they fit in the database volume; compact: give the audit "
+                         "tables' free space back to the system (locks them while it runs); retention: how long "
+                         "records are kept, and with --set NAME=VALUE a .env limit changed once the server has "
+                         "checked it")
+    au.add_argument("--set", dest="audit_set", action="append", metavar="NAME=VALUE",
+                    help="retention: a .env line to change (repeat for more); the server checks it first")
+    au.add_argument("--seqs", dest="seqs", help="acknowledge: the warning seals, comma-separated")
+    au.add_argument("--failures", dest="failures", action="store_true",
+                    help="acknowledge: every failure, and every warning kept by kind (not a seal's), not yet "
+                         "acknowledged")
+    au.add_argument("--rows", dest="rows", help="acknowledge: rows holding a value no release writes, by id")
+    au.add_argument("--late-rows", dest="late_rows",
+                    help="acknowledge: seal the rows added to this sealed hour (YYYY-MM-DDTHH:00:00Z)")
+    au.add_argument("--old-key-file", dest="old_key_file",
+                    help="rekey, after-record, accept-database-head: a file holding the earlier AUDIT_CHAIN_KEY "
+                         "(read here, handed to the tool on its standard input)")
+    au.add_argument("--accept-unverified-history", dest="accept_unverified_history", action="store_true",
+                    help="rekey: the old key is lost; write the key seal without its proof")
+    au.add_argument("--confirm-return", dest="confirm_return", action="store_true",
+                    help="rekey: return to a key the chain had left")
+    au.add_argument("--discard", dest="discard", action="store_true",
+                    help="after-record: delete the seals after the head record that no writer accepted")
+    au.add_argument("--discard-from", dest="discard_from", type=int, help="after-record --discard: the first seal")
+    au.add_argument("--confirm-unverified", dest="confirm_unverified", action="store_true",
+                    help="after-record: accept a key seal written without its proof, which you wrote")
+    au.add_argument("--no-reseal", dest="no_reseal", action="store_true",
+                    help="accept-database-head, accept-restore: do not seal again the cancels and values lost")
+    au.add_argument("--confirm", dest="confirm", action="append",
+                    help="what the read asks to confirm by name (otherwise it is asked for)")
+    au.add_argument("--before", dest="before", help="acknowledge-removed-before: the removal's cutoff time")
+    au.add_argument("--acknowledge-removed-before", dest="acknowledge_removed_before", metavar="TIME",
+                    help="verify: seal over rows an older release removed by age before TIME (the same as "
+                         "acknowledge-removed-before --before TIME; needs --retention-days)")
+    au.add_argument("--retention-days", dest="retention_days", type=int,
+                    help="acknowledge-removed-before: the AUDIT_LOG_RETENTION_DAYS the older release ran with")
+    au.add_argument("--yes", dest="yes", action="store_true", help="write without asking (confirmations by name "
+                                                                    "still need --confirm)")
+    au.add_argument("--from", dest="audit_from", help="verify: the first hour whose rows are checked "
+                                                      "(YYYY-MM-DDTHH:00:00Z), every hour by default; unarchive: "
+                                                      "the first day (YYYY-MM-DD), the oldest by default")
+    au.add_argument("--to", dest="audit_to", help="verify: the hour the row check stops before; unarchive: the "
+                                                  "last day, the newest by default")
+    au.add_argument("--anchor", dest="anchor", help="a head you kept elsewhere (dvchain1:...): the seals up to it "
+                                                    "must be the ones it names")
+    au.add_argument("--no-key", dest="no_key", action="store_true",
+                    help="verify: check as an auditor without the key would (no key, no head record); with --anchor, "
+                         "a later change to an hour the anchor covered shows as not authenticated")
 
     lk = parsers["lock"]
     lk.add_argument("--passphrase-file", dest="passphrase_file", help="read the passphrase from this file (first line)")

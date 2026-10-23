@@ -8,6 +8,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import skip_for_older_deployment
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -30,6 +31,7 @@ def test_log_token_reveal_shows_usage_curl(page: Page, admin_creds, admin):
     _login(page, admin_creds["username"], admin_creds["password"])
     page.click('[data-section="settings"]')
     page.click('.tab-btn[data-tab="logs"]')
+    show_advanced(page, "logs")
     page.click("#log-token-generate-btn")
     page.fill("#log-token-name", "usage-doc-test")
     # the component scope checkboxes default to checked; mint the token

@@ -33,6 +33,11 @@ class Store:
     follows_levels: bool = False
 
 
+# An archived day's blocks are rewritten once the whole day is past the cutoff, not once an hour
+# (app/core/audit_rewrite.py cutoff).
+ARCHIVED_DAY_LATER = "in a day the archive holds, once the whole day is past them: up to a day later"
+
+
 def _days(n: int) -> str:
     return "for ever" if not n else (f"{n} day" if n == 1 else f"{n} days")
 
@@ -46,7 +51,18 @@ def _audit_kept() -> str:
         text += f"; administration and security events at least {_days(numbers.admin_min_days)}"
     if numbers.max_mb:
         text += f"; the oldest events go first once the log passes {numbers.max_mb} MB"
+    days = _full_address_days()
+    if days:
+        text += (f"; an address recorded in full is shortened to the network it is in after {_days(days)} "
+                 f"({ARCHIVED_DAY_LATER})")
     return text + "."
+
+
+def _full_address_days() -> int:
+    """How many days an address in an audit row stays in full (0: as long as the row), as configured now."""
+    from app.core import audit_rewrite, settings_registry
+    value = settings_registry.resolve(audit_rewrite.FULL_DAYS_KEY)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 def _security_record_kept() -> str:
@@ -72,6 +88,16 @@ def _compliance_kept() -> str:
 def _sessions_kept() -> str:
     from app.core.session_retention import SESSION_DATA_RETENTION_DAYS
     return f"For the session's life, then {_days(SESSION_DATA_RETENTION_DAYS)}."
+
+
+def _notifications_kept() -> str:
+    from app.core import working_records
+    return working_records.notifications_kept()
+
+
+def _log_access_file_kept() -> str:
+    from app.core import settings_registry, working_records
+    return f"Up to {settings_registry.resolve(working_records.SINK_KEY)} MB; the oldest lines go first."
 
 
 STORES = (
@@ -102,13 +128,13 @@ STORES = (
           "files opened; names revealed with their sealed reasons; files a legal hold keeps after they are deleted.",
           _compliance_kept),
     Store("notifications", "Your notifications, including one telling you of a sign-in or a change to your account "
-          "from an address.", lambda: "Until you dismiss them.", table="notifications"),
+          "from an address.", _notifications_kept, table="notifications"),
     Store("cache", "Counts of requests and failed sign-ins by address and by account, in the cache.",
           lambda: "Minutes, or a day at most."),
     Store("container_output", "The server's output, which shows each request's address and route.",
           lambda: "As long as the operator's log rotation keeps it."),
     Store("log_access_file", "A copy of the server's output kept for log access.",
-          lambda: "Up to 15 MB; the oldest lines go first."),
+          _log_access_file_kept),
     Store("backups", "Backups of the database and its settings, made by the operator.",
           lambda: "As long as the operator keeps them."),
 )
@@ -230,6 +256,18 @@ def _contact_fallback(db) -> Optional[str]:
         return None
 
 
+def _level_words(key: str, level: str) -> str:
+    words = LEVEL_WORDS[level]
+    if key == ap.IP and level == ap.FULL:
+        try:
+            days = _full_address_days()
+        except Exception:  # noqa: BLE001 -- the level alone
+            days = 0
+        if days:
+            words += f", then shortened to the network it is in after {_days(days)} ({ARCHIVED_DAY_LATER})"
+    return words
+
+
 def build_notice(db) -> dict:
     """The public notice, as configured now. Never names a person, an address or a past version."""
     policy = ap.current()
@@ -248,7 +286,7 @@ def build_notice(db) -> dict:
         stores.append({"key": store.key, "what": store.what, "kept": kept, "follows_levels": store.follows_levels})
     return {
         "version": policy.version,
-        "levels": [{"key": key, "label": ap.LABELS[key], "level": levels[key], "words": LEVEL_WORDS[levels[key]]}
+        "levels": [{"key": key, "label": ap.LABELS[key], "level": levels[key], "words": _level_words(key, levels[key])}
                    for key in ap.POLICY_KEYS],
         "always": "Every event is recorded: who acted (an account's username), what happened, when and its outcome. "
                   "Passwords, codes and link tokens are never recorded.",

@@ -16,6 +16,17 @@
 
 name: dockvault-vault
 
+# Container output (`docker logs`) is kept in rotated json-file files on every service: at most
+# DOCKER_LOG_MAX_FILE files of DOCKER_LOG_MAX_SIZE each per container (10m x 5 by default; set either in
+# .env). Unbounded output fills the host's disk. A service's own `logging:` replaces the host's default
+# driver for that container: on a host whose Docker sends every container's output elsewhere (journald,
+# syslog, a log shipper), see the README, "Container logs", before you remove these lines.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+    max-file: "${DOCKER_LOG_MAX_FILE:-5}"
+
 services:
   vault-db:
     # Pinned to the 15 major ON PURPOSE — do not let a Dependabot bump carry this to 18+.
@@ -61,6 +72,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-redis:
     image: redis:8-alpine@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
@@ -94,6 +106,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-api:
     build:
@@ -178,6 +191,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-sftp:
     image: ${DOCKVAULT_IMAGE:-dockvault-vault:latest}
@@ -191,6 +205,9 @@ services:
       REDIS_PORT: "6379"
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
+      # The audit log's integrity chain is the web server's alone: this process neither seals nor checks it,
+      # so it never holds the chain's key (an empty value here overrides the one in .env).
+      AUDIT_CHAIN_KEY: ""
       ENVIRONMENT: development
       # Tie the app's per-upload clamp to the tmpfs size below, so it applies exactly when this
       # service backs staging with a tmpfs (the app default is 0 = unclamped, for a compose that
@@ -224,7 +241,9 @@ services:
         condition: service_healthy
     volumes:
       - vault_storage:/app/storage
-      - vault_keys:/app/keys
+      # Read-only here: the keys volume holds the audit chain's head record, which only the web server writes.
+      # The web server writes this container's SSH host key on its first start, before this one starts.
+      - vault_keys:/app/keys:ro
     # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
     # storage/keys are volumes; this service doesn't mount the logs volume, so
     # /app/logs, /app/certs, and /tmp ride tmpfs.
@@ -260,6 +279,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
 volumes:
   # Labelled so dockvault.py can enumerate this deployment's volumes as one bundle (see the

@@ -6,6 +6,7 @@ without an email. It clears when a username-bearing mode is chosen again.
 """
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -33,6 +34,7 @@ def _open_accounts_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-tab-accounts, .tab-btn[data-tab='accounts']").first).to_be_visible(timeout=10000)
     page.click('.tab-btn[data-tab="accounts"]')
+    show_advanced(page, "accounts")
     expect(page.locator("#setting-login-identifier")).to_be_visible(timeout=10000)
     # Wait for the async settings load to populate the select — otherwise populateAccountsPolicy can
     # run AFTER our selection and reset it to the stored value.

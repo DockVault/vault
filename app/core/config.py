@@ -474,6 +474,11 @@ class Settings(BaseSettings):
     audit_min_retention_days: int = Field(default=0)
     audit_protected_min_days: int = Field(default=365)
     audit_log_max_mb: int = Field(default=0)
+    # A per-person erase (app/core/person_erase.py) waits, with this true, while any audit row it would change is
+    # younger than the protected minimum for its kind (AUDIT_MIN_RETENTION_DAYS for every row, the panel's
+    # protected minimum for administration and security rows): for deployments whose records must be kept
+    # intact that long. False (the default): an erase runs once its delay has passed.
+    erase_blocked_by_protected_minimum: bool = Field(default=False)
     plan_log_max_days: int = Field(default=-1)
     plan_log_max_mb: int = Field(default=-1)
     # How long records are kept is managed in the panel (app/core/settings_registry.py), within the limits
@@ -508,6 +513,33 @@ class Settings(BaseSettings):
     compliance_auditor_grant_days: int = Field(default=365)
     compliance_record_min_days: int = Field(default=2190)
 
+    # Working records (app/core/working_records.py). Each person's notifications are deleted this many days
+    # after they arrive, read or not (30-3650; 0, the default, keeps them until the person dismisses them);
+    # the panel may change it. The log-access file (LOG_PULL_SINK_PATH) and its two older copies hold
+    # LOG_PULL_SINK_MAX_MB in all (3-1000).
+    notification_retention_days: int = Field(default=0)
+    # How many days an address in an audit row stays in full before it is shortened to its network
+    # (app/core/audit_rewrite.py); 0, the default, keeps it as recorded. The panel may change it (a lower number
+    # waits the reduction delay).
+    audit_ip_full_days: int = Field(default=0)
+    log_pull_sink_max_mb: int = Field(default=15)
+    # The audit log's integrity chain (app/core/audit_integrity.py): every closed hour of audit rows is
+    # sealed, and the seals are chained under a key the database never holds. AUDIT_CHAIN_KEY is that key's
+    # secret (at least 32 random characters, not ENCRYPTION_KEY; setup writes one). Unset, the key is
+    # derived from ENCRYPTION_KEY, which everyone who holds ENCRYPTION_KEY can then use too. An hour is
+    # sealed AUDIT_SEAL_LAG_MINUTES after it closes (0-1440). AUDIT_CHAIN_HEAD_FILE is where the server
+    # keeps its own copy of the chain's head, outside the database, on the keys volume.
+    audit_chain_key: str = Field(default="")
+    audit_seal_lag_minutes: int = Field(default=60)
+    audit_chain_head_file: str = Field(default="/app/keys/audit-chain-head.json")
+    # The audit log's archive (app/core/audit_archive.py): UTC days older than AUDIT_HOT_DAYS (31-3650) are
+    # compressed into daily blocks, each checked against the seals before its rows are removed; nothing is
+    # deleted, and `dockvault.py audit unarchive` restores them. The panel can change the window within those
+    # bounds. Archiving starts AUDIT_ARCHIVE_START_AFTER_DAYS (0-90) after this release first ran here (the
+    # chain's genesis), so going back to an earlier release meanwhile needs no unarchive.
+    audit_hot_days: int = Field(default=90)
+    audit_archive_start_after_days: int = Field(default=14)
+    
     # Logging. Logs go to the container's output; the in-app log access (Settings -> Log access)
     # keeps its own size-capped file (LOG_PULL_SINK_PATH, which creates its own directory). An old
     # .env's LOG_FILE_PATH -- once shipped here but never written -- is ignored like any unknown key.
@@ -667,6 +699,11 @@ def _validate_runtime_settings(candidate: Settings) -> None:
     weak = key_problem(candidate)
     if weak:
         raise RuntimeBootstrapError("audit-fingerprint-key-weak", weak + ".")
+
+    from app.core.audit_chain_keys import key_problem as chain_key_problem
+    weak = chain_key_problem(candidate)
+    if weak:
+        raise RuntimeBootstrapError("audit-chain-key-weak", weak + ".")
 
     if (candidate.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
         raise RuntimeBootstrapError(

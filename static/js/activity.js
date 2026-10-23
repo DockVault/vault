@@ -545,6 +545,23 @@
     // The list's params: the filters, the range, and a time picked on the chart inside it.
     function listParams() { return listParamsFor(S.range, S.f); }
 
+    // Whether the open event still matches the list: the list's filters, with the range narrowed to the event's own
+    // instant (it matches only inside the list's range anyway), so that over archived days the server reads only the
+    // part that holds it rather than every archived day of the range.
+    function detailCheckParams(id) {
+        const q = listParams();
+        q.set('ids', id);
+        const ts = S.detail && S.detail.id === id ? S.detail.timestamp : null;
+        const t = ts ? new Date(ts) : null;
+        if (!t || isNaN(t.getTime())) return q;
+        const from = q.get('from_date');
+        if (!from || t > new Date(from)) q.set('from_date', ts);
+        const end = new Date(t.getTime() + 1).toISOString();
+        const to = q.get('to_date');
+        if (!to || new Date(end) < new Date(to)) q.set('to_date', end);
+        return q;
+    }
+
     function listParamsFor(range, f) {
         const p = filterParams(f);
         const r = rangeBoundsFor(range);
@@ -1387,11 +1404,7 @@
         const detailId = S.detailOpen && !o.keepDetail ? S.selectedId : null;
         try {
             const reads = [get('/activity/events?' + params.toString())];
-            if (detailId) {
-                const q = listParams();
-                q.set('ids', detailId);
-                reads.push(get('/activity/events?' + q.toString()).catch(() => null));
-            }
+            if (detailId) reads.push(get('/activity/events?' + detailCheckParams(detailId).toString()).catch(() => null));
             const [data, one] = await Promise.all(reads);
             if (seq !== S.listSeq) return;
             const stillMatches = detailId ? !!(one && one.events && one.events.length) : null;
@@ -1416,6 +1429,8 @@
             S.lastRead = new Date();
             S.listLoaded = true;
             S.listError = null;
+            // What the list says of archived days (static/js/activity-archive.js).
+            document.dispatchEvent(new CustomEvent('activity:list', { detail: data }));
             clearHeld();
             renderListError();
             renderList();
@@ -1424,6 +1439,7 @@
             if (seq !== S.listSeq || S.blocked) return;
             S.listError = err.message || 'unknown error';
             S.listLoaded = true;
+            document.dispatchEvent(new CustomEvent('activity:list', { detail: null }));
             renderListError();
             renderList();
         } finally {
@@ -2302,6 +2318,7 @@
 
     function applyBand(data, snap) {
         S.band = data;
+        document.dispatchEvent(new CustomEvent('activity:band', { detail: data }));
         if (snap != null) S.bandFrom = { kind: data.range, from: data.from, snap };
         if (!S.now && data.now) S.now = data.now;
         renderBand();

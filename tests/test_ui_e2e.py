@@ -11,6 +11,7 @@ import uuid
 
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -102,6 +103,7 @@ def test_directory_search_scope_setting_persists_via_ui(logged_in: Page, admin):
     try:
         page.click('.sidebar-item[data-section="settings"]')
         page.click('.tab-btn[data-tab="sftp"]')
+        show_advanced(page, "sftp")
         # Wait until loadSettings has populated the control (else its async fetch would reset our
         # selection after select_option and the save would send the stale value).
         expect(page.locator("#setting-directory-search-scope")).to_have_value("deployment")
@@ -127,6 +129,7 @@ def test_directory_search_scope_setting_persists_via_ui(logged_in: Page, admin):
         page.reload()
         page.click('.sidebar-item[data-section="settings"]')
         page.click('.tab-btn[data-tab="sftp"]')
+        show_advanced(page, "sftp")
         expect(page.locator("#setting-directory-search-scope")).to_have_value("same_department")
     finally:
         admin.put("/settings", json={"directory_search_scope": "deployment"})
@@ -524,6 +527,7 @@ def _open_sftp_settings_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.click('.tab-btn[data-tab="sftp"]')
+    show_advanced(page, "sftp")
     expect(page.locator("#settings-tab-sftp")).to_be_visible(timeout=5000)
     save = page.locator("#save-all-settings-btn")
     expect(save).to_have_attribute("data-settings-ready", "true", timeout=15000)
@@ -649,6 +653,7 @@ def test_settings_sftp_policy_survives_groups_fetch_failure(logged_in: Page, adm
         page.click('.sidebar-item[data-section="settings"]')
         expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
         page.click('.tab-btn[data-tab="sftp"]')
+        show_advanced(page, "sftp")
         # Degraded read-only state is shown, not a silently empty picker.
         expect(page.locator("#sftp-temp-cred-group-picker")).to_contain_text(
             "policy shown read-only", timeout=5000

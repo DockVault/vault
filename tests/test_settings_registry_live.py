@@ -21,7 +21,8 @@ from app.core import settings_registry as R
 from app.core.database import SessionLocal, _require_engine
 a, b = sys.argv[1], sys.argv[2]
 for key in (a, b):
-    R.register(R.SettingSpec(key=key, kind="int", default=1, minimum=0, maximum=100))
+    R.register(R.SettingSpec(key=key, kind="int", default=1, minimum=0, maximum=100, level=R.ADVANCED,
+                             since="0.34.0"))
 out = {}
 first_stored = threading.Event()
 

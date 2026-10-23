@@ -11,6 +11,7 @@ These run on a throwaway SQLite database.
 """
 import ast
 import inspect
+import os
 import re
 import tempfile
 import threading
@@ -31,9 +32,11 @@ set_bare_api_env()
 from app.api import api_server as api  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import (ActiveSession, AuditLog, CredentialChange, ManagedSetting,  # noqa: E402
-                             ManagedSettingChange, PendingLogin, RateLimitRecord, RoleEnum, SecurityAlert,
-                             SystemSetting, User, ZkKeyProofChallenge)
+from app.core.models import (AccountInvitation, ActiveSession, AuditArchiveBlock, AuditLog, AuditSeal,  # noqa: E402
+                             CredentialChange, EmailChangeCode, ManagedSetting,
+                             ManagedSettingChange, Notification, OtpCode, PasswordResetToken, PendingLogin,
+                             RateLimitRecord, RoleEnum, SecurityAlert, SystemSetting, User, ZkKeyProofChallenge)
+from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -49,7 +52,8 @@ def env(monkeypatch):
     settings = SimpleNamespace(settings_locked_keys="", retention_hold=False, log_prune_interval_minutes=15,
                                log_prune_batch_rows=5000, retention_reduction_delay_days=7,
                                audit_log_retention_days=0, security_alert_retention_days=90,
-                               jwt_access_token_expire_minutes=60)
+                               jwt_access_token_expire_minutes=60, notification_retention_days=0,
+                               log_pull_sink_max_mb=15)
     monkeypatch.setattr(reg, "_deployment_settings", lambda: settings)
     monkeypatch.setattr(retention, "_settings", lambda: settings)
     monkeypatch.setattr(retention, "KEEP_RULES", {})
@@ -64,7 +68,9 @@ def factory(monkeypatch):
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'retention.db'}")
         copies = sa.MetaData()
         for model in (User, ActiveSession, PendingLogin, CredentialChange, RateLimitRecord, SecurityAlert,
-                      AuditLog, ManagedSetting, ManagedSettingChange, SystemSetting, ZkKeyProofChallenge):
+                      AuditLog, AuditSeal, AuditArchiveBlock, ManagedSetting, ManagedSettingChange,
+                      SystemSetting, ZkKeyProofChallenge, AccountInvitation, PasswordResetToken, OtpCode,
+                      EmailChangeCode, Notification):
             # Each column as it is, without the foreign keys (the tables they name are not copied), and with
             # SQLite's spelling of "now" where Postgres's is the default.
             columns = []
@@ -123,8 +129,34 @@ def _count(factory, model, *conditions):
     return factory().query(model).filter(*conditions).count()
 
 
+_CHAIN = []
+
+
+@pytest.fixture(autouse=True)
+def chain(request, monkeypatch, tmp_path):
+    """The audit log's integrity chain on the test's database, when the test has one: the audit job deletes
+    only through it."""
+    if "factory" not in request.fixturenames:
+        yield None
+        return
+    c = Chain(monkeypatch, tmp_path, request.getfixturevalue("env"), request.getfixturevalue("factory"), NOW)
+    _CHAIN.append(c)
+    yield c
+    _CHAIN.clear()
+
+
+def _retention_days(env, days):
+    """AUDIT_LOG_RETENTION_DAYS changed in .env on a running install: the chain has started (under the
+    deployment's first values), and the next pass seals the change before it acts on it."""
+    _CHAIN[-1].seal_all(NOW)
+    env.audit_log_retention_days = days
+    _CHAIN[-1].setenv("AUDIT_LOG_RETENTION_DAYS", days)
+
+
 def _pass(factory, **kw):
     kw.setdefault("now", NOW)
+    if _CHAIN:
+        _CHAIN[-1].at(kw["now"])
     return dict(retention.run_pass(factory, **kw))
 
 
@@ -201,11 +233,13 @@ def test_the_retention_settings_are_configured_documented_and_kept_by_the_tool(m
 
 def test_the_jobs_and_which_the_hold_switch_stops():
     assert [(j.name, j.held) for j in retention.JOBS] == [
-        ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
+        ("audit_seals", False), ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
         ("credential_changes", False), ("auditor_grants", False), ("compliance_cases", False),
         ("legal_holds", False), ("owner_notices", True),
-        ("rate_limit_records", False), ("security_alerts", True), ("security_records", True),
-        ("security_alert_values", True), ("audit_env_retention", False), ("audit_logs", True)]
+        ("rate_limit_records", False), ("invitations", False), ("one_time_proofs", False), ("notifications", False),
+        ("security_alerts", True), ("security_records", True),
+        ("security_alert_values", True), ("audit_env_retention", False), ("person_erase", True),
+        ("audit_value_removal", True), ("audit_ip_shortening", True), ("audit_logs", True), ("audit_archive", False)]
 
 
 def test_finished_sessions_and_sign_ins_go_after_their_window(env, factory):
@@ -266,39 +300,334 @@ def test_resolved_alerts_go_after_their_window_and_unresolved_ones_stay(env, fac
     assert _pass(factory)["security_alerts"].deleted == 1
 
 
+# --------------------------------------------------------------------------- working records
+
+DAY = timedelta(days=1)
+
+
+def _wr():
+    from app.core import working_records
+    return working_records
+
+
+def _invitation(db, *, expires_at, accepted_at=None, revoked_at=None, created_at=OLD):
+    inv = AccountInvitation(id=uuid.uuid4(), username=f"inv-{uuid.uuid4().hex[:8]}", role="user",
+                            token_prefix=uuid.uuid4().hex[:12], token_hash=uuid.uuid4().hex * 2,
+                            expires_at=expires_at, accepted_at=accepted_at, revoked_at=revoked_at,
+                            created_at=created_at)
+    db.add(inv)
+    db.commit()
+    return inv.id
+
+
+def _proof(db, model, user, *, expires_at, consumed_at=None):
+    common = dict(id=uuid.uuid4(), user_id=user.id, expires_at=expires_at, consumed_at=consumed_at, created_at=OLD)
+    if model is PasswordResetToken:
+        row = model(token_prefix=uuid.uuid4().hex[:12], token_hash=uuid.uuid4().hex * 2, **common)
+    elif model is OtpCode:
+        row = model(purpose="email_change", code_hash=uuid.uuid4().hex * 2, attempts=0, max_attempts=3, **common)
+    else:
+        row = model(new_email="new@example.com", code_hash=uuid.uuid4().hex * 2, **common)
+    db.add(row)
+    db.commit()
+    return row.id
+
+
+def _notification(db, user, at, *, read=False, ntype="share_received"):
+    n = Notification(id=uuid.uuid4(), user_id=user.id, type=ntype, title="t", is_read=read, created_at=at,
+                     read_at=at if read else None)
+    db.add(n)
+    db.commit()
+    return n.id
+
+
+def _notification_days(env, days):
+    """NOTIFICATION_RETENTION_DAYS changed in .env on a running install: the next pass seals the change (the
+    chain reads its inputs from the environment) before it acts on it."""
+    _CHAIN[-1].seal_all(NOW)
+    env.notification_retention_days = days
+    _CHAIN[-1].setenv("NOTIFICATION_RETENTION_DAYS", days)
+
+
+def _ids(factory, model):
+    return {r.id for r in factory().query(model).all()}
+
+
+def test_the_working_record_windows_are_listed_fixed_and_the_notification_window_is_a_reduction(env):
+    wr = _wr()
+    for key in (wr.INVITATION_DAYS_KEY, wr.ONE_TIME_DAYS_KEY):
+        spec = reg.spec_for(key)
+        assert (spec.editable, spec.default, spec.group, reg.resolve(key)) == (reg.FIXED, 30, "working_records", 30)
+    spec = reg.spec_for(wr.NOTIFICATION_DAYS_KEY)
+    assert (spec.kind, spec.default, spec.env, spec.editable, spec.minimum, spec.maximum, spec.unlimited,
+            spec.reduction) == ("int", 0, "notification_retention_days", reg.ADMIN, 30, 3650, 0, reg.LOWER)
+    # 0 keeps for ever: giving it a number deletes sooner, and so does a smaller number.
+    assert reg.is_reduction(spec, 0, 90) and reg.is_reduction(spec, 90, 30)
+    assert not reg.is_reduction(spec, 90, 0) and not reg.is_reduction(spec, 30, 90)
+    assert reg.check_value(spec, 29) is not None and reg.check_value(spec, 30) is None and reg.check_value(spec, 0) is None
+    # A setting an administrator may lower: the audit chain records it, so the pruner acts on the chain's value.
+    from app.core import audit_chain_policy as pol
+    assert wr.NOTIFICATION_DAYS_KEY in pol.chain_setting_keys()
+    assert "NOTIFICATION_RETENTION_DAYS" in pol.input_names()
+    from app.services import log_sink
+    spec = reg.spec_for(wr.SINK_KEY)
+    assert (spec.kind, spec.default, spec.env, spec.editable, spec.minimum, spec.maximum, spec.unit) == (
+        "int", log_sink.SINK_DEFAULT_MB, "log_pull_sink_max_mb", reg.ENV_ONLY, log_sink.SINK_MIN_MB,
+        log_sink.SINK_MAX_MB, "MB")
+    env.log_pull_sink_max_mb = 2
+    assert any("LOG_PULL_SINK_MAX_MB is not valid" in p for p in reg.check_contract())
+
+
+def test_invitations_go_thirty_days_after_they_end(env, factory):
+    db = factory()
+    later = NOW + 5 * DAY
+    kept = {_invitation(db, expires_at=later, accepted_at=NOW - 29 * DAY),
+            _invitation(db, expires_at=later, revoked_at=NOW - 29 * DAY),
+            _invitation(db, expires_at=NOW - 29 * DAY),
+            # Pending: made long ago, still claimable.
+            _invitation(db, expires_at=NOW + DAY)}
+    gone = {_invitation(db, expires_at=later, accepted_at=NOW - 31 * DAY),
+            _invitation(db, expires_at=later, revoked_at=NOW - 31 * DAY),
+            _invitation(db, expires_at=NOW - 31 * DAY)}
+    result = _pass(factory)["invitations"]
+    assert result.deleted == 3
+    assert _ids(factory, AccountInvitation) == kept and not gone & _ids(factory, AccountInvitation)
+    (row,) = _pruned(factory, "invitations")
+    assert (row["table"], row["deleted"]) == (AccountInvitation.__tablename__, 3)
+
+
+@pytest.mark.parametrize("model", [PasswordResetToken, OtpCode, EmailChangeCode])
+def test_used_or_expired_reset_links_and_codes_go_thirty_days_after_they_end(env, factory, model):
+    db = factory()
+    user = _user(db)
+    kept = {_proof(db, model, user, consumed_at=NOW - 29 * DAY, expires_at=NOW - 29 * DAY + timedelta(minutes=10)),
+            _proof(db, model, user, expires_at=NOW - 29 * DAY),
+            _proof(db, model, user, expires_at=NOW + timedelta(minutes=10))}
+    gone = {_proof(db, model, user, consumed_at=NOW - 31 * DAY, expires_at=NOW - 31 * DAY + timedelta(minutes=10)),
+            # Used 31 days ago, before an expiry that has not come: it ended when it was used.
+            _proof(db, model, user, consumed_at=NOW - 31 * DAY, expires_at=NOW + DAY),
+            _proof(db, model, user, expires_at=NOW - 31 * DAY)}
+    result = _pass(factory)["one_time_proofs"]
+    assert result.deleted == 3
+    assert _ids(factory, model) == kept and not gone & _ids(factory, model)
+    (row,) = _pruned(factory, "one_time_proofs")
+    assert (row["table"], row["deleted"]) == (model.__tablename__, 3)
+
+
+US = timedelta(microseconds=1)
+HALF = timedelta(hours=12)
+
+
+def test_the_working_record_windows_end_thirty_days_to_the_microsecond(env, factory):
+    """Ended exactly 30 days ago, or 29 and a half: kept. A microsecond more than 30 days: deleted. The same edge
+    for invitations, reset links and codes, and notifications on a 30-day window."""
+    db = factory()
+    user = _user(db)
+    later = NOW + 5 * DAY
+    kept, gone = {}, {}
+    for ended in (30 * DAY, 30 * DAY - HALF):
+        kept[f"accepted {ended}"] = _invitation(db, expires_at=later, accepted_at=NOW - ended)
+        kept[f"revoked {ended}"] = _invitation(db, expires_at=later, revoked_at=NOW - ended)
+        kept[f"expired {ended}"] = _invitation(db, expires_at=NOW - ended)
+    gone["accepted"] = _invitation(db, expires_at=later, accepted_at=NOW - 30 * DAY - US)
+    gone["revoked"] = _invitation(db, expires_at=later, revoked_at=NOW - 30 * DAY - US)
+    gone["expired"] = _invitation(db, expires_at=NOW - 30 * DAY - US)
+    proofs_kept, proofs_gone = {}, {}
+    for model in (PasswordResetToken, OtpCode, EmailChangeCode):
+        for ended in (30 * DAY, 30 * DAY - HALF):
+            proofs_kept[(model, "used", ended)] = _proof(db, model, user, consumed_at=NOW - ended, expires_at=later)
+            proofs_kept[(model, "expired", ended)] = _proof(db, model, user, expires_at=NOW - ended)
+        proofs_gone[(model, "used")] = _proof(db, model, user, consumed_at=NOW - 30 * DAY - US, expires_at=later)
+        proofs_gone[(model, "expired")] = _proof(db, model, user, expires_at=NOW - 30 * DAY - US)
+    notes_kept = {_notification(db, user, NOW - 30 * DAY), _notification(db, user, NOW - 30 * DAY + HALF)}
+    notes_gone = {_notification(db, user, NOW - 30 * DAY - US)}
+    _notification_days(env, 30)
+    done = _pass(factory)
+    assert (done["invitations"].deleted, done["one_time_proofs"].deleted, done["notifications"].deleted) == (3, 6, 1)
+    assert _ids(factory, AccountInvitation) == set(kept.values())
+    for model in (PasswordResetToken, OtpCode, EmailChangeCode):
+        assert _ids(factory, model) == {i for (m, *_), i in proofs_kept.items() if m is model}, model
+    assert _ids(factory, Notification) == notes_kept and not notes_gone & _ids(factory, Notification)
+
+
+def test_each_kind_of_one_time_proof_goes_in_one_pass(env, factory):
+    db = factory()
+    user = _user(db)
+    for model in (PasswordResetToken, OtpCode, EmailChangeCode):
+        _proof(db, model, user, expires_at=OLD)
+    assert _pass(factory)["one_time_proofs"].deleted == 3
+    assert sorted(r["table"] for r in _pruned(factory, "one_time_proofs")) == sorted(
+        m.__tablename__ for m in (PasswordResetToken, OtpCode, EmailChangeCode))
+
+
+def test_notifications_are_kept_while_the_window_is_zero(env, factory):
+    db = factory()
+    user = _user(db)
+    rows = {_notification(db, user, NOW - 3650 * DAY), _notification(db, user, OLD, read=True)}
+    assert _pass(factory)["notifications"].deleted == 0
+    assert _ids(factory, Notification) == rows
+    assert _wr().notifications_kept() == "Until you dismiss them."
+
+
+def test_notifications_go_after_their_window_read_or_not(env, factory):
+    db = factory()
+    user = _user(db)
+    kept = {_notification(db, user, NOW - 29 * DAY), _notification(db, user, NOW - 29 * DAY, read=True)}
+    gone = {_notification(db, user, NOW - 31 * DAY), _notification(db, user, NOW - 31 * DAY, read=True)}
+    _notification_days(env, 30)
+    assert _pass(factory)["notifications"].deleted == 2
+    assert _ids(factory, Notification) == kept and not gone & _ids(factory, Notification)
+    (row,) = _pruned(factory, "notifications")
+    assert (row["table"], row["deleted"]) == (Notification.__tablename__, 2)
+    assert _wr().notifications_kept() == "Until you dismiss them, or 30 days after they arrive."
+
+
+def test_a_window_written_into_the_database_deletes_no_notification_sooner(env, factory):
+    """The database's value of notification_retention_days, set without the server's key, cannot make the job
+    delete sooner than the audit chain's value: it acts on whichever keeps longer."""
+    db = factory()
+    user = _user(db)
+    middle = _notification(db, user, NOW - 60 * DAY)
+    _notification_days(env, 90)
+    _pass(factory)
+    reg.store(db, _wr().NOTIFICATION_DAYS_KEY, 30)       # behind the panel's back
+    db.commit()
+    _notification(db, user, NOW - 95 * DAY)
+    done = _pass(factory)
+    assert reg.resolve(_wr().NOTIFICATION_DAYS_KEY) == 30            # the registry reads the database's value
+    # The job ran (the 95-day-old one went) on the chain's 90 days: the 60-day-old one stays.
+    assert done["notifications"].deleted == 1 and _ids(factory, Notification) == {middle}
+
+
+def test_the_notification_window_waits_for_the_audit_chain_and_keeps_the_longer(env, monkeypatch):
+    from app.core import audit_chain_policy_seals as ps
+    wr = _wr()
+    values = {"answer": None}
+    monkeypatch.setattr(ps, "numbers", lambda st=None: values["answer"])
+    env.notification_retention_days = 0
+    assert wr.notification_days() == 0                   # nothing to delete: the chain is not asked
+    values["answer"] = {wr.NOTIFICATION_DAYS_KEY: 30}
+    assert wr.notification_days() == 0                   # the database keeps them: the longer of the two
+    values["answer"] = None
+    env.notification_retention_days = 60
+    assert wr.notification_days() is None                # no chain yet, or sealing stopped: wait
+    values["answer"] = {}
+    assert wr.notification_days() is None                # the chain's state does not hold it: wait
+    values["answer"] = {wr.NOTIFICATION_DAYS_KEY: 0}
+    assert wr.notification_days() == 0                   # the chain keeps them
+    values["answer"] = {wr.NOTIFICATION_DAYS_KEY: 90}
+    assert wr.notification_days() == 90
+    values["answer"] = {wr.NOTIFICATION_DAYS_KEY: 30}
+    assert wr.notification_days() == 60
+
+
+def test_the_notifications_job_deletes_nothing_while_the_chain_cannot_give_its_window(env, factory, monkeypatch,
+                                                                                     capsys):
+    from app.core import audit_chain_policy_seals as ps
+    db = factory()
+    user = _user(db)
+    row = _notification(db, user, OLD)
+    _notification_days(env, 30)
+    monkeypatch.setattr(ps, "numbers", lambda st=None: None)
+    capsys.readouterr()
+    assert _pass(factory)["notifications"].deleted == 0
+    assert _ids(factory, Notification) == {row}
+    # It says why, as the audit job does.
+    assert "The pruner's notifications job waits for the audit chain" in capsys.readouterr().out
+
+
+def test_the_working_record_jobs_go_on_under_the_hold(env, factory):
+    db = factory()
+    user = _user(db)
+    _invitation(db, expires_at=OLD)
+    _proof(db, PasswordResetToken, user, expires_at=OLD)
+    _notification(db, user, OLD)
+    _notification_days(env, 30)
+    reg.store(db, retention.HOLD_KEY, True)
+    db.commit()
+    done = _pass(factory)
+    assert done["security_alerts"] is None              # held
+    assert (done["invitations"].deleted, done["one_time_proofs"].deleted, done["notifications"].deleted) == (1, 1, 1)
+
+
+def test_a_keep_rule_keeps_working_records(env, factory):
+    db = factory()
+    user = _user(db)
+    held_note = _notification(db, user, OLD, ntype="kept")
+    _notification(db, user, OLD)
+    held_link = _proof(db, PasswordResetToken, user, expires_at=OLD)
+    _proof(db, PasswordResetToken, user, expires_at=OLD - DAY)
+    held_invitation = _invitation(db, expires_at=OLD)
+    _invitation(db, expires_at=OLD - DAY)
+    retention.register_keep("notifications", lambda model, now: model.type == "kept")
+    retention.register_keep("password_reset_tokens", lambda model, now: model.id == held_link)
+    retention.register_keep("account_invitations", lambda model, now: model.id == held_invitation)
+    _notification_days(env, 30)
+    done = _pass(factory)
+    assert (done["invitations"].deleted, done["one_time_proofs"].deleted, done["notifications"].deleted) == (1, 1, 1)
+    assert (_ids(factory, Notification), _ids(factory, PasswordResetToken), _ids(factory, AccountInvitation)) == (
+        {held_note}, {held_link}, {held_invitation})
+
+
+def test_the_working_record_settings_are_configured_documented_and_kept_by_the_tool(monkeypatch):
+    import importlib.util
+    from app.core.config import Settings
+    fields = Settings.model_fields
+    assert (fields["notification_retention_days"].default, fields["log_pull_sink_max_mb"].default) == (0, 15)
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for line in ("# NOTIFICATION_RETENTION_DAYS=0", "# LOG_PULL_SINK_MAX_MB=15"):
+        assert example.count(f"\n{line}\n") == 1, line
+    spec = importlib.util.spec_from_file_location("dockvault_working_records", ROOT / "dockvault.py")
+    dv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dv)
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
+    given = {"NOTIFICATION_RETENTION_DAYS": "90", "LOG_PULL_SINK_MAX_MB": "60"}
+    lines = dv.build_env_lines({**dv.new_set_config(given, "prefix-1", "dep-1"), "server_name": "localhost"})
+    written = dv.parse_env("\n".join(lines))
+    assert {k: written.get(k) for k in given} == given
+    parsed = Settings(notification_retention_days=written["NOTIFICATION_RETENTION_DAYS"],
+                      log_pull_sink_max_mb=written["LOG_PULL_SINK_MAX_MB"])
+    assert (parsed.notification_retention_days, parsed.log_pull_sink_max_mb) == (90, 60)
+    for kept in ({}, {"NOTIFICATION_RETENTION_DAYS": "0", "LOG_PULL_SINK_MAX_MB": "15"}):
+        plain = dv.build_env_lines({**dv.new_set_config(kept, "prefix-1", "dep-1"), "server_name": "localhost"})
+        assert not [line for line in plain if line.split("=")[0] in given]
+
+
 def test_audit_rows_go_only_after_a_positive_retention(env, factory):
     db = factory()
     _audit(db, OLD, n=3)
     _audit(db, NOW - timedelta(days=1))
     assert _pass(factory)["audit_logs"].deleted == 0 and _count(factory, AuditLog) == 4
-    env.audit_log_retention_days = 30
+    _retention_days(env, 30)
     assert _pass(factory)["audit_logs"].deleted == 3
     assert _count(factory, AuditLog, AuditLog.action == "file_upload") == 1
     (row,) = _pruned(factory, "audit_logs")
     assert row["deleted"] == 3
 
 
-@pytest.mark.parametrize("rows,transactions", [(5, 3), (4, 3), (1, 1), (0, 1)])
-def test_a_job_deletes_in_batches_one_transaction_each(env, factory, monkeypatch, rows, transactions):
-    env.audit_log_retention_days = 30
-    monkeypatch.setattr(retention, "JOBS", [j for j in retention.JOBS if j.name == "audit_logs"])
+@pytest.mark.parametrize("batch_rows,records", [(5000, [3, 1]), (2, [2, 1, 1]), (1, [2, 1, 1])])
+def test_a_job_deletes_a_day_of_hours_at_most_per_transaction(env, factory, monkeypatch, batch_rows, records):
+    """Audit rows go through the chain: each transaction deletes the rows of at most one day of sealed hours
+    (and stops adding hours once it has deleted a batch of rows; an hour is never split), with its prune seal
+    and its record."""
     db = factory()
-    _audit(db, OLD, n=rows)
-    before = len(factory.made)
-    assert _pass(factory, batch_rows=2)["audit_logs"].deleted == rows
-    # One session to read the settings, one to see the first pass after an upgrade is done, and one per
-    # batch (5 rows in twos: 2, 2, 1; 4 rows: 2, 2, then an empty one), each batch writing its own record.
-    assert len(factory.made) - before == 2 + transactions
+    _audit(db, OLD, n=2)
+    _audit(db, OLD + timedelta(hours=1))
+    _audit(db, OLD + timedelta(days=1))
+    _retention_days(env, 30)
+    assert _pass(factory, batch_rows=batch_rows)["audit_logs"].deleted == 4
     assert _count(factory, AuditLog, AuditLog.action == "file_upload") == 0
-    assert [r["deleted"] for r in _pruned(factory, "audit_logs")] == [2] * (rows // 2) + [1] * (rows % 2)
+    assert [r["deleted"] for r in _pruned(factory, "audit_logs")] == records
+    prunes = factory().query(AuditSeal).filter(AuditSeal.kind == "prune").order_by(AuditSeal.seq).all()
+    assert [len(p.detail["hours"]) for p in prunes] == ([2, 1] if batch_rows > 4 else [1, 1, 1])
 
 
 def test_every_batch_statement_is_bounded(env, factory, monkeypatch):
     seen = []
     monkeypatch.setattr(retention, "limit_statements", lambda db: seen.append(db))
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=5)
+    _retention_days(env, 30)
     _pass(factory, batch_rows=2)
     assert len(seen) >= 3
 
@@ -315,17 +644,17 @@ def test_the_statement_bound_is_set_on_postgres(monkeypatch):
 
 
 def test_a_pass_stops_when_its_time_runs_out(env, factory):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=5)
+    _retention_days(env, 30)
     assert _pass(factory, budget_seconds=0) == {}
     assert _count(factory, AuditLog) == 5
 
 
 def test_a_job_that_fails_never_stops_the_others(env, factory, monkeypatch, capsys):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=2)
+    _retention_days(env, 30)
 
     def broken(p):
         raise RuntimeError("no")
@@ -338,10 +667,11 @@ def test_a_job_that_fails_never_stops_the_others(env, factory, monkeypatch, caps
 
 def test_every_batch_commits_with_its_record_or_not_at_all(env, factory, monkeypatch, capsys):
     """A pass stopped part way leaves a record of each batch it committed, and a batch whose record cannot
-    be written deletes nothing."""
-    env.audit_log_retention_days = 30
-    monkeypatch.setattr(retention, "JOBS", [j for j in retention.JOBS if j.name == "audit_logs"])
-    _audit(factory(), OLD, n=5)
+    be written deletes nothing (nor writes its seal)."""
+    for day in range(3):
+        _audit(factory(), OLD + timedelta(days=day), n=2 if day < 2 else 1)
+    _retention_days(env, 30)
+    monkeypatch.setattr(retention, "JOBS", [j for j in retention.JOBS if j.name in ("audit_seals", "audit_logs")])
     real, calls = retention.Pass.record, []
 
     def second_fails(self, db, done, table=None):
@@ -375,12 +705,12 @@ def test_the_record_is_catalogued_as_the_servers_own():
 # --------------------------------------------------------------------------- the hold switch and what is kept
 
 def test_the_hold_switch_stops_the_log_jobs_and_not_the_working_records(env, factory):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, n=2)
     _alert(db, OLD, True)
     db.add(RateLimitRecord(id=uuid.uuid4(), identifier="x", action="login", window_start=OLD, attempt_count=1))
     db.commit()
+    _retention_days(env, 30)
     reg.store(db, retention.HOLD_KEY, True)             # stored by another process: the pass reads it itself
     db.commit()
     done = _pass(factory)
@@ -391,14 +721,21 @@ def test_the_hold_switch_stops_the_log_jobs_and_not_the_working_records(env, fac
     reg.store(db, retention.HOLD_KEY, None)
     db.commit()
     done = _pass(factory)
-    assert done["audit_logs"].deleted == 2 and done["security_alerts"].deleted == 1
+    # The database's hold kept more than the audit chain's state, so the pass sealed it as a veto: clearing
+    # the database's value afterwards releases neither the audit rows nor the security records (only an
+    # administrator's change, sealed and waited for, does): every job over logs reads the chain's hold too.
+    assert done["audit_logs"] is None and done["security_alerts"] is None
+    assert _count(factory, SecurityAlert) == 1
+    vetoes = [s for s in factory().query(AuditSeal).filter(AuditSeal.kind == "policy").all()
+              if s.detail["cause"] == "database"]
+    assert len(vetoes) == 1 and vetoes[0].detail["state"]["logs_hold"]["value"] is True
 
 
 def test_rows_a_keep_rule_keeps_are_never_deleted(env, factory):
-    env.audit_log_retention_days = 30
     db = factory()
     _audit(db, OLD, action="settings_updated", n=2)
     _audit(db, OLD, action="file_upload", n=3)
+    _retention_days(env, 30)
     retention.register_keep("audit_logs", lambda model, now: model.action == "settings_updated")
     retention.register_keep("audit_logs", lambda model, now: None)      # keeps nothing just now
     assert _pass(factory)["audit_logs"].deleted == 3
@@ -415,17 +752,36 @@ def test_a_keep_rule_is_added_once(env):
 # --------------------------------------------------------------------------- the waiting settings changes
 
 def test_a_pass_applies_the_settings_changes_that_are_due(env, factory, monkeypatch):
+    """A change is made with its seal in the audit chain, and the pruner applies it from the chain once its
+    delay has run, while sealing ran (a pass every few hours, as on a running install)."""
+    from app.core import audit_chain_policy_seals as ps
     from app.core import setting_changes as sc
     monkeypatch.setattr(sc, "announce", lambda *a, **k: None)
     db = factory()
     alice = _user(db)
-    sc.request(db, retention.HOLD_KEY, True, actor=alice, now=NOW - timedelta(days=30))
-    db.commit()
+    chain = _CHAIN[-1]
+    chain.seal_all(NOW - timedelta(days=31))
+    engine = db.get_bind()
+
+    def change(value, at):
+        chain.at(at)
+        with ps.change_transaction(engine) as w:
+            outcome = ps.change(w, retention.HOLD_KEY, value, alice, now=at)
+        return outcome.status
+
+    assert change(True, NOW - timedelta(days=30)) == "applied"
     reg.refresh(factory)
-    sc.request(db, retention.HOLD_KEY, False, actor=alice, now=NOW - timedelta(days=8))
-    db.commit()
+    assert change(False, NOW - timedelta(days=8)) == "pending"
     assert reg.resolve(retention.HOLD_KEY) is True
-    _pass(factory)
+    at = NOW - timedelta(days=8)
+    while at < NOW - timedelta(days=1, hours=6):
+        at += timedelta(hours=6)
+        _pass(factory, now=at)
+    reg.refresh(factory)
+    assert reg.resolve(retention.HOLD_KEY) is True          # seven days have not yet run
+    while at < NOW:
+        at += timedelta(hours=6)
+        _pass(factory, now=at)
     reg.refresh(factory)
     assert reg.resolve(retention.HOLD_KEY) is False
 
@@ -571,7 +927,7 @@ def _job_functions() -> set:
         for name in _handed_the_pass(ast.parse(inspect.getsource(fn).lstrip())):
             for module in ("app.core.retention", "app.core.audit_retention", "app.core.security_records",
                            "app.core.setting_changes", "app.core.credential_changes",
-                           "app.core.session_retention"):
+                           "app.core.session_retention", "app.core.working_records"):
                 target = getattr(importlib.import_module(module), name, None)
                 if inspect.isfunction(target):
                     todo.append(target)
@@ -584,7 +940,9 @@ OWNED_FUNCTIONS = _job_functions() | {"Pass", "delete_in_batches", "run_pass", "
                                       "purge_old_session_data", "purge_expired_key_proof_challenges",
                                       "cleanup_old_audit_logs", "cleanup_old_alerts"}
 # ZkKeyProofChallenge is not listed: issuing a key-proof challenge deletes the caller's own expired ones (a few
-# rows, which keeps the account under its cap of live challenges), and the pruner sweeps the rest.
+# rows, which keeps the account under its cap of live challenges), and the pruner sweeps the rest. Nor are the
+# working records whose own flows delete them (a person dismissing a notification, a new reset link or code
+# replacing the unused one): the pruner deletes only what ended 30 days ago, or outlived its window.
 OWNED_MODELS = {"AuditLog", "SecurityAlert", "SecurityRecord", "RateLimitRecord", "CredentialChange",
                 "ActiveSession", "PendingLogin", "ManagedSettingChange"}
 # Timed deletions the periodic loop keeps, each for a reason. Any other call there whose name starts with

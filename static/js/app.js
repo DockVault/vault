@@ -8412,6 +8412,7 @@ function renderRateLimitSettings(rows, apiEnabled) {
 function _rlBuildRow(row) {
     const wrap = _el('div', 'rl-row');
     wrap.dataset.key = row.key;
+    wrap.dataset.setting = row.key;   // its level, "New" and the provider's lock (settings-levels.js)
     wrap.style.cssText = 'border:1px solid var(--border, #e5e7eb); border-radius:8px; padding:10px 12px; margin-bottom:8px;';
 
     // Header: label (+unit) and an info toggle.
@@ -12233,6 +12234,7 @@ async function _zkUnlockOnce() {
     }
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
     zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
+    try { zkAfterUnlock(); } catch (_) { /* background work only (static/js/zk-background.js) */ }
     return zkState.privateKey;
 }
 
@@ -13992,7 +13994,7 @@ async function zkVaultKeyStatus(vaultId) {
         throw e;
     }
     const holdsKey = !!(keys && keys.has_access);
-    return { holdsKey, rekeyOwed: holdsKey && !!keys.rekey_owed };
+    return { holdsKey, rekeyOwed: holdsKey && !!keys.rekey_owed, keys };
 }
 
 // The notice a key holder sees when their zero-knowledge vault owes a rotation: someone was removed
@@ -14016,6 +14018,9 @@ async function refreshZkRekeyNotice() {
     }
     // Another vault may have been opened while the answer was on its way.
     if (!state.currentVault || state.currentVault.id !== vault.id) return;
+    // A direct vault whose current epoch has no key check yet gets one now, without asking for the passphrase
+    // (static/js/zk-background.js).
+    if (status.holdsKey) zkBootstrapInBackground(vault, status.keys);
     if (!status.holdsKey || !status.rekeyOwed) return;
 
     const notice = document.createElement('div');
@@ -18474,7 +18479,8 @@ async function confirmVaultGrant() {
     const level = document.getElementById('vault-grant-level').value;
     if (!ids.length) return;
     const zk = isZkVault(state.currentVault);
-    const results = await Promise.allSettled(ids.map(async uid => {
+    // A few at a time (static/js/zk-background.js), each share's requests one after another.
+    const results = await runAtMost(ids, BULK_SHARE_AT_ONCE, async uid => {
         // Zero-knowledge: try to wrap the DEK to each recipient. A keyless recipient returns
         // {pending:true} (an invite is recorded) rather than throwing — we STILL create the authz
         // membership row below (the server permits a keyless member); the wrapped key follows once
@@ -18486,7 +18492,7 @@ async function confirmVaultGrant() {
         }
         await apiRequest(`/vaults/${state.currentVault.id}/permissions`, { method: 'POST', body: JSON.stringify({ user_id: uid, level }) });
         return { pending };
-    }));
+    });
     const settled = results.filter(r => r.status === 'fulfilled');
     const pendingCount = settled.filter(r => r.value && r.value.pending).length;
     const ok = settled.length - pendingCount;

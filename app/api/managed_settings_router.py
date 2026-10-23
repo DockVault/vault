@@ -9,6 +9,10 @@
     PUT  /settings/managed/{key}                       an administrator's value for one setting;
                                                        ``{"value": null}`` goes back to the deployment's value.
     POST /settings/managed/changes/{change_id}/cancel  cancel a waiting change, by any administrator.
+    GET  /settings/managed/storage                     what the audit log and its archive take, what the size
+                                                       cap counts, the free space of the files' volume, and
+                                                       whether the install ran before this release
+                                                       (app/core/retention_storage.py).
 
 A change that deletes data sooner waits before it applies, and any administrator may cancel it meanwhile
 (app/core/setting_changes.py); every administrator is told of every change. Changing a value asks for the
@@ -19,6 +23,12 @@ Every route is a plain ``def``, so it runs on the thread pool, and every stateme
 statement timeout. Only an interactive administrator reaches them (a temporary credential is refused). A
 change is written with its audit row in one transaction: when the row cannot be written, the change is not
 made either.
+
+Each change and each cancel also writes its seal in the audit log's integrity chain, in the same transaction
+(app/core/audit_chain_policy_seals.py): the pruner acts on those seals, never on the database's values alone.
+Another writer of seals holding the chain's lock gives 409 (busy, retry). While sealing is stopped, or before
+the chain's first seal, a change that deletes sooner is refused with the reason; a change that keeps data
+longer, and a cancel, are saved and sealed from the database once sealing runs again.
 """
 from __future__ import annotations
 
@@ -31,6 +41,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.user_management_api import require_interactive_admin
+from app.core import audit_chain_policy_seals as chain_seals
+from app.core import audit_integrity
 from app.core import fixed_step_up
 from app.core import setting_changes
 from app.core import settings_registry as registry
@@ -73,11 +85,15 @@ def change_dict(change) -> Optional[dict]:
 @router.get("/settings/managed")
 def get_managed_settings(current_user: User = Depends(require_interactive_admin),
                          db: Session = Depends(get_db)):
-    """Every managed setting, from this process's copy, and the changes waiting (read from the table)."""
+    """Every managed setting, from this process's copy, the changes waiting as the audit log's integrity chain
+    holds them (app/core/audit_chain_pending.py: the database's rows neither add to that list nor hide an entry),
+    and when the audit archive starts and what it holds."""
     limit_statements(db)
-    return {"settings": registry.describe(), "locked": sorted(registry.locked_tokens()),
+    from app.core import audit_archive, audit_chain_pending
+    return {"settings": with_chain(registry.describe()), "locked": sorted(registry.locked_tokens()),
             "reduction_delay_days": registry.resolve(setting_changes.DELAY_KEY),
-            "pending": [change_dict(c) for c in setting_changes.pending_for(db)]}
+            "pending": audit_chain_pending.entries(db), "pending_chain": audit_chain_pending.chain_state(),
+            "archive": audit_archive.summary()}
 
 
 def spec_or_404(key: str) -> registry.SettingSpec:
@@ -87,9 +103,34 @@ def spec_or_404(key: str) -> registry.SettingSpec:
     return spec
 
 
+# Where the chain's entry came from, as the panel names where a value came from.
+_CHAIN_SOURCE = {"setting": registry.SOURCE_ADMIN, "clamped": registry.SOURCE_ADMIN, "held": registry.SOURCE_ADMIN,
+                 "env": registry.SOURCE_ENV, "default": registry.SOURCE_DEFAULT}
+
+
+def with_chain(rows: list) -> list:
+    """Each row of a setting the audit chain records shows what the pruner acts on (the chain's honoured
+    entry): its value, where it came from, the administrator's setting behind it, and the entry itself beside
+    them. The database's stored value alone decides nothing, so a value written into the database without the
+    chain's key is never shown as in force; it is shown apart, as ``database_stored``."""
+    entries = chain_seals.honoured_entries()
+    for row in rows:
+        entry = entries.get(row["key"])
+        if entry is None:
+            continue
+        row["database_stored"] = row.get("stored")
+        row["value"] = entry.get("value")
+        if row.get("source") != registry.SOURCE_LOCKED:
+            row["source"] = _CHAIN_SOURCE.get(entry.get("source"), row.get("source"))
+        row["stored"] = entry.get("setting") if row["source"] == registry.SOURCE_ADMIN else None
+        row["clamped"] = entry.get("source") == "clamped"
+        row["chain"] = {"value": entry.get("value"), "setting": entry.get("setting"), "source": entry.get("source")}
+    return rows
+
+
 def in_force(spec: registry.SettingSpec) -> dict:
     """The one describe() row of ``spec``."""
-    return registry.describe([spec.key])[0]
+    return with_chain(registry.describe([spec.key]))[0]
 
 
 def refusal(spec: registry.SettingSpec, value) -> Optional[str]:
@@ -124,14 +165,34 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
     _step_up(db, current_user, request)       # may commit (a receipt is used once): bound the rest again
     limit_statements(db)
     try:
-        outcome = setting_changes.request(db, key, body.value, actor=current_user)
-        change = change_dict(outcome.change)
-        db.commit()
+        try:
+            with chain_seals.change_transaction(db.get_bind()) as w:
+                limit_statements(w.db)
+                outcome = chain_seals.change(w, key, body.value, current_user)
+                change = change_dict(outcome.change)
+        except audit_integrity.ChainStopped as stopped:
+            # No seal can be written: a change that deletes sooner waits for sealing; any other is saved, and
+            # sealed from the database once sealing runs again.
+            if chain_seals.refuses_while_stopped(db, key, body.value):
+                db.rollback()
+                raise HTTPException(status_code=409, detail=(
+                    "This change deletes records sooner, and the audit log's integrity chain is not sealing "
+                    f"just now ({stopped.kind}), so it cannot be recorded. Nothing was changed; try again later."))
+            outcome = setting_changes.request(db, key, body.value, actor=current_user,
+                                              judge=chain_seals.judge_now(key))
+            change = change_dict(outcome.change)
+            db.commit()
+    except audit_integrity.ChainBusy:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Busy, retry: the audit log is being sealed.")
+    except HTTPException:
+        raise
     except registry.SettingRefused as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc))
-    except Exception:  # noqa: BLE001 -- no change without its audit row
+    except Exception as exc:  # noqa: BLE001 -- no change without its audit row
         db.rollback()
+        registry._say(f"Warning: a change of {key} was not saved ({type(exc).__name__}: {exc})")
         raise HTTPException(status_code=503, detail="The change was not saved: its audit record could not be "
                                                     "written. Nothing was changed.")
     if outcome.status == "applied":
@@ -144,26 +205,45 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
 def cancel_managed_setting_change(change_id: uuid.UUID,
                                   current_user: User = Depends(require_interactive_admin),
                                   db: Session = Depends(get_db)):
-    """Cancel a waiting change, with its audit row in the same transaction; every administrator is told."""
+    """Cancel a waiting change, with its audit row in the same transaction; every administrator is told. The
+    change is one the audit log's integrity chain holds waiting, whatever the database's row says: a row the
+    chain holds no request of is no change (404)."""
     limit_statements(db)
     try:
-        change = setting_changes.cancel(db, change_id, actor=current_user)
-        details = {"key": change.key, "old": change.old_value, "new": change.new_value,
-                   "requested_by": change.requested_by_name}
-        out = change_dict(change)
-        db.commit()
+        try:
+            with chain_seals.change_transaction(db.get_bind()) as w:
+                limit_statements(w.db)
+                out = chain_seals.cancel(w, change_id, current_user)
+        except audit_integrity.ChainStopped:
+            # Saved now, honoured at once (it keeps data longer), sealed from the database once sealing runs.
+            out = chain_seals.cancel_while_stopped(db, change_id, current_user)
+            db.commit()
+    except audit_integrity.ChainBusy:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Busy, retry: the audit log is being sealed.")
     except LookupError:
         db.rollback()
         raise HTTPException(status_code=404, detail="No such change")
     except registry.SettingRefused as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc))
-    except Exception:  # noqa: BLE001 -- no cancel without its audit row
+    except Exception as exc:  # noqa: BLE001 -- no cancel without its audit row
         db.rollback()
+        registry._say(f"Warning: a cancel of a waiting change was not saved ({type(exc).__name__}: {exc})")
         raise HTTPException(status_code=503, detail="The change was not cancelled: its audit record could not "
                                                     "be written. It is still waiting.")
+    details = {"key": out["key"], "old": out["old"], "new": out["new"], "requested_by": out["requested_by"]}
     setting_changes.announce(setting_changes.CANCELLED_BY_ADMIN, details, current_user.username)
     return {"status": "cancelled", "change": out}
+
+
+@router.get("/settings/managed/storage")
+def managed_storage(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """The page's Storage card (app/core/retention_storage.py). On Postgres it reads the planner's estimate of the
+    audit rows and counts them only on a table never analysed; the size cap's count comes from the chain's view."""
+    limit_statements(db)
+    from app.core import config, retention_storage
+    return retention_storage.summary(db, setting_changes.utcnow(), config.settings.file_storage_path)
 
 
 # A preview counts over the whole audit table, so it may take longer than a change.
@@ -173,10 +253,12 @@ PREVIEW_STATEMENT_TIMEOUT_MS = 30000
 @router.get("/settings/managed/audit/preview")
 def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[int] = None,
                             admin_min_days: Optional[int] = None, max_mb: Optional[int] = None,
+                            bytes_now: bool = False,
                             current_user: User = Depends(require_interactive_admin),
                             db: Session = Depends(get_db)):
     """What the audit job would delete now if the three numbers were these (each left out: the value in
-    force): rows and bytes by age and by size, by the same conditions the job uses."""
+    force): rows and bytes by age and by size, by the same conditions the job uses. ``bytes_now``: the size cap
+    counts what the log takes now, as it will once growth has waited its delay (the Storage card's warning)."""
     limit_statements(db, PREVIEW_STATEMENT_TIMEOUT_MS)
     from app.core import audit_retention as ar
     numbers = ar.current()
@@ -192,7 +274,7 @@ def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[i
         asked[key] = value
     numbers = ar.Numbers(asked.get(ar.MAX_DAYS, numbers.max_days), asked.get(ar.MIN_DAYS, numbers.min_days),
                          asked.get(ar.ADMIN_MIN_DAYS, numbers.admin_min_days), asked.get(ar.MAX_MB, numbers.max_mb))
-    out = ar.preview(db, setting_changes.utcnow(), numbers)
+    out = ar.preview(db, setting_changes.utcnow(), numbers, bytes_now=bytes_now)
     out["numbers"] = {ar.MAX_DAYS: numbers.max_days, ar.MIN_DAYS: numbers.min_days,
                       ar.ADMIN_MIN_DAYS: numbers.admin_min_days, ar.MAX_MB: numbers.max_mb}
     return out

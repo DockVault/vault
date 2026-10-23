@@ -285,6 +285,27 @@ It is not audited, since it changes nothing. When something stops it, the databa
 still prints one JSON object, `{"ok": false, ...}`, exits with status 1 and says what happened on standard
 error.
 
+### The audit log from the host
+
+```bash
+python dockvault.py                      # the menu: its Audit log entry asks for retention, verify, unarchive or compact
+python dockvault.py audit                # the same as audit verify
+python dockvault.py audit retention      # how long each kind of record is kept, and where the value comes from
+python dockvault.py audit retention --set AUDIT_LOG_RETENTION_DAYS=400   # change a .env limit, checked first
+python dockvault.py audit verify         # check the integrity chain; keep the head it prints somewhere else
+python dockvault.py audit unarchive --from 2026-01-01 --to 2026-01-31   # archived days back as rows
+python dockvault.py audit compact        # give the audit tables' free space back (locks them while it runs)
+```
+
+`audit retention --set` asks the running server first: a line it would refuse to start with is not
+written, and a change that deletes records sooner says so and needs `yes` (or `--yes`). A change of `.env`
+takes effect when the deployment is recreated (`python dockvault.py restart`), without the delay a change
+made in Settings, Activity and records waits, so prefer the panel for anything that deletes sooner. An
+administrator's value in the panel stays in force over the `.env` value, within the limits `.env` sets.
+`audit unarchive` checks that the restored days fit in the database volume before it writes anything.
+Every setting is described in `.env.example`, and what each kind of record holds in
+[`docs/data-inventory.md`](docs/data-inventory.md).
+
 ### Sealing credentials at rest (optional)
 
 `.env` holds every secret (including `ENCRYPTION_KEY`). You can seal it while the deployment is off:
@@ -334,6 +355,36 @@ It is the same control that protects a running deployment's `.env`. Run DockVaul
 but the on-disk layout still reveals **structure** — vault/file/folder counts, each encrypted file's
 size (to within the format's fixed overhead), and modification times. That residual metadata channel is
 an explicit non-goal; host full-disk encryption is again the control against a volume reader.
+
+## Container logs
+
+Docker keeps each container's output (`docker logs`: the web access log and the application's own
+lines). The shipped compose files rotate it on every service: Docker's `json-file` driver, at most
+`DOCKER_LOG_MAX_FILE` files (default 5) of `DOCKER_LOG_MAX_SIZE` (default `10m`) each, so about 50 MB per
+container. To change either, set it in `.env` (for example `DOCKER_LOG_MAX_SIZE=50m`) and run
+`python dockvault.py restart`: Docker applies log settings when it creates a container.
+
+**Which deployments have it.** The rotation is in the compose files, not in the image. A deployment set up
+or updated from a 0.34.0 checkout (or later) has it. A deployment that updates only by pulling a newer
+image (`DOCKVAULT_IMAGE`, the Update menu's default) keeps the compose files it was set up with, and with
+them output that is never rotated: update the checkout to the release you run (for example
+`git fetch --tags && git checkout v0.34.0`), or add the `logging:` block of `deploy/docker-compose.secure.yml`
+to each service of your compose file by hand. To see what Docker applied to each container:
+
+```bash
+docker inspect -f '{{.Name}} {{.HostConfig.LogConfig.Type}} {{.HostConfig.LogConfig.Config}}' \
+  $(docker compose -f docker-compose.secure.yml ps -q)
+```
+
+**A host that sends every container's output elsewhere.** A service's own `logging:` replaces the host's
+default for that container. If your Docker daemon sends container output to journald, syslog or a log
+shipper (`log-driver` in `/etc/docker/daemon.json`), DockVault's containers would no longer go there. To
+keep the host's driver, delete the `logging: *logging` line from each service in
+`deploy/docker-compose.secure.yml` (and `deploy/docker-compose.yml` for the local trial), then run
+`python dockvault.py restart`; the host's own settings, including any rotation they set, apply again. Pointing
+the block at journald or syslog instead does not work: they refuse the `max-size` and `max-file` options.
+An update of the checkout brings the lines back, so remove them again after each one. `dockvault.py setup`
+and `update` say so when the daemon's default driver is not `json-file`.
 
 ## Update notifications (opt-in)
 

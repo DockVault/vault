@@ -54,6 +54,22 @@ def generate_ed25519_host_key(path: Union[str, Path]) -> None:
     durable_write.sync_directory(path.parent)
 
 
+def ensure_host_key(path: Union[str, Path]) -> bool:
+    """Generate the SFTP host key at ``path`` when there is none yet; True when one was written. The web server
+    calls it at its start: in the split layout the SFTP container mounts the keys volume read-only (the audit
+    chain's head record lives there, and only the web server may write it), so its key must exist before it
+    starts, and the web server starts first. An existing key is never touched, so its fingerprint never
+    changes. Never raises: an SFTP container that still finds no key reports that itself."""
+    path = Path(path)
+    try:
+        if path.exists():
+            return False
+        generate_ed25519_host_key(path)
+        return True
+    except OSError:
+        return False
+
+
 def load_host_key(path: Union[str, Path]) -> paramiko.PKey:
     """Load an SFTP host key, trying Ed25519 (new installs) then RSA (existing installs).
 

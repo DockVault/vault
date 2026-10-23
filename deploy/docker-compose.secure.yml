@@ -33,6 +33,17 @@
 
 name: dockvault-vault
 
+# Container output (`docker logs`) is kept in rotated json-file files on every service: at most
+# DOCKER_LOG_MAX_FILE files of DOCKER_LOG_MAX_SIZE each per container (10m x 5 by default; set either in
+# .env). Unbounded output fills the host's disk. A service's own `logging:` replaces the host's default
+# driver for that container: on a host whose Docker sends every container's output elsewhere (journald,
+# syslog, a log shipper), see the README, "Container logs", before you remove these lines.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+    max-file: "${DOCKER_LOG_MAX_FILE:-5}"
+
 services:
   vault-db:
     # Pinned to the 15 major ON PURPOSE — do not let a Dependabot bump carry this to 18+.
@@ -74,6 +85,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-redis:
     image: redis:8-alpine@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
@@ -102,6 +114,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   # DEFAULT (combined) mode — COMPOSE_PROFILES=combined: ONE container runs BOTH the
   # web/API (HTTPS on 443) and, when RUN_SFTP=1, the SFTP server (2322) via run_combined.py
@@ -206,6 +219,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-api:
     # SPLIT mode (COMPOSE_PROFILES=split): the web/API as its OWN container, paired with
@@ -304,6 +318,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
   vault-sftp:
     # SPLIT mode (COMPOSE_PROFILES=split): the SFTP server as its own container, paired with
@@ -322,6 +337,9 @@ services:
       REDIS_PORT: "6379"
       SFTP_HOST: 0.0.0.0
       SFTP_PORT: "2222"
+      # The audit log's integrity chain is the web server's alone: this process neither seals nor checks it,
+      # so it never holds the chain's key (an empty value here overrides the one in .env).
+      AUDIT_CHAIN_KEY: ""
       # Tie the app's per-upload clamp to the staging tmpfs size below, so it applies exactly when
       # this container backs SFTP staging with a tmpfs (the app default is 0 = unclamped).
       SFTP_STAGING_TMPFS_MB: ${SFTP_STAGING_TMPFS_MB:-512}
@@ -357,7 +375,9 @@ services:
         condition: service_healthy
     volumes:
       - vault_storage:/app/storage
-      - vault_keys:/app/keys
+      # Read-only here: the keys volume holds the audit chain's head record, which only the web server writes.
+      # The web server writes this container's SSH host key on its first start, before this one starts.
+      - vault_keys:/app/keys:ro
     # Hardening: non-root (Dockerfile USER) + no escalation + read-only root fs.
     # storage/keys are volumes; this service doesn't mount the logs volume, so
     # /app/logs, /app/certs, and /tmp ride tmpfs. (/tmp is also where the healthcheck's
@@ -395,6 +415,7 @@ services:
     networks:
       - vault-network
     restart: unless-stopped
+    logging: *logging
 
 volumes:
   # DockVault labels every named volume so the management tool (dockvault.py) can enumerate a

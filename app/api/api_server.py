@@ -763,9 +763,18 @@ app.include_router(email_studio_router, prefix="/email")
 # The settings the panel manages through the settings registry (app/core/settings_registry.py)
 from app.api.managed_settings_router import router as managed_settings_router
 app.include_router(managed_settings_router)
+# Per-person erase (Settings -> Activity and records): a deleted account's name removed from the records.
+from app.api.person_erase_router import router as person_erase_router  # noqa: E402
+app.include_router(person_erase_router)
 # What the audit log records of personal data (Settings -> Activity and records).
 from app.api.recording_levels_router import router as recording_levels_router  # noqa: E402
 app.include_router(recording_levels_router)
+# Removing values recorded under earlier levels, beside them.
+from app.api.value_removal_router import router as value_removal_router  # noqa: E402
+app.include_router(value_removal_router)
+# What the Settings pages need to sort, mark and search every setting (its level, release and lock).
+from app.api.settings_catalogue_router import router as settings_catalogue_router  # noqa: E402
+app.include_router(settings_catalogue_router)
 # What users are told the audit log records: the public notice, its page, and the banner after a change.
 from app.api.recording_notice_router import router as recording_notice_router  # noqa: E402
 app.include_router(recording_notice_router)
@@ -778,6 +787,9 @@ app.include_router(activity_unlock_router)
 # Compliance access: the auditor right, cases, legal holds and their step-ups.
 from app.api.compliance_router import router as compliance_router  # noqa: E402
 app.include_router(compliance_router)
+# The audit log's integrity status on the Activity page: the chain's head and the last check.
+from app.api.audit_integrity_router import router as audit_integrity_router  # noqa: E402
+app.include_router(audit_integrity_router)
 
 @app.get("/download-sw.js", include_in_schema=False)
 async def download_service_worker():
@@ -874,9 +886,14 @@ def _validate_new_username(v):
     Rejects control, format and other invisible characters (Unicode category C): an escape byte in a
     username acts on the terminal of whoever prints it (the host tool, a log viewer), and an invisible
     one makes two usernames look the same.
-    NOT applied to LoginRequest, where an email is a legitimate identifier in email/either mode."""
+    NOT applied to LoginRequest, where an email is a legitimate identifier in email/either mode.
+    Rejects a name that starts with "erased-", in any case: a per-person erase writes such placeholders into
+    the audit log (app/core/person_erase.py), and an account named like one would read as their owner."""
     import unicodedata
+    from app.core.person_erase import is_reserved_name
     v = _reject_markup_chars(v, 'username')
+    if v is not None and is_reserved_name(v):
+        raise ValueError("usernames that start with 'erased-' are kept for erased records")
     if v is not None and '@' in v:
         raise ValueError("username may not contain '@'")
     if v is not None and any(unicodedata.category(ch).startswith('C') for ch in v):
@@ -2419,12 +2436,16 @@ async def health_check():
 
 @app.get("/audit/events")
 async def recent_audit_events(
+    response: Response,
     limit: int = 10,
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db)
 ):
-    """Recent audit-log entries for the dashboard activity feed (admin only)."""
+    """Recent audit-log entries for the dashboard activity feed (admin only). Rows only: the archived days'
+    span is in the activity_archive.ARCHIVE_HEADERS when there are any."""
     from app.core.models import AuditLog
+    from app.services import activity_archive
+    response.headers.update(activity_archive.headers_for())
     limit = max(1, min(limit, 50))
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
     out = []
@@ -2504,6 +2525,7 @@ def _audit_row_to_dict(r):
 
 @app.get("/audit/log")
 async def search_audit_log(
+    response: Response,
     user_id: Optional[str] = None,
     action: Optional[str] = Query(None, max_length=128),
     from_date: Optional[str] = None,
@@ -2512,8 +2534,13 @@ async def search_audit_log(
     current_user: User = Depends(require_interactive_admin),
     db: Session = Depends(get_db),
 ):
-    """Filtered audit-log search for the admin Audit page (admin only)."""
+    """Filtered audit-log search for the admin Audit page (admin only). Rows only: when the range reaches
+    archived days, their span is in the activity_archive.ARCHIVE_HEADERS (the Activity page searches them)."""
+    from app.core import audit_range
     from app.core.models import AuditLog
+    from app.services import activity_archive
+    response.headers.update(activity_archive.headers_for(audit_range.lower_bound(from_date),
+                                                         audit_range.upper_bound(to_date)))
     limit = max(1, min(limit, 2000))
     rows = (
         _build_audit_query(db, user_id, action, from_date, to_date)
@@ -2595,26 +2622,61 @@ def activity_events(
       nearest first), at most `limit`, with `more` true when more remain. `overlap` seconds also takes
       rows from just before that point, for a poll that catches rows committed late;
     - specific rows: `ids` (repeated, or comma-separated), those of the rows that match the filters,
-      newest first. This is how the live signal's rows are fetched.
+      newest first. This is how the live signal's rows are fetched. They are looked up in the rows first:
+      the archive is searched only when one of them is no row at all.
     `count_only` returns {"count": n} for any of them instead of rows. Every row carries its `cursor`;
     `head_cursor` is the newest row's in the response.
+
+    A range with a start that reaches a day the archive keeps as compressed blocks is read from rows and
+    archive together, the same filters running over both (app/services/activity_archive.py): at most
+    activity_archive.MAX_DAYS archived days at a time (400 beyond it). `archive` in the response says
+    where the archive is, whether this read searched it, and the days it could not read; it is there only
+    when the range reaches the archive.
 
     A plain def, so FastAPI runs it in its thread pool: a count and a page over a large audit table
     must not hold the event loop. It never writes an audit row: the page re-reads it as events arrive,
     and a row written here would signal another read."""
     from app.core import audit_range
-    from app.core.models import AuditLog
+    from app.services import activity_archive as archive
     from app.services import activity_events as ev
     limit = max(1, min(limit, ev.MAX_PAGE))
     wanted_ids = ev.split_ids(ids)
     selection = _activity_case(db, current_user, case, request)
-    base = ev.build_events_query(
-        db.query(AuditLog), AuditLog, categories=category, channels=channel, statuses=status,
-        actions=action, username=user, user_exact=(user_match == "exact"), no_account=no_account,
-        ip=ip, text=q, temp_credential_id=temp_credential_id, temp_credential=temp_credential,
-        vault_id=vault_id, ids=wanted_ids,
-        start=audit_range.lower_bound(from_date), end=audit_range.upper_bound(to_date),
-        **_case_filters(selection))
+    start, end = audit_range.lower_bound(from_date), audit_range.upper_bound(to_date)
+    # Reading the rows after a point reaches the archive only when that point is in it; reading rows by id only when
+    # one of them is no row of audit_logs (the live list's new rows always are).
+    reach = start
+    if wanted_ids and archive.ids_are_rows(db, wanted_ids):
+        reach = None
+    anchor = ev.read_anchor(after) if after and not wanted_ids else None
+    if anchor and anchor[0] == "cursor":
+        since = anchor[1][0] - timedelta(seconds=overlap)
+        reach = since if start is None or since > start else start
+    try:
+        with archive.source(db, reach, end) as src:
+            out = _activity_events_page(
+                src.db, src.entity, request, current_user, db, wanted_ids, after, overlap, cursor, page,
+                count_only, limit, dict(categories=category, channels=channel, statuses=status, actions=action,
+                                        username=user, user_exact=(user_match == "exact"), no_account=no_account,
+                                        ip=ip, text=q, temp_credential_id=temp_credential_id,
+                                        temp_credential=temp_credential, vault_id=vault_id, ids=wanted_ids,
+                                        start=start, end=end, **_case_filters(selection)),
+                selection)
+            if src.note is not None:
+                out["archive"] = src.note
+            return out
+    except archive.TooBroad as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _activity_events_page(rdb, AuditLog, request, current_user, db, wanted_ids, after, overlap, cursor, page,
+                          count_only, limit, filters, selection=None):
+    """activity_events' read, over ``rdb`` and ``AuditLog`` (the request's session and model, or an archive
+    search's: app/services/activity_archive.py). Names are looked up through the request's session ``db``; with a
+    compliance case selected (``selection``), the filters hold the case's and the names it lets its auditor read
+    are added."""
+    from app.services import activity_events as ev
+    base = ev.build_events_query(rdb.query(AuditLog), AuditLog, **filters)
     newest_first = (AuditLog.timestamp.desc(), AuditLog.id.desc())
     out = {"events": [], "next_cursor": None, "total": None}
 
@@ -2625,7 +2687,7 @@ def activity_events(
     elif after:
         anchor = ev.read_anchor(after)
         if anchor and anchor[0] == "id":
-            row = db.query(AuditLog.timestamp, AuditLog.id).filter(AuditLog.id == anchor[1]).first()
+            row = rdb.query(AuditLog.timestamp, AuditLog.id).filter(AuditLog.id == anchor[1]).first()
             anchor = (row[0], row[1]) if row else None
         elif anchor:
             anchor = anchor[1]
@@ -3006,14 +3068,30 @@ def activity_summary(
                     "That range cannot be charted. Choose a start before its end, at most 48 years before it."))
     zone_name = getattr(zone, "key", None)
     key = (range_, since, until, zone_name, tz_offset, win.start if win else None, summary.signature(filters))
+    from app.services import activity_archive as archive
+
+    def band(s):
+        if win is not None:
+            return summary.summarize(s, AuditLog, win, filters, since=since, until=until, now=now)
+        end = min(until, now) if until else now
+        first = summary.oldest(s, AuditLog, filters, until)           # all time is charted from it
+        # or from the oldest archived part the events block counts, when that is older
+        archived = archive.oldest_archived(summary.block_filters(filters)["events"], until)
+        if archived is not None and (first is None or archived < first):
+            first = archived
+        return summary.summarize(s, AuditLog, summary.all_time(first, end, tz_offset, zone), filters,
+                                 until=until, from_=first if first is not None and first < end else None, now=now)
 
     def compute():
-        if win is not None:
-            return summary.summarize(db, AuditLog, win, filters, since=since, until=until)
-        end = min(until, now) if until else now
-        first = summary.oldest(db, AuditLog, filters, until)          # all time is charted from it
-        return summary.summarize(db, AuditLog, summary.all_time(first, end, tz_offset, zone), filters,
-                                 until=until, from_=first if first is not None and first < end else None)
+        # Over archived hours the band reads rows and the parts' aggregates in one state of the database.
+        if not archive.reaches_archive(since, min(until, now) if until else now):
+            return band(db)
+        s = archive.snapshot_session(db.get_bind())
+        try:
+            return band(s)
+        finally:
+            s.rollback()
+            s.close()
 
     band, age = summary.cached(key, range_, compute)
     out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1),
@@ -3084,14 +3162,23 @@ def activity_export(
     Streamed a batch at a time, each batch in its own short database session, so a large export neither
     holds the rows in memory nor keeps one transaction open. It covers the rows that existed when it
     started, stops at activity_events.EXPORT_CAP rows (the last line says so), and is itself recorded
-    before a row is sent: when that record cannot be written the export is refused with 503."""
+    before a row is sent: when that record cannot be written the export is refused with 503.
+
+    A range with a start that reaches archived days is exported from rows and archive together, as the
+    Events list reads them (app/services/activity_archive.py): then every batch is read in the one
+    transaction that holds the archived rows, open while the export streams. Its last lines name any
+    archived day it could not read, or, for a range with no start, the archived days it left out."""
+    import contextlib
+    from starlette.background import BackgroundTask
     from app.core import audit_range
     from app.core.database import SessionLocal
     from app.core.models import AuditLog
+    from app.services import activity_archive as archive
     from app.services import activity_events as ev
     from app.services.activity_names import recorded_names_for, show_unlocked, temp_credential_names, unlocked_vaults
     case = case if isinstance(case, str) and case else None        # a direct call leaves its Query default
     unlocked = unlocked_vaults(db, current_user, request)
+    viewer_id = current_user.id          # read now: the audit row below commits, and the stream runs after
     started = datetime.now(timezone.utc).replace(tzinfo=None)      # stored naive in UTC
     filters = ev.export_filters(
         started=started, end=audit_range.upper_bound(to_date), categories=category, channels=channel,
@@ -3099,7 +3186,23 @@ def activity_export(
         no_account=no_account, ip=ip, text=q, temp_credential_id=temp_credential_id,
         temp_credential=temp_credential, vault_id=vault_id, start=audit_range.lower_bound(from_date),
         **_case_filters(_activity_case(db, current_user, case, None)))
-    total = ev.build_events_query(db.query(AuditLog), AuditLog, **filters).order_by(None).count()
+    # The archive search, when the range needs one, stays open until the export has streamed; its batches and
+    # its close take turns (activity_archive.Held).
+    stack = contextlib.ExitStack()
+    held = archive.Held(stack)
+    try:
+        src = stack.enter_context(archive.source(db, filters["start"], filters["end"]))
+    except archive.TooBroad as exc:
+        held.close()
+        raise HTTPException(status_code=400, detail=str(exc))
+    searched = bool(src.note and src.note["searched"])
+    if not searched:
+        held.close()
+    try:
+        total = ev.build_events_query(src.db.query(src.entity), src.entity, **filters).order_by(None).count()
+    except BaseException:
+        held.close()
+        raise
     # Recorded before a row is sent, and required: an export of up to EXPORT_CAP rows of personal data
     # that left no trace would be a gap in the log's own account of who read it. So when the row cannot
     # be written (the database refusing inserts, say) the export is refused, not sent unrecorded.
@@ -3117,8 +3220,11 @@ def activity_export(
                                               ("temp_credential", temp_credential), ("vault_id", vault_id),
                                               ("from_date", from_date), ("to_date", to_date),
                                               ("case", case)) if v},
+                # The archived days it read, when it read any: the archive is personal data too.
+                **({"archived_days": src.note["searched_days"]} if searched else {}),
             })
     except Exception as e:                                   # noqa: BLE001 - refused below, whatever it was
+        held.close()
         print(f"⚠ export refused: its audit row could not be written ({type(e).__name__})")
         try:
             db.rollback()
@@ -3127,29 +3233,47 @@ def activity_export(
         raise HTTPException(status_code=503, detail=(
             "The export could not be recorded in the audit log, so it was not made. Try again shortly."))
 
+    def views_of(s, got):
+        views = [ev.row_view(r) for r in got]
+        temp_credential_names(s, views)
+        viewer = s.get(User, viewer_id)
+        for view, recorded in zip(views, recorded_names_for(s, viewer, got, unlocked) if viewer
+                                  else [None] * len(views)):
+            view["recorded_names"] = recorded
+        return views
+
+    def from_search(after):
+        got = ev.export_page(src.db.query(src.entity), src.entity, filters, after).all()
+        nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
+        return views_of(src.db, got), nxt
+
     def fetch(after):
+        if searched:                      # every batch from the search's one transaction, until it is closed
+            return held.read(lambda: from_search(after)) or ([], None)
         s = SessionLocal()
         try:
             got = ev.export_page(s.query(AuditLog), AuditLog, filters, after).all()
             nxt = (got[-1].timestamp, got[-1].id) if len(got) == ev.EXPORT_BATCH else None
-            views = [ev.row_view(r) for r in got]
-            temp_credential_names(s, views)
-            viewer = s.get(User, current_user.id)
-            for view, recorded in zip(views, recorded_names_for(s, viewer, got, unlocked) if viewer
-                                      else [None] * len(views)):
-                view["recorded_names"] = recorded
-            return views, nxt
+            return views_of(s, got), nxt
         finally:
             s.close()
 
+    def lines():
+        try:
+            yield from ev.export_lines(fetch, format, total, archive=src.note)
+        finally:
+            held.close()
+
     name = f"activity-{started:%Y%m%d-%H%M%S}.{format}"
     return StreamingResponse(
-        ev.export_lines(fetch, format, total),
+        lines(),
         media_type="text/csv; charset=utf-8" if format == "csv" else "application/x-ndjson",
         headers={"Content-Disposition": f"attachment; filename={name}",
                  "X-Export-Total": str(total),
                  "X-Export-Rows": str(min(total, ev.EXPORT_CAP)),
                  "Cache-Control": "no-store"},
+        # A stream never started (the client gone first) still ends the search.
+        background=BackgroundTask(held.close),
     )
 
 
@@ -4699,10 +4823,13 @@ def _read_sink_lines() -> list:
     stored record can carry attacker-influenced content (an SFTP filename/username). str.splitlines()
     would ALSO break on \\v \\f \\x1c-\\x1e \\x85 \\u2028 \\u2029, so a content byte like '\\u2028[web] ...'
     inside an [sftp] record would be re-split into a fragment served under `?service=web`
-    (within-tenant tag smuggling). Splitting on '\\n' makes the read match the write exactly."""
+    (within-tenant tag smuggling). Splitting on '\\n' makes the read match the write exactly.
+
+    Only the newest 5 MB of the file are read (log_sink.read_tail), from a whole line: the pull returns 5000
+    lines at most, and LOG_PULL_SINK_MAX_MB can make the file far larger than this handler should read."""
     try:
-        with open(_LOG_SINK_PATH, "r", encoding="utf-8", errors="replace") as f:
-            return f.read().split("\n")
+        from app.services.log_sink import read_tail
+        return read_tail(_LOG_SINK_PATH).split("\n")
     except Exception:  # noqa: BLE001
         return []
 
@@ -10184,15 +10311,24 @@ _PREF_NOT_FOR_TEMP_SESSIONS = frozenset({"hide_note_text", "activity_page_size",
                                          "activity_range"})
 
 
+# Preferences the app writes itself rather than picks from a list, each kept only when its value has the shape
+# given: the release at which an administrator last opened the Settings pages (written only by
+# POST /settings/catalogue/seen, app/api/settings_catalogue_router.py; PUT /users/me/preferences cannot set it).
+_PREF_PATTERNS = {"settings_seen": re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")}
+
+
 def _sanitize_preferences(data) -> dict:
-    """Keep only known keys whose value is in that key's whitelist; drop the rest."""
+    """Keep only known keys whose value is in that key's whitelist (or has its pattern's shape); drop the rest."""
     if not isinstance(data, dict):
         return {}
-    return {
+    kept = {
         key: data[key]
         for key, allowed in _PREF_ALLOWED.items()
         if isinstance(data.get(key), str) and data[key] in allowed
     }
+    kept.update({key: data[key] for key, pattern in _PREF_PATTERNS.items()
+                 if isinstance(data.get(key), str) and pattern.fullmatch(data[key])})
+    return kept
 
 
 class PreferencesUpdate(BaseModel):
@@ -25841,6 +25977,9 @@ async def lifespan(app: FastAPI):
     # background (app/core/audit_privacy.py).
     from app.core import audit_privacy
     audit_privacy.start()
+    # The SFTP host key, written here so a split layout's SFTP container can mount the keys volume read-only.
+    from app.sftp.host_key import ensure_host_key
+    ensure_host_key(settings.sftp_host_key_path)
     _verify_encryption_key_canary()     # refuse to boot under a mismatched ENCRYPTION_KEY, BEFORE any seal migration
     _rehash_plaintext_session_tokens()  # hash any legacy plaintext session tokens at rest (no logout)
     _backfill_note_content()            # seal any legacy plaintext note/link content at rest

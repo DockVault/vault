@@ -11,6 +11,7 @@ import pytest                                              # noqa: E402
 from playwright.sync_api import Page, expect               # noqa: E402
 
 from _sf_helpers import enrolled_admin, step_up_receipt     # noqa: E402
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -44,6 +45,7 @@ def test_admin_mfa_policy_and_action_matrix(page: Page, admin):
         expect(item).to_be_visible(timeout=10000)
         item.click()
         page.click('.tab-btn[data-tab="security"]')
+        show_advanced(page, "security")
         expect(page.locator("#setting-mfa-mode")).to_be_visible(timeout=10000)
         # loadSettings populates the policy select then fetches the matrix asynchronously; wait for the
         # matrix rows so loadSettings has fully run before we set the select — otherwise a late load can

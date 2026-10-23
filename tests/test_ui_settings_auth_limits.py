@@ -15,6 +15,7 @@ Two surfaces enforce this:
 """
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -60,6 +61,7 @@ def _open_settings(page: Page, expected_sentinel: str):
 
 def _tab(page: Page, tab: str):
     page.click(f'.tab-btn[data-tab="{tab}"]')
+    show_advanced(page, tab)
     expect(page.locator(f"#settings-tab-{tab}")).to_be_visible()
 
 

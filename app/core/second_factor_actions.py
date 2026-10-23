@@ -72,6 +72,9 @@ FIXED_STEP_UP_ACTIONS: dict = {
     # What the audit log records of personal data (app/api/recording_levels_router.py): the same policy, since
     # the levels decide what is kept about every user.
     "admin.audit_privacy.write": ("Change what the audit log records", "password_always"),
+    # The audit log's integrity warnings an administrator acknowledges (app/api/audit_integrity_router.py): late
+    # rows and the values held from the database are seen and signed off, so the password every time.
+    "admin.audit_integrity.acknowledge": ("Acknowledge the audit log's integrity warnings", "password_always"),
 }
 
 # The steps of compliance access (app/api/compliance_router.py), each under the compliance policy: the password

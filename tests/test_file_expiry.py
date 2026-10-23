@@ -417,7 +417,8 @@ def test_each_audit_row_is_the_one_log_action_would_write(tmp_path, in_request):
         if token is not None:
             rc.reset_request_context(token)
 
-    columns = [c.name for c in AuditLog.__table__.columns if c.name not in ("id", "timestamp")]
+    columns = [c.name for c in AuditLog.__table__.columns if c.name not in ("id", "timestamp", "seal_nonce")]
+    assert all(len(a.seal_nonce) == 16 for a in db.added)     # each its own random nonce
     assert [{c: getattr(a, c) for c in columns} for a in db.added] == [
         {c: getattr(e, c) for c in columns} for e in expected]
     assert [a.channel for a in db.added] == (["web"] * 2 if in_request else [None] * 2)

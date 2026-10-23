@@ -173,7 +173,9 @@ def test_the_other_hooks_leave_their_columns_empty_and_privacy_stamps_the_policy
                                      details={"file_name": "x", "count": 1}, ip_address="192.0.2.7")
     db.expire_all()
     stored = db.query(AuditLog).one()
-    assert (stored.seal_nonce, stored.ip_via, stored.case_id) == (None, None, None)
+    assert (stored.ip_via, stored.case_id) == (None, None)
+    # The integrity chain's nonce: 16 random bytes on every row (app/core/audit_integrity.py).
+    assert isinstance(stored.seal_nonce, bytes) and len(stored.seal_nonce) == 16
     # Policy 1 (app/core/audit_privacy.py) records what earlier releases did: no names, the rest in full,
     # and nothing in another form.
     assert (stored.privacy_version, stored.recorded) == (1, None)
@@ -191,10 +193,24 @@ class _Untouchable:
         raise AssertionError(f"a hook deleted {name}")
 
 
-@pytest.mark.parametrize("name", [h for h in HOOKS if h != "privacy"])
-def test_each_hook_but_privacy_changes_nothing_and_returns_nothing(name):
+@pytest.mark.parametrize("name", [h for h in HOOKS if h not in ("privacy", "seal_nonce")])
+def test_each_hook_but_privacy_and_the_nonce_changes_nothing_and_returns_nothing(name):
     hook = getattr(audit_row_hooks, name)
     assert hook(_Untouchable()) is None
+
+
+def test_the_nonce_hook_sets_the_nonce_and_nothing_else():
+    class _Row:
+        id = uuid.uuid4()
+
+        def __setattr__(self, name, value):
+            if name != "seal_nonce":
+                raise AssertionError(f"a hook set {name}")
+            object.__setattr__(self, name, value)
+
+    a, b = _Row(), _Row()
+    assert audit_row_hooks.seal_nonce(a) is None and audit_row_hooks.seal_nonce(b) is None
+    assert len(a.seal_nonce) == len(b.seal_nonce) == 16 and a.seal_nonce != b.seal_nonce
 
 
 def test_privacy_hands_the_row_to_the_recording_levels(monkeypatch):

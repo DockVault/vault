@@ -8,7 +8,7 @@ from enum import Enum as PyEnum
 import uuid
 
 from sqlalchemy import (
-    Column, String, Integer, SmallInteger, Boolean, DateTime, ForeignKey,
+    Column, String, Integer, SmallInteger, Boolean, Date, DateTime, ForeignKey,
     Text, BigInteger, LargeBinary, Enum, Table, JSON, Index, CheckConstraint, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship, declarative_base, backref
@@ -257,7 +257,11 @@ class User(Base):
         secondaryjoin='Vault.id == vault_members.c.vault_id',
         back_populates='members'
     )
-    audit_logs = relationship('AuditLog', back_populates='user', foreign_keys='AuditLog.user_id')
+    # Deleting an account leaves its audit rows to the database's ON DELETE SET NULL (passive_deletes): the ORM
+    # neither loads every row of the account nor writes them one by one. audit_logs.user_id is neither a stable
+    # nor a committed column of the integrity chain, so clearing it changes no seal.
+    audit_logs = relationship('AuditLog', back_populates='user', foreign_keys='AuditLog.user_id',
+                              passive_deletes=True)
     key_pair = relationship('UserKeyPair', back_populates='user', uselist=False, cascade='all, delete-orphan')
     # Organizational group memberships (read-only view; writes via /groups endpoints)
     groups = relationship(
@@ -1379,6 +1383,138 @@ class ManagedSettingChange(Base):
     decided_by_name = Column(String(255), nullable=True)
     decided_at = Column(DateTime, nullable=True)
     reason = Column(String(255), nullable=True)
+
+
+class EraseRequest(Base):
+    """A per-person erase (app/core/person_erase.py, app/core/audit_chain_erase.py): a deleted account's username,
+    or a name typed at sign-in, removed from the audit log and the other records once the delay has passed.
+
+    The name waits in ``name_token`` only, sealed (AES-256-GCM under a key derived from ENCRYPTION_KEY, bound to
+    the request's id), and is deleted with the run's last seal or the cancel. The audit log's integrity chain
+    holds the request: its ``request`` seal carries a commitment to the name and the placeholder the erase
+    writes, and the pruner acts on that seal, never on this row alone; ``placeholder``, ``request_seq``,
+    ``effective_at`` and ``through`` are copies for the page. ``status`` is pending, running, completed or
+    cancelled; ``waiting`` says why a due erase has not run yet. ``counts`` says what it changed in each store,
+    never the name. Created by create_all; an older release ignores the table.
+    """
+    __tablename__ = 'erase_requests'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status = Column(String(16), nullable=False, index=True)
+    name_token = Column(Text, nullable=True)
+    placeholder = Column(String(16), nullable=False, unique=True)
+    request_seq = Column(BigInteger, nullable=True)
+    requested_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    requested_by_name = Column(String(255), nullable=True)
+    requested_at = Column(DateTime, nullable=False)
+    effective_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    through = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    waiting = Column(String(255), nullable=True)
+    counts = Column(JSON, nullable=True)
+
+
+class AuditValueRemoval(Base):
+    """A removal of personal values recorded under earlier recording levels (app/core/audit_value_removal.py): the
+    audit rows written before ``before`` are brought down to ``levels``, the levels in force when it was asked for,
+    once the delay has passed.
+
+    The audit log's integrity chain holds the request: its ``request`` seal carries the levels and ``before``, and the
+    pruner acts on that seal, never on this row alone; ``levels``, ``before``, ``request_seq`` and ``effective_at``
+    are copies for the page, and a copy that differs from the seal is not acted on. ``status`` is pending, running,
+    completed or cancelled; ``waiting`` says why a due removal has not run yet; ``counts`` says how many rows it
+    changed. Created by create_all; an older release ignores the table.
+    """
+    __tablename__ = 'audit_value_removals'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status = Column(String(16), nullable=False, index=True)
+    levels = Column(JSON, nullable=False)
+    before = Column(DateTime, nullable=False)
+    request_seq = Column(BigInteger, nullable=True)
+    requested_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    requested_by_name = Column(String(255), nullable=True)
+    requested_at = Column(DateTime, nullable=False)
+    effective_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    waiting = Column(String(255), nullable=True)
+    counts = Column(JSON, nullable=True)
+
+
+class AuditSeal(Base):
+    """One seal of the audit log's integrity chain (app/core/audit_integrity.py; the encoding is
+    app/core/audit_chain_format.py).
+
+    Seals are numbered 1, 2, 3 ... with no gap. Each seal's link hashes the previous link and the seal's body
+    (every column up to ``sealed_at``), and ``mac`` authenticates the link under the chain's key, which the
+    database never holds: only ``key_id`` names it. ``link`` is stored for tools that print one seal; every
+    check recomputes it. ``row_ids`` (an hour's 16-byte ids in (timestamp, id) order) and ``legacy_salt`` (the
+    salt of the nonces of an hour's rows written without one) are working data, not bound: a wrong value
+    changes a recomputed digest or root. Seals are never deleted. Created by create_all; an older release
+    ignores the table.
+    """
+    __tablename__ = 'audit_seals'
+
+    seq = Column(BigInteger, primary_key=True, autoincrement=False)
+    kind = Column(String(16), nullable=False)
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=True)
+    format = Column(SmallInteger, nullable=False)
+    row_count = Column(BigInteger, nullable=False)
+    row_bytes = Column(BigInteger, nullable=False)
+    root_s = Column(LargeBinary, nullable=True)
+    root_c = Column(LargeBinary, nullable=True)
+    ids_digest = Column(LargeBinary, nullable=True)
+    detail = Column(JSON().with_variant(JSONB(), 'postgresql'), nullable=False)
+    key_id = Column(String(32), nullable=False)
+    sealed_at = Column(DateTime, nullable=False)
+    mac = Column(LargeBinary, nullable=False)
+    link = Column(LargeBinary, nullable=False)
+    row_ids = Column(LargeBinary, nullable=True)
+    legacy_salt = Column(LargeBinary, nullable=True)
+
+    __table_args__ = (
+        # One hour seal per period start: hours are sealed once, in order.
+        Index('uq_audit_seals_hour', 'period_start', unique=True,
+              postgresql_where=text("kind = 'hour'"), sqlite_where=text("kind = 'hour'")),
+    )
+
+
+class AuditArchiveBlock(Base):
+    """One part of a UTC day of audit rows, compressed (app/core/audit_archive.py; the format is
+    app/core/audit_archive_format.py).
+
+    A day older than ``audit_hot_days`` leaves ``audit_logs`` for blocks once every hour of it is sealed: each
+    part holds whole hours and every column of each row, and is verified against the hours' seals before the
+    rows are deleted, in the same transaction. The ``archive`` seal of that transaction binds each part's hours,
+    row count, length and digest, so nothing here is trusted on its own: ``aggregates`` (rows and bytes by
+    action, status and channel, by hour, and rows by all four) are checked against the payload whenever it is read.
+    ``payload`` is stored without Postgres's own compression (STORAGE EXTERNAL, set by a background step), so its
+    length is read without reading it. A NEW table, which create_all builds; a release before it ignores it, and the data
+    marker (data_requirements) keeps releases from 0.33.1 on from starting while a block exists.
+    """
+    __tablename__ = 'audit_archive_blocks'
+
+    day = Column(Date, primary_key=True)
+    part = Column(Integer, primary_key=True, autoincrement=False)
+    first_hour = Column(DateTime, nullable=False)
+    last_hour = Column(DateTime, nullable=False)
+    row_count = Column(BigInteger, nullable=False)
+    codec = Column(String(16), nullable=False)
+    format = Column(SmallInteger, nullable=False)
+    payload = Column(LargeBinary, nullable=False)
+    raw_bytes = Column(BigInteger, nullable=False)
+    aggregates = Column(JSON, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    rewritten_at = Column(DateTime, nullable=True)
 
 
 class SftpProcess(Base):

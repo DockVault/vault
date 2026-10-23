@@ -2,7 +2,8 @@
 
 audit_logs has seal_nonce, privacy_version, recorded, ip_via and case_id, and security_alerts has ip_via,
 each nullable with no default, and the statements that add them were recorded as applied at start. A row
-written now keeps them empty, but for the recording levels' version (test_audit_privacy_live.py).
+written now has its integrity chain's nonce (16 random bytes) and the recording levels' version
+(test_audit_privacy_live.py), and keeps the others empty.
 test_audit_row_columns.py checks the model, the statements and the hooks
 offline.
 """
@@ -48,12 +49,12 @@ def test_the_statements_that_add_them_were_recorded_as_applied():
     assert all(line.endswith("|applied") for line in lines), rows
 
 
-def test_a_row_written_now_has_its_id_and_the_policy_and_leaves_the_rest_empty():
+def test_a_row_written_now_has_its_id_its_nonce_and_the_policy_and_leaves_the_rest_empty():
     name = f"nobody-{uuid.uuid4().hex[:10]}"
     r = requests.post(f"{BASE_URL}/auth/login", json={"username": name, "password": "not-the-password"},
                       timeout=30)
     assert r.status_code in (401, 429), r.status_code
-    out = psql("SELECT id, seal_nonce IS NULL, ip_via IS NULL, case_id IS NULL, recorded IS NULL, "
+    out = psql("SELECT id, octet_length(seal_nonce) = 16, ip_via IS NULL, case_id IS NULL, recorded IS NULL, "
                "privacy_version = (SELECT max(version) FROM audit_privacy_policies) "
                f"FROM audit_logs WHERE username = '{name}'")
     lines = out.splitlines()

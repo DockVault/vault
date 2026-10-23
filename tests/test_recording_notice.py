@@ -159,6 +159,18 @@ def test_each_stores_lifetime_reads_the_configuration(monkeypatch):
     assert "12 days" in next(s for s in rn.STORES if s.key == "security_records").kept()
 
 
+def test_the_days_an_address_stays_in_full_say_an_archived_day_can_take_a_day_longer(monkeypatch):
+    """With AUDIT_IP_FULL_DAYS, an address in a day the archive holds is shortened once the whole day is past the
+    cutoff: the audit log's lifetime and the address level's words both say it can be up to a day later."""
+    monkeypatch.setattr(rn, "_full_address_days", lambda: 0)
+    assert "shortened" not in rn._audit_kept() and "shortened" not in rn._level_words(ap.IP, ap.FULL)
+    monkeypatch.setattr(rn, "_full_address_days", lambda: 30)
+    later = "in a day the archive holds, once the whole day is past them: up to a day later"
+    assert f"shortened to the network it is in after 30 days ({later})." in rn._audit_kept()
+    assert rn._level_words(ap.IP, ap.FULL).endswith(f", then shortened to the network it is in after 30 days ({later})")
+    assert "after 30 days" not in rn._level_words(ap.IP, ap.SHORTENED)
+
+
 # --------------------------------------------------------------------------- the banner, the notification
 
 def test_the_banner_shows_a_version_the_user_has_not_read():

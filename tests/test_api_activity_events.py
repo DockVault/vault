@@ -113,12 +113,13 @@ def test_an_export_holds_the_filtered_rows_and_is_itself_recorded(admin, anon):
     assert r.status_code == 200, r.text
     assert r.headers["X-Export-Total"] == "3" and r.headers["X-Export-Rows"] == "3"
     assert r.headers["Content-Disposition"].startswith("attachment; filename=activity-")
-    table = list(csv.reader(io.StringIO(r.text)))
+    # The closing lines (the audit chain's head once the log is sealed) are not rows: they start with "#".
+    table = [row for row in csv.reader(io.StringIO(r.text)) if not row[0].startswith("#")]
     assert table[0][:3] == ["Time (UTC)", "Event", "Action"] and len(table) == 4
     assert sorted(row[5] for row in table[1:]) == [f"{prefix}-{i}" for i in range(3)]
     assert all(row[0].endswith("+00:00") for row in table[1:])
     nd = admin.get("/activity/export", params={"user": prefix, "format": "ndjson"})
-    lines = [json.loads(line) for line in nd.text.splitlines()]
+    lines = [e for e in map(json.loads, nd.text.splitlines()) if "id" in e]
     assert len(lines) == 3 and {e["label"] for e in lines} == {"Sign-in failed"}
     time.sleep(0.3)
     recorded = _events(admin, q=prefix, category="administration")["events"]
@@ -142,7 +143,8 @@ def test_an_export_takes_every_filter_the_list_takes(admin, anon, temp_vault):
     def exported(**params):
         r = admin.get("/activity/export", params={"format": "ndjson", **params})
         assert r.status_code == 200, r.text
-        rows = [json.loads(line) for line in r.text.splitlines()]
+        # Rows only: the closing lines (the audit chain's head once the log is sealed) are objects without an id.
+        rows = [e for e in map(json.loads, r.text.splitlines()) if "id" in e]
         assert int(r.headers["X-Export-Total"]) == len(rows)
         return rows
 

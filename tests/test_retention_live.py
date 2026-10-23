@@ -1,12 +1,20 @@
 """The pruner and the managed retention settings on a running stack (app/core/retention.py,
 app/core/setting_changes.py, app/api/managed_settings_router.py).
 
-Changing a managed setting asks for the password every time. Turning the hold switch on applies at once;
-turning it off deletes sooner, so it waits, every administrator is told, and any administrator can cancel
-it; a pass of the pruner applies it once it is due. A pass deletes old resolved alerts and the sign-in
-throttle's old fallback rows and writes a retention_pruned row for each job that deleted something; the
-hold switch stops the jobs over logs and security records and not the working-record jobs; and while
-another runner holds the pruner's lock, a pass does nothing. test_retention.py and test_setting_changes.py
+Changing a managed setting asks for the password every time. A change that keeps records longer applies at
+once; one that deletes sooner waits, every administrator is told, and any administrator can cancel it. Each
+change and each cancel is sealed in the audit log's integrity chain in its own transaction, and a waiting change
+applies only from its seal: its time edited in the database changes nothing (the offline tests apply one once
+its delay has run). The stack's changes are made to the minimum age of administration rows, raised by one day:
+every one of them is sealed, so the stack's chain and database agree afterwards, and nothing else on the stack
+reads it.
+
+A pass deletes old resolved alerts and the sign-in throttle's old fallback rows and writes a retention_pruned
+row for each job that deleted something; and while another runner holds the pruner's lock, a pass does nothing.
+The hold switch runs on a throwaway database of its own: turned on, it applies at once and stops the jobs over
+logs and security records and not the working-record jobs, and the chain's hold holds them even once the
+database's value is cleared behind its back (only a waiting change turns it off, which a test cannot wait for,
+so on the stack it would hold every job over logs from then on). test_retention.py and test_setting_changes.py
 cover the rules offline.
 """
 import json
@@ -18,11 +26,15 @@ import uuid
 import pytest
 
 from _account_change_helpers import DB, in_api_container, notifications, psql, second_admin
+from _throwaway_db import PREAMBLE, run_in, throwaway_database
 
 pytestmark = pytest.mark.integration
 
 ACTION = "admin.retention.write"
 LOCK = (0x7265, 1)
+# The setting the stack's changes are made to: raising it keeps administration rows longer and applies at once,
+# lowering it back deletes sooner and waits.
+KEY = "audit_admin_min_days"
 
 
 def _receipt(client, password):
@@ -50,13 +62,21 @@ def _wait_for(check, timeout=20.0, step=0.5):
     return check()
 
 
-def _clear(key):
-    """Put ``key`` back to the deployment's value the way the registry stores a clear, and end its waiting
-    changes, so the stack is left as it was."""
-    psql("UPDATE managed_setting_changes SET status = 'cancelled', reason = 'test cleanup' "
-         f"WHERE key = '{key}' AND status = 'pending'")
-    psql(f"UPDATE managed_settings SET value = NULL, version = (SELECT max(version) + 1 FROM managed_settings) "
-         f"WHERE key = '{key}'")
+def _cancel_waiting(admin, key):
+    """End every waiting change of ``key`` the way an administrator does, through the route, so each cancel is
+    sealed and the stack's chain and database still agree."""
+    for change in admin.get("/settings/managed").json()["pending"]:
+        if change["key"] == key:
+            admin.post(f"/settings/managed/changes/{change['id']}/cancel")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def chain_started():
+    """The web process's pruner starts the audit chain a minute after the server starts; a change that
+    deletes sooner is refused until it has."""
+    ok = _wait_for(lambda: psql("SELECT count(*) FROM audit_seals WHERE kind = 'policy'") not in ("", "0"),
+                   timeout=240, step=3)
+    assert ok, "the audit chain never started"
 
 
 def _run_pass():
@@ -86,37 +106,40 @@ def _alive(alert_id):
 
 
 def test_changing_a_managed_setting_asks_for_the_password(admin):
+    raised = _row(admin, KEY)["value"] + 1
     with second_admin(admin) as (_account, client):
-        r = client.put("/settings/managed/logs_hold", json={"value": True})
+        r = client.put(f"/settings/managed/{KEY}", json={"value": raised})
         assert r.status_code == 403, r.text
         detail = r.json()["detail"]
         assert (detail["second_factor_required"], detail["action"], detail["reason"]) == (
             True, ACTION, "step_up_required")
         assert "password" in detail["methods"]
-        r = client.put("/settings/managed/logs_hold", json={"value": True},
+        r = client.put(f"/settings/managed/{KEY}", json={"value": raised},
                        headers={"X-Second-Factor": "not-a-receipt"})
         assert r.status_code == 403
+    assert _row(admin, KEY)["value"] == raised - 1
 
 
-def test_the_hold_goes_on_at_once_and_off_only_after_the_wait_unless_cancelled(admin):
+def test_a_change_that_keeps_more_applies_at_once_and_one_that_deletes_sooner_waits_unless_cancelled(admin):
     seen = {n["id"] for n in notifications(admin, "retention_change")}
+    start = _row(admin, KEY)["value"]
     try:
         with second_admin(admin) as (account, client):
-            r = _put(client, account["_password"], "logs_hold", True)
+            r = _put(client, account["_password"], KEY, start + 1)
             assert r.status_code == 200, r.text
             assert r.json()["status"] == "applied"
-            assert _wait_for(lambda: _row(admin, "logs_hold")["value"] is True)
-            assert _row(admin, "logs_hold")["source"] == "admin"
+            assert _wait_for(lambda: _row(admin, KEY)["value"] == start + 1)
+            assert _row(admin, KEY)["source"] == "admin"
 
-            r = _put(client, account["_password"], "logs_hold", False)
+            r = _put(client, account["_password"], KEY, start)
             assert r.status_code == 200, r.text
             body = r.json()
-            assert body["status"] == "pending" and body["setting"]["value"] is True
+            assert body["status"] == "pending" and body["setting"]["value"] == start + 1
             change = body["change"]
-            assert (change["new"], change["status"], change["requested_by"]) == (False, "pending",
+            assert (change["new"], change["status"], change["requested_by"]) == (start, "pending",
                                                                                  account["_username"])
             pending = admin.get("/settings/managed").json()["pending"]
-            assert [p["id"] for p in pending if p["key"] == "logs_hold"] == [change["id"]]
+            assert [p["id"] for p in pending if p["key"] == KEY] == [change["id"]]
 
             told = _wait_for(lambda: [n for n in notifications(admin, "retention_change") if n["id"] not in seen])
             titles = [n["title"] for n in told]
@@ -126,30 +149,31 @@ def test_the_hold_goes_on_at_once_and_off_only_after_the_wait_unless_cancelled(a
             assert r.status_code == 200, r.text
             assert r.json()["change"]["decided_by"] == admin.get("/users/me").json()["username"]
             assert admin.post(f"/settings/managed/changes/{change['id']}/cancel").status_code == 409
-            assert _row(admin, "logs_hold")["value"] is True
+            assert _row(admin, KEY)["value"] == start + 1
 
-        rows = psql("SELECT action FROM audit_logs WHERE resource_type = 'setting' AND resource_id = 'logs_hold' "
+        rows = psql(f"SELECT action FROM audit_logs WHERE resource_type = 'setting' AND resource_id = '{KEY}' "
                     f"AND timestamp > now() - interval '5 minutes' ORDER BY timestamp").splitlines()
         assert rows[-3:] == ["setting_changed", "setting_change_requested", "setting_change_cancelled"], rows
     finally:
-        _clear("logs_hold")
+        _cancel_waiting(admin, KEY)
 
 
-def test_a_pass_applies_a_waiting_change_once_it_is_due(admin):
+def test_a_waiting_change_is_sealed_and_its_time_edited_in_the_database_changes_nothing(admin):
+    start = _row(admin, KEY)["value"]
     try:
         with second_admin(admin) as (account, client):
-            assert _put(client, account["_password"], "logs_hold", True).status_code == 200
-            change = _put(client, account["_password"], "logs_hold", False).json()["change"]
+            assert _put(client, account["_password"], KEY, start + 1).status_code == 200
+            change = _put(client, account["_password"], KEY, start).json()["change"]
+        sealed = json.loads(psql("SELECT detail::text FROM audit_seals WHERE kind = 'request' "
+                                 f"AND detail->>'request' = '{change['id']}'"))
+        assert (sealed["setting"], sealed["old"], sealed["new"], sealed["by"]) == (KEY, start + 1, start, "admin")
         psql(f"UPDATE managed_setting_changes SET effective_at = now() - interval '1 minute' "
              f"WHERE id = '{change['id']}'")
         _run_pass()
-        assert psql(f"SELECT status FROM managed_setting_changes WHERE id = '{change['id']}'") == "applied"
-        assert _wait_for(lambda: _row(admin, "logs_hold")["value"] is False)
-        details = json.loads(psql("SELECT details FROM audit_logs WHERE action = 'setting_change_applied' "
-                                  "ORDER BY timestamp DESC LIMIT 1"))
-        assert (details["change_id"], details["old"], details["new"]) == (change["id"], True, False)
+        assert psql(f"SELECT status FROM managed_setting_changes WHERE id = '{change['id']}'") == "pending"
+        assert _row(admin, KEY)["value"] == start + 1
     finally:
-        _clear("logs_hold")
+        _cancel_waiting(admin, KEY)
 
 
 def test_a_pass_deletes_old_resolved_alerts_and_old_throttle_rows_and_records_it():
@@ -170,23 +194,69 @@ def test_a_pass_deletes_old_resolved_alerts_and_old_throttle_rows_and_records_it
         psql(f"DELETE FROM security_alerts WHERE id IN ('{old_resolved}', '{old_open}')")
 
 
-def test_the_hold_stops_the_log_jobs_and_not_the_working_records(admin):
-    old_resolved = _alert("2001-01-01 00:00:00", True)
-    identifier = f"retention-test-{uuid.uuid4().hex[:8]}"
-    psql("INSERT INTO rate_limit_records (id, identifier, action, attempt_count, window_start, last_attempt) "
-         f"VALUES ('{uuid.uuid4()}', '{identifier}', 'login', 1, now() - interval '3 hours', now() - interval '3 hours')")
-    try:
-        with second_admin(admin) as (account, client):
-            assert _put(client, account["_password"], "logs_hold", True).status_code == 200
-        # The pass runs in a process of its own, which reads the table at its start.
-        done = _run_pass()
-        assert done["security_alerts"] is None and done["audit_logs"] is None, done
-        assert done["rate_limit_records"] is not None, done
-        assert _alive(old_resolved)
-        assert psql(f"SELECT count(*) FROM rate_limit_records WHERE identifier = '{identifier}'") == "0"
-    finally:
-        _clear("logs_hold")
-        psql(f"DELETE FROM security_alerts WHERE id = '{old_resolved}'")
+HOLD = PREAMBLE + r'''
+from types import SimpleNamespace
+from app.core import audit_chain_policy_seals as chain_seals, settings_registry as registry
+
+def jobs():
+    done = retention.run_pass(SessionLocal, engine=engine)
+    return None if done is None else {n: (r.deleted if r else None) for n, r in done}
+
+def add_old_rows():
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO security_alerts (id, event_type, severity, message, timestamp, resolved, "
+                       "details) VALUES (gen_random_uuid(), 'failed_login', 'warning', 'hold test', "
+                       "'2001-01-01 00:00:00', true, '{}')"))
+        c.execute(text("INSERT INTO rate_limit_records (id, identifier, action, attempt_count, window_start, "
+                       "last_attempt) VALUES (gen_random_uuid(), 'hold-test', 'login', 1, now() - interval "
+                       "'3 hours', now() - interval '3 hours')"))
+
+def left():
+    with engine.begin() as c:
+        return [c.execute(text("SELECT count(*) FROM security_alerts WHERE message = 'hold test'")).scalar(),
+                c.execute(text("SELECT count(*) FROM rate_limit_records WHERE identifier = 'hold-test'")).scalar()]
+
+out = {"first": jobs()}          # the chain starts here, at the first pass
+add_old_rows()
+with chain_seals.change_transaction(engine) as w:
+    outcome = chain_seals.change(w, "logs_hold", True, SimpleNamespace(id=None, username="hold-test"))
+out["status"] = outcome.status
+registry.refresh(SessionLocal)
+out["held"] = jobs()
+out["left_held"] = left()
+# The database's value cleared, as no seal records: the chain's hold still holds every job over logs, and the
+# pass reports the database's value as one it does not act on.
+with engine.begin() as c:
+    c.execute(text("UPDATE managed_settings SET value = NULL, version = (SELECT max(version) + 1 FROM "
+                   "managed_settings) WHERE key = 'logs_hold'"))
+add_old_rows()
+out["cleared"] = jobs()
+out["left_cleared"] = left()
+out["database_hold"] = retention.hold_in_force()
+out["failures"] = sorted(ai.status(st)["failures"])
+print(json.dumps(out))
+'''
+
+
+@pytest.fixture
+def throwaway():
+    yield from throwaway_database()
+
+
+def test_the_hold_applies_at_once_and_stops_the_log_jobs_and_not_the_working_records(throwaway):
+    out = run_in(throwaway, HOLD)
+    assert out["first"] is not None and out["first"]["security_alerts"] is not None, out
+    assert out["status"] == "applied"
+    held = out["held"]
+    assert held["security_alerts"] is None and held["security_records"] is None and held["audit_logs"] is None, held
+    assert held["rate_limit_records"] is not None, held
+    assert out["left_held"] == [1, 0]
+    cleared = out["cleared"]
+    assert out["database_hold"] is False
+    assert cleared["security_alerts"] is None and cleared["audit_logs"] is None, cleared
+    assert cleared["rate_limit_records"] is not None, cleared
+    assert out["left_cleared"] == [2, 0]
+    assert "unjustified-input" in out["failures"], out["failures"]
 
 
 def test_while_another_runner_holds_the_lock_a_pass_does_nothing():

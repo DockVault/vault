@@ -93,6 +93,21 @@
 
 .act-blocked { padding: 48px 16px; text-align: center; color: var(--text-secondary); }
 .act-blocked-text { margin: 0 auto; max-width: 52ch; }
+/* The audit log's integrity strip (static/js/audit-integrity.js). */
+.act-integrity { margin: 6px 0 8px; padding: 4px 12px; border: 1px solid var(--border-color, rgba(127,127,127,.3)); border-radius: 8px; display: grid; gap: 4px; font-size: .9rem; }
+.act-integrity[data-state="failed"] { border-color: var(--danger, #c0392b); }
+.act-integrity[data-state="warning"] { border-color: var(--warning, #d68910); }
+.act-integrity-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
+.act-integrity-head { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.act-integrity-code { font-size: .8rem; min-width: 0; max-width: 16em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.act-integrity-more { min-width: 0; }
+.act-integrity-more > summary { cursor: pointer; }
+.act-integrity-more[open] { flex-basis: 100%; }
+.act-integrity-full { overflow-wrap: anywhere; word-break: break-all; }
+.act-integrity-failure { color: var(--danger, #c0392b); }
+.act-integrity-warning { color: var(--warning, #d68910); }
+/* What the list and the band say of archived days (static/js/activity-archive.js). */
+.act-archive-note { margin: 6px 0 10px; overflow-wrap: anywhere; }
 #activity-section.is-blocked .act-band, #activity-section.is-blocked .act-toolbar,
 #activity-section.is-blocked .act-body, #activity-section.is-blocked .act-live,
 #activity-section.is-blocked .act-head-tools { display: none; }
@@ -696,6 +711,25 @@ tr.act-more .btn, li.act-more .btn { margin-left: 8px; }
     #recording-levels-table tr { display: block; padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); }
     #recording-levels-table th, #recording-levels-table td { display: block; border: 0; padding: .125rem 0; }
 }
+
+/* Settings -> Activity and records: how long records are kept (static/js/settings-retention.js). */
+.retention-banner { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; }
+.retention-banner p { margin: 0; flex: 1 1 20rem; min-width: 0; }
+.retention-group { margin-bottom: 1rem; }
+.retention-row { padding: .75rem 0; border-bottom: 1px solid var(--border, #ddd); min-width: 0; }
+.retention-head { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .75rem; }
+.retention-label { font-weight: 600; }
+.retention-edit { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .5rem 0; }
+.retention-number { max-width: 10rem; }
+.retention-env, .retention-value, .retention-change p { overflow-wrap: anywhere; }
+.retention-change { padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); }
+.retention-storage-list { margin: 0 0 .75rem; padding-left: 1.25rem; overflow-wrap: anywhere; }
+
+/* Settings -> Activity and records: erase a person's records (static/js/settings-erase.js). */
+.erase-preview-list, .erase-not-reached { margin: 0 0 .75rem; padding-left: 1.25rem; overflow-wrap: anywhere; }
+.erase-request { padding: .5rem 0; border-bottom: 1px solid var(--border, #ddd); min-width: 0; }
+.erase-request p { overflow-wrap: anywhere; margin: .25rem 0; }
+.erase-status { margin-left: .5rem; }
 
 /* A notice the signed-in user has to read, across the top of the app (static/js/notice-banner.js). */
 .notice-banners { position: sticky; top: 0; z-index: 900; }

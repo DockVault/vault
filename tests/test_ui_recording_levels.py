@@ -2,13 +2,15 @@
 
 The tab lists one row per kind of data with its levels, the limit and what a sample row records; a level the
 .env limit forbids is a disabled choice that says the line to add (the stack's own limits are all full, so the
-page is shown a description with a lowered limit); a preset fills the rows; the save button waits for a change
+page is shown a description with a lowered limit); with full addresses kept for a number of days, the card says an
+archived day's can be shortened up to a day later; a preset fills the rows; the save button waits for a change
 and asks for the password; the page has no console errors and fits a phone's width.
 """
 import json
 
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -28,6 +30,7 @@ def _open(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.click('#settings-section .tab-btn[data-tab="records"]')
+    show_advanced(page, "records")
     expect(page.locator(TAB)).to_be_visible()
     expect(page.locator("#recording-levels-table tbody tr")).to_have_count(5, timeout=10000)
 
@@ -67,6 +70,24 @@ def test_the_table_renders_with_a_forbidden_level_disabled_and_its_env_line(page
     assert not errors, errors
 
 
+def test_the_card_says_an_address_in_an_archived_day_can_stay_in_full_a_day_longer(page: Page, admin_creds):
+    """With full addresses kept for a number of days (served here as 30), the card says when an address is shortened,
+    and that in a day the archive holds it is once the whole day is that old: up to a day later."""
+    def handle(route):
+        if route.request.method != "GET":
+            return route.continue_()
+        response = route.fetch()
+        data = response.json()
+        data["ip_full_days"] = 30
+        route.fulfill(response=response, body=json.dumps(data))
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.route("**/settings/recording", handle)
+    _open(page)
+    expect(page.locator(TAB)).to_contain_text(
+        "An address recorded in full is shortened to its network once its row is 30 days old, and in a day the archive "
+        "holds once the whole day is that old (up to a day later;")
+
+
 def test_a_preset_fills_the_rows_and_the_save_waits_for_a_change(page: Page, admin_creds):
     _login(page, admin_creds["username"], admin_creds["password"])
     _open(page)
@@ -97,6 +118,7 @@ def test_the_table_fits_a_phone(page: Page, admin_creds):
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    show_advanced(page, "records")
     expect(page.locator("#recording-levels-table tbody tr")).to_have_count(5, timeout=10000)
     width = page.evaluate("() => document.getElementById('recording-levels-card').scrollWidth")
     assert width <= 375, width

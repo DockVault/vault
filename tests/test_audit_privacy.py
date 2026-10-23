@@ -178,8 +178,10 @@ def _spreads_into_a_write(trees):
 
 
 def _assigned(fn):
-    """name -> what a function puts under it: ``name = value``; ``name["key"] = value`` (as ``{"key": value}``);
-    and ``name.update(...)``: its dict arguments, its keywords and what it spreads in (``**{...}``)."""
+    """name -> every expression that gives the name (a dict of) keys in the function ``fn``: ``name = {...}``,
+    ``name["key"] = value``, ``name |= {...}``, ``name.update({...})`` (or ``name.update(key=value)``,
+    ``name.update(**{...})``) and ``name.setdefault("key", value)``. A name that is never handed to a write as
+    its details costs nothing: only the names a write is given are followed."""
     assigned = collections.defaultdict(list)
     for node in ast.walk(fn):
         if isinstance(node, ast.Assign):
@@ -189,14 +191,21 @@ def _assigned(fn):
                 elif (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
                       and isinstance(target.slice, ast.Constant)):
                     assigned[target.value.id].append(ast.Dict(keys=[target.slice], values=[node.value]))
-        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "update"
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and isinstance(node.op, ast.BitOr):
+            assigned[node.target.id].append(node.value)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
               and isinstance(node.func.value, ast.Name)):
             name = node.func.value.id
-            assigned[name] += node.args
-            if node.keywords:
-                assigned[name].append(ast.Dict(
-                    keys=[ast.Constant(kw.arg) if kw.arg else None for kw in node.keywords],
-                    values=[kw.value for kw in node.keywords]))
+            if node.func.attr == "update":
+                assigned[name] += list(node.args)
+                for kw in node.keywords:
+                    if kw.arg:
+                        assigned[name].append(ast.Dict(keys=[ast.Constant(kw.arg)], values=[kw.value]))
+                    else:
+                        assigned[name].append(kw.value)
+            elif node.func.attr == "setdefault" and node.args:
+                value = node.args[1] if len(node.args) > 1 else ast.Constant(None)
+                assigned[name].append(ast.Dict(keys=[node.args[0]], values=[value]))
     return assigned
 
 
@@ -245,8 +254,8 @@ def _paths(node, prefix=""):
 
 def detail_paths(trees, root=ROOT):
     """path -> where it is written, for every literal detail key reachable from an audit write: a dict passed
-    as details, or assigned (or subscript-assigned, or added with ``.update(...)``) to the name passed, in the
-    same function."""
+    as details, or given to the name passed in the same function (assigned, subscript-assigned, or added with
+    update, setdefault or |=)."""
     wrappers = _wrappers(trees)
     kwargs_wrappers, imports = _kwargs_wrappers(trees, wrappers, root)
     returned = _returned_dicts(trees)
@@ -407,6 +416,74 @@ def test_a_helper_that_spreads_its_keyword_arguments_into_a_write_is_reported(tm
             AuditLogger(db).log_action(action="x", status="success", details=None)
     ''')
     assert _spreads_into_a_write({tmp_path / "fake.py": ast.parse(source)}) == ["fake.py:_opaque"]
+
+
+def test_the_scan_reads_keys_added_with_update_setdefault_and_an_or_assignment(tmp_path):
+    """A key added to the details after they are made is read as one written in the dict: the refusal of a
+    zero-knowledge key proof adds the challenge's epochs with update()."""
+    source = textwrap.dedent('''
+        def route(db, actor, ch):
+            details = {"made_up_first": 1}
+            details.update(made_up_by_keyword=2)
+            details.update({"made_up_by_dict": {"made_up_inner": 3}})
+            details.update(**{"made_up_spread": 4})
+            details.setdefault("made_up_default", 5)
+            details |= {"made_up_or": 6}
+            AuditLogger(db).log_action(action="x", status="success", user=actor, details=details)
+
+        def untouched(db):
+            other = {}
+            other.update(not_a_detail=1)
+            other.setdefault("nor_this", 2)
+            AuditLogger(db).log_action(action="y", status="success", details={"made_up_last": 7})
+    ''')
+    found = detail_paths({tmp_path / "fake.py": ast.parse(source)}, root=tmp_path)
+    assert set(found) == {"made_up_first", "made_up_by_keyword", "made_up_by_dict", "made_up_by_dict.made_up_inner",
+                          "made_up_spread", "made_up_default", "made_up_or", "made_up_last"}
+
+
+def _zero_knowledge_writes(trees, wrappers):
+    """{site: whether it hands the write details} for every call that writes a catalogued zero-knowledge action
+    (one whose name starts with zk_), by the action's name given to the call."""
+    from app.core import audit_catalog
+    zk_actions = {a.name for a in audit_catalog.ACTIONS if a.name.startswith("zk_")}
+    out = {}
+    for path, tree in trees.items():
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call):
+                continue
+            callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
+            if callee not in wrappers:
+                continue
+            given = [a for a in call.args] + [kw.value for kw in call.keywords]
+            if not any(isinstance(g, ast.Constant) and g.value in zk_actions for g in given):
+                continue
+            has_details = (any(kw.arg == "details" for kw in call.keywords)
+                           or any(i < len(call.args) for i in wrappers[callee]))
+            out[f"{path.relative_to(ROOT).as_posix()}:{call.lineno}"] = has_details
+    return out
+
+
+def test_every_zero_knowledge_audit_write_has_every_key_read_and_classified():
+    """Each write of a zero-knowledge action (key changes, their proofs, shares, sealed names) has its details
+    read by the scan, wherever its keys are added, and every key is classified, so none is dropped as unknown
+    (with an alert) when it is written."""
+    trees = _trees()
+    wrappers = _wrappers(trees)
+    sites = _zero_knowledge_writes(trees, wrappers)
+    assert len(sites) >= 15, sites                        # the zero-knowledge routes, not a partial scan
+    paths = detail_paths(trees)
+    by_site = collections.defaultdict(set)
+    for p, where in paths.items():
+        for w in where:
+            by_site[w].add(p)
+    unread = sorted(site for site, has_details in sites.items() if has_details and not by_site.get(site))
+    assert unread == [], f"zero-knowledge writes whose details the scan cannot read: {unread}"
+    keys = set().union(*(by_site.get(site, set()) for site in sites))
+    assert {p for p in keys if ap.kind_of(p) is None} == set()
+    # The refusal of a proof: the operation and why, then the challenge's mode and epochs, added with update().
+    failed = [s for s in sites if by_site.get(s, set()) >= {"op", "reason"}]
+    assert any(by_site[s] >= {"op", "reason", "mode", "dek_epoch", "team_epoch"} for s in failed), failed
 
 
 def test_the_registry_holds_only_known_kinds_and_its_names_are_the_redacted_names():

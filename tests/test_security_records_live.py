@@ -6,7 +6,9 @@ the database refuses costs neither the audit row nor the answer, and raises an a
 of the name typed that fails costs none of them, the record included. An alert raised by repeated failures holds placeholders
 instead of the name and the address, is shown with them filled in, and is linked from the records that
 raised it. A pass of the pruner deletes records past the window and clears the names and addresses of
-alerts past it, resolved or not. test_security_records.py covers the rules offline.
+alerts past it, resolved or not. On a throwaway database, a shorter window written into the database behind the
+panel's back deletes no record and clears no alert sooner than the audit chain's window: it is reported, and not
+acted on. test_security_records.py covers the rules offline.
 """
 import json
 import os
@@ -19,6 +21,7 @@ import pytest
 from conftest import ApiClient, BASE_URL, unique
 from _account_change_helpers import in_api_container, psql, reset_sign_in_throttle
 from _sf_helpers import enroll_totp
+from _throwaway_db import PREAMBLE, run_in, throwaway_database
 
 pytestmark = pytest.mark.integration
 
@@ -340,3 +343,55 @@ def test_the_records_own_account_lookup_that_fails_never_costs_the_record(temp_u
         assert out == {"failed": True, "answer": "answered", "rows": 1, "record": [name, True]}, out
     finally:
         psql(f"DELETE FROM security_records WHERE name = '{name}'")
+
+
+_BEHIND_THE_PANEL = PREAMBLE + r"""
+from app.core import security_records as srec, settings_registry as registry
+
+def jobs():
+    done = retention.run_pass(SessionLocal, engine=engine)
+    return None if done is None else {n: (getattr(r, "deleted", None), getattr(r, "cleared", None)) if r else None
+                                      for n, r in done}
+
+def ids(sql):
+    with engine.begin() as c:
+        return sorted(str(r[0]) for r in c.execute(text(sql)).all())
+
+out = {"first": jobs()}          # the chain starts here, with the deployment's 30 days
+seeded = {}
+with engine.begin() as c:
+    for days in (10, 40):
+        rid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+        seeded[days] = (rid, aid)
+        c.execute(text("INSERT INTO security_records (id, at, kind, name, address) VALUES (:i, :t, 'login_failure', "
+                       "'someone', '203.0.113.7')"), {"i": rid, "t": now - timedelta(days=days)})
+        c.execute(text("INSERT INTO security_alerts (id, event_type, severity, message, username, ip_address, "
+                       "timestamp, resolved, details) VALUES (:i, 'multiple_failed_logins', 'warning', "
+                       "'WARNING: 7 failures for {username} from {ip_address}', 'someone', '203.0.113.7', :t, false, "
+                       "'{}')"), {"i": aid, "t": now - timedelta(days=days)})
+    # A shorter window written into the database without the server's key.
+    c.execute(text("INSERT INTO managed_settings (key, value, version, updated_at) VALUES ('security_record_days', "
+                   "'7', (SELECT coalesce(max(version), 0) + 1 FROM managed_settings), now()) ON CONFLICT (key) DO "
+                   "UPDATE SET value = '7', version = excluded.version"))
+registry.refresh(SessionLocal)
+out["registry"] = registry.resolve(srec.WINDOW_KEY)
+out["window_days"] = srec.window().days
+out["pass"] = jobs()
+out["records"] = ids("SELECT id FROM security_records WHERE name = 'someone'")
+out["named_alerts"] = ids("SELECT id FROM security_alerts WHERE username = 'someone'")
+out["seeded"] = {str(k): v for k, v in seeded.items()}
+out["failures"] = sorted(ai.status(st)["failures"])
+print(json.dumps(out))
+"""
+
+
+def test_a_shorter_window_written_behind_the_panel_deletes_no_record_sooner():
+    for name in throwaway_database():
+        out = run_in(name, _BEHIND_THE_PANEL)
+        assert out["first"] is not None, out
+        assert (out["registry"], out["window_days"]) == (7, 30), out
+        young, old = out["seeded"]["10"], out["seeded"]["40"]
+        # The 40-day-old record went and its alert lost the name; the 10-day-old ones stayed as they were.
+        assert out["pass"]["security_records"][0] == 1 and out["pass"]["security_alert_values"][1] == 1, out
+        assert out["records"] == [young[0]] and out["named_alerts"] == [young[1]], out
+        assert "unjustified-input" in out["failures"], out["failures"]

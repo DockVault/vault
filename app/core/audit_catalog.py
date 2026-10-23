@@ -43,6 +43,9 @@ class AuditAction(NamedTuple):
     # The server writes the row on its own, with no person acting (the file-expiry sweep). Such a row
     # has no user, and the Activity page says the system did it rather than "Unknown".
     automatic: bool = False
+    # The row's username may be a name someone typed, with no account (a failed sign-in): an account's
+    # name on such a row with no account linked is expected, not an account row unlinked from its account.
+    typed_name: bool = False
 
 
 ACTIONS: Tuple[AuditAction, ...] = (
@@ -51,7 +54,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     # A row says which (ROW_LABELS); these are the labels the filters list.
     AuditAction("account_auto_locked", "sign_in", "New sign-ins paused after failed sign-ins", "warning"),
     AuditAction("account_auto_unlocked", "sign_in", "Sign-ins resumed", "info"),
-    AuditAction("login_failure", "sign_in", "Sign-in failed", "warning"),
+    AuditAction("login_failure", "sign_in", "Sign-in failed", "warning", typed_name=True),
     AuditAction("login_password_ok", "sign_in", "Password accepted, second factor pending", "info"),
     AuditAction("login_success", "sign_in", "Signed in", "info"),
     # A user said they had read the notice of what this vault records, after a change (reading, not consent).
@@ -259,8 +262,40 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("note_link_tag_deactivated", "administration", "Note-link tag deactivated", "notice"),
     AuditAction("note_link_tag_updated", "administration", "Note-link tag changed", "notice"),
     AuditAction("receiver_tag_created", "administration", "Upload-link tag created", "notice"),
+    # The audit log's integrity chain (app/core/audit_integrity.py): a check found the log or its seals
+    # changed (announced once per finding; the status itself is kept outside the database), rows that arrived
+    # in an hour already sealed were sealed late, and an acknowledgment of such warnings.
+    AuditAction("audit_integrity_failed", "security", "Audit log integrity check failed", "warning",
+                automatic=True),
+    AuditAction("audit_rows_sealed_late", "security", "Audit rows sealed late", "warning", automatic=True),
+    AuditAction("audit_integrity_acknowledged", "administration", "Audit log integrity warning acknowledged",
+                "notice"),
+    # What the host's operator does to the chain (dockvault.py audit): the chain moved to another key, seals
+    # after the head record accepted or discarded, a restored database or backup accepted, and a removal made
+    # by a release without the chain sealed over.
+    AuditAction("audit_chain_key_changed", "administration", "Audit log chain moved to another key", "warning"),
+    AuditAction("audit_seals_accepted", "administration", "Audit log seals accepted by the host", "warning"),
+    AuditAction("audit_seals_discarded", "administration", "Audit log seals discarded by the host", "warning"),
+    AuditAction("audit_chain_restored", "administration", "Audit log restore accepted", "warning"),
+    AuditAction("audit_removal_acknowledged", "administration", "Audit rows removed by an older release sealed over",
+                "warning"),
+    # The host's `audit unarchive` (app/core/audit_archive.py): an archived day put back as rows.
+    AuditAction("audit_archive_restored", "administration", "Archived audit day restored as rows", "notice"),
     # The pruner (app/core/retention.py): one row per job that deleted something in a pass.
     AuditAction("retention_pruned", "administration", "Old records deleted", "info", automatic=True),
+    # A per-person erase (app/core/person_erase.py): asked for, cancelled by any administrator, and completed by
+    # the server once due. Each names the placeholder the erase writes, never the name it removes.
+    AuditAction("person_erase_requested", "administration", "Erase of a person's records requested", "warning"),
+    AuditAction("person_erase_cancelled", "administration", "Erase of a person's records cancelled", "notice"),
+    AuditAction("person_erased", "administration", "A person's records erased", "warning", automatic=True),
+    # A removal of values recorded under earlier recording levels (app/core/audit_value_removal.py): asked for,
+    # cancelled by any administrator, and completed by the pruner.
+    AuditAction("audit_values_removal_requested", "administration", "Removal of earlier recorded values requested",
+                "warning"),
+    AuditAction("audit_values_removal_cancelled", "administration", "Removal of earlier recorded values cancelled",
+                "notice"),
+    AuditAction("audit_values_removed", "administration", "Earlier recorded values removed", "warning",
+                automatic=True),
     AuditAction("receiver_tag_deactivated", "administration", "Upload-link tag deactivated", "notice"),
     AuditAction("receiver_tag_updated", "administration", "Upload-link tag changed", "notice"),
     # A managed setting (app/core/settings_registry.py): the row carries the values before and after.

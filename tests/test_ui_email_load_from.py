@@ -6,6 +6,7 @@ present; user templates appear below an underline. Selecting confirms first (it 
 """
 import pytest
 from playwright.sync_api import Page, expect
+from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -22,6 +23,7 @@ def _login(page: Page, username: str, password: str):
 def _open_email_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     page.click('.tab-btn[data-tab="email"]')
+    show_advanced(page, "email")
     expect(page.locator("#email-templates-grid")).to_be_visible(timeout=10000)
 
 

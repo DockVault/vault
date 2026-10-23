@@ -28,7 +28,9 @@ from app.api import api_server as api  # noqa: E402
 from app.api import managed_settings_router as routes  # noqa: E402
 from app.core import setting_changes as sc  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
-from app.core.models import AuditLog, ManagedSetting, ManagedSettingChange, RoleEnum, User  # noqa: E402
+from app.core.models import (AuditArchiveBlock, AuditLog, AuditSeal, ManagedSetting,  # noqa: E402
+                             ManagedSettingChange, RoleEnum, SystemSetting, User)
+from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -41,15 +43,17 @@ def env(monkeypatch):
                                retention_reduction_delay_days=7)
     monkeypatch.setattr(reg, "_deployment_settings", lambda: settings)
     reg.all_specs()
-    saved = [(table, dict(table)) for table in (reg._SPECS, reg._LISTED, reg._LOCK_GROUPS)]
+    saved = [(table, dict(table)) for table in (reg._SPECS, reg._LISTED, reg._LOCK_GROUPS, reg._FIELDS)]
     delay = reg._SPECS[sc.DELAY_KEY]
     for table, _ in saved:
         table.clear()
     reg.register(delay)
     reg.register(reg.SettingSpec(key="keep_days", kind="int", default=90, env="keep_days", minimum=1,
                                  maximum=3650, floor="keep_floor", ceiling="keep_ceiling", unlimited=0,
-                                 reduction=reg.LOWER, group="keeping", label="Keep for"))
-    reg.register(reg.SettingSpec(key="env_days", kind="int", default=5, editable=reg.ENV_ONLY))
+                                 reduction=reg.LOWER, group="keeping", label="Keep for", level=reg.ADVANCED,
+                                 since="0.34.0"))
+    reg.register(reg.SettingSpec(key="env_days", kind="int", default=5, editable=reg.ENV_ONLY, level=reg.ADVANCED,
+                                 since="0.34.0"))
     yield settings
     for table, before in saved:
         table.clear()
@@ -60,7 +64,8 @@ def env(monkeypatch):
 def db(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'managed.db'}")
-        for model in (User, ManagedSetting, ManagedSettingChange, AuditLog):
+        for model in (User, ManagedSetting, ManagedSettingChange, AuditLog, AuditSeal, AuditArchiveBlock,
+                      SystemSetting):
             model.__table__.create(engine)
         factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
         monkeypatch.setattr(reg, "_default_session_factory", factory)
@@ -68,6 +73,27 @@ def db(monkeypatch):
         yield session
         session.close()
         engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def chain(request, monkeypatch, tmp_path):
+    """The audit log's integrity chain, started on the test's database: every change writes its seal there."""
+    if "db" not in request.fixturenames:
+        yield None
+        return
+    from datetime import datetime, timezone
+    from app.core import audit_chain_policy as pol
+    settings = request.getfixturevalue("env")
+    request.getfixturevalue("db")
+    # The chain reads the deployment's values from .env as the app's configuration parses them; this test's
+    # own settings are not in that configuration, so the chain is given them as the registry has them.
+    parse = pol.settings_from_inputs
+    monkeypatch.setattr(pol, "settings_from_inputs",
+                        lambda inputs: SimpleNamespace(**{**vars(parse(inputs)), **vars(settings)}))
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    c = Chain(monkeypatch, tmp_path, settings, reg._default_session_factory, now)
+    c.seal_all()
+    yield c
 
 
 @pytest.fixture(autouse=True)
@@ -128,7 +154,7 @@ def test_the_routes_are_plain_functions_mounted_on_the_app():
     found = _managed_routes()
     assert {("GET", "/settings/managed"), ("PUT", "/settings/managed/{key}"),
             ("POST", "/settings/managed/changes/{change_id}/cancel"),
-            ("GET", "/settings/managed/audit/preview")} <= set(found)
+            ("GET", "/settings/managed/audit/preview"), ("GET", "/settings/managed/storage")} <= set(found)
     for route in found.values():
         assert not inspect.iscoroutinefunction(route.endpoint), route.path
 
@@ -136,7 +162,7 @@ def test_the_routes_are_plain_functions_mounted_on_the_app():
 def test_only_an_interactive_administrator_reaches_them():
     from app.api import user_management_api as um
     found = _managed_routes()
-    assert len(found) == 4
+    assert len(found) == 5
     for route in found.values():
         deps = {d.call for d in route.dependant.dependencies}
         assert um.require_interactive_admin in deps, route.path
@@ -250,6 +276,9 @@ def test_going_back_to_the_deployments_value_waits_when_it_deletes_sooner(env, d
     _put(db, user, "keep_days", 400)
     out = _put(db, user, "keep_days", None)
     assert (out["status"], out["change"]["setting"], out["change"]["new"]) == ("pending", None, 30)
+    # The list says what the request seal asks for (no setting) and the value it resolves to when it applies.
+    (waiting,) = routes.get_managed_settings(current_user=user, db=db)["pending"]
+    assert (waiting["old"], waiting["setting"], waiting["new"]) == (400, None, 30)
 
 
 def test_the_same_value_again_changes_nothing_and_writes_no_row(env, db, quiet):
@@ -367,3 +396,157 @@ def test_a_cancel_whose_audit_row_cannot_be_written_leaves_the_change_waiting(en
     assert "still waiting" in caught.value.detail
     assert db.get(ManagedSettingChange, uuid.UUID(change_id)).status == sc.PENDING
     assert len(quiet["announced"]) == 1
+
+
+def _waiting(db, user):
+    return routes.get_managed_settings(current_user=user, db=db)["pending"]
+
+
+def _planted(db, user, key="keep_days"):
+    """A pending row written straight into the database, with no request seal."""
+    from datetime import datetime, timedelta
+    planted = uuid.uuid4()
+    now = datetime.utcnow()
+    db.add(ManagedSettingChange(id=planted, key=key, setting=1, old_value=30, new_value=1, status=sc.PENDING,
+                                requested_by=user.id, requested_by_name=user.username, requested_at=now,
+                                effective_at=now + timedelta(days=7)))
+    db.commit()
+    return planted
+
+
+def test_the_changes_waiting_and_their_cancel_come_from_the_chain_not_the_table(env, db, quiet):
+    """The row's values and date edited: the list shows what the request seal holds. The row marked cancelled:
+    still listed, with what the database says, and another administrator's cancel is sealed. A row planted with
+    no request seal: not listed, and its cancel is no change (404), with no audit row and no seal."""
+    from datetime import timedelta
+    from app.core.models import AuditSeal
+    alice, bob = _admin(db), _admin(db, "bob")
+    sealed = _put(db, alice, "keep_days", 10)["change"]
+    change_id = uuid.UUID(sealed["id"])
+    row = db.get(ManagedSettingChange, change_id)
+    row.new_value, row.setting, row.effective_at = 400, 400, row.effective_at + timedelta(days=300)
+    db.commit()
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["old"], e["setting"], e["new"], e["requested_by"]) == (sealed["id"], 30, 10, 10, "alice")
+    assert e["effective_at"].rstrip("Z") == sealed["effective_at"].rstrip("Z") and e["database"] is None
+    row.status = sc.CANCELLED
+    db.commit()
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (sealed["id"], "cancelled", True)
+    out = routes.cancel_managed_setting_change(change_id, current_user=bob, db=db)
+    assert (out["status"], out["change"]["decided_by"], out["change"]["new"]) == ("cancelled", "bob", 10)
+    assert quiet["announced"][-1] == (sc.CANCELLED_BY_ADMIN, "keep_days", 30, 10, "bob")
+    (audit,) = db.query(AuditLog).filter(AuditLog.action == sc.CANCELLED_ACTION).all()
+    assert (audit.username, audit.details["old"], audit.details["new"], audit.details["setting"]) == (
+        "bob", 30, 10, 10)
+    newest = db.query(AuditSeal).order_by(AuditSeal.seq.desc()).first()
+    assert (newest.kind, newest.detail["request"], newest.detail["by"]) == ("cancel", sealed["id"], "admin")
+    assert _waiting(db, alice) == []
+    planted = _planted(db, alice)
+    assert _waiting(db, alice) == []
+    seals, rows = db.query(AuditSeal).count(), db.query(AuditLog).count()
+    with refused(404):
+        routes.cancel_managed_setting_change(planted, current_user=bob, db=db)
+    assert (db.query(AuditSeal).count(), db.query(AuditLog).count()) == (seals, rows)
+    assert db.get(ManagedSettingChange, planted).status == sc.PENDING
+
+
+def test_while_sealing_is_stopped_a_cancel_needs_the_change_the_chain_holds_waiting(env, db, quiet, chain):
+    """The chain's tail cut: sealing stops, the view keeps what it authenticated. A cancel of the waiting change
+    is saved on its row (sealed from the database once sealing runs again); a row planted with no request seal is
+    no change (404); a waiting change whose row the database marks ended already does not apply (409, saying so),
+    and the list offers no cancel for it while sealing is stopped."""
+    from app.core.models import AuditSeal
+    alice = _admin(db)
+    first = uuid.UUID(_put(db, alice, "keep_days", 10)["change"]["id"])
+    second = uuid.UUID(_put(db, alice, "keep_days", 20)["change"]["id"])     # supersedes the first
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    assert chain.seal_all().stopped == "head-record-mismatch"
+    assert routes.get_managed_settings(current_user=alice, db=db)["pending_chain"] == {
+        "read": True, "stopped": "head-record-mismatch"}
+    seals = db.query(AuditSeal).count()
+    with refused(404):
+        routes.cancel_managed_setting_change(_planted(db, alice), current_user=alice, db=db)
+    with refused(409) as caught:
+        routes.cancel_managed_setting_change(first, current_user=alice, db=db)
+    assert caught.value.detail == "This change is no longer waiting: it was superseded."
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(second), None, True)
+    db.get(ManagedSettingChange, second).status = sc.SUPERSEDED
+    db.commit()
+    # The list offers no cancel for it while sealing is stopped: the cancel could only be refused.
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(second), "superseded", False)
+    with refused(409) as caught:
+        routes.cancel_managed_setting_change(second, current_user=alice, db=db)
+    assert "marks this change superseded, so it does not apply" in caught.value.detail
+    db.get(ManagedSettingChange, second).status = sc.PENDING
+    db.commit()
+    out = routes.cancel_managed_setting_change(second, current_user=alice, db=db)
+    assert (out["status"], out["change"]["setting"], out["change"]["decided_by"]) == ("cancelled", 20, "alice")
+    assert db.get(ManagedSettingChange, second).status == sc.CANCELLED
+    assert db.query(AuditSeal).count() == seals
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(second), "cancelled", False)
+
+
+@pytest.mark.parametrize("how", [sc.APPLIED, "missing"])
+def test_while_sealing_is_stopped_no_cancel_is_offered_for_a_change_whose_row_is_applied_or_gone(env, db, quiet,
+                                                                                                  chain, how):
+    """While sealing is stopped, a waiting change whose row the database marks applied, or no longer holds,
+    already does not apply: the list says so and offers no cancel, since the cancel could only be refused (409,
+    saying what the database shows), and nothing is written."""
+    alice = _admin(db)
+    change = uuid.UUID(_put(db, alice, "keep_days", 10)["change"]["id"])
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    assert chain.seal_all().stopped == "head-record-mismatch"
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(change), None, True)
+    row = db.get(ManagedSettingChange, change)
+    if how == "missing":
+        db.delete(row)
+    else:
+        row.status = how
+    db.commit()
+    (e,) = _waiting(db, alice)
+    assert (e["id"], e["database"], e["cancellable"]) == (str(change), how, False)
+    seals, rows = db.query(AuditSeal).count(), db.query(AuditLog).count()
+    with refused(409) as caught:
+        routes.cancel_managed_setting_change(change, current_user=alice, db=db)
+    said = "holds no row of this change" if how == "missing" else "marks this change applied"
+    assert f"The database {said}, so it does not apply" in caught.value.detail
+    assert (db.query(AuditSeal).count(), db.query(AuditLog).count()) == (seals, rows)
+
+
+def test_while_sealing_is_stopped_a_reduction_is_refused_and_a_longer_value_is_saved(env, db, chain):
+    from app.core.models import AuditSeal
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    from app.core import audit_integrity
+    chain.st.view.reset()
+    user = _admin(db)
+    with pytest.raises(HTTPException) as refused:
+        routes.put_managed_setting("keep_days", routes.ManagedValue(value=10), request=None, current_user=user, db=db)
+    assert refused.value.status_code == 409 and "not sealing" in refused.value.detail
+    out = routes.put_managed_setting("keep_days", routes.ManagedValue(value=400), request=None, current_user=user,
+                                     db=db)
+    assert out["status"] == "applied"
+    assert audit_integrity
+
+
+def test_while_sealing_is_stopped_a_change_is_judged_against_the_chain_not_the_stored_value(env, db, chain):
+    """Sealing stops with the chain's 30 days in force; the database says 1000 (written without the key). 500
+    keeps more than what the pruner acts on, so it is saved at once, though it is lower than the stored 1000."""
+    from app.core.models import AuditSeal
+    assert chain.st.view.newest_state()["keep_days"]["value"] == 30
+    db.add(ManagedSetting(key="keep_days", value=1000, version=1))
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    user = _admin(db)
+    with refused(409):
+        _put(db, user, "keep_days", 10)
+    out = _put(db, user, "keep_days", 500)
+    assert out["status"] == "applied" and out["change"] is None
+    assert db.get(ManagedSetting, "keep_days").value == 500
