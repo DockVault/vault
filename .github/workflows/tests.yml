@@ -274,8 +274,20 @@ jobs:
       # deserves a standing instrument that says WHERE it is stuck, not only that it is. Without it a
       # hang is a log of dots until the job cap, which also loses the JUnit report below (the file is
       # written at session end, which a capped run never reaches).
+      #
+      # VAULT_SFTP_STREAMING=1 opts tests/test_sftp_streaming_upload.py in: those tests hold only where
+      # the SFTP server streams uploads, which the shipped default does (SFTP_STREAMING_UPLOAD is not
+      # set in this job's .env). The SFTP container is asked first, so the opt-in is never given to a
+      # stack that buffers; it is given to this command only, and every other step runs as before.
+      # The question builds Settings() from the container's environment, as the server does when it
+      # starts: the module's `settings` object holds only the defaults until a server fills it in, so
+      # reading that would answer True whatever the container was given.
       - name: Run the full test suite
-        run: python -m pytest --maxfail=1 --junitxml=pytest-results.xml -o faulthandler_timeout=300
+        run: |
+          set -euo pipefail
+          streaming="$(docker compose exec -T vault-sftp python -c 'from app.core.config import Settings; print(Settings().sftp_streaming_upload)')"
+          test "$streaming" = "True"
+          VAULT_SFTP_STREAMING=1 python -m pytest --maxfail=1 --junitxml=pytest-results.xml -o faulthandler_timeout=300
 
       # Keep the JUnit report -- it holds the per-test durations for all ~4,000 tests. Uploaded
       # always (not only on failure), before the audit step below, so it survives a failing run too:

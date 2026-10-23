@@ -79,3 +79,38 @@ def test_the_users_row_names_the_columns_added_to_accounts_since_0_33():
         assert column in named, f"the users row does not name {column}"
     unknown = [n for n in named if n not in User.__table__.c]
     assert not unknown, f"the users row names columns the table does not have: {unknown}"
+
+
+def _cache_keys():
+    """The first cell of every row of the Cache (Redis) table, as one string."""
+    text = _text()
+    assert text.count("\n## Cache (Redis)\n") == 1
+    cache = text.split("\n## Cache (Redis)\n", 1)[1].split("\n## ", 1)[0]
+    return " ".join(line.split("|")[1] for line in cache.splitlines() if line.startswith("| `"))
+
+
+def test_the_cache_table_names_every_key_an_anonymous_link_keeps():
+    # Found from the code that writes them: a link's download grant and its wrong-secret counters (a
+    # helper that returns the key), and the throttles on opening a link and on downloading through one
+    # (the prefix given to the rate limiter). A new one fails here until the table says what it holds.
+    source = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    keys = _cache_keys()
+    built = re.findall(r'return f"([a-z_]+:[a-z_]+:)\{', source)
+    throttles = re.findall(r'prefix="((?:publiclink|notelink|receiver)_[a-z_]+)"', source)
+    assert "publiclink:grant:" in built and "notelink:fail:" in built and len(built) >= 4, built
+    assert "publiclink_download_ip" in throttles and len(throttles) >= 7, throttles
+    missing = [k for k in built if f"`{k}<" not in keys] + [t for t in throttles if f"`{t}:<" not in keys]
+    assert not missing, f"keys the links keep in Redis that the Cache table does not name: {missing}"
+
+
+def test_the_grant_row_says_what_a_grant_holds_and_for_how_long():
+    # What the code stores (link id, address, mint time) and for how long (_PUBLINK_GRANT_TTL) is pinned
+    # in tests/test_public_link_grant.py; this holds the row to the same three parts and the same time.
+    source = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    assert re.findall(r"^_PUBLINK_GRANT_TTL = (\d+)\b", source, re.M) == ["60"]
+    rows = [line for line in _text().splitlines() if line.startswith("| `publiclink:grant:")]
+    assert len(rows) == 1
+    _, _key, holds, lifetime, _ = rows[0].split("|")
+    for part in ("the link's id", "the address that redeemed it", "when it was minted"):
+        assert part in holds, part
+    assert lifetime.strip().startswith("60 seconds"), lifetime

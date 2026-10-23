@@ -22,3 +22,14 @@ def test_the_page_lets_the_browser_send_no_form(path):
     assert r.status_code == 200 and "text/html" in r.headers.get("content-type", ""), (r.status_code, path)
     directives = [d.strip() for d in r.headers.get("Content-Security-Policy", "").split(";")]
     assert [d for d in directives if d.startswith("form-action")] == ["form-action 'none'"], directives
+
+
+def test_a_refused_download_page_lets_the_browser_send_no_form():
+    # The page a browser shows when a public file link's download is refused (a grant that was used, or
+    # one that never was) is an HTML page of the vault's too, with the same policy.
+    r = requests.get(f"{BASE_URL}/public-links/not-a-real-token-0000000000/download/"
+                     "00000000-0000-4000-8000-000000000000?grant=not-a-real-grant", timeout=30)
+    assert r.status_code == 404 and "text/html" in r.headers.get("content-type", ""), r.status_code
+    directives = [d.strip() for d in r.headers.get("Content-Security-Policy", "").split(";")]
+    assert [d for d in directives if d.startswith("form-action")] == ["form-action 'none'"], directives
+    assert "script-src 'self'" in directives and "<form" not in r.text and "<script" not in r.text

@@ -366,3 +366,63 @@ def test_temp_session_cannot_create(admin, links_enabled):
         assert r.status_code == 403, r.text
     finally:
         admin.post(f"/temp-creds/{tc['temp_username']}/delete")
+
+
+def test_a_peek_spends_nothing_and_only_the_redeem_spends_the_view(admin, links_enabled):
+    """The page of a link with no secret peeks as it loads and shows its note on a click, so neither a
+    fetch of the page nor its script (a link preview, a mail scanner) spends the view."""
+    import requests
+
+    note_id = _mk_note(admin, title="Look once", body="the body")
+    tag = _mk_tag(admin, max_uses_cap=1)
+    link = admin.post("/note-links", json={"note_id": note_id, "tag_id": tag["id"], "max_uses": 1}).json()
+    anon = admin.clone_anonymous()
+
+    def card():
+        found = {l["id"]: l for l in admin.get("/note-links").json()["links"]}[link["id"]]
+        return found["view_count"], found["use_count"], found["status"]
+
+    page = requests.get(f"{BASE_URL}/l/{link['token']}", timeout=30)
+    assert page.status_code == 200 and "the body" not in page.text
+    for _ in range(3):
+        peek = anon.post(f"/note-links/{link['token']}/redeem", json={"peek": True})
+        assert peek.status_code == 200 and peek.json() == {"available": True, "secret_kind": "none"}
+    assert card() == (0, 0, "active")
+    shown = anon.post(f"/note-links/{link['token']}/redeem", json={})
+    assert shown.json() == {"title": "Look once", "body": "the body", "secret_kind": "none"}
+    assert card() == (1, 1, "exhausted")
+    # The next visitor's page peeks and is told the link is used up.
+    assert anon.post(f"/note-links/{link['token']}/redeem", json={"peek": True}).status_code == 404
+
+
+def test_a_peek_at_a_protected_link_prompts_and_neither_checks_nor_spends(admin, links_enabled):
+    note_id = _mk_note(admin, body="guarded")
+    tag = _mk_tag(admin, require_secret="password")
+    link = admin.post("/note-links", json={"note_id": note_id, "tag_id": tag["id"],
+                                           "password": "hunter2x9"}).json()
+    import hashlib
+    import os
+    import subprocess
+
+    anon = admin.clone_anonymous()
+    # Six peeks, three of them with a wrong password: more than the five that would lock the link had
+    # any of them been checked.
+    for secret in (None, "hunter2x9", "a-wrong-one", "a-wrong-two", "a-wrong-three", None):
+        body = {"peek": True} if secret is None else {"peek": True, "secret": secret}
+        r = anon.post(f"/note-links/{link['token']}/redeem", json=body)
+        assert r.status_code == 401 and r.json()["detail"] == {"error": "secret_required", "secret_kind": "password"}
+    found = {l["id"]: l for l in admin.get("/note-links").json()["links"]}[link["id"]]
+    assert (found["view_count"], found["use_count"]) == (0, 0)
+    # No wrong guess was counted: the link has no failure counter at all.
+    fail_key = "notelink:fail:" + hashlib.sha256(link["token"].encode()).hexdigest()
+    held = subprocess.run(["docker", "exec", os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis"),
+                           "redis-cli", "EXISTS", fail_key], capture_output=True, text=True, timeout=30)
+    assert held.returncode == 0 and held.stdout.strip() == "0", held.stdout + held.stderr
+    # The control: a wrong guess that is checked (no peek) is counted under that key.
+    wrong = anon.post(f"/note-links/{link['token']}/redeem", json={"secret": "a-wrong-four"})
+    assert wrong.status_code == 401 and wrong.json()["detail"]["error"] == "wrong_secret"
+    held = subprocess.run(["docker", "exec", os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis"),
+                           "redis-cli", "EXISTS", fail_key], capture_output=True, text=True, timeout=30)
+    assert held.stdout.strip() == "1", "the counter was looked for under the wrong key"
+    shown = anon.post(f"/note-links/{link['token']}/redeem", json={"secret": "hunter2x9"})
+    assert shown.status_code == 200 and shown.json()["body"] == "guarded"

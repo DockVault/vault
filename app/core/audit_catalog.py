@@ -171,6 +171,10 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("public_link_download_completed", "public_links", "Public link download finished", "info"),
     AuditAction("public_link_redeem", "public_links", "Public link opened", "info"),
     AuditAction("public_link_revoke", "public_links", "Public link revoked", "info"),
+    # The server could not start a download it had granted (the stored file missing or unreadable, no
+    # transfer slot free): the use the link's redeem spent was given back.
+    AuditAction("public_link_use_refunded", "public_links", "Public link use given back after a failed download",
+                "notice"),
     # Upload links
     AuditAction("receiver_admin_revoke", "upload_links", "Upload link revoked by an admin", "notice"),
     AuditAction("receiver_create", "upload_links", "Upload link created", "notice"),

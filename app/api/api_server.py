@@ -389,7 +389,21 @@ from app.core.log_redaction import (  # noqa: E402
     access_target as _access_target,
     AccessLogRedactFilter as _AccessLogRedactFilter,
     WebSocketLogRedactFilter as _WebSocketLogRedactFilter,
+    SECRET_QUERY_RE as _SECRET_QUERY_RE,
+    redact_log_path as _redact_log_path,
 )
+
+
+def _referrer_policy(path: str, query: str) -> str:
+    """The Referrer-Policy for a response: strict-origin-when-cross-origin, except when the response's own
+    address holds a secret, a link's token in the path (a note, file or upload link's page, its redeem,
+    its download) or an invitation's or a reset's token in the query: the routes the access log masks
+    (app/core/log_redaction.py). Then a Referer carries the origin alone, to this origin as well, where a
+    reverse proxy may log it, so the page's own requests (its script, its redeem, the download it starts)
+    never repeat the token. Not no-referrer: that would also send `Origin: null` on the page's own POST."""
+    if _redact_log_path(path) != path or (query and _SECRET_QUERY_RE.search("?" + query)):
+        return "strict-origin"
+    return "strict-origin-when-cross-origin"
 
 
 def _public_base_url(request) -> str:
@@ -473,8 +487,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # value has historically been abusable for same-origin info leaks). CSP is the real control.
         response.headers['X-XSS-Protection'] = '0'
         
-        # Security Header: Referrer policy
-        response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+        # Security Header: Referrer policy (origin only, wherever the address itself holds a secret)
+        response.headers['Referrer-Policy'] = _referrer_policy(request.url.path, request.url.query)
         
         # Security Header: Permissions policy (disable unnecessary features)
         response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
@@ -736,7 +750,7 @@ app.include_router(info_router)
 # SystemSetting key that holds the brand overrides (A3 mirrors the Settings brand
 # fields into it so /branding + the rendered shell update live).
 from app.config.branding import HEX_COLOR_RE
-from app.config.effective import BRAND_SETTINGS_KEY, set_brand_overrides
+from app.config.effective import BRAND_SETTINGS_KEY, load_brand_overrides, set_brand_overrides
 
 # Import and include ECC router (Elliptic Curve Cryptography)
 from app.api.ecc_router import router as ecc_router
@@ -7202,24 +7216,54 @@ async def upload_brand_asset(
         raise HTTPException(status_code=503, detail="Brand asset storage is not writable")
     fname = f"{slot}.{hashlib.sha256(data).hexdigest()[:8]}.{ext}"
     dest = os.path.join(BRAND_ASSET_DIR, fname)
-    # keep one asset per slot: drop older files for this slot (different hash/ext)
+    url = f"/brand-assets/{fname}"
+    # What the slot shows now, so a save that fails below can tell its own new file from it.
+    shown_before = load_brand_overrides(db).get(fields[0])
+    # The new image first, content and name on the disk; then the setting points at it; only then is
+    # the slot's old image removed. A write or a save that fails leaves the old image in place, and
+    # still shown, instead of a setting that names a file already gone.
+    tmp = dest + ".tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            # The content is on the disk before the rename, and the name after it, before the brand row
+            # points at the file: a power cut must not leave the row naming an empty or missing image.
+            durable_write.sync_file(fh)
+        os.replace(tmp, dest)  # atomic publish
+        durable_write.sync_directory(BRAND_ASSET_DIR)
+        written = True
+    except OSError:
+        written = False
+    if written:
+        try:
+            _update_brand_row(db, set_map={f: url for f in fields})
+            db.commit()
+        except Exception:
+            db.rollback()
+            if shown_before != url:        # the new file is no one's: the setting still names the old one
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+            raise
+    else:
+        # The temporary file, and the new name if the rename got that far but its sync did not; never the
+        # file the setting names (the same image uploaded again).
+        for leftover in (tmp, dest if shown_before != url else None):
+            if leftover:
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+        raise HTTPException(status_code=503, detail="Brand asset storage is not writable")
+    # Keep one asset per slot: now that the setting names the new image, drop the slot's other files
+    # (another hash or type, or a temporary file a failed upload left).
     for existing in os.listdir(BRAND_ASSET_DIR):
         if existing.startswith(slot + ".") and existing != fname:
             try:
                 os.remove(os.path.join(BRAND_ASSET_DIR, existing))
             except OSError:
                 pass
-    tmp = dest + ".tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-        # The content is on the disk before the rename, and the name after it, before the brand row
-        # points at the file: a power cut must not leave the row naming an empty or missing image.
-        durable_write.sync_file(fh)
-    os.replace(tmp, dest)  # atomic publish
-    durable_write.sync_directory(BRAND_ASSET_DIR)
-    url = f"/brand-assets/{fname}"
-    _update_brand_row(db, set_map={f: url for f in fields})
-    db.commit()
     try:
         AuditLogger(db).log_action(
             action="brand_asset_uploaded", status="success", user=current_user,
@@ -12472,6 +12516,11 @@ class NoteLinkCreate(BaseModel):
 
 class NoteLinkRedeem(BaseModel):
     secret: Optional[str] = None
+    # A peek says whether the link can be opened, and with what (no secret, a PIN or a password),
+    # WITHOUT spending a view or showing the note: the page of a link with no secret shows a "Show
+    # note" button first, so a scanner or a link preview that runs the page spends nothing. The click
+    # redeems with peek=false, which is where the view is spent. A peek never checks a secret.
+    peek: bool = False
 
 
 @app.post("/note-links")
@@ -12789,13 +12838,16 @@ async def redeem_note_link(
     """PUBLIC: redeem a snapshot link. Rate-limited per IP AND per token (fail-closed); a secret-gated
     link prompts for its PIN/password with a per-link lockout after repeated wrong attempts; expiry,
     max-uses and revocation are enforced atomically; every outcome is audited. Returns the frozen
-    snapshot on success."""
+    snapshot on success. With peek=true nothing is spent and no secret is checked: a link with no secret
+    answers {available, secret_kind} (its page then waits for a "Show note" click), one with a secret
+    answers with the prompt, as a first request without the secret does."""
     import time as _t
     from sqlalchemy import update as _sa_update, or_ as _or
     from app.core.security import verify_password
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
 
     client_ip = get_client_ip(request)
+    peek = bool(getattr(payload, "peek", False))
     if not token or len(token) > _NOTELINK_TOKEN_MAX_INPUT:
         raise HTTPException(status_code=404, detail="This link is not available.")
 
@@ -12863,7 +12915,9 @@ async def redeem_note_link(
             _audit("failure", reason="locked_out", link_id=link.id)
             raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again later.",
                                 headers={"Retry-After": str(_NOTELINK_FAIL_WINDOW)})
-        raw = (payload.secret if payload else None) or ""
+        # A peek never checks a secret (so it can neither spend a view nor count a wrong guess): it is
+        # answered as a first request without one is, with the prompt.
+        raw = "" if peek else ((payload.secret if payload else None) or "")
         if not raw.strip():
             # The page needs to know which prompt to show; no consume, no failure recorded.
             raise HTTPException(status_code=401,
@@ -12882,6 +12936,11 @@ async def redeem_note_link(
             raise HTTPException(status_code=401,
                                 detail={"error": "wrong_secret", "secret_kind": link.secret_kind})
         _notelink_clear_fails(token)
+
+    if peek:
+        # A link with no secret, peeked at: the page shows its "Show note" button, nothing is spent.
+        _audit("success", reason="peek", link_id=link.id)
+        return {"available": True, "secret_kind": link.secret_kind}
 
     # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced.
     now = datetime.utcnow()
@@ -13065,6 +13124,141 @@ def _publiclink_discard_grant(grant: str) -> None:
         redis_guard.timed_redis("_publiclink_discard_grant", lambda: r.delete(_publiclink_grant_key(grant)))
     except Exception:
         pass
+
+
+def _publiclink_failure_reason(exc: BaseException) -> str:
+    """What a download that failed before its first byte records as the reason for the use it gave
+    back: the stored file is missing, it could not be read or decrypted, it changed while it was being
+    read, its checksum did not match, the server had no transfer slot, or anything else."""
+    from app.core.security import EncryptionError, ObjectChangedDuringRead
+    from app.services.download_stream import ChecksumMismatch
+    if isinstance(exc, TransferBusy):
+        return "busy"
+    if isinstance(exc, FileNotFoundError):
+        return "file_missing"
+    if isinstance(exc, ChecksumMismatch):
+        return "checksum_mismatch"
+    if isinstance(exc, ObjectChangedDuringRead):
+        return "changed_during_read"
+    if isinstance(exc, (EncryptionError, FileServiceError)):
+        return "unreadable"
+    if isinstance(exc, OSError):
+        return "read_error"
+    return "internal_error"
+
+
+def _publiclink_refund_use(db, link_id, vault_id, file_id, reason: str, client_ip: str) -> bool:
+    """Give back the use a redeem spent, for a download the SERVER failed before the first byte of the
+    file went out (the grant was used, nothing was delivered). Never for a client that left (the caller
+    asks first, _publiclink_settle_failure), and never once a byte is on its way: those keep the use
+    spent.
+
+    One guarded update, so it is atomic and can never take the count below zero; and each refund
+    follows a grant that this download alone used up (the grant's single-winner delete), each grant
+    follows one use its redeem recorded, so the uses given back never exceed the uses spent, and a link
+    capped at N still delivers at most N. Recorded in the audit log either way, so the owner's counts
+    can be read against what happened. Returns whether a use was given back."""
+    from sqlalchemy import update as _sa_update
+    try:
+        db.rollback()        # whatever failed may have left the session's transaction unusable
+    except Exception:
+        pass
+    refunded = False
+    try:
+        res = db.execute(_sa_update(PublicLink)
+                         .where(PublicLink.id == link_id, PublicLink.use_count > 0)
+                         .values(use_count=PublicLink.use_count - 1))
+        db.commit()
+        refunded = (res.rowcount or 0) == 1
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    try:
+        AuditLogger(db).log_action(
+            action="public_link_use_refunded", status="success" if refunded else "failure", user=None,
+            resource_type="file", resource_id=str(file_id),
+            details={"vault_id": str(vault_id), "public_link_id": str(link_id), "reason": reason},
+            ip_address=client_ip)
+    except Exception:
+        pass
+    return refunded
+
+
+# How long a download that failed before its first byte listens for its client's disconnect before it
+# takes the client to be still there (_publiclink_client_left). A disconnect that already happened is
+# read at once; this only bounds the wait for a client that is still there.
+_PUBLINK_CLIENT_GONE_WAIT = 0.1
+
+
+async def _publiclink_client_left(request) -> bool:
+    """Whether the client of a download has already gone, asked before its use is given back.
+
+    ``request.is_disconnected()`` cannot answer this here. It reads the request's channel under a
+    cancellation that is already pending, and behind the security-header middleware (a
+    BaseHTTPMiddleware) such a read never returns a message, so a client that left before the response
+    started reads as still there. Reading the channel for a moment can tell: a GET's channel holds its
+    empty body and then, once the connection has closed, the disconnect; a client still there sends
+    nothing more, so the read runs out of time and the answer is no. When the channel cannot be read
+    the answer is no too, so a server failure keeps its refund. A client whose leaving the server cannot
+    see (a proxy that keeps its connection open after its own client went) reads as still there and is
+    refunded: nothing was delivered to it, so the cap holds either way."""
+    import anyio
+    try:
+        with anyio.move_on_after(_PUBLINK_CLIENT_GONE_WAIT):
+            for _ in range(2):
+                message = await request.receive()
+                kind = message.get("type")
+                if kind == "http.disconnect":
+                    return True
+                if kind != "http.request" or message.get("more_body", False):
+                    return False
+    except Exception:
+        return False
+    return False
+
+
+async def _publiclink_settle_failure(request, db, link_id, vault_id, file_id, reason: str,
+                                     client_ip: str) -> bool:
+    """A download the server failed before the first byte of its file: give the use back
+    (_publiclink_refund_use), unless the client has already gone (_publiclink_client_left). A client
+    that left keeps its use spent, and the download is recorded as ended with its client gone, nothing
+    sent, with the failure that ended it. Returns whether a use was given back."""
+    if await _publiclink_client_left(request):
+        try:
+            db.rollback()        # whatever failed may have left the session's transaction unusable
+        except Exception:
+            pass
+        try:
+            AuditLogger(db).log_action(
+                action="public_link_download_completed", status="failed", user=None,
+                resource_type="file", resource_id=str(file_id),
+                details={"vault_id": str(vault_id), "public_link_id": str(link_id), "bytes_sent": 0,
+                         "outcome": "disconnected", "reason": reason},
+                ip_address=client_ip)
+        except Exception:
+            pass
+        return False
+    return _publiclink_refund_use(db, link_id, vault_id, file_id, reason, client_ip)
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that calls ``on_close`` once it has been sent or abandoned, including when
+    it ends before its body was ever started (a client gone before the headers went out), which a
+    ``finally`` inside the body's generator never sees: an async generator that was never started has
+    no frame to run it in."""
+
+    def __init__(self, *args, on_close=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._on_close is not None:
+                self._on_close()
 
 
 def _link_owner_if_live(db, owner_id):
@@ -13808,6 +14002,43 @@ async def redeem_public_link(
     return {**meta, "grant": grant}
 
 
+def _publiclink_is_speculative(request) -> bool:
+    """A request made ahead of the person rather than by them: a browser's prefetch or prerender, or a
+    preview, which says so in Sec-Purpose (or the older Purpose, X-Purpose, X-Moz). The download refuses
+    it before it looks at the grant, so it spends nothing, and the person's own request finds the grant
+    unused."""
+    headers = getattr(request, "headers", None) or {}
+    for name in ("sec-purpose", "purpose", "x-purpose", "x-moz"):
+        value = (headers.get(name) or "").lower()
+        if "prefetch" in value or "prerender" in value or "preview" in value:
+            return True
+    return False
+
+
+# What a browser shows when the link page's own download (an ordinary request the browser saves itself)
+# is refused, in place of an error document the person would otherwise see as raw JSON. Fixed text only.
+_PUBLIC_DOWNLOAD_REFUSALS = {
+    404: ("This file could not be downloaded",
+          "Go back to the link page to see whether the link can still be used."),
+    429: ("Too many requests", "Wait a minute, then go back to the link page and try again."),
+    503: ("The server is busy", "Wait a few seconds, then go back to the link page and try again."),
+}
+
+
+def _public_download_refusal_page(refused: HTTPException):
+    from fastapi.responses import HTMLResponse
+    title, text = _PUBLIC_DOWNLOAD_REFUSALS.get(refused.status_code, _PUBLIC_DOWNLOAD_REFUSALS[404])
+    page = ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<meta name="robots" content="noindex, nofollow">'
+            f'<title>{title}</title></head>'
+            '<body style="font-family: system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem;">'
+            f'<h1 style="font-size: 1.3rem;">{title}</h1><p>{text}</p></body></html>')
+    headers = dict(refused.headers or {})
+    headers.update({"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+    return HTMLResponse(page, status_code=refused.status_code, headers=headers)
+
+
 @app.get("/public-links/{token}/download/{file_id}")
 async def download_public_link(
     token: str,
@@ -13815,16 +14046,37 @@ async def download_public_link(
     request: Request,
     db: Session = Depends(get_db),
     x_download_grant: Optional[str] = Header(None),
+    grant: Optional[str] = Query(None),
 ):
-    """PUBLIC: stream one file of a redeemed public link. The download GRANT rides an X-Download-Grant
-    HEADER (never a query string, which proxies/history record) and is single-use. The redeem that
-    minted the grant spent the link's use, so the download spends nothing and does NOT ask whether the
-    link has a use left: a link capped at N downloads delivers N. It re-checks every other gate from
-    redemption (master switch, link present and not revoked, vault Standard+not-pw, owner active +
-    still holds READ, target present + not password-protected), requires the grant to have been minted
-    before the link expired, and confines the requested file_id to the link's target subtree
-    (id_scope). Any failure is the uniform 404. No principal is synthesised: the blob is opened
-    directly once every gate passes."""
+    """PUBLIC: stream one file of a redeemed public link. The single-use download GRANT comes one of two
+    ways. A script or API client sends it in an X-Download-Grant header. The link page sends it as the
+    `grant` query parameter of an ordinary GET the browser saves itself (Content-Disposition:
+    attachment), so the file never passes through the page's memory and in-app browsers can save it.
+    In that address the grant can be logged or kept (a proxy's log, the browser's list of downloads),
+    which is harmless: it is used by the request that carries it and otherwise expires within 60 s.
+    The access line keeps only the parameter's name, and the link's token in the path is masked; the
+    page and this response send at most the origin in a Referer (_referrer_policy). A refusal of the
+    query form is a small page the browser can show; the header form keeps the JSON body. The redeem
+    that minted the grant spent the link's use (see _serve_public_link_download)."""
+    if x_download_grant is not None or grant is None:
+        return await _serve_public_link_download(token, file_id, request, db, x_download_grant)
+    try:
+        return await _serve_public_link_download(token, file_id, request, db, grant)
+    except HTTPException as refused:
+        return _public_download_refusal_page(refused)
+
+
+async def _serve_public_link_download(token, file_id, request, db, presented_grant):
+    """Serve one file of a redeemed public link for `presented_grant`, which is single-use. The redeem
+    that minted the grant spent the link's use, so the download spends nothing and does NOT ask whether
+    the link has a use left: a link capped at N downloads delivers N. It refuses a prefetch or preview
+    first (_publiclink_is_speculative), then re-checks every other gate from redemption (master switch,
+    link present and not revoked, vault Standard+not-pw, owner active + still holds READ, target present
+    + not password-protected), requires the grant to have been minted before the link expired, and
+    confines the requested file_id to the link's target subtree (id_scope). Any failure is the uniform
+    404. No principal is synthesised: the blob is opened directly once every gate passes. When the
+    server fails after the grant is used and before the first byte of the file goes out, the redeem's
+    use is given back (_publiclink_refund_use)."""
     import time as _t
     from app.core.id_scope import id_in_scope
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
@@ -13832,7 +14084,9 @@ async def download_public_link(
     client_ip = get_client_ip(request)
     if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
         raise HTTPException(status_code=404, detail="This file is not available.")
-    if not x_download_grant:
+    if not presented_grant:
+        raise HTTPException(status_code=404, detail="This file is not available.")
+    if _publiclink_is_speculative(request):
         raise HTTPException(status_code=404, detail="This file is not available.")
 
     # Per-IP rate limit (fail-closed): this is an anonymous endpoint that does DB work before it can
@@ -13887,13 +14141,12 @@ async def download_public_link(
 
     # Consume the single-use grant (bound to this link + client IP, minted before the link expired).
     # A miss = uniform 404.
-    if not _publiclink_consume_grant(x_download_grant, link.id, client_ip, expires_at=link.expires_at):
+    if not _publiclink_consume_grant(presented_grant, link.id, client_ip, expires_at=link.expires_at):
         _deny()
 
     # Everything authorized: open the blob for streaming (no principal — the equivalent of the authed
     # path's _resolve_download checks have all been done above) and serve it under a transfer slot.
     import asyncio
-    from fastapi.responses import StreamingResponse
     from app.core.security import EncryptionError, ObjectChangedDuringRead
     from app.services.download_stream import ChecksumMismatch
 
@@ -13901,19 +14154,60 @@ async def download_public_link(
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
 
+    # From here the use the redeem spent belongs to this download, and the grant is gone. Until the first
+    # byte of the file is on its way, a failure is the server's (no slot, a missing blob, a read or
+    # decryption error, anything else), so the use is given back and the person can try again; once a
+    # byte is on its way, or when the client has left (one that gave up while it waited for a slot, for
+    # example), it stays spent (_publiclink_settle_failure). The first piece is read here, before the
+    # response exists, so a failure in it is still an error status rather than a 200 cut short.
+    transfer_slot = None
+    download = None
     try:
-        transfer_slot = await transfer_admission.acquire()
-    except TransferBusy as busy:
-        raise _busy_response(busy)
-
-    try:
+        try:
+            transfer_slot = await transfer_admission.acquire()
+        except TransferBusy as busy:
+            await _publiclink_settle_failure(request, db, link.id, vault.id, file_id, "busy", client_ip)
+            raise _busy_response(busy)
         download = vault_service._open_stored_file(file_record, vault, file_id, whole=False)
-    except Exception:
-        transfer_admission.release(transfer_slot)
+        pieces = download.chunks()
+        first = next(pieces, None)
+        file_name = download.name or "download"
+        mime_type = download.mime_type
+        headers = {
+            "Content-Disposition": _content_disposition(file_name),
+            "Content-Length": str(download.total_length),
+            "Cache-Control": "no-store",
+            "X-Robots-Tag": "noindex, nofollow",
+        }
+        media_type = _safe_media_type(mime_type)
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        # The request was cancelled (an ASGI server may cancel a handler whose client left; uvicorn does
+        # not, which is why a failure asks whether the client is still there): not a server failure.
+        if download is not None:
+            download.close()
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
+        raise
+    except Exception as exc:
+        if download is not None:
+            try:
+                download.close()
+            except Exception:
+                pass
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
+        reason = _publiclink_failure_reason(exc)
+        await _publiclink_settle_failure(request, db, link.id, vault.id, file_id, reason, client_ip)
+        if reason == "internal_error":
+            # Not a stored file that could not be served: say where, for the operator (the class and
+            # the place, never the message, which can carry values), and answer as for any other.
+            from app.core.safe_log import exception_outline
+            print(f"[ERROR] Public link download failed before its first byte: {type(exc).__name__}")
+            print(exception_outline(exc))
         _deny()
 
-    file_name = download.name or "download"
-    mime_type = download.mime_type
     try:
         audit_logger.log_action(
             action="public_link_download", status="authorized", user=None,
@@ -13923,62 +14217,76 @@ async def download_public_link(
     except Exception:
         pass
 
+    state = {"served": 0, "disconnected": False, "terminal_success": False, "failure": None,
+             "finished": False}
+    total_size = download.total_length
+
+    def finish():
+        """Close the file, free the slot, and record what the transfer did, exactly once: from the
+        body's own end, or from the response's when the body never ran to one."""
+        if state["finished"]:
+            return
+        state["finished"] = True
+        try:
+            download.close()
+        except Exception:
+            pass
+        transfer_admission.release(transfer_slot)
+        if state["terminal_success"]:
+            # Count only a completed transfer against the owner's card + oversight counters.
+            try:
+                from sqlalchemy import update as _sa_update2
+                db.execute(_sa_update2(PublicLink).where(PublicLink.id == link.id).values(
+                    download_count=PublicLink.download_count + 1,
+                    bytes_served=PublicLink.bytes_served + state["served"]))
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        failure = state["failure"]
+        try:
+            audit_logger.log_action(
+                action="public_link_download_completed",
+                status="success" if state["terminal_success"] else "failed", user=None,
+                resource_type="file", resource_id=str(file_id),
+                details={"vault_id": str(vault.id), "public_link_id": str(link.id),
+                         "bytes_sent": state["served"], "total_bytes": total_size,
+                         "outcome": ("completed" if state["terminal_success"]
+                                     else "disconnected" if state["disconnected"]
+                                     else type(failure).__name__ if failure is not None
+                                     else "incomplete")},
+                ip_address=client_ip)
+        except Exception:
+            pass
+
     async def file_streamer():
-        served = 0
-        total_size = download.total_length
-        disconnected = False
-        terminal_success = False
-        failure = None
         try:
             try:
-                for piece in download.chunks():
+                if first is not None:
                     if await request.is_disconnected():
-                        disconnected = True
-                        break
-                    yield piece
-                    served += len(piece)
-                    await asyncio.sleep(0)
-                terminal_success = (not disconnected and served == total_size)
+                        state["disconnected"] = True
+                    else:
+                        yield first
+                        state["served"] += len(first)
+                        await asyncio.sleep(0)
+                if not state["disconnected"]:
+                    for piece in pieces:
+                        if await request.is_disconnected():
+                            state["disconnected"] = True
+                            break
+                        yield piece
+                        state["served"] += len(piece)
+                        await asyncio.sleep(0)
+                state["terminal_success"] = (not state["disconnected"] and state["served"] == total_size)
             except (ChecksumMismatch, ObjectChangedDuringRead, EncryptionError) as exc:
-                failure = exc
+                state["failure"] = exc
         finally:
-            download.close()
-            transfer_admission.release(transfer_slot)
-            if terminal_success:
-                # Count only a completed transfer against the owner's card + oversight counters.
-                try:
-                    from sqlalchemy import update as _sa_update2
-                    db.execute(_sa_update2(PublicLink).where(PublicLink.id == link.id).values(
-                        download_count=PublicLink.download_count + 1,
-                        bytes_served=PublicLink.bytes_served + served))
-                    db.commit()
-                except Exception:
-                    try:
-                        db.rollback()
-                    except Exception:
-                        pass
-            try:
-                audit_logger.log_action(
-                    action="public_link_download_completed",
-                    status="success" if terminal_success else "failed", user=None,
-                    resource_type="file", resource_id=str(file_id),
-                    details={"vault_id": str(vault.id), "public_link_id": str(link.id),
-                             "bytes_sent": served, "total_bytes": total_size,
-                             "outcome": ("completed" if terminal_success
-                                         else "disconnected" if disconnected
-                                         else type(failure).__name__ if failure is not None
-                                         else "incomplete")},
-                    ip_address=client_ip)
-            except Exception:
-                pass
+            finish()
 
-    headers = {
-        "Content-Disposition": _content_disposition(file_name),
-        "Content-Length": str(download.total_length),
-        "Cache-Control": "no-store",
-        "X-Robots-Tag": "noindex, nofollow",
-    }
-    return StreamingResponse(file_streamer(), media_type=_safe_media_type(mime_type), headers=headers)
+    return _ClosingStreamingResponse(file_streamer(), media_type=media_type, headers=headers,
+                                     on_close=finish)
 
 
 # ---------------------------------------------------------------------------

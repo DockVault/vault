@@ -273,6 +273,57 @@ def test_disposable_ci_enables_outage_and_same_commit_guards():
     assert "VAULT_SAME_COMMIT_CI=1" in _WORKFLOW
 
 
+def test_the_full_suite_runs_the_streaming_sftp_tests_and_nothing_else_changes():
+    """tests/test_sftp_streaming_upload.py is skipped unless VAULT_SFTP_STREAMING=1, and CI never set it,
+    so the streaming upload tests never ran there. The full suite's command sets it, after the SFTP
+    container says it streams (the shipped default); nothing else in the workflow sees it: not a job's or
+    a step's env, not GITHUB_ENV, not another command."""
+    jobs = yaml.safe_load(_WORKFLOW)["jobs"]
+    [step] = [s for s in jobs["integration"]["steps"] if s.get("name") == "Run the full test suite"]
+    assert "env" not in step
+    lines = [line.strip() for line in step["run"].splitlines() if line.strip()]
+    assert lines == [
+        "set -euo pipefail",
+        "streaming=\"$(docker compose exec -T vault-sftp python -c 'from app.core.config import Settings; "
+        "print(Settings().sftp_streaming_upload)')\"",
+        'test "$streaming" = "True"',
+        "VAULT_SFTP_STREAMING=1 python -m pytest --maxfail=1 --junitxml=pytest-results.xml "
+        "-o faulthandler_timeout=300",
+    ]
+    commands = [line.strip() for line in _WORKFLOW.splitlines()
+                if "VAULT_SFTP_STREAMING" in line and not line.strip().startswith("#")]
+    assert commands == [lines[-1]], "the opt-in reaches something besides the full suite's command"
+    # The setting the check reads is the one the SFTP server streams by, and the opt-in is the one the
+    # streaming tests read.
+    config = (_ROOT / "app" / "core" / "config.py").read_text(encoding="utf-8")
+    assert re.search(r"^    sftp_streaming_upload: bool = Field\(default=True\)$", config, re.M)
+    streaming_tests = (_ROOT / "tests" / "test_sftp_streaming_upload.py").read_text(encoding="utf-8")
+    assert streaming_tests.count('os.environ.get("VAULT_SFTP_STREAMING") != "1"') == 1
+
+
+@pytest.mark.parametrize("given, answer", [(None, "True"), ("true", "True"), ("false", "False"),
+                                           ("0", "False")])
+def test_the_streaming_check_reads_what_the_container_was_given(given, answer):
+    """The full suite's step asks the SFTP container whether it streams before it turns the streaming
+    tests on. The question must read the environment, as the server does when it starts, or it can never
+    say no: the module-level `settings` object holds the defaults until a server fills it in, so a check
+    that read it answered True even with SFTP_STREAMING_UPLOAD=false. Here the step's own Python runs
+    with each value, and a container given false must answer False (which then fails the step)."""
+    jobs = yaml.safe_load(_WORKFLOW)["jobs"]
+    [step] = [s for s in jobs["integration"]["steps"] if s.get("name") == "Run the full test suite"]
+    [line] = [x.strip() for x in step["run"].splitlines() if x.strip().startswith("streaming=")]
+    program = line.split("python -c '", 1)[1].rsplit("')\"", 1)[0]
+    assert "'" not in program and program.startswith("from app.core.config import "), program
+    env = {k: v for k, v in os.environ.items() if k.upper() != "SFTP_STREAMING_UPLOAD"}
+    if given is not None:
+        env["SFTP_STREAMING_UPLOAD"] = given
+    result = subprocess.run([sys.executable, "-c", program], cwd=_ROOT, env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    # $(...) drops the trailing newline, and the step compares the rest with "True" exactly.
+    assert result.stdout.removesuffix("\n") == answer, (given, result.stdout, result.stderr)
+
+
 def test_same_commit_missing_endpoint_is_a_failure(monkeypatch):
     monkeypatch.setenv("VAULT_SAME_COMMIT_CI", "1")
     with pytest.raises(pytest.fail.Exception, match="newly built image"):

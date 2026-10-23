@@ -202,7 +202,7 @@ KEYED_ON_THE_SUBJECT = {
     ("app/api/api_server.py", "second_factor_step_up", "check_rate_limit"),
     ("app/api/api_server.py", "redeem_note_link", "check_rate_limit"),
     ("app/api/api_server.py", "redeem_public_link", "check_rate_limit"),
-    ("app/api/api_server.py", "download_public_link", "check_rate_limit"),
+    ("app/api/api_server.py", "_serve_public_link_download", "check_rate_limit"),   # download_public_link's body
     ("app/api/api_server.py", "open_receiver_upload_session", "check_rate_limit"),
     ("app/core/rate_limiter.py", "dispatch", "check_rate_limit"),
     ("app/core/rate_limiter.py", "wrapper", "check_rate_limit"),

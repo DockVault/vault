@@ -20347,12 +20347,39 @@ async function loadMyPublicLinks() {
 
 function _pflExpiryText(l) { return l.expires_at ? (typeof _fmtLinkExpiry === 'function' ? _fmtLinkExpiry(l.expires_at).replace(/^Expires /, '') : l.expires_at) : 'Never'; }
 
+// What a link has delivered, from what the server recorded: opening it for a download spends a use
+// (use_count), and a download that reached its last byte counts once (download_count). A use with no
+// finished download (the transfer was cut off, or never asked for) reads "Used, nothing downloaded",
+// apart from a link that delivered its file. A use the server failed to start was given back, so it
+// is in neither count.
+function _pflDelivery(l) {
+    const used = Number(l.use_count) || 0;
+    const done = Number(l.download_count) || 0;
+    if (used === 0) return { state: 'unused', text: l.status === 'active' ? 'Not used yet' : 'Never used' };
+    if (done === 0) return { state: 'nothing', text: 'Used, nothing downloaded' };
+    if (done < used) return { state: 'partly', text: 'Used ' + used + ' times, ' + done + ' downloaded' };
+    return { state: 'downloaded', text: done === 1 ? 'Downloaded' : 'Downloaded ' + done + ' times' };
+}
+
+const _PFL_DELIVERY_CLASS = { unused: 'text-tertiary', nothing: 'text-warning', partly: 'text-warning', downloaded: 'text-success' };
+
+// The Uses cell of a link's row: the count against its cap, and what those uses delivered.
+function _pflUsesCell(l) {
+    const td = _el('td', 'pfl-uses');
+    td.appendChild(_el('span', 'pfl-uses-count', (l.max_uses != null) ? ((l.use_count || 0) + '/' + l.max_uses) : String(l.use_count || 0)));
+    const d = _pflDelivery(l);
+    const line = _el('span', 'pfl-delivery block text-xs ' + _PFL_DELIVERY_CLASS[d.state], d.text);
+    line.dataset.delivery = d.state;
+    td.appendChild(line);
+    return td;
+}
+
 function renderMyPublicLinks(links) {
     const host = _pflEl('pflm-list'); if (!host) return;
     if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', "You haven't created any public file links yet.")); return; }
     const table = _el('table', 'data-table');
     const thead = _el('thead'); const hr = _el('tr');
-    ['Type', 'Item', 'Status', 'Protection', 'Expires', 'Downloads', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    ['Type', 'Item', 'Status', 'Protection', 'Expires', 'Uses', ''].forEach(h => hr.appendChild(_el('th', '', h)));
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     links.forEach(l => {
@@ -20366,7 +20393,7 @@ function renderMyPublicLinks(links) {
         tr.appendChild(_el('td', '', _PFL_STATUS_LABEL[l.status] || l.status));
         tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
         tr.appendChild(_el('td', '', _pflExpiryText(l)));
-        tr.appendChild(_el('td', '', (l.max_uses != null) ? ((l.use_count || 0) + '/' + l.max_uses) : String(l.use_count || 0)));
+        tr.appendChild(_pflUsesCell(l));
         // The link URL is shown only once at creation (the token isn't stored in the clear), so there
         // is no "copy" here — just revoke (while active) and delete.
         const actTd = _el('td', 'flex gap-sm');
@@ -20429,7 +20456,7 @@ function renderAdminPublicLinks(data) {
     if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public file/folder links exist.')); return; }
     const table = _el('table', 'data-table');
     const thead = _el('thead'); const hr = _el('tr');
-    ['Owner', 'Type', 'Item', 'Status', 'Protection', 'Expires', 'Downloads', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    ['Owner', 'Type', 'Item', 'Status', 'Protection', 'Expires', 'Uses', ''].forEach(h => hr.appendChild(_el('th', '', h)));
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     links.forEach(l => {
@@ -20444,7 +20471,7 @@ function renderAdminPublicLinks(data) {
         tr.appendChild(_el('td', '', _PFL_STATUS_LABEL[l.status] || l.status));
         tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
         tr.appendChild(_el('td', '', _pflExpiryText(l)));
-        tr.appendChild(_el('td', '', (l.max_uses != null) ? ((l.use_count || 0) + '/' + l.max_uses) : String(l.use_count || 0)));
+        tr.appendChild(_pflUsesCell(l));
         const actTd = _el('td');
         if (l.status === 'active') {
             const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';

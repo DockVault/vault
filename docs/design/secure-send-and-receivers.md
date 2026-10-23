@@ -103,7 +103,11 @@ and per IP at 600/min — the enumeration bound), a per-link wrong-secret lockou
 **kill switch** (feature off ⇒ every minted link 404s), a uniform 404 for missing/revoked/expired/
 exhausted **or whose owner is no longer active or is locked by an administrator** (checked before any
 secret prompt; the automatic lock armed by wrong passwords does not count, see §5.1), and
-an atomic `UPDATE … WHERE` consume of one use. Owners revoke/delete; admins list
+an atomic `UPDATE … WHERE` consume of one use. The page first redeems with `peek: true`, which spends
+nothing and checks no secret: a link with no secret answers `{available, secret_kind}` and the page
+shows a "Show note" button, whose click is the redeem that spends the view, so a scanner or a link
+preview that loads the page (with its script or without) uses nothing; a link with a secret answers
+the peek with its prompt, as it always did. Owners revoke/delete; admins list
 (`/admin/note-links`, never the body), revoke one, or `revoke-all`. Owner tiles render in the Notes
 section's *Shared* tab (`_noteLinkCard`), coloured by the tag.
 
@@ -243,8 +247,19 @@ cannot be stored is never handed out, and the download endpoint refuses any gran
 Standard vault's in-memory-decrypted `File.name` / `Folder.name` (the same plaintext the internal
 share card shows), no recursion in v1 (Q3).
 
-`GET /public-links/{token}/download/{file_id}` with the grant in an `X-Download-Grant` header — never a
-query parameter, which proxies and browser history record — streams the file. The grant is consumed on
+`GET /public-links/{token}/download/{file_id}` streams the file, with the grant in an `X-Download-Grant`
+header (a script or an API client) or in the `grant` query parameter. The link page uses the query
+form: its Download click redeems for a grant and then navigates to that address, an ordinary request
+the browser saves itself from the `Content-Disposition: attachment` response, so the file never passes
+through the page's memory and in-app browsers that cannot save a script's blob can save it (no public
+file link serves a zero-knowledge file, so the page never has to decrypt one). In that address the
+grant can be recorded (a proxy's log, the browser's list of downloads), which is harmless: the request
+that carries it uses it up, and it expires within 60 s otherwise. The vault's own access line keeps only
+the parameter's name and masks the link's token, the audit row keeps the route template, and every
+address holding a secret is served with `Referrer-Policy: strict-origin`, so the page's own requests
+send no more than the origin in a Referer. A request that says it is a prefetch or a preview
+(`Sec-Purpose`, `Purpose`, `X-Purpose`, `X-Moz`) is refused before the grant is looked at, and a refusal
+of the query form is a short page a browser can show (the header form keeps its JSON). The grant is consumed on
 first use (single winner, like the OTP service), the `file_id` must lie inside the link's target
 (`app/core/id_scope.id_in_scope` with the folder ancestry — the same membership check
 `require_scope` uses for temp credentials and share claims), and the response is built with
@@ -254,7 +269,21 @@ through the existing filename hardening. One redemption = one use = one grant = 
 folder link therefore counts one use per file fetched (Q3 again). The redeem spends the use, so the
 download does not ask whether the link has a use left: a link capped at N delivers N downloads. A
 redeem whose conditional update finds the use already gone (a concurrent redeem took it) deletes the
-grant it minted before it answers 404, so no grant exists without a use behind it. The IP binding is only as good as the
+grant it minted before it answers 404, so no grant exists without a use behind it. When the server
+fails after the grant is used and before the first byte of the file goes out (no transfer slot, the
+stored file missing, unreadable or replaced while it was read, its checksum wrong, any other error),
+the person received nothing, so the use is given back: one guarded update (`use_count - 1` where it
+is above zero), recorded as `public_link_use_refunded` with the reason. The first piece is read before
+the response is built, so such a failure is an error status, not a 200 cut short. A client that
+leaves, or a transfer that fails after its first byte, keeps the use spent; since a grant is used
+once and earns at most one refund, a link capped at N still delivers at most N. That includes a
+client that gave up while it waited for a transfer slot: before it gives a use back, the server
+reads the request's channel for a moment (`request.is_disconnected()` cannot see a client that left
+before the response started, behind the security-header middleware), and a client already gone keeps
+its use spent, recorded as `public_link_download_completed` (failed, outcome `disconnected`, nothing
+sent, with the failure). A client whose leaving the server cannot see, behind a proxy that keeps its
+connection open after its own client went, is refunded; nothing was delivered to it, so the cap holds
+either way. The IP binding is only as good as the
 deployment's trusted-proxy configuration (`ClientIPMiddleware`), which the public page's documentation
 must say.
 
