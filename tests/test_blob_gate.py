@@ -63,10 +63,12 @@ CLASSIFIED = {
     ("app/core/admin_password_hygiene.py", "scrub_bootstrap_password_source"): (["os.remove"], NOT_CONTENT),
     ("app/core/health.py", "check_storage_status"): (["os.remove"], NOT_CONTENT),
     # The audit chain's head record: the temporary file a failed write leaves, and the restore mark once accepted;
-    # and an SFTP host key that could not be synced to the disk.
+    # and an SFTP host key's temporary copy (once the key has its path, or when it could not be synced), and a key
+    # created at its path that could not be written whole.
     ("app/core/audit_head_record.py", "_write_file"): (["os.unlink"], NOT_CONTENT),
     ("app/core/audit_head_record.py", "remove_mark"): (["os.unlink"], NOT_CONTENT),
-    ("app/sftp/host_key.py", "ensure_host_key"): (["path.unlink"], NOT_CONTENT),
+    ("app/sftp/host_key.py", "generate_ed25519_host_key"): (["os.unlink"], NOT_CONTENT),
+    ("app/sftp/host_key.py", "_write_in_place"): (["os.unlink"], NOT_CONTENT),
     ("app/services/encrypted_file_storage.py", "EncryptedFileStorage.secure_delete"): (
         ["storage_path.unlink", "storage_path.unlink"], SECURE_DELETE),
 }

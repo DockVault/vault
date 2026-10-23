@@ -51,9 +51,11 @@ SYNCED = {
         ["open"], "EncryptedFileStorage.secure_delete", {"sync_file"}),
     ("app/services/vault_service.py", "VaultService._destroy_blobs"): (
         ["open"], "VaultService._destroy_blobs", {"sync_file"}),
-    # The SFTP host key: its directory made, the key synced, its name synced.
+    # The SFTP host key: its directory made, the key written to a temporary file and synced, linked into place
+    # (never over another key), its name synced; or, with no hard links, created at its path exclusively.
     ("app/sftp/host_key.py", "generate_ed25519_host_key"): (
-        ["os.open"], "generate_ed25519_host_key", {"make_directories", "sync_file", "sync_directory"}),
+        ["os.open", "os.link"], "generate_ed25519_host_key", {"make_directories", "sync_file", "sync_directory"}),
+    ("app/sftp/host_key.py", "_write_in_place"): (["os.open"], "_write_in_place", {"sync_file", "sync_directory"}),
     # The audit chain's head record and the restore mark: a temporary file in the record's directory (made with
     # its name synced), given its owner and synced, renamed over the old one, the directory synced.
     ("app/core/audit_head_record.py", "_write_file"): (
@@ -464,12 +466,13 @@ def test_a_new_writer_in_no_list_fails_and_so_does_a_listed_one_that_is_gone():
 def test_a_synced_writer_whose_sync_is_gone_fails():
     rel = "app/sftp/host_key.py"
     source = (ROOT / rel).read_text(encoding="utf-8")
-    assert source.count("durable_write.sync_directory(") == 1
+    assert source.count("durable_write.sync_directory(") == 2
     without = source.replace("durable_write.sync_directory(", "print(")
     sources = {k[0]: (ROOT / k[0]).read_text(encoding="utf-8") for k in SYNCED}
     assert missing_syncs(sources) == {}
     sources[rel] = without
-    assert missing_syncs(sources) == {(rel, "generate_ed25519_host_key"): ["sync_directory"]}
+    assert missing_syncs(sources) == {(rel, "generate_ed25519_host_key"): ["sync_directory"],
+                                      (rel, "_write_in_place"): ["sync_directory"]}
 
 
 def test_a_durable_call_imported_by_name_counts():

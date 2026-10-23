@@ -6,7 +6,7 @@ Each goes through app/core/durable_write.py: a file given its owner first (a hos
 before it is renamed into place or closed, its directory synced after, and only then the record counts as written
 or the database commits what the file stands for. A sync that fails says so: the head record is then unwritable,
 the restore mark's removal is not taken for done, the discard is abandoned with every seal kept, and a host key
-that may not be on the disk is removed.
+whose bytes may not be on the disk never gets its path.
 
 These record what reached the disk by wrapping ``os.fsync`` (a file, or a directory, and its inode), with marks
 between. On Windows a directory cannot be synced, so the directory steps are absent there.
@@ -203,13 +203,28 @@ def test_a_discard_whose_saved_seals_cannot_be_synced_deletes_nothing(env, disk,
 
 # --------------------------------------------------------------------------- the SFTP host key
 
-@pytest.mark.parametrize("failing", ["file"] + (["dir"] if DIRS else []))
-def test_a_host_key_that_cannot_be_synced_is_not_left_at_its_path(disk, tmp_path, failing):
+def test_a_host_key_that_cannot_be_synced_is_not_left_at_its_path(disk, tmp_path):
     from app.sftp.host_key import ensure_host_key
     path = tmp_path / "keys" / "ssh_host_rsa_key"
-    path.parent.mkdir()                                  # so the directory synced is the one after the key's write
-    disk.fail_kind = failing
+    path.parent.mkdir()
+    disk.fail_kind = "file"
     assert ensure_host_key(path) is False
-    assert not path.exists()
+    assert not path.exists() and list(path.parent.iterdir()) == []      # nor its temporary copy
     disk.fail_kind = None
     assert ensure_host_key(path) is True and path.exists()
+    assert list(path.parent.iterdir()) == [path]
+
+
+@pytest.mark.skipif(not DIRS, reason="a directory cannot be synced here")
+def test_a_host_key_whose_directory_cannot_be_synced_stays_as_the_key(disk, tmp_path):
+    """Its bytes were on the disk before it got its path: only the name may be lost, and while it is there it is
+    the key every start uses, so it is not removed (an SFTP server may already serve it)."""
+    from app.sftp.host_key import ensure_host_key, load_host_key
+    path = tmp_path / "keys" / "ssh_host_rsa_key"
+    path.parent.mkdir()
+    disk.fail_kind = "dir"
+    assert ensure_host_key(path) is False
+    disk.fail_kind = None
+    before = path.read_bytes()
+    assert load_host_key(path) is not None and list(path.parent.iterdir()) == [path]
+    assert ensure_host_key(path) is False and path.read_bytes() == before

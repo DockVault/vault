@@ -74,7 +74,7 @@ from app.services.vault_service import (
 from app.services.vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
 from app.core.config import settings
-from app.sftp.host_key import generate_ed25519_host_key, load_host_key
+from app.sftp.host_key import ensure_host_key, load_whole_host_key
 from app.sftp import heartbeat
 from app.sftp.upload_assembler import UploadAssembler, AssemblerError
 from app.core.session_hash_utils import hash_session_token
@@ -2588,6 +2588,22 @@ def _sweep_sftp_tmp():
         safe_event('tmp-sweep.failed', e)
 
 
+def server_host_key(host_key_path: Path):
+    """The key this SFTP server serves: the one at ``host_key_path``, written first when there is none."""
+    if not host_key_path.exists():
+        # New install: generate a modern Ed25519 key, as the web server's start does (ensure_host_key: never over
+        # a key another start put there first, and never at its path before it is synced). Where it is written is
+        # a host path and stays out of the log. An existing deployment already has its key here and skips this
+        # branch, so its fingerprint never changes on upgrade.
+        safe_event('host-key.generating')
+        ensure_host_key(host_key_path)
+        if not host_key_path.exists():
+            safe_event('host-key.unwritable')
+            raise RuntimeError("no SFTP host key: none was there and none could be written")
+    # Load whatever is present -- Ed25519 on new installs, RSA on ones that predate this -- as it is on the disk.
+    return load_whole_host_key(str(host_key_path))
+
+
 def start_sftp_server():
     """
     Start the SFTP server.
@@ -2598,17 +2614,7 @@ def start_sftp_server():
     set_process_default_channel("sftp")
 
     # Generate or load host key
-    host_key_path = Path(settings.sftp_host_key_path)
-
-    if not host_key_path.exists():
-        # New install: generate a modern Ed25519 key. Where it is written is a host path and stays
-        # out of the log. An existing deployment already has its key here and skips this branch, so
-        # its fingerprint never changes on upgrade.
-        safe_event('host-key.generating')
-        generate_ed25519_host_key(host_key_path)
-
-    # Load whatever is present -- Ed25519 on new installs, RSA on ones that predate this.
-    host_key = load_host_key(str(host_key_path))
+    host_key = server_host_key(Path(settings.sftp_host_key_path))
 
     # Remove any plaintext upload buffers orphaned by a previous crash/kill (no uploads can
     # be in flight at startup, so all are stale).
