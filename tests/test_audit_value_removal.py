@@ -9,9 +9,10 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py):
   stay, and verify is clean; a row written after it is untouched; an erased row is passed over; rows an earlier
   release wrote (no nonce) get theirs written out; a day archived in part is reached in its block and in its later
   hours still held as rows, and taken again when the archive finishes it between two steps; the day it was asked in,
-  archived before it runs, is no obstacle; rows left in an archived hour are reported; a day a later release
-  archived holds it, and says so; the preview counted what it changed, and one past its time says what it had
-  counted;
+  archived before it runs, is no obstacle; rows left in an archived hour are reported, and so is a sealed hour
+  whose rows no longer match its seal, each finding ending with the wait (only rows dated before the chain's first
+  hour wait until they are removed); a day a later release archived holds it, and says so; the preview counted
+  what it changed, and one past its time says what it had counted;
 - a cancel stops it before it begins, never after (also while sealing is stopped); the database removing its row,
   or marking it no longer waiting, vetoes it; a row whose copies (levels or scope) differ from its seal is not acted
   on, and the daily check reports it, and a row the chain holds no request of, which holds no new removal back; a
@@ -709,7 +710,9 @@ def test_a_removal_whose_own_day_is_archived_before_it_runs_completes(env, monke
 
 def test_rows_left_in_an_archived_hour_are_reported_and_nothing_of_the_day_is_rewritten(env, monkeypatch):
     """A row of audit_logs in an hour a block holds (no path of the app writes one there): the removal reports
-    row-in-archived-day for that day, rewrites nothing in it, and does not complete."""
+    row-in-archived-day for that day, rewrites nothing in it, and does not complete. The finding ends with the wait:
+    only rows dated before the chain's first hour wait until they are removed from audit_logs, and deleting rows is
+    not what releases this one."""
     kept = env.put(_at(3, 5))
     env.run_until_sealed()
     arc.archive_job(retention.Pass(env.session, now=env.clock()))
@@ -725,17 +728,22 @@ def test_rows_left_in_an_archived_hour_are_reported_and_nothing_of_the_day_is_re
     env.removal_job()
     assert "row-in-archived-day" in seen
     assert f"nothing in {DAY.isoformat()} was rewritten" in seen["row-in-archived-day"]
+    seq = env.removal_row(asked["id"]).request_seq
+    assert seen["row-in-archived-day"].endswith(f"; the removal of request seal {seq} waits")
+    assert "removed from audit_logs" not in seen["row-in-archived-day"]
     with env.session() as db:
         assert db.query(AuditArchiveBlock).one().payload == payload
     assert env.get(stray).ip_address == "203.0.113.9" and env.rewrite_seals() == []
     assert env.removal_row(asked["id"]).status == vr.PENDING
+    assert env.removal_row(asked["id"]).waiting == vr.held_by("row-in-archived-day")
     assert _values(env)[kept] == ("203.0.113.9", "Mozilla/5.0 test")
 
 
 def test_a_row_put_back_into_the_last_hour_of_a_part_of_a_day_archived_in_part_is_reported(env, monkeypatch):
     """A day archived over two passes: its first part ends with the hour before its 09:00 rows. A row put back into
     that part's last hour: the removal reports row-in-archived-day for the day, rewrites nothing in it, and does not
-    complete (the check reaches every hour of a part, its last one too)."""
+    complete (the check reaches every hour of a part, its last one too). The finding ends with the wait, with no word
+    of removing rows."""
     _early, _late = _half_archived(env, monkeypatch)
     asked = env.ask_removal()
     _idle_archive(monkeypatch)
@@ -751,11 +759,39 @@ def test_a_row_put_back_into_the_last_hour_of_a_part_of_a_day_archived_in_part_i
     monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
     env.removal_job()
     assert f"nothing in {DAY.isoformat()} was rewritten" in seen.get("row-in-archived-day", "")
+    seq = env.removal_row(asked["id"]).request_seq
+    assert seen["row-in-archived-day"].endswith(f"; the removal of request seal {seq} waits")
+    assert "removed from audit_logs" not in seen["row-in-archived-day"]
     with env.session() as db:
         assert db.query(AuditArchiveBlock).one().payload == payload
     assert env.get(stray).ip_address == "203.0.113.9" and env.rewrite_seals() == []
     assert env.removal_row(asked["id"]).status == vr.PENDING
     assert env.removal_row(asked["id"]).waiting == vr.held_by("row-in-archived-day")
+
+
+def test_a_removal_held_by_rows_that_no_longer_match_their_hours_seal_is_not_told_to_remove_rows(env, monkeypatch):
+    """A row of a sealed hour changed by a database writer (rows-altered): the removal reports the hour, rewrites
+    nothing in it, and waits there, held by the finding. The finding ends with the wait: only rows dated before the
+    chain's first hour wait until they are removed from audit_logs, and deleting rows is not what releases this one."""
+    bad = env.put(_at(3, 5))
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    _idle_archive(monkeypatch)
+    pe.WAIT_RULES.append(lambda db, now: "held for the test")
+    env.week()
+    pe.WAIT_RULES.clear()
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == bad).update({AuditLog.username: "mallory"})
+        db.commit()
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    env.removal_job()
+    seq = env.removal_row(asked["id"]).request_seq
+    assert seen.get("rows-altered", "").endswith(f"; the removal of request seal {seq} waits"), seen
+    assert "removed from audit_logs" not in seen["rows-altered"]
+    assert env.get(bad).ip_address == "203.0.113.9" and env.rewrite_seals() == []
+    assert env.removal_row(asked["id"]).status == vr.PENDING
+    assert env.removal_row(asked["id"]).waiting == vr.held_by("rows-altered")
 
 
 @pytest.mark.parametrize("before", [timedelta(days=2), timedelta(minutes=30)], ids=["days before", "the hour before"])
