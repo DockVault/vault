@@ -794,6 +794,60 @@ def test_a_removal_held_by_rows_that_no_longer_match_their_hours_seal_is_not_tol
     assert env.removal_row(asked["id"]).waiting == vr.held_by("rows-altered")
 
 
+def _a_week_held(env, monkeypatch):
+    """A week of passes while a registered rule holds every removal back: the removal is due and has not begun."""
+    with monkeypatch.context() as m:
+        m.setattr(pe, "WAIT_RULES", [lambda db, now: "held for the test"])
+        env.week()
+
+
+def test_a_sealed_hour_whose_rows_changed_is_reported_in_the_words_for_changed_rows(env, monkeypatch):
+    """The finding for a sealed hour whose rows no longer give its seal says exactly that, not the words for an erased
+    row, and ends with the wait."""
+    bad = env.put(_at(3, 5))
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    _idle_archive(monkeypatch)
+    _a_week_held(env, monkeypatch)
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == bad).update({AuditLog.username: "mallory"})
+        db.commit()
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    env.removal_job()
+    seq = env.removal_row(asked["id"]).request_seq
+    hour = fmt.hour_text(ai.hour_floor(_at(3, 5)))
+    assert seen.get("rows-altered") == (f"the rows of {hour} no longer give its seal; nothing in it was rewritten; "
+                                        f"the removal of request seal {seq} waits"), seen
+    assert env.removal_row(asked["id"]).waiting == vr.held_by("rows-altered")
+
+
+def test_an_erased_row_changed_after_its_erase_holds_a_removal_as_unjustified(env, monkeypatch):
+    """An erased row changed after its erase is not what its erase seal says: the removal reports it as unjustified, in
+    the words for an erased row, rewrites nothing in its hour and waits there, held by that finding."""
+    when = T0 - timedelta(hours=30)
+    erased = env.put(when, username="eve")
+    kept = env.put(when + timedelta(minutes=10))
+    env.run_until_sealed()
+    erase = env.ask("eve")
+    assert until(env, lambda: env.request_row(erase["id"]).status == pe.COMPLETED)
+    asked = env.ask_removal()
+    _a_week_held(env, monkeypatch)
+    with env.session() as db:
+        db.query(AuditLog).filter(AuditLog.id == erased).update({AuditLog.ip_address: "198.51.100.7"})
+        db.commit()
+    seen = {}
+    monkeypatch.setattr(ai, "report_failures", lambda st, f, found, *a, **k: seen.update(found))
+    env.removal_job()
+    seq = env.removal_row(asked["id"]).request_seq
+    hour = fmt.hour_text(ai.hour_floor(when))
+    assert "rows-altered" not in seen, seen
+    assert seen.get("unjustified") == (f"an erased row of {hour} is not what its erase seal says; nothing in it was "
+                                       f"rewritten; the removal of request seal {seq} waits"), seen
+    assert env.get(kept).ip_address == "203.0.113.9" and env.rewrite_seals() == []
+    assert env.removal_row(asked["id"]).waiting == vr.held_by("unjustified")
+
+
 @pytest.mark.parametrize("before", [timedelta(days=2), timedelta(minutes=30)], ids=["days before", "the hour before"])
 def test_rows_dated_before_the_chains_first_hour_hold_a_removal_which_can_still_be_cancelled(env, monkeypatch,
                                                                                             before):
