@@ -65,6 +65,17 @@ def test_the_managed_settings_are_on_their_page_and_the_rate_limits_on_security(
     assert {listed.page for listed in reg.all_listed()} == {"security"}
 
 
+def test_the_records_page_draws_every_group_of_its_settings():
+    """The records page draws the managed settings group by group (static/js/settings-retention.js, GROUPS): a
+    setting of a group it does not list would be on no page."""
+    js = (ROOT / "static" / "js" / "settings-retention.js").read_text(encoding="utf-8")
+    assert js.count("const GROUPS = [") == 1
+    start = js.index("const GROUPS = [")
+    drawn = set(re.findall(r"\['([a-z_]+)', '", js[start:js.index("];", start)]))
+    missing = {spec.group for spec in reg.all_specs()} - drawn
+    assert not missing, sorted(missing)
+
+
 @pytest.fixture
 def bare(monkeypatch):
     """Only what a test registers, with deployment settings the test controls."""

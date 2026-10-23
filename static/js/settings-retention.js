@@ -25,6 +25,7 @@
         ['retention', 'Other records'],
         ['audit_integrity', 'Sealing'],
         ['working_records', 'Fixed periods'],
+        ['compliance', 'Compliance access'],   // only .env sets them (app/core/compliance_settings.py)
     ];
     const SOURCES = { default: 'Default', env: 'From .env', admin: 'Set here', locked: 'Locked' };
     // The audit numbers the preview counts for.
