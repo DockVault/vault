@@ -692,7 +692,7 @@ def run_job(p):
     findings: Dict[str, str] = {}
     finished = []
     for seq in sorted(set(due(st.view, st.known_record(), p.now)) | set(vetoed(st, p.session_factory))):
-        while p.time_left():
+        while p.time_left() and not p.held_now():
             outcome, changed, cursor, done, why = STOP, 0, None, None, None
             with ai.ChainWriter(engine, st) as w:
                 outcome, changed, cursor, done, why = step(p, w, seq, findings)

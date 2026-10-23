@@ -122,7 +122,7 @@ def prune(p, conditions, *, reason: str, size: Optional[dict] = None, plan=None,
                                before=before)
         result.add(done.deleted, done.oldest, done.newest)
     skipped: set = set()
-    while p.time_left():
+    while p.time_left() and not p.held_now():
         with ai.ChainWriter(engine, st) as w:
             view = w.st.view
             newest = view.newest_policy()
@@ -212,7 +212,7 @@ def _prune_archived(p, st, engine, failures: Dict[str, str], *, reason: str, siz
     result = retention.JobResult()
     today = p.now.date()
     looked = st.archive_checked
-    while p.time_left():
+    while p.time_left() and not p.held_now():
         batch = None
         with ai.ChainWriter(engine, st) as w:
             view = w.st.view

@@ -24,7 +24,9 @@ the shortening of addresses does not change them. Those modules are listed in KE
 this one.
 
 The hold switch. ``logs_hold`` (the deployment's value is RETENTION_HOLD; with RETENTION_HOLD=true the panel
-cannot turn it off) stops every job over logs and security records while it is on. The jobs over working
+cannot turn it off) stops every job over logs and security records while it is on. A pass takes the stricter of
+the stored settings and the audit chain's honoured state, and reads the stored settings again before each such job
+and before each batch of one, so a hold turned on during a pass stops what comes after it. The jobs over working
 records (finished sessions, expired key-proof challenges, credential-change records, the sign-in throttle's
 fallback rows, ended invitations, used or expired reset links and one-time codes, old notifications, waiting
 settings changes) keep running. Turning the hold off deletes sooner, so it waits like any such change
@@ -104,6 +106,13 @@ def utcnow() -> datetime:
 def hold_in_force() -> bool:
     """The hold switch as the stored settings give it (the database's value, or the deployment's)."""
     return bool(registry.resolve(HOLD_KEY))
+
+
+def stored_hold_now(session_factory: Optional[Callable] = None) -> bool:
+    """The hold switch as the stored settings give it, read again now. An administrator's change of it writes the
+    stored value and the audit chain's policy seal together, so a hold turned on during a pass is seen here."""
+    registry.refresh(session_factory)
+    return hold_in_force()
 
 
 def chain_holds(session_factory: Optional[Callable] = None) -> bool:
@@ -249,11 +258,21 @@ class Pass:
         self.now = now or utcnow()
         self.batch_rows = int(batch_rows if batch_rows is not None else registry.resolve(BATCH_KEY))
         self.deadline = time.monotonic() + budget_seconds
-        # The job running now (run_pass sets it), which names the records its transactions write.
+        # The job running now (run_pass sets it), which names the records its transactions write, and whether the
+        # hold switch stops it (then each of its batches asks again first: held_now()).
         self.job_name: Optional[str] = None
+        self.job_held = False
 
     def time_left(self) -> bool:
         return time.monotonic() < self.deadline
+
+    def held_now(self) -> bool:
+        """Whether the hold switch stops the job running now: never for a job it does not stop; for one it stops,
+        the stored settings read again (the audit chain's honoured hold is decided once a pass, before the first
+        job it stops, and each job over the chain asks the chain itself in its transactions)."""
+        if not self.job_held:
+            return False
+        return stored_hold_now(self.session_factory)
 
     @contextmanager
     def transaction(self):
@@ -293,6 +312,8 @@ class Pass:
         result = JobResult()
         id_column = model.__mapper__.primary_key[0]
         while self.time_left():
+            if self.held_now():
+                break
             with self.transaction() as db:
                 why = waits(db, self.now) if waits is not None else None
                 if why:
@@ -625,17 +646,19 @@ def run_pass(session_factory: Optional[Callable] = None, *, engine=None, now: Op
         registry.refresh(session_factory)
         # The hold is decided at the first job over logs, once the sealing job (the first) has read the chain:
         # a process's first pass knows the chain's hold and the grace after a restore only once it has read them.
-        hold = None
+        # The stored settings are read again before each such job, and before each batch of one (Pass.held_now),
+        # so a hold turned on during the pass stops what comes after it.
+        chain_hold = None
         done = []
         for job in JOBS:
             if not p.time_left():
                 break
-            if job.held and hold is None:
-                hold = hold_in_force() or chain_holds(session_factory)
-            if job.held and hold:
+            if job.held and chain_hold is None:
+                chain_hold = chain_holds(session_factory)
+            if job.held and (chain_hold or stored_hold_now(session_factory)):
                 done.append((job.name, None))
                 continue
-            p.job_name = job.name
+            p.job_name, p.job_held = job.name, job.held
             try:
                 result = job.run(p)
             except Exception as exc:  # noqa: BLE001 -- one job's failure never stops the others

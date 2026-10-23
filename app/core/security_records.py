@@ -163,7 +163,7 @@ def clear_alert_values(p):
     if keep is None:
         registry._say("The pruner's security_alert_values job waits for the audit chain")
         return result
-    while p.time_left():
+    while p.time_left() and not p.held_now():
         with p.transaction() as db:
             alerts = (db.query(SecurityAlert)
                       .filter(*retention.deletable(SecurityAlert, p.now, SecurityAlert.timestamp < p.now - keep,

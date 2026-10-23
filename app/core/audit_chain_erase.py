@@ -734,7 +734,7 @@ def run_job(p):
     for seq in sorted(set(due(st.view, st.known_record(), p.now)) | set(vetoed(st, p.session_factory))):
         tried: set = set()
         cache: dict = {}
-        while p.time_left():
+        while p.time_left() and not p.held_now():
             outcome, changed, done, why = STOP, 0, None, None
             with ai.ChainWriter(engine, st) as w:
                 outcome, changed, done, why = step(p, w, seq, findings, tried, cache)

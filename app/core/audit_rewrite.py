@@ -687,7 +687,7 @@ def shorten_job(p):
     # A compliance case's rows stay as they are (retention.register_keep_as_is).
     conditions = retention.changeable(AuditLog, p.now, *prefilter(AuditLog, {ap.IP: ap.SHORTENED}))
     findings: Dict[str, str] = {}
-    while p.time_left():
+    while p.time_left() and not p.held_now():
         before = cutoff(st.view, ai.hour_floor(min(p.now, st.clock()) - timedelta(days=days)))
         cursor = _cursors.get(key, _EPOCH)
         if cursor >= before:
