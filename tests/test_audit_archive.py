@@ -2259,26 +2259,53 @@ def test_a_later_releases_block_format_is_a_warning_and_its_day_is_left_as_it_is
 
 
 def test_unarchive_refuses_a_later_releases_block_in_its_read_phase(env, monkeypatch):
-    """The read phase names the days whose blocks a later release wrote, and nothing is restored; a range without
-    them is planned as usual. (The write phase checks each block itself, as above.)"""
+    """The read phase names the days whose blocks a later release wrote, as the block row says and as the block's own
+    header says (a row changed to say this release's format does not hide it), and nothing is restored."""
+    second = DAY + timedelta(days=1)
     _sealed_day(env)
-    _sealed_day(env, day=DAY + timedelta(days=1))
+    _sealed_day(env, day=second)
     monkeypatch.setattr(af, "FORMAT", 2)
     _archive(env)
     monkeypatch.setattr(af, "FORMAT", 1)
     with env.session() as db:
-        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == DAY + timedelta(days=1)).update(
+        db.query(AuditArchiveBlock).filter(AuditArchiveBlock.day == second).update(
             {AuditArchiveBlock.format: 1}, synchronize_session=False)
         db.commit()
-    with pytest.raises(host.Refused, match=f"the archived days {DAY.isoformat()} hold blocks of a later block format"):
+    with pytest.raises(host.Refused, match=f"the archived days {DAY.isoformat()}, {second.isoformat()} hold blocks "
+                                           "of a later block format"):
         arc.unarchive(env.engine, env.st, None, None, read=True)
-    assert _hot(env) == 0 and len(_blocks(env)) == 2
-    seen = arc.unarchive(env.engine, env.st, DAY + timedelta(days=1), None, read=True)
-    assert seen["estimate"]["days"] == 1
-    # The row's format column is not what the write phase trusts: the block itself is of the later format.
-    with pytest.raises(arc.NotVerified, match="a later release writes"):
-        arc.unarchive(env.engine, env.st, DAY + timedelta(days=1), None, expect=seen["state"])
-    assert _hot(env) == 0 and len(_blocks(env)) == 2
+    with pytest.raises(host.Refused, match=f"the archived days {second.isoformat()} hold blocks of a later block "
+                                           "format, which a later release writes: this release cannot restore them"):
+        arc.unarchive(env.engine, env.st, second, None, read=True)
+    assert _hot(env) == 0 and _hot(env, day=second) == 0 and len(_blocks(env)) == 2
+
+
+@pytest.mark.parametrize("later", [False, True], ids=["this release's", "a later release's"])
+@pytest.mark.parametrize("start_bytes", [None, 16], ids=["header within the start", "header past the start"])
+def test_the_read_phase_takes_a_blocks_format_from_its_own_header(env, monkeypatch, later, start_bytes):
+    """The read phase reads a block's format from the start of its payload, and the whole payload only when the start
+    does not hold the header line; either way a later release's block is refused and this release's planned."""
+    _sealed_day(env)
+    if later:
+        monkeypatch.setattr(af, "FORMAT", 2)
+    _archive(env)
+    monkeypatch.setattr(af, "FORMAT", 1)
+    with env.session() as db:
+        db.query(AuditArchiveBlock).update({AuditArchiveBlock.format: 1}, synchronize_session=False)
+        db.commit()
+    if start_bytes is not None:
+        monkeypatch.setattr(af, "HEADER_BYTES", start_bytes)
+    whole = []
+    real = arc.read_payload
+    monkeypatch.setattr(arc, "read_payload", lambda db, day, number: (whole.append(number), real(db, day, number))[1])
+    if later:
+        with pytest.raises(host.Refused, match=f"the archived days {DAY.isoformat()} hold blocks of a later block "
+                                               "format"):
+            arc.unarchive(env.engine, env.st, None, None, read=True)
+    else:
+        assert arc.unarchive(env.engine, env.st, None, None, read=True)["estimate"]["days"] == 1
+    assert whole == ([] if start_bytes is None else [1])
+    assert _hot(env) == 0 and len(_blocks(env)) == 1
 
 
 def test_a_block_of_this_releases_format_with_other_columns_is_altered(env):

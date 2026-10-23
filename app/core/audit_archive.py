@@ -995,6 +995,38 @@ def _days_in(view, first: Optional[date], last: Optional[date]) -> List[date]:
                   and (last is None or d <= last))
 
 
+def _block_is_later(db, day, number: int) -> bool:
+    """Whether the block of ``day``'s part ``number`` names a later release's block format in its own header: read
+    from the start of its payload, or from the whole payload when the start does not hold the header. A block that
+    cannot be read is not called later here (the write phase reports it)."""
+    from app.core.models import AuditArchiveBlock as B
+    r = db.query(func.substr(B.payload, 1, af.HEADER_BYTES)).filter(B.day == day, B.part == number).first()
+    if r is None or r[0] is None:
+        return False
+    named = af.header_format(bytes(r[0]))
+    if named is not None:
+        return named > af.FORMAT
+    payload = read_payload(db, day, number)
+    try:
+        af.open_block(payload or b"")
+    except af.LaterFormat:
+        return True
+    except af.BlockError:
+        return False
+    return False
+
+
+def later_format_in(db, days: List[date]) -> List[str]:
+    """The days of ``days`` that hold a block of a later release's block format, as its row says or as the block's
+    own header says (the header is what the write phase trusts; the row alone could be changed to hide it)."""
+    from app.core.models import AuditArchiveBlock as B
+    later = set()
+    for d, number, named in db.query(B.day, B.part, B.format).filter(B.day.in_(days)).all():
+        if (named is not None and named > af.FORMAT) or _block_is_later(db, d, number):
+            later.add(_as_date(d).isoformat())
+    return sorted(later)
+
+
 def unarchive_plan(db, view, record: Optional[dict], first: Optional[date], last: Optional[date]) -> dict:
     """The read phase of ``audit unarchive``: the days it would restore, with each day's archive seal, the
     estimate, and the state. Raises Refused when there is none."""
@@ -1002,11 +1034,9 @@ def unarchive_plan(db, view, record: Optional[dict], first: Optional[date], last
     days = _days_in(view, first, last)
     if not days:
         raise host.Refused("no archived day in that range")
-    # A later release's block (its row says so; the write phase checks the block itself) cannot be restored by this
-    # release: refused before anything is restored, rather than stopping at that day with the days before it rows.
-    from app.core.models import AuditArchiveBlock as B
-    later = sorted({_as_date(d).isoformat() for (d,) in db.query(B.day).filter(B.day.in_(days),
-                                                                               B.format > af.FORMAT).all()})
+    # A later release's block cannot be restored by this release: refused before anything is restored, rather than
+    # stopping at that day with the days before it rows.
+    later = later_format_in(db, days)
     if later:
         raise host.Refused(f"the archived days {', '.join(later)} hold blocks of a later block format, which a later "
                            "release writes: this release cannot restore them. Leave them out of the range, or "

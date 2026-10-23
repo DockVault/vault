@@ -300,6 +300,31 @@ def open_block(payload: bytes) -> Block:
     return block
 
 
+# How much of a payload header_format() reads, and the most it decompresses of it: the header is one line of a
+# few kilobytes (the columns' names and at most a day's salts).
+HEADER_BYTES = 65536
+HEADER_MAX = 1 << 20
+
+
+def header_format(prefix: bytes) -> Optional[int]:
+    """The block format the header names, read from ``prefix``, the first bytes of a payload (at most HEADER_BYTES):
+    None when they do not hold the whole header line, or are not the start of a block."""
+    from compression import zstd
+    try:
+        out = zstd.ZstdDecompressor().decompress(bytes(prefix), max_length=HEADER_MAX)
+    except (zstd.ZstdError, EOFError, ValueError, TypeError):
+        return None
+    line, newline, _rest = out.partition(b"\n")
+    if not newline:
+        return None
+    try:
+        header = json.loads(line)
+    except ValueError:
+        return None
+    named = header.get("format") if isinstance(header, dict) else None
+    return named if isinstance(named, int) and not isinstance(named, bool) else None
+
+
 def digest(payload: bytes) -> str:
     """The SHA-256 of the payload as stored, as an archive seal binds it."""
     return hashlib.sha256(bytes(payload)).hexdigest()
