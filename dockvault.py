@@ -589,6 +589,38 @@ def admin_password_problem(pw, environment="production"):
     return None
 
 
+# The names the vault writes into its records for itself (app/core/person_erase.py system_names(); a test keeps the
+# two the same). No account may take one, in any case or spacing.
+SERVER_WRITTEN_NAMES = ("operator@host", "server configuration", "the server (AUDIT_LOG_RETENTION_DAYS in .env)",
+                        "system")
+
+
+def server_name_form(name):
+    """``name`` as the vault compares it with the names it writes for itself (person_erase.server_name_form)."""
+    import unicodedata
+    return re.sub(r"[\s_.\-]+", "", unicodedata.normalize("NFKC", name).casefold())
+
+
+def admin_username_problem(name):
+    """Return a human reason ``name`` cannot be the first administrator's username, or None if OK. Mirrors the
+    app's rules for a new account's username, so the first start does not refuse the name the tool wrote."""
+    import unicodedata
+    n = name or ""
+    if not 3 <= len(n) <= 50:
+        return "must be 3 to 50 characters"
+    if "'" in n:
+        return "must not contain a single quote (it breaks .env quoting)"
+    if any(c in n for c in "<>@"):
+        return "must not contain '<', '>' or '@'"
+    if any(unicodedata.category(c).startswith("C") for c in n):
+        return "must not contain control or invisible characters"
+    if unicodedata.normalize("NFKC", n).casefold().startswith("erased-"):
+        return "must not start with 'erased-' (kept for erased records)"
+    if server_name_form(n) in {server_name_form(s) for s in SERVER_WRITTEN_NAMES}:
+        return "is a name the vault writes into its records for itself"
+    return None
+
+
 def migrate_compose_profiles(existing):
     """Return the one selected app profile, migrating only supported legacy values.
 
@@ -4105,6 +4137,13 @@ class DockVault:
             self._fail("invalid/missing server name (letters, digits, dots, hyphens only): %r" % server)
 
         admin_user = a("admin_username") or (ask("Admin username", pal, "admin") if interactive else "admin")
+        why = admin_username_problem(admin_user)
+        while why and interactive and not a("admin_username"):
+            print(pal.paint("  The admin username %s." % why, "red"))
+            admin_user = ask("Admin username", pal, "admin")
+            why = admin_username_problem(admin_user)
+        if why:
+            self._fail("admin username %r %s" % (admin_user, why))
         admin_email = a("admin_email") or (ask("Admin email", pal, "admin@example.com") if interactive else "admin@example.com")
         admin_pw, generated = a("admin_password"), False
         if interactive and not admin_pw:
@@ -4280,6 +4319,7 @@ class DockVault:
         reused .env so it can seed a not-yet-bootstrapped set (harmless on a bootstrapped one). Returns
         the updated env dict. A no-op when none were passed."""
         changed = {}
+        given = []
         for cli, key in (("admin_password", "ADMIN_PASSWORD"), ("admin_username", "ADMIN_USERNAME"),
                          ("admin_email", "ADMIN_EMAIL")):
             val = (getattr(args, cli, None) if args else None)
@@ -4288,11 +4328,18 @@ class DockVault:
             # Validate the password with the SAME guard the fresh path uses (_collect_setup_config),
             # BEFORE it reaches .env. An unvalidated value that contains a single quote would corrupt
             # the single-quoted .env line, so the app is seeded with a different password than the
-            # operator supplied - then dropped after a healthy boot, a silent admin lockout.
+            # operator supplied - then dropped after a healthy boot, a silent admin lockout. Every value is
+            # checked before any is written, so a refusal leaves .env as it was.
             if key == "ADMIN_PASSWORD":
                 prob = admin_password_problem(val, "production")
                 if prob:
                     self._fail("admin password %s" % prob)
+            if key == "ADMIN_USERNAME":
+                prob = admin_username_problem(val)
+                if prob:
+                    self._fail("admin username %r %s" % (val, prob))
+            given.append((key, val))
+        for key, val in given:
             self._set_env_key(path, key, "'%s'" % val)
             changed[key] = val
         if changed:

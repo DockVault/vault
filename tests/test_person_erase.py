@@ -1,8 +1,10 @@
 """Asking for a per-person erase (app/core/person_erase.py), offline, on a throwaway SQLite database with a chain of
 its own (tests/_erase_env.py):
 
-- whose name: refused for an account's, a temporary credential's, a waiting invitation's, and a name that starts
-  with "erased-" in any case or form (and no account can be named so); matched exactly;
+- whose name: refused for an account's, a temporary credential's, a waiting invitation's, a name that starts
+  with "erased-" in any case or form, and a name the server writes for itself (and no account can be named so, the
+  server's names in any case or spacing either; an account an older release let take one is reported to every
+  administrator); matched exactly;
 - the name waits sealed: the token opens only for its request, the request seal's subject commits to it without
   revealing it, the placeholder is random, in its form, and drawn again on a clash;
 - the request, the cancel and the audit rows never name the person; a cancel ends the request and deletes the name;
@@ -24,7 +26,7 @@ from _erase_env import EraseEnv
 from app.core import audit_chain_policy_seals as ps
 from app.core import audit_integrity as ai
 from app.core import person_erase as pe
-from app.core.models import (AccountInvitation, AuditLog, AuditSeal, Base, EraseRequest, Notification,
+from app.core.models import (AccountInvitation, AuditLog, AuditSeal, Base, EraseRequest, Notification, RoleEnum,
                              SecurityAlert, SecurityRecord, TemporaryCredential, User)
 
 pytestmark = pytest.mark.unit
@@ -77,6 +79,99 @@ def test_the_names_the_server_writes_for_itself_are_refused():
     assert {"operator@host", "server configuration"} <= names
     for name in names:
         assert "writes for itself" in pe.name_problem(name)
+
+
+SERVER_NAME_FORMS = ["system", "System", "SYSTEM", " system ", "sys tem", "ｓｙｓｔｅｍ", "server configuration",
+                     "Server Configuration", "server_configuration", "server-configuration", "server.configuration",
+                     "SERVERCONFIGURATION", "the server (AUDIT_LOG_RETENTION_DAYS in .env)",
+                     "The Server (audit log retention days in env)"]
+
+
+@pytest.mark.parametrize("name", SERVER_NAME_FORMS)
+def test_no_account_invitation_or_signup_may_take_a_name_the_server_writes_in_any_case_or_spacing(name):
+    """Such an account's rows and the server's would read alike, and once it is deleted its records could not be
+    erased (an erase of a name the server writes is refused for good)."""
+    from app.api.api_server import _validate_new_username
+    assert pe.is_server_name(name)
+    with pytest.raises(ValueError, match="server writes"):
+        _validate_new_username(name)
+
+
+@pytest.mark.parametrize("name", ["systems", "system1", "my system", "sysadmin", "server", "configuration", "eve"])
+def test_names_near_the_servers_are_left_to_accounts(name):
+    from app.api.api_server import _validate_new_username
+    assert not pe.is_server_name(name) and _validate_new_username(name) == name
+
+
+def test_every_name_the_server_writes_is_kept_from_accounts():
+    assert pe.system_names() and all(pe.is_server_name(n) for n in pe.system_names())
+
+
+def test_the_service_every_account_is_made_through_refuses_them_too(env):
+    """Account creation, invitations, signup and the first administrator from ADMIN_USERNAME all make the account
+    through AuthService.create_user."""
+    from app.services.auth_service import AuthService
+    with env.session() as db:
+        for name in ("system", "Server Configuration", "Erased-1234abcd"):
+            with pytest.raises(ValueError, match="server writes|erased-"):
+                AuthService(db).create_user(username=name, email=None, password="Long-Enough-Pass-1")
+        db.rollback()
+        assert db.query(User).count() == 0
+
+
+def test_the_first_administrator_cannot_be_named_like_the_server(env, monkeypatch):
+    from app.core import admin_bootstrap
+    monkeypatch.setattr(admin_bootstrap.settings, "admin_username", "System")
+    monkeypatch.setattr(admin_bootstrap.settings, "admin_password", "A-Long-Enough-Pass-1")
+    with env.session() as db:
+        with pytest.raises(ValueError, match="server writes"):
+            admin_bootstrap.bootstrap_admin(db)
+        db.rollback()
+        assert db.query(User).count() == 0
+
+
+def _older_release_made(env, username, *, invitation=False, expires=None):
+    with env.session() as db:
+        if invitation:
+            db.add(AccountInvitation(id=uuid.uuid4(), username=username, role="user", token_prefix="p" * 12,
+                                     token_hash="h" * 64, expires_at=expires or T0 + timedelta(days=2),
+                                     created_at=T0))
+        else:
+            db.add(User(id=uuid.uuid4(), username=username, email=None, password_hash="x", role=RoleEnum.USER,
+                        is_active=True))
+        db.commit()
+
+
+def test_an_account_an_older_release_let_take_a_server_name_keeps_working_and_every_administrator_is_told(env):
+    """An account exactly named like the server is listed (its rows and the server's read alike, and its erase is
+    refused); one in another case is not (its rows are told apart by the name itself). A waiting invitation for
+    any form of such a name can no longer be accepted, so it is listed too; an expired one is not."""
+    _older_release_made(env, "system")
+    _older_release_made(env, "System")
+    _older_release_made(env, "Server Configuration", invitation=True)
+    _older_release_made(env, "server configuration", invitation=True, expires=T0 - timedelta(hours=1))
+    ada, bea = env.admin("ada"), env.admin("bea")
+    found = pe.report_server_named(env.session, now=T0)
+    assert found == {"accounts": ["system"], "invitations": ["Server Configuration"]}
+    with env.session() as db:
+        told = db.query(Notification).filter(Notification.type == pe.SERVER_NAMED_NOTICE).all()
+        assert sorted(str(n.user_id) for n in told) == sorted([str(ada.id)] * 2 + [str(bea.id)] * 2)
+        account = [n for n in told if n.user_id == ada.id and '"system"' in n.body]
+        invitation = [n for n in told if n.user_id == ada.id and '"Server Configuration"' in n.body]
+        assert len(account) == 1 and "keeps working" in account[0].body
+        assert "compliance access" in account[0].body and "erase" in account[0].body
+        assert len(invitation) == 1 and "can no longer be accepted" in invitation[0].body
+        assert all(n.target == "#users" and n.dedup_key for n in told)
+        assert db.query(User).filter(User.username == "system").one().is_active
+    assert pe.name_problem("system") and pe.name_problem("System") is None
+
+
+def test_with_no_such_account_nothing_is_told(env):
+    env.admin("ada")
+    _older_release_made(env, "sysadmin")
+    assert pe.report_server_named(env.session, now=T0) == {"accounts": [], "invitations": []}
+    with env.session() as db:
+        assert db.query(Notification).count() == 0
 
 
 @pytest.mark.parametrize("text, name, want", [
@@ -460,3 +555,12 @@ def test_the_data_inventory_describes_the_built_in_erase():
 
 def test_deleting_an_account_leaves_its_audit_rows_to_the_database():
     assert User.audit_logs.property.passive_deletes is True
+
+
+def test_the_host_tool_keeps_the_same_names_from_the_first_administrator():
+    """dockvault.py cannot import the app: it keeps its own copy of the names and of their form, which must be the
+    app's, or the setup could write an ADMIN_USERNAME the first start refuses."""
+    import dockvault as dv
+    assert set(dv.SERVER_WRITTEN_NAMES) == set(pe.system_names())
+    for name in SERVER_NAME_FORMS + ["systems", "server", "Erased-1", "ada"]:
+        assert dv.server_name_form(name) == pe.server_name_form(name), name

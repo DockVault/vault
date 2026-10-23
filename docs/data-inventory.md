@@ -414,7 +414,12 @@ and the unlock state.
    only by an erase of its own), and says what it does not reach. Asking asks for your password, and the
    erase waits `RETENTION_REDUCTION_DELAY_DAYS` (7 days by default); any administrator can cancel it
    until it begins, and every administrator is told. It is refused while an account, a temporary
-   credential or an invitation still waiting has the name, and for any name that starts with `erased-`.
+   credential or an invitation still waiting has the name, for any name that starts with `erased-`, and
+   for the names the server writes into the records for itself (`system`, `server configuration`, the
+   host's operator `operator@host`, and the server acting on a retention limit in `.env`). No account can
+   take any of those names, in any case or spacing; an account an older release let take one keeps
+   working, and every administrator is told of it once at the start after the upgrade (an erase of that
+   name stays refused).
 
    When it runs, every row of the audit log whose username is exactly that name, and every archived row,
    gets a placeholder (`erased-` and 8 random characters) in its place: its address, browser

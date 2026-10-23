@@ -888,12 +888,17 @@ def _validate_new_username(v):
     one makes two usernames look the same.
     NOT applied to LoginRequest, where an email is a legitimate identifier in email/either mode.
     Rejects a name that starts with "erased-", in any case: a per-person erase writes such placeholders into
-    the audit log (app/core/person_erase.py), and an account named like one would read as their owner."""
+    the audit log (app/core/person_erase.py), and an account named like one would read as their owner.
+    Rejects a name the server writes into the records for itself ("system", "server configuration", ...), in any
+    case and spacing (person_erase.is_server_name): the server's own rows would read as the account's, and once
+    the account is gone its records could not be erased."""
     import unicodedata
-    from app.core.person_erase import is_reserved_name
+    from app.core.person_erase import is_reserved_name, is_server_name
     v = _reject_markup_chars(v, 'username')
     if v is not None and is_reserved_name(v):
         raise ValueError("usernames that start with 'erased-' are kept for erased records")
+    if v is not None and is_server_name(v):
+        raise ValueError("this username is a name the server writes into the records for itself")
     if v is not None and '@' in v:
         raise ValueError("username may not contain '@'")
     if v is not None and any(unicodedata.category(ch).startswith('C') for ch in v):
@@ -5285,6 +5290,13 @@ def _invitation_inviter_can_act(db: Session, inv, *, lock: bool = False) -> bool
     return cc.can_approve(q.first())
 
 
+def _username_kept(name) -> bool:
+    """Whether ``name`` is kept from accounts: an erase's placeholder form, or a name the server writes for itself
+    (app/core/person_erase.py). An invitation made for such a name by an older release cannot be accepted."""
+    from app.core.person_erase import is_reserved_name, is_server_name
+    return is_reserved_name(name) or is_server_name(name)
+
+
 def _audit_accept_failure(db: Session, prefix: str, ip: str, reason: str) -> None:
     """Record a failed acceptance attempt (anonymous — no user yet). Never carries the raw token,
     only its public prefix; never raises."""
@@ -5318,7 +5330,7 @@ async def get_invite(token: str, request: Request, db: Session = Depends(get_db)
         raise HTTPException(status_code=503,
                             detail="Invitations are unavailable: the invite-token secret is not configured.")
     inv = _resolve_valid_invite(db, token)
-    if inv is None or not _invitation_inviter_can_act(db, inv):
+    if inv is None or not _invitation_inviter_can_act(db, inv) or _username_kept(inv.username):
         raise HTTPException(status_code=404, detail="Invitation not found.")
     pol = _account_policy(db)
     return {
@@ -5382,6 +5394,11 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     if not _invitation_inviter_can_act(db, inv, lock=True):
         _audit_accept_failure(db, prefix, client_ip, reason="inviter_not_admin")
         raise generic_miss
+    # An invitation made before its name was kept for erased records or for the server's own rows (an older
+    # release made it) cannot become an account under that name: its administrator invites again with another.
+    if _username_kept(inv.username):
+        _audit_accept_failure(db, prefix, client_ip, reason="username_reserved")
+        raise HTTPException(status_code=409, detail="This invitation cannot be completed.")
 
     # (c)-(e) Post-resolution validation. A rejection here is a legitimate-but-invalid submission on an
     # already-valid token; audit each outcome (the accept contract logs EVERY outcome) with a distinct
@@ -26007,6 +26024,10 @@ async def lifespan(app: FastAPI):
     _assert_step_up_boot_contract()  # fail boot if any catalog action ships ungatable
     _backfill_default_permissions()
     _seed_default_email_profile()
+    # Accounts, and invitations still waiting, that an older release let take a name the server writes into the
+    # records for itself: every active administrator is told once (app/core/person_erase.py). They keep working.
+    from app.core import person_erase as _person_erase
+    _person_erase.report_server_named()
 
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(cleanup_expired_sessions())

@@ -452,6 +452,15 @@ class AuthService:
         # create, reporting the nonsensical "Email 'None' already exists".
         normalized_email = normalize_email(email)
 
+        # Every path that makes an account comes here (the first administrator from ADMIN_USERNAME included), so
+        # the names kept for erased records and for the server's own rows are refused here too, whatever the
+        # route's own checks were.
+        from app.core.person_erase import is_reserved_name, is_server_name
+        if is_reserved_name(username):
+            raise ValueError(f"Username '{username}' starts with 'erased-', which is kept for erased records")
+        if is_server_name(username):
+            raise ValueError(f"Username '{username}' is a name the server writes into the records for itself")
+
         if self.db.query(User.id).filter(User.username == username).first():
             raise ValueError(f"Username '{username}' already exists")
 

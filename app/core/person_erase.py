@@ -176,7 +176,9 @@ def name_problem(name) -> Optional[str]:
         return ("Names that start with 'erased-' are the placeholders erases write: rows with such a name are "
                 "already erased.")
     if name in system_names():
-        return "This name is one the server writes for itself (the host's operator, the server), not a person's."
+        return ("This name is one the server writes for itself (the host's operator, the server, the steps compliance "
+                "access takes on its own), not a person's: its rows cannot be erased by name, those of an account an "
+                "older release let take it included.")
     return None
 
 
@@ -188,6 +190,118 @@ def system_names() -> frozenset:
     from app.core.credential_changes import HOST_OPERATOR
     from app.core.legal_holds import SYSTEM
     return frozenset({HOST_OPERATOR, SERVER_CONFIGURATION, SERVER_NAME, SYSTEM})
+
+
+def server_name_form(name: str) -> str:
+    """``name`` as it is compared with the names the server writes for itself: its compatible form (NFKC), in any
+    case, with every space, underscore, hyphen and dot left out, so "System", " system " and "server_configuration"
+    read as the server's own names do."""
+    return re.sub(r"[\s_.\-]+", "", unicodedata.normalize("NFKC", name).casefold())
+
+
+def is_server_name(name) -> bool:
+    """Whether ``name`` reads as one of the names the server writes for itself (system_names, compared in
+    server_name_form). An account may not take such a name: the server's own rows would read as its, and once the
+    account is gone its records could not be erased (name_problem refuses the server's names)."""
+    if not isinstance(name, str):
+        return False
+    form = server_name_form(name)
+    return any(form == server_name_form(n) for n in system_names())
+
+
+# --------------------------------------------------------------------------- accounts an older release let take such a name
+
+SERVER_NAMED_NOTICE = "account_named_like_the_server"
+
+
+def _server_steps(name: str) -> str:
+    """What the server writes under the server name ``name`` reads as, in words."""
+    from app.core.audit_chain_policy_seals import SERVER_NAME
+    from app.core.audit_privacy import SERVER_CONFIGURATION
+    from app.core.legal_holds import SYSTEM
+    form = server_name_form(name)
+    for own, words in ((SYSTEM, "the steps compliance access takes on its own"),
+                       (SERVER_CONFIGURATION, "the recording levels it sets at its start"),
+                       (SERVER_NAME, "a limit on the audit log's retention set in .env")):
+        if form == server_name_form(own):
+            return words
+    return "its own steps"
+
+
+def server_named(db, now: Optional[datetime] = None) -> dict:
+    """{"accounts": [...], "invitations": [...]}: the usernames of the accounts that are exactly a name the server
+    writes for itself (their rows and the server's read alike, and an erase of the name is refused), and of the
+    invitations still waiting whose names read as one (is_server_name: they can no longer be accepted). An older
+    release let them be made; the accounts keep working. An account named so in another case or spacing is not
+    listed: its rows are told apart from the server's by the name itself, and its erase works."""
+    from app.core.models import AccountInvitation, User
+    now = now or datetime.utcnow()
+    own = system_names()
+    accounts = sorted(u for (u,) in db.query(User.username).filter(User.username.in_(sorted(own))).all())
+    waiting = db.query(AccountInvitation.username).filter(
+        AccountInvitation.accepted_at.is_(None), AccountInvitation.revoked_at.is_(None),
+        AccountInvitation.expires_at > now).all()
+    return {"accounts": accounts, "invitations": sorted(u for (u,) in waiting if is_server_name(u))}
+
+
+def server_named_words(username: str, *, invitation: bool) -> tuple:
+    """(title, body) of what every administrator is told about one such account or invitation."""
+    steps = _server_steps(username)
+    if invitation:
+        return ("An invitation is for a name the server uses in its records",
+                f'The invitation for "{username}" can no longer be accepted: the server writes this name into '
+                f"the records for itself ({steps}). Revoke it and invite again under another name.")
+    return ("An account has a name the server uses in its records",
+            f'The account "{username}" was made before such names were kept from accounts. It keeps working, but '
+            f"the server writes this name into the records for itself ({steps}): on the Activity page those rows "
+            "read as the account's, and once the account is deleted, an erase of its records by name is refused. "
+            "New accounts cannot take such a name.")
+
+
+def report_server_named(session_factory=None, now: Optional[datetime] = None) -> dict:
+    """At the web server's start: tell every active administrator, once in the app, of each account and waiting
+    invitation whose name reads as one the server writes for itself, and say how many in the log (no names).
+    Returns server_named's answer. Never raises."""
+    import hashlib as _hashlib
+    from sqlalchemy.exc import IntegrityError
+    found = {"accounts": [], "invitations": []}
+    try:
+        if session_factory is None:
+            from app.core.database import SessionLocal as session_factory
+        db = session_factory()
+    except Exception:  # noqa: BLE001
+        return found
+    try:
+        from app.core.models import Notification, RoleEnum, User
+        found = server_named(db, now)
+        items = [(u, False) for u in found["accounts"]] + [(u, True) for u in found["invitations"]]
+        if not items:
+            return found
+        admins = [uid for (uid,) in db.query(User.id).filter(User.role == RoleEnum.ADMIN,
+                                                               User.is_active.is_(True)).all()]
+        for username, invitation in items:
+            title, body = server_named_words(username, invitation=invitation)
+            tag = _hashlib.sha256((("i:" if invitation else "a:") + username).encode("utf-8")).hexdigest()[:24]
+            for uid in admins:
+                try:
+                    with db.begin_nested():
+                        db.add(Notification(user_id=uid, type=SERVER_NAMED_NOTICE, title=title, body=body,
+                                            target="#users", dedup_key=f"server-name:{tag}:{uid}"))
+                except IntegrityError:
+                    pass                    # told at an earlier start
+        db.commit()
+        registry._say(f"Warning: {len(found['accounts'])} accounts and {len(found['invitations'])} waiting "
+                      "invitations have a name the server writes into the records for itself; every administrator "
+                      "is told in the app.")
+    except Exception as exc:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        registry._say(f"Warning: the accounts named like the server could not be checked ({type(exc).__name__})")
+    finally:
+        db.close()
+    return found
 
 
 def holder(db, name: str, now: datetime) -> Optional[str]:

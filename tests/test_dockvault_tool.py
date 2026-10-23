@@ -184,6 +184,31 @@ def test_admin_password_problem():
     assert dv.admin_password_problem("Strong-Pass-1234", "production") is None
 
 
+@pytest.mark.parametrize("name", ["system", "System", " sys tem", "Server_Configuration", "ｓｙｓｔｅｍ",
+                                  "The server (AUDIT_LOG_RETENTION_DAYS in .env)", "erased-12345678", "Erased-x",
+                                  "op@host", "a<b", "ab", "x" * 51, "it's", "tab\there"])
+def test_an_admin_username_the_app_would_refuse_is_refused_before_it_reaches_env(name):
+    assert dv.admin_username_problem(name)
+
+
+@pytest.mark.parametrize("name", ["admin", "boss", "sysadmin", "systems", "ada.lovelace", "x" * 50])
+def test_an_ordinary_admin_username_is_accepted(name):
+    assert dv.admin_username_problem(name) is None
+
+
+def test_setup_refuses_an_admin_username_the_server_writes_for_itself(tmp_path, monkeypatch):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = dv.build_parser().parse_args(["setup", "--non-interactive", "--server-name", "localhost",
+                                         "--admin-username", "System", "--admin-password", "Strong-Pass-1234"])
+    with pytest.raises(SystemExit):
+        tool._collect_setup_config(args)
+    (tmp_path / ".env").write_text("ADMIN_USERNAME='admin'\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        tool._apply_cli_admin_overrides(str(tmp_path / ".env"), {"ADMIN_USERNAME": "admin"}, args)
+    left = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert left["ADMIN_USERNAME"] == "admin" and "ADMIN_PASSWORD" not in left      # nothing written
+
+
 def test_migrate_compose_profiles():
     assert dv.migrate_compose_profiles("combined") == "combined"
     assert dv.migrate_compose_profiles("split") == "split"

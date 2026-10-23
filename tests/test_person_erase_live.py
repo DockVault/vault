@@ -5,7 +5,9 @@ On the stack's own database, through the routes: asking asks for the password ev
 name that starts with "erased-", are refused; the preview counts the audit rows of the name; an erase asked for is
 listed by its placeholder, its request seal, its row (the name only sealed) and its audit row never name the person,
 and any administrator cancels it (each erase asked for here is cancelled, so the stack's chain and database agree
-afterwards); a user, and no session, are refused; an account cannot be created with a placeholder's name.
+afterwards); a user, and no session, are refused; an account cannot be created, invited or signed up with a
+placeholder's name or a name the server writes for itself, and an account an older release let take one keeps
+working while every administrator is told of it once.
 
 On a throwaway database of its own (tests/_throwaway_db.py), its passes run as a script whose clock is set: an
 erase over rows and an archived day on Postgres, the chain clean afterwards, the other stores given the placeholder,
@@ -123,6 +125,53 @@ def test_no_account_can_be_created_with_a_placeholders_name(admin):
     r = admin.post("/users", json={"username": "erased-" + uuid.uuid4().hex[:8], "password": "Aa1!" + "x" * 14,
                                    "role": "user"})
     assert r.status_code in (400, 422) and "erased-" in r.text
+
+
+@pytest.mark.parametrize("name", ["system", "System", " system", "server configuration", "Server_Configuration",
+                                  "The Server (audit log retention days in env)"])
+def test_no_account_invitation_or_signup_can_take_a_name_the_server_writes_for_itself(admin, anon, name):
+    password = "Aa1!" + "x" * 14
+    r = admin.post("/users", json={"username": name, "password": password, "role": "user"})
+    assert r.status_code == 422 and "server writes" in r.text, r.text
+    r = admin.post("/invites", json={"username": name, "role": "user"})
+    assert r.status_code == 422 and "server writes" in r.text, r.text
+    r = anon.post("/auth/signup", json={"username": name, "password": password})
+    assert r.status_code == 422 and "server writes" in r.text, r.text
+    assert psql(f"SELECT count(*) FROM users WHERE username = '{name}'") == "0"
+
+
+REPORT = ("import json\nfrom app.core import person_erase as pe\n"
+          "print(json.dumps(pe.report_server_named()))\n")
+
+
+def test_an_account_an_older_release_named_like_the_server_keeps_working_and_every_administrator_is_told_once(
+        admin):
+    """An older release let an account be named "system", a name the server now writes into the records for its
+    own steps. It still signs in; at the start each administrator is told once, in the app; an erase of the name
+    stays refused."""
+    from _account_change_helpers import in_api_container
+    from conftest import BASE_URL, ApiClient
+    account = admin.create_user()
+    try:
+        psql(f"UPDATE users SET username = 'system' WHERE id = '{account['id']}'")
+        signed = ApiClient(BASE_URL)
+        signed.login("system", account["_password"])
+        assert signed.get("/notifications").status_code == 200
+
+        def told():
+            return [n for n in admin.get("/notifications", params={"limit": 100}).json()["notifications"]
+                    if n["type"] == "account_named_like_the_server" and '"system"' in (n["body"] or "")]
+        out = json.loads(in_api_container(REPORT).stdout.strip().splitlines()[-1])
+        assert "system" in out["accounts"]
+        first = told()
+        assert len(first) == 1 and "keeps working" in first[0]["body"] and first[0]["target"] == "#users"
+        in_api_container(REPORT)
+        assert [n["id"] for n in told()] == [first[0]["id"]]                     # told once, not at every start
+        p = admin.post("/settings/erase-requests/preview", json={"name": "system"})
+        assert p.status_code == 400 and "writes for itself" in p.text, p.text
+    finally:
+        admin.delete_user(account["id"])
+        psql("DELETE FROM notifications WHERE type = 'account_named_like_the_server'")
 
 
 # --------------------------------------------------------------------------- the run, on a database of its own

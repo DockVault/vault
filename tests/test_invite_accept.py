@@ -402,3 +402,27 @@ def test_a_user_invitation_keeps_no_lineage(admin, invites_on):
                      f"WHERE token_prefix={_q(inv['token_prefix'])}") == "t"
     finally:
         admin.delete(f"/invites/{inv['id']}")
+
+
+@pytest.mark.parametrize("kept", ["system", "Server Configuration", "Erased-1234abcd"])
+def test_an_invitation_an_older_release_made_for_a_kept_name_cannot_be_accepted(admin, invites_on, kept):
+    """An older release let an invitation take a name that is now kept from accounts (one the server writes into
+    the records for itself, or an erase's placeholder form): its lookup says not found, its acceptance is refused
+    and audited, and no account is made under the name."""
+    inv = _mint(admin, username=unique("kept"), role="user")
+    try:
+        _psql(f"UPDATE account_invitations SET username={_q(kept)} WHERE token_prefix={_q(inv['token_prefix'])}",
+              fetch=False)
+        before = int(_psql("SELECT count(*) FROM audit_logs WHERE action='account_invitation_accept_failed' "
+                           f"AND details::text LIKE {_q('%username_reserved%')}"))
+        assert _anon().get(f"/invites/{inv['token']}").status_code == 404
+        r = _anon().post(f"/invites/{inv['token']}/accept", json={"password": STRONG_PW})
+        assert r.status_code == 409, r.text
+        assert _psql(f"SELECT count(*) FROM users WHERE username={_q(kept)}") == "0"
+        after = int(_psql("SELECT count(*) FROM audit_logs WHERE action='account_invitation_accept_failed' "
+                          f"AND details::text LIKE {_q('%username_reserved%')}"))
+        assert after == before + 1
+        assert _psql(f"SELECT accepted_at IS NULL FROM account_invitations "
+                     f"WHERE token_prefix={_q(inv['token_prefix'])}") == "t"
+    finally:
+        admin.delete(f"/invites/{inv['id']}")
