@@ -276,7 +276,14 @@ the person received nothing, so the use is given back: one guarded update (`use_
 is above zero), recorded as `public_link_use_refunded` with the reason. The first piece is read before
 the response is built, so such a failure is an error status, not a 200 cut short. A client that
 leaves, or a transfer that fails after its first byte, keeps the use spent; since a grant is used
-once and earns at most one refund, a link capped at N still delivers at most N. The IP binding is only as good as the
+once and earns at most one refund, a link capped at N still delivers at most N. That includes a
+client that gave up while it waited for a transfer slot: before it gives a use back, the server
+reads the request's channel for a moment (`request.is_disconnected()` cannot see a client that left
+before the response started, behind the security-header middleware), and a client already gone keeps
+its use spent, recorded as `public_link_download_completed` (failed, outcome `disconnected`, nothing
+sent, with the failure). A client whose leaving the server cannot see, behind a proxy that keeps its
+connection open after its own client went, is refunded; nothing was delivered to it, so the cap holds
+either way. The IP binding is only as good as the
 deployment's trusted-proxy configuration (`ClientIPMiddleware`), which the public page's documentation
 must say.
 

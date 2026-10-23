@@ -11,6 +11,7 @@ The real download handler runs here against a stand-in database that applies the
 send (the refund, and the completed-download count) to an in-memory link, and a stand-in for the stored
 file that fails where each case says. tests/test_api_public_links_refund.py does the same live.
 """
+import asyncio
 import types
 import uuid
 
@@ -122,12 +123,24 @@ class _Stored:
 
 
 class _Request:
-    def __init__(self, gone_after=None):
-        self.checks, self.gone_after = 0, gone_after
+    """gone_after: the body's disconnect checks answer yes after that many. left: the client closed its
+    connection before the server answered, so the request's channel holds its empty body and then the
+    disconnect; otherwise the channel holds the body and then nothing, as for a client still there."""
+
+    def __init__(self, gone_after=None, left=False):
+        self.checks, self.gone_after, self.left = 0, gone_after, left
+        self._messages = [{"type": "http.request", "body": b"", "more_body": False}]
 
     async def is_disconnected(self):
         self.checks += 1
         return self.gone_after is not None and self.checks > self.gone_after
+
+    async def receive(self):
+        if self._messages:
+            return self._messages.pop(0)
+        if self.left:
+            return {"type": "http.disconnect"}
+        await asyncio.Event().wait()
 
 
 @pytest.fixture
@@ -251,6 +264,92 @@ def test_a_server_failure_before_the_first_byte_gives_back_exactly_one_use(harne
         assert stored.closed
     if status == 404:
         assert out.error.detail == "This file is not available."
+    assert out.completed == []
+
+
+@pytest.mark.parametrize("case", list(BEFORE_THE_FIRST_BYTE))
+def test_a_client_that_left_before_a_server_failure_keeps_the_use_spent(harness, case):
+    # The same failures, for a client that closed its connection before the server answered: one that
+    # gave up while it waited for a transfer slot, above all. Its use is not given back; the download is
+    # recorded as ended with its client gone, nothing sent, with the failure that ended it.
+    how, reason, status = BEFORE_THE_FIRST_BYTE[case]
+    out = harness(request=_Request(left=True), **how)
+    assert out.status == status, case
+    assert out.body == b""
+    assert out.link.use_count == 1, "a use was given back to a client that had left"
+    assert REFUND_SQL.format(id=out.link.id) not in out.db.statements and out.refunds == []
+    assert [(r["status"], r["details"]["outcome"], r["details"]["bytes_sent"], r["details"]["reason"])
+            for r in out.completed] == [("failed", "disconnected", 0, reason)]
+    assert out.completed[0]["details"]["public_link_id"] == str(out.link.id)
+    assert out.store.data == {}, "the grant must stay used"
+    assert not out.admission._live, "the transfer slot was not given back"
+    stored = how.get("stored")
+    if stored is not None:
+        assert stored.closed
+
+
+def test_a_failure_whose_client_cannot_be_asked_still_gives_the_use_back(harness):
+    # When the request's channel cannot be read, the server cannot say the client left, so a failure
+    # of its own keeps its refund.
+    class _Unreadable(_Request):
+        async def receive(self):
+            raise RuntimeError("no channel")
+
+    out = harness(open_error=S.FileNotFoundError("gone"), request=_Unreadable())
+    assert out.status == 404 and out.link.use_count == 0
+    assert [(r["status"], r["details"]["reason"]) for r in out.refunds] == [("success", "file_missing")]
+    assert out.completed == []
+
+
+def _through_the_header_middleware(endpoint, left):
+    """Run `endpoint(request)` behind the application's own security-header middleware (a
+    BaseHTTPMiddleware), for a client that has left or one still there, and return what it found."""
+    from fastapi import FastAPI, Request
+
+    inner = FastAPI()
+    found = {}
+
+    @inner.get("/probe")
+    async def probe(request: Request):
+        found["answer"] = await endpoint(request)
+        return {}
+
+    messages = [{"type": "http.request", "body": b"", "more_body": False}]
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        if left:
+            return {"type": "http.disconnect"}
+        await asyncio.Event().wait()
+
+    async def send(message):
+        pass
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1",
+             "method": "GET", "scheme": "http", "path": "/probe", "raw_path": b"/probe", "query_string": b"",
+             "root_path": "", "headers": [(b"host", b"testserver")], "client": (ADDRESS, 50000),
+             "server": ("testserver", 80)}
+    run_coroutine(S.SecurityHeadersMiddleware(app=inner)(scope, receive, send), timeout=20)
+    return found["answer"]
+
+
+@pytest.mark.parametrize("left", [True, False])
+def test_the_server_can_tell_a_client_that_left_behind_its_middleware(left):
+    # What the download asks before it gives a use back, behind the middleware the application really
+    # has: a client that closed its connection reads as gone, one still there as still there.
+    assert _through_the_header_middleware(S._publiclink_client_left, left) is left
+
+
+def test_the_disconnect_question_starlette_offers_cannot_tell_behind_that_middleware():
+    # The control for the test above: it shows this set-up reproduces what made the download read the
+    # request's channel itself. Behind the same middleware, the framework's own question says a client
+    # that has left is still there. If this starts to fail, the framework can tell now, and the
+    # download's question may be simplified to it.
+    async def asked(request):
+        return await request.is_disconnected()
+
+    assert _through_the_header_middleware(asked, left=True) is False
 
 
 def test_a_completed_download_keeps_its_use_and_counts_the_download(harness):

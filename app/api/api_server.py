@@ -13149,8 +13149,9 @@ def _publiclink_failure_reason(exc: BaseException) -> str:
 
 def _publiclink_refund_use(db, link_id, vault_id, file_id, reason: str, client_ip: str) -> bool:
     """Give back the use a redeem spent, for a download the SERVER failed before the first byte of the
-    file went out (the grant was used, nothing was delivered). Never for a client that left, and never
-    once a byte is on its way: those keep the use spent.
+    file went out (the grant was used, nothing was delivered). Never for a client that left (the caller
+    asks first, _publiclink_settle_failure), and never once a byte is on its way: those keep the use
+    spent.
 
     One guarded update, so it is atomic and can never take the count below zero; and each refund
     follows a grant that this download alone used up (the grant's single-winner delete), each grant
@@ -13183,6 +13184,63 @@ def _publiclink_refund_use(db, link_id, vault_id, file_id, reason: str, client_i
     except Exception:
         pass
     return refunded
+
+
+# How long a download that failed before its first byte listens for its client's disconnect before it
+# takes the client to be still there (_publiclink_client_left). A disconnect that already happened is
+# read at once; this only bounds the wait for a client that is still there.
+_PUBLINK_CLIENT_GONE_WAIT = 0.1
+
+
+async def _publiclink_client_left(request) -> bool:
+    """Whether the client of a download has already gone, asked before its use is given back.
+
+    ``request.is_disconnected()`` cannot answer this here. It reads the request's channel under a
+    cancellation that is already pending, and behind the security-header middleware (a
+    BaseHTTPMiddleware) such a read never returns a message, so a client that left before the response
+    started reads as still there. Reading the channel for a moment can tell: a GET's channel holds its
+    empty body and then, once the connection has closed, the disconnect; a client still there sends
+    nothing more, so the read runs out of time and the answer is no. When the channel cannot be read
+    the answer is no too, so a server failure keeps its refund. A client whose leaving the server cannot
+    see (a proxy that keeps its connection open after its own client went) reads as still there and is
+    refunded: nothing was delivered to it, so the cap holds either way."""
+    import anyio
+    try:
+        with anyio.move_on_after(_PUBLINK_CLIENT_GONE_WAIT):
+            for _ in range(2):
+                message = await request.receive()
+                kind = message.get("type")
+                if kind == "http.disconnect":
+                    return True
+                if kind != "http.request" or message.get("more_body", False):
+                    return False
+    except Exception:
+        return False
+    return False
+
+
+async def _publiclink_settle_failure(request, db, link_id, vault_id, file_id, reason: str,
+                                     client_ip: str) -> bool:
+    """A download the server failed before the first byte of its file: give the use back
+    (_publiclink_refund_use), unless the client has already gone (_publiclink_client_left). A client
+    that left keeps its use spent, and the download is recorded as ended with its client gone, nothing
+    sent, with the failure that ended it. Returns whether a use was given back."""
+    if await _publiclink_client_left(request):
+        try:
+            db.rollback()        # whatever failed may have left the session's transaction unusable
+        except Exception:
+            pass
+        try:
+            AuditLogger(db).log_action(
+                action="public_link_download_completed", status="failed", user=None,
+                resource_type="file", resource_id=str(file_id),
+                details={"vault_id": str(vault_id), "public_link_id": str(link_id), "bytes_sent": 0,
+                         "outcome": "disconnected", "reason": reason},
+                ip_address=client_ip)
+        except Exception:
+            pass
+        return False
+    return _publiclink_refund_use(db, link_id, vault_id, file_id, reason, client_ip)
 
 
 class _ClosingStreamingResponse(StreamingResponse):
@@ -14099,15 +14157,16 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
     # From here the use the redeem spent belongs to this download, and the grant is gone. Until the first
     # byte of the file is on its way, a failure is the server's (no slot, a missing blob, a read or
     # decryption error, anything else), so the use is given back and the person can try again; once a
-    # byte is on its way, or when the client leaves, it stays spent. The first piece is read here, before
-    # the response exists, so a failure in it is still an error status rather than a 200 cut short.
+    # byte is on its way, or when the client has left (one that gave up while it waited for a slot, for
+    # example), it stays spent (_publiclink_settle_failure). The first piece is read here, before the
+    # response exists, so a failure in it is still an error status rather than a 200 cut short.
     transfer_slot = None
     download = None
     try:
         try:
             transfer_slot = await transfer_admission.acquire()
         except TransferBusy as busy:
-            _publiclink_refund_use(db, link.id, vault.id, file_id, "busy", client_ip)
+            await _publiclink_settle_failure(request, db, link.id, vault.id, file_id, "busy", client_ip)
             raise _busy_response(busy)
         download = vault_service._open_stored_file(file_record, vault, file_id, whole=False)
         pieces = download.chunks()
@@ -14124,7 +14183,8 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
     except HTTPException:
         raise
     except asyncio.CancelledError:
-        # The request was abandoned (the client left while it waited for a slot): not a server failure.
+        # The request was cancelled (an ASGI server may cancel a handler whose client left; uvicorn does
+        # not, which is why a failure asks whether the client is still there): not a server failure.
         if download is not None:
             download.close()
         if transfer_slot is not None:
@@ -14139,7 +14199,7 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
         if transfer_slot is not None:
             transfer_admission.release(transfer_slot)
         reason = _publiclink_failure_reason(exc)
-        _publiclink_refund_use(db, link.id, vault.id, file_id, reason, client_ip)
+        await _publiclink_settle_failure(request, db, link.id, vault.id, file_id, reason, client_ip)
         if reason == "internal_error":
             # Not a stored file that could not be served: say where, for the operator (the class and
             # the place, never the message, which can carry values), and answer as for any other.

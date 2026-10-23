@@ -6,10 +6,12 @@ and they can try again; the owner's card shows the link as it was, and the audit
 failure is made for real in the running deployment: the stored file removed, overwritten, damaged in
 its first record, made a directory, or its recorded checksum changed. A client that leaves after the
 first byte, and a file that fails after its first byte, keep the use spent. Through all of it a link
-capped at N delivers exactly N, with failures and successes at the same time too.
+capped at N delivers exactly N, with failures and successes at the same time too. With every transfer
+slot held, a client that waits for one and stays is told to come back and gets its use back; one that
+gives up while it waits keeps its use spent.
 
-tests/test_public_link_download_refund.py runs the same handler offline, with the busy and the
-internal-error cases a running deployment cannot be made to show on demand.
+tests/test_public_link_download_refund.py runs the same handler offline, with the internal-error case
+a running deployment cannot be made to show on demand.
 """
 import os
 import socket
@@ -381,3 +383,124 @@ def test_failures_and_successes_at_once_keep_the_count_exact_and_a_capped_link_d
         assert _counts(admin, link["id"], cap, cap)["status"] == "exhausted"
     finally:
         blob.restore()
+
+
+def _transfers_now(admin):
+    """The web transfers of the deployment now: slots held, people waiting for one, and the ceiling."""
+    r = admin.get("/activity/summary")
+    assert r.status_code == 200, r.text
+    now = r.json()["now"]
+    return now["transfers_in_flight"], now["transfers_waiting"], now["transfer_limit"]
+
+
+def _until(admin, wanted, what, timeout=60):
+    deadline = time.monotonic() + timeout
+    while True:
+        seen = _transfers_now(admin)
+        if wanted(*seen):
+            return seen
+        assert time.monotonic() < deadline, f"never {what}: in flight, waiting, limit = {seen}"
+        time.sleep(0.3)
+
+
+def _connect(base_url, receive_buffer=None):
+    """A raw connection (over TLS when the deployment serves https). A small receive buffer, set before
+    connecting, keeps a client that reads nothing from soaking up much of a file."""
+    url = urlparse(base_url)
+    https = url.scheme == "https"
+    port = url.port or (443 if https else 80)
+    refused = None
+    for family, kind, proto, _, address in socket.getaddrinfo(url.hostname, port, type=socket.SOCK_STREAM):
+        sock = socket.socket(family, kind, proto)
+        if receive_buffer:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+        sock.settimeout(30)
+        try:
+            sock.connect(address)
+            break
+        except OSError as exc:   # localhost can name an address the deployment does not listen on
+            sock.close()
+            refused = exc
+    else:
+        raise refused
+    if https:
+        import ssl
+        context = ssl.create_default_context(cafile=os.environ.get("REQUESTS_CA_BUNDLE") or None)
+        sock = context.wrap_socket(sock, server_hostname=url.hostname)
+    return sock
+
+
+def _ask_for(sock, base_url, token, file_id, grant):
+    host = urlparse(base_url).hostname
+    sock.sendall((f"GET /public-links/{token}/download/{file_id} HTTP/1.1\r\nHost: {host}\r\n"
+                  f"X-Download-Grant: {grant}\r\nConnection: close\r\n\r\n").encode())
+
+
+def test_a_client_that_gives_up_while_it_waits_for_a_slot_keeps_its_use_spent(admin, base_url,
+                                                                                files_enabled, vault):
+    """Every transfer slot is held by a download whose client reads nothing, and two more people wait
+    for a slot. One gives up and closes its connection while it waits; the other stays. When the wait
+    runs out, the one that stayed is told to come back (503) and its use is given back. The one that
+    left keeps its use spent, and its download is recorded as ended with its client gone, nothing sent.
+    The server must see that departure through the middleware the application really has."""
+    _until(admin, lambda flying, waiting, limit: flying == 0 and waiting == 0, "idle")
+    limit = _transfers_now(admin)[2]
+    assert limit and limit <= 64, f"a transfer ceiling this test cannot fill: {limit}"
+    content = os.urandom(48 * MB)
+    file_id = _upload(admin, vault["id"], unique("hold") + ".bin", content, chunk_size=MB)
+    holding = _link(admin, vault["id"], limit, file_id=file_id)
+    waiting = _link(admin, vault["id"], 2, file_id=file_id)
+    socks = []
+    try:
+        grants = []
+        for i in range(limit):
+            if i % 9 == 0:
+                _clear_open_throttle()
+            redeemed = _redeem(base_url, holding["token"])
+            assert redeemed.status_code == 200, redeemed.text
+            grants.append(redeemed.json()["grant"])
+        for grant in grants:
+            sock = _connect(base_url, receive_buffer=4096)
+            socks.append(sock)
+            _ask_for(sock, base_url, holding["token"], file_id, grant)
+        _until(admin, lambda flying, waiting_, limit_: flying == limit_ and waiting_ == 0, "every slot held")
+
+        stays_grant, leaves_grant = (_redeem(base_url, waiting["token"]).json()["grant"] for _ in range(2))
+        stays, leaves = _connect(base_url), _connect(base_url)
+        socks += [stays, leaves]
+        _ask_for(stays, base_url, waiting["token"], file_id, stays_grant)
+        _ask_for(leaves, base_url, waiting["token"], file_id, leaves_grant)
+        _until(admin, lambda flying, waiting_, limit_: flying == limit_ and waiting_ == 2, "both waiting")
+        leaves.close()
+
+        stays.settimeout(180)
+        answer = b""
+        while True:
+            piece = stays.recv(65536)
+            if not piece:
+                break
+            answer += piece
+        assert answer.startswith(b"HTTP/1.1 503"), answer[:200]
+
+        def ended():
+            return sorted(_psql(
+                "SELECT action || '|' || status || '|' || coalesce(details->>'reason', '') || '|' || "
+                "coalesce(details->>'outcome', '') || '|' || coalesce(details->>'bytes_sent', '') "
+                "FROM audit_logs WHERE action IN ('public_link_use_refunded', 'public_link_download_completed') "
+                f"AND details->>'public_link_id' = '{waiting['id']}'").splitlines())
+
+        deadline = time.monotonic() + 30
+        while len(ended()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.3)
+        assert ended() == ["public_link_download_completed|failed|busy|disconnected|0",
+                           "public_link_use_refunded|success|busy||"], ended()
+        _counts(admin, waiting["id"], 1, 0)
+        assert _refunds(holding["id"]) == []
+    finally:
+        for sock in socks:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        # The slots go back before the next test needs one.
+        _until(admin, lambda flying, waiting_, limit_: flying == 0 and waiting_ == 0, "idle again", 120)
