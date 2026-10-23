@@ -133,8 +133,12 @@ def opened(db, case, vault_ids, *, unlocked: set, owner_id) -> list:
 
 
 def _exports(db, case) -> int:
+    """The case's completed exports: the count kept on it once it has been closed long enough (cases.keep_counts),
+    its audit rows until then."""
     from sqlalchemy import func
     from app.core.models import AuditLog
+    if getattr(case, "counts_kept_at", None) is not None:
+        return int(case.exports_count or 0)
     return int(db.query(func.count(AuditLog.id)).filter(AuditLog.case_id == case.id,
                                                         AuditLog.action == "case_export_completed",
                                                         AuditLog.status == "success").scalar() or 0)

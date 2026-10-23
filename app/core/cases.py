@@ -779,16 +779,58 @@ def close_refusal(db, case, person, now: Optional[datetime] = None) -> Optional[
 
 
 def _counts_since_approval(db, case) -> tuple:
-    """(files opened, exports) under the case: its audit rows of each kind."""
+    """(files opened, exports) under the case: the counts kept on the case once it has been closed
+    COUNTS_SETTLE_DAYS (keep_counts), its audit rows of each kind until then."""
+    if getattr(case, "counts_kept_at", None) is not None:
+        return int(case.files_opened_count or 0), int(case.exports_count or 0)
+    return counted_rows(db, [case.id]).get(case.id, (0, 0))
+
+
+# How long after a case closes its counts are kept on it (keep_counts): an export streaming when the case closed
+# has long ended, and its rows are still in the table (they stay at least COMPLIANCE_RECORD_MIN_DAYS, 365 at the
+# least, and until the counts are kept: compliance_retention.case_rows_kept).
+COUNTS_SETTLE_DAYS = 30
+
+
+def counted_rows(db, case_ids) -> dict:
+    """{case id: (files opened, exports)} from the audit rows under each case, in one query: the distinct files of
+    its case_file_viewed rows and its case_export_completed rows, successes only. A case with neither is left
+    out."""
     from sqlalchemy import func
     from app.core.models import AuditLog
-    opened = (db.query(func.count(func.distinct(AuditLog.resource_id)))
-              .filter(AuditLog.case_id == case.id, AuditLog.action == "case_file_viewed",
-                      AuditLog.status == "success").scalar() or 0)
-    exports = (db.query(func.count(AuditLog.id))
-               .filter(AuditLog.case_id == case.id, AuditLog.action == "case_export_completed",
-                       AuditLog.status == "success").scalar() or 0)
-    return int(opened), int(exports)
+    if not case_ids:
+        return {}
+    out = {}
+    rows = (db.query(AuditLog.case_id, AuditLog.action, func.count(func.distinct(AuditLog.resource_id)),
+                     func.count(AuditLog.id))
+            .filter(AuditLog.case_id.in_(list(case_ids)),
+                    AuditLog.action.in_(("case_file_viewed", "case_export_completed")), AuditLog.status == "success")
+            .group_by(AuditLog.case_id, AuditLog.action).all())
+    for case_id, action, distinct, total in rows:
+        opened, exports = out.get(case_id, (0, 0))
+        if action == "case_file_viewed":
+            opened = int(distinct or 0)
+        else:
+            exports = int(total or 0)
+        out[case_id] = (opened, exports)
+    return out
+
+
+def keep_counts(db, now: Optional[datetime] = None) -> int:
+    """Keep on each case closed COUNTS_SETTLE_DAYS ago the counts of its audit rows (files opened, exports), once:
+    after its records' floor its rows follow the audit log's retention (archived, or pruned), and the Compliance
+    page and its owners' summary still read its counts. Returns how many cases."""
+    from app.core.models import ComplianceCase
+    now = now or utcnow()
+    due = (db.query(ComplianceCase).filter(ComplianceCase.closed_at.isnot(None),
+                                           ComplianceCase.closed_at <= now - timedelta(days=COUNTS_SETTLE_DAYS),
+                                           ComplianceCase.counts_kept_at.is_(None))
+           .with_for_update(skip_locked=True).limit(500).all())
+    counted = counted_rows(db, [c.id for c in due])
+    for case in due:
+        case.files_opened_count, case.exports_count = counted.get(case.id, (0, 0))
+        case.counts_kept_at = now
+    return len(due)
 
 
 def _summary_counts(db, case, *, held: set) -> dict:

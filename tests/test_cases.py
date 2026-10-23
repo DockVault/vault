@@ -1449,6 +1449,59 @@ def test_the_list_counts_files_opened_and_exports_per_case_as_the_owners_summary
     assert cr._case_counts(db, []) == {}
 
 
+def test_a_cases_counts_are_kept_on_it_a_month_after_it_closed_and_read_from_there_once_its_rows_are_gone(
+        db, people):
+    """Past its records' floor a closed case's rows follow the audit log's retention (archived, or pruned); its
+    counts on the Compliance page and in its owners' summary are read from the case once kept there."""
+    from datetime import timedelta
+    from app.core import owner_access
+    one = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    a = uuid.uuid4()
+    _viewed(db, one, a)
+    _viewed(db, one, a)
+    _viewed(db, one, uuid.uuid4(), action="case_export_completed")
+    now = rights.utcnow()
+    one.status, one.closed_at = "closed", now - timedelta(days=cases.COUNTS_SETTLE_DAYS - 1)
+    db.commit()
+    assert cases.keep_counts(db, now) == 0 and one.counts_kept_at is None          # not a month yet
+    one.closed_at = now - timedelta(days=cases.COUNTS_SETTLE_DAYS + 1)
+    db.commit()
+    assert cases.keep_counts(db, now) == 1
+    db.commit()
+    assert (one.files_opened_count, one.exports_count, one.counts_kept_at) == (1, 1, now)
+    assert cases.keep_counts(db, now) == 0                                          # once
+    db.query(m.AuditLog).filter(m.AuditLog.case_id == one.id).delete(synchronize_session=False)
+    db.commit()                                                                     # archived, or pruned
+    listed = {c["id"]: c for c in cr.list_cases(current_user=people.uma, db=db)["cases"]}
+    assert (listed[str(one.id)]["files_opened"], listed[str(one.id)]["exports"]) == (1, 1)
+    assert cases._counts_since_approval(db, one) == (1, 1) and owner_access._exports(db, one) == 1
+
+
+def test_the_compliance_cases_job_keeps_the_counts(db, people, monkeypatch):
+    from app.core import retention
+    one = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    one.status, one.closed_at = "closed", rights.utcnow() - timedelta(days=cases.COUNTS_SETTLE_DAYS + 1)
+    db.commit()
+    seen = []
+    real = cases.keep_counts
+    monkeypatch.setattr(cases, "keep_counts", lambda db_, now=None: seen.append(now) or real(db_, now))
+
+    class _Pass:
+        now = rights.utcnow()
+
+        def transaction(self):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def tx():
+                yield db
+                db.commit()
+            return tx()
+    retention.run_compliance_cases(_Pass())
+    db.expire_all()
+    assert seen and db.get(m.ComplianceCase, one.id).counts_kept_at is not None
+
+
 def test_the_list_says_which_pending_cases_this_administrator_may_decide(db, people):
     case = _ask(db, people.uma, _vaults(people.v1))
     by_bob = cr.list_cases(current_user=people.bob, db=db)["cases"]

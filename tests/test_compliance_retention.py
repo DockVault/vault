@@ -87,12 +87,16 @@ def factory(monkeypatch):
         engine.dispose()
 
 
-def _case(db, *, closed_days=None, kept_until_days=None):
+def _case(db, *, closed_days=None, kept_until_days=None, counts_kept=True):
+    """A case, open or closed ``closed_days`` ago; a closed one has its counts kept on it (cases.keep_counts, which
+    the compliance cases' job does 30 days after the close) unless ``counts_kept`` is false."""
+    closed = None if closed_days is None else NOW - timedelta(days=closed_days)
     case = ComplianceCase(id=uuid.uuid4(), status="closed" if closed_days is not None else "active",
                           purpose="internal_investigation", legal_basis="f", justification_enc="x",
                           owner_note_enc="x", auditor_id=uuid.uuid4(), auditor_username="aud",
-                          closed_at=None if closed_days is None else NOW - timedelta(days=closed_days),
-                          records_kept_until=None if kept_until_days is None else NOW + timedelta(days=kept_until_days))
+                          closed_at=closed,
+                          records_kept_until=None if kept_until_days is None else NOW + timedelta(days=kept_until_days),
+                          counts_kept_at=closed if counts_kept else None)
     db.add(case)
     db.commit()
     return case.id
@@ -201,6 +205,23 @@ def test_a_positive_retention_deletes_no_case_row_while_it_must_stay(env, factor
     left = _left(factory, list(kept.values()) + list(gone.values()))
     assert {k for k, v in kept.items() if v not in left} == set()
     assert {k for k, v in gone.items() if v in left} == set()
+
+
+def test_a_closed_cases_rows_stay_past_its_floor_until_its_counts_are_kept_on_it(env, factory):
+    """The Compliance page reads a case's counts from its rows until they are kept on the case (cases.keep_counts):
+    its rows must not go before."""
+    from app.core.models import ComplianceCase
+    db = factory()
+    not_counted = _case(db, closed_days=3000, counts_kept=False)
+    row = _row(db, 4000, case_id=not_counted)
+    _prune(factory, ar.Numbers(30, 0, 0, 0))
+    assert _left(factory, [row]) == {row}
+    db = factory()
+    db.query(ComplianceCase).filter(ComplianceCase.id == not_counted).update(
+        {ComplianceCase.counts_kept_at: NOW - timedelta(days=2970)}, synchronize_session=False)
+    db.commit()
+    _prune(factory, ar.Numbers(30, 0, 0, 0))
+    assert _left(factory, [row]) == set()
 
 
 def test_the_floor_is_read_from_the_settings(env, factory):

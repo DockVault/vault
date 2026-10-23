@@ -771,7 +771,7 @@ def list_cases(current_user: User = Depends(require_interactive_account), db: Se
     q = _seen_by(db, db.query(ComplianceCase).filter(ComplianceCase.access_days > 0), current_user)
     now = cases.utcnow()
     rows = q.order_by(ComplianceCase.requested_at.desc()).limit(ENDED_SHOWN).all()
-    counts = _case_counts(db, [c.id for c in rows])
+    counts = _case_counts(db, rows)
     out = []
     for c in rows:
         view = cases.case_view(db, c, current_user, now=now, light=True)
@@ -784,26 +784,13 @@ def list_cases(current_user: User = Depends(require_interactive_account), db: Se
     return {"cases": out, "access_enabled": rights.access_enabled(), "max_open_cases": cases.rules.MAX_OPEN_CASES}
 
 
-def _case_counts(db, case_ids) -> dict:
-    """{case id: (files opened, exports)} under each case, as its owners' summary counts them, in one query: the
-    distinct files of its case_file_viewed rows and its case_export_completed rows."""
-    from sqlalchemy import func
-    from app.core.models import AuditLog
-    if not case_ids:
-        return {}
-    out = {}
-    rows = (db.query(AuditLog.case_id, AuditLog.action, func.count(func.distinct(AuditLog.resource_id)),
-                     func.count(AuditLog.id))
-            .filter(AuditLog.case_id.in_(list(case_ids)),
-                    AuditLog.action.in_(("case_file_viewed", "case_export_completed")), AuditLog.status == "success")
-            .group_by(AuditLog.case_id, AuditLog.action).all())
-    for case_id, action, distinct, total in rows:
-        opened, exports = out.get(case_id, (0, 0))
-        if action == "case_file_viewed":
-            opened = int(distinct or 0)
-        else:
-            exports = int(total or 0)
-        out[case_id] = (opened, exports)
+def _case_counts(db, cases_shown) -> dict:
+    """{case id: (files opened, exports)} under each case, as its owners' summary counts them: the counts kept on a
+    case closed long enough (cases.keep_counts), its audit rows otherwise (in one query)."""
+    from app.core import cases
+    out = {c.id: (int(c.files_opened_count or 0), int(c.exports_count or 0))
+           for c in cases_shown if c.counts_kept_at is not None}
+    out.update(cases.counted_rows(db, [c.id for c in cases_shown if c.counts_kept_at is None]))
     return out
 
 

@@ -3343,7 +3343,10 @@ class ComplianceCase(Base):
     ``closed_at`` is when the case reached a final state (closed, rejected, withdrawn, expired before its
     approval); ``records_kept_until`` is set then: its records and their audit rows are kept until then at
     least (app/core/compliance_retention.py). ``version`` is the optimistic lock an approval checks. The auditor's account cannot be
-    deleted while it has a case (RESTRICT)."""
+    deleted while it has a case (RESTRICT). ``files_opened_count`` and ``exports_count`` are the counts of its
+    audit rows of each kind, written once the case has been closed COUNTS_SETTLE_DAYS (``counts_kept_at``): its
+    rows are kept until then (compliance_retention.case_rows_kept), and its counts read from here after, so they
+    stay right once its rows are archived or pruned."""
     __tablename__ = 'compliance_cases'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -3393,6 +3396,9 @@ class ComplianceCase(Base):
     closed_by_username = Column(String(255), nullable=True)
     close_reason_enc = Column(Text, nullable=True)
     records_kept_until = Column(DateTime, nullable=True)
+    files_opened_count = Column(Integer, nullable=True)
+    exports_count = Column(Integer, nullable=True)
+    counts_kept_at = Column(DateTime, nullable=True)
     version = Column(Integer, nullable=False, default=1, server_default='1')
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)

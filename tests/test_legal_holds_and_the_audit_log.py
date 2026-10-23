@@ -79,13 +79,15 @@ def env30(monkeypatch, tmp_path):
 
 
 def _case(env, *, closed_days=None):
-    """A compliance case: open, or closed ``closed_days`` before the test's clock."""
+    """A compliance case: open, or closed ``closed_days`` before the test's clock (its counts kept on it, as the
+    compliance cases' job does 30 days after the close)."""
     case_id = uuid.uuid4()
+    closed = None if closed_days is None else T0 - timedelta(days=closed_days)
     with env.session() as db:
         db.add(ComplianceCase(id=case_id, status="closed" if closed_days is not None else "active",
                               purpose="internal_investigation", legal_basis="f", justification_enc="x",
                               owner_note_enc="x", auditor_id=uuid.uuid4(), auditor_username="aud",
-                              closed_at=None if closed_days is None else T0 - timedelta(days=closed_days)))
+                              closed_at=closed, counts_kept_at=closed))
         db.commit()
     return case_id
 
@@ -112,7 +114,8 @@ def _release(env, case_id):
 def _close(env, case_id, days):
     with env.session() as db:
         db.query(ComplianceCase).filter(ComplianceCase.id == case_id).update(
-            {ComplianceCase.status: "closed", ComplianceCase.closed_at: env.clock() - timedelta(days=days)},
+            {ComplianceCase.status: "closed", ComplianceCase.closed_at: env.clock() - timedelta(days=days),
+             ComplianceCase.counts_kept_at: env.clock() - timedelta(days=days)},
             synchronize_session=False)
         db.commit()
 

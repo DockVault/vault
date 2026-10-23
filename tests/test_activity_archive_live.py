@@ -523,7 +523,7 @@ kept = add_user("kept", RoleEnum.USER)
 db = SessionLocal()
 closed = ComplianceCase(status="closed", purpose="internal_investigation", legal_basis="f", justification_enc="x",
                         owner_note_enc="x", auditor_id=kept, auditor_username="kept",
-                        closed_at=now - timedelta(days=4000))
+                        closed_at=now - timedelta(days=4000), counts_kept_at=now - timedelta(days=3970))
 db.add(closed)
 db.commit()
 closed_id = closed.id

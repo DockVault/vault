@@ -6,8 +6,9 @@ the maximum age and the size cap alike:
 - A row written under a case (``case_id`` set) is kept while the case is open (not yet closed, whatever its
   state: pending, active, keeping a hold, suspended), while any legal hold of the case stands (placed and
   neither released nor lapsed), and until both COMPLIANCE_RECORD_MIN_DAYS have passed since the case closed
-  and the case's own ``records_kept_until`` (the floor in force at its approval, the stricter one) has passed.
-  A row whose case cannot be found is kept.
+  and the case's own ``records_kept_until`` (the floor in force at its approval, the stricter one) has passed,
+  and until the counts of its rows are kept on the case (cases.keep_counts, 30 days after it closed: the
+  Compliance page reads them there once the rows are archived or pruned). A row whose case cannot be found is kept.
 - A row of the compliance category (app/core/audit_catalog.py) is kept COMPLIANCE_RECORD_MIN_DAYS after it was
   written, case or not (an auditor grant, a reveal of a name, a refused request).
 
@@ -47,10 +48,12 @@ def case_rows_kept(model, now: datetime):
     floor = now - timedelta(days=floor_days())
     holding = exists().where(LegalHoldVault.case_id == model.case_id, LegalHoldVault.released_at.is_(None),
                              LegalHoldVault.lapsed_at.is_(None))
-    # An open case has no closed_at, which is never before the floor.
+    # An open case has no closed_at, which is never before the floor. A case whose counts are not yet kept on it
+    # (cases.keep_counts) keeps its rows until they are.
     released = exists().where(ComplianceCase.id == model.case_id, ComplianceCase.closed_at < floor,
                               or_(ComplianceCase.records_kept_until.is_(None),
-                                  ComplianceCase.records_kept_until < now))
+                                  ComplianceCase.records_kept_until < now),
+                              ComplianceCase.counts_kept_at.isnot(None))
     return and_(model.case_id.isnot(None), or_(not_(released), holding))
 
 
