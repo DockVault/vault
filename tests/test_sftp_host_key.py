@@ -274,3 +274,16 @@ def test_a_start_waits_for_a_key_another_start_is_still_writing_at_its_path(tmp_
     assert _fingerprint(load_whole_host_key(path, wait_seconds=5)) == _fingerprint(load_host_key(tmp_path / "whole"))
     with pytest.raises((FileNotFoundError, OSError)):
         load_whole_host_key(tmp_path / "does_not_exist", wait_seconds=5)
+
+
+def test_the_sftp_server_waits_for_a_key_another_start_is_still_writing(tmp_path):
+    """On a filesystem with no hard links a key is created at its path and then written: a start that finds it
+    there half-written waits for it rather than failing to start."""
+    import threading
+    from app.sftp import sftp_server
+    path = tmp_path / "ssh_host_rsa_key"
+    generate_ed25519_host_key(tmp_path / "whole")
+    whole = (tmp_path / "whole").read_bytes()
+    path.write_bytes(whole[:20])
+    threading.Timer(0.3, lambda: path.write_bytes(whole)).start()
+    assert _fingerprint(sftp_server.server_host_key(path)) == _fingerprint(load_host_key(tmp_path / "whole"))
