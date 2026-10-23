@@ -511,15 +511,22 @@ def test_archived_rows_read_back_identical_in_every_column_on_postgres(throwaway
     """A search loads the archived rows with COPY: every column of every row reads back as it was stored before it
     was archived, the JSON column's stored text included, whatever the text holds (backslashes, tabs, line ends, a
     literal \\N, quotes, characters outside ASCII), and NULLs stay NULL; a row of an account deleted since loses its
-    link."""
+    link. The rows that carry a case carry one closed long ago, whose records may go: a row of a case whose records
+    must be kept, or of a case that cannot be found, stays a row and its day is not archived."""
     got = _script(throwaway, r'''
-from app.core.models import AuditLog
+from app.core.models import AuditLog, ComplianceCase
 NAMES = [c.name for c in AuditLog.__table__.columns]
 SPECIALS = ["back\\slash", "tab\there", "new\nline", "carriage\rreturn", "\\N", "\\x41", "quote\"s 'and' `ticks`",
             "café ☃ \U0001F600", "", "comma, semi; pipe|", "tab\tand \\t written", " spaced "]
 uid = add_user("gone", RoleEnum.USER)
 kept = add_user("kept", RoleEnum.USER)
 db = SessionLocal()
+closed = ComplianceCase(status="closed", purpose="internal_investigation", legal_basis="f", justification_enc="x",
+                        owner_note_enc="x", auditor_id=kept, auditor_username="kept",
+                        closed_at=now - timedelta(days=4000))
+db.add(closed)
+db.commit()
+closed_id = closed.id
 ids = []
 for i, sv in enumerate(SPECIALS):
     row = AuditLog(id=uuid.uuid4(), user_id=(uid if i % 3 == 0 else kept if i % 3 == 1 else None), username=sv,
@@ -532,7 +539,7 @@ for i, sv in enumerate(SPECIALS):
                             if i % 5 else None),
                    error_message=sv if i % 2 == 0 else None, seal_nonce=os.urandom(16) if i % 3 else None,
                    privacy_version=i if i % 4 else None, recorded=({"names": [sv], "n": i} if i % 2 else None),
-                   ip_via=("trusted-proxy" if i % 2 else None), case_id=uuid.uuid4() if i % 3 == 2 else None)
+                   ip_via=("trusted-proxy" if i % 2 else None), case_id=closed_id if i % 3 == 2 else None)
     db.add(row)
     ids.append(row.id)
 db.commit()

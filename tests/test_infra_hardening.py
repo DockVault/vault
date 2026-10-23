@@ -1266,11 +1266,13 @@ def test_secure_compose_hardening():
     assert "--requirepass" in sc
 
 
-def test_audit_retention_prunes_by_setting():
-    # A positive AUDIT_LOG_RETENTION_DAYS makes the pruner's audit_logs job (which reads settings) delete
-    # audit rows older than the window and keep recent ones. The window is deliberately huge
-    # (3650d -> cutoff ~2016) so the DELETE only ever reaches the year-2000 seed and never purges
-    # real audit history on a persistent dev/VM stack these _in_container tests may run against.
+def test_audit_retention_set_in_env_deletes_nothing_without_the_audit_chain():
+    # The pruner's audit_logs job acts on the retention the audit log's integrity chain honours, never on .env
+    # or the database alone: a process that has not read the chain (this one-off process, with a positive
+    # AUDIT_LOG_RETENTION_DAYS in its environment) deletes nothing and says it waits for the chain. Deleting by
+    # the chain's values is tests/test_audit_retention_live.py's, on a throwaway database. The two seeded rows
+    # (one from the year 2000, before the chain's first hour, and one of the hour not yet sealed) are removed
+    # by the script itself, so nothing is left in the stack's audit log.
     script = "\n".join([
         "import datetime",
         "from app.core.database import get_db_context",
@@ -1283,15 +1285,15 @@ def test_audit_retention_prunes_by_setting():
         "    db.add(old); db.add(recent); db.commit()",
         "    old_id=str(old.id); recent_id=str(recent.id)",
         "    deleted = retention.prune_audit_logs(retention.Pass(SessionLocal)).deleted",
-        "    old_gone = db.query(AuditLog).filter(AuditLog.id==old_id).first() is None",
+        "    old_kept = db.query(AuditLog).filter(AuditLog.id==old_id).first() is not None",
         "    recent_kept = db.query(AuditLog).filter(AuditLog.id==recent_id).first() is not None",
-        "    db.query(AuditLog).filter(AuditLog.id==recent_id).delete(); db.commit()",
-        "    print('OLD_GONE=%s RECENT_KEPT=%s DELETED_POS=%s' % (old_gone, recent_kept, deleted>0))",
+        "    db.query(AuditLog).filter(AuditLog.id.in_([old_id, recent_id])).delete(synchronize_session=False)",
+        "    db.commit()",
+        "    print('OLD_KEPT=%s RECENT_KEPT=%s DELETED=%s' % (old_kept, recent_kept, deleted))",
     ])
     proc = _in_container(env_overrides={"AUDIT_LOG_RETENTION_DAYS": "3650"}, args=["python", "-"], stdin=script)
-    assert "OLD_GONE=True" in proc.stdout, f"old audit row should be pruned\n{proc.stdout}\n{proc.stderr}"
-    assert "RECENT_KEPT=True" in proc.stdout, f"recent audit row should be kept\n{proc.stdout}\n{proc.stderr}"
-    assert "DELETED_POS=True" in proc.stdout, f"cleanup should report a positive delete count\n{proc.stdout}"
+    assert "OLD_KEPT=True RECENT_KEPT=True DELETED=0" in proc.stdout, f"{proc.stdout}\n{proc.stderr}"
+    assert "The pruner's audit_logs job waits for the audit chain" in proc.stdout, proc.stdout
 
 
 def test_audit_retention_disabled_by_default_keeps_all():
