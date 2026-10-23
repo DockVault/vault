@@ -63,13 +63,16 @@ def compliance_rows_kept(model, now: datetime):
 
 def holds_back(db, now: datetime) -> Optional[str]:
     """Why every path that changes or deletes what a hold or a case may need waits now, or None: a legal hold stands
-    (placed, neither released nor lapsed), or a case is open (not closed, whatever its state). Any hold and any case,
-    not only those of the rows a path would touch: an audit row of what was done in a held vault need not carry the
-    case. In the caller's transaction, after taking the turn of holds and deletions shared, so a hold or a case
+    (placed, neither released nor lapsed), a case is open (not closed, whatever its state), or a step that would
+    place a hold or open a case gave up waiting for its turn a moment ago (legal_holds.want_turn). Any hold and any
+    case, not only those of the rows a path would touch: an audit row of what was done in a held vault need not carry
+    the case. In the caller's transaction, after taking the turn of holds and deletions shared, so a hold or a case
     committed before this check is seen, and one placed meanwhile waits until the caller's transaction ends."""
     from app.core import legal_holds
     from app.core.models import ComplianceCase, LegalHoldVault
     legal_holds.take_turn(db, shared=True)
+    if legal_holds.turn_wanted(db):
+        return "a legal hold or a compliance case is being asked for"
     if db.query(LegalHoldVault.vault_id).filter(LegalHoldVault.released_at.is_(None),
                                                  LegalHoldVault.lapsed_at.is_(None)).first() is not None:
         return "a legal hold stands"

@@ -82,6 +82,7 @@ NOTHING_TO_UNDO = "nothing_to_undo"
 UNDO_TOO_LATE = "undo_too_late"
 PLACER = "placer"
 STARTER_CHANGED = "starter_changed"
+DELETION_RUNNING = "deletion_running"
 
 TEXTS = {
     ACCESS_OFF: "compliance access is turned off on this deployment (COMPLIANCE_ACCESS=disabled)",
@@ -110,6 +111,8 @@ TEXTS = {
     PLACER: "the person who placed the hold cannot confirm it",
     STARTER_CHANGED: ("someone else changed your sign-in details, or added an SSH key to your account, since the "
                       "case started: an independent administrator must do this"),
+    DELETION_RUNNING: ("a step that deletes or changes audit records is running, and this waits for it to end: "
+                       "nothing was changed and no code was used; try again in a minute"),
     # The independence rule's reasons, said of a case (whoever started it: its auditor, or the administrator who
     # placed a hold-only case).
     "not_able": "only an active administrator who is not locked can do this",
@@ -309,18 +312,102 @@ def after_starter_change(db, target, kind: str, now: Optional[datetime] = None) 
 # and then changes (compliance_retention.holds_back). So a hold committed before such a check is seen by it, and
 # one placed while such a transaction runs is written once that transaction has ended.
 HOLD_TURN = (0x6c68, 1)
+# How long a step that makes a hold stand or opens a case waits for the turn while a deletion step holds it, at most:
+# a deletion step holds it for its whole transaction (an archived day's scan or rewrite can take seconds), longer
+# than the connection's lock_timeout (app/core/database.py). Postgres queues the step ahead of every deletion step
+# that asks after it, so it waits only for those already running.
+TURN_WAIT_SECONDS = 30
+# What a lock wait that ran out raises: lock_timeout (55P03), or the statement's own timeout (57014).
+_TURN_TIMEOUTS = ("55P03", "57014")
+
+
+class TurnBusy(Exception):
+    """The turn of holds and deletions stayed with a deletion step for longer than TURN_WAIT_SECONDS: nothing was
+    written, and the step can be asked for again."""
 
 
 def take_turn(db, *, shared: bool) -> None:
     """Take the turn of holds and deletions in ``db``'s transaction (held until it ends): shared for a path that
     checks for holds before it changes or deletes, exclusive for a step that makes a hold stand or opens a case.
-    Nothing outside PostgreSQL."""
+    Taking it again in a transaction that holds it returns at once. Nothing outside PostgreSQL.
+
+    The exclusive turn waits up to TURN_WAIT_SECONDS for a deletion step that holds it, the connection's
+    lock_timeout and statement_timeout raised for that one statement only, then raises TurnBusy with the transaction
+    as it was (the wait runs in a savepoint)."""
     from sqlalchemy import text as sql
     bind = db.get_bind()
     if bind is None or bind.dialect.name != "postgresql":
         return
-    call = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
-    db.execute(sql(f"SELECT {call}(:c, :k)"), {"c": HOLD_TURN[0], "k": HOLD_TURN[1]})
+    params = {"c": HOLD_TURN[0], "k": HOLD_TURN[1]}
+    if shared:
+        db.execute(sql("SELECT pg_advisory_xact_lock_shared(:c, :k)"), params)
+        return
+    from sqlalchemy.exc import DBAPIError
+    wait_ms = int(TURN_WAIT_SECONDS * 1000)
+    before = db.execute(sql("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")).one()
+    point = db.begin_nested()
+    try:
+        db.execute(sql("SELECT set_config('lock_timeout', :lock, true), set_config('statement_timeout', :stmt, true)"),
+                   {"lock": f"{wait_ms}ms", "stmt": f"{wait_ms + 10000}ms"})
+        db.execute(sql("SELECT pg_advisory_xact_lock(:c, :k)"), params)
+    except DBAPIError as exc:
+        point.rollback()                     # the settings go back with it
+        if getattr(getattr(exc, "orig", None), "pgcode", None) in _TURN_TIMEOUTS:
+            raise TurnBusy() from None
+        raise
+    point.commit()
+    db.execute(sql("SELECT set_config('lock_timeout', :lock, true), set_config('statement_timeout', :stmt, true)"),
+               {"lock": before[0], "stmt": before[1]})
+    # Had: the deletion steps may start again once this transaction ends (want_turn).
+    db.execute(sql("DELETE FROM system_settings WHERE key = :k"), {"k": TURN_WANTED})
+
+
+# A step that gave up waiting for the turn (TurnBusy) says so (want_turn): until it has had the turn, or for
+# TURN_WANTED_MINUTES at most, no deletion step starts (compliance_retention.holds_back), so the step asked again
+# waits only for the one that held the turn when it gave up.
+TURN_WANTED = "hold_turn_wanted"
+TURN_WANTED_MINUTES = 10
+
+
+def want_turn() -> None:
+    """Say, in a transaction of its own, that a step that makes a hold stand or opens a case gave up waiting for the
+    turn (see TURN_WANTED). Nothing outside PostgreSQL. Never raises."""
+    from app.core.database import SessionLocal
+    from app.core.models import SystemSetting
+    db = None
+    try:
+        db = SessionLocal()
+        bind = db.get_bind()
+        if bind is None or bind.dialect.name != "postgresql":
+            return
+        until = {"until": (utcnow() + timedelta(minutes=TURN_WANTED_MINUTES)).isoformat()}
+        row = db.get(SystemSetting, TURN_WANTED)
+        if row is None:
+            db.add(SystemSetting(key=TURN_WANTED, value=until))
+        else:
+            row.value = until
+        db.commit()
+    except Exception:  # noqa: BLE001 -- the step asked again still waits its turn, only behind more deletion steps
+        if db is not None:
+            db.rollback()
+    finally:
+        if db is not None:
+            db.close()
+
+
+def turn_wanted(db) -> bool:
+    """Whether a step that makes a hold stand or opens a case gave up waiting for the turn less than
+    TURN_WANTED_MINUTES ago and has not had it since. Nothing outside PostgreSQL."""
+    from sqlalchemy import text as sql
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return False
+    value = db.execute(sql("SELECT value FROM system_settings WHERE key = :k"), {"k": TURN_WANTED}).scalar()
+    try:
+        until = datetime.fromisoformat((value or {})["until"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return until > utcnow()
 
 
 # --------------------------------------------------------------------------- the SFTP guard

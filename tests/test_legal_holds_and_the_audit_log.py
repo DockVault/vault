@@ -607,27 +607,96 @@ def test_working_records_wait_while_a_hold_stands_and_go_after(env, monkeypatch)
 # --------------------------------------------------------------------------- the turn of holds and deletions
 
 class _Postgres:
-    """A session on Postgres that records what it is asked to run."""
+    """A session on Postgres that records what it is asked to run, and its savepoints; ``fail`` is raised by the
+    exclusive lock."""
 
-    def __init__(self):
+    def __init__(self, fail=None):
         self.sql = []
+        self.fail = fail
 
     def get_bind(self):
         from types import SimpleNamespace
         return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
 
     def execute(self, statement, params=None):
+        from types import SimpleNamespace
         self.sql.append((str(statement), params))
+        if self.fail is not None and "pg_advisory_xact_lock(" in str(statement):
+            raise self.fail
+        return SimpleNamespace(one=lambda: ("5s", "5s"))
+
+    def begin_nested(self):
+        from types import SimpleNamespace
+        self.sql.append(("SAVEPOINT", None))
+        return SimpleNamespace(commit=lambda: self.sql.append(("RELEASE", None)),
+                               rollback=lambda: self.sql.append(("ROLLBACK TO", None)))
+
+
+_SETTINGS = "SELECT current_setting('lock_timeout'), current_setting('statement_timeout')"
+_SET = "SELECT set_config('lock_timeout', :lock, true), set_config('statement_timeout', :stmt, true)"
 
 
 def test_the_turn_is_a_transaction_lock_shared_by_deletions_and_exclusive_for_a_hold_or_a_case():
+    """The exclusive turn waits up to TURN_WAIT_SECONDS (longer than the connection's 5 s lock_timeout, raised for
+    that one statement in a savepoint and put back after), so a deletion step that holds it for seconds is waited
+    for rather than failing the step."""
     from app.core import legal_holds
     db = _Postgres()
     legal_holds.take_turn(db, shared=True)
     legal_holds.take_turn(db, shared=False)
     params = {"c": legal_holds.HOLD_TURN[0], "k": legal_holds.HOLD_TURN[1]}
+    wait = int(legal_holds.TURN_WAIT_SECONDS * 1000)
+    assert legal_holds.TURN_WAIT_SECONDS > 5
     assert db.sql == [("SELECT pg_advisory_xact_lock_shared(:c, :k)", params),
-                      ("SELECT pg_advisory_xact_lock(:c, :k)", params)]
+                      (_SETTINGS, None), ("SAVEPOINT", None),
+                      (_SET, {"lock": f"{wait}ms", "stmt": f"{wait + 10000}ms"}),
+                      ("SELECT pg_advisory_xact_lock(:c, :k)", params), ("RELEASE", None),
+                      (_SET, {"lock": "5s", "stmt": "5s"}),
+                      ("DELETE FROM system_settings WHERE key = :k", {"k": legal_holds.TURN_WANTED})]
+
+
+@pytest.mark.parametrize("pgcode", ["55P03", "57014"])
+def test_an_exclusive_turn_a_deletion_holds_too_long_is_refused_as_busy_with_the_transaction_as_it_was(pgcode):
+    from types import SimpleNamespace
+    from sqlalchemy.exc import OperationalError
+    from app.core import legal_holds
+    db = _Postgres(fail=OperationalError("SELECT pg_advisory_xact_lock(...)", {}, SimpleNamespace(pgcode=pgcode)))
+    with pytest.raises(legal_holds.TurnBusy):
+        legal_holds.take_turn(db, shared=False)
+    params = {"c": legal_holds.HOLD_TURN[0], "k": legal_holds.HOLD_TURN[1]}
+    assert db.sql[-2:] == [("SELECT pg_advisory_xact_lock(:c, :k)", params), ("ROLLBACK TO", None)]
+
+
+def test_any_other_failure_of_the_turn_is_not_taken_for_busy():
+    from types import SimpleNamespace
+    from sqlalchemy.exc import OperationalError
+    from app.core import legal_holds
+    db = _Postgres(fail=OperationalError("SELECT pg_advisory_xact_lock(...)", {}, SimpleNamespace(pgcode="40P01")))
+    with pytest.raises(OperationalError):
+        legal_holds.take_turn(db, shared=False)
+    assert db.sql[-1] == ("ROLLBACK TO", None)
+
+
+def test_the_routes_take_the_turn_before_the_code_is_used_and_keep_it_until_the_step_commits():
+    """A hold, an undone release and a case request: the turn is taken before the code is used, the code is used in
+    a session of its own (using it may commit), and the step runs after, in the turn. The hold and the undo ask for
+    the code before they wait for the turn when there is no receipt."""
+    import inspect
+    from app.api import compliance_router as routes
+    for route, step_up, then in ((routes.place_hold, "STEP_UP_HOLD_PLACE", "holds.place_hold_only(db, "),
+                                 (routes.undo_hold_release, "STEP_UP_HOLD_DECIDE", "_take_decision("),
+                                 (routes.request_case, "STEP_UP_CASE_REQUEST", "case = cases.request_case(db, ")):
+        src = inspect.getsource(route)
+        turn = src.index("_take_the_turn(db, ")
+        used = src.index(f"_code_used_keeping_the_turn({step_up}, ")
+        assert turn < used < src.index(then), route.__name__
+        assert f"{step_up}(db, " not in src, route.__name__
+        if route is not routes.request_case:
+            assert src.index(f"_code_asked_first({step_up}, ") < turn, route.__name__
+    ask = inspect.getsource(routes.request_case)
+    assert "db.rollback()" not in ask
+    assert ask.index("_take_the_turn(db, ") < ask.index("point = db.begin_nested()") < ask.index(
+        "cases.request_case(db, current_user, **args)")
 
 
 def test_the_check_takes_the_turn_before_it_reads_and_every_step_that_makes_a_hold_stand_before_it_writes():
