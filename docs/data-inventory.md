@@ -106,9 +106,9 @@ Visits to a link and uploads through one are also in the audit log.
 | `user_preferences` | Display choices only, from fixed lists. **New in 0.33.0:** "Hide note text" is kept here (it used to be in the browser), with the Activity page's page size, live updates and range. | Remembering a person's choices. | Until changed. | Deleted with the account. |
 | `log_pull_tokens` | Token name, prefix and hash, who created it, last use. | Log access. | Until disabled and deleted. | An administrator. |
 | `audit_seals` **New in 0.34.0** | The audit log's integrity chain: one seal per closed hour of audit rows (two hashes over the hour's rows and the ids of its rows), and one per retention change, cancel, acknowledgment and deletion of audit rows. A retention change's seal names the setting, its values, the change's id and the administrator's account id; an acknowledgment's names the seals it acknowledges. An hour's seal also keeps the 16-byte ids of its rows, and, for rows written without a nonce, a random value per hour from which their nonces are derived. No username, address, name or text of a row: those enter only as a hash, under each row's random nonce. | Finding changes made to the audit log in the database. | For ever: seals are never deleted, and they stay when the rows they cover are deleted. | Nothing deletes a seal. Deleting rows writes a seal that says so; an erase destroys the rows' nonces, so the old hashes reveal nothing. |
-| `audit_archive_blocks` **New in 0.34.0** | Audit rows older than the row window (`AUDIT_HOT_DAYS`, 90 days by default), compressed: each block is a part of one UTC day and holds every column of every row it took from `audit_logs`, so the same personal data as those rows (see [The audit log](#the-audit-log)), and the per-hour values from which the nonces of rows written without one are derived. A count of rows and bytes by action, status and channel, and by hour, and of rows by hour, action, status and channel, per block, for the summaries and the size cap. The Activity page and its exports read archived days for a time range that reaches them, through a temporary table that goes with the request. | The audit log, kept compressed: it is kept for ever by default. Archiving starts `AUDIT_ARCHIVE_START_AFTER_DAYS` (14) days after 0.34.0 first ran here (when it began sealing the audit log); a day `audit unarchive` put back stays rows that long again. While any block exists, a row in `data_requirements` keeps 0.33.1 and later from starting. | As long as the audit rows it holds: the audit log's retention applies to archived rows as to the others (the maximum, the size cap, the protected minimums, the hold). | The pruner deletes archived rows by the audit log's retention, rewriting the block; `dockvault.py audit unarchive` puts days back as rows and removes their blocks. **Not** deleted with the account: a block keeps the account id of a deleted account (a restored row has it cleared, as the database clears it on a row, and the Activity page shows it cleared). |
+| `audit_archive_blocks` **New in 0.34.0** | Audit rows older than the row window (`AUDIT_HOT_DAYS`, 90 days by default), compressed: each block is a part of one UTC day and holds every column of every row it took from `audit_logs`, so the same personal data as those rows (see [The audit log](#the-audit-log)), and the per-hour values from which the nonces of rows written without one are derived. A count of rows and bytes by action, status and channel, and by hour, and of rows by hour, action, status and channel, per block, for the summaries and the size cap. The Activity page and its exports read archived days for a time range that reaches them, through a temporary table that goes with the request. | The audit log, kept compressed: it is kept for ever by default. Archiving starts `AUDIT_ARCHIVE_START_AFTER_DAYS` (14) days after 0.34.0 first ran here (when it began sealing the audit log); a day `audit unarchive` put back stays rows that long again. While any block exists, a row in `data_requirements` keeps 0.33.1 and later from starting. | As long as the audit rows it holds: the audit log's retention applies to archived rows as to the others (the maximum, the size cap, the protected minimums, the hold). | The pruner deletes archived rows by the audit log's retention, rewriting the block (a compliance case's rows stay while they must be kept); `dockvault.py audit unarchive` puts days back as rows and removes their blocks. A day holding a compliance case's rows that must be kept stays rows, whole, until they may go. **Not** deleted with the account: a block keeps the account id of a deleted account (a restored row has it cleared, as the database clears it on a row, and the Activity page shows it cleared). |
 | `audit_value_removals` **New in 0.34.0** | For each removal of values recorded under earlier recording levels: the levels it brings rows down to and the time before which its rows were written, who asked for it and who cancelled it (id and username), when, why it waits, and how many rows it changed (counts). | The removal waits its delay before it runs, and any administrator can cancel it meanwhile. | For ever, as a record alongside the audit log. | Nothing deletes a row. The account ids are cleared when the account is deleted. |
-| `erase_requests` **New in 0.34.0** | For each per-person erase: the name it removes, only sealed (AES-256-GCM under a key derived from `ENCRYPTION_KEY`, bound to the request), the placeholder it writes, who asked for it and who cancelled it (id and username), when, why it waits, and what it changed in each place (counts). | The erase waits its delay before it runs, and any administrator can cancel it meanwhile. | For ever, as a record alongside the audit log; the sealed name is deleted when the erase completes or is cancelled. | Nothing deletes a row. The sealed name is deleted with the erase's end; the account ids are cleared when the account is deleted. |
+| `erase_requests` **New in 0.34.0** | For each per-person erase: the name it removes, only sealed (AES-256-GCM under a key derived from `ENCRYPTION_KEY`, bound to the request), the placeholder it writes, who asked for it and who cancelled it (id and username), when, why it waits, and what it changed in each place (counts). | The erase waits its delay before it runs, and any administrator can cancel it meanwhile. | For ever, as a record alongside the audit log; the sealed name is deleted when the erase completes or is cancelled, or, while a legal hold stands or a compliance case is open, once neither does. | Nothing deletes a row. The sealed name is deleted with the erase's end (under a legal hold or an open case, by the pruner once neither holds it); the account ids are cleared when the account is deleted. |
 | `managed_setting_changes` **New in 0.34.0** | For each change of a managed setting that deletes records sooner: the setting, the values before and after, the id and username of the administrator who asked and of the one who cancelled it, and when. | A change that deletes records sooner waits `RETENTION_REDUCTION_DELAY_DAYS` (7 by default) and any administrator can cancel it meanwhile; this is the record of each one and how it ended. What waits, and what the pruner applies, is the audit log's integrity chain's: the retention screen lists the waiting changes from it, not from this table. | For ever, as a record alongside the audit log. | Nothing deletes it. The account ids are cleared when the account is deleted; the usernames stay. |
 
 ### Compliance access (new in 0.34.0)
@@ -215,11 +215,13 @@ Each row of `audit_logs` holds:
   panel's "Keep full addresses in audit rows for"; no limit by default) an address recorded in full is
   shortened to its /24 or /48 once its row is that many days old (in a day the archive holds, once the whole
   day is: up to a day later). Either change gives each changed row a new
-  `seal_nonce`, and the integrity chain records it and still verifies;
+  `seal_nonce`, and the integrity chain records it and still verifies. Both wait while a legal hold stands or
+  a compliance case is open, and leave a case's rows that must be kept as they are;
 - **New in 0.34.0:** `seal_nonce`, 16 random bytes on every row written from 0.34.0 on, under which the
   log's integrity chain hashes the row's personal values (`audit_seals`), so that once it is destroyed the
-  hash reveals nothing about them. **Empty on every row so far:** `ip_via` (how the address was learned)
-  and `case_id` (a compliance case). `security_alerts` gains the same `ip_via`, also empty.
+  hash reveals nothing about them. `case_id`: the compliance case a row was written under (see
+  Compliance access, above), empty on every other row. **Empty on every row so far:** `ip_via`
+  (how the address was learned). `security_alerts` gains the same `ip_via`, also empty.
 
 Rows are not deleted when the account they name is deleted: its id is cleared and its username is
 kept, and the deletion itself adds a row. With the default `AUDIT_LOG_RETENTION_DAYS=0` every row is
@@ -428,7 +430,9 @@ and the unlock state.
    sealed in `erase_requests` until then, and deleted when the erase completes or is cancelled; the
    audit rows of the request, the cancel and the completion name the placeholder, never the person.
 
-   It waits while the hold switch is on, while a restore is not finished, and, with
+   It waits while the hold switch is on, while a restore is not finished, while a legal hold stands or a
+   compliance case is open (any of them: an audit row of what was done in a held vault need not name the case;
+   a cancelled erase keeps its sealed name until neither holds), and, with
    `ERASE_BLOCKED_BY_PROTECTED_MINIMUM=true` (for deployments whose records must be kept intact), until
    every audit row it would change is older than the protected minimum for its kind.
 
@@ -436,7 +440,10 @@ and the unlock state.
    files until their space is reused: the erase runs a plain VACUUM, and `dockvault.py audit compact`
    rewrites the tables); container output and the log-access file; email already sent; other people's
    audit rows that name the person in their details (an administrator's row recording the deletion of
-   their account, for example); and audit rows with no time.
+   their account, for example); audit rows with no time; a compliance case's audit rows while they must be
+   kept (while the case is open or a hold stands, and `COMPLIANCE_RECORD_MIN_DAYS` after it closes), which stay
+   as they are; and the records of compliance access (cases, legal holds, auditor rights, revealed names and
+   owners' notices), which keep who asked, approved and acted.
 
 ## Retention settings
 
@@ -538,7 +545,8 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
 - `audit_seals` and `audit_logs.seal_nonce`: the integrity chain, and the head record on the keys volume.
 - `audit_archive_blocks`: audit rows older than `AUDIT_HOT_DAYS` (90), compressed, from
   `AUDIT_ARCHIVE_START_AFTER_DAYS` (14) after the upgrade. They hold the same personal data as the rows they
-  replace. `python dockvault.py audit unarchive` restores them; an earlier release cannot read them.
+  replace (a day holding a compliance case's rows that must be kept stays rows). `python dockvault.py audit
+  unarchive` restores them; an earlier release cannot read them.
 - `erase_requests`: a per-person erase, with its name only sealed; see [Erasing a person](#erasing-a-person)
   and what it does not reach.
 - `audit_value_removals`: a removal of the values recorded under earlier recording levels, asked for after a
@@ -546,6 +554,7 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
   [The audit log](#the-audit-log)).
 - Working records: invitations, and used or expired reset links, one-time codes and email-change codes, are
   deleted 30 days after they end (they were kept); notifications after `NOTIFICATION_RETENTION_DAYS` when
-  set (0 keeps them, as before). The log-access file holds `LOG_PULL_SINK_MAX_MB` (15) in all.
+  set (0 keeps them, as before). None of them is deleted while a legal hold stands or a compliance case is
+  open. The log-access file holds `LOG_PULL_SINK_MAX_MB` (15) in all.
 - Container output rotates in the shipped compose files (`DOCKER_LOG_MAX_SIZE`, `DOCKER_LOG_MAX_FILE`), on
   installs whose compose files come from 0.34.0.

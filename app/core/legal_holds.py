@@ -301,6 +301,28 @@ def after_starter_change(db, target, kind: str, now: Optional[datetime] = None) 
     return marked
 
 
+# --------------------------------------------------------------------------- the turn of holds and deletions
+
+# A hold or a case and the deletions they hold back take turns: every step that makes a hold stand or opens a case
+# takes this lock, exclusively, in its own transaction before it writes; every path of the audit log and the
+# records that changes or deletes what they hold back takes it shared, in the transaction that checks for them
+# and then changes (compliance_retention.holds_back). So a hold committed before such a check is seen by it, and
+# one placed while such a transaction runs is written once that transaction has ended.
+HOLD_TURN = (0x6c68, 1)
+
+
+def take_turn(db, *, shared: bool) -> None:
+    """Take the turn of holds and deletions in ``db``'s transaction (held until it ends): shared for a path that
+    checks for holds before it changes or deletes, exclusive for a step that makes a hold stand or opens a case.
+    Nothing outside PostgreSQL."""
+    from sqlalchemy import text as sql
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    call = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
+    db.execute(sql(f"SELECT {call}(:c, :k)"), {"c": HOLD_TURN[0], "k": HOLD_TURN[1]})
+
+
 # --------------------------------------------------------------------------- the SFTP guard
 
 def sftp_guard(db) -> None:
@@ -482,6 +504,7 @@ def place_hold_only(db, placer, vault_ids: Iterable, *, purpose: str, legal_basi
         raise HoldRefused(NO_VAULTS, code=422)
     if len(ids) > int(cs.current(cs.MAX_CASE_VAULTS)):
         raise HoldRefused(TOO_MANY_VAULTS, code=422)
+    take_turn(db, shared=False)
     vaults = _lock_vaults(db, ids)
     owners = {str(v.owner_id) for v in vaults if v.owner_id is not None}
     if str(placer.id) in owners:
@@ -726,6 +749,7 @@ def undo_release(db, case, *, by, now: Optional[datetime] = None) -> int:
     finished with it by then, so its time has come and the undo is refused (UNDO_TOO_LATE). A hold is never
     restored over kept rows a purge has already taken."""
     now = now or utcnow()
+    take_turn(db, shared=False)
     holds = last_release(db, case.id)
     _lock_vaults(db, [h.vault_id for h in holds])
     at = max(now, utcnow())

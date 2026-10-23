@@ -517,9 +517,22 @@ def _check_stored(db, view, day: date, part, bw: af.BlockWriter,
 
 # --------------------------------------------------------------------------- archiving
 
+def kept_rows_in(db, start: datetime, end: datetime, now: datetime) -> int:
+    """How many rows of audit_logs from ``start`` to ``end`` must stay as they are, where they are (a compliance
+    case's rows: retention.register_keep_as_is): archiving would move them out of audit_logs."""
+    from app.core import retention
+    from app.core.models import AuditLog as A
+    clause = retention.kept_as_is(A, now)
+    if clause is None:
+        return 0
+    return int(db.query(func.count()).select_from(A).filter(A.timestamp >= start, A.timestamp < end, clause)
+               .scalar() or 0)
+
+
 def next_day(db, view, now: datetime, skipped: set) -> Optional[date]:
     """The oldest day archiving may take now: with rows in audit_logs at or after the chain's first hour, older
-    than the row window, sealed whole, and not one ``audit unarchive`` put back within its grace."""
+    than the row window, sealed whole, not one ``audit unarchive`` put back within its grace, and holding no row that
+    must stay as it is (a compliance case's: it stays rows, whole)."""
     from app.core.models import AuditLog as A
     first = view.first_hour()
     if first is None or view.newest_hour_end is None:
@@ -532,7 +545,8 @@ def next_day(db, view, now: datetime, skipped: set) -> Optional[date]:
             return None
         d = t.date()
         until = unarchived_until(view, d)
-        if d not in skipped and (until is None or now >= until):
+        if d not in skipped and (until is None or now >= until) and not kept_rows_in(db, day_start(d),
+                                                                                     day_start(d) + DAY, now):
             return d
         after = day_start(d) + DAY
     return None
@@ -570,6 +584,10 @@ def archive_next_part(w, day: date, now: datetime):
         return None
     start = max(prev[-1].last_hour + HOUR, covered[0]) if prev else covered[0]
     end = day_start(day) + DAY
+    kept = kept_rows_in(db, day_start(day), end, now)
+    if kept:
+        raise NotArchivable(f"{day.isoformat()} holds {kept} row{'' if kept == 1 else 's'} a compliance case keeps "
+                            "as it is, so the day stays rows")
     if view.newest_hour_end is None or view.newest_hour_end < end:
         raise NotArchivable(f"{day.isoformat()} is not sealed whole")
     counts = hour_counts(db, start, end)
@@ -872,6 +890,25 @@ def matching(db, rows: Iterable[dict], conditions_for: Callable) -> Dict:
 
 
 PROBE_CHUNK = 2000
+
+
+def kept_as_is(db, rows: Iterable[dict], now: datetime) -> Dict:
+    """{id: timestamp} of the archived ``rows`` that must stay as they are (retention.register_keep_as_is: the rows
+    of a compliance case), as the probe table finds them; {} without reading them into it when no rule keeps any.
+    The rows are consumed."""
+    from app.core import retention
+    if not retention.AS_IS_RULES.get("audit_logs"):
+        for _row in rows:
+            pass
+        return {}
+    probe_create(db)
+    try:
+        def conditions(model):
+            clause = retention.kept_as_is(model, now)
+            return [clause] if clause is not None else [sa.false()]
+        return matching(db, rows, conditions)
+    finally:
+        probe_drop(db)
 
 
 def prune_day(w, day: date, conditions_for: Callable, now: datetime) -> Optional[Rewritten]:

@@ -413,9 +413,15 @@ def rewrite_hour(w, hour: datetime, change: Callable[[dict], Optional[dict]], *,
         raise NotRewritten(f"an erased row of {fmt.hour_text(hour)} is not what its erase seal says; nothing in it "
                            "was rewritten", nv.kind) from None
     users = dict(db.query(A.id, A.user_id).filter(A.timestamp >= hour, A.timestamp < hour + HOUR).all())
+    # A compliance case's rows stay as they are (retention.register_keep_as_is): they are not rewritten.
+    from app.core import retention
+    clause = retention.kept_as_is(A, now)
+    kept = set()
+    if clause is not None:
+        kept = {i for (i,) in db.query(A.id).filter(A.timestamp >= hour, A.timestamp < hour + HOUR, clause).all()}
     changes = {}
     for r in ai.iter_rows(db, hour, hour + HOUR):
-        if r["timestamp"] is None or r["timestamp"] >= before or str(r["id"]) in view.erased_rows:
+        if r["timestamp"] is None or r["timestamp"] >= before or str(r["id"]) in view.erased_rows or r["id"] in kept:
             continue
         new = change(dict(r, user_id=users.get(r["id"])))
         if new:
@@ -456,7 +462,16 @@ def rewrite_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, no
         return change(row)
 
     def pick(rows):
-        return {r["id"]: r["timestamp"] for r in rows if wanted(r)}
+        # A compliance case's rows stay as they are (retention.register_keep_as_is): they are not rewritten.
+        found = {}
+
+        def changing():
+            for r in rows:
+                if wanted(r):
+                    found[r["id"]] = r["timestamp"]
+                    yield r
+        kept = arc.kept_as_is(w.db, changing(), now)
+        return {i: t for i, t in found.items() if i not in kept}
 
     def transform(row):
         new = wanted(row)
@@ -669,7 +684,8 @@ def shorten_job(p):
         return result
     engine = ai._engine_of(p.session_factory)
     key = (id(st), st.view.generation)
-    conditions = prefilter(AuditLog, {ap.IP: ap.SHORTENED})
+    # A compliance case's rows stay as they are (retention.register_keep_as_is).
+    conditions = retention.changeable(AuditLog, p.now, *prefilter(AuditLog, {ap.IP: ap.SHORTENED}))
     findings: Dict[str, str] = {}
     while p.time_left():
         before = cutoff(st.view, ai.hour_floor(min(p.now, st.clock()) - timedelta(days=days)))

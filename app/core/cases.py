@@ -323,7 +323,7 @@ def request_case(db, auditor, *, purpose, legal_basis, justification, owner_note
                  hold: Optional[bool] = None, now: Optional[datetime] = None):
     """Ask for a case as ``auditor`` (whose right the caller found in force), in the caller's transaction. Returns
     the pending case. Raises CaseRefused."""
-    from app.core import auditor_rights
+    from app.core import auditor_rights, legal_holds
     from app.core.models import (ComplianceCase, ComplianceCasePerson, ComplianceCaseScope, ComplianceCaseVault,
                                  User)
     from app.core.security import seal_case_field
@@ -375,6 +375,9 @@ def request_case(db, auditor, *, purpose, legal_basis, justification, owner_note
         if why:
             raise CaseRefused(why, code=409)
 
+    # An open case holds back every change and deletion the audit log's paths make (compliance_retention.holds_back):
+    # it opens in its turn, after any of them that checked before it has ended.
+    legal_holds.take_turn(db, shared=False)
     case = ComplianceCase(
         id=uuid.uuid4(), status=rules.PENDING, purpose=purpose, legal_basis=legal_basis,
         lia_reference=_clean(lia_reference)[:255] or None, special_category=bool(special_category),

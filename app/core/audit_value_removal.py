@@ -107,12 +107,15 @@ def delay_days(view, st) -> int:
 
 # --------------------------------------------------------------------------- the preview
 
-def _hot_rows(db, levels, before: datetime):
+def _hot_rows(db, levels, before: datetime, now: Optional[datetime] = None):
     from sqlalchemy import Text, cast
+    from app.core import retention
     from app.core.models import AuditLog as A
+    # Not a compliance case's rows, which a removal leaves as they are (retention.register_keep_as_is).
     q = db.query(A.id, A.action, A.user_id, A.temp_credential_id, A.username, A.ip_address, A.user_agent,
                  cast(A.recorded, Text), cast(A.details, Text)).filter(
-        *rw.prefilter(A, levels), A.timestamp.isnot(None), A.timestamp < before)
+        *retention.changeable(A, now or _ai().state().clock(), *rw.prefilter(A, levels)),
+        A.timestamp.isnot(None), A.timestamp < before)
     for r in q.yield_per(2000):
         yield {"id": r[0], "action": r[1], "user_id": r[2], "temp_credential_id": r[3], "username": r[4],
                "ip_address": r[5], "user_agent": r[6], "recorded": r[7], "details": r[8]}
@@ -622,7 +625,10 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
     if view.newest_hour_end is None or view.newest_hour_end < before:
         return WAIT, 0, cursor, None, "It waits until every hour it covers is sealed."
     ctx = rw.Context.load(db)
-    scope = rw.Scope(rw.LEVELS, before, lambda r: rw.reduced(r, levels, ctx), rw.prefilter(AuditLog, levels),
+    # A compliance case's rows stay as they are (retention.register_keep_as_is).
+    from app.core import retention
+    scope = rw.Scope(rw.LEVELS, before, lambda r: rw.reduced(r, levels, ctx),
+                     retention.changeable(AuditLog, now, *rw.prefilter(AuditLog, levels)),
                      request_seq=seq, through=fmt.hour_text(before - HOUR))
     try:
         outcome, cursor, changed, _oldest, _newest, unit = rw.step(p, w, scope, cursor)

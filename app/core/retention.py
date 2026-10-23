@@ -18,7 +18,9 @@ session-level advisory lock on a connection of its own, and a pass that cannot t
 
 What a job may not delete. Other modules register row-keep rules for a table (register_keep): each gives a
 condition for rows that must stay (a category's protected minimum, rows a compliance case or a legal hold
-keeps), and every job over that table leaves them. Those modules are listed in KEEP_MODULES and imported with
+keeps), and every job over that table leaves them. A rule registered with register_keep_as_is keeps its rows as
+they are, where they are, too: the audit archive does not move them, and an erase, a removal of earlier values or
+the shortening of addresses does not change them. Those modules are listed in KEEP_MODULES and imported with
 this one.
 
 The hold switch. ``logs_hold`` (the deployment's value is RETENTION_HOLD; with RETENTION_HOLD=true the panel
@@ -173,6 +175,43 @@ def deletable(model, now: datetime, *conditions) -> list:
     return list(conditions) + ([not_(or_(*kept))] if kept else [])
 
 
+# Rows that must stay exactly as they are, where they are: a job that moves rows elsewhere (the audit archive) or
+# changes their values (a per-person erase, a removal of earlier values, the shortening of addresses) leaves them.
+AS_IS_RULES: dict[str, list] = {}
+
+
+def register_keep_as_is(table: str, rule: Callable) -> Callable:
+    """Keep rows of ``table`` as they are: ``rule(model, now)`` as for register_keep. The rows are kept from
+    deletion (the rule is a row-keep rule too), and from every job that moves or changes them."""
+    register_keep(table, rule)
+    rules = AS_IS_RULES.setdefault(table, [])
+    if rule not in rules:
+        rules.append(rule)
+    return rule
+
+
+def as_is_clauses(model, now: datetime) -> list:
+    """The conditions of the rows of ``model``'s table that must stay as they are, as of ``now``."""
+    clauses = []
+    for rule in AS_IS_RULES.get(getattr(model, "__keep_rules_of__", model.__tablename__), []):
+        clause = rule(model, now)
+        if clause is not None:
+            clauses.append(clause)
+    return clauses
+
+
+def changeable(model, now: datetime, *conditions) -> list:
+    """``conditions`` for the rows a job moves or changes, and not those that must stay as they are."""
+    kept = as_is_clauses(model, now)
+    return list(conditions) + ([not_(or_(*kept))] if kept else [])
+
+
+def kept_as_is(model, now: datetime):
+    """One condition for the rows of ``model``'s table that must stay as they are, or None when no rule keeps any."""
+    kept = as_is_clauses(model, now)
+    return or_(*kept) if kept else None
+
+
 # --------------------------------------------------------------------------- one pass
 
 @dataclass
@@ -245,14 +284,20 @@ class Pass:
         db.add(AuditLogger(db).build_row(action="retention_pruned", status="success", resource_type="table",
                                          resource_id=job, details=details))
 
-    def delete_in_batches(self, model, conditions, time_column) -> JobResult:
+    def delete_in_batches(self, model, conditions, time_column, *, waits: Optional[Callable] = None) -> JobResult:
         """Delete the rows of ``model`` meeting ``conditions``, oldest first, one batch per transaction,
         while the pass has time, each batch's record written in that batch's transaction. Rows another
-        transaction holds are skipped, not waited for."""
+        transaction holds are skipped, not waited for. ``waits(db, now)``, when given, is asked first in each
+        batch's transaction: a reason it gives (a legal hold, an open case: person_erase.rule_waits) ends the
+        job with nothing more deleted."""
         result = JobResult()
         id_column = model.__mapper__.primary_key[0]
         while self.time_left():
             with self.transaction() as db:
+                why = waits(db, self.now) if waits is not None else None
+                if why:
+                    _say(f"The pruner's {self.job_name or model.__tablename__} job waits: {why}")
+                    break
                 rows = (db.query(id_column, time_column).filter(*conditions).order_by(time_column)
                         .limit(self.batch_rows).with_for_update(skip_locked=True).all())
                 batch = JobResult()

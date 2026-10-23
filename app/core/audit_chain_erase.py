@@ -225,19 +225,28 @@ def pending_input_problems(db, view, cfg) -> List[str]:
 
 # --------------------------------------------------------------------------- finding the rows of the name
 
-def _hot_rows(db, name: str, fp: Optional[str], scope_end: datetime):
-    """(id, time, action) of the rows of ``name`` before ``scope_end`` (with a time), as row_matches decides."""
+def _now(now: Optional[datetime]) -> datetime:
+    return now if now is not None else _ai().state().clock()
+
+
+def _hot_rows(db, name: str, fp: Optional[str], scope_end: datetime, now: Optional[datetime] = None):
+    """(id, time, action) of the rows of ``name`` before ``scope_end`` (with a time), as row_matches decides; not
+    those that must stay as they are (a compliance case's rows: retention.register_keep_as_is), which an erase
+    leaves unchanged."""
+    from app.core import retention
     from app.core.models import AuditLog as A
     found = db.query(A.id, A.timestamp, A.action, A.username, A.recorded).filter(
-        pe.audit_matches(A, name, fp), A.timestamp.isnot(None), A.timestamp < scope_end).all()
+        *retention.changeable(A, _now(now), pe.audit_matches(A, name, fp), A.timestamp.isnot(None),
+                              A.timestamp < scope_end)).all()
     return [(i, t, a) for i, t, a, u, r in found if pe.row_matches({"username": u, "recorded": r}, name, fp)]
 
 
-def hot_hours(db, view, name: str, scope_end: datetime, fp: Optional[str] = None) -> List[datetime]:
+def hot_hours(db, view, name: str, scope_end: datetime, fp: Optional[str] = None,
+              now: Optional[datetime] = None) -> List[datetime]:
     """The sealed hours before ``scope_end`` that hold rows of ``name`` as rows (not archived), oldest first."""
     ai = _ai()
     out = set()
-    for _i, t, _a in _hot_rows(db, name, fp, scope_end):
+    for _i, t, _a in _hot_rows(db, name, fp, scope_end, now):
         h = ai.hour_floor(t)
         if view.entry_for(h) is None or view.archived_part(h) is not None:
             continue
@@ -245,14 +254,15 @@ def hot_hours(db, view, name: str, scope_end: datetime, fp: Optional[str] = None
     return sorted(out)
 
 
-def before_first(db, view, name: str, fp: Optional[str] = None) -> Optional[Tuple[datetime, int]]:
+def before_first(db, view, name: str, fp: Optional[str] = None,
+                 now: Optional[datetime] = None) -> Optional[Tuple[datetime, int]]:
     """(the chain's first hour, how many rows of ``name`` are dated before it) when there are any, else None. No seal
     covers such rows (verify: row-before-genesis), so none can bind an erase of them: hot_hours leaves them out, and
     the erase must not complete without them."""
     first = view.first_hour()
     if first is None:
         return None
-    n = len(_hot_rows(db, name, fp, first))
+    n = len(_hot_rows(db, name, fp, first, now))
     return (first, n) if n else None
 
 
@@ -266,14 +276,15 @@ def _held_before_first(findings: Dict[str, str], seq: int, found: Tuple[datetime
     return held_by("row-before-genesis")
 
 
-def _hot_newest(db, name: str, fp: Optional[str], scope_end: datetime, protected: frozenset) -> tuple:
-    rows = _hot_rows(db, name, fp, scope_end)
+def _hot_newest(db, name: str, fp: Optional[str], scope_end: datetime, protected: frozenset,
+                now: Optional[datetime] = None) -> tuple:
+    rows = _hot_rows(db, name, fp, scope_end, now)
     newest = max((t for _i, t, _a in rows), default=None)
     newest_p = max((t for _i, t, a in rows if a in protected), default=None)
     return newest, newest_p
 
 
-def scan_day(w, day, name: str, fp: Optional[str] = None) -> tuple:
+def scan_day(w, day, name: str, fp: Optional[str] = None, now: Optional[datetime] = None) -> tuple:
     """(rows of ``name``, newest of them, newest protected one) in ``day``'s blocks, each part read and checked.
     A row of the name that an erase seal lists as erased already is a finding, as in an hour of rows (erase_hour):
     the day is not erased. Raises NotVerified."""
@@ -288,17 +299,26 @@ def scan_day(w, day, name: str, fp: Optional[str] = None) -> tuple:
     protected = ai.protected_names()
     for part in sorted(entry.parts, key=lambda p: p.first_hour):
         reader = arc.PartReader(db, view, day, part)
-        for row in reader.rows():
-            if pe.row_matches(row, name, fp):
-                if str(row["id"]) in view.erased_rows:
-                    raise arc.NotVerified("unjustified", f"a row of {day.isoformat()} that holds the name is listed "
-                                                         "as erased already", day.isoformat())
-                count += 1
-                t = row["timestamp"]
-                newest = t if newest is None or t > newest else newest
-                if row.get("action") in protected:
-                    newest_p = t if newest_p is None or t > newest_p else newest_p
+        seen = {}
+
+        def of_the_name():
+            for row in reader.rows():
+                if pe.row_matches(row, name, fp):
+                    if str(row["id"]) in view.erased_rows:
+                        raise arc.NotVerified("unjustified", f"a row of {day.isoformat()} that holds the name is "
+                                                             "listed as erased already", day.isoformat())
+                    seen[row["id"]] = (row["timestamp"], row.get("action"))
+                    yield row
+        # A compliance case's rows stay as they are: not counted, and not erased (erase_day leaves them too).
+        kept = arc.kept_as_is(db, of_the_name(), now if now is not None else w.st.clock())
         reader.finish()
+        for row_id, (t, action) in seen.items():
+            if row_id in kept:
+                continue
+            count += 1
+            newest = t if newest is None or t > newest else newest
+            if action in protected:
+                newest_p = t if newest_p is None or t > newest_p else newest_p
     return count, newest, newest_p
 
 
@@ -317,6 +337,16 @@ def _detail(hour: Optional[datetime], seq: int, d: dict, policy_seq: int, throug
     return {"hour": fmt.hour_text(hour) if hour is not None else None, "request_seq": seq,
             "request_id": d.get("request"), "placeholder": d.get("placeholder"), "policy_seq": policy_seq,
             "bytes_now": int(nbytes), "through": through, "final": bool(final), "rows": rows}
+
+
+def _kept_in_hour(db, hour: datetime, now: datetime) -> set:
+    """The ids of the rows of ``hour`` that must stay as they are (retention.register_keep_as_is)."""
+    from app.core import retention
+    from app.core.models import AuditLog as A
+    clause = retention.kept_as_is(A, now)
+    if clause is None:
+        return set()
+    return {i for (i,) in db.query(A.id).filter(A.timestamp >= hour, A.timestamp < hour + HOUR, clause).all()}
 
 
 def erase_hour(w, seq: int, d: dict, name: str, hour: datetime, *, policy_seq: int, through: str,
@@ -348,7 +378,9 @@ def erase_hour(w, seq: int, d: dict, name: str, hour: datetime, *, policy_seq: i
                             "was erased", nv.kind) from None
         raise NotErased(f"the rows of {fmt.hour_text(hour)} no longer give its seal; nothing in it was erased",
                         "rows-altered") from None
-    rows = [r for r in ai.iter_rows(db, hour, hour + HOUR) if pe.row_matches(r, name, fp)]
+    # A compliance case's rows stay as they are (retention.register_keep_as_is): they are not erased.
+    kept = _kept_in_hour(db, hour, _now(now))
+    rows = [r for r in ai.iter_rows(db, hour, hour + HOUR) if pe.row_matches(r, name, fp) and r["id"] not in kept]
     if not rows or any(str(r["id"]) in view.erased_rows for r in rows):
         raise NotErased(f"rows of {fmt.hour_text(hour)} that hold the name are listed as erased already",
                         "unjustified")
@@ -356,7 +388,7 @@ def erase_hour(w, seq: int, d: dict, name: str, hour: datetime, *, policy_seq: i
     db.flush()
     c_prev = {}
     for r in ai.iter_rows(db, hour, hour + HOUR):
-        if not pe.row_matches(r, name, fp):
+        if not pe.row_matches(r, name, fp) or r["id"] in kept:
             continue
         c_prev[r["id"]] = fmt.commitment(r["seal_nonce"], r)
         new = erased_values(r, name, d["placeholder"], templates)
@@ -401,9 +433,17 @@ def erase_day(w, seq: int, d: dict, name: str, day, *, policy_seq: int, through:
         for part in sorted(entry.parts, key=lambda p: p.first_hour):
             reader = arc.PartReader(db, view, day, part)
             # A row of the name listed as erased already: scan_day has refused the day (it reads every day at its
-            # archive seal before any unit runs).
-            touched = {r["id"]: r["timestamp"] for r in reader.rows() if pe.row_matches(r, name, fp)}
+            # archive seal before any unit runs). A compliance case's rows stay as they are.
+            found = {}
+
+            def of_the_name():
+                for r in reader.rows():
+                    if pe.row_matches(r, name, fp):
+                        found[r["id"]] = r["timestamp"]
+                        yield r
+            kept = arc.kept_as_is(db, of_the_name(), now)
             reader.finish()
+            touched = {i: t for i, t in found.items() if i not in kept}
             if touched:
                 picked[part.part] = touched
         for touched in picked.values():
@@ -551,7 +591,9 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
                                        "by": "database", "user_id": None})
             if row is not None and row.status != pe.COMPLETED:
                 row.status = pe.CANCELLED
-                row.name_token = None
+                # Its sealed name stays while a registered rule holds deletions back (pe.sweep_names deletes it).
+                if pe.rule_waits(db, now) is None:
+                    row.name_token = None
         return DONE, 0, None, None
     why = pe.holder(db, name, now) or pe.rule_waits(db, now)
     if why:
@@ -570,7 +612,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
     scope_end = fmt.parse_time_text(through) + HOUR
     cache = cache if cache is not None else {}
     if "before_first" not in cache:
-        cache["before_first"] = before_first(db, view, name, fp)
+        cache["before_first"] = before_first(db, view, name, fp, now)
     if cache["before_first"] is not None:
         return STOP, 0, None, _held_before_first(findings, seq, cache["before_first"])
     # The archived days are read first, a day per transaction, nothing written.
@@ -580,7 +622,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
         scan = st.erase_scans.get(key)
         if scan is None or scan[0] != view.archives[day].seq:
             try:
-                st.erase_scans[key] = (view.archives[day].seq,) + scan_day(w, day, name, fp)
+                st.erase_scans[key] = (view.archives[day].seq,) + scan_day(w, day, name, fp, now)
             except arc.NotVerified as nv:
                 if nv.kind == arc.LATER_FORMAT:
                     return WAIT, 0, None, (f"It waits: {day.isoformat()} is archived in a later release's block "
@@ -592,15 +634,15 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
     hours = cache.get("hours")
     fresh = hours is None
     if fresh:
-        hours = hot_hours(db, view, name, scope_end, fp)
+        hours = hot_hours(db, view, name, scope_end, fp, now)
     if len(with_rows) + len(hours) <= 1 and not fresh:
-        hours = hot_hours(db, view, name, scope_end, fp)
-        cache["before_first"] = before_first(db, view, name, fp)
+        hours = hot_hours(db, view, name, scope_end, fp, now)
+        cache["before_first"] = before_first(db, view, name, fp, now)
         if cache["before_first"] is not None:
             return STOP, 0, None, _held_before_first(findings, seq, cache["before_first"])
     cache["hours"] = list(hours)
     if not started and pe.protected_minimum():
-        newest, newest_p = _hot_newest(db, name, fp, scope_end, ai.protected_names())
+        newest, newest_p = _hot_newest(db, name, fp, scope_end, ai.protected_names(), now)
         for day in with_rows:
             _s, _n, t, tp = st.erase_scans[(seq, day)]
             newest = max([x for x in (newest, t) if x is not None], default=None)
@@ -716,6 +758,10 @@ def run_job(p):
                 del st.erase_scans[key]
     if findings:
         ai.report_failures(st, p.session_factory, findings)
+    # The sealed names of erases that ended while a rule held deletions back go once nothing holds them.
+    if p.time_left():
+        with p.transaction() as db:
+            pe.sweep_names(db, st.view, p.now)
     for done in finished:
         result.cleared += done["other_rows"]
         pe.tell_administrators("completed", done)

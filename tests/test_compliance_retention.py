@@ -47,6 +47,7 @@ def env(monkeypatch):
     monkeypatch.setattr(reg, "_deployment_settings", lambda: settings)
     monkeypatch.setattr(retention, "_settings", lambda: settings)
     monkeypatch.setattr(retention, "KEEP_RULES", {"audit_logs": [cr.case_rows_kept, cr.compliance_rows_kept]})
+    monkeypatch.setattr(retention, "AS_IS_RULES", {"audit_logs": [cr.case_rows_kept]})
     return settings
 
 

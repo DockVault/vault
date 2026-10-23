@@ -71,6 +71,7 @@ class Env:
         monkeypatch.setattr(reg, "_deployment_settings", lambda: self.settings)
         monkeypatch.setattr(retention, "_settings", lambda: self.settings)
         monkeypatch.setattr(retention, "KEEP_RULES", {})
+        monkeypatch.setattr(retention, "AS_IS_RULES", {})
         monkeypatch.setattr(sc, "announce", lambda *a, **k: None)
         self.engine = sa.create_engine(f"sqlite:///{tmp / 'audit.db'}")
         copies = sa.MetaData()

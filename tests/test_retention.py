@@ -57,6 +57,9 @@ def env(monkeypatch):
     monkeypatch.setattr(reg, "_deployment_settings", lambda: settings)
     monkeypatch.setattr(retention, "_settings", lambda: settings)
     monkeypatch.setattr(retention, "KEEP_RULES", {})
+    # Legal holds and open cases (their own tests: tests/test_legal_holds_and_the_audit_log.py) hold nothing here.
+    from app.core import person_erase
+    monkeypatch.setattr(person_erase, "WAIT_RULES", [])
     return settings
 
 

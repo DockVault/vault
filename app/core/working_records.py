@@ -12,7 +12,8 @@
 
 The log-access file's size (LOG_PULL_SINK_MAX_MB, app/services/log_sink.py) is listed here too, so the Settings
 page can say how much of the server's output it keeps. These jobs are not stopped by the hold switch: they are
-working records, not logs.
+working records, not logs. They wait while a legal hold stands or a compliance case is open (the rules registered
+with person_erase.register_wait), asked in each batch's transaction.
 """
 from __future__ import annotations
 
@@ -101,6 +102,13 @@ def old_notification_conditions(model, now: datetime, days: int) -> list:
     return [model.created_at < now - timedelta(days=days)]
 
 
+def _waits():
+    """What holds these deletions back, asked in each batch's transaction: the rules registered with
+    person_erase.register_wait (a legal hold stands, or a compliance case is open)."""
+    from app.core import person_erase
+    return person_erase.rule_waits
+
+
 def prune_invitations(p, *, model=None):
     """Invitations that ended 30 days ago. The model is a parameter so the real condition can run against a
     throwaway schema."""
@@ -108,7 +116,7 @@ def prune_invitations(p, *, model=None):
     from app.core.models import AccountInvitation
     model = model or AccountInvitation
     return p.delete_in_batches(model, retention.deletable(model, p.now, *ended_invitation_conditions(model, p.now)),
-                               model.expires_at)
+                               model.expires_at, waits=_waits())
 
 
 def prune_one_time_proofs(p, *, models=None):
@@ -120,7 +128,8 @@ def prune_one_time_proofs(p, *, models=None):
         if not p.time_left():
             break
         done = p.delete_in_batches(
-            model, retention.deletable(model, p.now, *ended_one_time_conditions(model, p.now)), model.expires_at)
+            model, retention.deletable(model, p.now, *ended_one_time_conditions(model, p.now)), model.expires_at,
+            waits=_waits())
         result.add(done.deleted, done.oldest, done.newest)
     return result
 
@@ -138,7 +147,8 @@ def prune_notifications(p, *, model=None):
     if not days:
         return retention.JobResult()
     return p.delete_in_batches(
-        model, retention.deletable(model, p.now, *old_notification_conditions(model, p.now, days)), model.created_at)
+        model, retention.deletable(model, p.now, *old_notification_conditions(model, p.now, days)), model.created_at,
+        waits=_waits())
 
 
 def notifications_kept() -> str:

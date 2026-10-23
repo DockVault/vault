@@ -209,13 +209,18 @@ def holder(db, name: str, now: datetime) -> Optional[str]:
 
 
 # Rules other parts of the app register (legal holds, open cases): rule(db, now) -> why every erase waits, or None.
+# The modules that register them are imported with this one (WAIT_MODULES, at its end), so no path that asks
+# rule_waits can run without them.
 WAIT_RULES: List[Callable] = []
+WAIT_MODULES: tuple = ("app.core.compliance_retention",)
 
 
 def register_wait(rule: Callable) -> Callable:
-    """Make every erase wait while ``rule(db, now)`` returns a reason (words), not None. Rules of the compliance
-    branch (legal holds, open cases) register here; every deletion path of the erase checks them, through
-    waits()."""
+    """Make every erase wait while ``rule(db, now)`` returns a reason (words), not None: legal holds and open cases
+    (app/core/compliance_retention.py holds_back) register here. Every path of the audit log and the records that
+    changes or deletes what they may need asks rule_waits in the transaction that would change or delete: an
+    erase's units and its last step, the removal of earlier values, the shortening of addresses, the deletion of
+    ended invitations, ended one-time proofs and old notifications, and of an ended erase's sealed name."""
     if rule not in WAIT_RULES:
         WAIT_RULES.append(rule)
     return rule
@@ -622,13 +627,21 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
     has = holder(db, name, now)
     fp = signin_fingerprint(name, st.cfg())
     mine = audit_matches(A, name, fp)
-    times, undated = None, 0
+    times, undated, kept = None, 0, 0
     try:
+        from app.core import retention
         with db.begin_nested():
-            dated = db.query(A.username, A.recorded, A.timestamp).filter(mine, A.timestamp.isnot(None)).all()
+            # A compliance case's rows that must be kept stay as they are: counted apart (retention.kept_as_is).
+            dated = db.query(A.username, A.recorded, A.timestamp).filter(
+                *retention.changeable(A, now, mine, A.timestamp.isnot(None))).all()
             times = [t for u, r, t in dated if row_matches({"username": u, "recorded": r}, name, fp)]
             undated = db.query(func.count()).select_from(A).filter(A.username == name,
                                                                    A.timestamp.is_(None)).scalar() or 0
+            clause = retention.kept_as_is(A, now)
+            if clause is not None:
+                kept = sum(1 for u, r in db.query(A.username, A.recorded).filter(mine, A.timestamp.isnot(None),
+                                                                                  clause).all()
+                           if row_matches({"username": u, "recorded": r}, name, fp))
     except Exception:  # noqa: BLE001 -- too slow to count in a request: the erase counts them as it runs
         times = None
     placeholder = PREFIX + "00000000"
@@ -646,6 +659,8 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
                    "a name typed at a failed sign-in recorded as a fingerprint under an earlier fingerprint key"]
     if undated:
         not_reached.append(f"{undated} audit rows with no time")
+    if kept:
+        not_reached.append(f"{kept} audit rows of a compliance case whose records must be kept, which stay as they are")
     return {
         "refused": has,
         "audit_rows": len(times) if times is not None else None,
@@ -774,7 +789,10 @@ def _end_row(db, row, request_id, placeholder, actor, now):
     from app.services.audit_logger import AuditLogger
     if row is not None:
         row.status = CANCELLED
-        row.name_token = None
+        # The sealed name goes with the cancel; while a registered rule holds deletions back (a legal hold, an open
+        # case) it stays, sealed, until the erase job deletes it once nothing does (sweep_names).
+        if rule_waits(db, now) is None:
+            row.name_token = None
         row.decided_by = getattr(actor, "id", None)
         row.decided_by_name = getattr(actor, "username", None)
         row.decided_at = now
@@ -801,6 +819,28 @@ def cancel_while_stopped(db, request_id, actor, st=None) -> dict:
     row = db.get(EraseRequest, fmt.as_uuid(request_id))
     _end_row(db, row, request_id, view.requests[seq].get("placeholder"), actor, st.clock())
     return entry_of(row, view) if row is not None else {"id": str(request_id), "status": CANCELLED}
+
+
+def sweep_names(db, view, now: datetime) -> int:
+    """Delete the sealed name of every erase the chain holds as ended (cancelled or completed) whose row still keeps
+    it, once no registered rule holds deletions back; in ``db``'s transaction (the caller commits). Returns how many.
+    A row the chain holds no request of, or one it still holds waiting, keeps its name."""
+    from app.core.models import EraseRequest
+    rows = db.query(EraseRequest).filter(EraseRequest.name_token.isnot(None),
+                                         EraseRequest.status.in_((CANCELLED, COMPLETED))).all()
+    if not rows or rule_waits(db, now) is not None:
+        return 0
+    pending = view.pending_requests()
+    gone = 0
+    for row in rows:
+        try:
+            seq = held_request(view, row.id)
+        except LookupError:
+            continue
+        if seq not in pending:
+            row.name_token = None
+            gone += 1
+    return gone
 
 
 def _iso(v) -> Optional[str]:
@@ -908,3 +948,12 @@ def tell_administrators(event: str, facts: dict, by: Optional[str] = None) -> No
                                         {"change": body, "by": by or "", "when": api._change_time_text()})
     except Exception as exc:  # noqa: BLE001
         registry._say(f"Warning: the administrators were not told of an erase ({type(exc).__name__})")
+
+
+def _load_wait_modules() -> None:
+    import importlib
+    for name in WAIT_MODULES:
+        importlib.import_module(name)
+
+
+_load_wait_modules()

@@ -14,13 +14,24 @@ the maximum age and the size cap alike:
 After that the rows follow the audit log's retention like any other. The floor is enforced here, by the
 pruner's filters, rather than by a trigger on the busiest table: the pruner is the only thing that deletes
 audit rows.
+
+A case's rows are also kept as they are, where they are (retention.register_keep_as_is): the audit archive leaves
+a day that holds one as rows, and a per-person erase, a removal of earlier values or the shortening of addresses
+leaves them unchanged.
+
+What every such path waits for (person_erase.register_wait): while a legal hold stands or a case is open, an
+erase, a removal of earlier values, the shortening of addresses, and the deletion of ended invitations, ended
+one-time proofs, old notifications and the sealed name of an erase that ended wait (holds_back), checked in the
+transaction that would change or delete, in its turn with the holds and cases (legal_holds.take_turn).
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Optional
 
 from sqlalchemy import and_, exists, not_, or_
 
+from app.core import person_erase
 from app.core import retention
 
 
@@ -50,5 +61,23 @@ def compliance_rows_kept(model, now: datetime):
                 model.timestamp >= now - timedelta(days=floor_days()))
 
 
-retention.register_keep("audit_logs", case_rows_kept)
+def holds_back(db, now: datetime) -> Optional[str]:
+    """Why every path that changes or deletes what a hold or a case may need waits now, or None: a legal hold stands
+    (placed, neither released nor lapsed), or a case is open (not closed, whatever its state). Any hold and any case,
+    not only those of the rows a path would touch: an audit row of what was done in a held vault need not carry the
+    case. In the caller's transaction, after taking the turn of holds and deletions shared, so a hold or a case
+    committed before this check is seen, and one placed meanwhile waits until the caller's transaction ends."""
+    from app.core import legal_holds
+    from app.core.models import ComplianceCase, LegalHoldVault
+    legal_holds.take_turn(db, shared=True)
+    if db.query(LegalHoldVault.vault_id).filter(LegalHoldVault.released_at.is_(None),
+                                                 LegalHoldVault.lapsed_at.is_(None)).first() is not None:
+        return "a legal hold stands"
+    if db.query(ComplianceCase.id).filter(ComplianceCase.closed_at.is_(None)).first() is not None:
+        return "a compliance case is open"
+    return None
+
+
+retention.register_keep_as_is("audit_logs", case_rows_kept)
 retention.register_keep("audit_logs", compliance_rows_kept)
+person_erase.register_wait(holds_back)
