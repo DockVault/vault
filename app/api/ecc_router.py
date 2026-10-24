@@ -2971,8 +2971,10 @@ def _commit_rotation(db: Session) -> None:
 
 def _lowest_epoch_in_use(db, vault_id, vault):
     """The lowest DEK epoch still referenced by any file's CONTENT (File.encryption_metadata
-    key_version), any ZK folder's NAME (Folder.name_key_version), or the vault's OWN sealed
-    name/description (Vault.name_key_version). Returns None when nothing references an epoch.
+    key_version), any ZK folder's NAME (Folder.name_key_version), the vault's OWN sealed
+    name/description (Vault.name_key_version), or a file or folder a legal hold kept of the vault
+    (app/core/kept_tables.py: its kept rows were sealed under their epochs, and the hold keeps them so
+    they can still be opened). Returns None when nothing references an epoch.
 
     Files, folder names and the vault name have no shared "content epoch": each is sealed under
     whatever the DEK epoch was at seal time, so retiring a member key below any of these would make
@@ -3004,6 +3006,17 @@ def _lowest_epoch_in_use(db, vault_id, vault):
             min_in_use = v
     if getattr(vault, 'enc_name', None):
         v = _as_epoch(getattr(vault, 'name_key_version', None))
+        if min_in_use is None or v < min_in_use:
+            min_in_use = v
+    from app.core import kept_tables
+    kept_files, kept_folders = kept_tables.kept_epochs(db, vault_id)
+    for meta in kept_files:
+        meta = meta or {}
+        v = _as_epoch(meta.get('key_version', 1) if isinstance(meta, dict) else 1)
+        if min_in_use is None or v < min_in_use:
+            min_in_use = v
+    for value in kept_folders:
+        v = _as_epoch(value)
         if min_in_use is None or v < min_in_use:
             min_in_use = v
     return min_in_use

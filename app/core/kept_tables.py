@@ -440,6 +440,20 @@ def vault_keeps(db, vault_id) -> bool:
         db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid)))
 
 
+def kept_epochs(db, vault_id) -> tuple:
+    """(the encryption metadata of each kept file, the name epoch of each kept folder) of ``vault_id``: what they
+    were sealed under. A zero-knowledge vault's lowest epoch in use counts them (ecc_router._lowest_epoch_in_use), so
+    no retire drops a key a kept file or folder needs. Nothing on a database without the kept tables; on Postgres a
+    failing read is raised to the caller, which then retires nothing."""
+    from app.core.models import HeldFile, HeldFolder
+    if not _readable(db):
+        return [], []
+    vid = uuid.UUID(str(vault_id))
+    files = [r[0] for r in db.query(HeldFile.encryption_metadata).filter(HeldFile.vault_id == vid).all()]
+    folders = [r[0] for r in db.query(HeldFolder.name_key_version).filter(HeldFolder.vault_id == vid).all()]
+    return files, folders
+
+
 def totals(db) -> dict:
     """What the kept tables hold: {files, folders, bytes}. Kept bytes are on the deployment's disk but in no
     vault's counters."""

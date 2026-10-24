@@ -78,7 +78,7 @@ def _pg():
     try:
         from sqlalchemy import create_engine, text
         from sqlalchemy.engine import URL
-        from app.core.models import Base
+        from app.core.models import Base, KeptBase
         url = URL.create("postgresql+psycopg2", username="postgres", password=_PG_PW,
                          host="localhost", port=port, database=_PG_DB)
         engine, last = None, None
@@ -95,6 +95,9 @@ def _pg():
         if engine is None:
             pytest.skip("throwaway postgres never accepted a connection: %r" % last)
         Base.metadata.create_all(bind=engine)
+        # The kept tables of the legal holds, which every deployment has (the start refuses to serve without
+        # them) and the floor reads too.
+        KeptBase.metadata.create_all(bind=engine)
         yield engine
         engine.dispose()
     finally:

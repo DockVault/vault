@@ -4,7 +4,9 @@
     vault and what it holds as they were; after the release, while what the hold kept waits for its purge, the same
     (the answer says until when); after the purge the vault is deleted;
   * a zero-knowledge vault's older key versions are not retired while a hold stands on it: 409, recorded, the old
-    epoch's key still there; once the hold is released (and kept nothing) the retire runs.
+    epoch's key still there; once the hold is released (and kept nothing) the retire runs;
+  * the lowest epoch in use, read by the retire on the stack's Postgres, counts the epochs of the files and folders
+    a hold kept.
 
 test_hold_refusals.py covers the same offline; test_legal_holds_live.py the holds themselves.
 """
@@ -161,4 +163,43 @@ def test_older_key_versions_are_kept_while_a_hold_stands_on_a_zero_knowledge_vau
         assert admin.get(f"/ecc/vaults/{vid}/keys?key_version=1").json()["has_access"] is False
     finally:
         _forget(cases, [vid])
+        admin.delete_vault(vid)
+
+
+_FLOOR = """
+import uuid
+from app.api.ecc_router import _lowest_epoch_in_use
+from app.core.database import get_db_context
+from app.core.models import Vault
+with get_db_context() as db:
+    vault = db.get(Vault, uuid.UUID(VAULT_ID))
+    print("FLOOR=" + str(_lowest_epoch_in_use(db, vault.id, vault)))
+"""
+
+
+def _floor(vid):
+    from _account_change_helpers import in_api_container
+    out = in_api_container(f"VAULT_ID = '{vid}'\n" + _FLOOR)
+    return [ln for ln in out.stdout.splitlines() if ln.startswith("FLOOR=")][0][6:]
+
+
+def test_the_lowest_epoch_in_use_counts_kept_rows_on_postgres(admin):
+    # A nameless zero-knowledge vault with nothing in it: no epoch is in use (a sealed name would pin one).
+    ensure_ecc_keypair(admin)
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    try:
+        vid = create_zk_vault(admin, seal_name=False)["id"]
+    finally:
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+    try:
+        assert _floor(vid) == "None"
+        psql(f"INSERT INTO held_folders (id, vault_id, name_key_version, kept_reason, kept_at) "
+             f"VALUES (gen_random_uuid(), '{vid}', 3, 'deleted', now() AT TIME ZONE 'utc')")
+        assert _floor(vid) == "3"
+        psql(f"INSERT INTO held_files (id, vault_id, encryption_metadata, kept_reason, kept_at) "
+             f"VALUES (gen_random_uuid(), '{vid}', '{{\"key_version\": 2}}', 'replaced', "
+             f"now() AT TIME ZONE 'utc')")
+        assert _floor(vid) == "2"
+    finally:
+        _forget([], [vid])
         admin.delete_vault(vid)

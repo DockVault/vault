@@ -366,3 +366,46 @@ def test_the_retire_asks_under_the_vaults_row_lock_before_it_reads_the_floor():
     asked = source.index("hold_refusals.vault_keeping(db, locked.id)")
     assert source.index(".with_for_update().first())") < asked < source.index("_lowest_epoch_in_use(db, vault_id, locked)")
     assert asked < source.index("VaultKeyProof.dek_epoch < proof_floor")
+
+
+# --------------------------------------------------------------------------- the lowest epoch in use
+
+def test_the_lowest_epoch_in_use_counts_what_a_hold_kept(world):
+    """A retire keeps every key version at or above the lowest epoch in use. What a hold kept of the vault was
+    sealed under its epochs: the floor counts the kept files' content epochs and the kept folders' name epochs, so
+    no retire drops a key they need."""
+    v = m.Vault(id=uuid.uuid4(), owner_id=world.olga.id, type="zero_knowledge", key_wrapping_mode="direct",
+                dek_version=4)
+    world.db.add(v)
+    world.db.add(m.File(id=uuid.uuid4(), vault_id=v.id, name=None, storage_path=f"{v.id}/live", size_bytes=1,
+                        encryption_metadata={"key_version": 4}))
+    world.db.commit()
+    assert E._lowest_epoch_in_use(world.db, v.id, v) == 4
+    world.db.add(m.HeldFolder(id=uuid.uuid4(), vault_id=v.id, name_key_version=3, kept_reason="deleted",
+                              kept_at=NOW))
+    world.db.commit()
+    assert E._lowest_epoch_in_use(world.db, v.id, v) == 3
+    world.db.add(m.HeldFile(id=uuid.uuid4(), vault_id=v.id, storage_path=f"{v.id}/kept", size_bytes=1,
+                            encryption_metadata={"key_version": 2}, kept_reason="replaced", kept_at=NOW))
+    world.db.commit()
+    assert E._lowest_epoch_in_use(world.db, v.id, v) == 2
+    # A kept file with no recorded epoch was sealed before epochs were recorded: epoch 1, as for a live file.
+    world.db.add(m.HeldFile(id=uuid.uuid4(), vault_id=v.id, storage_path=f"{v.id}/old", size_bytes=1,
+                            encryption_metadata=None, kept_reason="deleted", kept_at=NOW))
+    world.db.commit()
+    assert E._lowest_epoch_in_use(world.db, v.id, v) == 1
+
+
+def test_only_this_vaults_kept_rows_count(world):
+    v = m.Vault(id=uuid.uuid4(), owner_id=world.olga.id, type="zero_knowledge", dek_version=5)
+    world.db.add(v)
+    world.db.add(m.HeldFile(id=uuid.uuid4(), vault_id=world.vault.id, storage_path="x", size_bytes=1,
+                            encryption_metadata={"key_version": 1}, kept_reason="deleted", kept_at=NOW))
+    world.db.commit()
+    assert E._lowest_epoch_in_use(world.db, v.id, v) is None
+    assert kept_tables.kept_epochs(world.db, v.id) == ([], [])
+
+
+def test_a_database_without_the_kept_tables_counts_none(monkeypatch):
+    """A stand-in session (no database behind it) reads no kept rows rather than failing."""
+    assert kept_tables.kept_epochs(SimpleNamespace(), uuid.uuid4()) == ([], [])
