@@ -33,10 +33,11 @@ the scope, the same in every seal of the run). When no unit is left, a last ``re
 ``audit_values_removed`` audit row; then a plain VACUUM of the tables it changed, within a time budget, so the old
 values leave the live tables' pages sooner (backups keep them).
 
-Rows a compliance case keeps as they are (retention.register_keep_as_is) are left by every unit. While any in the
-scope would change, the last seal waits: at the end of the scope the removal stays running and says so on its row,
-and once the case lets them go (rows as they are now, an archived day read again once a pass) it goes back to the
-first of them, changes them, and completes.
+Rows a compliance case keeps as they are (retention.register_keep_as_is) are left by every unit, and noted as the
+run passes them. While any in the scope would change, the last seal waits: at the end of the scope the removal stays
+running and says so on its row. Once the case lets them go (each noted row looked at again, an archived day read
+again once a pass), even before the run reaches the end of its scope, it goes back to the first of them, changes
+them, and completes; a row archived since it was passed is reached in its day.
 """
 from __future__ import annotations
 
@@ -549,9 +550,9 @@ def vetoed(st, session_factory) -> List[int]:
 
 
 _cursors: Dict[tuple, datetime] = {}
-# Per removal (_cursor_key), the rows its run left because a compliance case keeps them as they are: {id: time} of
-# rows, and {day: how many} of archived days. Kept in this process only: after a restart the run reads its scope
-# again from the start, as it does anyway.
+# Per removal (_cursor_key), the rows its run passed over or left because a compliance case keeps them as they are:
+# {id: time} of rows, noted as each step passes them, and {day: how many} of archived days. Kept in this process
+# only: after a restart the run reads its scope again from the start, as it does anyway.
 _kept_rows: Dict[tuple, Dict] = {}
 _kept_days: Dict[tuple, Dict] = {}
 
@@ -564,32 +565,55 @@ KEPT_WAIT = ("It waits: {n} rows in its scope are kept as they are for a complia
              "completes, once the case lets them go.")
 
 
-def kept_to_change(db, levels, before: datetime, ctx, now: datetime) -> Dict:
-    """{id: time} of the rows of audit_logs before ``before`` whose values the removal would change but which a
-    compliance case keeps as they are (retention.kept_as_is)."""
+def kept_to_change(db, levels, before: datetime, ctx, now: datetime, since: Optional[datetime] = None) -> Dict:
+    """{id: time} of the rows of audit_logs before ``before`` (and from ``since``, when given) whose values the
+    removal would change but which a compliance case keeps as they are (retention.kept_as_is)."""
     from app.core import retention
     from app.core.models import AuditLog
     clause = retention.kept_as_is(AuditLog, now)
     if clause is None:
         return {}
+    q = db.query(AuditLog).filter(*rw.prefilter(AuditLog, levels), AuditLog.timestamp.isnot(None),
+                                  AuditLog.timestamp < before, clause)
+    if since is not None:
+        q = q.filter(AuditLog.timestamp >= since)
     out = {}
-    for row in db.query(AuditLog).filter(*rw.prefilter(AuditLog, levels), AuditLog.timestamp.isnot(None),
-                                         AuditLog.timestamp < before, clause):
+    for row in q:
         values = {c.key: getattr(row, c.key) for c in AuditLog.__table__.columns}
         if rw.reduced(values, levels, ctx) is not None:
             out[row.id] = row.timestamp
     return out
 
 
+def _let_go(db, rows: Dict, levels, ctx) -> List[datetime]:
+    """The times of ``rows`` ({id: time}: rows a case kept when the run passed them, and keeps no longer) that the run
+    must go back for: each still a row of audit_logs that holds a value the removal changes, and each no longer one
+    (archived since: the run reads its day again; or deleted, and then it finds nothing there)."""
+    from app.core.models import AuditLog
+    ids = list(rows)
+    present = {}
+    for start in range(0, len(ids), 500):
+        for row in db.query(AuditLog).filter(AuditLog.id.in_(ids[start:start + 500])):
+            present[row.id] = row
+    out = []
+    for row_id, t in rows.items():
+        row = present.get(row_id)
+        if row is None or rw.reduced({c.key: getattr(row, c.key) for c in AuditLog.__table__.columns},
+                                     levels, ctx) is not None:
+            out.append(t)
+    return out
+
+
 def _finished_or_waiting(w, key, scope: "rw.Scope", levels, before: datetime, ctx, now: datetime, cursor: datetime,
                          cache: dict) -> Optional[tuple]:
     """At the end of the scope: None when nothing a case keeps is left (the removal completes), else what step
-    returns: SCANNED with the cursor moved back to rows a case has let go since, or WAIT while it keeps them."""
+    returns: SCANNED with the cursor moved back to rows a case has let go since the run passed them, or WAIT while it
+    keeps them."""
     ai = _ai()
     db = w.db
     rows_now = kept_to_change(db, levels, before, ctx, now)
     left = _kept_rows.get(key) or {}
-    gone = [t for i, t in left.items() if i not in rows_now]
+    gone = _let_go(db, {i: t for i, t in left.items() if i not in rows_now}, levels, ctx)
     days = _kept_days.get(key) or {}
     if days and not cache.get("days_read"):
         # Archived days holding rows a case keeps are read again once a pass: the case may have let them go.
@@ -599,12 +623,12 @@ def _finished_or_waiting(w, key, scope: "rw.Scope", levels, before: datetime, ct
             if still < n:
                 gone.append(arc_day_start(day))
             days[day] = still
+    # The rows a case still keeps stay noted, wherever the run goes from here; those it let go are reached again.
+    _kept_rows[key] = dict(rows_now)
     if gone:
         back = ai.hour_floor(min(gone))
         if back < cursor:
-            _kept_rows.pop(key, None)
             return SCANNED, 0, back, None, None
-    _kept_rows[key] = rows_now
     kept = len(rows_now) + sum(days.values())
     if kept:
         return WAIT, 0, cursor, None, KEPT_WAIT.format(n=kept)
@@ -697,8 +721,14 @@ def step(p, w, seq: int, findings: Dict[str, str], cache: Optional[dict] = None)
                      retention.changeable(AuditLog, now, *rw.prefilter(AuditLog, levels)),
                      request_seq=seq, through=fmt.hour_text(before - HOUR))
     key = _cursor_key(st, seq)
+    start = cursor
     try:
         outcome, cursor, changed, _oldest, _newest, unit = rw.step(p, w, scope, cursor)
+        if outcome != rw.FINISHED and cursor > start:
+            # The rows a case keeps as they are in what this step passed over, noted now: the run comes back to each
+            # once the case lets it go, even when that happens before the run reaches the end of its scope.
+            _kept_rows.setdefault(key, {}).update(
+                kept_to_change(db, levels, min(cursor, before), ctx, now, since=start))
         days = _kept_days.setdefault(key, {})
         days.update(scope.kept_archived)
         for day in [d for d, n in days.items() if not n]:

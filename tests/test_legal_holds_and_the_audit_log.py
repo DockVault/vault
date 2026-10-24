@@ -502,6 +502,65 @@ def test_a_removal_leaves_a_cases_rows_that_must_be_kept_as_they_are_until_the_c
     assert failures(env.verify()) == []
 
 
+def _steps(env, n):
+    """A pass with time for ``n`` transactions of a job, so that a run can be taken a unit at a time."""
+    p = retention.Pass(env.session, now=env.clock())
+    left = {"n": n}
+
+    def time_left():
+        left["n"] -= 1
+        return left["n"] >= 0
+    p.time_left = time_left
+    return p
+
+
+def _removal_past_its_first_unit(env, monkeypatch, day):
+    """A row a case keeps and a row beside it in the last hour of a day, ``day`` days ago (so a block of that day
+    would end where the run stands after it), a row in a later day, and a removal whose run has taken the first day
+    only (the archive idle): it changed the row beside, and left the kept row as it is. Returns the real archive job
+    too."""
+    real = arc.archive_job
+    monkeypatch.setattr(arc, "archive_job", lambda p: retention.JobResult())
+    case = _case(env, closed_days=30)
+    kept = env.put(_at(day, 23), case_id=case, details={"email": "a@example.com"})
+    gone = env.put(_at(day, 23, 10), details={"email": "b@example.com"})
+    later = env.put(_at(1, 3), details={"email": "c@example.com"})
+    env.run_until_sealed()
+    asked = env.ask_removal()
+    waiting = _case(env)                                      # its delay runs while an open case holds it back
+    env.week()
+    _close(env, waiting, FLOOR_DAYS + 1)
+    vr.run_job(_steps(env, 1))
+    assert env.get(gone).ip_address is None and env.get(kept).ip_address == "203.0.113.9"
+    assert env.get(later).ip_address == "203.0.113.9"
+    assert env.removal_row(asked["id"]).status == vr.RUNNING
+    return case, kept, later, asked, real
+
+
+def test_a_removal_goes_back_to_a_row_a_case_let_go_after_its_run_passed_it(env, monkeypatch):
+    """The case lets the kept row go before the run reaches the end of its scope, so the run never waits there for it:
+    it goes back to the row, changes it, and completes."""
+    case, kept, later, asked, _real = _removal_past_its_first_unit(env, monkeypatch, 3)
+    _close(env, case, FLOOR_DAYS + 1)
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(kept).ip_address is None and "email" not in (env.get(kept).details or {})
+    assert env.get(later).ip_address is None
+    assert failures(env.verify()) == []
+
+
+def test_a_removal_reaches_a_row_a_case_let_go_in_the_day_the_archive_moved_it_to(env, monkeypatch):
+    """The case lets the kept row go, and the archive moves its day into a block, after the run passed it: the run
+    goes back to that day, changes the row in its block, and completes."""
+    case, kept, later, asked, real = _removal_past_its_first_unit(env, monkeypatch, 120)
+    _close(env, case, FLOOR_DAYS + 1)
+    real(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept) is None and _archived_rows(env)[kept]["ip_address"] == "203.0.113.9"
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    row = _archived_rows(env)[kept]
+    assert row["ip_address"] is None and "email" not in json.loads(row["details"] or "{}")
+    assert failures(env.verify()) == []
+
+
 # --------------------------------------------------------------------------- the shortening of addresses
 
 def test_the_shortening_waits_while_a_hold_stands_over_rows_and_archived_days_and_runs_after(env30):
