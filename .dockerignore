@@ -79,5 +79,5 @@ dockvault.py
 # CI / repo config (Dependabot etc.) — not part of the runtime image.
 .github/
 # The previous AUDIT_CHAIN_KEY of each volume set, kept by `dockvault.py audit change-key` until the chain has
-# moved off it (and moved aside by Reset).
+# moved off it (and moved aside by Reset), and the lock a key change holds.
 .audit-chain-key.*

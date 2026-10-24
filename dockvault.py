@@ -238,6 +238,7 @@ def docker_available(run=subprocess.run):
 
 # --- setup: secrets + .env authoring (the pure, testable core) --------------------------------
 import base64   # noqa: E402
+import contextlib  # noqa: E402
 import glob     # noqa: E402
 import hashlib  # noqa: E402
 import json     # noqa: E402
@@ -1900,6 +1901,9 @@ def clear_volume(volume, run=subprocess.run):
 KEPT_CHAIN_KEY = ".audit-chain-key.previous"
 KEPT_CHAIN_KEY_REMOVED = ".audit-chain-key.removed-"
 KEPT_CHAIN_KEY_BUNDLE = "audit-chain-key.previous"
+# Held by a key change, and by the key an update offers, from before either reads AUDIT_CHAIN_KEY in .env until it
+# ends: another one started meanwhile is refused at once (an empty file, left in place).
+CHAIN_KEY_LOCK = ".audit-chain-key.lock"
 
 
 def kept_chain_key_path(root, prefix):
@@ -1908,6 +1912,43 @@ def kept_chain_key_path(root, prefix):
     if not (valid_volume_prefix(prefix) and prefix == prefix.strip()):
         raise ValueError("VAULT_VOLUME_PREFIX %r is not a volume set's name" % (prefix,))
     return os.path.join(root, "%s.%s" % (KEPT_CHAIN_KEY, prefix))
+
+
+class LockBusy(Exception):
+    """The lock asked for is held by another process."""
+
+
+@contextlib.contextmanager
+def held_lock(path):
+    """An exclusive lock on the file `path` (created mode 600 when missing, and left in place) for a `with` block.
+    Never waits: LockBusy when another process holds it. The system releases it when the process ends, however it
+    ends."""
+    flags = os.O_RDWR | os.O_CREAT
+    fd = os.open(path, flags, 0o600) if os.name != "nt" else os.open(path, flags)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise LockBusy(str(exc))
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise LockBusy(str(exc))
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def kept_chain_key_text(text):
@@ -6346,9 +6387,22 @@ class DockVault:
         if self._is_locked() or not os.path.exists(self._env_path()):
             self._fail("there is no plaintext .env to write AUDIT_CHAIN_KEY into (unlock it first: python "
                        "dockvault.py unlock). Nothing changed.")
+        with self._chain_key_lock("the update"):
+            self._offer_chain_key_held(interactive)
+
+    def _offer_chain_key_held(self, interactive):
+        """The key an update offers, under the key change's lock (see _offer_chain_key): .env read again once the
+        lock is held, and once more after the answer."""
+        pal = self.pal
+        if (self._load_env().get("AUDIT_CHAIN_KEY") or "").strip():
+            return
         if interactive and not confirm("Give the audit log's integrity chain a key of its own (AUDIT_CHAIN_KEY, "
                                        "recommended)?", pal, default=True):
             print(pal.paint("  Left unset: the chain's key is derived from ENCRYPTION_KEY.", "yellow"))
+            return
+        if (self._load_env().get("AUDIT_CHAIN_KEY") or "").strip():
+            # Written into .env (by hand) while this waited for its answer: never written over.
+            print(pal.paint("  AUDIT_CHAIN_KEY was set in .env meanwhile: left as it is.", "yellow"))
             return
         # On the disk before the deployment starts under it: once the chain has moved to the key, it must be in
         # .env whatever happens to the power.
@@ -6892,17 +6946,45 @@ class DockVault:
         the command that finishes the earlier one, and the kept file is never written over. Another set's kept file
         is that set's, and changes nothing here.
 
+        Two runs at once (or a run and an update offering a key) are never let through: the lock CHAIN_KEY_LOCK is
+        taken before .env is read, the second is refused at once, and .env is read again after the confirmation.
+
         Refused, with nothing written, while .env is sealed by `lock` (it holds every secret: a .env written now
         would hold only the new key, and a lock after it would seal that over the real one) or is not there. The
         new key is on the disk, in .env, before the stack is recreated under it (_set_env_key); when it cannot be
         written, .env is put back as it was."""
-        pal = self.pal
         if self._is_locked():
             self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run "
                        "audit change-key again. Nothing changed.")
         if not os.path.exists(self._env_path()):
             self._fail("there is no .env in %s: run audit change-key where the deployment's .env is. Nothing "
                        "changed." % self.root)
+        with self._chain_key_lock("audit change-key"):
+            self._audit_change_key_held(args)
+
+    @contextlib.contextmanager
+    def _chain_key_lock(self, what):
+        """The lock a key change, and the key an update offers, hold from before they read AUDIT_CHAIN_KEY until
+        they end (CHAIN_KEY_LOCK): with two at once, the second would keep a stale old key aside and write its new
+        key over the one the first has just moved the chain to, which would then be in no file. Refused at once
+        when another holds it."""
+        path = os.path.join(self.root, CHAIN_KEY_LOCK)
+        try:
+            lock = held_lock(path)
+            lock.__enter__()
+        except LockBusy:
+            self._fail("another change of AUDIT_CHAIN_KEY (audit change-key, or an update writing one) is running on "
+                       "this host: wait for it to end, then run %s again. Nothing changed." % what)
+        except OSError as exc:
+            self._fail("could not take the lock %s (%s): nothing changed" % (path, exc))
+        try:
+            yield
+        finally:
+            lock.__exit__(None, None, None)
+
+    def _audit_change_key_held(self, args):
+        """audit change-key, under the key change's lock (see _audit_change_key)."""
+        pal = self.pal
         env = self._load_env()
         try:
             kept_path = kept_chain_key_path(self.root, volume_prefix(env))
@@ -6916,6 +6998,12 @@ class DockVault:
                                        default=False):
             print(pal.paint("  Nothing changed.\n", "yellow"))
             return
+        # .env read again once confirmed: a key or a set written into it meanwhile (by hand) would make the key kept
+        # aside below a stale one.
+        again = self._load_env()
+        if (again.get("AUDIT_CHAIN_KEY") or "").strip() != old or volume_prefix(again) != volume_prefix(env):
+            self._fail("AUDIT_CHAIN_KEY or VAULT_VOLUME_PREFIX in .env changed while this waited for its "
+                       "confirmation: run audit change-key again. Nothing changed.")
         kept = None
         if old:
             kept = kept_path

@@ -869,3 +869,116 @@ def test_a_reset_with_no_kept_key_moves_nothing(tmp_path, monkeypatch):
 def test_a_prefix_that_is_not_a_volume_sets_name_names_no_kept_file(tmp_path, prefix):
     with pytest.raises(ValueError):
         dv.kept_chain_key_path(str(tmp_path), prefix)
+
+
+# --------------------------------------------------------------------------- two key changes at once
+
+def test_a_key_change_started_while_another_waits_for_its_answer_is_refused_and_the_chains_key_stays_in_a_file(
+        tmp_path, monkeypatch, capsys):
+    """Two runs on one host. The one waiting at its confirmation holds the lock from before it read the key in .env:
+    the other, started meanwhile, is refused at once with nothing written, and the first then moves the chain with
+    the key it read. A stand-in for the server moves the chain only with the proof of the key it is under, as rekey
+    does: the chain's key is in .env or the kept file at every step."""
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    chain = {"in_force": env["AUDIT_CHAIN_KEY"]}
+
+    def server(tool):
+        def audit_tool(*args, input_text=None):
+            old = (input_text or "").strip()
+            current = _chain_key(tmp_path)
+            if chain["in_force"] == current:
+                return {"ok": False, "error": "already under the current key: nothing to do"}
+            if old != chain["in_force"]:
+                return {"ok": False, "error": "the key in force is not held"}
+            chain["in_force"] = current
+            return {"ok": True, "sealed": 9}
+        monkeypatch.setattr(tool, "_audit_tool", audit_tool)
+        monkeypatch.setattr(tool, "_recreate_stack", lambda build: True)
+        monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+
+    waiting = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    other = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    server(waiting)
+    server(other)
+    seen = {}
+
+    def confirm(prompt, pal, default=True):
+        before = (tmp_path / ".env").read_bytes()
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            other.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+        seen["refusal"] = " ".join(capsys.readouterr().out.split())
+        seen["unchanged"] = (tmp_path / ".env").read_bytes() == before and not _kept(tmp_path).exists()
+        return True
+    monkeypatch.setattr(dv, "confirm", confirm)
+    waiting.audit(dv.build_parser().parse_args(["audit", "change-key"]))
+    assert "another change of AUDIT_CHAIN_KEY" in seen["refusal"] and "Nothing changed" in seen["refusal"]
+    assert seen["unchanged"]
+    assert chain["in_force"] == _chain_key(tmp_path) != env["AUDIT_CHAIN_KEY"]
+    assert not _kept(tmp_path).exists()
+    # The lock is let go at the end: a later change goes on.
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: True)
+    other.audit(dv.build_parser().parse_args(["audit", "change-key"]))
+    assert chain["in_force"] == _chain_key(tmp_path)
+
+
+def test_an_update_offering_a_key_while_a_key_change_waits_is_refused_and_writes_nothing(tmp_path, monkeypatch,
+                                                                                          capsys):
+    """With no AUDIT_CHAIN_KEY yet there is no kept file: the lock alone keeps the update's offered key from being
+    written over the key a change is about to write (or the other way round)."""
+    _env_file(tmp_path)
+    lines = [ln for ln in (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
+             if not ln.startswith("AUDIT_CHAIN_KEY")]
+    (tmp_path / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    changing = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    updating = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    _on_set(changing, monkeypatch)
+    seen = {}
+
+    def confirm(prompt, pal, default=True):
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            updating._offer_chain_key(argparse.Namespace(no_chain_key=False), True, "0.34.0")
+        seen["refusal"] = " ".join(capsys.readouterr().out.split())
+        seen["key"] = _chain_key(tmp_path)
+        return True
+    monkeypatch.setattr(dv, "confirm", confirm)
+    changing.audit(dv.build_parser().parse_args(["audit", "change-key"]))
+    assert "another change of AUDIT_CHAIN_KEY" in seen["refusal"] and "run the update again" in seen["refusal"]
+    assert not seen["key"] and len(_chain_key(tmp_path)) == 64
+
+
+def test_a_key_written_into_env_while_the_change_waited_for_its_answer_refuses_it(tmp_path, monkeypatch, capsys):
+    """The key read before the confirmation must still be the one in .env after it: a key put there meanwhile (by
+    hand) would be the one the chain moves off, and the key kept aside a stale one. Refused, nothing written."""
+    _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, **k: pytest.fail("the chain was asked to move"))
+    meanwhile = dv.gen_hex(32)
+
+    def confirm(prompt, pal, default=True):
+        tool._set_env_key(tool._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % meanwhile)
+        return True
+    monkeypatch.setattr(dv, "confirm", confirm)
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key"]))
+    assert _chain_key(tmp_path) == meanwhile and not _kept(tmp_path).exists()
+    out = " ".join(capsys.readouterr().out.split())
+    assert "changed while this waited for its confirmation" in out and "Nothing changed" in out
+
+
+def test_the_key_an_update_offers_is_never_written_over_one_set_while_it_waited_for_its_answer(tmp_path, monkeypatch):
+    tool = _updating(tmp_path, monkeypatch)
+    lines = [ln for ln in (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
+             if not ln.startswith("AUDIT_CHAIN_KEY")]
+    (tmp_path / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    meanwhile = dv.gen_hex(32)
+
+    def confirm(prompt, pal, default=True):
+        tool._set_env_key(tool._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % meanwhile)
+        return True
+    monkeypatch.setattr(dv, "confirm", confirm)
+    tool._offer_chain_key(argparse.Namespace(no_chain_key=False), True, "0.34.0")
+    assert _chain_key(tmp_path) == meanwhile
