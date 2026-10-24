@@ -318,9 +318,19 @@ def after_record(engine, st, *, discard: bool = False, discard_from: Optional[in
                              f"--discard --from {refused[0]['seq']}.")
             state = {"chain": chain_state(view, record), "command": "after-record",
                      "seals": [[s["seq"], s["kind"], s["link"]] for s in seals], "waiting": waiting}
+        # The ack goes under the key in force where it goes (after the seals discarded, or after those accepted):
+        # held, or given with --old-key-file; never the current key in its place.
+        ack_kid = view.key_at(first - 1) if discard else view.key_in_force()
+        ack_key = held.get(ack_kid)
+        if ack_key is None:
+            lines.append(f"The ack seal goes under {ack_kid}, the key in force there, which this command does not "
+                         "hold: give it with --old-key-file.")
         if read:
             return {"state": token(state), "lines": lines}
         check_expected(state, expect)
+        if ack_key is None:
+            raise Refused(f"the ack seal goes under {ack_kid}, the key in force there, which this command does not "
+                          "hold: give it with --old-key-file. Nothing was written.")
         findings = [f for f in host.open_findings(record) if f[1] in AFTER_RECORD_KINDS]
         listed = [[kind, first_seen, last] for _t, kind, first_seen, last in findings]
         if discard:
@@ -334,7 +344,7 @@ def after_record(engine, st, *, discard: bool = False, discard_from: Optional[in
             discarded = [[s["seq"], s["kind"], s["link"]] for s in gone]
             row = host_audit_row(w.db, DISCARDED_ACTION, {"seals": [d[0] for d in discarded], "saved": saved})
             w.append("ack", detail={"acknowledges": [], "failures": listed, "rows": [], "discarded": discarded,
-                                    "by": "host", "user_id": None, "request": str(row.id)})
+                                    "by": "host", "user_id": None, "request": str(row.id)}, key=ack_key)
             mark = host.marker(prefix, set(), findings, bool(listed), now)
 
             def change(rec):
@@ -358,7 +368,7 @@ def after_record(engine, st, *, discard: bool = False, discard_from: Optional[in
         acked = sorted({s["seq"] for s in seals} | set(waiting))
         row = host_audit_row(w.db, ACCEPTED_ACTION, {"seals": acked, "failures": [k for k, _f, _l in listed]})
         w.append("ack", detail={"acknowledges": acked, "failures": listed, "rows": [], "discarded": [],
-                                "by": "host", "user_id": None, "request": str(row.id)})
+                                "by": "host", "user_id": None, "request": str(row.id)}, key=ack_key)
         mark = host.marker(view, set(acked), findings, bool(listed), now)
         unverified = [s for s in seals if s.get("unverified_key")]
 

@@ -147,6 +147,11 @@ class ChainBusy(Exception):
     """Another writer holds the chain lock."""
 
 
+class NotUnderKeyInForce(Exception):
+    """A seal would be written under a key other than the one in force at its position, which breaks the chain's
+    key sequence for good: refused, and the writer's transaction rolled back with nothing written."""
+
+
 # --------------------------------------------------------------------------- seals
 
 @dataclass
@@ -797,12 +802,39 @@ class ChainWriter:
 
     # -- writing
 
+    def key_in_force_here(self) -> Optional[str]:
+        """The key in force where the next seal goes: the view's, or the one a seal this writer wrote moved to;
+        None before the chain's first seal."""
+        kid = self.st.view.key_in_force() if self.st.view.position else None
+        for seal, _link in self.written:
+            if seal.kind in ("key", "genesis"):
+                kid = seal.key_id
+        return kid
+
     def append(self, kind: str, *, period_start=None, period_end=None, row_count=0, row_bytes=0, root_s=None,
                root_c=None, ids_dig=None, detail=None, row_ids=None, legacy_salt=None,
                key: Optional[keys.ChainKey] = None) -> Seal:
+        """Append a seal under ``key``: by default the key in force where it goes, held by this process (the
+        current key for the chain's first seal). While the chain is to move to a new current key on its own (from
+        the key derived from ENCRYPTION_KEY, at the sealer's next pass), a seal written meanwhile goes under the key
+        it is still under, and the move follows it. A seal under any other key than the one in force, but a key seal
+        that moves on from it, would break the key sequence for good: NotUnderKeyInForce, nothing written."""
         from app.core.models import AuditSeal
         view = self.st.view
-        key = key or self.st.current_key()
+        in_force = self.key_in_force_here()
+        if key is None:
+            if in_force is None:
+                key = self.st.current_key()
+            else:
+                key = self.st.keys_held().get(in_force)
+                if key is None:
+                    raise NotUnderKeyInForce(f"the chain is under {in_force}, a key this process does not hold: "
+                                             f"no {kind} seal is written under another (move the chain to the current "
+                                             "key first: dockvault.py audit rekey --old-key-file)")
+        if kind != "key" and in_force is not None and key.key_id != in_force:
+            raise NotUnderKeyInForce(f"a {kind} seal would be under {key.key_id}, not the key in force there "
+                                     f"({in_force}), which breaks the chain's key sequence for good: nothing is "
+                                     "written (move the chain to that key first: dockvault.py audit rekey)")
         prev_seq = view.position + len(self.written)
         prev_link = self.written[-1][1] if self.written else view.link_at(view.position)
         if _is_pg(self.engine):

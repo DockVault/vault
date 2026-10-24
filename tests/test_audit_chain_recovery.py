@@ -363,3 +363,97 @@ def test_after_record_accepts_another_writers_listed_seals_for_good(env):
     report = env.verify()
     assert "after-record" not in report.kinds("warning")
     assert any(f.kind == "acknowledged" and f"by host: seals {seq}" in f.message for f in report.findings)
+
+
+# --------------------------------------------------------------------------- seals while the chain is to move
+
+def _waiting_to_move(env):
+    """A chain under the key derived from ENCRYPTION_KEY, and AUDIT_CHAIN_KEY set since (by hand, or by
+    audit change-key with no key before): the chain moves to it on its own at the sealer's next pass."""
+    env.settings.audit_chain_key = ""
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    derived = env.st.current_key().key_id
+    env.settings.audit_chain_key = "f" * 64
+    return derived
+
+
+def test_a_change_made_before_the_chain_moves_to_a_new_key_goes_under_the_key_it_is_under(env):
+    """An administrator's change in the minute between the restart under a new AUDIT_CHAIN_KEY and the sealer's
+    move: its seal goes under the key the chain is still under, never under the new one (that would break the key
+    sequence for good), and the move follows it."""
+    from test_audit_chain_trust import _admin, _change
+    derived = _waiting_to_move(env)
+    admin = _admin(env)
+    before = len(env.seals())
+    assert _change(env, admin, "logs_hold", True).status == "applied"
+    new = [(s.kind, s.key_id) for s in env.seals()[before:]]
+    assert new == [("policy", derived)]
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    moved = [s for s in env.seals()[before:] if s.kind == "key"]
+    assert moved and moved[0].detail["old_key_id"] == derived and moved[0].key_id == env.st.current_key().key_id
+    assert failures(env.verify()) == []
+
+
+def test_an_env_change_with_a_new_key_is_sealed_under_the_key_the_chain_is_under_and_the_chain_then_moves(
+        env, monkeypatch):
+    """The restart that brings a new AUDIT_CHAIN_KEY changes a retention line of .env too: the policy seal of the
+    .env change, written before the sealer moves the chain, goes under the key the chain is still under."""
+    derived = _waiting_to_move(env)
+    monkeypatch.setenv("AUDIT_LOG_RETENTION_DAYS", "400")
+    before = len(env.seals())
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    new = [(s.kind, s.key_id) for s in env.seals()[before:]]
+    assert new[:2] == [("policy", derived), ("key", env.st.current_key().key_id)], new
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
+
+
+def test_a_seal_under_a_key_other_than_the_one_in_force_is_never_written(env):
+    """A writer that asks for a seal under another key than the one in force at its position (but a key seal that
+    moves on), or under the key in force when it does not hold it, is refused, and nothing is written."""
+    from app.core import audit_chain_keys as keys
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    before = [(s.seq, s.key_id) for s in env.seals()]
+    other_key = fmt.chain_key("9" * 64)
+    other = keys.ChainKey(other_key, fmt.key_id(other_key), "given")
+    ack = {"acknowledges": [], "failures": [], "rows": [], "discarded": [], "by": "host", "user_id": None,
+           "request": None}
+    with pytest.raises(ai.NotUnderKeyInForce, match="not the key in force"):
+        with ai.ChainWriter(env.engine, _host(env), writer="host", check_key=False) as w:
+            w.append("ack", detail=dict(ack), key=other)
+    env.settings.audit_chain_key = "e" * 64
+    env.settings.encryption_key = "Z2hhbmdlbWVjaGFuZ2VtZWNoYW5nZW1lY2hhbmdlbWU="
+    with pytest.raises(ai.NotUnderKeyInForce, match="does not hold"):
+        with ai.ChainWriter(env.engine, _host(env), writer="host", check_key=False) as w:
+            w.append("ack", detail=dict(ack))
+    assert [(s.seq, s.key_id) for s in env.seals()] == before
+
+
+def test_after_record_writes_its_ack_under_the_key_in_force_given_with_old_key_file(env):
+    """A seal after the head record to discard, while the chain is under a key this process no longer holds (a key
+    change whose move waits): the ack goes under the key in force, so it needs that key; without it after-record says
+    so and writes nothing, with it the ack is under it, and rekey then moves the chain."""
+    seq = _refused_on_its_face(env)
+    old_kid = env.st.current_key().key_id
+    env.settings.audit_chain_key = "e" * 64
+    env.settings.encryption_key = "Z2hhbmdlbWVjaGFuZ2VtZWNoYW5nZW1lY2hhbmdlbWU="
+    seen = recovery.after_record(env.engine, _host(env), discard=True, read=True)
+    assert any(f"The ack seal goes under {old_kid}" in ln for ln in seen["lines"]), seen["lines"]
+    with pytest.raises(host.Refused, match="--old-key-file. Nothing was written"):
+        recovery.after_record(env.engine, _host(env), discard=True, expect=seen["state"])
+    assert env.seals()[-1].seq == seq
+    old = fmt.chain_key(KEY_TEXT)
+    seen = recovery.after_record(env.engine, _host(env), discard=True, read=True, old_key=old)
+    recovery.after_record(env.engine, _host(env), discard=True, expect=seen["state"], old_key=old)
+    ack = env.seals()[-1]
+    assert (ack.seq, ack.kind, ack.key_id) == (seq, "ack", old_kid)
+    seen = recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    recovery.rekey(env.engine, _host(env), old_key=old, expect=seen["state"])
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
