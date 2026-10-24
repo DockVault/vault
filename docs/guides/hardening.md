@@ -117,6 +117,14 @@ hold also tells the owner). The purpose "Regulator or authority request" does no
   recorded while a vault had a password can be revealed once its owner removes the password, and a vault given a
   password later no longer has any of its recorded names revealed, including those recorded before.
 
+### What a legal hold refuses
+
+While a legal hold stands on a vault, or files it kept wait for their purge, the vault cannot be deleted, and a
+zero-knowledge vault's older key versions are not retired: the kept files were sealed under them, and only their
+owner's keys open them. A case about a person (its custodian) keeps their account as well: it cannot be deleted
+while the case's hold stands or what the hold kept waits for its purge. Each refusal names the case and is recorded
+(`hold_blocked_delete`). A per-person erase waits while any hold stands or any case is open.
+
 ### Upgrading with SFTP in its own container
 
 In the split profile (and the trial compose) the SFTP server runs in a container of its own. An SFTP server of an
