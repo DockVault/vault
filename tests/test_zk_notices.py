@@ -317,12 +317,13 @@ def test_a_notice_that_cannot_be_written_never_raises(world, monkeypatch):
 
 # ------------------------------------------------------------------------------------ the email action
 
-def test_the_email_is_a_system_action_that_must_say_what_happened():
+def test_the_email_is_a_locked_action_that_always_says_what_happened():
+    """A locked action always sends its built-in subject and body (test_email_locked_actions.py), and the built-in
+    body says what happened and when."""
     spec = ea.SPEC_BY_KEY[N.EMAIL_ACTION]
-    assert spec["category"] == ea.SYSTEM
+    assert spec["category"] == ea.LOCKED and ea.LOCKED in ea.ALWAYS_ON
     for token in ("{{action.change}}", "{{action.when}}"):
         assert token in spec["default_body_html"]
-    assert ea._fallback_body_if_missing_required_token(ea.SYSTEM, "<p>Hello</p>", spec) == spec["default_body_html"]
 
 
 # ------------------------------------------------------------------------------------ where they are sent
