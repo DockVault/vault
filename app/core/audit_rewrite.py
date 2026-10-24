@@ -704,8 +704,17 @@ def cutoff(view, before: datetime) -> datetime:
     return before
 
 
-def _row_values(row) -> dict:
-    return {c.key: getattr(row, c.key) for c in row.__table__.columns}
+# The columns shortened() reads (an address is in ip_address, or under an address key of details; its shortened form
+# goes into recorded): what the shortening's notes and its look load of a row, and nothing more.
+SHORTEN_COLUMNS = ("ip_address", "details", "recorded")
+
+
+def _address_rows(db, *conditions):
+    """(id, time, the columns shortened() reads) of the rows of audit_logs that meet ``conditions``."""
+    from app.core.models import AuditLog as A
+    cols = [getattr(A, c) for c in SHORTEN_COLUMNS]
+    for r in db.query(A.id, A.timestamp, *cols).filter(*conditions):
+        yield r[0], r[1], dict(zip(SHORTEN_COLUMNS, r[2:]))
 
 
 def _kept_to_shorten(db, now: datetime, start: datetime, end: datetime) -> Dict:
@@ -717,12 +726,9 @@ def _kept_to_shorten(db, now: datetime, start: datetime, end: datetime) -> Dict:
     clause = retention.kept_as_is(A, now)
     if clause is None or end <= start:
         return {}
-    out = {}
-    for row in db.query(A).filter(*prefilter(A, {ap.IP: ap.SHORTENED}), A.timestamp >= start, A.timestamp < end,
-                                  clause):
-        if shortened(_row_values(row)) is not None:
-            out[row.id] = row.timestamp
-    return out
+    return {row_id: t for row_id, t, values in _address_rows(db, *prefilter(A, {ap.IP: ap.SHORTENED}),
+                                                              A.timestamp >= start, A.timestamp < end, clause)
+            if shortened(values) is not None}
 
 
 def _in_archived_part(view, t: datetime) -> bool:
@@ -738,32 +744,40 @@ def _let_go(w, key: tuple, before: datetime, now: datetime) -> Optional[datetime
     """Where the shortening goes back to for what a compliance case kept as it was when the run passed it and has let
     go of since: the hour of such a row that still holds a full address, or that is no longer a row because the
     archive moved it (its day is read again there), and the start of an archived day in which fewer rows are kept
-    than when it was read. None when there is none. What a case still keeps stays noted; what it let go is not."""
+    than when it was read. None when there is none. What a case still keeps stays noted; what it let go is not.
+
+    Of the noted rows, only the ids a case still keeps are read, then the columns shortened() reads of the others (a
+    few, once a case lets them go): the notes grow with what the cases keep. The notes change only once both the
+    rows and the days have been read: a read that fails (a statement's timeout, a lost connection) leaves every
+    note as it was, and the next pass looks again."""
     from app.core import audit_archive as arc
     from app.core import retention
     from app.core.models import AuditLog as A
     db = w.db
     back: List[datetime] = []
     rows = _kept_rows.get(key) or {}
+    let_go: List = []
     if rows:
         clause = retention.kept_as_is(A, now)
         ids = list(rows)
-        still, present = set(), {}
-        for first in range(0, len(ids), 500):
-            chunk = ids[first:first + 500]
-            for row in db.query(A).filter(A.id.in_(chunk)):
-                present[row.id] = row
-            if clause is not None:
-                still |= {i for (i,) in db.query(A.id).filter(A.id.in_(chunk), clause)}
-        for row_id in [i for i in ids if i not in still]:
-            t = rows.pop(row_id)
-            row = present.get(row_id)
-            if row is None:
+        still = set()
+        if clause is not None:
+            for first in range(0, len(ids), 500):
+                still |= {i for (i,) in db.query(A.id).filter(A.id.in_(ids[first:first + 500]), clause)}
+        let_go = [i for i in ids if i not in still]
+        present = {}
+        for first in range(0, len(let_go), 500):
+            for row_id, _t, values in _address_rows(db, A.id.in_(let_go[first:first + 500])):
+                present[row_id] = values
+        for row_id in let_go:
+            t, values = rows[row_id], present.get(row_id)
+            if values is None:
                 if _in_archived_part(w.st.view, t):
                     back.append(t)
-            elif shortened(_row_values(row)) is not None:
+            elif shortened(values) is not None:
                 back.append(t)
     days = _kept_days.get(key) or {}
+    read: Dict = {}
     for day, n in sorted(days.items()):
         try:
             kept = kept_in_archived_day(w, day, shortened, now=now, before=before)
@@ -771,10 +785,15 @@ def _let_go(w, key: tuple, before: datetime, now: datetime) -> Optional[datetime
             continue                        # read again at the next pass
         if kept < n:
             back.append(arc.day_start(day))
+        read[day] = kept
+    # Both read: only now does the run forget what a case let go of.
+    for row_id in let_go:
+        rows.pop(row_id, None)
+    for day, kept in read.items():
         if kept:
             days[day] = kept
         else:
-            del days[day]
+            days.pop(day, None)
     return _ai().hour_floor(min(back)) if back else None
 
 

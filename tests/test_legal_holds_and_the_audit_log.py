@@ -671,6 +671,117 @@ def test_the_shortening_goes_back_to_an_archived_days_row_a_case_let_go(env30):
     assert failures(env.verify()) == []
 
 
+def test_the_shortening_reads_of_a_row_only_the_columns_its_notes_and_its_look_load():
+    """The notes and the look load SHORTEN_COLUMNS of a row (the notes grow with what the cases keep, and are looked at
+    every pass): shortened() must read nothing else of a row, whatever the row holds."""
+    class Seen(dict):
+        def __init__(self, row):
+            super().__init__(row)
+            self.read = set()
+
+        def get(self, k, default=None):
+            self.read.add(k)
+            return super().get(k, default)
+
+        def __getitem__(self, k):
+            self.read.add(k)
+            return super().__getitem__(k)
+    base = {"id": uuid.uuid4(), "action": "file_uploaded", "status": "success", "username": "alice",
+            "user_id": None, "temp_credential_id": None, "user_agent": "Mozilla/5.0 test", "endpoint": "/x"}
+    rows = [dict(base, ip_address="203.0.113.9", details={"n": 1}, recorded=None),
+            dict(base, ip_address=None, details={"client_ip": "198.51.100.7", "filters": {"ip": "192.0.2.1"}},
+                 recorded=None),
+            dict(base, ip_address="203.0.113.9", details=None, recorded={"ip": "203.0.113.0/24"}),
+            dict(base, ip_address=None, details=None, recorded={"details": {"client_ip": "198.51.100.0/24"}}),
+            dict(base, action="login_failed", username="bob@example.com", ip_address="203.0.113.9",
+                 details={"email": "bob@example.com", "user_agent": "x"}, recorded=None)]
+    for row in rows:
+        seen = Seen(row)
+        rw.shortened(seen)
+        assert seen.read <= set(rw.SHORTEN_COLUMNS), seen.read
+    assert rw.shortened(rows[1]) is not None and rw.shortened(rows[0]) is not None
+
+
+def test_the_shortening_goes_back_to_a_let_go_row_whose_only_full_address_is_in_its_details(env30):
+    """The look loads only the columns of an address: an address under a key of details (no ip_address) is one."""
+    env = env30
+    case = _case(env, closed_days=30)
+    kept = env.put(T0 - timedelta(days=40), case_id=case, ip_address=None, details={"client_ip": "198.51.100.7"})
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept).details == {"client_ip": "198.51.100.7"}
+    _close(env, case, FLOOR_DAYS + 1)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert "client_ip" not in (env.get(kept).details or {})
+    assert failures(env.verify()) == []
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["control", "a-noted-days-read-fails-once"])
+def test_a_look_that_fails_while_it_reads_a_noted_day_forgets_no_row_a_case_let_go(env30, monkeypatch, fails):
+    """The look reads the noted rows, then the noted archived days. A read of a day that fails (a statement's timeout,
+    a lost connection) ends the pass; the rows a case let go of stay noted, and the next pass shortens them, with no
+    restart."""
+    env = env30
+    case = _case(env, closed_days=30)
+    kept = env.put(T0 - timedelta(days=40), case_id=case)
+    other = env.put(T0 - timedelta(days=40, minutes=-10))
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept).ip_address == "203.0.113.9" and env.get(other).ip_address is None
+    key = (id(env.st), env.st.view.generation)
+    assert kept in rw._kept_rows[key]
+    some_day = (T0 - timedelta(days=200)).date()
+    rw._kept_days.setdefault(key, {})[some_day] = 1          # a noted archived day, which still keeps its row
+    calls = []
+
+    def read_day(*a, **k):
+        calls.append(1)
+        if fails and len(calls) == 1:
+            raise RuntimeError("the statement ran out of time")
+        return 1
+    monkeypatch.setattr(rw, "kept_in_archived_day", read_day)
+    _close(env, case, FLOOR_DAYS + 1)
+    if fails:
+        with pytest.raises(RuntimeError):
+            rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+        assert kept in rw._kept_rows[key] and rw._kept_days[key] == {some_day: 1}
+        assert env.get(kept).ip_address == "203.0.113.9"
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept).ip_address is None and kept not in rw._kept_rows[key]
+    assert rw._kept_days[key] == {some_day: 1}
+    assert failures(env.verify()) == []
+
+
+def test_a_look_that_fails_on_a_later_day_forgets_no_earlier_day_a_case_let_go(env30, monkeypatch):
+    """Two noted archived days: the first keeps fewer rows than when it was read (a case let one go), the read of the
+    second fails. The first stays noted as it was, and the next pass goes back to its start."""
+    env = env30
+    env.put(T0 - timedelta(days=40))
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    key = (id(env.st), env.st.view.generation)
+    first, second = (T0 - timedelta(days=220)).date(), (T0 - timedelta(days=200)).date()
+    rw._kept_days.setdefault(key, {}).update({first: 2, second: 1})
+    calls = []
+
+    def read_day(w, day, *a, **k):
+        calls.append(day)
+        if day == second and calls.count(second) == 1:
+            raise RuntimeError("the connection was lost")
+        return 1                                  # the first now keeps one row of its two; the second its one
+    monkeypatch.setattr(rw, "kept_in_archived_day", read_day)
+    starts = []
+    real_step = rw.step
+    monkeypatch.setattr(rw, "step", lambda p, w, scope, cursor: (starts.append(cursor), real_step(p, w, scope,
+                                                                                                    cursor))[1])
+    with pytest.raises(RuntimeError):
+        rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert rw._kept_days[key] == {first: 2, second: 1} and starts == []
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert starts and starts[0] == arc.day_start(first)
+    assert rw._kept_days[key] == {first: 1, second: 1}
+
+
 @pytest.mark.parametrize("change, fixture", [("removal", "env"), ("shortening", "env30")],
                          ids=["removal", "shortening"])
 def test_a_removal_and_the_shortening_leave_a_cases_rows_in_an_archived_day_as_they_are(request, change, fixture):
