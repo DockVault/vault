@@ -457,3 +457,51 @@ def test_after_record_writes_its_ack_under_the_key_in_force_given_with_old_key_f
     env.clock.advance(hours=1)
     assert env.seal().stopped is None
     assert failures(env.verify()) == []
+
+
+def test_after_record_accepts_under_the_key_in_force_given_with_old_key_file(env, monkeypatch):
+    """A host seal whose record write was lost, accepted while the chain is under a key this process no longer holds:
+    the ack goes under that key, given with --old-key-file, and rekey then moves the chain."""
+    env.row(T0 - timedelta(hours=10))
+    env.run_until_sealed()
+    env.row(ai.hour_floor(T0 - timedelta(hours=10)) + timedelta(minutes=30))
+    env.clock.advance(hours=8)
+    env.seal()
+    hour = ai.hour_floor(T0 - timedelta(hours=10))
+    seen = host.seal_late_rows(env.engine, _host(env), hour, read=True)
+    with monkeypatch.context() as m:
+        m.setattr(hr.HeadStore, "write", lambda self, change, now: (_ for _ in ()).throw(OSError("full")))
+        with pytest.raises(Exception):
+            host.seal_late_rows(env.engine, _host(env), hour, expect=seen["state"])
+    old_kid = env.st.current_key().key_id
+    env.settings.audit_chain_key = "e" * 64
+    env.settings.encryption_key = "Z2hhbmdlbWVjaGFuZ2VtZWNoYW5nZW1lY2hhbmdlbWU="
+    env.fresh_process()
+    old = fmt.chain_key(KEY_TEXT)
+    seen = recovery.after_record(env.engine, _host(env), read=True, old_key=old)
+    recovery.after_record(env.engine, _host(env), expect=seen["state"], old_key=old)
+    ack = env.seals()[-1]
+    assert (ack.kind, ack.key_id) == ("ack", old_kid)
+    seen = recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    recovery.rekey(env.engine, _host(env), old_key=old, expect=seen["state"])
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
+
+
+def test_a_seal_after_a_key_seal_in_the_same_transaction_goes_under_the_key_moved_to(env):
+    """A writer that moves the chain and then writes another seal before it commits: that seal is under the key the
+    key seal moved to, the key in force at its position."""
+    _waiting_to_move(env)
+    before = len(env.seals())
+    with ai.ChainWriter(env.engine, env.st) as w:
+        assert w.key_move is not None
+        ai.write_key_move(w)
+        w.append("ack", detail={"acknowledges": [], "failures": [], "rows": [], "discarded": [], "by": "admin",
+                                "user_id": None, "request": None})
+    new = [(s.kind, s.key_id) for s in env.seals()[before:]]
+    current = env.st.current_key().key_id
+    assert new == [("key", current), ("ack", current)]
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert "key-sequence" not in failures(env.verify())
