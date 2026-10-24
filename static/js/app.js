@@ -7092,6 +7092,9 @@ const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds'
 // Targets that open a dialog rather than a page: a notice about the reader's own account (a password,
 // an email address or a second factor an administrator changed) opens "Your account".
 const _NOTIF_TARGET_OPEN = { '#profile': () => openUserSettingsModal() };
+// A notice about one vault opens it: "#vault/" and its id, nothing else (a zero-knowledge vault's name is
+// sealed, so a notice can only name it by id). The id is matched in full before it is used.
+const _NOTIF_VAULT_TARGET = /^#vault\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 
 async function initNotifications() {
     // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
@@ -7175,9 +7178,13 @@ async function onNotifClick(n) {
         if (item) item.click();
     } else if (_NOTIF_TARGET_OPEN[n.target]) {
         _NOTIF_TARGET_OPEN[n.target]();
-    } else if (n.target && typeof window.openNotifTarget === 'function') {
-        // A target that carries an id, such as one vault (static/js/compliance.js).
-        window.openNotifTarget(n.target);
+    } else {
+        const vault = String(n.target || '').match(_NOTIF_VAULT_TARGET);
+        if (vault) await openVault(vault[1]);
+        else if (n.target && typeof window.openNotifTarget === 'function') {
+            // A target that carries another id (static/js/compliance.js).
+            window.openNotifTarget(n.target);
+        }
     }
 }
 
@@ -10738,6 +10745,8 @@ async function openVault(vaultId, options) {
         // Zero-knowledge: tell a key holder if the vault owes a key rotation. Not awaited, so the
         // extra request never holds up the open; it clears any notice from the previous vault.
         refreshZkRekeyNotice();
+        // And check the key this browser holds for it (never asks for the passphrase; see refreshZkKeyChecks).
+        refreshZkKeyChecks();
 
         // Show vault view section (don't hide navbar/sidebar)
         document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
@@ -11960,8 +11969,12 @@ function eccLib() {
 // (already fail-closed) unwrap. In-session only; the crypto fails closed regardless of the pin.
 // keyProofKeys: vaultId -> { [dek_epoch]: {pem, key} } -- a direct vault's opened per-epoch proof keys
 // (non-extractable, deriveBits only), with the public key each was checked against.
-const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {}, vaultIndexKeys: {}, keyProofKeys: {} };
-function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; zkState.vaultIndexKeys = {}; zkState.keyProofKeys = {}; }
+// keyChecks: vaultId -> { [dek_epoch]: what the /keys answer said about that epoch's key, and the verdict on
+// the key this browser holds for it } plus `reported` (the findings already sent) -- see zk_key_checks.js
+// teamKeyMatches: vaultId -> { [team_epoch]: {pem, matches} } whether the unwrapped team key is the pair of
+// the vault's team public key, compared while it was unwrapped (true, false, or null: it could not be compared)
+const zkState = { privateKey: null, vaultDeks: {}, teamKeys: {}, pinnedHier: {}, vaultIndexKeys: {}, keyProofKeys: {}, keyChecks: {}, teamKeyMatches: {} };
+function zkResetKeys() { zkState.privateKey = null; zkState.vaultDeks = {}; zkState.teamKeys = {}; zkState.pinnedHier = {}; zkState.vaultIndexKeys = {}; zkState.keyProofKeys = {}; zkState.keyChecks = {}; zkState.teamKeyMatches = {}; }
 
 // --- ZK idle auto-lock -------------------------------------------------------------------------
 // Optional org policy (zk_idle_lock_minutes, from /zk-enabled): drop the in-memory ZK key after N
@@ -12039,18 +12052,41 @@ async function zkPutPrivateEnvelope(envelope, privateKey, registeredPublicKeyPem
     if (readBack !== expectedPem) {
         throw new Error('Internal error preparing the new encryption key — nothing was changed.');
     }
-    const challenge = await apiRequest('/ecc/keys/private/challenge', { method: 'POST' });
-    const mac = await eccLib().computeKeyUpdatePoP(
-        challenge.server_ephemeral_public_key, challenge.nonce, challenge.challenge_id,
-        userId, registeredPublicKeyPem, body, privateKey
-    );
-    await apiRequest('/ecc/keys/private', {
-        method: 'PUT',
-        body: JSON.stringify({
-            encrypted_private_key: body,
-            pop: { challenge_id: challenge.challenge_id, mac },
-        }),
-    });
+    // A challenge the server cannot open is refused once (see zkIsPossessionChallengeRefusal); the
+    // fresh one asked for then goes through.
+    for (let attempt = 0; ; attempt++) {
+        const challenge = await apiRequest('/ecc/keys/private/challenge', { method: 'POST' });
+        const mac = await eccLib().computeKeyUpdatePoP(
+            challenge.server_ephemeral_public_key, challenge.nonce, challenge.challenge_id,
+            userId, registeredPublicKeyPem, body, privateKey
+        );
+        try {
+            await apiRequest('/ecc/keys/private', {
+                method: 'PUT',
+                body: JSON.stringify({
+                    encrypted_private_key: body,
+                    pop: { challenge_id: challenge.challenge_id, mac },
+                }),
+            });
+            return;
+        } catch (e) {
+            if (attempt === 0 && zkIsPossessionChallengeRefusal(e)) continue;
+            throw e;
+        }
+    }
+}
+
+// A refusal that a fresh challenge may fix, when a key registration or an envelope replacement is
+// refused. The server keeps each challenge's one-time key sealed, and refuses a challenge it cannot open
+// -- one an older release issued before an upgrade -- like one that does not exist; an older server
+// given a challenge a newer one sealed, before a rollback, fails the proof instead. Either way the
+// caller asks once more, with a fresh challenge. A proof that is really wrong fails again, and that
+// answer is the one the caller sees.
+function zkIsPossessionChallengeRefusal(err) {
+    if (!err || err.status !== 400 || typeof err.message !== 'string') return false;
+    return err.message.startsWith('Invalid or expired proof-of-possession challenge')
+        || err.message.startsWith('Proof-of-possession challenge has expired')
+        || err.message.startsWith('Proof of possession failed');
 }
 
 // Turn a crypto failure code into the sentence a user should read, for the flow they are in.
@@ -12187,8 +12223,69 @@ async function zkEnsureUnlocked() {
     return _zkUnlockInFlight;
 }
 
+// The account's key envelope (GET /ecc/keys/private). For a while after an administrator changed the account's
+// sign-in details, the server releases it only to a session that has entered a code sent by email (reason
+// zk-envelope-hold): the person is asked, the code is sent and entered, and the envelope is fetched again.
+async function zkFetchPrivateEnvelope() {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await apiRequest('/ecc/keys/private', { silent: true });
+        } catch (e) {
+            if (!e || e.reason !== 'zk-envelope-hold' || attempt > 0) throw e;
+            await zkReleaseEnvelopeHold();   // throws when cancelled or refused
+        }
+    }
+}
+
+// Ask for the emailed code that releases the envelope to this session, and enter it. The code goes to the
+// account's address (the one before, after an email change), so it reaches the person rather than whoever
+// changed the sign-in details. Without mail the server says so; the person who runs the server can release it.
+async function zkReleaseEnvelopeHold() {
+    const go = await showConfirm(
+        "An administrator changed your account's sign-in details recently, so your encryption key opens only "
+        + 'after you enter a code sent to your email. Send the code now?', 'Confirm it is you', null, 'Send the code');
+    if (!go) throw new Error('Unlock cancelled.');
+    const sent = await apiRequest('/ecc/keys/private/hold/code', { method: 'POST', silent: true });
+    if (sent && sent.held === false) return;
+    for (let tries = 1; ; tries++) {
+        const code = await showPrompt(
+            `Enter the code sent to ${sent.sent_to}. It expires in ${sent.expires_in_minutes} minutes.`,
+            'Enter the code', {});
+        if (code === null) throw new Error('Unlock cancelled.');
+        try {
+            await apiRequest('/ecc/keys/private/hold/release', {
+                method: 'POST', silent: true, body: JSON.stringify({ code: String(code).trim() }),
+            });
+            return;
+        } catch (e) {
+            if (e && e.reason === 'zk-envelope-hold-code-failed' && tries < 3) {
+                showError(e.message);
+                continue;
+            }
+            throw e;
+        }
+    }
+}
+
+// The rule for a new passphrase (static/js/zk_passphrase.js), for this account: why it is refused, or null.
+function zkPassphraseProblem(pass) {
+    return ZkPassphrase.problem(pass, {
+        username: currentUser && currentUser.username, email: currentUser && currentUser.email,
+    });
+}
+
+// A passphrase that unlocked the key but would be refused as a new one: the person is told once per
+// session, and nothing stops the unlock.
+let _zkWeakPassphraseTold = false;
+function zkNudgeWeakPassphrase(pass) {
+    if (_zkWeakPassphraseTold || !zkPassphraseProblem(pass)) return;
+    _zkWeakPassphraseTold = true;
+    showWarning(`Your encryption passphrase is weaker than new ones may be: at least ${ZkPassphrase.MIN_LENGTH} `
+        + "characters, and not a common one. Change it under Your account, Encryption key.");
+}
+
 async function _zkUnlockOnce() {
-    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    const priv = await zkFetchPrivateEnvelope();
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
@@ -12235,6 +12332,7 @@ async function _zkUnlockOnce() {
     zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
     zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
     try { zkAfterUnlock(); } catch (_) { /* background work only (static/js/zk-background.js) */ }
+    zkNudgeWeakPassphrase(pass);
     return zkState.privateKey;
 }
 
@@ -12258,11 +12356,12 @@ async function zkRegisterNewKeypair() {
     );
     if (!acknowledged) throw new Error('Setup cancelled.');
     const pass = await showPrompt(
-        'Create a passphrase to protect your encryption key. You will need it to open zero-knowledge vaults — it CANNOT be recovered if lost.',
+        'Create a passphrase to protect your encryption key: at least 12 characters, and not a common one. You will need it to open zero-knowledge vaults — it CANNOT be recovered if lost.',
         'Set up encryption key', { password: true }
     );
     if (pass === null) throw new Error('Setup cancelled.');
-    if (!pass || pass.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const passProblem = zkPassphraseProblem(pass);
+    if (passProblem) throw new Error(passProblem);
     const confirm = await showPrompt('Re-enter your passphrase to confirm.', 'Confirm passphrase', { password: true });
     if (confirm === null) throw new Error('Setup cancelled.');
     if (confirm !== pass) throw new Error('Passphrases do not match.');
@@ -12273,20 +12372,29 @@ async function zkRegisterNewKeypair() {
     const privatePem = await lib.exportPrivateKeyPEM(kp.privateKey);
     const enc = await zkWrapPrivateKey(privatePem, pass);  // legacy shape, or v1 when enabled
     // Proof-of-possession: prove we hold this key's private half (ECDH key-confirmation) so the
-    // server won't accept a substituted/unheld public key.
-    const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
-    const mac = await lib.computeRegistrationPoP(
-        challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey);
-    await apiRequest('/ecc/keys/register', {
-        method: 'POST',
-        body: JSON.stringify({
-            public_key: publicPem,
-            // Pack salt+iterations into the opaque blob so a later session can
-            // decrypt it; the server stores this verbatim and cannot read it.
-            encrypted_private_key: JSON.stringify(enc),
-            pop: { challenge_id: challenge.challenge_id, mac },
-        }),
-    });
+    // server won't accept a substituted/unheld public key. A challenge the server cannot open is
+    // refused once (see zkIsPossessionChallengeRefusal); the fresh one asked for then goes through.
+    for (let attempt = 0; ; attempt++) {
+        const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
+        const mac = await lib.computeRegistrationPoP(
+            challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey);
+        try {
+            await apiRequest('/ecc/keys/register', {
+                method: 'POST',
+                body: JSON.stringify({
+                    public_key: publicPem,
+                    // Pack salt+iterations into the opaque blob so a later session can
+                    // decrypt it; the server stores this verbatim and cannot read it.
+                    encrypted_private_key: JSON.stringify(enc),
+                    pop: { challenge_id: challenge.challenge_id, mac },
+                }),
+            });
+            break;
+        } catch (e) {
+            if (attempt === 0 && zkIsPossessionChallengeRefusal(e)) continue;
+            throw e;
+        }
+    }
     // Hold a NON-extractable runtime copy (the generated key was extractable only
     // so we could export + password-encrypt it above).
     zkState.privateKey = await lib.importPrivateKeyPEM(privatePem, false);
@@ -12299,7 +12407,7 @@ async function zkRegisterNewKeypair() {
 // from now on (this is a passphrase change, not a key rotation). Throws Error('Cancelled.')
 // if the user backs out of any prompt.
 async function zkChangePassphrase() {
-    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    const priv = await zkFetchPrivateEnvelope();
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
@@ -12324,7 +12432,8 @@ async function zkChangePassphrase() {
     }
     const next = await showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true });
     if (next === null) throw new Error('Cancelled.');
-    if (!next || next.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const nextProblem = zkPassphraseProblem(next);
+    if (nextProblem) throw new Error(nextProblem);
     const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
@@ -12346,7 +12455,7 @@ async function zkChangePassphrase() {
 // browser — the kit holds only ciphertext the server never sees. Throws Error('Cancelled.') on
 // back-out.
 async function zkExportRecoveryKey() {
-    const priv = await apiRequest('/ecc/keys/private', { silent: true });
+    const priv = await zkFetchPrivateEnvelope();
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) throw new Error('No encryption key is set up for your account.');
     try {
         eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
@@ -12368,7 +12477,8 @@ async function zkExportRecoveryKey() {
     }
     const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
     if (rec === null) throw new Error('Cancelled.');
-    if (!rec || rec.length < 8) throw new Error('Recovery passphrase must be at least 8 characters.');
+    const recProblem = zkPassphraseProblem(rec);
+    if (recProblem) throw new Error(recProblem.replace('The passphrase', 'The recovery passphrase'));
     const confirm = await showPrompt('Re-enter your RECOVERY passphrase to confirm.', 'Confirm recovery passphrase', { password: true });
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== rec) throw new Error('Passphrases do not match.');
@@ -12445,7 +12555,8 @@ async function zkRestoreFromRecoveryKey(kitText) {
     }
     const next = await showPrompt('Set a NEW encryption passphrase. It replaces your forgotten one and CANNOT be recovered if lost.', 'New passphrase', { password: true });
     if (next === null) throw new Error('Cancelled.');
-    if (!next || next.length < 8) throw new Error('Passphrase must be at least 8 characters.');
+    const nextProblem = zkPassphraseProblem(next);
+    if (nextProblem) throw new Error(nextProblem);
     const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
@@ -12722,12 +12833,16 @@ async function zkGetVaultDek(vaultId, keyVersion = null) {
     // blob — not the advisory `mode` string alone — drives this branch; if a hierarchical vault
     // were mis-served as direct the user-key unwrap would fail closed (the ephemeral agreed with
     // the team pubkey, not the user's), never leaking a key.
+    zkRecordKeyView(vaultId, keys, version);
     let dek;
     if (keys.wrapped_team_privkey && keys.team_ephemeral_public_key) {
         zkState.pinnedHier[vaultId] = true;  // pin: this vault is hierarchical
+        // At the current epoch the team key is compared with the vault's team public key as it is unwrapped
+        // (see zkWriteKeyVerdict); an older epoch's team key is not the current public key's pair.
         const teamPriv = await zkGetTeamPrivKey(
             vaultId, keys.team_key_version, keys.wrapped_team_privkey,
-            keys.team_ephemeral_public_key, keys.recipient_user_id);
+            keys.team_ephemeral_public_key, keys.recipient_user_id,
+            version === keys.current_dek_version ? keys.team_public_key : null);
         // teamMode says which purpose this caller will accept. The payload's own byte never
         // gets to choose; it is compared against this and rejected if it disagrees.
         dek = await eccLib().unwrapVaultDEK(
@@ -12816,18 +12931,348 @@ async function zkGetVaultIndexKey(vaultId) {
 // blob + its ephemeral come from the /keys response (no extra fetch). Cached per (vault, team
 // epoch); the runtime key is non-extractable. Cleared on logout via zkResetKeys.
 async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphemeralPublicKey,
-                                recipientUserId) {
+                                recipientUserId, teamPublicKeyPem = null) {
     const perVault = zkState.teamKeys[vaultId] || (zkState.teamKeys[vaultId] = {});
-    if (teamEpoch != null && perVault[teamEpoch]) return perVault[teamEpoch];
+    const compared = zkState.teamKeyMatches[vaultId] || (zkState.teamKeyMatches[vaultId] = {});
+    // With the vault's team public key: whether the key unwrapped is its pair, found while the key is being
+    // unwrapped (it is non-extractable afterwards). Asked again when that key was not yet compared with it.
+    const pem = teamPublicKeyPem ? String(teamPublicKeyPem).trim() : null;
+    const check = !!pem && teamEpoch != null && !(compared[teamEpoch] && compared[teamEpoch].pem === pem);
+    if (teamEpoch != null && perVault[teamEpoch] && !check) return perVault[teamEpoch];
     const priv = await zkEnsureUnlocked();
     // The account this wrap was made for. It has to come from the caller: this function is
     // handed the vault, the epoch and the two blobs, and an absent id would be encoded as
     // nothing rather than refused -- a wrap that authenticates against nothing.
-    const teamPriv = await eccLib().unwrapPrivateKeyFromWrapped(
-        wrappedTeamPrivkey, teamEphemeralPublicKey, priv, false,
-        { vaultId, recipientUserId });
+    let teamPriv;
+    if (check) {
+        const out = await eccLib().unwrapTeamPrivateKeyWithCheck(
+            wrappedTeamPrivkey, teamEphemeralPublicKey, priv, { vaultId, recipientUserId }, pem);
+        teamPriv = out.privateKey;
+        // Three answers: only a positive mismatch (false) stops a write; null, a comparison that could not run
+        // (a stored team public key that cannot be read), writes as before.
+        const m = out.matchesPublic;
+        compared[teamEpoch] = { pem, matches: m === true ? true : (m === false ? false : null) };
+    } else {
+        teamPriv = await eccLib().unwrapPrivateKeyFromWrapped(
+            wrappedTeamPrivkey, teamEphemeralPublicKey, priv, false,
+            { vaultId, recipientUserId });
+    }
     if (teamEpoch != null) perVault[teamEpoch] = teamPriv;
     return teamPriv;
+}
+
+// ============================================================================
+// ZERO-KNOWLEDGE KEY CHECKS (member side)
+// ============================================================================
+// The server cannot tell a member whether the key they were given is the vault's; it stores, for each key
+// epoch, what lets the member's browser tell (see static/js/zk_key_checks.js). Here the app fetches what those
+// checks need, keeps their answers for the session, and acts on them:
+//  - on the write path (zkGetWriteDek) a key that does not match the vault's is refused: nothing is uploaded,
+//    renamed or created with it, the person is told why, and the owner is told. Reading is never affected;
+//  - when a vault is opened (zkCheckVaultKey) the key the browser holds is checked, a manager also opens the
+//    epoch's sealed key check, and the current epoch's lineage is verified. What fails is shown on the vault
+//    and in its key details, and reported (POST /ecc/vaults/{id}/key-proof/report).
+
+// Remember what one /keys answer said about the key of its epoch, for the checks below. Returns the entry.
+function zkRecordKeyView(vaultId, keys, epoch) {
+    if (!keys || epoch == null) return null;
+    const perVault = zkState.keyChecks[vaultId] || (zkState.keyChecks[vaultId] = {});
+    const hier = !!(keys.wrapped_team_privkey && keys.team_ephemeral_public_key);
+    const prior = perVault[epoch];
+    perVault[epoch] = {
+        mode: hier ? 'hierarchical' : 'direct',
+        view: keys.key_proof || null,
+        isCurrent: epoch === keys.current_dek_version,
+        teamEpoch: hier ? keys.team_key_version : null,
+        teamPublicKey: hier ? (keys.team_public_key || null) : null,
+        teamWrap: hier ? (keys.wrapped_dek || null) : null,
+        verdict: prior ? prior.verdict : undefined,
+    };
+    return perVault[epoch];
+}
+
+// May this browser write under the key it holds for `epoch`? The answer is kept for the session (an epoch's
+// key-check material never changes). A check that cannot be made -- no stored check, an older server, a
+// failed request -- is "not verifiable", which writes as before: only a positive mismatch blocks.
+async function zkWriteKeyVerdict(vaultId, epoch, dek) {
+    const perVault = zkState.keyChecks[vaultId] || (zkState.keyChecks[vaultId] = {});
+    let info = perVault[epoch];
+    if (!info) {
+        let keys = null;
+        try {
+            keys = await apiRequest(`/ecc/vaults/${vaultId}/keys?key_version=${encodeURIComponent(epoch)}`,
+                                    { silent: true });
+        } catch (_) { /* not verifiable */ }
+        info = zkRecordKeyView(vaultId, keys, epoch) || (perVault[epoch] = { mode: 'direct', view: null });
+    }
+    if (info.verdict) return info.verdict;
+    let teamKeyMatches = null;
+    if (info.mode === 'hierarchical' && info.isCurrent && info.teamPublicKey && info.teamEpoch != null) {
+        const compared = (zkState.teamKeyMatches[vaultId] || {})[info.teamEpoch];
+        if (compared && compared.pem === String(info.teamPublicKey).trim()) teamKeyMatches = compared.matches;
+    }
+    info.verdict = await ZkKeyChecks.writeVerdict(eccLib(), {
+        mode: info.mode, vaultId, epoch, view: info.view, dek, isCurrent: info.isCurrent, teamKeyMatches,
+    });
+    return info.verdict;
+}
+
+// What a write that failed in the browser tells the person: a key that does not match the vault's is said
+// as such; anything else as before.
+function zkWriteFailureMessage(e) {
+    if (e && e.zkKeyMismatch) return e.message;
+    return isCodedCryptoError(e) ? safeMessageForCode(e.code, 'unlock') : 'Zero-knowledge encryption failed.';
+}
+
+// What a person is told when the key they hold does not match the vault's.
+function zkKeyMismatchMessage(vaultId, what) {
+    const done = what === 'uploaded' ? 'Nothing was uploaded.' : 'Nothing was saved.';
+    return zkIsCurrentVaultOwner(vaultId)
+        ? `The key you hold for this vault does not match it. ${done} As its owner you can reset the `
+          + "vault's key from its Info tab."
+        : `The key you were given for this vault does not match it. ${done} The vault's owner has been told.`;
+}
+
+// The DEK to ENCRYPT with at an epoch: every upload, rename, folder and name written under a vault's key
+// gets it here, never from zkGetVaultDek directly. A key that does not match the vault's is refused, and the
+// owner is told; `what` says what was stopped ('uploaded', or anything else for "saved").
+async function zkGetWriteDek(vaultId, epoch, what) {
+    const dek = await zkGetVaultDek(vaultId, epoch);
+    let verdict;
+    try {
+        verdict = await zkWriteKeyVerdict(vaultId, epoch, dek);
+    } catch (_) {
+        verdict = { verdict: ZkKeyChecks.WRITE_UNCHECKED };   // a check that cannot run never blocks
+    }
+    if (verdict.verdict === ZkKeyChecks.WRITE_MISMATCH) {
+        zkReportKeyFinding(vaultId, epoch, verdict.finding);
+        const err = new Error(zkKeyMismatchMessage(vaultId, what));
+        err.zkKeyMismatch = true;
+        throw err;
+    }
+    return dek;
+}
+
+// Tell the server (and through it the vault's owner) what a check found. Once per finding per session;
+// best-effort: a report that cannot be sent changes nothing here.
+function zkReportKeyFinding(vaultId, epoch, finding) {
+    const perVault = zkState.keyChecks[vaultId] || (zkState.keyChecks[vaultId] = {});
+    const reported = perVault.reported || (perVault.reported = {});
+    const key = `${epoch}:${finding}`;
+    if (reported[key]) return;
+    reported[key] = true;
+    apiRequest(`/ecc/vaults/${vaultId}/key-proof/report`, {
+        method: 'POST', silent: true, body: JSON.stringify({ dek_epoch: Number(epoch), finding }),
+    }).catch(() => {});
+}
+
+// Check the vault's key as it is opened (or its Info tab shown): the key this browser holds for the current
+// epoch, a manager's copy of the epoch's sealed key check, the team key of a team vault and the current
+// epoch's lineage. Only when the account key is already unlocked: this never asks for the passphrase.
+// Returns a summary for the key details and the warning, or null.
+async function zkCheckVaultKey(vault) {
+    if (!vault || !isZkVault(vault) || !zkKeyUnlocked()) return null;
+    const vid = vault.id;
+    let keys;
+    try { keys = await apiRequest(`/ecc/vaults/${vid}/keys`, { silent: true }); }
+    catch (_) { return null; }
+    if (!keys || !keys.has_access) return null;
+    const epoch = keys.key_version;
+    const summary = { epoch, mode: null, write: null, seal: null, lineage: null, view: keys.key_proof || null };
+    try {
+        const dek = await zkGetVaultDek(vid, epoch);
+        const info = (zkState.keyChecks[vid] || {})[epoch] || zkRecordKeyView(vid, keys, epoch);
+        summary.mode = info ? info.mode : 'direct';
+        summary.write = await zkWriteKeyVerdict(vid, epoch, dek);
+        // A manager's copy of the sealed key check must open with the key and be the named key's pair.
+        const view = summary.view;
+        if (summary.mode === 'direct' && view && view.state === 'set' && view.sealed_private_key) {
+            try {
+                await zkOpenProofKey(vid, epoch, view, dek);
+                summary.seal = 'ok';
+            } catch (_) {
+                summary.seal = 'failed';
+            }
+        }
+        let prevDek = null;
+        if (epoch > 1) {
+            try {
+                const prev = await apiRequest(`/ecc/vaults/${vid}/keys?key_version=${epoch - 1}`, { silent: true });
+                if (prev && prev.has_access) prevDek = await zkGetVaultDek(vid, epoch - 1);
+            } catch (_) { /* the previous key is not this member's: not verifiable */ }
+        }
+        summary.lineage = await ZkKeyChecks.lineageState(eccLib(), {
+            mode: summary.mode, vaultId: vid, epoch, view, prevDek,
+            teamEpoch: info ? info.teamEpoch : null, teamPublicKeyPem: info ? info.teamPublicKey : null,
+            teamWrap: info ? info.teamWrap : null,
+        });
+    } catch (_) {
+        return null;   // a check that cannot run shows nothing, and blocks nothing
+    }
+    if (summary.write && summary.write.verdict === ZkKeyChecks.WRITE_MISMATCH) {
+        zkReportKeyFinding(vid, epoch, summary.write.finding);
+    }
+    if (summary.seal === 'failed') zkReportKeyFinding(vid, epoch, 'seal');
+    if (summary.lineage === ZkKeyChecks.LINEAGE_FAILED) zkReportKeyFinding(vid, epoch, 'lineage');
+    const perVault = zkState.keyChecks[vid] || (zkState.keyChecks[vid] = {});
+    perVault.summary = summary;
+    return summary;
+}
+
+// Did anything about this vault's key fail, and is it the kind that stops writing?
+function zkKeyTrouble(summary) {
+    if (!summary) return null;
+    const mismatch = !!(summary.write && summary.write.verdict === ZkKeyChecks.WRITE_MISMATCH);
+    const seal = summary.seal === 'failed';
+    const lineage = summary.lineage === ZkKeyChecks.LINEAGE_FAILED;
+    return (mismatch || seal || lineage) ? { mismatch, seal, lineage } : null;
+}
+
+// Run the check for the vault on screen and show what it found: the warning on the vault, and the key
+// details in its Info tab. Not awaited by the open, so it never holds it up.
+async function refreshZkKeyChecks() {
+    const vault = state.currentVault;
+    const warning = document.getElementById('vault-key-warning');
+    if (warning) { warning.replaceChildren(); warning.hidden = true; }
+    const card = document.getElementById('vault-key-details-card');
+    if (!vault || !isZkVault(vault)) { if (card) card.hidden = true; return; }
+    const summary = await zkCheckVaultKey(vault);
+    if (!state.currentVault || state.currentVault.id !== vault.id) return;   // another vault was opened
+    zkRenderKeyDetails(vault, summary);
+    const trouble = zkKeyTrouble(summary);
+    if (!warning || !trouble) return;
+    const notice = document.createElement('div');
+    notice.className = 'alert alert-warning flex-wrap items-center justify-between';
+    notice.setAttribute('role', 'alert');
+    const text = document.createElement('span');
+    text.style.flex = '1 1 16rem';
+    text.textContent = trouble.mismatch
+        ? "The key you hold for this vault does not match it, so this browser will not upload, rename or "
+          + "create anything in it. " + (zkIsCurrentVaultOwner(vault.id)
+              ? "As its owner you can reset the vault's key." : "The vault's owner has been told.")
+        : trouble.seal
+            ? "This vault's key check does not open with its key, so its key cannot be changed the usual way. "
+              + (zkIsCurrentVaultOwner(vault.id) ? "As its owner you can reset the vault's key."
+                                                 : "The vault's owner has been told.")
+            : "This vault's current key could not be traced to someone who held the previous key. It may have "
+              + "been changed by someone who should not have been able to. " + (zkIsCurrentVaultOwner(vault.id)
+                  ? "As its owner you can reset the vault's key." : "The vault's owner has been told.");
+    notice.appendChild(text);
+    if (zkIsCurrentVaultOwner(vault.id)) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm btn-danger';
+        btn.id = 'vault-key-warning-reset-btn';
+        btn.textContent = "Reset the vault's key";
+        btn.addEventListener('click', () => zkOwnerResetFromDetails(vault, summary));
+        notice.appendChild(btn);
+    }
+    warning.appendChild(notice);
+    warning.hidden = false;
+}
+
+// The key details in a zero-knowledge vault's Info tab.
+function zkRenderKeyDetails(vault, summary) {
+    const card = document.getElementById('vault-key-details-card');
+    const body = document.getElementById('vault-key-details');
+    if (!card || !body) return;
+    body.replaceChildren();
+    card.hidden = !isZkVault(vault);
+    if (card.hidden) return;
+    const row = (label, value, id, cls) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'mb-md';
+        const l = document.createElement('div');
+        l.className = 'text-sm text-secondary mb-xs';
+        l.textContent = label;
+        const v = document.createElement('div');
+        if (id) v.id = id;
+        if (cls) v.className = cls;
+        v.textContent = value;
+        wrap.append(l, v);
+        body.appendChild(wrap);
+        return v;
+    };
+    if (!summary) {
+        row('Checks', zkKeyUnlocked()
+            ? "This vault's key could not be checked just now."
+            : "Unlock your encryption key to check this vault's key.", 'vault-key-state');
+    } else {
+        row('Key version', String(summary.epoch), 'vault-key-epoch');
+        const w = summary.write ? summary.write.verdict : null;
+        row('Your copy of the key', w === ZkKeyChecks.WRITE_OK
+                ? (summary.mode === 'hierarchical' ? "It is the vault's team key." : "It matches the vault's key check.")
+                : w === ZkKeyChecks.WRITE_MISMATCH
+                    ? "It does not match the vault's key: this browser will not upload, rename or create anything "
+                      + 'in this vault.'
+                    : 'It cannot be checked: the key was made before this check existed.',
+            'vault-key-copy', w === ZkKeyChecks.WRITE_MISMATCH ? 'text-warning' : null);
+        if (summary.seal) {
+            row('Key check', summary.seal === 'ok' ? "It opens with the vault's key."
+                : "It does not open with the vault's key.", 'vault-key-seal',
+                summary.seal === 'ok' ? null : 'text-warning');
+        }
+        let history = ZkKeyChecks.LINEAGE_TEXT[summary.lineage] || '';
+        if (summary.lineage === ZkKeyChecks.LINEAGE_RESET && summary.view && summary.view.created_at) {
+            const when = parseServerTime(summary.view.created_at);
+            if (when) history = `The owner reset this vault's key on ${when.toLocaleDateString()} without the previous one.`;
+        }
+        const h = row('Key history', history, 'vault-key-history',
+                      summary.lineage === ZkKeyChecks.LINEAGE_FAILED ? 'text-warning' : null);
+        h.dataset.state = summary.lineage || '';
+    }
+    if (zkIsCurrentVaultOwner(vault.id)) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.id = 'vault-key-reset-btn';
+        btn.className = zkKeyTrouble(summary) ? 'btn btn-sm btn-danger' : 'btn btn-sm btn-secondary';
+        btn.textContent = "Reset this vault's key";
+        btn.addEventListener('click', () => zkOwnerResetFromDetails(vault, summary));
+        body.appendChild(btn);
+    }
+}
+
+// The owner's reset, from the key details or the warning: a new key and fresh key-check material for every
+// remaining member, without proving the old key (see zkRekeyForRevoke). When the current key was set up by
+// someone else and something about it failed, the owner is offered to remove that person in the same step.
+async function zkOwnerResetFromDetails(vault, summary) {
+    if (!vault || !zkIsCurrentVaultOwner(vault.id)) return;
+    const ok = await showConfirm(
+        "Reset this vault's key? A new key is made and given to every remaining member, and the files already "
+        + "in the vault stay readable. Use this when the vault's key check is damaged or a member's key does "
+        + 'not match.', "Reset this vault's key", null, 'Reset the key');
+    if (!ok) return;
+    let remove = null;
+    const installer = summary && summary.view ? summary.view.created_by : null;
+    if (installer && zkKeyTrouble(summary) && String(installer) !== String(currentUser && currentUser.id)) {
+        let name = null;
+        try {
+            const perms = await apiRequest(`/vaults/${vault.id}/permissions`, { silent: true });
+            const hit = (Array.isArray(perms) ? perms : []).find(p => String(p.user_id) === String(installer));
+            name = hit ? (hit.username || null) : null;
+        } catch (_) { /* no name: not offered */ }
+        if (name && await showConfirm(
+            `${name} set up this vault's current key. Remove ${name} from the vault in the same step?`,
+            'Remove who set up the key?', null, `Remove ${name}`)) {
+            remove = String(installer);
+        }
+    }
+    try {
+        await zkRekeyForRevoke(vault.id, remove, { ownerReset: true });
+        if (remove) {
+            const headers = {};
+            if (vault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
+            await apiRequest(`/vaults/${vault.id}/permissions/${remove}`, { method: 'DELETE', headers });
+        }
+    } catch (e) {
+        showError("The vault's key could not be reset. (" + (e && e.message ? e.message : e) + ')');
+        return;
+    }
+    delete zkState.keyChecks[vault.id];
+    delete zkState.teamKeyMatches[vault.id];
+    showSuccess("The vault's key was reset.");
+    await refreshZkKeyChecks();
+    if (remove) await loadVaultPermissions();
 }
 
 // ============================================================================
@@ -13698,6 +14143,8 @@ async function zkUnlockAllVaults() {
     updateZkLockControl();
     renderVaults();
     zkResetIdleLock();
+    // The key checks of a vault already open run now that its key can be read (they never ask).
+    if (state.currentVault && isZkVault(state.currentVault)) refreshZkKeyChecks();
     // Reveal the freshly-decrypted metadata with the decode animation (after the render commits).
     requestAnimationFrame(() => { try { zkAnimateReveal(); } catch (_) {} });
 }
@@ -13719,7 +14166,7 @@ async function zkSealLegacyVaultNames() {
             // the vault name pinned to an old epoch the way a file's content is, so advancing is safe
             // and lets the stale epoch be retired.)
             const epoch = await zkGetCurrentDekVersion(v.id);
-            const dek = await zkGetVaultDek(v.id, epoch);
+            const dek = await zkGetWriteDek(v.id, epoch);
             const body = {
                 enc_name: await eccLib().encryptName(v.name, dek, v.id, 'name', epoch, v.id),
                 name_key_version: epoch,
@@ -13743,6 +14190,8 @@ function zkLockAllVaults() {
     zkRelockOpenDetail();                    // also re-hide the OPEN vault's detail header/description
     updateZkLockControl();
     renderVaults();
+    // What was found about the open vault's key went with the keys; its details now say to unlock.
+    if (state.currentVault && isZkVault(state.currentVault)) refreshZkKeyChecks();
     try { showInfo('Zero-knowledge vaults locked.'); } catch (_) {}
 }
 
@@ -13824,7 +14273,7 @@ async function zkSealLegacyNames(vault, items) {
             const epoch = it.type === 'folder'
                 ? await zkGetCurrentDekVersion(vault.id)
                 : zkNameEpoch(it);
-            const dek = await zkGetVaultDek(vault.id, epoch);
+            const dek = await zkGetWriteDek(vault.id, epoch);
             const entry = {
                 id: it.id, kind: it.type,
                 // Seal bound to the existing row id (v2) — upgrades a legacy plaintext name
@@ -14047,6 +14496,7 @@ async function refreshZkRekeyNotice() {
         }
         showSuccess('Vault key rotated.');
         await refreshZkRekeyNotice();
+        refreshZkKeyChecks();
     });
     notice.append(text, btn);
     box.appendChild(notice);
@@ -15085,7 +15535,7 @@ async function renameVaultItem(itemId, currentName, type) {
                 const vid = state.currentVault.id;
                 const item = (state.currentFiles || []).find(i => i.id === itemId);
                 const epoch = zkNameEpoch(item);
-                const dek = await zkGetVaultDek(vid, epoch);
+                const dek = await zkGetWriteDek(vid, epoch);
                 const lib = eccLib();
                 // Clash detection must consider a same-name row at ANY epoch, not just this
                 // item's: renaming INTO a name sealed before a rotation would otherwise miss it and
@@ -15099,9 +15549,7 @@ async function renameVaultItem(itemId, currentName, type) {
                 };
                 if (type === 'folder') body.name_key_version = epoch;
             } catch (e) {
-                showError(isCodedCryptoError(e)
-                    ? safeMessageForCode(e.code, 'unlock')
-                    : 'Zero-knowledge encryption failed.');
+                showError(zkWriteFailureMessage(e));
                 return;
             }
         } else {
@@ -16633,7 +17081,7 @@ const uploadManager = {
                           + 'again to continue.');
         }
         const lib = eccLib();
-        const dek = await zkGetVaultDek(it.vaultId, it.zkKeyVersion);
+        const dek = await zkGetWriteDek(it.vaultId, it.zkKeyVersion, 'uploaded');
         const ctx = { vaultId: it.vaultId, objectId: it.clientFileId, dekEpoch: it.zkKeyVersion };
         it.zkStream = await lib.startContentV2Encryption(it.zkPlain.file, dek, ctx);
         // The attempt token declared to the server IS the session's: one mint, read once, here.
@@ -16989,7 +17437,7 @@ const uploadManager = {
                 { headers: this._vaultHeaders() });
             if (s.ok) held = (await s.json()).received_chunks || [];
             const lib = eccLib();
-            const dek = await zkGetVaultDek(it.vaultId, it.zkKeyVersion);
+            const dek = await zkGetWriteDek(it.vaultId, it.zkKeyVersion, 'uploaded');
             const session = await lib.resumeContentV2Encryption(file, dek,
                 { vaultId: it.vaultId, objectId: it.clientFileId, dekEpoch: it.zkKeyVersion }, st);
             for (const index of held) {
@@ -17677,7 +18125,7 @@ async function uploadFiles(files) {
                 // client blind index (name_bi) are sent.
                 const vid = state.currentVault.id;
                 const keyVersion = await zkGetCurrentDekVersion(vid);
-                const dek = await zkGetVaultDek(vid, keyVersion);
+                const dek = await zkGetWriteDek(vid, keyVersion, 'uploaded');
                 const lib = eccLib();
                 for (const entry of toUpload) {
                     const mime = entry.file.type || '';
@@ -17768,9 +18216,7 @@ async function uploadFiles(files) {
                     entry.encMime = mime ? await lib.encryptName(mime, dek, vid, 'mime', keyVersion, clientFileId) : null;
                 }
             } catch (e) {
-                showError(isCodedCryptoError(e)
-                    ? safeMessageForCode(e.code, 'unlock')
-                    : 'Zero-knowledge encryption failed.');
+                showError(zkWriteFailureMessage(e));
                 return;
             }
         }
@@ -17880,7 +18326,7 @@ async function createFolder() {
             try {
                 const vid = state.currentVault.id;
                 const epoch = await zkGetCurrentDekVersion(vid);
-                const dek = await zkGetVaultDek(vid, epoch);
+                const dek = await zkGetWriteDek(vid, epoch);
                 const lib = eccLib();
                 // Client-generate the folder id so the name is sealed BOUND to it (v2, can't be
                 // transposed). The server uses this id for the row (validated + collision-checked).
@@ -17892,9 +18338,7 @@ async function createFolder() {
                 body.name_bi_candidates = await zkUploadNameCandidates(lib, folderName, vid, epoch, dek);
                 body.name_key_version = epoch;
             } catch (e) {
-                showError(isCodedCryptoError(e)
-                    ? safeMessageForCode(e.code, 'unlock')
-                    : 'Zero-knowledge encryption failed.');
+                showError(zkWriteFailureMessage(e));
                 return;
             }
         } else {
@@ -17971,6 +18415,11 @@ async function loadVaultInfo() {
 
         // Who paid for this vault's size, and the caller's own share of it.
         await loadVaultStorageCard();
+
+        // Zero-knowledge: what this browser found about the vault's key, checked now if it was not yet.
+        const found = ((zkState.keyChecks[vault.id] || {}).summary) || null;
+        if (found) zkRenderKeyDetails(vault, found);
+        else refreshZkKeyChecks();
 
     } catch (error) {
         console.error('Failed to load vault info:', error);
@@ -18187,7 +18636,7 @@ async function revokeVaultPermission(userId) {
 
         // Reload permissions, and the rotation notice (a rotation above clears an owed one).
         await loadVaultPermissions();
-        if (zk) refreshZkRekeyNotice();
+        if (zk) { refreshZkRekeyNotice(); refreshZkKeyChecks(); }
     } catch (error) {
         console.error('Failed to revoke permission:', error);
         showError('Failed to revoke permission: ' + error.message);
@@ -18459,11 +18908,60 @@ function renderVaultGrantList() {
         nameEl.className = 'cell-user-name';
         nameEl.textContent = u.username || '';
         textWrap.appendChild(nameEl);
+        if (isZkVault(state.currentVault)) {
+            const keyInfo = document.createElement('div');
+            keyInfo.className = 'grant-key-info';
+            textWrap.appendChild(keyInfo);
+            cb.addEventListener('change', () => {
+                if (cb.checked) { showGrantRecipientKey(u.id, keyInfo); return; }
+                keyInfo.dataset.seq = String(Number(keyInfo.dataset.seq || 0) + 1);  // drops a lookup in flight
+                keyInfo.replaceChildren();
+            });
+        }
         label.append(cb, avatar, textWrap);
         frag.appendChild(label);
     }
     listEl.replaceChildren(frag);
     updateVaultGrantCount();
+}
+
+// A zero-knowledge vault is shared with a person's encryption key, and whoever sets up an account's key
+// first owns it. So for each person ticked, the dialog shows their key's fingerprint -- the one they see
+// under "Your account" -- and when it was set up, and flags a key set up within 14 days after an
+// administrator changed that account's sign-in details: that key may be someone else's.
+async function showGrantRecipientKey(userId, box) {
+    const seq = String(Number(box.dataset.seq || 0) + 1);
+    box.dataset.seq = seq;
+    const shown = document.createElement('div');
+    shown.className = 'text-xs text-tertiary';
+    shown.textContent = 'Looking up their encryption key…';
+    box.replaceChildren(shown);
+    let pk = null;
+    try {
+        pk = await apiRequest(`/ecc/users/${encodeURIComponent(userId)}/public-key`, { silent: true });
+    } catch (_) {
+        if (box.dataset.seq === seq) shown.textContent = "Their encryption key could not be looked up.";
+        return;
+    }
+    if (box.dataset.seq !== seq) return;   // unticked (or ticked again) while this was on its way
+    if (!pk || !pk.has_keypair || !pk.public_key) {
+        shown.textContent = 'No encryption key yet: they get the vault once they set one up.';
+        return;
+    }
+    const fingerprint = await zkKeyFingerprint(pk.public_key);
+    if (box.dataset.seq !== seq) return;
+    const setUp = parseServerTime(pk.registered_at);
+    shown.textContent = `Key ${fingerprint}` + (setUp ? `, set up ${setUp.toLocaleDateString()}` : '');
+    shown.setAttribute('data-key-fingerprint', fingerprint);
+    if (pk.registered_after_admin_change === true) {
+        const flag = document.createElement('div');
+        flag.className = 'text-xs text-warning grant-key-flag';
+        flag.setAttribute('role', 'note');
+        flag.textContent = "Set up within 14 days after an administrator changed this account's sign-in "
+            + 'details. Whoever sets up a key first owns it: check this fingerprint with the person before '
+            + 'sharing.';
+        box.appendChild(flag);
+    }
 }
 
 function updateVaultGrantCount() {
@@ -18849,7 +19347,7 @@ async function handleEditVaultInfo(e) {
             // read/retire uses the right epoch. The non-secret label (server-side `name`) is left
             // unchanged here.
             zkEpoch = await zkGetCurrentDekVersion(cv.id);
-            const dek = await zkGetVaultDek(cv.id, zkEpoch);
+            const dek = await zkGetWriteDek(cv.id, zkEpoch);
             body = {
                 enc_name: await eccLib().encryptName(name, dek, cv.id, 'name', zkEpoch, cv.id),
                 enc_description: description

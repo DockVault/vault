@@ -143,12 +143,21 @@ but it is a UX affordance — the server sanitizer is authoritative.
 ## 7. Automated email actions
 
 `app/core/email_actions.py` turns the manual workbench into the vault's outbound automation. It
-defines a fixed **action catalog** (`ACTION_CATALOG`) — one entry per automated email — in two
+defines a fixed **action catalog** (`ACTION_CATALOG`) — one entry per automated email — in three
 categories:
 
 - **System** (`email_change`, `password_reset`, `account_invite`): the email *is* the mechanism for a
   flow the user asked for, so it is always on and cannot be switched off. Its built-in body carries a
   required dynamic token (`{{action.code}}` or `{{action.link}}`).
+- **Locked** (`compliance_access_notice`, `vault_access_notice`, `encryption_key_release_code`,
+  `encryption_key_notice`; the category `locked` in `email_actions.py`): always on, and always the
+  built-in subject and body, through the default sending profile. No default template is made for one;
+  a template bound to one (a row from before, or a direct database write) is ignored, and so is its
+  profile; `PUT /email/actions/{key}` refuses any change to one (409), and the Automated emails list
+  shows it read-only, with a test send. The owner's notices of access to their vaults must not be
+  softened or emptied by an administrator; the encryption-key emails carry what concerns a person's
+  encryption key, the code that releases it above all, and administrators are who that code guards
+  against (docs/design/vault-zk-key-proof-v1.md, §13.2).
 - **Optional** (`account_welcome`, `login_alert`, `share_created`, `vault_member_added`,
   `temp_credential_issued`): courtesy notices. Each is **off by default** and an admin turns it on
   per action — but only once a template is bound (§7.2).

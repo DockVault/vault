@@ -432,7 +432,7 @@ def after_cursor(q, AuditLog, cursor: Optional[Tuple[datetime, uuid.UUID]]):
 # The rows the host tool (dockvault.py accounts) writes under credential_changes.HOST_OPERATOR, with no
 # account behind them. A name typed at a failed sign-in can be the same text, so the action decides.
 HOST_OPERATOR_ACTIONS = frozenset({"user_updated", "password_reset_link_minted", "second_factor_admin_reset",
-                                   "credential_change_approved"})
+                                   "credential_change_approved", "zk_envelope_released"})
 
 
 def is_host_operator(r) -> bool:

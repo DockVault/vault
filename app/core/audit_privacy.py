@@ -163,8 +163,9 @@ _IDENTIFIER_KEYS = (
     "password_protected", "require_otp", "require_password", "has_expiry", "email_sent", "is_temporary",
     "job", "table", "superseded", "cleared", "is_active",
     "at_promotion", "added_by_left_because", "link_made_by_other", "locked", "was_locked",
-    # a zero-knowledge key change: the operation, and how it was proved ("key" or "absent"), never the proof
-    "op", "proof",
+    # a zero-knowledge key change: the operation, and how it was proved ("key" or "absent"), never the proof;
+    # and what a member's browser found when it checked the vault key it holds (one of KEY_CHECK_FINDINGS)
+    "op", "proof", "finding",
     # the auditor right: the grant, and who proposed it (a username)
     "grant_id", "proposed_by",
     # legal holds: the case's number, a hold's dates, and what it kept and why (never a name)

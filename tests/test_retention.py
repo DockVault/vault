@@ -33,9 +33,10 @@ from app.api import api_server as api  # noqa: E402
 from app.core import retention  # noqa: E402
 from app.core import settings_registry as reg  # noqa: E402
 from app.core.models import (AccountInvitation, ActiveSession, AuditArchiveBlock, AuditLog, AuditSeal,  # noqa: E402
-                             CredentialChange, EmailChangeCode, ManagedSetting,
-                             ManagedSettingChange, Notification, OtpCode, PasswordResetToken, PendingLogin,
-                             RateLimitRecord, RoleEnum, SecurityAlert, SystemSetting, User, ZkKeyProofChallenge)
+                             CredentialChange, ECCKeyUpdateChallenge, ECCRegistrationChallenge, EmailChangeCode,
+                             ManagedSetting, ManagedSettingChange, Notification, OtpCode, PasswordResetToken,
+                             PendingLogin, RateLimitRecord, RoleEnum, SecurityAlert, SystemSetting, User,
+                             ZkKeyProofChallenge)
 from _audit_chain_env import Chain  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -72,8 +73,8 @@ def factory(monkeypatch):
         copies = sa.MetaData()
         for model in (User, ActiveSession, PendingLogin, CredentialChange, RateLimitRecord, SecurityAlert,
                       AuditLog, AuditSeal, AuditArchiveBlock, ManagedSetting, ManagedSettingChange,
-                      SystemSetting, ZkKeyProofChallenge, AccountInvitation, PasswordResetToken, OtpCode,
-                      EmailChangeCode, Notification):
+                      SystemSetting, ZkKeyProofChallenge, ECCRegistrationChallenge, ECCKeyUpdateChallenge,
+                      AccountInvitation, PasswordResetToken, OtpCode, EmailChangeCode, Notification):
             # Each column as it is, without the foreign keys (the tables they name are not copied), and with
             # SQLite's spelling of "now" where Postgres's is the default.
             columns = []
@@ -237,7 +238,7 @@ def test_the_retention_settings_are_configured_documented_and_kept_by_the_tool(m
 def test_the_jobs_and_which_the_hold_switch_stops():
     assert [(j.name, j.held) for j in retention.JOBS] == [
         ("audit_seals", False), ("setting_changes", False), ("sessions", False), ("key_proof_challenges", False),
-        ("credential_changes", False), ("auditor_grants", False), ("compliance_cases", False),
+        ("possession_challenges", False), ("credential_changes", False), ("auditor_grants", False), ("compliance_cases", False),
         ("legal_holds", False), ("owner_notices", True),
         ("rate_limit_records", False), ("invitations", False), ("one_time_proofs", False), ("notifications", False),
         ("security_alerts", True), ("security_records", True),
@@ -941,6 +942,7 @@ def _job_functions() -> set:
 # pass itself, the functions it replaced, and the models its jobs delete from.
 OWNED_FUNCTIONS = _job_functions() | {"Pass", "delete_in_batches", "run_pass", "prune_done", "apply_due",
                                       "purge_old_session_data", "purge_expired_key_proof_challenges",
+                                      "purge_expired_possession_challenges",
                                       "cleanup_old_audit_logs", "cleanup_old_alerts"}
 # ZkKeyProofChallenge is not listed: issuing a key-proof challenge deletes the caller's own expired ones (a few
 # rows, which keeps the account under its cap of live challenges), and the pruner sweeps the rest. Nor are the

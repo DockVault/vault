@@ -343,16 +343,18 @@ def test_put_settings_refuses_a_key_only_env_sets(clean, monkeypatch):
     assert refused is not None and refused.status_code == 400
 
 
-@pytest.mark.parametrize("spelled", ["zk_key_proof_enforce", "ZK_KEY_PROOF_ENFORCE", "Zk_Key_Proof_Enforce"])
+@pytest.mark.parametrize("spelled", ["zk_key_proof_enforce", "ZK_KEY_PROOF_ENFORCE", "Zk_Key_Proof_Enforce",
+                                     "zk_envelope_hold_days", "ZK_ENVELOPE_HOLD_DAYS", "Zk_Envelope_Hold_Days"])
 def test_the_switches_only_env_sets_are_refused_by_the_registry_with_their_own_reason(clean, spelled):
     # One mechanism refuses every key only .env sets: ENV_ONLY_KEYS. The refusal is the one these switches
     # always had, a 400 that says the deployment environment manages them.
-    assert "zk_key_proof_enforce" in {k.lower() for k in reg.ENV_ONLY_KEYS}
-    assert "zk_key_proof_enforce" in reg.refused_settings_keys()
-    for value in (False, True, "false", 0, None):
+    name = spelled.lower()
+    assert name in {k.lower() for k in reg.ENV_ONLY_KEYS}
+    assert name in reg.refused_settings_keys()
+    for value in (False, True, "false", 0, 14, None):
         refused = _refused({spelled: value})
         assert refused is not None and refused.status_code == 400
-        assert refused.detail == "zk_key_proof_enforce is managed by the deployment environment"
+        assert refused.detail == f"{name} is managed by the deployment environment"
 
 
 def test_every_key_only_env_sets_is_a_setting_and_is_not_registered(clean):

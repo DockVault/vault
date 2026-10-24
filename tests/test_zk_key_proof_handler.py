@@ -81,7 +81,12 @@ def world(monkeypatch):
     monkeypatch.setattr(E, "_ecc_rate_limit", lambda *a, **k: None)
     audit = []
     monkeypatch.setattr(E, "_audit_zk", lambda db, actor, action, **kw: audit.append((action, kw.get("details"))))
-    state = {"enforce": True, "step_ups": []}
+    state = {"enforce": True, "step_ups": [], "told": []}
+    # Who the notices would tell (app/services/zk_notices.py is exercised in test_zk_notices.py).
+    monkeypatch.setattr(E.zk_notices, "failed_identity_proof",
+                        lambda db, user: state["told"].append(("failed_identity_proof", str(user.id))))
+    monkeypatch.setattr(E.zk_notices, "owner_reset",
+                        lambda db, owner, vault: state["told"].append(("owner_reset", str(vault.id))))
     monkeypatch.setattr(E.zk_key_proof, "enforcement_enabled", lambda: state["enforce"])
     # The owner reset's step-up (the account's second factor) is exercised live; here it is recorded, or
     # made to refuse, to see where it runs.
@@ -115,6 +120,10 @@ class World:
 
     def enforce(self, on: bool):
         self._state["enforce"] = on
+
+    @property
+    def told(self):
+        return self._state["told"]
 
     # ------------------------------------------------------------------ people and vaults
     def person(self, s, role=RoleEnum.USER):
@@ -1071,3 +1080,184 @@ def test_a_refusal_after_the_vault_lock_ends_its_transaction_first(world):
     assert (err.status_code, err.reason) == (400, "zk-key-proof-malformed") and "P-384" in err.detail
     assert not still_open, "the refusal of a team key that is not P-384 kept the vault lock"
     assert world.dek_version(vid) == 1
+
+
+# ------------------------------------------------------------------ a share never replaces another's key
+
+def _wrap_of(world, vid, user_id, epoch=1):
+    s = world.Session()
+    try:
+        row = s.query(VaultMemberKey).filter(VaultMemberKey.vault_id == vid, VaultMemberKey.user_id == user_id,
+                                             VaultMemberKey.key_version == epoch).first()
+        return None if row is None else (row.wrapped_dek, row.is_active, str(row.granted_by))
+    finally:
+        s.close()
+
+
+def test_a_share_to_someone_who_holds_the_current_key_changes_nothing(world):
+    """The server cannot tell a correct wrap from one of another key, so a key holder's copy is never
+    replaced by someone else's share: the answer is 200 with `unchanged`, and the row is as it was."""
+    vid, owner, manager, proof_key = world.direct_vault()
+    before = _wrap_of(world, vid, manager)
+    _, body, raw, header = _proved_share(world, vid, owner, manager, proof_key)
+    out = _share(world, vid, owner, manager, header=header, body=body, raw=raw)
+    assert out["status"] == "ok" and out["unchanged"] is True and out["key_version"] == 1
+    assert _wrap_of(world, vid, manager) == before
+    assert world.challenges_left() == 0
+    assert not [a for a, _ in world.audit if a == "zk_member_key_granted"]
+
+    # A team vault's copy of the team key likewise.
+    vid, owner, manager, team = world.hier_vault()
+    before = _wrap_of(world, vid, manager)
+    body = {"user_id": str(manager), "wrapped_team_privkey": "t2", "team_ephemeral_public_key": "e2"}
+    raw = _serialize(body)
+    ch = world.challenge(owner, vid, "share")
+    header = world.prove(ch, owner, vid, "share", raw, current_key=team)
+    out = _share(world, vid, owner, manager, header=header, body=body, raw=raw)
+    assert out["unchanged"] is True and _wrap_of(world, vid, manager) == before
+
+
+def test_a_first_share_a_switched_off_copy_and_your_own_still_go_ahead(world):
+    vid, owner, manager, proof_key = world.direct_vault()
+    # A first share.
+    target = world.new_person()
+    _, body, raw, header = _proved_share(world, vid, owner, target, proof_key)
+    out = _share(world, vid, owner, target, header=header, body=body, raw=raw)
+    assert "unchanged" not in out and _wrap_of(world, vid, target)[:2] == ("w2", True)
+    # A copy that was switched off is brought back with the new wrap.
+    s = world.Session()
+    row = s.query(VaultMemberKey).filter(VaultMemberKey.vault_id == vid, VaultMemberKey.user_id == target).one()
+    row.is_active, row.wrapped_dek = False, "old"
+    s.commit()
+    s.close()
+    _, body, raw, header = _proved_share(world, vid, owner, target, proof_key)
+    out = _share(world, vid, owner, target, header=header, body=body, raw=raw)
+    assert "unchanged" not in out and _wrap_of(world, vid, target)[:2] == ("w2", True)
+    # The caller's own copy is theirs to replace.
+    _, body, raw, header = _proved_share(world, vid, manager, manager, proof_key)
+    out = _share(world, vid, manager, manager, header=header, body=body, raw=raw)
+    assert "unchanged" not in out and _wrap_of(world, vid, manager)[:2] == ("w2", True)
+
+
+def test_with_enforcement_off_a_share_without_a_proof_still_replaces_no_one(world):
+    world.enforce(False)
+    vid, owner, manager, _ = world.direct_vault()
+    before = _wrap_of(world, vid, manager)
+    out = _share(world, vid, owner, manager)
+    assert out["unchanged"] is True and _wrap_of(world, vid, manager) == before
+
+
+# ------------------------------------------------------------------ who is told
+
+def test_only_a_failed_identity_proof_tells_the_account_it_was_made_for(world):
+    """A wrong identity MAC means a session for the account without the account's key: its user is told. A
+    wrong current-key or new-key MAC, or no live challenge, is not that, and tells nobody."""
+    vid, owner, manager, proof_key = world.direct_vault()
+    target = world.new_person()
+    body = _share_body(target)
+    raw = _serialize(body)
+    ch = world.challenge(manager, vid, "share")
+    header = world.prove(ch, manager, vid, "share", raw, current_key=ec.generate_private_key(ec.SECP384R1()))
+    world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid), request=E.GrantMemberKeyRequest(**body))
+    world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid), request=E.GrantMemberKeyRequest(**body))
+    assert world.failures() == ["current_key", "no_live_challenge"] and world.told == []
+    ch = world.challenge(manager, vid, "share")
+    header = world.prove(ch, manager, vid, "share", raw, current_key=proof_key,
+                         identity_key=ec.generate_private_key(ec.SECP384R1()))
+    world.refused(GRANT, manager, FakeRequest(raw, header), vault_id=str(vid), request=E.GrantMemberKeyRequest(**body))
+    assert world.told == [("failed_identity_proof", str(manager))]
+
+
+def test_an_owner_reset_tells_the_managers_and_a_rotation_does_not(world):
+    reset_vid, owner, manager = _damaged_direct_vault(world)
+    body, raw, header = _reset_request(world, reset_vid, owner, owner, manager)
+    out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(reset_vid), request=E.RekeyRequest(**body))
+    assert out["status"] == "ok" and world.told == [("owner_reset", str(reset_vid))]
+    vid, owner, manager, proof_key = world.direct_vault()
+    new_key, material = _direct_material()
+    body = _rekey_body(owner, manager, material)
+    raw = _serialize(body)
+    ch = world.challenge(owner, vid, "rekey")
+    header = world.prove(ch, owner, vid, "rekey", raw, current_key=proof_key, new_pem=material["public_key"],
+                         new_key=new_key)
+    out = world.call(REKEY, owner, FakeRequest(raw, header), vault_id=str(vid), request=E.RekeyRequest(**body))
+    assert out["status"] == "ok" and world.told == [("owner_reset", str(reset_vid))]
+
+
+
+# ------------------------------------------------------------------ a member's report of a key that does not match
+
+REPORT = E.report_key_check_mismatch
+
+
+def _report(world, vid, caller, finding="dek_check", epoch=1):
+    s = world.Session()
+    try:
+        user = s.query(User).filter(User.id == caller).first()
+        return run_coroutine(REPORT(vault_id=str(vid), request=E.KeyCheckReport(dek_epoch=epoch, finding=finding),
+                                    current_user=user, db=s))
+    finally:
+        s.close()
+
+
+def test_a_key_holders_report_is_recorded_and_the_owner_told(world, monkeypatch):
+    told = []
+    monkeypatch.setattr(E.zk_notices, "key_check_mismatch", lambda db, vault, finding: told.append((str(vault.id), finding)))
+    vid, owner, manager, _ = world.direct_vault()
+    out = _report(world, vid, manager, "lineage")
+    assert out == {"status": "recorded", "vault_id": str(vid), "dek_epoch": 1, "finding": "lineage"}
+    assert world.audit[-1] == ("zk_key_check_mismatch", {"dek_epoch": 1, "finding": "lineage", "mode": "direct"})
+    assert told == [(str(vid), "lineage")]
+    # The owner's own report is recorded; the owner sees the warning on the vault already.
+    assert _report(world, vid, owner, "seal")["status"] == "recorded"
+    assert told == [(str(vid), "lineage")]
+    # A report changes nothing about the vault's keys.
+    assert world.dek_version(vid) == 1 and world.proof_rows(vid).keys() == {1}
+
+
+def test_a_report_through_a_session_that_may_not_receive_the_vaults_key_is_refused(world, monkeypatch):
+    """A temporary credential that may not receive this vault's key gets the same refusal it gets for the key,
+    and its report records and tells nothing."""
+    from fastapi import HTTPException
+    told, asked = [], []
+    monkeypatch.setattr(E.zk_notices, "key_check_mismatch", lambda db, vault, finding: told.append(finding))
+
+    def may_not(db, user, vault):
+        asked.append(str(vault.id))
+        return False
+    monkeypatch.setattr(E, "may_release_vault_key", may_not)
+    vid, owner, manager, _ = world.direct_vault()
+    with pytest.raises(HTTPException) as exc:
+        _report(world, vid, manager)
+    assert (exc.value.status_code, exc.value.detail) == (403, E.TEMP_ZK_KEY_ACCESS_DENIED)
+    assert asked == [str(vid)] and told == []
+    assert not [a for a, _ in world.audit if a == "zk_key_check_mismatch"]
+
+
+def test_a_report_is_refused_to_anyone_without_a_key_and_for_what_is_not_a_finding(world, monkeypatch):
+    monkeypatch.setattr(E.zk_notices, "key_check_mismatch", lambda *a: None)
+    vid, owner, manager, _ = world.direct_vault()
+    stranger = world.new_person()
+    from fastapi import HTTPException
+    for caller in (stranger,):
+        with pytest.raises(HTTPException) as exc:
+            _report(world, vid, caller)
+        assert exc.value.status_code == 403
+    # A member whose key was switched off.
+    s = world.Session()
+    row = s.query(VaultMemberKey).filter(VaultMemberKey.vault_id == vid, VaultMemberKey.user_id == manager).one()
+    row.is_active = False
+    s.commit()
+    s.close()
+    with pytest.raises(HTTPException) as exc:
+        _report(world, vid, manager)
+    assert exc.value.status_code == 403
+    for finding, epoch in (("guess", 1), ("dek_check", 2)):
+        with pytest.raises(HTTPException) as exc:
+            _report(world, vid, owner, finding, epoch)
+        assert exc.value.status_code == 400
+    # A vault that does not exist answers as one the caller cannot reach.
+    with pytest.raises(HTTPException) as exc:
+        _report(world, uuid.uuid4(), owner)
+    assert exc.value.status_code == 403
+    assert not [a for a, _ in world.audit if a == "zk_key_check_mismatch"]

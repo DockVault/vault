@@ -702,6 +702,9 @@ def _action_out(a: EmailAction) -> dict:
         "description": a.description,
         "category": a.category,
         "enabled": bool(a.enabled),
+        # Always its built-in wording through the default sending profile, and nothing here changes it
+        # (a locked action, app/core/email_actions.py): the catalog decides, whatever the row says.
+        "locked": a.category == LOCKED or SPEC_BY_KEY.get(a.key, {}).get("category") == LOCKED,
         "template_id": str(a.template_id) if a.template_id else None,
         "template": ({"id": str(tpl.id), "name": tpl.name, "subject": tpl.subject} if tpl else None),
     }

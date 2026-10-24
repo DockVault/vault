@@ -9,7 +9,11 @@ always on and always sends its built-in subject and body: a template bound to it
 can be bound (Email Studio shows it read-only), so no administrator can change what it says. Only the
 brand (``{{vault.name}}``) and the sending profile are the deployment's. The notice that tells a
 vault's owner about compliance access to their vaults is one: an administrator must not be able to
-soften or empty it.
+soften or empty it. The emails about a person's encryption key are others, the code that releases it
+above all: administrators are the very people they guard against, and one who could choose the
+template or its sending profile could route every code through a relay of their own, or carry it in a
+link. What remains is stated in the design (docs/design/vault-zk-key-proof-v1.md, 13.2): an
+administrator who repoints the deployment's default sending profile can read them.
 
 Delivery and dynamic-token injection live in ONE place — :func:`send_action_email`. A trigger only
 supplies the action key, the recipient, and any per-send context (a link / code / expiry). No trigger
@@ -264,6 +268,34 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "encryption_key_release_code": {
+        "name": "Encryption key release code",
+        "subject": "Your code to open your encryption key on {{vault.name}}",
+        "body_html": (
+            "<h2>Your code</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>An administrator changed your account's sign-in details recently, so your encryption key is "
+            "released to a browser only after it enters this code:</p>"
+            "<h1>{{action.code}}</h1>"
+            "<p>This code expires {{action.expires}}. If you did not ask for it, someone else may be signed "
+            "in as you: do not give this code to anyone, and contact your administrators at once.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
+    "encryption_key_notice": {
+        "name": "Encryption key notice",
+        "subject": "About the encryption keys of your {{vault.name}} account",
+        "body_html": (
+            "<h2>About your encryption keys</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>If you did not expect this, contact your administrators.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
 }
 
 # (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
@@ -315,6 +347,15 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("recorded_values_removal", "Removal of recorded values",
      "Sent to every administrator when a removal of the values the audit log recorded under earlier "
      "recording levels is asked for, cancelled or completed — says what, when and by whom.", SYSTEM),
+    ("encryption_key_release_code", "Encryption key release code",
+     "Sent to a user whose sign-in details an administrator changed recently, when a browser asks to open "
+     "their encryption key — carries the code that releases it (to the address before an email change). "
+     "Its wording is fixed: it cannot be changed or turned off.", LOCKED),
+    ("encryption_key_notice", "Encryption key notice",
+     "Sent to a user when a change to a zero-knowledge vault's key was refused because it did not come with "
+     "their own encryption key (at most once an hour), when an encryption key is set up for their account, "
+     "and to a vault's managers when its owner resets its key — says what happened and when. Its wording is "
+     "fixed: it cannot be changed or turned off.", LOCKED),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(

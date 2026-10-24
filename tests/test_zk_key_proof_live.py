@@ -768,16 +768,22 @@ def test_key_holders_see_the_epochs_proof_material_and_only_managers_get_the_sea
         assert (mine["state"], mine["source"], mine["lineage_tag"]) == ("set", "create", None)
         assert mine["public_key"].strip() == row[0].strip() and mine["dek_check"] == row[2]
         assert mine["sealed_private_key"] == row[1] and mine["created_at"]
+        assert mine["created_by"] == str(owner["id"])
         theirs = mc.get(f"/ecc/vaults/{vid}/keys").json()["key_proof"]
         assert "sealed_private_key" not in theirs, "a plain member was given the sealed proof key"
+        assert "created_by" not in theirs, "a plain member was told who installed the key check"
         assert (theirs["state"], theirs["public_key"], theirs["dek_check"]) == ("set", mine["public_key"], row[2])
         assert sc.get(f"/ecc/vaults/{vid}/keys").status_code == 403
 
         # An epoch with no row, and a team vault, whose verifier is its team key.
         _psql(f"DELETE FROM vault_key_proofs WHERE vault_id = '{vid}'")
         assert oc.get(f"/ecc/vaults/{vid}/keys").json()["key_proof"] == {"state": "missing"}
-        assert oc.get(f"/ecc/vaults/{team_vid}/keys").json()["key_proof"] == {
+        team = oc.get(f"/ecc/vaults/{team_vid}/keys").json()["key_proof"]
+        assert {k: team[k] for k in ("state", "source", "lineage_tag")} == {
             "state": "team", "source": "create", "lineage_tag": None}
+        # Who installed the material, for a manager (the owner here), and when.
+        assert team["created_by"] == str(owner["id"]) and team["created_at"]
+        assert set(team) == {"state", "source", "lineage_tag", "created_at", "created_by"}
     finally:
         oc.delete_vault(vid)
         oc.delete_vault(team_vid)

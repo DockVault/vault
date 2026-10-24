@@ -151,3 +151,29 @@ def test_the_locked_owner_notice_is_shown_read_only(admin_page: Page, admin):
     expect(row.locator(".ear-test")).to_be_visible()
     # And the server refuses a change made around the page.
     assert admin.put("/email/actions/compliance_access_notice", json={"template_id": None}).status_code == 409
+
+
+@pytest.mark.parametrize("key", ["encryption_key_release_code", "encryption_key_notice"])
+def test_an_encryption_key_email_is_shown_locked_with_no_template_to_choose(admin_page: Page, admin, key):
+    """It always sends its built-in text through the default sending profile: the list offers no template
+    for it, and a template made meanwhile is no choice for it."""
+    made = admin.post("/email/templates", json={"name": unique("Not for keys"), "subject": "s",
+                                                "body_html": "<p>{{action.code}}</p>"})
+    assert made.status_code in (200, 201), made.text
+    tid = made.json()["id"]
+    try:
+        page = admin_page
+        _open_email_tab(page)
+        row = page.locator(f'.email-action-row[data-action-key="{key}"]')
+        expect(row).to_be_visible()
+        expect(row.locator(".ear-badge")).to_have_text("Locked")
+        expect(row.locator(".ear-locked")).to_contain_text("cannot be changed")
+        expect(row.locator("select.ear-template")).to_have_count(0)
+        expect(row.locator(".ear-notify")).to_have_count(0)
+        # An action that is not locked still offers the templates, the new one among them.
+        other = page.locator('.email-action-row[data-action-key="password_reset"] .ear-template option')
+        expect(other.filter(has_text="Not for keys")).not_to_have_count(0)
+        # And the server refuses a binding made around the page.
+        assert admin.put(f"/email/actions/{key}", json={"template_id": tid}).status_code == 409
+    finally:
+        admin.delete(f"/email/templates/{tid}")

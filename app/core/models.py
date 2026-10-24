@@ -723,6 +723,10 @@ class ActiveSession(Base):
     # NULL: written by an earlier release, and treated as a web session. Nullable and added by the boot
     # DDL, so an earlier release reads the table without it.
     channel = Column(String(8), nullable=True)
+    # When this session entered the emailed code that releases the account's zero-knowledge key envelope
+    # during the hold after an administrator changed the account's sign-in details (app/core/envelope_hold.py).
+    # It releases this session only, and only for changes made before it. NULL: never released.
+    zk_envelope_released_at = Column(DateTime, nullable=True)
     
     # Relationships
     user = relationship('User', back_populates='active_sessions')
@@ -797,7 +801,14 @@ class Vault(Base):
     # conflating the two would regress Standard vaults. Always 1 for never-rotated /
     # non-ZK vaults.
     dek_version = Column(Integer, nullable=False, default=1, server_default='1')
-    
+
+    # A rotation this vault owes because an account that held its CURRENT key was deleted: the epoch on
+    # the vault's own axis (the DEK epoch of a direct vault, the team epoch of a hierarchical one) at which
+    # that happened. Deleting an account takes its key rows with it, so the removal leaves no deactivated
+    # row for the "rotation owed" check to find; this records it instead. A rotation moves the epoch past
+    # it, which ends it. NULL when nothing is owed this way; an older release ignores the column.
+    rotation_owed_epoch = Column(Integer, nullable=True)
+
     # Expiration policy
     expire_files_after_days = Column(Integer, nullable=True)  # null means never expire
     expire_files_unit = Column(String(20), default='days')  # 'minutes', 'hours', or 'days'
@@ -2310,6 +2321,13 @@ class UserKeyPair(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_used = Column(DateTime, nullable=True)
+
+    # Whether the key was set up within 14 days after an administrator (or the server's operator) changed
+    # the account's sign-in details. Whoever sets up an account's key first owns it, so a key set up in that
+    # window may be someone else's; the share dialog says so beside it. Decided at registration, from the
+    # credential-change records, which are kept only for those 14 days. NULL for a key set up before this
+    # was recorded; an older release ignores the column.
+    registered_after_admin_change = Column(Boolean, nullable=True)
     
     # Relationships
     user = relationship('User', foreign_keys=[user_id])
@@ -2347,16 +2365,17 @@ class ZKShareInvite(Base):
 class ECCRegistrationChallenge(Base):
     """A one-time proof-of-possession challenge for ECC public-key registration (app/services/ecc_pop.py).
 
-    Holds the server's EPHEMERAL private key + nonce so the register endpoint can verify the
-    client's ECDH key-confirmation MAC. NOT a user key and never a DEK — a transient,
-    single-use, short-TTL server challenge (deleted on verify; expired rows swept). This is
-    what stops a caller registering a public key whose private key they don't hold.
+    Holds the server's EPHEMERAL private key, SEALED with the deployment key (encrypt_secret; read back
+    only through the strict decrypt), + nonce so the register endpoint can verify the client's ECDH
+    key-confirmation MAC. NOT a user key and never a DEK — a transient, single-use, short-TTL server
+    challenge (deleted on verify; expired rows deleted by the pruner). This is what stops a
+    caller registering a public key whose private key they don't hold.
     """
     __tablename__ = 'ecc_registration_challenges'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM (transient)
+    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM, sealed (transient)
     nonce = Column(Text, nullable=False)               # base64
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -2373,15 +2392,16 @@ class ECCKeyUpdateChallenge(Base):
     make a registration challenge simply unreachable from the update verifier. The key-derivation
     domain differs too, so even a misrouted row could not yield a valid MAC.
 
-    Holds the server's EPHEMERAL private key and nonce so the update endpoint can verify the
-    client's proof. Never a user key, never a DEK: transient, single-use and short-lived.
+    Holds the server's EPHEMERAL private key, sealed with the deployment key as a registration
+    challenge's is, and nonce so the update endpoint can verify the client's proof. Never a user key,
+    never a DEK: transient, single-use and short-lived; expired rows are deleted by the pruner.
     See app/services/ecc_update_pop.py and docs/design/vault-private-key-update-pop-v1.md.
     """
     __tablename__ = 'ecc_key_update_challenges'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM (transient)
+    server_private_key = Column(Text, nullable=False)  # server ephemeral PKCS8 PEM, sealed (transient)
     nonce = Column(Text, nullable=False)               # base64
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -3165,6 +3185,9 @@ class CredentialChange(Base):
     # asked cannot clear the way for their maker (credential_changes.snapshot). NULL for a change
     # made at once.
     approval_snapshot = Column(JSON(none_as_null=True), nullable=True)
+    # When the host operator released the hold this change put on the account's zero-knowledge key envelope
+    # (`dockvault.py accounts`, for an account with no email to send the code to). NULL: not released.
+    envelope_released_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         Index('idx_credential_change_target', 'target_user_id', 'applied_at'),

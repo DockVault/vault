@@ -1857,6 +1857,10 @@ async def get_current_user(
             headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
         )
 
+    # Which session this request came in on: what the hold on the zero-knowledge key envelope is released
+    # for (app/core/envelope_hold.py, which compares it hashed, as every lookup of a session row does).
+    user._session_token = session_token or None
+
     # Surface the temp-session context (scope, vault mode, per-vault caps) so the
     # permission decorator and the data layer can enforce least privilege.
     # NULL scope = legacy credential = unrestricted (handled inside the helpers).
@@ -6083,12 +6087,13 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
     if last is None:
         change = cc.record_made(db, kind=kind, target_id=target.id, requester_id=requester_id,
                                 requester_name=requester_name, summary=summary, now=now)
+        email_before = target.email
         result = _apply_credential_change(db, kind, target, payload, actor_id=requester_id,
                                           actor_name=requester_name, request=request)
-        if kind == cc.EMAIL:
-            # The address before and after, for the 14 days a self-service reset link goes to the old
-            # one (_self_service_reset_destination).
-            change.payload = cc.applied_email_payload(result)
+        # The address the account had before the change (for an email change, before and after): for the 14
+        # days a self-service reset link goes to the old one (_self_service_reset_destination), and the
+        # code that releases the encryption-key envelope goes there (app/core/envelope_hold.py).
+        change.payload = cc.applied_payload(kind, email_before, result)
         return _CredentialOutcome(change, False, result)
     change = cc.hold(db, kind=kind, target_id=target.id, requester_id=requester_id,
                      requester_name=requester_name, summary=summary, payload=payload, now=now)
@@ -11538,6 +11543,7 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
     if not cc.claim_approval(db, change, approver_id=approver_id, approver_name=approver_name):
         db.rollback()
         raise HTTPException(status_code=409, detail="That request was already decided, so nothing was changed.")
+    email_before = target.email
     try:
         # A reset link is handed to the approver, not to the one who asked: its maker is the approver.
         result = _apply_credential_change(db, kind, target, payload, actor_id=requested_by_id,
@@ -11547,10 +11553,9 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
         # Rolled back here, because the host tool's session commits whatever is left when it ends.
         db.rollback()
         raise
-    if kind == cc.EMAIL:
-        # The address before and after, for the 14 days a self-service reset link goes to the old one
-        # (_self_service_reset_destination). Nothing else a decided request held is kept.
-        change.payload = cc.applied_email_payload(result)
+    # The address the account had before the change (for an email change, before and after), as for a change
+    # made at once (_credential_change). Nothing else a decided request held is kept.
+    change.payload = cc.applied_payload(kind, email_before, result)
     db.add(AuditLogger(db).build_row(
         action="credential_change_approved", status="success", user=approver,
         username=None if approver is not None else cc.HOST_OPERATOR,
@@ -11670,6 +11675,14 @@ async def delete_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account"
         )
+
+    # Their zero-knowledge key rows go with the account, so the vaults whose current key they were given
+    # record, before the delete and in its transaction, that they owe a rotation. This locks those vault
+    # rows, and comes before the last-administrator check, which locks every administrator's row: vault
+    # rows are always locked first, since a rotation holding one goes on to write key rows, and writing a
+    # key row locks the user it names (see _blacklist_user_vault_keys). A refusal below rolls it back.
+    from app.api.ecc_router import record_rotations_owed_by
+    record_rotations_owed_by(db, user.id)
 
     # Never delete the last administrator who can act (see app/core/last_admin.py).
     if user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
@@ -15722,6 +15735,27 @@ def _user_group_ids(db: Session, user_id) -> list:
     return [str(r[0]) for r in db.query(user_groups.c.group_id).filter(user_groups.c.user_id == user_id).all()]
 
 
+def _share_eligible_ids(db: Session, current_user: User, user_ids) -> set:
+    """The ids among ``user_ids`` that ``current_user`` could reach through the recipient picker (GET
+    /users/search): active, non-EXTERNAL accounts, and -- when the org sets
+    directory_search_scope='same_department' -- accounts sharing a department with them. An interactive admin
+    is not department-scoped (they have the unrestricted /users directory). As strings."""
+    ids = [u for u in user_ids if u]
+    if not ids:
+        return set()
+    from sqlalchemy import select as _select
+    q = db.query(User.id).filter(
+        User.id.in_(ids),
+        User.is_active == True,  # noqa: E712
+        User.role != RoleEnum.EXTERNAL,
+    )
+    if getattr(current_user, "role", None) != RoleEnum.ADMIN and _directory_search_scope(db) == "same_department":
+        caller_gids = _select(user_groups.c.group_id).where(user_groups.c.user_id == current_user.id)
+        q = q.join(user_groups, User.id == user_groups.c.user_id).filter(
+            user_groups.c.group_id.in_(caller_gids)).distinct()
+    return {str(r[0]) for r in q.all()}
+
+
 def _validate_share_audience_users(db: Session, current_user: User, aud_users: list) -> None:
     """A direct-push 'users' audience must be limited to recipients the creator could actually reach
     through the recipient picker (GET /users/search): active, non-EXTERNAL accounts, and — when the org
@@ -15733,17 +15767,7 @@ def _validate_share_audience_users(db: Session, current_user: User, aud_users: l
     closed: any ineligible id is rejected with a non-enumerating 400 (the specific ids are not echoed)."""
     if not aud_users:
         return
-    from sqlalchemy import select as _select
-    q = db.query(User.id).filter(
-        User.id.in_(aud_users),
-        User.is_active == True,  # noqa: E712
-        User.role != RoleEnum.EXTERNAL,
-    )
-    if getattr(current_user, "role", None) != RoleEnum.ADMIN and _directory_search_scope(db) == "same_department":
-        caller_gids = _select(user_groups.c.group_id).where(user_groups.c.user_id == current_user.id)
-        q = q.join(user_groups, User.id == user_groups.c.user_id).filter(
-            user_groups.c.group_id.in_(caller_gids)).distinct()
-    eligible = {str(r[0]) for r in q.all()}
+    eligible = _share_eligible_ids(db, current_user, aud_users)
     if any(str(u) not in eligible for u in aud_users):
         raise HTTPException(
             status_code=400,
@@ -16406,16 +16430,18 @@ async def list_shared_with_me(
 # ---------------------------------------------------------------------------
 
 def _notify_users(user_ids, ntype: str, title: str, body: str = None,
-                  target: str = None, dedup_prefix: str = None) -> None:
+                  target: str = None, dedup_prefix: str = None) -> list:
     """Best-effort: create an in-app notification for each user in a SEPARATE session, so a failure
     or a dedup collision can never affect the caller's request/transaction. When dedup_prefix is
     given, each row's dedup_key is f"{dedup_prefix}:{user_id}" and a UNIQUE(user_id, dedup_key)
-    collision is silently skipped (that user was already notified for this event)."""
+    collision is silently skipped (that user was already notified for this event). Returns the ids of
+    the users a notification was written for (none after a failure), so a caller can send an email only
+    to the people the deduplicated notice reached."""
     from app.core.database import get_db_context
     from app.core.models import Notification
     ids = [str(u) for u in dict.fromkeys(user_ids) if u]  # de-dup + drop falsy, preserve order
     if not ids:
-        return
+        return []
     notified = []
     try:
         with get_db_context() as db:
@@ -16442,6 +16468,8 @@ def _notify_users(user_ids, ntype: str, title: str, body: str = None,
                           include_metrics=False)
     except Exception as e:
         print(f"⚠ notification write skipped: {type(e).__name__}")
+        return []
+    return notified
 
 
 def _notification_dict(n) -> dict:
@@ -25476,6 +25504,19 @@ END $$;""",
             "ALTER TABLE user_ssh_keys ADD COLUMN IF NOT EXISTS created_by_name VARCHAR(255)",
             SSH_KEY_MAKER_FROM_ACCOUNT,
             SSH_KEY_MAKER_FROM_AUDIT,
+            # The epoch at which an account that held a zero-knowledge vault's current key was deleted,
+            # so the vault still owes a rotation after the account's key rows are gone. Nullable, no
+            # default: nothing is owed on an existing vault, and an older release ignores the column.
+            "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS rotation_owed_epoch INTEGER",
+            # Whether an account's encryption key was set up within 14 days after an administrator changed
+            # its sign-in details, shown beside the key when a vault is shared with the account. Nullable,
+            # no default: unknown for a key set up before, and an older release ignores the column.
+            "ALTER TABLE user_keypairs ADD COLUMN IF NOT EXISTS registered_after_admin_change BOOLEAN",
+            # The hold on an account's zero-knowledge key envelope after an administrator changed its
+            # sign-in details: when a session entered the emailed code, and when the host operator released
+            # a change's hold. Nullable, no default; an older release ignores both.
+            "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS zk_envelope_released_at TIMESTAMP",
+            "ALTER TABLE credential_changes ADD COLUMN IF NOT EXISTS envelope_released_at TIMESTAMP",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)
@@ -26045,8 +26086,11 @@ async def lifespan(app: FastAPI):
     # Say so when requests that change zero-knowledge keys are accepted without a key proof.
     from app.services import zk_key_proof
     zk_key_proof.report_at_startup()
+    # And when the encryption-key envelope is not held after an administrator changes an account.
+    from app.core import envelope_hold
+    envelope_hold.report_at_startup()
 
-    # The pruner: every timed deletion of records (finished sessions, expired key-proof challenges, the
+    # The pruner: every timed deletion of records (finished sessions, expired key challenges, the
     # records of credential changes, the sign-in throttle's fallback rows, resolved alerts, audit rows) and
     # the settings changes that wait, on a thread of its own, one runner at a time, first a minute after the
     # start. Only this process runs it. See app/core/retention.py.

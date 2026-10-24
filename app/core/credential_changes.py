@@ -190,6 +190,43 @@ def applied_email_payload(result: dict) -> dict:
     return {"previous_email": result.get("old_email"), "new_email": result.get("new_email")}
 
 
+def applied_payload(kind: str, email_before, result: dict) -> dict:
+    """What an applied change keeps for the window, from the account's address just before it was applied
+    and what applying it returned. An email change keeps the address before and after
+    (applied_email_payload); any other change, the address the account had (``email_at_change``).
+
+    The address before the change is where the code that releases the account's encryption-key envelope
+    goes during the hold the change starts (app/core/envelope_hold.py), and where a notice about the
+    account's encryption key also goes: not the address the account has later, which whoever made the
+    change could have moved through the account's own settings, with the password they set."""
+    if kind == EMAIL:
+        return applied_email_payload(result)
+    return {"email_at_change": email_before}
+
+
+def address_before(change: CredentialChange) -> Optional[str]:
+    """The account's email address just before ``change`` was applied: for an email change the address it
+    replaced, for any other the address the account had. An empty string when it had none. None when the
+    row does not say: a change other than an email change applied before 0.34.0 kept no address."""
+    payload = change.payload or {}
+    key = "previous_email" if change.kind == EMAIL else "email_at_change"
+    if key not in payload:
+        return None
+    return (payload.get(key) or "").strip()
+
+
+def first_applied(db, target_id, now: Optional[datetime] = None) -> Optional[CredentialChange]:
+    """The oldest change applied to this account within the window, or None."""
+    now = now or utcnow()
+    return (db.query(CredentialChange)
+            .filter(CredentialChange.target_user_id == target_id,
+                    CredentialChange.status.in_(APPLIED),
+                    CredentialChange.applied_at.isnot(None),
+                    CredentialChange.applied_at > now - WINDOW)
+            .order_by(CredentialChange.applied_at.asc())
+            .first())
+
+
 def window_ends(change: CredentialChange) -> Optional[datetime]:
     """When a further change to that account stops needing approval."""
     return change.applied_at + WINDOW if change.applied_at else None

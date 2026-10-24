@@ -27,7 +27,7 @@ The hold switch. ``logs_hold`` (the deployment's value is RETENTION_HOLD; with R
 cannot turn it off) stops every job over logs and security records while it is on. A pass takes the stricter of
 the stored settings and the audit chain's honoured state, and reads the stored settings again before each such job
 and before each batch of one, so a hold turned on during a pass stops what comes after it. The jobs over working
-records (finished sessions, expired key-proof challenges, credential-change records, the sign-in throttle's
+records (finished sessions, expired key challenges, credential-change records, the sign-in throttle's
 fallback rows, ended invitations, used or expired reset links and one-time codes, old notifications, waiting
 settings changes) keep running. Turning the hold off deletes sooner, so it waits like any such change
 (app/core/setting_changes.py).
@@ -408,6 +408,21 @@ def prune_key_proof_challenges(p: Pass, *, model=None) -> JobResult:
         model, deletable(model, p.now, *sr.expired_key_proof_challenge_conditions(model, p.now)), model.created_at)
 
 
+def prune_possession_challenges(p: Pass, *, models=None) -> JobResult:
+    """Key registration and envelope-replacement challenges past their lifetime, each holding a sealed one-time
+    key (app/core/session_retention.py). The models are a parameter so the real condition can run against a
+    throwaway schema."""
+    from app.core import session_retention as sr
+    from app.core.models import ECCKeyUpdateChallenge, ECCRegistrationChallenge
+    result = JobResult()
+    for model in models or (ECCRegistrationChallenge, ECCKeyUpdateChallenge):
+        done = p.delete_in_batches(
+            model, deletable(model, p.now, *sr.expired_possession_challenge_conditions(model, p.now)),
+            model.created_at)
+        result.add(done.deleted, done.oldest, done.newest)
+    return result
+
+
 def prune_credential_changes(p: Pass) -> JobResult:
     """Records of credential changes applied, or requests decided, 14 days ago (credential_changes.prune_done).
     They are few, so they go in one statement, bounded like every other."""
@@ -572,6 +587,7 @@ JOBS: list[Job] = [
     Job("setting_changes", "Waiting settings changes that are due", apply_waiting_changes),
     Job("sessions", "Finished sessions and sign-ins", prune_sessions),
     Job("key_proof_challenges", "Expired key-proof challenges", prune_key_proof_challenges),
+    Job("possession_challenges", "Expired key registration and envelope challenges", prune_possession_challenges),
     Job("credential_changes", "Records of changes to people's sign-in details", prune_credential_changes),
     Job("auditor_grants", "Auditor rights whose time ran out, or whose holder's account changed",
         settle_auditor_grants),

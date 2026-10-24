@@ -102,8 +102,11 @@ SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setti
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too (settings_refusal),
 # so a settings save can never look as if it had changed one: nothing reads them from the settings store.
 #   ZK_KEY_PROOF_ENFORCE: whether a key change to a zero-knowledge vault must carry a key proof.
+#   ZK_ENVELOPE_HOLD_DAYS: how many days after an administrator changed an account's sign-in details its
+#     encryption key is released to a browser only after an emailed code (app/core/envelope_hold.py).
 #   AUDIT_CHAIN_KEY, AUDIT_CHAIN_HEAD_FILE: the audit chain's key and where the server keeps the chain's head.
-ENV_ONLY_KEYS: frozenset[str] = frozenset({"ZK_KEY_PROOF_ENFORCE", "AUDIT_CHAIN_KEY", "AUDIT_CHAIN_HEAD_FILE"})
+ENV_ONLY_KEYS: frozenset[str] = frozenset({"ZK_KEY_PROOF_ENFORCE", "ZK_ENVELOPE_HOLD_DAYS", "AUDIT_CHAIN_KEY",
+                                           "AUDIT_CHAIN_HEAD_FILE"})
 
 # How prominently the Settings pages show a setting: essential ones on the page, advanced ones behind "Show
 # advanced settings (N)". The rule: essential is what most administrators change in their first month.

@@ -52,10 +52,13 @@ const state = { currentVault: { id: 'V', zk: true }, currentFolderId: null, curr
 const isZkVault = (v) => !!(v && v.zk);
 const zkGetCurrentDekVersion = async () => 1;
 const zkGetVaultDek = async () => 'dek';
+const zkGetWriteDek = async () => 'dek';
 const zkNewObjId = () => 'obj-' + (zkNewObjId.n = (zkNewObjId.n || 0) + 1);
 const zkNewBlobId = () => 'blob';
 const zkUploadNameCandidates = async () => ['bi'];
 const isCodedCryptoError = () => false, safeMessageForCode = () => '';
+const zkWriteFailureMessage = (e) => (e && e.zkKeyMismatch) ? e.message
+    : (isCodedCryptoError(e) ? safeMessageForCode(e.code, 'unlock') : 'Zero-knowledge encryption failed.');
 const sealed = [];                                 // every name the library was asked to seal
 const lib = { ZK_CONTENT_WRITE_V2: true,
     nameBlindIndex: async (name) => 'bi:' + name,
@@ -195,6 +198,7 @@ const state = { currentVault: null }, isZkVault = () => false;
 const zkUploadStore = { delete: async () => {} };
 const isCodedCryptoError = (e) => !!(e && e.code), safeMessageForCode = () => 'coded';
 const zkGetVaultDek = async () => 'dek';
+const zkGetWriteDek = async () => 'dek';
 const ZK_FRAMES_PER_UPLOAD_CHUNK = 2;
 let held = [];                                    // what the server says it holds
 let signOutDuringGet = false, duringGet = null;

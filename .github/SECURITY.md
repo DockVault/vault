@@ -132,6 +132,14 @@ the key of a zero-knowledge vault they hold. The protocol is specified in
   downloading and syncing are unaffected, and nobody is signed out.
 - **Reverse proxies** must pass the `X-ZK-Key-Proof` request header and the request body on
   unchanged: the proof is a MAC over the body's exact bytes.
+- **`ZK_ENVELOPE_HOLD_DAYS`** (`.env` only, default `14`, from 0.34.0). For this many days after an
+  administrator or the server's operator changed a person's sign-in details, their encrypted key is
+  given to a browser only after it enters a code sent by email, to the address the account had before
+  the change. It needs mail: without it, release a person with `python dockvault.py accounts --action
+  release-key-hold`. `0` turns the hold off; more than `14` stops the server starting. An
+  administrator cannot change it from the settings page. The code's email, and the encryption-key
+  notices, always use their built-in text and the default sending profile: Email Studio cannot bind
+  a template or another profile to them.
 - **The compatibility promise.** A request without a proof never half-applies: it gets a refusal
   with a plain `detail` and a `reason`, never a 401. Reads, uploads, downloads and sync never depend
   on proof material. A client recognises a server without key proofs by a 404 without a `reason`
@@ -141,12 +149,20 @@ the key of a zero-knowledge vault they hold. The protocol is specified in
 
 What this does not cover:
 
-- **A weak zero-knowledge passphrase.** Someone who can sign in as a person can download their
-  passphrase-encrypted key and try to guess the passphrase offline; a guessed passphrase makes them
-  that person. Use a long passphrase.
+- **A weak zero-knowledge passphrase.** This bounds every zero-knowledge guarantee. Someone who can
+  sign in as a person can download their passphrase-encrypted key and try to guess the passphrase
+  offline; a guessed passphrase makes them that person. From 0.34.0 a new passphrase must be at least
+  12 characters and not a common one, and the hold above keeps the key from whoever changed a
+  person's sign-in details, but a weak passphrase set earlier and never changed, a session stolen
+  outside the hold, or a mailbox someone else reads is still exposed. So is the code itself to an
+  administrator who repoints the deployment's default sending profile at a relay of their own: keep
+  that profile out of administrators' hands where you can, and check the audit log for
+  `email_profile_created` and `email_profile_updated` after a change to someone's sign-in details. Use a long passphrase.
 - **An account that has not set up its encryption key yet.** Whoever sets it up first owns it. If
   someone signs in as a person before that person has set up a key, a vault shared to that account
-  afterwards is shared to them.
+  afterwards is shared to them. From 0.34.0 the person is told when a key is set up for their
+  account, and the share dialog shows the recipient's key fingerprint and flags a key set up soon
+  after an administrator changed that account.
 - **Keys changed before the upgrade.** A vault whose key someone else chose before 0.33.2 keeps that
   key. Check the audit log for entries made after an administrator changed a vault member's sign-in
   details: `zk_vault_rekeyed` and `zk_member_key_granted`, and `vault_created` for a zero-knowledge

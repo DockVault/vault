@@ -196,6 +196,13 @@ registered with its default code, like every other public method:
 | `keyProofTranscript` | `INVALID_INPUT` for an unknown operation or mode, a nonce that is not 32 bytes, or a malformed id or epoch | `INVALID_INPUT` |
 | `computeKeyProof` | as `keyProofTranscript`, and `INVALID_INPUT` without an identity key | `CRYPTO_OPERATION_FAILED` |
 
+From 0.34.0 a member's browser also checks the team key it unwraps, while the key's bytes are in hand, with one
+more operation and no new code:
+
+| Operation | Raises | Default |
+|---|---|---|
+| `unwrapTeamPrivateKeyWithCheck` | as `unwrapPrivateKeyFromWrapped`, and `INVALID_INPUT` without the team public key to check against. A key that is not that public key's pair is not an error: it answers `matchesPublic: false` | `WRAP_FAILED` |
+
 A failed open is never `AUTH_FAILED`: the user supplied no secret to reach it, so it must not read as a
 passphrase problem (§3).
 

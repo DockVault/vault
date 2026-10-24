@@ -211,12 +211,21 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("activity_vault_unlocked", "vaults", "Vault names unlocked on the Activity page", "notice"),
     # Zero-knowledge keys
     AuditAction("zk_index_key_wrapped", "zero_knowledge", "Name-index key given to members", "notice"),
+    # A member's app found that a key it was given, or the vault's key check, does not match the vault's key.
+    AuditAction("zk_key_check_mismatch", "zero_knowledge", "Vault key did not match a member's check", "warning"),
     # A request to change a vault's keys whose proof that the caller holds the keys did not check out, and
     # one accepted without such a proof (only while the host operator has turned enforcement off).
     AuditAction("zk_key_proof_absent", "zero_knowledge", "Vault key changed without proof of the key", "warning"),
     AuditAction("zk_key_proof_bootstrapped", "zero_knowledge", "Vault key check set up", "notice"),
     AuditAction("zk_key_proof_failed", "zero_knowledge", "Vault key change refused: key not proven", "warning"),
     AuditAction("zk_key_update_pop_failed", "zero_knowledge", "Encryption key change refused", "warning"),
+    # The hold on an account's encryption-key envelope after an administrator changed its sign-in details.
+    AuditAction("zk_envelope_release_code_sent", "zero_knowledge", "Code to open the encryption key sent",
+                "info"),
+    AuditAction("zk_envelope_release_failed", "zero_knowledge", "Wrong code to open the encryption key",
+                "warning"),
+    AuditAction("zk_envelope_released", "zero_knowledge", "Encryption key released after a sign-in change",
+                "notice"),
     AuditAction("zk_keypair_registered", "zero_knowledge", "Encryption keys set up", "notice"),
     AuditAction("zk_member_key_granted", "zero_knowledge", "Vault key given to a member", "notice"),
     AuditAction("zk_member_key_revoked", "zero_knowledge", "Member's vault keys removed", "notice"),

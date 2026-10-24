@@ -256,6 +256,8 @@ EXPECTED_CALLS = {
     "list": ([], [], [["list"]]),
     "user-managers": ([], [], [["user-managers"]]),
     "regranted-defaults": ([], [], [["regranted-defaults"]]),
+    "release-key-hold": (NAMED, ["alice", "alice"],
+                         [["lookup", "--username", "alice"], ["release-key-hold", *NAMED]]),
 }
 ANSWERS = {
     "lookup": ACCOUNT,
@@ -268,6 +270,7 @@ ANSWERS = {
     "list": {"ok": True, "requests": []},
     "user-managers": {"ok": True, "accounts": []},
     "regranted-defaults": {"ok": True, "permissions": []},
+    "release-key-hold": {"ok": True, "account": "alice", "released": True},
 }
 MENU_KEYS = [k for k, _ in dv.ACCOUNT_ACTIONS]
 

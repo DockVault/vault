@@ -23,6 +23,8 @@ from app.services import ecc_pop, ecc_update_pop
 from app.services import zk_key_proof
 from app.core import fixed_step_up
 from app.core.second_factor_actions import OWNER_KEY_RESET
+from app.services import zk_notices
+from app.core import envelope_hold
 from app.services.ecc_crypto_service import ECCCryptoService
 from app.services.audit_logger import AuditLogger
 from app.core.rate_limiter import rate_limiter as _rate_limiter, retry_after_seconds
@@ -326,6 +328,9 @@ _ECC_RATELIMIT = {
     # bulk share asks for one per person, in parallel. Each attempt at a proof needs a fresh challenge,
     # and every attempt is recorded, so this bounds guessing even when the limiter fails open.
     "key_proof_challenge": (400, 60),
+    # Asking for, and entering, the code that releases the encryption-key envelope during the hold after an
+    # administrator changed the account's sign-in details. Each code also dies after three wrong guesses.
+    "envelope_hold": (10, 900),
 }
 
 
@@ -481,11 +486,24 @@ async def register_challenge(
     db.query(ECCRegistrationChallenge).filter(
         ECCRegistrationChallenge.user_id == current_user.id
     ).delete(synchronize_session=False)
-    ch = ECCRegistrationChallenge(user_id=current_user.id, server_private_key=priv_pem, nonce=nonce_b64)
+    # The one-time key is stored sealed with the deployment key and read back only through the strict
+    # decrypt: ECDH is symmetric, so anyone who read a live key in the clear could compute the MAC the
+    # server expects for any public key.
+    ch = ECCRegistrationChallenge(user_id=current_user.id, server_private_key=encrypt_secret(priv_pem),
+                                  nonce=nonce_b64)
     db.add(ch)
     db.commit()
     db.refresh(ch)
     return {"challenge_id": str(ch.id), "server_ephemeral_public_key": pub_pem, "nonce": nonce_b64}
+
+
+def _unseal_pop_challenge_key(sealed) -> Optional[str]:
+    """The one-time key of a registration or envelope-replacement challenge, or None when the row does not
+    hold a key this deployment sealed (see register_challenge)."""
+    try:
+        return decrypt_secret_strict(sealed)
+    except (ValueError, TypeError):
+        return None
 
 
 def _verify_registration_pop(db: Session, user: User, request: "KeypairRegisterRequest") -> None:
@@ -507,11 +525,16 @@ def _verify_registration_pop(db: Session, user: User, request: "KeypairRegisterR
         raise HTTPException(status_code=400, detail="Invalid or expired proof-of-possession challenge.")
     # Consume it FIRST (single-use): capture the values, then delete + commit so a wrong MAC
     # can't be brute-forced by retrying against the same challenge.
-    created_at, server_priv, nonce = ch.created_at, ch.server_private_key, ch.nonce
+    created_at, sealed, nonce = ch.created_at, ch.server_private_key, ch.nonce
     db.delete(ch)
     db.commit()
     if created_at is None or (datetime.utcnow() - created_at) > timedelta(seconds=_POP_CHALLENGE_TTL_SECONDS):
         raise HTTPException(status_code=400, detail="Proof-of-possession challenge has expired; request a new one.")
+    server_priv = _unseal_pop_challenge_key(sealed)
+    if server_priv is None:
+        # Not a key this server sealed: written in the clear by an older release (a challenge issued
+        # before an upgrade) or by someone who can write the table. The client asks for a new one.
+        raise HTTPException(status_code=400, detail="Invalid or expired proof-of-possession challenge.")
     if not ecc_pop.verify_pop(server_priv, request.public_key, nonce, pop.mac):
         raise HTTPException(status_code=400, detail="Proof of possession failed for this public key.")
 
@@ -588,6 +611,10 @@ async def register_public_key(
         # substituted / not-held key can't be registered. Raises 400 on missing/invalid/expired.
         _verify_registration_pop(db, current_user, request)
 
+        # A key set up within 14 days after an administrator changed the account's sign-in details may be
+        # someone else's: whoever sets up the key first owns it. Recorded now, while the record of the change
+        # still exists, so the share dialog can say so for as long as the key lives.
+        from app.core import credential_changes as _cc
         keypair = UserKeyPair(
             user_id=current_user.id,
             public_key=request.public_key,
@@ -596,7 +623,8 @@ async def register_public_key(
             fingerprint=fingerprint,
             version=1,
             created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc)
+            updated_at=datetime.now(timezone.utc),
+            registered_after_admin_change=_cc.last_applied(db, current_user.id) is not None,
         )
         db.add(keypair)
         db.commit()
@@ -617,6 +645,9 @@ async def register_public_key(
         _audit_zk(db, current_user, "zk_keypair_registered",
                   resource_id=current_user.id, resource_type="user",
                   details={"fingerprint": fingerprint})
+        # Whoever sets up an account's key first owns it: the account's user is told, so a key they did
+        # not set up themselves does not go unnoticed.
+        zk_notices.key_registered(db, current_user)
 
         return KeypairRegisterResponse(
             message="Public key registered successfully",
@@ -712,7 +743,83 @@ async def get_private_key(
     keypair = db.query(UserKeyPair).filter(UserKeyPair.user_id == current_user.id).first()
     if not keypair or not keypair.encrypted_private_key:
         return {"has_keypair": False, "encrypted_private_key": None}
+    # For a while after an administrator changed the account's sign-in details, the envelope goes only to a
+    # session that entered a code sent by email (app/core/envelope_hold.py). Whoever made the change may be
+    # the one asking, and would otherwise take the envelope away to guess its passphrase.
+    if envelope_hold.held_until(db, current_user) is not None:
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold")
     return {"has_keypair": True, "encrypted_private_key": keypair.encrypted_private_key}
+
+
+class EnvelopeReleaseRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=64)
+
+
+@router.post("/keys/private/hold/code")
+async def send_envelope_release_code(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send the code that releases the account's encryption-key envelope to this session, during the hold
+    after an administrator changed the account's sign-in details (app/core/envelope_hold.py).
+
+    It goes by email, to the address the account had before the first change that holds it (for an email
+    change, the address it replaced; envelope_hold.code_destination), so it reaches the person and not
+    whoever made the change -- who could since have moved the account's address through its own settings.
+    Without mail, or an address to send to: 409, and the host operator can release the hold instead. Not
+    held: nothing is sent."""
+    _ecc_rate_limit(current_user, "envelope_hold")
+    if envelope_hold.held_until(db, current_user) is None:
+        return {"held": False}
+    from app.api.api_server import _mask_email, _smtp_configured
+    from app.core import email_send, otp_service
+    from app.core.config import settings as _settings
+    from app.core.email_actions import send_action_email
+    address = (envelope_hold.code_destination(db, current_user) or "").strip()
+    if not address or not _smtp_configured(db):
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-no-mail")
+    code = otp_service.issue(db, purpose=envelope_hold.OTP_PURPOSE, user_id=current_user.id, destination=address,
+                             ttl_minutes=envelope_hold.CODE_TTL_MINUTES, pepper=_settings.jwt_secret_key)
+    try:
+        sent = send_action_email(
+            db, envelope_hold.EMAIL_ACTION, recipient={"email": address, "username": current_user.username},
+            action_context={"code": code, "expires": f"in {envelope_hold.CODE_TTL_MINUTES} minutes"},
+            raise_errors=True)
+    except email_send.EmailSendError:
+        sent = False
+    if not sent:
+        otp_service.invalidate(db, purpose=envelope_hold.OTP_PURPOSE, user_id=current_user.id)
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-no-mail")
+    _audit_zk(db, current_user, "zk_envelope_release_code_sent", resource_id=current_user.id,
+              resource_type="user")
+    return {"held": True, "sent_to": _mask_email(address), "expires_in_minutes": envelope_hold.CODE_TTL_MINUTES}
+
+
+@router.post("/keys/private/hold/release")
+async def release_envelope_hold(
+    request: EnvelopeReleaseRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Enter the emailed code, which releases the envelope to this session for the changes made so far. A
+    wrong or expired code: 403 (a code dies after three wrong guesses). Not held: nothing to release."""
+    _ecc_rate_limit(current_user, "envelope_hold")
+    if envelope_hold.held_until(db, current_user) is None:
+        return {"released": True}
+    from app.core import otp_service
+    from app.core.config import settings as _settings
+    result = otp_service.verify(db, purpose=envelope_hold.OTP_PURPOSE, user_id=current_user.id,
+                                code=request.code.strip().lower(), pepper=_settings.jwt_secret_key)
+    if not result.ok or not envelope_hold.release_session(db, current_user):
+        db.rollback()
+        _audit_zk(db, current_user, "zk_envelope_release_failed", resource_id=current_user.id,
+                  resource_type="user", details={"reason": result.reason if not result.ok else "no_session"},
+                  status="failure")
+        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-code-failed")
+    db.commit()
+    _audit_zk(db, current_user, "zk_envelope_released", resource_id=current_user.id, resource_type="user",
+              details={"by": "code"})
+    return {"released": True}
 
 
 class KeyUpdatePoP(BaseModel):
@@ -775,8 +882,9 @@ async def key_update_challenge(
     db.query(ECCKeyUpdateChallenge).filter(
         ECCKeyUpdateChallenge.user_id == current_user.id
     ).delete(synchronize_session=False)
+    # Sealed with the deployment key, as a registration challenge is (see register_challenge).
     ch = ECCKeyUpdateChallenge(
-        user_id=current_user.id, server_private_key=priv_pem, nonce=nonce_b64
+        user_id=current_user.id, server_private_key=encrypt_secret(priv_pem), nonce=nonce_b64
     )
     db.add(ch)
     db.commit()
@@ -869,9 +977,17 @@ async def update_private_key(
                   resource_id=current_user.id, resource_type="user",
                   details={"reason": "no_live_challenge"}, status="failure")
         raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
-    created_at, server_priv, nonce = ch.created_at, ch.server_private_key, ch.nonce
+    created_at, sealed, nonce = ch.created_at, ch.server_private_key, ch.nonce
     db.delete(ch)
     db.commit()
+    server_priv = _unseal_pop_challenge_key(sealed)
+    if server_priv is None:
+        # Not a key this server sealed (an older release's challenge, or a row someone wrote): refused like
+        # a challenge that does not exist, and the client asks for a new one.
+        _audit_zk(db, current_user, "zk_key_update_pop_failed",
+                  resource_id=current_user.id, resource_type="user",
+                  details={"reason": "no_live_challenge"}, status="failure")
+        raise HTTPException(status_code=400, detail=_UPDATE_POP_FAILED)
 
     # STEP 3 - expiry, then the proof. Failures are audited with a short reason code and never the
     # attempted MAC, nonce or envelope bytes: both routes are authenticated and rate-limited, and
@@ -924,6 +1040,49 @@ def _team_key_map(vault: Vault) -> dict:
         return {}
 
 
+def _owed_since_a_holder_was_deleted(vault: Vault, current_epoch: int) -> bool:
+    """True when an account that held the vault's key at its current epoch was deleted (see
+    record_rotations_owed_by). Compared with the current epoch, so the next rotation ends it."""
+    owed = getattr(vault, 'rotation_owed_epoch', None)
+    return owed is not None and owed == current_epoch
+
+
+def record_rotations_owed_by(db: Session, user_id) -> List[str]:
+    """Before an account is deleted: record, on every zero-knowledge vault where it has a key row at the
+    CURRENT epoch, switched on or off, that the vault owes a rotation at that epoch. Returns the ids of the
+    vaults marked; the caller commits, in the same transaction as the delete.
+
+    Deleting an account takes its key rows with it (they cascade), so without this nothing would show
+    that someone who held the key is gone: the "rotation owed" notice would stay quiet, and a hierarchical
+    vault would accept a rotation of its DEK alone, wrapped to the team key the deleted person still has.
+    The epoch is on the vault's own axis: the DEK epoch of a direct vault, the team epoch of a
+    hierarchical one (only a new team key shuts out someone who held the old one).
+
+    A switched-off row counts as much as an active one. Deactivating an account, and removing a member
+    without a rotation, switch the key rows off and leave them at the current epoch; that row is what
+    makes the vault owe a rotation (_rekey_owed, _team_rotation_owed), and the delete would erase it. The
+    usual way out is exactly that: deactivate first, delete later.
+
+    Each vault row is locked first, in a fixed order, and the account is judged against the locked
+    epoch, so a rotation in flight either committed before (and this reads its new epoch) or waits for
+    the delete. Call it before anything in the same transaction locks a user row (the last-administrator
+    check locks every administrator's): vault rows are always locked first (see
+    _blacklist_user_vault_keys)."""
+    vault_ids = sorted({str(v) for (v,) in db.query(VaultMemberKey.vault_id).filter(
+        VaultMemberKey.user_id == user_id,
+    ).distinct().all()})
+    marked = []
+    for vid in vault_ids:
+        locked = (db.query(Vault).populate_existing()
+                  .filter(Vault.id == vid).with_for_update().first())
+        if locked is None or not _had_current_key(db, locked, user_id):
+            continue
+        axis = 'team_key_version' if _is_hierarchical(locked) else 'dek_version'
+        locked.rotation_owed_epoch = getattr(locked, axis, 1) or 1
+        marked.append(vid)
+    return marked
+
+
 def _team_rotation_owed(db: Session, vault: Vault) -> bool:
     """True iff a TEAMPRIV holder was deactivated at the CURRENT team epoch WITHOUT the team
     keypair being rotated — the signature of a bare revoke (DELETE /permissions, DELETE /members)
@@ -935,6 +1094,8 @@ def _team_rotation_owed(db: Session, vault: Vault) -> bool:
     if not _is_hierarchical(vault):
         return False
     cur = getattr(vault, 'team_key_version', 1) or 1
+    if _owed_since_a_holder_was_deleted(vault, cur):
+        return True
     return db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault.id,
         VaultMemberKey.key_version == cur,
@@ -949,10 +1110,16 @@ def _rekey_owed(db: Session, vault: Vault) -> bool:
     (a deactivated user's wrapped-DEK rows). A manager should rotate the vault key (browser
     /rekey) for forward secrecy on new content. Derived (not stored): a rekey mints a new epoch
     the removed member never receives, so no deactivated row remains at the NEW current epoch and
-    the flag clears itself. Hierarchical vaults reuse the team-rotation-owed signal."""
+    the flag clears itself. Hierarchical vaults reuse the team-rotation-owed signal.
+
+    A member deleted with their account leaves no row at all (their key rows go with the account), so
+    the deletion records the epoch on the vault instead (record_rotations_owed_by), and that counts too
+    until a rotation moves the epoch past it."""
     if _is_hierarchical(vault):
         return _team_rotation_owed(db, vault)
     cur = getattr(vault, 'dek_version', 1) or 1
+    if _owed_since_a_holder_was_deleted(vault, cur):
+        return True
     return db.query(VaultMemberKey).filter(
         VaultMemberKey.vault_id == vault.id,
         VaultMemberKey.key_version == cur,
@@ -968,16 +1135,10 @@ def _rekey_owed(db: Session, vault: Vault) -> bool:
 _NOT_A_KEY_HOLDER = "Only someone who holds this vault's key can rotate it"
 
 
-def _holds_current_key(db: Session, vault: Vault, user_id) -> bool:
-    """True if `user_id` holds an ACTIVE key for the vault's CURRENT epoch.
-
-    DIRECT: a wrapped-DEK row at dek_version. HIERARCHICAL: a team-private-key row at
-    team_key_version, the key every current DEK epoch is wrapped under. A row at an older epoch does
-    not count: it opens files written before a rotation, not the key in use now.
-
-    Pass the vault row the handler LOCKED (populate_existing + with_for_update), so the epoch is the
-    live one, and a removal of the caller that takes the same lock is either already visible here or
-    waits until the write that depends on this answer has committed."""
+def _current_key_rows(db: Session, vault: Vault, user_id):
+    """The query for `user_id`'s key rows of the vault's own kind at its CURRENT epoch, switched on or off:
+    a wrapped-DEK row at dek_version for a direct vault, a team-private-key row at team_key_version for a
+    hierarchical one."""
     if _is_hierarchical(vault):
         epoch = getattr(vault, 'team_key_version', 1) or 1
         kind = VaultMemberKey.wrapping_algorithm.in_(TEAMPRIV_ALGOS)
@@ -989,8 +1150,29 @@ def _holds_current_key(db: Session, vault: Vault, user_id) -> bool:
         VaultMemberKey.user_id == user_id,
         VaultMemberKey.key_version == epoch,
         kind,
+    )
+
+
+def _holds_current_key(db: Session, vault: Vault, user_id) -> bool:
+    """True if `user_id` holds an ACTIVE key for the vault's CURRENT epoch.
+
+    DIRECT: a wrapped-DEK row at dek_version. HIERARCHICAL: a team-private-key row at
+    team_key_version, the key every current DEK epoch is wrapped under. A row at an older epoch does
+    not count: it opens files written before a rotation, not the key in use now.
+
+    Pass the vault row the handler LOCKED (populate_existing + with_for_update), so the epoch is the
+    live one, and a removal of the caller that takes the same lock is either already visible here or
+    waits until the write that depends on this answer has committed."""
+    return _current_key_rows(db, vault, user_id).filter(
         VaultMemberKey.is_active == True,  # noqa: E712
     ).first() is not None
+
+
+def _had_current_key(db: Session, vault: Vault, user_id) -> bool:
+    """True if `user_id` has ever been given the key of the vault's CURRENT epoch: a row of its kind at
+    that epoch, switched on or off. A switched-off copy was still handed out, so its holder may have the
+    key; only a rotation past that epoch shuts them out."""
+    return _current_key_rows(db, vault, user_id).first() is not None
 
 
 class IndexKeyWrap(BaseModel):
@@ -1293,16 +1475,19 @@ def _key_proof_view(db: Session, vault: Vault, epoch: int, *, may_manage: bool) 
     """What a key holder sees of an epoch's key-proof material.
 
     Direct, with a row: {"state": "set", source, created_at, public_key, dek_check, lineage_tag}, plus
-    `sealed_private_key` for a caller who may manage the vault. Direct, without one: {"state":
-    "missing"} (the epoch predates key proofs, or was made while they were not required). Hierarchical:
-    {"state": "team"}, with the row's source and lineage tag when it has one; its verifier is the team
-    public key."""
+    `sealed_private_key` and `created_by` (who installed it) for a caller who may manage the vault. Direct,
+    without one: {"state": "missing"} (the epoch predates key proofs, or was made while they were not
+    required). Hierarchical: {"state": "team"}, with the row's source, lineage tag and time when it has one
+    (and `created_by` for a manager); its verifier is the team public key."""
     row = db.query(VaultKeyProof).filter(
         VaultKeyProof.vault_id == vault.id, VaultKeyProof.dek_epoch == epoch).first()
     if _is_hierarchical(vault):
         view = {"state": "team"}
         if row is not None:
-            view.update(source=row.source, lineage_tag=row.lineage_tag)
+            view.update(source=row.source, lineage_tag=row.lineage_tag,
+                        created_at=row.created_at.isoformat() if row.created_at else None)
+            if may_manage:
+                view["created_by"] = str(row.created_by) if row.created_by else None
         return view
     if row is None or not row.proof_public_key:
         return {"state": "missing"}
@@ -1313,6 +1498,9 @@ def _key_proof_view(db: Session, vault: Vault, epoch: int, *, may_manage: bool) 
     }
     if may_manage:
         view["sealed_private_key"] = row.sealed_private_key
+        # Who installed the epoch's material, for a manager's key details: an owner resetting damaged
+        # material is offered to remove that person in the same step.
+        view["created_by"] = str(row.created_by) if row.created_by else None
     return view
 
 
@@ -1714,6 +1902,9 @@ def _verify_key_proof(db: Session, user: User, ch: _IssuedChallenge, header, *, 
     if failed:
         db.rollback()
         _audit_key_proof_failed(db, user, vault_id, ch.op, failed, ch)
+        if failed == "identity":
+            # A session for this account without the account's own key: its user is told (at most once an hour).
+            zk_notices.failed_identity_proof(db, user)
         raise zk_key_proof.KeyProofRefusal("zk-key-proof-failed")
 
 
@@ -1824,6 +2015,63 @@ async def bootstrap_key_proof(
     return {"status": "ok", "vault_id": str(locked.id), "dek_epoch": epoch}
 
 
+# The findings a member's app can report (POST /ecc/vaults/{id}/key-proof/report): the key check of a direct
+# epoch that the member's DEK does not reproduce; a manager's copy of the epoch's sealed proof key that does not
+# open with it; a team private key whose public point is not the vault's team public key; and a lineage tag
+# that does not check out against the previous epoch's key, or is missing where one is due.
+KEY_CHECK_FINDINGS = ("dek_check", "seal", "team_key", "lineage")
+
+
+class KeyCheckReport(BaseModel):
+    dek_epoch: int = Field(..., ge=1)
+    finding: str = Field(..., max_length=16)
+
+
+@router.post("/vaults/{vault_id}/key-proof/report")
+async def report_key_check_mismatch(
+    vault_id: str,
+    request: KeyCheckReport,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record that a member's app found a key that does not match this vault's key.
+
+    A member's app checks the key it was given against the epoch's key check, a manager's app opens the
+    epoch's sealed proof key, and every app compares the team key it unwrapped with the vault's team public
+    key and checks the lineage tag of the current epoch. What fails is reported here: it is recorded
+    (zk_key_check_mismatch) and the vault's owner is told in the app, once a day for each vault. A report
+    changes nothing else, so filing one gives a member nothing: it cannot lower a check or block anyone.
+
+    Open to anyone who holds a key of the vault at any epoch; everyone else gets the same 403 whether or
+    not the vault exists, as GET /keys does."""
+    _ecc_rate_limit(current_user, "mutate")
+    vault = db.query(Vault).filter(Vault.id == vault_id).first()
+    if not _reaches_vault(db, vault, current_user.id):
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
+    if not may_release_vault_key(db, current_user, vault):
+        raise HTTPException(status_code=403, detail=TEMP_ZK_KEY_ACCESS_DENIED)
+    enforce_vault(current_user, vault_id)
+    holds_a_key = db.query(VaultMemberKey.id).filter(
+        VaultMemberKey.vault_id == vault.id,
+        VaultMemberKey.user_id == current_user.id,
+        VaultMemberKey.is_active == True,  # noqa: E712
+    ).first() is not None
+    if not holds_a_key:
+        raise HTTPException(status_code=403, detail="No access to this vault's keys")
+    if request.finding not in KEY_CHECK_FINDINGS:
+        raise HTTPException(status_code=400, detail="finding must be one of: " + ", ".join(KEY_CHECK_FINDINGS))
+    if request.dek_epoch > (getattr(vault, 'dek_version', 1) or 1):
+        raise HTTPException(status_code=400, detail="dek_epoch is not an epoch of this vault")
+    mode = getattr(vault, 'key_wrapping_mode', None) or 'direct'
+    _audit_zk(db, current_user, "zk_key_check_mismatch", resource_id=vault.id,
+              details={"dek_epoch": request.dek_epoch, "finding": request.finding, "mode": mode})
+    if str(vault.owner_id) != str(current_user.id):
+        # The owner's own app shows them the same warning on the vault itself.
+        zk_notices.key_check_mismatch(db, vault, request.finding)
+    return {"status": "recorded", "vault_id": str(vault.id), "dek_epoch": request.dek_epoch,
+            "finding": request.finding}
+
+
 @router.get("/users/{user_id}/public-key")
 async def get_user_public_key(
     user_id: str,
@@ -1843,11 +2091,19 @@ async def get_user_public_key(
     kp = db.query(UserKeyPair).filter(UserKeyPair.user_id == user_id).first()
     if not kp:
         return {"user_id": user_id, "public_key": None, "fingerprint": None, "has_keypair": False}
+    # When the key was set up, and whether that was within 14 days after an administrator changed the
+    # account's sign-in details (null: set up before this was recorded). Shown in the share dialog, so given
+    # only for someone the caller could pick there (the recipient picker's own rule): for anyone else it
+    # would say, of any account, that an administrator changed its sign-in details shortly before.
+    from app.api.api_server import _share_eligible_ids
+    shareable = str(kp.user_id) in _share_eligible_ids(db, current_user, [kp.user_id])
     return {
         "user_id": user_id,
         "public_key": kp.public_key,
         "fingerprint": kp.fingerprint,
         "has_keypair": True,
+        "registered_at": (kp.created_at.isoformat() if kp.created_at else None) if shareable else None,
+        "registered_after_admin_change": kp.registered_after_admin_change if shareable else None,
     }
 
 
@@ -2011,6 +2267,16 @@ async def grant_member_key(
         VaultMemberKey.user_id == request.user_id,
         VaultMemberKey.key_version == epoch,
     ).first()
+    if existing is not None and existing.is_active and str(existing.user_id) != str(current_user.id):
+        # Someone else who already holds the current key keeps the copy they have. The server cannot
+        # tell a correct wrap from one of another key, so replacing it would hand that person a key of
+        # the caller's choosing: they could no longer open what is there, and what they upload next
+        # would be readable to whoever chose it. A share to someone who holds the key adds nothing, so
+        # it changes nothing and says so. A first share, bringing back a switched-off copy and
+        # replacing your own still go ahead.
+        db.rollback()
+        return {"status": "ok", "unchanged": True, "vault_id": vault_id, "user_id": request.user_id,
+                "key_version": epoch, "mode": getattr(vault, 'key_wrapping_mode', 'direct')}
     if existing:
         existing.wrapped_dek = blob
         existing.ephemeral_public_key = eph
@@ -2600,6 +2866,8 @@ async def rekey_vault(
             "proof": _proof_detail(ch, owner_reset)})
         if ch is None:
             _audit_key_proof_absent(db, current_user, vault_id, "rekey", "hierarchical")
+        if owner_reset:
+            zk_notices.owner_reset(db, current_user, locked)
         return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version,
                 "team_key_version": getattr(locked, 'team_key_version', 1)}
 
@@ -2654,6 +2922,8 @@ async def rekey_vault(
         "proof": _proof_detail(ch, owner_reset)})
     if ch is None:
         _audit_key_proof_absent(db, current_user, vault_id, "rekey", "direct")
+    if owner_reset:
+        zk_notices.owner_reset(db, current_user, locked)
     return {"status": "ok", "vault_id": vault_id, "dek_version": request.to_version}
 
 
