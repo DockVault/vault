@@ -1,12 +1,19 @@
 """What a legal hold refuses, beside the deletions it keeps (app/core/kept_tables.py): deleting a vault it keeps
-anything of. The refusal answers 409 with a sentence that names the case, and records ``hold_blocked_delete``
-under it (audit_logs.case_id).
+anything of, and retiring a zero-knowledge vault's older key versions while it keeps anything of the vault. Each
+refusal answers 409 with a sentence that names the case, and records ``hold_blocked_delete`` under it
+(audit_logs.case_id).
 
 A hold keeps a vault while it stands (a row of ``legal_hold_vaults`` with ``released_at`` NULL: a lapse sets it
 too), and after its release while files or folders it kept still wait for their purge: until then the release
-can be undone, and the kept files must still open. The vault's directory holds the kept blobs, and the database
-refuses the vault's delete on its own (the ``vaults`` trigger). The route asks first, so the answer says why,
-and takes the trigger's refusal (a hold placed in between) for the same answer (is_trigger_refusal).
+can be undone, and the kept files must still open. So:
+
+- **Deleting the vault.** Its directory holds the kept blobs, and the database refuses the delete on its own (the
+  ``vaults`` trigger). The route asks first, so the answer says why, and takes the trigger's refusal (a hold placed
+  in between) for the same answer (is_trigger_refusal).
+- **Retiring older key versions** of a zero-knowledge vault deletes the wrapped keys of the epochs below the lowest
+  one in use: the kept files and folders were sealed under their epochs, and their owner needs those keys to open
+  them for the case. The route asks under the vault's row lock, which a placing waits for, so a hold placed
+  meanwhile comes after the retire.
 """
 from __future__ import annotations
 
@@ -18,7 +25,8 @@ from typing import List, Optional, Tuple
 ACTION = "hold_blocked_delete"
 # What a refusal kept from happening (the audit row's ``kind``).
 VAULT = "vault"
-KINDS = (VAULT,)
+KEY_VERSIONS = "key_versions"
+KINDS = (VAULT, KEY_VERSIONS)
 
 
 @dataclass
@@ -95,6 +103,18 @@ def vault_text(keeping: Keeping) -> str:
                 "while it is. Your administrator can tell you more.")
     return (f"This vault keeps files a legal hold of {_cases_text(keeping.waiting)} kept, {_until(keeping)}: it can "
             "be deleted then. Your administrator can tell you more.")
+
+
+def key_versions_text(keeping: Keeping, *, name_cases: bool = True) -> str:
+    """``name_cases`` False for a manager who is neither the vault's owner nor an administrator: a vault's members
+    are told that it is held, never by which case (app/core/owner_access.py)."""
+    if keeping.standing:
+        hold = f"a legal hold until {_cases_text(keeping.standing)} ends" if name_cases else "a legal hold"
+        return (f"This vault is under {hold}: its older key versions are kept while it is, so what the hold keeps "
+                "can still be opened.")
+    of_case = f" of {_cases_text(keeping.waiting)}" if name_cases else ""
+    return (f"This vault keeps files a legal hold{of_case} kept, {_until(keeping)}: its older key versions are kept "
+            "until then, so they can still be opened.")
 
 
 # --------------------------------------------------------------------------- recording it

@@ -2,17 +2,21 @@
 
   * a vault under a hold cannot be deleted: 409 naming the case, ``hold_blocked_delete`` recorded under it, the
     vault and what it holds as they were; after the release, while what the hold kept waits for its purge, the same
-    (the answer says until when); after the purge the vault is deleted.
+    (the answer says until when); after the purge the vault is deleted;
+  * a zero-knowledge vault's older key versions are not retired while a hold stands on it: 409, recorded, the old
+    epoch's key still there; once the hold is released (and kept nothing) the retire runs.
 
 test_hold_refusals.py covers the same offline; test_legal_holds_live.py the holds themselves.
 """
+import base64
 import time
+import uuid
 
 import pytest
 
 from _account_change_helpers import psql
 from _auditor_helpers import compliance_receipt, run_pass, two_admins
-from conftest import unique
+from conftest import create_zk_vault, ensure_ecc_keypair, post_zk, unique
 
 pytestmark = pytest.mark.integration
 
@@ -115,3 +119,46 @@ def test_a_held_vault_cannot_be_deleted_until_what_its_hold_kept_is_purged(admin
     assert r.status_code == 200, r.text
     assert psql(f"SELECT count(*) FROM vaults WHERE id = '{vid}'") == "0"
     assert _blocked(case["id"], "vault") == "2"
+
+
+def _stub(prefix):
+    """Opaque wrap material: the server stores it verbatim."""
+    return base64.b64encode(f"{prefix}-{uuid.uuid4().hex}".encode()).decode()
+
+
+def test_older_key_versions_are_kept_while_a_hold_stands_on_a_zero_knowledge_vault(admin, admins):
+    ensure_ecc_keypair(admin)
+    admin.put("/settings", json={"zero_knowledge_enabled": True})
+    try:
+        # Nameless: a sealed name would pin epoch 1 on its own.
+        vid = create_zk_vault(admin, seal_name=False)["id"]
+    finally:
+        admin.put("/settings", json={"zero_knowledge_enabled": False})
+    cases = []
+    try:
+        r = post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
+            "from_version": 1, "to_version": 2, "revoke_user_id": None,
+            "member_keys": [{"user_id": str(admin.user["id"]), "wrapped_dek": _stub("dek"),
+                             "ephemeral_public_key": _stub("eph")}]})
+        assert r.status_code == 200, r.text
+        case = _place(admins["ada"], [vid])
+        cases.append(case["id"])
+
+        r = admin.post(f"/ecc/vaults/{vid}/retire-version")
+        assert r.status_code == 409, r.text
+        assert case["number"] in r.json()["detail"] and "older key versions are kept" in r.json()["detail"]
+        assert admin.get(f"/ecc/vaults/{vid}/keys?key_version=1").json()["has_access"] is True
+        assert _blocked(case["id"], "key_versions") == "1"
+        assert psql(f"SELECT count(*) FROM audit_logs WHERE action = 'zk_versions_retired' "
+                    f"AND resource_id = '{vid}'") == "0"
+
+        # Released, having kept nothing: nothing keeps the vault, and the retire runs.
+        r = _decide(admins["ada"], case["id"], "release", {"reason": "The claim was withdrawn."})
+        assert r.status_code == 200, r.text
+        r = admin.post(f"/ecc/vaults/{vid}/retire-version")
+        assert r.status_code == 200, r.text
+        assert r.json()["rows_deleted"] >= 1 and r.json()["retired_below_version"] == 2
+        assert admin.get(f"/ecc/vaults/{vid}/keys?key_version=1").json()["has_access"] is False
+    finally:
+        _forget(cases, [vid])
+        admin.delete_vault(vid)

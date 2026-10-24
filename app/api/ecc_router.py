@@ -3043,6 +3043,16 @@ async def retire_dek_versions(
     locked = (db.query(Vault).populate_existing()
               .filter(Vault.id == vault_id).with_for_update().first())
 
+    # A legal hold that keeps anything of the vault keeps every key version too: what it kept was sealed under
+    # those epochs (app/core/hold_refusals.py). Asked under the row lock, which a placing waits for.
+    from app.core import hold_refusals
+    keeping = hold_refusals.vault_keeping(db, locked.id)
+    if keeping is not None:
+        hold_refusals.record(db, current_user, hold_refusals.KEY_VERSIONS, keeping, vault_id=locked.id)
+        # The owner was told of the case, and an administrator sees it; another manager is told only of the hold.
+        raise HTTPException(status_code=409, detail=hold_refusals.key_versions_text(
+            keeping, name_cases=_is_owner_or_admin(locked, current_user)))
+
     # Lowest DEK epoch still referenced by any file CONTENT, any ZK folder NAME, or the vault's own
     # sealed name (all under the row lock, so the floor can't move before the delete below).
     min_in_use = _lowest_epoch_in_use(db, vault_id, locked)

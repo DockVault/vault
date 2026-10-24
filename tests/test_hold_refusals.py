@@ -33,8 +33,23 @@ pytestmark = pytest.mark.unit
 NOW = datetime(2026, 11, 2, 10, 0)
 
 
+@pytest.fixture(autouse=True)
+def text_ids(monkeypatch):
+    """The retire route takes a vault's id as text, which Postgres reads as an id; SQLite's id type is taught the
+    same, before the database is made (its bind processors are kept per database)."""
+    from sqlalchemy.sql import sqltypes
+    original = sqltypes.Uuid.bind_processor
+
+    def bind_processor(self, dialect):
+        inner = original(self, dialect)
+        if inner is None:
+            return None
+        return lambda value: inner(uuid.UUID(value) if isinstance(value, str) else value)
+    monkeypatch.setattr(sqltypes.Uuid, "bind_processor", bind_processor)
+
+
 @pytest.fixture
-def db():
+def db(text_ids):
     from _kept_db import kept_database
     with kept_database() as (make, _engine):
         session = make()
@@ -257,3 +272,97 @@ def test_the_route_asks_after_the_owner_check_and_before_the_service_deletes():
     assert source.index("Only the vault owner or an admin can delete this vault") < asked
     assert asked < source.index("vault_service.delete_vault(vault_id, current_user)")
     assert source.count("hold_refusals.is_trigger_refusal(e)") == 1
+
+
+# --------------------------------------------------------------------------- retiring older key versions
+
+from app.api import ecc_router as E  # noqa: E402
+
+RETIRE = inspect.unwrap(E.retire_dek_versions)
+
+
+@pytest.fixture
+def zk(world, monkeypatch):
+    """A zero-knowledge vault of olga's at epoch 2 with nothing sealed under epoch 1: a retire deletes her epoch-1
+    key row."""
+    monkeypatch.setattr(E, "_ecc_rate_limit", lambda user, bucket: None)
+    v = m.Vault(id=uuid.uuid4(), owner_id=world.olga.id, type="zero_knowledge", key_wrapping_mode="direct",
+                dek_version=2)
+    world.db.add(v)
+    for epoch in (1, 2):
+        world.db.add(m.VaultMemberKey(vault_id=v.id, user_id=world.olga.id, encrypted_dek=f"w{epoch}",
+                                      ephemeral_public_key="e", key_version=epoch))
+    world.db.commit()
+    return v
+
+
+def _key_epochs(db, vault):
+    return sorted(k.key_version for k in db.query(m.VaultMemberKey).filter(m.VaultMemberKey.vault_id == vault.id))
+
+
+def _retire(world, vault):
+    return run_coroutine(RETIRE(vault_id=str(vault.id), current_user=world.olga, db=world.db))
+
+
+@pytest.mark.parametrize("held", ["standing", "kept rows"])
+def test_retiring_older_key_versions_is_refused_while_a_hold_keeps_the_vault(world, zk, held):
+    case = _case(world.db, world.ada, "C-2026-0011")
+    if held == "standing":
+        _hold(world.db, case, zk)
+    else:
+        _hold(world.db, case, zk, released=NOW, purge_after=NOW + timedelta(days=7))
+        _kept_file(world.db, zk)
+    with pytest.raises(HTTPException) as refused:
+        _retire(world, zk)
+    assert refused.value.status_code == 409 and "C-2026-0011" in refused.value.detail
+    assert "older key versions are kept" in refused.value.detail
+    assert _key_epochs(world.db, zk) == [1, 2], "no key row was deleted"
+    (row,) = _blocked(world.db)
+    assert row.case_id == case.id and row.details["kind"] == "key_versions"
+    assert row.details["vault_id"] == str(zk.id) and row.user_id == world.olga.id
+    assert not world.db.query(m.AuditLog).filter(m.AuditLog.action == "zk_versions_retired").count()
+
+
+def test_a_retire_with_nothing_keeping_the_vault_still_deletes_the_unused_versions(world, zk):
+    """The control: the same call with no hold deletes the epoch-1 row, so a refusal above is the hold's doing."""
+    out = _retire(world, zk)
+    assert out["rows_deleted"] == 1 and _key_epochs(world.db, zk) == [2] and _blocked(world.db) == []
+
+
+def test_a_hold_on_another_vault_does_not_stop_this_ones_retire(world, zk):
+    _hold(world.db, _case(world.db, world.ada, "C-2026-0012"), world.vault)
+    assert _retire(world, zk)["rows_deleted"] == 1
+
+
+def test_a_manager_who_is_not_the_owner_is_told_of_the_hold_and_not_of_its_case(world, zk, monkeypatch):
+    """A vault's members learn that it is held, never by which case: the owner was told of the case, and an
+    administrator sees it, but another manager's refusal names none."""
+    mia = _user(world.db, "mia")
+    monkeypatch.setattr(E, "_can_manage_vault", lambda db, vault, user: True)
+    case = _case(world.db, world.ada, "C-2026-0021")
+    _hold(world.db, case, zk)
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(RETIRE(vault_id=str(zk.id), current_user=mia, db=world.db))
+    assert refused.value.status_code == 409 and "under a legal hold:" in refused.value.detail
+    assert "C-2026" not in refused.value.detail and "case" not in refused.value.detail
+    assert _key_epochs(world.db, zk) == [1, 2]
+    (row,) = _blocked(world.db)
+    assert row.case_id == case.id and row.user_id == mia.id
+    # Released with kept rows: the same, without the case.
+    world.db.query(m.LegalHoldVault).update({"released_at": NOW, "purge_after": NOW + timedelta(days=7)})
+    world.db.commit()
+    _kept_file(world.db, zk)
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(RETIRE(vault_id=str(zk.id), current_user=mia, db=world.db))
+    assert "a legal hold kept" in refused.value.detail and "C-2026" not in refused.value.detail
+    # An administrator is told the case.
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(RETIRE(vault_id=str(zk.id), current_user=world.ada, db=world.db))
+    assert "C-2026-0021" in refused.value.detail
+
+
+def test_the_retire_asks_under_the_vaults_row_lock_before_it_reads_the_floor():
+    source = inspect.getsource(E.retire_dek_versions)
+    asked = source.index("hold_refusals.vault_keeping(db, locked.id)")
+    assert source.index(".with_for_update().first())") < asked < source.index("_lowest_epoch_in_use(db, vault_id, locked)")
+    assert asked < source.index("VaultKeyProof.dek_epoch < proof_floor")
