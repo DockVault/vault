@@ -75,6 +75,54 @@ def test_rekey_with_the_old_key_moves_the_chain_with_its_proof(env):
     assert failures(report) == [] and "key-change-waiting" not in report.kinds("warning")
 
 
+def test_rekey_says_of_the_key_given_whether_this_chain_was_ever_under_it(env):
+    """dockvault.py's key change keeps the old key in a file until the chain has moved off it, and says to remove that
+    file once rekey says its key is no longer needed. rekey says so only of a key this chain was under: of one it was
+    never under (another volume set's chain key, say) it says it is not this chain's, before and after a move, and
+    whether or not there is anything to do."""
+    _key_changed_without_the_old_one(env)
+    old = fmt.chain_key(KEY_TEXT)
+    stranger = fmt.chain_key("f" * 64)
+    with pytest.raises(host.Refused) as why:
+        recovery.rekey(env.engine, _host(env), old_key=stranger, read=True)
+    assert "is not held" in str(why.value)
+    assert f"The key given ({fmt.key_id(stranger)}) was never in force on this chain" in str(why.value)
+    seen = recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    assert f"The key given ({fmt.key_id(old)}) is the one the chain is under: once the key seal is written, it is " \
+           "no longer needed." in seen["lines"]
+    recovery.rekey(env.engine, _host(env), old_key=old, expect=seen["state"])
+    with pytest.raises(host.Refused) as why:
+        recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    told = str(why.value)
+    assert "already under the current key" in told and "nothing to do" in told
+    assert f"The key given ({fmt.key_id(old)}) is one this chain was under before it moved on: it is no longer " \
+           "needed" in told
+    with pytest.raises(host.Refused) as why:
+        recovery.rekey(env.engine, _host(env), old_key=stranger, read=True)
+    told = str(why.value)
+    assert "nothing to do" in told and "was never in force on this chain: it is not this chain's old key" in told
+    assert "no longer needed" not in told
+    with pytest.raises(host.Refused, match=r"is the current key, not an old one"):
+        recovery.rekey(env.engine, _host(env), old_key=fmt.chain_key(env.settings.audit_chain_key), read=True)
+    with pytest.raises(host.Refused) as why:
+        recovery.rekey(env.engine, _host(env), read=True)
+    assert str(why.value).endswith("nothing to do")
+
+
+def test_rekey_moving_with_a_key_the_server_holds_says_the_key_given_was_not_this_chains(env):
+    """The chain is under the key derived from ENCRYPTION_KEY, which the server always holds: the move needs no key
+    given, and a key given that the chain was never under is said not to be its."""
+    env.settings.audit_chain_key = ""
+    env.row(T0 - timedelta(hours=5))
+    env.run_until_sealed()
+    env.settings.audit_chain_key = "e" * 64
+    stranger = fmt.chain_key("f" * 64)
+    seen = recovery.rekey(env.engine, _host(env), old_key=stranger, read=True)
+    assert any(f"The key given ({fmt.key_id(stranger)}) was never in force on this chain" in ln
+               for ln in seen["lines"])
+    assert not any("no longer needed" in ln for ln in seen["lines"])
+
+
 def test_a_lost_old_key_is_accepted_without_its_proof_and_reported_for_good(env):
     _key_changed_without_the_old_one(env)
     seen = recovery.rekey(env.engine, _host(env), accept_unverified=True, read=True)

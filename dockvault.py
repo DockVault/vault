@@ -1891,10 +1891,23 @@ def clear_volume(volume, run=subprocess.run):
     return getattr(r, "returncode", 1) == 0
 
 
-# The old AUDIT_CHAIN_KEY a key change keeps beside .env until the audit log's chain has moved to the new one, and
-# its name in a backup bundle (sealed with env under --lock, as KEPT_CHAIN_KEY_BUNDLE + ".enc").
+# The old AUDIT_CHAIN_KEY a key change keeps beside .env until the audit log's chain has moved to the new one. Each
+# volume set has its own file, named with its VAULT_VOLUME_PREFIX (kept_chain_key_path): a change of set (Volumes'
+# new set or repoint, a restore of another set's bundle) leaves every set's kept key under that set's name, never
+# beside another set's .env as if it were that set's. Reset moves the file of the set it destroys aside
+# (KEPT_CHAIN_KEY_REMOVED). A backup bundle, which is one set's own, carries it as KEPT_CHAIN_KEY_BUNDLE (sealed with
+# env under --lock, as KEPT_CHAIN_KEY_BUNDLE + ".enc").
 KEPT_CHAIN_KEY = ".audit-chain-key.previous"
+KEPT_CHAIN_KEY_REMOVED = ".audit-chain-key.removed-"
 KEPT_CHAIN_KEY_BUNDLE = "audit-chain-key.previous"
+
+
+def kept_chain_key_path(root, prefix):
+    """The file in `root` that holds the old AUDIT_CHAIN_KEY of the volume set `prefix` while a change of its key is
+    not finished. ValueError for a prefix that is not a volume set's name (it would not be a plain file name)."""
+    if not (valid_volume_prefix(prefix) and prefix == prefix.strip()):
+        raise ValueError("VAULT_VOLUME_PREFIX %r is not a volume set's name" % (prefix,))
+    return os.path.join(root, "%s.%s" % (KEPT_CHAIN_KEY, prefix))
 
 
 def kept_chain_key_text(text):
@@ -5201,9 +5214,13 @@ class DockVault:
         _copy_secret(self._env_path(), os.path.join(bundle, "env"))
         tighten_secret_file(os.path.join(bundle, "env"))
         # A change of AUDIT_CHAIN_KEY that is not finished: the audit log's chain may still be under the old key,
-        # which is then only in the file kept beside .env. The bundle carries it (sealed with env under --lock),
-        # and a restore puts it back beside .env, so the restored chain's key is always in a file.
-        kept = os.path.join(self.root, KEPT_CHAIN_KEY)
+        # which is then only in the file this set keeps beside .env. The bundle carries it (sealed with env under
+        # --lock), and a restore puts it back, so the restored chain's key is always in a file. Another set's kept
+        # key is that set's: never carried here.
+        try:
+            kept = kept_chain_key_path(self.root, prefix)
+        except ValueError as exc:
+            self._fail_backup(bundle, str(exc))
         carried = os.path.lexists(kept)
         if carried:
             try:
@@ -5515,10 +5532,14 @@ class DockVault:
             plan.append((names[role], "%s.tar.gz" % VOLUME_BASENAMES[role]))
         head_rel = chain_head_relpath(bundle_env)
         # The old AUDIT_CHAIN_KEY a backup taken during an unfinished key change carries: put back beside .env
-        # below, as the file the change kept. A different one already here belongs to this host's own unfinished
-        # change: it is never written over, and the restore waits until that change is settled.
+        # below, as the file the change kept for this set. A different one already here for this set belongs to
+        # this host's own unfinished change of it: it is never written over, and the restore waits until that
+        # change is settled. Another set's kept key is left as it is.
         carried = self._carried_chain_key(bundle, sealed_dek)
-        kept_here = os.path.join(self.root, KEPT_CHAIN_KEY)
+        try:
+            kept_here = kept_chain_key_path(self.root, prefix)
+        except ValueError as exc:
+            self._fail("%s - refusing to restore" % exc)
         if carried is not None and os.path.lexists(kept_here):
             try:
                 with open(kept_here, encoding="utf-8") as f:
@@ -5526,10 +5547,10 @@ class DockVault:
             except (OSError, ValueError):
                 here = None
             if here != carried:
-                self._fail("%s holds another old AUDIT_CHAIN_KEY: a change of the key here is not finished, and this "
-                           "backup carries the key of its own unfinished change. Finish the change here (python "
-                           "dockvault.py audit rekey --old-key-file %s), or move that file somewhere safe, then "
-                           "restore again. Nothing was changed." % (kept_here, kept_here))
+                self._fail("%s holds another old AUDIT_CHAIN_KEY of set '%s': a change of its key here is not "
+                           "finished, and this backup carries the key of its own unfinished change. Finish the change "
+                           "here (python dockvault.py audit rekey --old-key-file %s), or move that file somewhere "
+                           "safe, then restore again. Nothing was changed." % (kept_here, prefix, kept_here))
         force = bool(getattr(args, "force", False)) if args else False
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
@@ -5621,9 +5642,10 @@ class DockVault:
         rekey = "python dockvault.py audit rekey --old-key-file %s" % kept_here
         if carried is not None:
             # The restored chain may be under the old key: it moves to the current key, with the old key's proof,
-            # before the restore is accepted (accept-restore seals under the current key).
-            finish = "%s (it says so when the chain is already under the current key), then %s, then remove %s" % (
-                rekey, finish, kept_here)
+            # before the restore is accepted (accept-restore refuses while the chain is under a key the server
+            # does not hold).
+            finish = ("%s (it says so when the chain is already under the current key), then %s, then remove %s once "
+                      "the rekey has said the key it holds is no longer needed" % (rekey, finish, kept_here))
             print(pal.paint("  This backup was taken while a change of AUDIT_CHAIN_KEY was not finished: the old key, "
                             "which the audit log's chain may still be under, is back in %s." % kept_here, "yellow"))
         # Bring the restored set back up on ITS .env and health-check, so restore leaves a RUNNING
@@ -5663,7 +5685,8 @@ class DockVault:
             print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: %s\n" % finish,
                             "yellow"))
         elif carried is not None:
-            print(pal.paint("  Finish the change of AUDIT_CHAIN_KEY: %s, then remove %s\n" % (rekey, kept), "yellow"))
+            print(pal.paint("  Finish the change of AUDIT_CHAIN_KEY: %s, then remove %s once it says the key it holds "
+                            "is no longer needed\n" % (rekey, kept), "yellow"))
 
     def _load_env(self):
         """Parse the current .env (best-effort: {} if absent or unreadable)."""
@@ -5674,6 +5697,32 @@ class DockVault:
         except OSError:
             pass
         return env
+
+    def _archive_kept_key(self, prefix):
+        """Move the old AUDIT_CHAIN_KEY the set `prefix` kept (an unfinished change of its key) aside once Reset has
+        destroyed the set, as its .env is: its chain is gone, and a new set with the same prefix must not take it
+        for its own. Never over another file. Returns where it went, or None when there was none (or it could not
+        be moved, which is said)."""
+        try:
+            kept = kept_chain_key_path(self.root, prefix)
+        except ValueError:
+            return None
+        if not os.path.lexists(kept):
+            return None
+        base = os.path.join(self.root, KEPT_CHAIN_KEY_REMOVED + prefix)
+        dest, n = base, 1
+        while os.path.lexists(dest):
+            dest = "%s.%d" % (base, n)
+            n += 1
+        try:
+            os.rename(kept, dest)
+            sync_directory(self.root)
+        except OSError as exc:
+            print(self.pal.paint("  Could not move %s aside (%s): it holds the old AUDIT_CHAIN_KEY of the set just "
+                                 "destroyed; move it away before a new set with the same prefix changes its key."
+                                 % (kept, exc), "yellow"))
+            return None
+        return dest
 
     def _archive_env(self, label):
         """Move the current .env aside as .env.<label> so it isn't lost / left live. Collision-safe
@@ -5864,9 +5913,13 @@ class DockVault:
             self._fail("'docker compose down -v' failed (exit %d) - the set was NOT destroyed and your "
                        ".env is untouched. A volume may still be in use; free it and retry." % r.returncode)
         archived = self._archive_env("removed-" + prefix)   # keep the (now-orphaned) .env, don't leave it live
+        kept = self._archive_kept_key(prefix)
         print(pal.paint("\n  Set '%s' destroyed." % prefix, "green"))
         if archived:
             print("  Its .env (no longer matching any data) was moved to: %s" % archived)
+        if kept:
+            print("  The old AUDIT_CHAIN_KEY its unfinished key change kept (its chain is gone) was moved to: %s"
+                  % kept)
         print(pal.paint("  Run Setup to start a fresh deployment.\n", "cyan"))
 
     def _running_version(self, profiles=None):
@@ -6831,11 +6884,13 @@ class DockVault:
         and move the chain to it at once with `audit rekey --old-key-stdin --now`, the old key handed over on
         standard input (never on a command line or in a container's environment, where `ps` or `docker inspect`
         would show it). Sealing waits only for the seconds between the restart and that command. Until the move
-        is done the old key is kept beside .env (mode 600), and removed once the chain is under the new one.
+        is done the old key is kept beside .env (mode 600) in the file of the volume set .env is for
+        (kept_chain_key_path), and removed once the chain is under the new one.
 
-        While that kept file is there, an earlier change is not finished: the chain may still be under the key it
-        holds, which is then in no other file. A new change is refused, naming the command that finishes the
-        earlier one, and the kept file is never written over.
+        While that kept file is there, an earlier change of the set's key is not finished: the chain may still be
+        under the key it holds, which is then in no other file. A new change of that set's key is refused, naming
+        the command that finishes the earlier one, and the kept file is never written over. Another set's kept file
+        is that set's, and changes nothing here.
 
         Refused, with nothing written, while .env is sealed by `lock` (it holds every secret: a .env written now
         would hold only the new key, and a lock after it would seal that over the real one) or is not there. The
@@ -6848,10 +6903,13 @@ class DockVault:
         if not os.path.exists(self._env_path()):
             self._fail("there is no .env in %s: run audit change-key where the deployment's .env is. Nothing "
                        "changed." % self.root)
-        kept_path = os.path.join(self.root, KEPT_CHAIN_KEY)
-        if os.path.lexists(kept_path):
-            self._unfinished_key_change(kept_path)
         env = self._load_env()
+        try:
+            kept_path = kept_chain_key_path(self.root, volume_prefix(env))
+        except ValueError as exc:
+            self._fail("%s. Nothing changed." % exc)
+        if os.path.lexists(kept_path):
+            self._unfinished_key_change(kept_path, volume_prefix(env))
         old = (env.get("AUDIT_CHAIN_KEY") or "").strip()
         interactive = not getattr(args, "yes", False)
         if interactive and not confirm("Write a new AUDIT_CHAIN_KEY and move the audit log's chain to it now?", pal,
@@ -6872,7 +6930,7 @@ class DockVault:
                 # On the disk, file and name, before .env changes: a power cut then keeps the old key beside the new.
                 sync_to_disk(kept)
             except FileExistsError:
-                self._unfinished_key_change(kept)
+                self._unfinished_key_change(kept, volume_prefix(env))
             except OSError as exc:
                 if created:
                     # .env still holds the old key: the copy begun here is not needed, and a copy left behind
@@ -6914,8 +6972,8 @@ class DockVault:
         if not done.get("ok"):
             print(pal.paint("  The chain was not moved: %s" % server_text(done.get("error")), "red"))
             print(pal.paint("  Sealing waits until it is: python dockvault.py audit rekey --old-key-file %s\n"
-                            "  then remove %s (a new key change is refused while it is there).\n" % (kept, kept),
-                            "yellow"))
+                            "  then remove %s once the rekey says the key it holds is no longer needed (a new key\n"
+                            "  change of this set is refused while it is there).\n" % (kept, kept), "yellow"))
             raise SystemExit(1)
         try:
             os.remove(kept)
@@ -6924,13 +6982,15 @@ class DockVault:
                             "use (a new key change is refused while it is there)." % (kept, exc), "yellow"))
         print(pal.paint("  The chain is under the new key (seal %s).\n" % server_text(done.get("sealed")), "green"))
 
-    def _unfinished_key_change(self, kept):
-        """Refuse a key change while an earlier one is not finished, naming the commands that finish it."""
-        self._fail("an earlier change of AUDIT_CHAIN_KEY is not finished: the key the audit log's chain may still "
-                   "be under is kept in %s, and in no other file. Finish that change first:\n"
+    def _unfinished_key_change(self, kept, prefix):
+        """Refuse a key change while an earlier one of the same set is not finished, naming the commands that finish
+        it. The file is removed only once rekey says the key it holds is no longer needed: rekey says so of a key
+        this chain was under before it moved to the current key, and says a key it was never under is not its."""
+        self._fail("an earlier change of AUDIT_CHAIN_KEY of this volume set ('%s') is not finished: the key its audit "
+                   "log's chain may still be under is kept in %s, and in no other file. Finish that change first:\n"
                    "  python dockvault.py audit rekey --old-key-file %s\n"
-                   "Once the chain is under the current key (the rekey says so, or says there is nothing to do), "
-                   "remove %s and run audit change-key again. Nothing changed." % (kept, kept, kept))
+                   "Remove %s only once that rekey says the key it holds is no longer needed, then run audit "
+                   "change-key again. Nothing changed." % (prefix, kept, kept, kept))
 
     def _db_free_bytes(self):
         """The free space of the database volume, in bytes, as the database container sees it, or None."""

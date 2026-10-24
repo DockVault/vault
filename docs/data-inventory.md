@@ -348,8 +348,9 @@ the recipients' mailboxes.
   acknowledge`** and the other host commands (`rekey`, `after-record`, `accept-database-head`,
   `accept-restore`, `acknowledge-removed-before`, `change-key`) write their seals audited as the host
   operator; `after-record --discard` saves the seals it deletes in a file beside the head record.
-  `change-key` keeps the old key in `.audit-chain-key.previous` beside `.env` (mode 600) until the chain has
-  moved to the new one.
+  `change-key` keeps the old key beside `.env` (mode 600), in `.audit-chain-key.previous.<VAULT_VOLUME_PREFIX>`
+  (one file for each volume set), until the chain has moved to the new one; `lock` does not seal it, and Reset
+  moves the file of the set it destroys aside as `.audit-chain-key.removed-<VAULT_VOLUME_PREFIX>`.
   **`python dockvault.py audit retention`** (**new in 0.34.0**) prints how long each kind of record is kept,
   as the server has it, and where each value comes from, and the changes waiting with the username of the
   administrator who asked for each (not audited, like the other reads on the host); with `--set NAME=VALUE`

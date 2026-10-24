@@ -74,6 +74,25 @@ def _record_lines(record: Optional[dict]) -> List[str]:
 
 # --------------------------------------------------------------------------- rekey
 
+def given_key_line(view, record: dict, given: Optional[str], in_force: Optional[str], current: str) -> Optional[str]:
+    """What rekey says of the old key the host gave (``given``, its id), or None when none was given: whether this
+    chain was ever under it, so that the host knows whether the file holding it (the one dockvault.py's key change
+    kept) may go. A key the chain was never under is never said to be no longer needed: it may be the only copy of
+    another chain's key (another volume set's, or a backup's)."""
+    if given is None:
+        return None
+    if given == current:
+        return f"The key given ({given}) is the current key, not an old one."
+    if not (view.ever_in_force(given) or _ai()._ever_in_force(record, given)):
+        return (f"The key given ({given}) was never in force on this chain: it is not this chain's old key. Keep the "
+                "file holding it until you know which chain it is for (another volume set's, or a backup's).")
+    if given == in_force:
+        return (f"The key given ({given}) is the one the chain is under: once the key seal is written, it is no longer "
+                "needed.")
+    return (f"The key given ({given}) is one this chain was under before it moved on: it is no longer needed (a backup "
+            "taken before that move holds it in its own .env).")
+
+
 def rekey(engine, st, *, old_key: Optional[bytes] = None, accept_unverified: bool = False,
           confirm_return: bool = False, expect: Optional[str] = None, read: bool = False,
           one_step: bool = False) -> dict:
@@ -86,10 +105,15 @@ def rekey(engine, st, *, old_key: Optional[bytes] = None, accept_unverified: boo
         current = w.st.current_key()
         in_force = view.key_in_force()
         held = _held(w.st, old_key)
+        given = given_key_line(view, record, fmt.key_id(old_key) if old_key is not None else None, in_force,
+                               current.key_id)
         if in_force == current.key_id:
-            raise Refused(f"the chain is already under the current key ({current.key_id}): nothing to do")
+            raise Refused(f"the chain is already under the current key ({current.key_id}): nothing to do"
+                          + (". " + given if given else ""))
         returning = view.ever_in_force(current.key_id) or ai._ever_in_force(record, current.key_id)
         lines = [f"The chain is under {in_force}; the current key is {current.key_id}."]
+        if given:
+            lines.append(given)
         if returning:
             lines.append(f"{current.key_id} is a key the chain had left: from now on whoever holds it can write "
                          "seals again (--confirm-return).")
@@ -112,7 +136,7 @@ def rekey(engine, st, *, old_key: Optional[bytes] = None, accept_unverified: boo
             old = held.get(in_force)
             if old is None:
                 raise Refused(f"the key in force ({in_force}) is not held: give it with --old-key-file, or, if it "
-                              "is lost, use --accept-unverified-history")
+                              "is lost, use --accept-unverified-history" + (". " + given if given else ""))
             if newest is None or not ai._mac_ok(old.key, view.link_at(view.position), newest.mac):
                 raise Refused(f"the newest seal ({view.position}) does not verify under {in_force}: the chain cannot "
                               "be moved with a proof (key-unverified)")
