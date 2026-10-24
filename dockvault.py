@@ -851,15 +851,21 @@ def sync_to_disk(path):
     """Force a file just written, and its name in its directory, to the disk (the standard library's fsync, as the
     app's durable writes do), so a power cut right after cannot lose it. Windows, and a filesystem that cannot sync
     a directory (EINVAL, EBADF), skip the directory; any other error (EIO) raises OSError."""
-    import errno
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+    sync_directory(os.path.dirname(os.path.abspath(path)))
+
+
+def sync_directory(directory):
+    """Force the names in `directory` to the disk. Windows, and a filesystem that cannot sync a directory (EINVAL,
+    EBADF), skip it; any other error (EIO) raises OSError."""
+    import errno
     if os.name == "nt":
         return
-    dfd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    dfd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(dfd)
     except OSError as exc:
@@ -867,6 +873,43 @@ def sync_to_disk(path):
             raise
     finally:
         os.close(dfd)
+
+
+def replace_file_durably(path, data):
+    """Replace the file at `path` with `data` (text, written UTF-8 with LF line ends; or bytes, as they are) so that a
+    power cut leaves the old file or the new one, whole, and the new one on the disk once this returns: written to a
+    temporary file beside it (created mode 600), synced, renamed over it, then its directory synced. A symbolic link
+    at `path` is followed: its target is replaced and the link stays. The file keeps its owner and group where this
+    process may give them. Raises OSError: the file is then as it was, unless only the directory's sync failed (the
+    rename was done)."""
+    target = os.path.realpath(path)
+    directory = os.path.dirname(target) or "."
+    try:
+        before = os.stat(target)
+    except OSError:
+        before = None
+    fd, tmp = tempfile.mkstemp(prefix=".dvtmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            if os.name != "nt":
+                os.fchmod(f.fileno(), 0o600)
+                if before is not None:
+                    try:
+                        os.fchown(f.fileno(), before.st_uid, before.st_gid)
+                    except OSError:
+                        pass                  # not this process's to give: the file stays its own
+            f.write(bytes(data) if isinstance(data, (bytes, bytearray)) else data.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    sync_directory(directory)
 
 
 def tighten_secret_file(path):
@@ -4279,9 +4322,11 @@ class DockVault:
         return (mode or "selfsigned", email, cpath, kpath)
 
     def _set_env_key(self, path, key, value):
-        """Replace/append KEY=value in .env (bare value), preserving perms. A byte order mark at the start is
-        read past (without_bom) and not written back. Never makes a .env beside a sealed .env.enc (that .env would
-        hold only this line, and a later lock would seal it over the real one): refused, with nothing written."""
+        """Replace/append KEY=value in .env (bare value), mode 600. A byte order mark at the start is read past
+        (without_bom) and not written back. The file is replaced whole and on the disk when this returns
+        (replace_file_durably): a power cut never leaves it half-written, nor without a key something already
+        depends on. Never makes a .env beside a sealed .env.enc (that .env would hold only this line, and a later
+        lock would seal it over the real one): refused, with nothing written."""
         if not os.path.exists(path) and os.path.exists(path + ".enc"):
             self._fail("%s is locked (sealed in %s.enc): unlock it first (python dockvault.py unlock). Nothing was "
                        "written." % (os.path.basename(path), os.path.basename(path)))
@@ -4294,14 +4339,32 @@ class DockVault:
                     lines.append(raw)
         if not found:
             lines.append("%s=%s" % (key, value))
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(lines) + "\n")
+        replace_file_durably(path, "\n".join(lines) + "\n")
         tighten_secret_file(path)
 
+    def _set_env_key_or_put_back(self, key, value):
+        """_set_env_key on .env, and on a failure .env put back as it was, byte for byte. Returns None once written,
+        else (why it failed, why .env could not be put back, or None when it was)."""
+        path = self._env_path()
+        try:
+            with open(path, "rb") as f:
+                before = f.read()
+        except OSError as exc:
+            return exc, None                    # not read, so not written either
+        try:
+            self._set_env_key(path, key, value)
+            return None
+        except OSError as exc:
+            try:
+                replace_file_durably(path, before)
+            except OSError as again:
+                return exc, again
+            return exc, None
+
     def _remove_env_keys(self, path, keys):
-        """Remove any KEY= lines for the given keys from .env (preserving perms). Returns True if any
-        line was removed. Comments and every other line are kept verbatim; a byte order mark at the start is
-        read past (without_bom), and not written back when a line is removed."""
+        """Remove any KEY= lines for the given keys from .env (mode 600, replaced whole and on the disk as
+        _set_env_key does). Returns True if any line was removed. Comments and every other line are kept verbatim;
+        a byte order mark at the start is read past (without_bom), and not written back when a line is removed."""
         if not os.path.exists(path):
             return False
         keyset = set(keys)
@@ -4313,8 +4376,7 @@ class DockVault:
                 continue
             out.append(raw)
         if removed:
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write("\n".join(out) + "\n")
+            replace_file_durably(path, "\n".join(out) + "\n")
             tighten_secret_file(path)
         return removed
 
@@ -6082,7 +6144,14 @@ class DockVault:
                                        "recommended)?", pal, default=True):
             print(pal.paint("  Left unset: the chain's key is derived from ENCRYPTION_KEY.", "yellow"))
             return
-        self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
+        # On the disk before the deployment starts under it: once the chain has moved to the key, it must be in
+        # .env whatever happens to the power.
+        failed = self._set_env_key_or_put_back("AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
+        if failed is not None:
+            why, unrestored = failed
+            self._fail("could not write AUDIT_CHAIN_KEY into .env (%s)%s. The update did not start." % (
+                why, ": .env is as it was" if unrestored is None else
+                ", nor put .env back as it was (%s): check .env before anything else" % unrestored))
         print(pal.paint("  Wrote AUDIT_CHAIN_KEY to .env (it is in every backup with .env; keep it as you keep "
                         "ENCRYPTION_KEY).", "green"))
 
@@ -6616,7 +6685,9 @@ class DockVault:
         earlier one, and the kept file is never written over.
 
         Refused, with nothing written, while .env is sealed by `lock` (it holds every secret: a .env written now
-        would hold only the new key, and a lock after it would seal that over the real one) or is not there."""
+        would hold only the new key, and a lock after it would seal that over the real one) or is not there. The
+        new key is on the disk, in .env, before the stack is recreated under it (_set_env_key); when it cannot be
+        written, .env is put back as it was."""
         pal = self.pal
         if self._is_locked():
             self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run "
@@ -6658,8 +6729,27 @@ class DockVault:
                     except OSError:
                         pass
                 self._fail("could not keep the old key aside before changing it (%s): nothing changed" % exc)
-        self._set_env_key(self._env_path(), "AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
-        print(pal.paint("  Wrote the new AUDIT_CHAIN_KEY; recreating the stack ...", "cyan"))
+        failed = self._set_env_key_or_put_back("AUDIT_CHAIN_KEY", "'%s'" % gen_hex(32))
+        if failed is not None:
+            why, unrestored = failed
+            if unrestored is None:
+                if kept is not None:
+                    try:
+                        os.remove(kept)          # .env holds the old key again: the copy is not needed
+                    except OSError:
+                        pass
+                self._fail("could not write the new AUDIT_CHAIN_KEY into .env (%s): .env is as it was. Nothing "
+                           "changed." % why)
+            if kept is None:
+                self._fail("could not write the new AUDIT_CHAIN_KEY into .env (%s), nor put .env back as it was "
+                           "(%s). The stack was not recreated. Check .env: the audit log's chain is under the key "
+                           "derived from ENCRYPTION_KEY, and moves on its own, with a proof, to any AUDIT_CHAIN_KEY "
+                           ".env holds." % (why, unrestored))
+            self._fail("could not write the new AUDIT_CHAIN_KEY into .env (%s), nor put .env back as it was (%s). "
+                       "The stack was not recreated: the audit log's chain is still under the old key, kept in %s. "
+                       "Before anything else, make AUDIT_CHAIN_KEY in .env that key again, then remove %s."
+                       % (why, unrestored, kept, kept))
+        print(pal.paint("  Wrote the new AUDIT_CHAIN_KEY (on the disk); recreating the stack ...", "cyan"))
         if not self._recreate_stack(build=False):
             self._fail("the stack did not come up with the new key; the old key is in %s" % (kept or "(none)"))
         self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))

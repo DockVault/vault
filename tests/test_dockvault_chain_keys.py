@@ -8,8 +8,9 @@
 - the key change writes the new key, recreates the stack and moves the chain with the old key on standard
   input, keeping the old key aside (mode 600) until the move is done; while that kept file is there, a new key
   change is refused and the kept file is never written over;
-- a key change, an update and every line written into .env are refused while .env is sealed: no .env is ever
-  made beside a .env.enc;
+- a key change, an update and every line written into .env are refused while .env is sealed (no .env is ever
+  made beside a .env.enc); the new key is on the disk in .env (file and name) before the stack is recreated under
+  it, and when it cannot be, .env is put back as it was, or the operator is told what to do;
 - the split layout's SFTP container never gets the chain's key and mounts the keys volume read-only; the web
   server writes the SSH host key it needs.
 
@@ -352,7 +353,7 @@ def test_the_web_server_writes_the_sftp_host_key_when_there_is_none(tmp_path):
     assert "ensure_host_key(settings.sftp_host_key_path)" in source
 
 
-# --------------------------------------------------------------------------- a sealed .env
+# --------------------------------------------------------------------------- a sealed .env, and .env on the disk
 
 def _lock_args(**kw):
     base = dict(passphrase_file=None, passphrase_stdin=False, hint=None, recovery_out=None, recovery_key=False,
@@ -429,3 +430,137 @@ def test_an_update_on_a_locked_env_is_refused_and_the_chain_key_is_never_written
     with pytest.raises(SystemExit):
         tool._offer_chain_key(argparse.Namespace(no_chain_key=False), True, "0.34.0")
     assert sorted(p.name for p in tmp_path.iterdir()) == [".env.enc"]
+
+
+def _fsyncs(monkeypatch, events):
+    """Record each fsync: ("dir"|"file", the inode)."""
+    import os
+    import stat
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        events.append(("dir" if stat.S_ISDIR(st.st_mode) else "file", st.st_ino))
+        return real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "O_DIRECTORY"), reason="a directory cannot be synced here")
+def test_the_new_key_is_on_the_disk_in_env_before_the_stack_is_recreated_under_it(tmp_path, monkeypatch):
+    """Once the stack runs under the new key the chain moves to it (a durable commit), and the kept old key is
+    removed: by then .env's new bytes and its name must be on the disk, or a power cut leaves the chain under a key
+    that is in no file."""
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    events = []
+    _fsyncs(monkeypatch, events)
+
+    def recreate(build):
+        events.append(("recreate", _chain_key(tmp_path)))
+        return True
+    monkeypatch.setattr(tool, "_recreate_stack", recreate)
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, input_text=None: events.append(("move",)) or
+                        {"ok": True, "sealed": 30})
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    new = _chain_key(tmp_path)
+    assert new != env["AUDIT_CHAIN_KEY"]
+    env_file = ("file", (tmp_path / ".env").stat().st_ino)
+    directory = ("dir", tmp_path.stat().st_ino)
+    recreated = events.index(("recreate", new))
+    synced = events.index(env_file)
+    assert synced < recreated and directory in events[synced + 1:recreated], events
+    assert events[-1] == ("move",)
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "O_DIRECTORY"), reason="a directory cannot be synced here")
+def test_the_chain_key_an_update_offers_is_on_the_disk_before_the_update_goes_on(tmp_path, monkeypatch):
+    tool = _updating(tmp_path, monkeypatch)
+    lines = [ln for ln in (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
+             if not ln.startswith("AUDIT_CHAIN_KEY")]
+    (tmp_path / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    events = []
+    _fsyncs(monkeypatch, events)
+    tool._offer_chain_key(argparse.Namespace(no_chain_key=False), True, "0.34.0")
+    assert len(_chain_key(tmp_path)) == 64
+    synced = events.index(("file", (tmp_path / ".env").stat().st_ino))
+    assert ("dir", tmp_path.stat().st_ino) in events[synced + 1:], events
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="a symbolic link and an owner are POSIX's")
+def test_a_line_written_into_env_follows_a_link_and_keeps_the_files_owner(tmp_path, monkeypatch):
+    import os
+    real = tmp_path / "kept-elsewhere"
+    real.mkdir()
+    (real / ".env").write_text("A=1\nB=2\n", encoding="utf-8")
+    root = tmp_path / "deploy"
+    root.mkdir()
+    os.symlink(real / ".env", root / ".env")
+    owners = []
+    real_fchown = os.fchown
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: owners.append((uid, gid)) or real_fchown(fd, uid, gid))
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    st = (real / ".env").stat()
+    tool._set_env_key(str(root / ".env"), "B", "3")
+    assert os.path.islink(root / ".env") and (real / ".env").read_text(encoding="utf-8") == "A=1\nB=3\n"
+    assert owners == [(st.st_uid, st.st_gid)]
+    assert (real / ".env").stat().st_mode & 0o777 == 0o600
+    assert [p.name for p in real.iterdir()] == [".env"]                     # no temporary file left
+
+
+def test_a_line_that_cannot_be_written_leaves_env_as_it_was_and_no_temporary_file(tmp_path, monkeypatch):
+    import errno
+    import os
+    (tmp_path / ".env").write_bytes(b"A=1\r\nB=2\n")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+
+    def full(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(OSError):
+        tool._set_env_key(tool._env_path(), "B", "3")
+    assert (tmp_path / ".env").read_bytes() == b"A=1\r\nB=2\n"
+    assert [p.name for p in tmp_path.iterdir()] == [".env"]
+
+
+def _a_key_change_whose_env_write_fails(tmp_path, monkeypatch, failing_calls):
+    """A key change whose write of the new key into .env fails at the directory syncs numbered in
+    `failing_calls` (1 is the kept old key's own)."""
+    import errno
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    before = (tmp_path / ".env").read_bytes()
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    real_sync = dv.sync_directory
+    calls = []
+
+    def sync(directory):
+        calls.append(directory)
+        if len(calls) in failing_calls:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_sync(directory)
+    monkeypatch.setattr(dv, "sync_directory", sync)
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, **k: pytest.fail("the chain was asked to move"))
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    return env["AUDIT_CHAIN_KEY"], before
+
+
+def test_a_key_change_whose_new_env_cannot_be_synced_puts_env_back_and_changes_nothing(tmp_path, monkeypatch,
+                                                                                         capsys):
+    """The rename of the new .env was done, its directory's sync failed: .env is put back as it was, byte for byte,
+    and the kept copy of the old key goes, as nothing changed."""
+    old, before = _a_key_change_whose_env_write_fails(tmp_path, monkeypatch, {2})
+    assert (tmp_path / ".env").read_bytes() == before
+    assert not (tmp_path / ".audit-chain-key.previous").exists()
+    out = capsys.readouterr().out
+    assert ".env is as it was" in out and "Nothing changed" in out
+
+
+def test_a_key_change_whose_env_can_be_neither_written_nor_put_back_keeps_the_old_key_and_says_what_to_do(
+        tmp_path, monkeypatch, capsys):
+    old, _before = _a_key_change_whose_env_write_fails(tmp_path, monkeypatch, {2, 3})
+    kept = tmp_path / ".audit-chain-key.previous"
+    assert kept.read_text(encoding="utf-8") == old + "\n"
+    out = capsys.readouterr().out
+    assert "nor put .env back" in out and str(kept) in out and "make AUDIT_CHAIN_KEY in .env that key again" in out
