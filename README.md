@@ -324,6 +324,12 @@ Every command that writes `.env` (`update`, `audit change-key`, `audit retention
 settings) refuses while it is sealed, with nothing written: unlock it first.
 Requires the `cryptography` package (`pip install cryptography`).
 
+`lock` seals `.env` only: the `.env.<set>` archives that Volumes and Reset set aside stay in plain text, and so
+does the old `AUDIT_CHAIN_KEY` that `audit change-key` keeps beside `.env` until the audit log's chain has moved
+off it (`.audit-chain-key.previous.<set>`, the key the chain is still under while that change is not finished).
+`lock` names each of them. Finish the change (`python dockvault.py audit rekey --old-key-file <file>`) and remove
+the file once the rekey says its key is no longer needed, or keep it off the host until then.
+
 **What this protects — and what it does not.** Sealing guards `.env` only while it is **locked/off**
 (a stolen disk, a backup, a snapshot). A **running** stack always uses the plaintext `.env`, so for a
 box that stays up, **host full-disk encryption is the real control**. There is deliberately **no

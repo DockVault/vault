@@ -1914,6 +1914,12 @@ def kept_chain_key_path(root, prefix):
     return os.path.join(root, "%s.%s" % (KEPT_CHAIN_KEY, prefix))
 
 
+def kept_chain_key_files(root):
+    """Every old AUDIT_CHAIN_KEY kept in plain text in `root`: each set's, and those Reset moved aside."""
+    return sorted(set(glob.glob(os.path.join(root, KEPT_CHAIN_KEY + "*")) +
+                      glob.glob(os.path.join(root, KEPT_CHAIN_KEY_REMOVED + "*"))))
+
+
 class LockBusy(Exception):
     """The lock asked for is held by another process."""
 
@@ -3783,6 +3789,16 @@ class DockVault:
                 "  WARNING: %d plaintext .env archive(s) are NOT sealed by lock and still hold an\n"
                 "  ENCRYPTION_KEY (%s). Back them up off this host, then delete them."
                 % (len(archives), ", ".join(os.path.basename(a) for a in archives)), "red"))
+        # The old AUDIT_CHAIN_KEY a key change keeps until the audit log's chain has moved off it stays in plain
+        # text too: while the change is not finished, the chain is still under that key.
+        kept = kept_chain_key_files(self.root)
+        if kept:
+            print(pal.paint(
+                "  WARNING: %d old AUDIT_CHAIN_KEY file(s) are NOT sealed by lock (%s). Each holds, in plain text,\n"
+                "  a key an audit log's chain may still be under, as a change of AUDIT_CHAIN_KEY is not finished:\n"
+                "  finish it (unlock, then python dockvault.py audit rekey --old-key-file <file>) and remove the file\n"
+                "  once the rekey says its key is no longer needed, or keep the file off this host until then."
+                % (len(kept), ", ".join(os.path.basename(k) for k in kept)), "red"))
         # Sealing .env does NOT clear the copy Docker already baked into a running/stopped container's
         # on-disk config -- point the operator at the command that does.
         if container_exists(DB_CONTAINER):

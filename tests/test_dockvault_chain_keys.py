@@ -871,6 +871,40 @@ def test_a_prefix_that_is_not_a_volume_sets_name_names_no_kept_file(tmp_path, pr
         dv.kept_chain_key_path(str(tmp_path), prefix)
 
 
+def test_lock_says_the_kept_old_keys_are_not_sealed(tmp_path, monkeypatch, capsys):
+    """lock seals .env only: the old key an unfinished change keeps (the key the chain is still under) stays in plain
+    text, and lock says so, naming each file, as it does of the .env archives."""
+    pytest.importorskip("cryptography")
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _p: True)
+    monkeypatch.setattr(dv, "container_exists", lambda *a, **k: False)
+    _unfinished_change(tmp_path)
+    (tmp_path / (dv.KEPT_CHAIN_KEY_REMOVED + "dockvault-vault-old")).write_text(dv.gen_hex(32) + "\n",
+                                                                                encoding="utf-8")
+    passfile = tmp_path / "pass.txt"
+    passfile.write_text("correct horse battery staple\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    capsys.readouterr()
+    tool.lock(_lock_args(passphrase_file=str(passfile)))
+    out = " ".join(capsys.readouterr().out.split())
+    assert "2 old AUDIT_CHAIN_KEY file(s) are NOT sealed by lock" in out
+    assert _kept(tmp_path).name in out and dv.KEPT_CHAIN_KEY_REMOVED + "dockvault-vault-old" in out
+    assert dv.CHAIN_KEY_LOCK not in out
+
+
+def test_lock_with_no_kept_old_key_says_nothing_of_one(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("cryptography")
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _p: True)
+    monkeypatch.setattr(dv, "container_exists", lambda *a, **k: False)
+    _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    (tmp_path / dv.CHAIN_KEY_LOCK).write_text("", encoding="utf-8")
+    passfile = tmp_path / "pass.txt"
+    passfile.write_text("correct horse battery staple\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    capsys.readouterr()
+    tool.lock(_lock_args(passphrase_file=str(passfile)))
+    assert "AUDIT_CHAIN_KEY file" not in capsys.readouterr().out
+
+
 # --------------------------------------------------------------------------- two key changes at once
 
 def test_a_key_change_started_while_another_waits_for_its_answer_is_refused_and_the_chains_key_stays_in_a_file(
