@@ -691,6 +691,97 @@ def test_accept_restore_refuses_a_restore_mark_it_cannot_read(env):
     assert env.st.restore_mark() == {"unreadable": "JSONDecodeError"}
 
 
+def test_a_restore_whose_chain_is_under_a_key_the_server_does_not_hold_waits_for_rekey(env):
+    """A backup taken during an unfinished change of AUDIT_CHAIN_KEY: the restored chain is under the old key, and
+    the .env put back holds the new one. A restore seal under the new key would break the key sequence for good,
+    so accept-restore refuses in both phases with nothing written, naming rekey, and the status and the pruner's
+    reason say rekey first. Once rekey has moved the chain with the old key, accept-restore finishes the restore
+    and sealing goes on clean."""
+    from app.core import audit_chain_recovery as recovery
+    env.row(T0 - timedelta(hours=8))
+    env.run_until_sealed()
+    old_kid = env.st.current_key().key_id
+    snap = _snapshot(env)
+    env.settings.audit_chain_key = "e" * 64          # the change's new key; the chain stays under the old one
+    _restore_bundle(env, snap)
+    before = [(s.seq, s.kind, s.key_id) for s in env.seals()]
+    assert before[-1][2] == old_kid
+    told = ai.status(env.st)["warnings"]["restore-pending"]["message"]
+    assert f"under {old_kid}, a key the server does not hold" in told and "audit rekey --old-key-file" in told
+    assert "audit rekey --old-key-file" in env.st.holds_deletion()
+    for kw in ({"read": True}, {"expect": "dvstate1:0"}):
+        with pytest.raises(restore.Refused, match=f"under {old_kid}, a key the server does not hold") as why:
+            restore.accept_restore(env.engine, _host(env), **kw)
+        assert "audit rekey --old-key-file" in str(why.value) and "Nothing was written" in str(why.value)
+    assert [(s.seq, s.kind, s.key_id) for s in env.seals()] == before
+    assert hr.read_mark(env.st.head_store().path) is not None
+    assert host_rows(env, restore.RESTORED_ACTION) == []
+    old = fmt.chain_key(KEY_TEXT)
+    seen = recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    recovery.rekey(env.engine, _host(env), old_key=old, expect=seen["state"])
+    assert ai.status(_host(env))["warnings"]["restore-pending"]["message"].endswith(
+        "finishes it: run dockvault.py audit accept-restore")
+    seen = restore.accept_restore(env.engine, _host(env), read=True)
+    restore.accept_restore(env.engine, _host(env), expect=seen["state"])
+    seal = [s for s in env.seals() if s.kind == "restore"][0]
+    assert seal.key_id == env.st.current_key().key_id != old_kid
+    assert hr.read_mark(env.st.head_store().path) is None
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
+
+
+def test_a_restore_whose_newest_seal_does_not_verify_under_the_key_in_force_is_refused(env):
+    """The restored chain is under a key the server holds, but its newest seal does not verify under it: nothing
+    is accepted over a chain that cannot be authenticated, in either phase, and nothing is written."""
+    env.row(T0 - timedelta(hours=8))
+    env.run_until_sealed()
+    snap = _snapshot(env)
+    _restore_bundle(env, snap)
+    newest = env.seals()[-1].seq
+    with env.session() as db:
+        db.query(AuditSeal).filter(AuditSeal.seq == newest).update({AuditSeal.mac: bytes(32)})
+        db.commit()
+    for kw in ({"read": True}, {"expect": "dvstate1:0"}):
+        with pytest.raises(restore.Refused) as why:
+            restore.accept_restore(env.engine, _host(env), **kw)
+        assert f"newest seal of the restored chain ({newest}) does not verify" in str(why.value)
+        assert "Nothing was written" in str(why.value)
+    assert env.seals()[-1].seq == newest and hr.read_mark(env.st.head_store().path) is not None
+
+
+def test_a_lost_cancel_is_sealed_again_under_the_old_key_the_host_gave(env):
+    """A database restored on its own whose chain ends under a key the server no longer holds (the key changed
+    since): accept-database-head with that key as --old-key-file writes the restore seal under it, and the cancel
+    it lost is sealed again under it too, never under the current key (that would break the key sequence for
+    good); rekey then moves the chain and sealing goes on clean."""
+    from app.core import audit_chain_recovery as recovery
+    env.row(T0 - timedelta(days=60))
+    env.run_until_sealed()
+    admin = _admin(env)
+    outcome = _change(env, admin, "audit_max_days", 30)
+    req = [s for s in env.seals() if s.kind == "request"][-1].seq
+    before_cut = env.seals()[-1].seq
+    with ps.change_transaction(env.engine) as w:
+        ps.cancel(w, outcome.change.id, admin)
+    _cut_from(env, before_cut + 1)
+    old_kid = env.st.current_key().key_id
+    env.settings.audit_chain_key = "e" * 64
+    env.clock.advance(hours=1)
+    assert env.seal().stopped
+    old = fmt.chain_key(KEY_TEXT)
+    _seen, done = _accept(env, old_key=old)
+    assert done["cancels"] == [req]
+    tail = [(s.kind, s.key_id) for s in env.seals()[-2:]]
+    assert tail == [("restore", old_kid), ("cancel", old_kid)]
+    seen = recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    recovery.rekey(env.engine, _host(env), old_key=old, expect=seen["state"])
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert req not in env.st.view.pending_requests()
+    assert failures(env.verify()) == []
+
+
 def test_a_key_history_only_the_replaced_record_held_is_kept_and_the_left_key_named(env):
     """The chain moved to AUDIT_CHAIN_KEY after the backup: the restored chain is under the key it left. The
     restore says so, and the replaced record's key history stays in the record."""

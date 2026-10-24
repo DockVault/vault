@@ -271,8 +271,8 @@ def _verify(args) -> int:
                                                         "not acknowledged)")
                     mark = st.restore_mark()
                     if mark is not None and "restore-pending" not in report.kinds(v.WARNING):
-                        report.add(v.WARNING, "restore-pending", "a restore of a backup is not finished: run "
-                                                                 "dockvault.py audit accept-restore")
+                        report.add(v.WARNING, "restore-pending", "a restore of a backup is not finished: "
+                                                                 + st.restore_step(report.key_id))
             finally:
                 db.close()
     except Exception as exc:  # noqa: BLE001

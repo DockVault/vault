@@ -36,7 +36,10 @@ completed erases. If the database holds no seal at all, it writes a new genesis 
 restore undid from the record it replaced, writes a ``restore`` seal (cause backup) that acknowledges the
 seals of the backup's window (written between its keys archive and its database part, accepted at the first
 start after the mark), folds the replaced record's key history, links and completed erases into the new one,
-and removes the mark.
+and removes the mark. The restore seal is written under the key the restored chain is under; while the server
+does not hold that key (a backup taken during an unfinished change of AUDIT_CHAIN_KEY), or the newest seal does
+not verify under it, both phases refuse with nothing written, naming ``audit rekey --old-key-file``, which moves
+the chain to the current key first.
 """
 from __future__ import annotations
 
@@ -575,6 +578,7 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
         w.st.own.clear()
         w.st.pending_after = []
         was_empty = view.position == 0
+        k = None
         if was_empty:
             seal = ai.write_genesis(w, now, replaces=restored["lost_head"] or "unknown", grace_days=grace)
         else:
@@ -590,7 +594,7 @@ def accept_database_head(engine, st, *, old_key: Optional[bytes] = None, confirm
         from app.core import audit_chain_policy_seals as ps
         ps.write_genesis_policy(engine, st, now)
     if cancels:
-        _reseal_cancels(engine, st, cancels)
+        _reseal_cancels(engine, st, cancels, k)
     return {"restored": seal.seq, "generation": w.st.view.generation, "grace_days": grace,
             "resealed": sorted(settings), "cancels": cancels, "superseded": [c for _s, _n, c in superseded]}
 
@@ -627,11 +631,38 @@ def _append_restore_policy(w, settings: Dict[str, object], superseded: List[list
                                  now=w.st.clock(), reason="a value sealed again after a restore")
 
 
-def _reseal_cancels(engine, st, requests: List[int]) -> None:
-    """The lost cancels sealed again by the host, one per transaction, under the key in force (which may be one
-    the chain is to move off: rekey then follows), each with its change row ended in the same transaction: the
-    restored database shows it waiting again, and a row left waiting would be offered for a cancel the chain
-    no longer accepts."""
+def held_key_in_force(w, view, what: str = "the restored chain") -> Optional[keys.ChainKey]:
+    """The key a host seal on ``view`` is written under: the key in force there, held by this process, with the
+    newest seal verifying under it. None for a chain with no seal yet (its first seal is under the current key).
+    Refused otherwise, with nothing written: a seal under any other key would break the chain's key sequence
+    for good (the server, rekey and every other host command then stop on it). The chain is moved to the
+    current key first, with the key it is under (audit rekey --old-key-file)."""
+    ai = _ai()
+    if not view.position:
+        return None
+    kid = view.key_in_force()
+    k = w.st.keys_held().get(kid)
+    if k is None:
+        raise Refused(f"{what} is under {kid}, a key the server does not hold (the current key is "
+                      f"{w.st.current_key().key_id}): a seal written now would break the chain's key sequence for "
+                      "good. Move the chain to the current key first, with the key it is under: dockvault.py audit "
+                      "rekey --old-key-file <a file holding it> (after a restore of a backup taken during a change "
+                      "of AUDIT_CHAIN_KEY, the file the restore put back beside .env). Then run this again. Nothing "
+                      "was written.")
+    newest = ai.read_seal(w.db, view.position)
+    if newest is None or not ai._mac_ok(k.key, view.link_at(view.position), newest.mac):
+        raise Refused(f"the newest seal of {what} ({view.position}) does not verify under {kid}, the key in force "
+                      "there (key-unverified): nothing is accepted over a chain that cannot be authenticated "
+                      "(dockvault.py audit verify says what changed). Nothing was written.")
+    return k
+
+
+def _reseal_cancels(engine, st, requests: List[int], key: Optional[keys.ChainKey] = None) -> None:
+    """The lost cancels sealed again by the host, one per transaction, under the key the restore seal was
+    written under (``key``: the key in force, held or given, which may be one the chain is to move off: rekey
+    then follows), each with its change row ended in the same transaction: the restored database shows it
+    waiting again, and a row left waiting would be offered for a cancel the chain no longer accepts. Never under
+    the current key in place of the key in force."""
     from app.core import setting_changes
     from app.core.credential_changes import HOST_OPERATOR
     from app.core.models import ManagedSettingChange as Change
@@ -641,9 +672,14 @@ def _reseal_cancels(engine, st, requests: List[int]) -> None:
             if r not in w.st.view.pending_requests():
                 continue
             d = w.st.view.requests.get(r) or {}
-            key = w.st.keys_held().get(w.st.view.key_in_force())
+            kid = w.st.view.key_in_force()
+            k = key if key is not None and key.key_id == kid else w.st.keys_held().get(kid)
+            if k is None:
+                raise Refused(f"the lost cancel of request {r} was not sealed again: the chain is under {kid}, a key "
+                              "this command does not hold, so the request waits again. Once the chain is under the "
+                              "current key (audit rekey), cancel it again in the panel")
             w.append("cancel", detail={"cancels": r, "request": d.get("request"), "audit_row": None, "by": "host",
-                                       "user_id": None}, key=key)
+                                       "user_id": None}, key=k)
             change = w.db.get(Change, fmt.as_uuid(d.get("request"))) if d.get("request") else None
             if change is not None and change.status == setting_changes.PENDING:
                 setting_changes._end(change, setting_changes.CANCELLED, by_id=None, by_name=HOST_OPERATOR,
@@ -725,6 +761,10 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
             raise Refused(f"the restore mark cannot be read ({mark['unreadable']}): remove it by hand once you have "
                           "checked the restore")
         view, record = w.st.view, w.record or {}
+        # The restore seal goes under the key the restored chain is under, which the server must hold (a backup
+        # taken during an unfinished change of AUDIT_CHAIN_KEY: the chain is under the old key, .env holds the new
+        # one): refused in both phases until rekey has moved the chain.
+        key = held_key_in_force(w, view)
         replaced = mark.get("record") or None
         try:
             mark_at = fmt.parse_time_text(mark.get("at"))
@@ -796,7 +836,6 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
                             "deleted_through_seq": None},
                   "lost": {"policy": lost["policy"], "cancels": lost["cancels"], "erases": lost["erases"]},
                   "by": "host"}
-        key = w.st.keys_held().get(view.key_in_force())
         carried = [dict(e, generation=new_generation) for e in record.get("after_record") or []
                    if e.get("generation") == view.generation and int(e.get("seq") or 0) in kept]
         seal = w.append("restore", detail=lambda seq, at: {**detail, "grace_until": fmt.time_text(
@@ -831,7 +870,7 @@ def accept_restore(engine, st, *, reseal: bool = True, expect: Optional[str] = N
     except OSError as exc:
         unsure = exc
     if cancels:
-        _reseal_cancels(engine, st, cancels)
+        _reseal_cancels(engine, st, cancels, key)
     if unsure is not None:
         # The restore seal is written and the lost cancels sealed again; the mark may still be on the disk, which
         # keeps the pruner from deleting, erasing or rewriting anything until it is gone.

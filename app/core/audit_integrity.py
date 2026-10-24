@@ -338,11 +338,39 @@ class ChainState:
         except Exception:  # noqa: BLE001 -- a path that cannot be looked at holds no mark
             return None
 
+    def unheld_key_in_force(self, key_id: Optional[str] = None) -> Optional[str]:
+        """The key the chain is under (``key_id``, when the caller read it from the seals) when this process does
+        not hold it, or None: after a restore of a backup taken during an unfinished change of AUDIT_CHAIN_KEY, the
+        restored chain is under the old key and .env holds the new one. Read from the view once this process has
+        read the chain, else from the head record."""
+        kid = key_id or self.view.key_in_force()
+        try:
+            if not kid:
+                record = self.head_store().memory
+                if record is None:
+                    record = self.head_store().load()
+                kid = (record or {}).get("key_id")
+            if not kid:
+                return None
+            return None if kid in self.keys_held() else kid
+        except Exception:  # noqa: BLE001 -- a record that cannot be read, or a key that cannot be derived, is
+            return None     # reported where it is read; accept-restore itself then says what it needs
+
+    def restore_step(self, key_id: Optional[str] = None) -> str:
+        """What the host operator runs to finish a restore of a backup: accept-restore, after rekey while the
+        restored chain is under a key this process does not hold (accept-restore refuses until then)."""
+        kid = self.unheld_key_in_force(key_id)
+        if kid:
+            return (f"move the restored chain, which is under {kid}, a key the server does not hold, to the current "
+                    "key with dockvault.py audit rekey --old-key-file (the file holding that key), then run "
+                    "dockvault.py audit accept-restore")
+        return "run dockvault.py audit accept-restore"
+
     def holds_deletion(self) -> Optional[str]:
         """Why the pruner may delete, erase or rewrite nothing now, or None: a restore of a whole backup not
         finished (its mark), or the grace after a restore still running."""
         if self.restore_mark() is not None:
-            return "a restore is not finished: run dockvault.py audit accept-restore"
+            return "a restore is not finished: " + self.restore_step()
         if self.view.position:
             from app.core import audit_chain_honour as honour
             until = honour.grace_until(self.view, self.known_record(), self.clock())
@@ -1855,8 +1883,8 @@ def status(st: Optional[ChainState] = None) -> dict:
     mark = st.restore_mark()
     if mark is not None:
         out["warnings"]["restore-pending"] = {
-            "message": "a restore of a backup is not finished: nothing is deleted until the host operator runs "
-                       "dockvault.py audit accept-restore", "first_seen": mark.get("at")}
+            "message": "a restore of a backup is not finished, and nothing is deleted until the host operator "
+                       "finishes it: " + st.restore_step(), "first_seen": mark.get("at")}
     if out["failures"]:
         out["outcome"] = "failed"
     if st.stopped is not None:
