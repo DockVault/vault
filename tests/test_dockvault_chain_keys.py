@@ -8,6 +8,8 @@
 - the key change writes the new key, recreates the stack and moves the chain with the old key on standard
   input, keeping the old key aside (mode 600) until the move is done; while that kept file is there, a new key
   change is refused and the kept file is never written over;
+- a key change, an update and every line written into .env are refused while .env is sealed: no .env is ever
+  made beside a .env.enc;
 - the split layout's SFTP container never gets the chain's key and mounts the keys volume read-only; the web
   server writes the SSH host key it needs.
 
@@ -348,3 +350,82 @@ def test_the_web_server_writes_the_sftp_host_key_when_there_is_none(tmp_path):
     assert ensure_host_key(path) is False and path.read_bytes() == before
     source = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
     assert "ensure_host_key(settings.sftp_host_key_path)" in source
+
+
+# --------------------------------------------------------------------------- a sealed .env
+
+def _lock_args(**kw):
+    base = dict(passphrase_file=None, passphrase_stdin=False, hint=None, recovery_out=None, recovery_key=False,
+                recovery_key_file=None, show_recovery_key=False, force=False, lock=False, new_passphrase_file=None,
+                new_passphrase_stdin=False)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_a_key_change_on_a_locked_env_is_refused_with_nothing_written(tmp_path, monkeypatch, capsys):
+    """A deployment whose .env is sealed into .env.enc has no plaintext .env: a key change would write a .env holding
+    only the new key, and a lock after it would seal that over the real one. It is refused before anything."""
+    (tmp_path / ".env.enc").write_text("sealed", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, **k: pytest.fail("the chain was asked to move"))
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: pytest.fail("asked before refusing"))
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key"]))
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env.enc"]
+    assert (tmp_path / ".env.enc").read_text(encoding="utf-8") == "sealed"
+    out = capsys.readouterr().out
+    assert "locked" in out and "dockvault.py unlock" in out and "Nothing changed" in out
+
+
+def test_a_key_change_with_no_env_is_refused_with_nothing_written(tmp_path, monkeypatch, capsys):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    assert list(tmp_path.iterdir()) == []
+    assert "Nothing changed" in capsys.readouterr().out
+
+
+def test_a_sealed_env_keeps_every_secret_through_a_key_change_and_a_lock(tmp_path, monkeypatch):
+    """lock, change-key (refused), lock again, unlock: .env comes back whole, the chain's key with it."""
+    pytest.importorskip("cryptography")
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _p: True)
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    passfile = tmp_path / "pass.txt"
+    passfile.write_text("correct horse battery staple\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    tool.lock(_lock_args(passphrase_file=str(passfile)))
+    assert tool._is_locked()
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: pytest.fail("the stack was recreated"))
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    assert not (tmp_path / ".env").exists() and tool._is_locked()
+    tool.lock(_lock_args(passphrase_file=str(passfile)))
+    tool.unlock(_lock_args(passphrase_file=str(passfile)))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == text
+    assert dv.parse_env(text)["ENCRYPTION_KEY"] == env["ENCRYPTION_KEY"]
+
+
+def test_no_line_is_ever_written_into_a_new_env_beside_a_sealed_one(tmp_path, monkeypatch, capsys):
+    """Every command that writes a line into .env goes through _set_env_key: beside a .env.enc and no .env it
+    refuses, rather than make a .env holding that line alone."""
+    (tmp_path / ".env.enc").write_text("sealed", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    with pytest.raises(SystemExit):
+        tool._set_env_key(tool._env_path(), "DOCKVAULT_IMAGE", "ghcr.io/dockvault/vault:v1.0.0")
+    assert not (tmp_path / ".env").exists()
+    assert "locked" in capsys.readouterr().out
+
+
+def test_an_update_on_a_locked_env_is_refused_and_the_chain_key_is_never_written_beside_it(tmp_path, monkeypatch):
+    (tmp_path / ".env.enc").write_text("sealed", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: pytest.fail("update went on"))
+    with pytest.raises(SystemExit):
+        tool.update(argparse.Namespace(tag="v0.34.0", non_interactive=True, yes=True))
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: pytest.fail("asked before refusing"))
+    with pytest.raises(SystemExit):
+        tool._offer_chain_key(argparse.Namespace(no_chain_key=False), True, "0.34.0")
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env.enc"]

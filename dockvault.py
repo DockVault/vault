@@ -4280,7 +4280,11 @@ class DockVault:
 
     def _set_env_key(self, path, key, value):
         """Replace/append KEY=value in .env (bare value), preserving perms. A byte order mark at the start is
-        read past (without_bom) and not written back."""
+        read past (without_bom) and not written back. Never makes a .env beside a sealed .env.enc (that .env would
+        hold only this line, and a later lock would seal it over the real one): refused, with nothing written."""
+        if not os.path.exists(path) and os.path.exists(path + ".enc"):
+            self._fail("%s is locked (sealed in %s.enc): unlock it first (python dockvault.py unlock). Nothing was "
+                       "written." % (os.path.basename(path), os.path.basename(path)))
         lines, found = [], False
         if os.path.exists(path):
             for raw in without_bom(open(path, encoding="utf-8").read()).splitlines():
@@ -5731,8 +5735,12 @@ class DockVault:
         """Update menu: show the current version, list releases newest-first (fail-closed to a manual
         tag), pick one to upgrade OR downgrade to, WARN about the no-down-migration schema risk +
         recommend a Backup first, then either set DOCKVAULT_IMAGE + pull (default) or git-checkout +
-        build (--source), recreate, and health-wait."""
+        build (--source), recreate, and health-wait. Refused while .env is sealed by `lock`: an update writes .env,
+        and a .env written then would hold only what it writes."""
         pal = self.pal
+        if self._is_locked():
+            self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run "
+                       "update again. Nothing changed.")
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
@@ -6067,6 +6075,9 @@ class DockVault:
             print(pal.paint("  AUDIT_CHAIN_KEY left unset: the audit log's chain key is derived from "
                             "ENCRYPTION_KEY (the status shows key-shared).", "yellow"))
             return
+        if self._is_locked() or not os.path.exists(self._env_path()):
+            self._fail("there is no plaintext .env to write AUDIT_CHAIN_KEY into (unlock it first: python "
+                       "dockvault.py unlock). Nothing changed.")
         if interactive and not confirm("Give the audit log's integrity chain a key of its own (AUDIT_CHAIN_KEY, "
                                        "recommended)?", pal, default=True):
             print(pal.paint("  Left unset: the chain's key is derived from ENCRYPTION_KEY.", "yellow"))
@@ -6602,8 +6613,17 @@ class DockVault:
 
         While that kept file is there, an earlier change is not finished: the chain may still be under the key it
         holds, which is then in no other file. A new change is refused, naming the command that finishes the
-        earlier one, and the kept file is never written over."""
+        earlier one, and the kept file is never written over.
+
+        Refused, with nothing written, while .env is sealed by `lock` (it holds every secret: a .env written now
+        would hold only the new key, and a lock after it would seal that over the real one) or is not there."""
         pal = self.pal
+        if self._is_locked():
+            self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run "
+                       "audit change-key again. Nothing changed.")
+        if not os.path.exists(self._env_path()):
+            self._fail("there is no .env in %s: run audit change-key where the deployment's .env is. Nothing "
+                       "changed." % self.root)
         kept_path = os.path.join(self.root, ".audit-chain-key.previous")
         if os.path.lexists(kept_path):
             self._unfinished_key_change(kept_path)

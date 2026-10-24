@@ -320,6 +320,8 @@ recovery key (the recovery key itself stays the same).
 
 `lock` asks for an **unlock passphrase** and shows a one-time **credential recovery key** (save it in a
 password manager — it opens `.env` if you forget the passphrase). `start` will offer to unlock inline.
+Every command that writes `.env` (`update`, `audit change-key`, `audit retention --set` and the other
+settings) refuses while it is sealed, with nothing written: unlock it first.
 Requires the `cryptography` package (`pip install cryptography`).
 
 **What this protects — and what it does not.** Sealing guards `.env` only while it is **locked/off**
