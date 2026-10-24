@@ -231,7 +231,14 @@
         card.appendChild(vaults);
         const opened = el('div', 'my-access-opened');
         opened.appendChild(el('div', 'text-tertiary text-sm', 'Files opened'));
-        if (!(c.opened || []).length) {
+        // Past the case's records' time its audit rows follow the audit log's retention: the list may be short.
+        const recordEnded = c.opened_kept_until && !c.hold_only;
+        if (recordEnded) {
+            opened.appendChild(el('div', 'my-access-opened-ended text-sm',
+                'The record of each file opened was kept until ' + when(c.opened_kept_until)
+                + '; since then it follows the audit log\'s retention, so this list may not be complete.'));
+        }
+        if (!(c.opened || []).length && !recordEnded) {
             opened.appendChild(el('div', 'text-sm', c.hold_only ? 'A legal hold opens nothing.' : 'None so far.'));
         }
         const askedUnlock = new Set();

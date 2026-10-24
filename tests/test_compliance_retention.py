@@ -224,6 +224,30 @@ def test_a_closed_cases_rows_stay_past_its_floor_until_its_counts_are_kept_on_it
     assert _left(factory, [row]) == set()
 
 
+@pytest.mark.parametrize("state", [
+    {}, {"closed_days": 100}, {"closed_days": 2190}, {"closed_days": 2191}, {"closed_days": 2191, "counts_kept": False},
+    {"closed_days": 2191, "kept_until_days": 5}, {"closed_days": 2191, "kept_until_days": -5},
+    {"closed_days": 3000, "kept_until_days": -100}, {"closed_days": 2191, "hold": "standing"},
+    {"closed_days": 2191, "hold": "released"}, {"closed_days": 2191, "hold": "lapsed"}])
+def test_when_a_cases_rows_stopped_being_kept_is_read_as_the_rule_keeps_them(env, factory, state):
+    """The owner's page says when a case's record of the files opened stopped being kept
+    (case_rows_released_since): exactly when the rule the pruner and the archive read lets its rows go."""
+    state = dict(state)
+    hold = state.pop("hold", None)
+    db = factory()
+    case_id = _case(db, **state)
+    if hold:
+        _hold(db, case_id, released=hold == "released", lapsed=hold == "lapsed")
+    row = _row(db, 3500, case_id=case_id)
+    kept = db.query(AuditLog.id).filter(AuditLog.id == row, cr.case_rows_kept(AuditLog, NOW)).first() is not None
+    case = db.get(ComplianceCase, case_id)
+    since = cr.case_rows_released_since(db, case, NOW)
+    assert (since is None) == kept, (state, hold, since)
+    if since is not None:
+        floor = case.closed_at + timedelta(days=2190)
+        assert since == max(floor, case.records_kept_until or floor) < NOW
+
+
 def test_the_floor_is_read_from_the_settings(env, factory):
     db = factory()
     case = _case(db, closed_days=500)

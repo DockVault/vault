@@ -146,6 +146,7 @@ def _exports(db, case) -> int:
 
 def case_for_owner(db, case, rows, *, unlocked: set, now: datetime, owner_id) -> dict:
     from app.core import cases as case_steps
+    from app.core import compliance_retention
     from app.core import legal_holds
     from app.core.security import is_case_sealed, open_case_field
     standing = {h.vault_id for h in legal_holds.standing(db, case.id)}
@@ -175,6 +176,9 @@ def case_for_owner(db, case, rows, *, unlocked: set, now: datetime, owner_id) ->
         "can_export": bool(case.can_export), "password_override": bool(case.password_override),
         "note": note, "vaults": vaults, "exports": _exports(db, case),
         "opened": opened(db, case, [r.vault_id for r in rows], unlocked=unlocked, owner_id=owner_id),
+        # Once the case's records are no longer kept, its audit rows follow the audit log's retention: the files
+        # opened are listed from those rows, so the list may no longer be whole (compliance.js says so).
+        "opened_kept_until": _iso(compliance_retention.case_rows_released_since(db, case, now)),
     }
 
 

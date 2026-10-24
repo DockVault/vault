@@ -407,6 +407,36 @@ def test_a_vault_no_longer_the_owners_shows_them_no_file_name(db, people):
     assert oa.page(db, people.otto)["cases"] == [], "the new owner was never told of this case"
 
 
+def test_the_page_says_when_a_cases_record_of_the_files_opened_stopped_being_kept(db, people):
+    """Past the case's records' time its audit rows follow the audit log's retention, so the list of files opened is
+    read from rows that may be gone: the page gives the time the record stopped being kept, and none before."""
+    from app.core import compliance_retention as kept
+    case = _case(db, people, [people.v1], hold=False)                 # a hold that stands would keep its rows
+    _viewed(db, case, people.v1, _file(db, people.v1, "plain.txt").id)
+    (seen,) = oa.page(db, people.olga)["cases"]
+    assert seen["opened_kept_until"] is None and len(seen["opened"]) == 1
+    now = rights.utcnow()
+    floor = kept.floor_days()
+    case.status, case.closed_at, case.records_kept_until = "closed", now - timedelta(days=floor + 10), None
+    case.counts_kept_at = now - timedelta(days=floor - 20)
+    db.commit()
+    (seen,) = oa.page(db, people.olga, now=now)["cases"]
+    assert seen["opened_kept_until"] == oa._iso(case.closed_at + timedelta(days=floor))
+    case.records_kept_until = now + timedelta(days=1)                  # its own floor has not passed
+    db.commit()
+    (seen,) = oa.page(db, people.olga, now=now)["cases"]
+    assert seen["opened_kept_until"] is None
+
+
+def test_the_page_says_the_list_of_files_opened_may_not_be_complete_past_the_records_time():
+    js = _js("compliance.js")
+    start = js.index("const opened = el('div', 'my-access-opened');")
+    body = js[start:js.index("const askedUnlock", start)]
+    assert "c.opened_kept_until && !c.hold_only" in body and "may not be complete" in body
+    assert body.index("may not be complete") < body.index("'None so far.'")
+    assert "!(c.opened || []).length && !recordEnded" in body
+
+
 # --------------------------------------------------------------------------- names revealed outside a case
 
 def _revealed(db, vault, *, by="uma", category="security_incident", at=None, text="sealed-reason-text"):

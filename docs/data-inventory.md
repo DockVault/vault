@@ -121,7 +121,9 @@ pruner keeps a case's audit rows while the case is open or a hold stands, and fo
 `COMPLIANCE_RECORD_MIN_DAYS` (2190 by default) after it closes; rows of the compliance category are kept
 that long after they were written. 30 days after a case closes, the counts of the files opened and the exports
 under it are kept on the case (`compliance_cases`), and read from there once its rows are archived or deleted;
-its rows are kept until then whatever the floor.
+its rows are kept until then whatever the floor. The owner's "Access to my vaults" page lists each file opened
+from those rows: once they are no longer kept, it says until when they were, as the list may no longer be
+complete.
 
 | Table | Personal data | Purpose | Kept for | Erased by |
 |---|---|---|---|---|

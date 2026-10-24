@@ -57,6 +57,25 @@ def case_rows_kept(model, now: datetime):
     return and_(model.case_id.isnot(None), or_(not_(released), holding))
 
 
+def case_rows_released_since(db, case, now: datetime) -> Optional[datetime]:
+    """When ``case``'s audit rows stopped being kept (case_rows_kept, read for one case): the later of
+    COMPLIANCE_RECORD_MIN_DAYS after its close and its own ``records_kept_until``, once both have passed, its counts
+    are kept on it and no legal hold of it stands; None while they are kept. From then they follow the audit log's
+    retention (archived, or pruned), so a list read from them may no longer be whole."""
+    from app.core.models import LegalHoldVault
+    if case.closed_at is None or case.counts_kept_at is None:
+        return None
+    since = case.closed_at + timedelta(days=floor_days())
+    if case.records_kept_until is not None and case.records_kept_until > since:
+        since = case.records_kept_until
+    if since >= now:
+        return None
+    holding = (db.query(LegalHoldVault.vault_id)
+               .filter(LegalHoldVault.case_id == case.id, LegalHoldVault.released_at.is_(None),
+                       LegalHoldVault.lapsed_at.is_(None)).first())
+    return None if holding is not None else since
+
+
 def compliance_rows_kept(model, now: datetime):
     """The rows of ``model`` (audit_logs) of the compliance category younger than the floor."""
     from app.core import audit_catalog

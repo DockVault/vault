@@ -6,7 +6,11 @@ access to their vaults is unread; its link opens the page with the case; "I've r
 A member who opens the vault sees a neutral banner that names no case number, purpose, auditor or person
 concerned. On a phone (390 px) the page fits the screen without scrolling sideways. A name revealed from the
 owner's vault outside a case is listed with who revealed it, when and why (the category), never the reason's text.
+Past a case's records' time the page says its list of files opened may not be complete.
 """
+import json
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -139,3 +143,28 @@ def test_the_page_lists_a_name_revealed_from_the_owners_vault(page: Page, world)
         assert errors == []
     finally:
         psql(f"DELETE FROM compliance_reveals WHERE id = '{reveal}'")
+
+
+def test_a_case_past_its_records_time_says_its_list_of_files_opened_may_not_be_complete(page: Page, world):
+    """While a case's records are kept, an empty list of files opened says none were; past their time the case's
+    audit rows follow the audit log's retention, and the page says the list may not be complete instead."""
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+
+    def past_its_time(route):
+        response = route.fetch()
+        data = response.json()
+        for case in data.get("cases", []):
+            if case["id"] == world["case"]["id"]:
+                case["opened"], case["opened_kept_until"] = [], "2025-01-02T03:04:05Z"
+        route.fulfill(response=response, body=json.dumps(data))
+    _login(page, world["olga"])
+    page.evaluate("() => window.openMyAccess()")
+    opened = page.locator(f'#my-access-modal .my-access-case[data-case-id="{world["case"]["id"]}"] .my-access-opened')
+    expect(opened).to_contain_text("None so far.", timeout=15000)
+    expect(opened.locator(".my-access-opened-ended")).to_have_count(0)
+    page.route(re.compile(r".*/me/compliance-access$"), past_its_time)
+    page.evaluate("() => window.openMyAccess()")
+    expect(opened.locator(".my-access-opened-ended")).to_contain_text("may not be complete", timeout=15000)
+    expect(opened).not_to_contain_text("None so far.")
+    assert errors == []
