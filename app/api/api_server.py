@@ -11676,6 +11676,15 @@ async def delete_user(
             detail="Cannot delete your own account"
         )
 
+    # The person a held case is about (its custodian) keeps their account while the hold keeps anything of the
+    # case's vaults (app/core/hold_refusals.py): 409, recorded under the case. Asked in the turn of holds and
+    # deletions, before any vault row is locked below, the order a placing takes them in.
+    from app.core import hold_refusals
+    keeping = hold_refusals.custodian_keeping(db, user.id)
+    if keeping is not None:
+        hold_refusals.record(db, current_user, hold_refusals.ACCOUNT, keeping, target=user)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=hold_refusals.account_text(keeping))
+
     # Their zero-knowledge key rows go with the account, so the vaults whose current key they were given
     # record, before the delete and in its transaction, that they owe a rotation. This locks those vault
     # rows, and comes before the last-administrator check, which locks every administrator's row: vault

@@ -203,3 +203,69 @@ def test_the_lowest_epoch_in_use_counts_kept_rows_on_postgres(admin):
     finally:
         _forget([], [vid])
         admin.delete_vault(vid)
+
+
+CASE_TEXT = {"purpose": "internal_investigation", "legal_basis": "legal_obligation",
+             "justification": "Suspected exfiltration of client records, ticket SEC-2041.",
+             "owner_note": "Your vault is part of an internal review; nothing is changed in it."}
+
+
+def test_a_custodians_account_is_kept_while_the_cases_hold_stands(admin):
+    from _account_change_helpers import in_api_container
+    from _auditor_helpers import forget_grants, grant_right, new_auditor_account
+    from _owner_notice_helpers import owner_with_vault
+    with two_admins(admin) as admins:
+        uma, uma_c, codes = new_auditor_account(admin)
+        grant_right(admins, uma["id"])
+        olga, olga_c, vid = owner_with_vault(admin)
+        otto = admin.create_user(username=unique("otto"))       # the custodian; owns no vault
+        cid = None
+        try:
+            r = uma_c.post("/compliance/cases", json={
+                "scope": [{"kind": "vault", "target_id": vid}, {"kind": "custodian", "target_id": otto["id"]}],
+                "hold": True, **CASE_TEXT},
+                headers=compliance_receipt(uma_c, "compliance.case.request", uma["_password"], codes))
+            assert r.status_code == 201, r.text
+            cid = r.json()["id"]
+            bob, bob_c, bob_codes = admins["bob"]
+            headers = compliance_receipt(bob_c, "compliance.case.approve", bob["_password"], bob_codes)
+            headers["If-Match"] = '"1"'
+            r = bob_c.post(f"/compliance/cases/{cid}/approve", headers=headers)
+            assert r.status_code == 200, r.text
+            number = r.json()["number"]
+            assert psql(f"SELECT why FROM compliance_case_people WHERE case_id = '{cid}' "
+                        f"AND user_id = '{otto['id']}'") == "custodian"
+
+            # The custodian's account is kept: 409 naming the case, recorded under it, the account as it was.
+            r = admin.delete_user(otto["id"])
+            assert r.status_code == 409, r.text
+            assert f"custodian of case {number}" in r.json()["detail"]
+            assert psql(f"SELECT count(*) FROM users WHERE id = '{otto['id']}'") == "1"
+            assert _blocked(cid, "account") == "1"
+            assert psql(f"SELECT details ->> 'target_user_id' FROM audit_logs WHERE action = 'hold_blocked_delete' "
+                        f"AND case_id = '{cid}'") == otto["id"]
+            # The owner of the held vault is no custodian: her account is refused for the vault she owns, not
+            # by the hold.
+            r = admin.delete_user(olga["id"])
+            assert r.status_code == 409 and "owns 1 vault" in r.json()["detail"], r.text
+            assert _blocked(cid, "account") == "1"
+
+            # The auditor closes the case: the hold is released, having kept nothing, and the account goes.
+            r = uma_c.post(f"/compliance/cases/{cid}/close", json={"reason": "Concluded, nothing found."},
+                           headers=compliance_receipt(uma_c, "compliance.hold.decide", uma["_password"], codes))
+            assert r.status_code == 200 and r.json()["status"] == "closed", r.text
+            r = admin.delete_user(otto["id"])
+            assert r.status_code == 200, r.text
+            assert psql(f"SELECT count(*) FROM users WHERE id = '{otto['id']}'") == "0"
+        finally:
+            if cid:
+                psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE case_id = '{cid}' "
+                     "AND released_at IS NULL")
+                for table in ("held_files", "held_folders", "held_name_history"):
+                    psql(f"DELETE FROM {table} WHERE vault_id = '{vid}'")
+                psql(f"DELETE FROM compliance_cases WHERE id = '{cid}'")
+                in_api_container("from app.core import legal_hold_marker\nlegal_hold_marker.check_at_start()\n")
+            forget_grants(uma["id"])
+            olga_c.delete_vault(vid)
+            for person in (otto, olga, uma):
+                admin.delete_user(person["id"])

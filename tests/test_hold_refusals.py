@@ -409,3 +409,120 @@ def test_only_this_vaults_kept_rows_count(world):
 def test_a_database_without_the_kept_tables_counts_none(monkeypatch):
     """A stand-in session (no database behind it) reads no kept rows rather than failing."""
     assert kept_tables.kept_epochs(SimpleNamespace(), uuid.uuid4()) == ([], [])
+
+
+# --------------------------------------------------------------------------- a custodian's account
+
+def _custodian_case(db, auditor, number, person, *, how="person"):
+    """A case about ``person``: among the people it concerns as its custodian, or in its scope as one."""
+    case = _case(db, auditor, number)
+    if how == "person":
+        db.add(m.ComplianceCasePerson(case_id=case.id, user_id=person.id, why="custodian"))
+    else:
+        db.add(m.ComplianceCaseScope(case_id=case.id, kind="custodian", target_id=person.id))
+    db.commit()
+    return case
+
+
+@pytest.mark.parametrize("how", ["person", "scope"])
+def test_the_custodian_of_a_case_whose_hold_stands_is_kept(world, how):
+    otto = _user(world.db, "otto")
+    case = _custodian_case(world.db, world.ada, "C-2026-0013", otto, how=how)
+    assert hr.custodian_keeping(world.db, otto.id) is None, "no hold yet"
+    _hold(world.db, case, world.vault)
+    keeping = hr.custodian_keeping(world.db, otto.id)
+    assert keeping.standing == [(case.id, "C-2026-0013")] and keeping.waiting == []
+    text = hr.account_text(keeping)
+    assert "custodian of case C-2026-0013" in text and "cannot be deleted until the hold ends" in text
+
+
+def test_a_released_hold_keeps_its_custodian_while_what_it_kept_waits_for_its_purge(world):
+    otto = _user(world.db, "otto")
+    case = _custodian_case(world.db, world.ada, "C-2026-0014", otto)
+    purge = NOW + timedelta(days=6)
+    _hold(world.db, case, world.vault, released=NOW, purge_after=purge)
+    assert hr.custodian_keeping(world.db, otto.id) is None, "it kept nothing"
+    _kept_file(world.db, world.vault)
+    keeping = hr.custodian_keeping(world.db, otto.id)
+    assert keeping.standing == [] and keeping.waiting == [(case.id, "C-2026-0014")] and keeping.purge_after == purge
+    assert f"cannot be deleted until they are purged after {purge:%Y-%m-%d}" in hr.account_text(keeping)
+
+
+def test_an_owner_or_someone_named_is_not_kept_as_a_custodian_is(world):
+    otto = _user(world.db, "otto")
+    case = _case(world.db, world.ada, "C-2026-0015")
+    world.db.add(m.ComplianceCasePerson(case_id=case.id, user_id=world.olga.id, why="owner"))
+    world.db.add(m.ComplianceCasePerson(case_id=case.id, user_id=otto.id, why="named"))
+    world.db.add(m.ComplianceCaseScope(case_id=case.id, kind="vault", target_id=world.vault.id))
+    world.db.commit()
+    _hold(world.db, case, world.vault)
+    assert hr.custodian_keeping(world.db, world.olga.id) is None
+    assert hr.custodian_keeping(world.db, otto.id) is None
+
+
+def test_another_cases_hold_on_the_vault_does_not_keep_a_custodian_whose_own_hold_ended(world):
+    otto = _user(world.db, "otto")
+    own = _custodian_case(world.db, world.ada, "C-2026-0016", otto)
+    _hold(world.db, own, world.vault, released=NOW, purge_after=NOW - timedelta(days=1))
+    _hold(world.db, _case(world.db, world.ada, "C-2026-0017"), world.vault)
+    assert hr.custodian_keeping(world.db, otto.id) is None
+
+
+def test_on_postgres_the_check_takes_the_turn_of_holds_and_deletions_shared_first(world, monkeypatch):
+    """A hold an approval commits before the check is seen, and one placed meanwhile waits for the deleting
+    transaction: the check takes the turn before it reads anything."""
+    from app.core import legal_holds
+    otto = _user(world.db, "otto")
+    case = _custodian_case(world.db, world.ada, "C-2026-0020", otto)
+    _hold(world.db, case, world.vault)
+    seen = []
+    real_query = world.db.query
+
+    def query(*a, **k):
+        seen.append("read")
+        return real_query(*a, **k)
+    monkeypatch.setattr(world.db, "query", query)
+    monkeypatch.setattr(hr, "_dialect", lambda db: "postgresql")
+    monkeypatch.setattr(legal_holds, "take_turn", lambda db, *, shared: seen.append(("turn", shared)))
+    assert hr.custodian_keeping(world.db, otto.id) is not None
+    assert seen[0] == ("turn", True) and seen.count(("turn", True)) == 1
+
+
+DELETE_USER = inspect.unwrap(S.delete_user)
+
+
+def _delete_user(world, target):
+    return run_coroutine(DELETE_USER(user_id=target.id, current_user=world.ada, db=world.db, request=None))
+
+
+def test_deleting_a_custodians_account_is_refused_with_409_and_recorded(world):
+    otto = _user(world.db, "otto")
+    case = _custodian_case(world.db, world.ada, "C-2026-0018", otto)
+    _hold(world.db, case, world.vault)
+    with pytest.raises(HTTPException) as refused:
+        _delete_user(world, otto)
+    assert refused.value.status_code == 409 and "custodian of case C-2026-0018" in refused.value.detail
+    assert world.db.get(m.User, otto.id) is not None
+    (row,) = _blocked(world.db)
+    assert row.case_id == case.id and row.user_id == world.ada.id and row.status == "failure"
+    assert (row.resource_type, row.resource_id) == ("user", str(otto.id))
+    assert row.details["kind"] == "account" and row.details["target_user_id"] == str(otto.id)
+    assert row.details["target_username"] == "otto" and row.details["case_number"] == "C-2026-0018"
+
+
+def test_a_custodians_account_is_deleted_once_nothing_of_the_case_is_kept(world, monkeypatch):
+    """The control: the same call once the hold ended and kept nothing reaches the delete."""
+    monkeypatch.setattr(S, "get_client_ip", lambda request: "10.0.0.9")
+    otto = _user(world.db, "otto")
+    oid = otto.id
+    case = _custodian_case(world.db, world.ada, "C-2026-0019", otto)
+    _hold(world.db, case, world.vault, released=NOW, purge_after=NOW - timedelta(days=1))
+    out = _delete_user(world, otto)
+    assert "deleted" in out["message"] and world.db.get(m.User, oid) is None and _blocked(world.db) == []
+
+
+def test_the_delete_asks_before_it_locks_any_vault_row():
+    source = inspect.getsource(S.delete_user)
+    asked = source.index("hold_refusals.custodian_keeping(db, user.id)")
+    assert source.index("Cannot delete your own account") < asked
+    assert asked < source.index("record_rotations_owed_by(db, user.id)") < source.index("db.delete(user)")

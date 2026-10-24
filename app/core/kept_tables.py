@@ -440,6 +440,17 @@ def vault_keeps(db, vault_id) -> bool:
         db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid)))
 
 
+def has_kept_rows(db, vault_id) -> bool:
+    """Whether files or folders a hold kept of ``vault_id`` still wait for their purge (whether or not a hold
+    stands on it now)."""
+    from app.core.models import HeldFile, HeldFolder
+    if not _readable(db):
+        return False
+    vid = uuid.UUID(str(vault_id))
+    return any(q.first() is not None for q in (db.query(HeldFile.id).filter(HeldFile.vault_id == vid),
+                                               db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid)))
+
+
 def kept_epochs(db, vault_id) -> tuple:
     """(the encryption metadata of each kept file, the name epoch of each kept folder) of ``vault_id``: what they
     were sealed under. A zero-knowledge vault's lowest epoch in use counts them (ecc_router._lowest_epoch_in_use), so
