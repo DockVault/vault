@@ -4,9 +4,11 @@ Stored bytes reach the disk before a row or an answer says they exist (app/core/
 writer of stored bytes syncs the file, its name in its directory, and each directory it makes, before
 the commit. That holds only while no writer is added that skips it, so this lists every call in app/
 that writes a file -- an open for writing (open, io.FileIO, the gzip, bz2, lzma and tar files, a file
-database), write_bytes and write_text, a rename or a replace into place, a shutil copy or move, a
-temporary file that is kept, a log file handler, a directory made, any of them called through another
-name an assignment gives it -- by the function it is in, and requires each one to be either:
+database), write_bytes and write_text, a rename or a replace into place, a shutil copy or move, Path's
+copy and move, an archive extracted, a node made, a temporary file that is kept, a log file handler or a
+logging configuration given a file, a directory made, any of them called through another name an
+assignment gives it, named by getattr, brought in by a star import, or handed to another call to run --
+by the function it is in, and requires each one to be either:
 
 - a writer of stored bytes, synced through durable_write: the entry names the function that syncs it
   and the durable_write calls made there, and the test checks that they are; or
@@ -108,17 +110,33 @@ _WRITE_FLAGS = {"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC", "O_EXCL"
 # Functions that write, whatever their arguments.
 _WRITERS = {
     "os.rename", "os.renames", "os.replace", "os.link", "os.symlink", "os.mkdir", "os.makedirs", "os.truncate",
-    "os.mkfifo", "shutil.copy", "shutil.copy2", "shutil.copyfile", "shutil.copytree", "shutil.copyfileobj",
-    "shutil.move", "shutil.make_archive", "shutil.unpack_archive", "tempfile.mkstemp", "tempfile.mkdtemp",
-    "logging.FileHandler", "logging.handlers.RotatingFileHandler", "logging.handlers.TimedRotatingFileHandler",
-    "logging.handlers.WatchedFileHandler",
+    "os.mkfifo", "os.mknod", "shutil.copy", "shutil.copy2", "shutil.copyfile", "shutil.copytree",
+    "shutil.copyfileobj", "shutil.move", "shutil.make_archive", "shutil.unpack_archive", "tempfile.mkstemp",
+    "tempfile.mkdtemp", "logging.FileHandler", "logging.handlers.RotatingFileHandler",
+    "logging.handlers.TimedRotatingFileHandler", "logging.handlers.WatchedFileHandler",
+    # A logging configuration may make file handlers of its own.
+    "logging.config.dictConfig", "logging.config.fileConfig",
 }
-# Methods that write, on whatever object (a Path, as a rule).
-_WRITING_METHODS = {"write_bytes", "write_text", "touch", "mkdir", "symlink_to", "hardlink_to"}
+# Methods that write, on whatever object (a Path, as a rule; extract and extractall: a ZipFile's or a TarFile's).
+_WRITING_METHODS = {"write_bytes", "write_text", "touch", "mkdir", "symlink_to", "hardlink_to", "copy_into",
+                    "move_into", "extract", "extractall"}
+# Methods that write when given a target: Path.copy and Path.move (a dict's or a list's copy takes none).
+_TARGET_METHODS = {"copy", "move"}
+_NOT_TARGET_METHODS = {"copy.copy", "copy.deepcopy"}
+# Every function the scan knows to write, by its full name: what a module's star import may bring in, and what a
+# call may be handed to run.
+_KNOWN = (_OPENERS | set(_FLAGGED_OPENERS) | _WRITERS
+          | {"os.open", "sqlite3.connect", "tempfile.NamedTemporaryFile", "zipfile.ZipFile", "logging.basicConfig"})
+# Modules whose attribute named by a string the scan cannot read may be any of their writers.
+_WRITER_MODULES = {name.rsplit(".", 1)[0] for name in _KNOWN if "." in name} | {"builtins", "pathlib"}
+# Calls that run a function they are handed, by where it is among their arguments (its own arguments follow it).
+_RUNNERS = {"asyncio.to_thread": 0, "anyio.to_thread.run_sync": 0}
+_RUNNER_METHODS = {"run_in_executor": 1, "submit": 0}
 
 
 def _imports(tree) -> dict:
-    """Local name -> what it names, for the modules and functions imported anywhere in the module."""
+    """Local name -> what it names, for the modules and functions imported anywhere in the module; "*" -> the modules
+    imported whole (``from shutil import *``)."""
     names = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -127,16 +145,61 @@ def _imports(tree) -> dict:
                     names[alias.asname] = alias.name
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             for alias in node.names:
-                names[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+                if alias.name == "*":
+                    names.setdefault("*", []).append(node.module)
+                else:
+                    names[alias.asname or alias.name] = f"{node.module}.{alias.name}"
     return names
 
 
 def _qualified(func, imports) -> str:
     text = ast.unparse(func)
     head, _, rest = text.partition(".")
-    if head in imports:
+    if head in imports and head != "*":
         return imports[head] + ("." + rest if rest else "")
+    for module in imports.get("*", ()):
+        if f"{module}.{text}" in _KNOWN:
+            return f"{module}.{text}"
     return text
+
+
+def _named_attribute(call: ast.Call):
+    """``getattr(obj, "name")`` as the attribute ``obj.name``; None for any other call."""
+    if (isinstance(call.func, ast.Name) and call.func.id == "getattr" and len(call.args) >= 2
+            and isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str)):
+        return ast.Attribute(value=call.args[0], attr=call.args[1].value, ctx=ast.Load())
+    return None
+
+
+def _unknown_attribute_of_a_writer_module(call: ast.Call, imports) -> bool:
+    """``getattr(module, name)`` with a name the scan cannot read, of a module that has writers."""
+    return (isinstance(call.func, ast.Name) and call.func.id == "getattr" and len(call.args) >= 2
+            and not (isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str))
+            and _qualified(call.args[0], imports) in _WRITER_MODULES)
+
+
+def _is_writer_reference(node, imports) -> bool:
+    """A function that writes, named and not called (handed to another call to run)."""
+    if isinstance(node, ast.Call):
+        named = _named_attribute(node)
+        return named is not None and _is_writer_reference(named, imports)
+    if not isinstance(node, (ast.Name, ast.Attribute)):
+        return False
+    if _qualified(node, imports) in _KNOWN:
+        return True
+    return isinstance(node, ast.Attribute) and node.attr in _WRITING_METHODS
+
+
+def _handed(call: ast.Call, imports) -> list:
+    """The call ``call`` makes of the function it is handed, when it is a runner the scan knows (asyncio.to_thread,
+    anyio's run_sync, a pool's submit, a loop's run_in_executor), with that function's own arguments."""
+    name = _qualified(call.func, imports)
+    at = _RUNNERS.get(name)
+    if at is None and isinstance(call.func, ast.Attribute):
+        at = _RUNNER_METHODS.get(call.func.attr)
+    if at is None or len(call.args) <= at:
+        return []
+    return [ast.Call(func=call.args[at], args=list(call.args[at + 1:]), keywords=list(call.keywords))]
 
 
 def _aliases(tree) -> dict:
@@ -189,11 +252,15 @@ def _through(bound, call: ast.Call) -> ast.Call:
 
 
 def _bindings(func, imports: dict, aliases: dict) -> list:
-    """What ``func`` is bound to by an assignment the scan can follow: callables, and partials of one."""
+    """What ``func`` is bound to by an assignment the scan can follow: callables, partials of one, and the attribute
+    a getattr with a string names (``f = getattr(shutil, "copyfile")``)."""
     out = []
     for bound in aliases.get(ast.unparse(func), ()):
         if isinstance(bound, ast.Call):
-            if _qualified(bound.func, imports) in ("functools.partial", "partial") and bound.args:
+            named = _named_attribute(bound)
+            if named is not None:
+                out.append(named)
+            elif _qualified(bound.func, imports) in ("functools.partial", "partial") and bound.args:
                 out.append(bound)
         elif ast.unparse(bound) != ast.unparse(func):
             out.append(bound)
@@ -207,7 +274,20 @@ def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 
         if any(is_writer(_through(bound, call), imports, aliases, depth + 1)
                for bound in _bindings(func, imports, aliases)):
             return True
+    if isinstance(func, ast.Call) and depth < 5:
+        # A writer that a call gives, called at once: getattr(shutil, "copyfile")(p, q), partial(open, mode="w")(p).
+        named = _named_attribute(func)
+        if named is not None:
+            return is_writer(ast.Call(func=named, args=list(call.args), keywords=list(call.keywords)), imports,
+                             aliases, depth + 1)
+        if _unknown_attribute_of_a_writer_module(func, imports):
+            return True                                 # a writer module's attribute the scan cannot name
+        if _qualified(func.func, imports) in ("functools.partial", "partial") and func.args:
+            return is_writer(_through(func, call), imports, aliases, depth + 1)
+        return False
     name = _qualified(func, imports)
+    if name == "logging.basicConfig":                   # a file handler of its own, given a file name
+        return any(k.arg in ("filename", None) for k in call.keywords)
     if name == "os.open":
         return len(call.args) < 2 or _flags_write(call.args[1])
     if name in _OPENERS:
@@ -248,11 +328,26 @@ def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 
             return _writes_in_mode(mode)
         if func.attr in _WRITING_METHODS:
             return True
+        if func.attr in _TARGET_METHODS and (call.args or call.keywords) and name not in _NOT_TARGET_METHODS:
+            return True                                 # Path.copy(target), Path.move(target)
         # Path.rename(target) and Path.replace(target): one argument, where str.replace takes two and
         # datetime.replace keywords.
         if func.attr in ("rename", "replace") and len(call.args) == 1 and not call.keywords:
             return True
     return False
+
+
+def hands_a_writer(call: ast.Call, imports: dict, aliases: dict = None) -> bool:
+    """Whether ``call`` is handed a function that writes, to run: by a runner the scan knows, judged as the call the
+    runner makes (``asyncio.to_thread(open, p)`` reads); by any other call, a writer it is handed named and not
+    called counts as a write (``Thread(target=os.replace, ...)``, ``map(Path.write_text, ...)``). A partial is not
+    a run: the call made through it is judged where it is made."""
+    if _qualified(call.func, imports) in ("functools.partial", "partial"):
+        return False
+    handed = _handed(call, imports)
+    if handed:
+        return any(is_writer(h, imports, aliases) for h in handed)
+    return any(_is_writer_reference(arg, imports) for arg in list(call.args) + [k.value for k in call.keywords])
 
 
 def writers(source: str) -> dict:
@@ -267,7 +362,8 @@ def writers(source: str) -> dict:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 visit(child, scope + [child.name])
                 continue
-            if isinstance(child, ast.Call) and is_writer(child, imports, aliases):
+            if isinstance(child, ast.Call) and (is_writer(child, imports, aliases)
+                                                 or hands_a_writer(child, imports, aliases)):
                 found.setdefault(".".join(scope) or "<module>", []).append(ast.unparse(child.func))
             visit(child, scope)
 
@@ -433,15 +529,77 @@ def test_reads_through_other_openers_and_other_names_stay_reads():
 
 @pytest.mark.parametrize("form", [
     "io.FileIO(path, 'w')", "gzip.GzipFile(path, 'wb')", "bz2.BZ2File(path, 'w')", "lzma.LZMAFile(path, 'w')",
-    "o = open\n    o(path, 'w')", "Path(path).open(mode)"])
+    "o = open\n    o(path, 'w')", "Path(path).open(mode)",
+    "Path(path).copy(path + '.b')", "Path(path).move(path + '.b')", "Path(path).copy_into(mode)",
+    "Path(path).move_into(mode)", "os.mknod(path)", "zipfile.ZipFile(path).extract('a', mode)",
+    "zipfile.ZipFile(path).extractall(mode)", "tarfile.open(path).extractall(mode)",
+    "logging.basicConfig(filename=path)", "asyncio.get_event_loop().run_in_executor(None, open, path, 'w')",
+    "asyncio.to_thread(open, path, 'w')", "getattr(shutil, 'copyfile')(path, mode)",
+    "save = getattr(shutil, 'copyfile')\n    save(path, mode)"])
 def test_a_writer_of_each_such_form_added_to_the_application_is_in_no_list(form):
     rel = "app/sftp/heartbeat.py"
     source = (ROOT / rel).read_text(encoding="utf-8") + (
-        "\n\ndef added_writer(path, mode):\n    import io, gzip, bz2, lzma\n    from pathlib import Path\n"
+        "\n\ndef added_writer(path, mode):\n"
+        "    import asyncio, io, gzip, bz2, lzma, logging, os, shutil, tarfile, zipfile\n"
+        "    from pathlib import Path\n"
         f"    {form}\n")
     found = dict(_all_writers())
     found.update({(rel, scope): calls for scope, calls in writers(source).items()})
     assert (rel, "added_writer") in unclassified(found)
+
+
+def test_a_writer_a_star_import_brings_into_the_application_is_in_no_list():
+    rel = "app/sftp/heartbeat.py"
+    source = (ROOT / rel).read_text(encoding="utf-8") + (
+        "\n\nfrom shutil import *  # noqa: E402,F403\n\n\ndef added_writer(path, other):\n"
+        "    copyfile(path, other)  # noqa: F405\n")
+    found = dict(_all_writers())
+    found.update({(rel, scope): calls for scope, calls in writers(source).items()})
+    assert unclassified(found)[(rel, "added_writer")] == {"found": ["copyfile"], "listed": []}
+
+
+def test_the_scan_finds_the_forms_a_newer_python_and_a_call_handed_a_writer_write_through():
+    """Path.copy, Path.move, copy_into and move_into (Python 3.14), os.mknod, an archive extracted, a logging
+    configuration given a file; a writer handed to a runner (judged as the call it makes) or to any other call (a
+    write), one named by getattr with a string, or by a name the scan cannot read on a module that has writers, a
+    partial called at once; a writer a star import brings in."""
+    source = (
+        "import asyncio, os, shutil, logging, logging.config, threading\n"
+        "from functools import partial\n"
+        "from shutil import *\n"
+        "from os import *\n"
+        "def w(p, q, z, t, pool, loop, name):\n"
+        "    p.copy(q); p.move(q); p.copy_into(q); p.move_into(q); p.copy(target=q)\n"
+        "    os.mknod(p); z.extract('a', q); z.extractall(q); t.extractall(q)\n"
+        "    logging.basicConfig(filename=p); logging.basicConfig(**name); logging.config.dictConfig({})\n"
+        "    loop.run_in_executor(None, open, p, 'w'); asyncio.to_thread(open, p, 'a')\n"
+        "    pool.submit(shutil.copyfile, p, q)\n"
+        "    threading.Thread(target=os.replace, args=(p, q)); list(map(p.write_text, q))\n"
+        "    getattr(shutil, 'copyfile')(p, q); getattr(os, name)(p)\n"
+        "    partial(open, mode='w')(p)\n"
+        "    f = getattr(shutil, 'move')\n"
+        "    f(p, q)\n"
+        "    copyfile(p, q); open(p, 'w'); open(p, O_RDONLY)\n"
+    )
+    assert writers(source) == {"w": [
+        "p.copy", "p.move", "p.copy_into", "p.move_into", "p.copy", "os.mknod", "z.extract", "z.extractall",
+        "t.extractall", "logging.basicConfig", "logging.basicConfig", "logging.config.dictConfig",
+        "loop.run_in_executor", "asyncio.to_thread", "pool.submit", "threading.Thread", "map",
+        "getattr(shutil, 'copyfile')", "getattr(os, name)", "partial(open, mode='w')", "f", "copyfile", "open"]}
+
+
+def test_the_new_forms_that_read_or_hold_no_file_stay_alone():
+    source = (
+        "import asyncio, copy, os, shutil, logging\n"
+        "from functools import partial\n"
+        "def r(p, d, x, loop, pool, name):\n"
+        "    d.copy(); copy.copy(x); copy.deepcopy(x); x.copy()\n"
+        "    loop.run_in_executor(None, open, p); asyncio.to_thread(open, p, 'rb'); pool.submit(len, p)\n"
+        "    loop.run_in_executor(None, lambda: len(p)); getattr(shutil, 'which')(p); getattr(x, name)()\n"
+        "    logging.basicConfig(level=10); sorted(p, key=len); partial(open, mode='rb')(p)\n"
+        "    os.open(p, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))\n"
+    )
+    assert writers(source) == {}
 
 
 def test_a_new_writer_in_no_list_fails_and_so_does_a_listed_one_that_is_gone():
