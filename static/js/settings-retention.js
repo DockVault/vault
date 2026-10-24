@@ -6,7 +6,7 @@
  * Each setting shows the value in force and where it comes from (the default, .env, set here, or locked by the
  * deployment); a locked one shows the .env line to change instead of a field, and so does one only .env sets. One
  * the audit log's integrity chain holds says, until the server has read the chain, that it has not yet, and shows
- * neither a value nor a field.
+ * neither a value nor a field; a switch whose turning on deletes nothing (the hold) can still be turned on there.
  * Each change is saved on its own: the server asks for the password every time (apiRequest prompts for it). A
  * change that deletes records sooner first shows what it would delete (the audit numbers: the preview, as the
  * audit job counts) and asks to confirm; it then waits the deployment's delay, during which any administrator can
@@ -166,11 +166,23 @@
         if (row.help) item.appendChild(el('p', 'text-secondary text-sm', row.help));
         if (row.chain_read === false) {
             // The value in force is the audit log's integrity chain's, which this server has not read yet: no
-            // value from the database is shown as in force, and nothing can be changed from here until it has.
+            // value from the database is shown as in force. A switch whose turning off deletes sooner (the hold)
+            // can still be turned on, which deletes nothing and is taken at once; nothing else can be changed
+            // from here until the chain is read.
+            const onNow = row.kind === 'bool' && row.reduction === 'lower' && row.editable === 'admin' &&
+                !row.locked;
             item.appendChild(el('p', 'text-secondary text-sm retention-unread',
                 'The value in force is held by the audit log\'s integrity chain, which this server has not read ' +
                 'yet (it does in the first minutes after it starts). Nothing is deleted under it before then. ' +
-                'Reload this page in a minute or two to see it and change it.'));
+                (onNow ? 'Turning it on deletes nothing, so it can be done now; reload this page in a minute or ' +
+                    'two to see the value in force or to turn it off.'
+                    : 'Reload this page in a minute or two to see it and change it.')));
+            if (onNow) {
+                const on = el('button', 'btn btn-primary btn-sm retention-on-now', 'Turn it on now');
+                on.type = 'button';
+                on.addEventListener('click', () => change(row, true));
+                item.appendChild(on);
+            }
             return item;
         }
         const canEdit = row.editable === 'admin' && !row.locked;

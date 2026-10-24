@@ -2,7 +2,8 @@
 
 Each setting shows the value in force with a badge saying where it comes from; a locked setting (the page is
 served its own description with one locked) and one only .env sets show the .env line instead of a field; one the
-audit chain holds shows, until the server has read the chain, neither a value nor a field, and says why. A change
+audit chain holds shows, until the server has read the chain, neither a value nor a field, and says why (the hold
+can still be turned on there, which deletes nothing). A change
 that deletes records sooner first shows what it would delete (the preview) and asks to confirm: dismissed, nothing
 is sent; confirmed, it asks for the password and then waits in the list of changes, where any administrator can
 cancel it. That list is the audit chain's: it says beside a change what the database says when that differs (and,
@@ -279,6 +280,44 @@ def test_before_the_chain_is_read_a_setting_it_holds_shows_no_value_and_no_field
     expect(banner).not_to_contain_text("are kept at least")
     expect(_row(page, "audit_archive_start_after_days")).to_contain_text("Set in .env: AUDIT_ARCHIVE_START_AFTER_DAYS=")
     page.evaluate("() => { try { localStorage.removeItem('dockvault.retention.banner.dismissed'); } catch (e) {} }")
+    assert not errors, errors
+
+
+def test_before_the_chain_is_read_the_hold_can_still_be_turned_on(page: Page, admin_creds):
+    """Turning the hold on deletes nothing, and the server takes it at once: before the server has read the chain,
+    the hold's row shows no value and no field, but a button that turns it on, and the request it sends sets it on.
+    A number the chain holds offers nothing to press meanwhile."""
+    errors = []
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+
+    def unread(data):
+        for row in data["settings"]:
+            if row["key"] in ("logs_hold", "audit_max_days"):
+                row.update(value=None, source="unread", stored=None, clamped=False, chain=None, chain_read=False,
+                           database_stored=row.get("stored"))
+    sent = []
+
+    def put(route):
+        if route.request.method != "PUT":
+            return route.continue_()
+        sent.append(route.request.post_data_json)
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps({"status": "applied", "key": "logs_hold", "value": True}))
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _serve_managed(page, unread)
+    page.route(re.compile(r"/settings/managed/logs_hold$"), put)
+    _open(page)
+    hold = _row(page, "logs_hold")
+    expect(hold.locator(".retention-source")).to_have_text("Not read yet")
+    expect(hold.locator(".retention-unread")).to_contain_text("Turning it on deletes nothing, so it can be done now")
+    expect(hold.locator("input")).to_have_count(0)
+    expect(hold.locator("button")).to_have_count(1)
+    numbers = _row(page, "audit_max_days")
+    expect(numbers.locator(".retention-unread")).to_contain_text("Reload this page in a minute or two")
+    expect(numbers.locator("button")).to_have_count(0)
+    hold.locator(".retention-on-now").click()
+    expect(page.locator("body")).to_contain_text("is saved", timeout=10000)
+    assert sent == [{"value": True}]
     assert not errors, errors
 
 
