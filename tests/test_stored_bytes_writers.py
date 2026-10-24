@@ -3,12 +3,15 @@
 Stored bytes reach the disk before a row or an answer says they exist (app/core/durable_write.py): every
 writer of stored bytes syncs the file, its name in its directory, and each directory it makes, before
 the commit. That holds only while no writer is added that skips it, so this lists every call in app/
-that writes a file -- an open for writing (open, io.FileIO, the gzip, bz2, lzma and tar files, a file
-database), write_bytes and write_text, a rename or a replace into place, a shutil copy or move, Path's
-copy and move, an archive extracted, a node made, a temporary file that is kept, a log file handler or a
-logging configuration given a file, a directory made, any of them called through another name an
-assignment gives it, named by getattr, brought in by a star import, or handed to another call to run --
-by the function it is in, and requires each one to be either:
+that writes a file -- an open for writing (open, io.FileIO, the gzip, bz2, lzma and tar files, anyio's
+open_file, a file database, fileinput in place), write_bytes and write_text, a rename or a replace into
+place (os's, or aiofiles' async os), a shutil copy or move, Path's copy and move, an archive extracted, a
+node made, a temporary file or directory that is kept, a log file handler (or a class made from one) or a
+logging configuration given a file, an image or a document saved, a process started, a directory made,
+any of them called through another name an assignment, a default argument or a class body gives it, held
+in a dict, a list or a tuple, named by getattr, through a module import_module or __import__ gives,
+through __call__, brought in by a star import, or handed to another call to run -- by the function it is
+in, and requires each one to be either:
 
 - a writer of stored bytes, synced through durable_write: the entry names the function that syncs it
   and the durable_write calls made there, and the test checks that they are; or
@@ -79,6 +82,7 @@ RESUME_HINT = ("a chunk's digest, a hint for a resuming client: lost or emptied,
                "chunk again, which is slower and never wrong")
 IN_MEMORY = "the case export's ZIP, built in memory as it streams to the client: never stored"
 NOT_A_FILE = "not a file: an in-memory cache's replace()"
+QR_IN_MEMORY = "the second factor's QR code, drawn into a buffer in memory and sent in the answer: never stored"
 LOCK = "the head record's lock file: empty, it holds only the lock (its directory made through durable_write)"
 
 # (file, enclosing function) -> (the writing calls in it that hold no stored bytes, and why).
@@ -94,6 +98,8 @@ NO_STORED_BYTES = {
     ("app/core/case_export.py", "ExportStream._pieces"): (["zipfile.ZipFile", "archive.open"], IN_MEMORY),
     ("app/api/api_server.py", "update_settings"): (["_api_rate_limit_policy_cache.replace"], NOT_A_FILE),
     ("app/core/audit_head_record.py", "_file_lock"): (["os.open"], LOCK),
+    ("app/core/second_factor.py", "otpauth_qr_svg"): (["qr.make_image(image_factory=SvgPathImage).save"],
+                                                      QR_IN_MEMORY),
 }
 
 # --------------------------------------------------------------------------- the scan
@@ -101,7 +107,8 @@ NO_STORED_BYTES = {
 _MODE = re.compile(r"^[rwxabtU+]{1,5}$")
 # Functions and classes that open a file by name, with the mode as their second argument.
 _OPENERS = {"open", "builtins.open", "io.open", "io.FileIO", "os.fdopen", "codecs.open", "gzip.open", "gzip.GzipFile",
-            "bz2.open", "bz2.BZ2File", "lzma.open", "lzma.LZMAFile", "tarfile.open", "tarfile.TarFile"}
+            "bz2.open", "bz2.BZ2File", "lzma.open", "lzma.LZMAFile", "tarfile.open", "tarfile.TarFile",
+            "anyio.open_file"}
 # Databases kept in a file, with their flag as the second argument and the flag they take when given none: they
 # write unless opened read-only ("r").
 _FLAGGED_OPENERS = {"shelve.open": "c", "dbm.open": "r", "dbm.gnu.open": "r", "dbm.ndbm.open": "r",
@@ -116,17 +123,31 @@ _WRITERS = {
     "logging.handlers.TimedRotatingFileHandler", "logging.handlers.WatchedFileHandler",
     # A logging configuration may make file handlers of its own.
     "logging.config.dictConfig", "logging.config.fileConfig",
+    # A process started may write anything.
+    "subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.Popen",
+    "subprocess.getoutput", "subprocess.getstatusoutput", "os.system", "os.popen", "os.posix_spawn",
+    "os.posix_spawnp", "os.spawnl", "os.spawnle", "os.spawnlp", "os.spawnlpe", "os.spawnv", "os.spawnve",
+    "os.spawnvp", "os.spawnvpe", "os.execl", "os.execle", "os.execlp", "os.execlpe", "os.execv", "os.execve",
+    "os.execvp", "os.execvpe", "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell", "pty.spawn",
 }
+# Modules that run another's calls: aiofiles' async os and tempfile write as os and tempfile do.
+_STANDS_FOR = {"aiofiles.os.": "os.", "aiofiles.tempfile.": "tempfile."}
+# Calls that give a module by its name (importlib.import_module("shutil").copyfile is shutil.copyfile).
+_MODULE_GIVERS = {"importlib.import_module", "__import__"}
 # Methods that write, on whatever object (a Path, as a rule; extract and extractall: a ZipFile's or a TarFile's).
 _WRITING_METHODS = {"write_bytes", "write_text", "touch", "mkdir", "symlink_to", "hardlink_to", "copy_into",
                     "move_into", "extract", "extractall"}
-# Methods that write when given a target: Path.copy and Path.move (a dict's or a list's copy takes none).
-_TARGET_METHODS = {"copy", "move"}
+# Methods that write when given a target: Path.copy and Path.move (a dict's or a list's copy takes none), and an
+# image's or a document's save (PIL's Image.save, and the like: a buffer in memory is a target too, and is listed).
+_TARGET_METHODS = {"copy", "move", "save"}
 _NOT_TARGET_METHODS = {"copy.copy", "copy.deepcopy"}
 # Every function the scan knows to write, by its full name: what a module's star import may bring in, and what a
 # call may be handed to run.
 _KNOWN = (_OPENERS | set(_FLAGGED_OPENERS) | _WRITERS
-          | {"os.open", "sqlite3.connect", "tempfile.NamedTemporaryFile", "zipfile.ZipFile", "logging.basicConfig"})
+          | {"os.open", "sqlite3.connect", "tempfile.NamedTemporaryFile", "tempfile.TemporaryDirectory",
+             "zipfile.ZipFile", "logging.basicConfig", "fileinput.input", "fileinput.FileInput"})
+# The last part of each such name: what an attribute of a module the scan cannot name may be.
+_KNOWN_LAST = {name.rsplit(".", 1)[1] for name in _KNOWN if "." in name}
 # Modules whose attribute named by a string the scan cannot read may be any of their writers.
 _WRITER_MODULES = {name.rsplit(".", 1)[0] for name in _KNOWN if "." in name} | {"builtins", "pathlib"}
 # Calls that run a function they are handed, by where it is among their arguments (its own arguments follow it).
@@ -152,15 +173,50 @@ def _imports(tree) -> dict:
     return names
 
 
+def _text(node) -> str:
+    """The source text of a name or a dotted name (as ast.unparse gives it, read directly), or of any other node."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parts = [node.attr]
+        value = node.value
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            return ".".join([value.id] + parts[::-1])
+    return ast.unparse(node)
+
+
+def _given_module(node, imports):
+    """The module ``importlib.import_module("name")`` or ``__import__("name")`` gives: its name, "" for a name the scan
+    cannot read, None when ``node`` is no such call."""
+    if not (isinstance(node, ast.Call) and node.args and _qualified(node.func, imports) in _MODULE_GIVERS):
+        return None
+    first = node.args[0]
+    return first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else ""
+
+
+def _standing(name: str) -> str:
+    for prefix, stands in _STANDS_FOR.items():
+        if name.startswith(prefix):
+            return stands + name[len(prefix):]
+    return name
+
+
 def _qualified(func, imports) -> str:
-    text = ast.unparse(func)
+    if isinstance(func, ast.Attribute):
+        module = _given_module(func.value, imports)
+        if module:
+            return _standing(f"{module}.{func.attr}")
+    text = _text(func)
     head, _, rest = text.partition(".")
     if head in imports and head != "*":
-        return imports[head] + ("." + rest if rest else "")
+        return _standing(imports[head] + ("." + rest if rest else ""))
     for module in imports.get("*", ()):
         if f"{module}.{text}" in _KNOWN:
             return f"{module}.{text}"
-    return text
+    return _standing(text)
 
 
 def _named_attribute(call: ast.Call):
@@ -178,14 +234,30 @@ def _unknown_attribute_of_a_writer_module(call: ast.Call, imports) -> bool:
             and _qualified(call.args[0], imports) in _WRITER_MODULES)
 
 
-def _is_writer_reference(node, imports) -> bool:
-    """A function that writes, named and not called (handed to another call to run)."""
+def _is_writer_reference(node, imports, aliases=None, depth: int = 0) -> bool:
+    """A function that writes, named and not called (handed to another call to run): by its name, through
+    __call__, a name an assignment binds to one, or a dict, a list or a tuple holding one."""
+    if depth > 5:
+        return False
     if isinstance(node, ast.Call):
         named = _named_attribute(node)
-        return named is not None and _is_writer_reference(named, imports)
+        return named is not None and _is_writer_reference(named, imports, aliases, depth + 1)
+    if isinstance(node, ast.Subscript):
+        return any(_is_writer_reference(held, imports, aliases, depth + 1)
+                   for held in _held(node.value, imports, aliases))
+    if isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set)):
+        return any(_is_writer_reference(held, imports, aliases, depth + 1)
+                   for held in _held(node, imports, aliases))
     if not isinstance(node, (ast.Name, ast.Attribute)):
         return False
+    if isinstance(node, ast.Attribute) and node.attr == "__call__":
+        return _is_writer_reference(node.value, imports, aliases, depth + 1)
     if _qualified(node, imports) in _KNOWN:
+        return True
+    if isinstance(node, ast.Attribute) and _given_module(node.value, imports) == "" and node.attr in _KNOWN_LAST:
+        return True
+    if aliases and any(_is_writer_reference(bound, imports, aliases, depth + 1)
+                       for bound in _bindings(node, imports, aliases)):
         return True
     return isinstance(node, ast.Attribute) and node.attr in _WRITING_METHODS
 
@@ -202,24 +274,70 @@ def _handed(call: ast.Call, imports) -> list:
     return [ast.Call(func=call.args[at], args=list(call.args[at + 1:]), keywords=list(call.keywords))]
 
 
+_BOUND = (ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.Dict, ast.List, ast.Tuple, ast.Set)
+
+
 def _aliases(tree) -> dict:
-    """Name -> the expressions bound to it, for a name or an attribute given a callable by assignment anywhere in
-    the module (``o = open``, ``self.save = os.replace``, ``w = functools.partial(open, mode="w")``): a call
-    through it is judged as a call of what it names."""
+    """Name -> the expressions bound to it, for a name or an attribute given a callable, a module, or a dict, a list
+    or a tuple of them, anywhere in the module: by assignment (``o = open``, ``self.save = os.replace``, ``w =
+    functools.partial(open, mode="w")``, ``sh = shutil``, ``table = {"w": open}``), as a parameter's default
+    (``def f(p, w=open)``), in a class body (``save = os.replace``, called as ``self.save``), or as a class's base
+    (``class Log(logging.FileHandler)``, made as ``Log(p)``): a call through it is judged as a call of what it
+    names."""
     out = {}
+
+    def bind(name, value):
+        if isinstance(value, _BOUND):
+            out.setdefault(name, []).append(value)
     for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            positional = args.posonlyargs + args.args
+            for arg, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
+                bind(arg.arg, default)
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+                if default is not None:
+                    bind(arg.arg, default)
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                if isinstance(base, (ast.Name, ast.Attribute)):
+                    bind(node.name, base)
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    names, value = [t for t in stmt.targets if isinstance(t, ast.Name)], stmt.value
+                elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None and isinstance(stmt.target, ast.Name):
+                    names, value = [stmt.target], stmt.value
+                else:
+                    continue
+                for target in names:
+                    for through in ("self", "cls", node.name):
+                        bind(f"{through}.{target.id}", value)
         if isinstance(node, ast.Assign):
             targets, value = node.targets, node.value
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             targets, value = [node.target], node.value
         else:
             continue
-        if not isinstance(value, (ast.Name, ast.Attribute, ast.Call)):
-            continue
         for target in targets:
             if isinstance(target, (ast.Name, ast.Attribute)):
-                out.setdefault(ast.unparse(target), []).append(value)
+                bind(_text(target), value)
     return out
+
+
+def _held(node, imports, aliases, depth: int = 0) -> list:
+    """What a dict, a list, a tuple or a set holds (``{"w": open}``, ``dict(w=open)``, ``[open]``), directly or through a
+    name bound to one: the expressions a subscript of it may give."""
+    if depth > 5:
+        return []
+    if isinstance(node, ast.Dict):
+        return list(node.values)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return list(node.elts)
+    if isinstance(node, ast.Call) and _qualified(node.func, imports) == "dict":
+        return list(node.args) + [k.value for k in node.keywords]
+    if isinstance(node, (ast.Name, ast.Attribute)) and aliases:
+        return [h for bound in aliases.get(_text(node), ()) for h in _held(bound, imports, aliases, depth + 1)]
+    return []
 
 
 def _keyword(call, name):
@@ -255,16 +373,36 @@ def _bindings(func, imports: dict, aliases: dict) -> list:
     """What ``func`` is bound to by an assignment the scan can follow: callables, partials of one, and the attribute
     a getattr with a string names (``f = getattr(shutil, "copyfile")``)."""
     out = []
-    for bound in aliases.get(ast.unparse(func), ()):
+    for bound in aliases.get(_text(func), ()):
         if isinstance(bound, ast.Call):
             named = _named_attribute(bound)
             if named is not None:
                 out.append(named)
             elif _qualified(bound.func, imports) in ("functools.partial", "partial") and bound.args:
                 out.append(bound)
-        elif ast.unparse(bound) != ast.unparse(func):
+        elif isinstance(bound, (ast.Name, ast.Attribute, ast.Subscript)) and _text(bound) != _text(func):
             out.append(bound)
+    if isinstance(func, ast.Attribute):
+        # An attribute of a name bound to a module (``sh = shutil``, ``m = importlib.import_module("shutil")``).
+        for bound in aliases.get(_text(func.value), ()):
+            if isinstance(bound, (ast.Name, ast.Attribute, ast.Call)) and _text(bound) != _text(func.value):
+                out.append(ast.Attribute(value=bound, attr=func.attr, ctx=ast.Load()))
     return out
+
+
+def _callable(node, imports) -> bool:
+    """Whether ``node``, held in a container, is something a call through it calls: a name, an attribute, a partial
+    or a getattr with a string."""
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return True
+    return isinstance(node, ast.Call) and bool(node.args) and (
+        _named_attribute(node) is not None or _qualified(node.func, imports) in ("functools.partial", "partial"))
+
+
+def _through_held(held, call: ast.Call) -> ast.Call:
+    named = _named_attribute(held) if isinstance(held, ast.Call) else None
+    return ast.Call(func=named, args=list(call.args), keywords=list(call.keywords)) if named is not None \
+        else _through(held, call)
 
 
 def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 0) -> bool:
@@ -274,6 +412,15 @@ def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 
         if any(is_writer(_through(bound, call), imports, aliases, depth + 1)
                for bound in _bindings(func, imports, aliases)):
             return True
+    if isinstance(func, ast.Subscript) and depth < 5:
+        # A writer held in a dict, a list or a tuple, called from it: {"w": open}["w"](p, "w").
+        return any(is_writer(_through_held(held, call), imports, aliases, depth + 1)
+                   for held in _held(func.value, imports, aliases) if _callable(held, imports))
+    if isinstance(func, ast.Attribute) and func.attr == "__call__" and depth < 5:
+        return is_writer(ast.Call(func=func.value, args=list(call.args), keywords=list(call.keywords)), imports,
+                         aliases, depth + 1)
+    if isinstance(func, ast.Attribute) and _given_module(func.value, imports) == "":
+        return func.attr in _KNOWN_LAST                 # a writer of a module the scan cannot name
     if isinstance(func, ast.Call) and depth < 5:
         # A writer that a call gives, called at once: getattr(shutil, "copyfile")(p, q), partial(open, mode="w")(p).
         named = _named_attribute(func)
@@ -307,9 +454,14 @@ def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 
         return not (isinstance(target, ast.Constant) and target.value == ":memory:")
     if name in _WRITERS:
         return True
-    if name == "tempfile.NamedTemporaryFile":
+    if name in ("tempfile.NamedTemporaryFile", "tempfile.TemporaryDirectory"):
         delete = _keyword(call, "delete")              # kept unless deleted on close (the default)
         return delete is not None and not (isinstance(delete, ast.Constant) and delete.value is True)
+    if name in ("fileinput.input", "fileinput.FileInput"):
+        inplace = _keyword(call, "inplace")            # rewrites its files in place when told to
+        if inplace is None and len(call.args) > 1:
+            inplace = call.args[1]
+        return inplace is not None and not (isinstance(inplace, ast.Constant) and not inplace.value)
     if name == "zipfile.ZipFile":
         mode = _keyword(call, "mode") or (call.args[1] if len(call.args) > 1 else None)
         return _writes_in_mode(mode)
@@ -347,7 +499,8 @@ def hands_a_writer(call: ast.Call, imports: dict, aliases: dict = None) -> bool:
     handed = _handed(call, imports)
     if handed:
         return any(is_writer(h, imports, aliases) for h in handed)
-    return any(_is_writer_reference(arg, imports) for arg in list(call.args) + [k.value for k in call.keywords])
+    return any(_is_writer_reference(arg, imports, aliases)
+               for arg in list(call.args) + [k.value for k in call.keywords])
 
 
 def writers(source: str) -> dict:
@@ -401,13 +554,20 @@ def durable_calls(source: str, function: str) -> set:
     return out
 
 
+_SCANNED: dict = {}
+
+
 def _all_writers() -> dict:
-    out = {}
-    for path in sorted((ROOT / "app").rglob("*.py")):
-        rel = path.relative_to(ROOT).as_posix()
-        for scope, calls in writers(path.read_text(encoding="utf-8")).items():
-            out[(rel, scope)] = calls
-    return out
+    """Every writing call in app/, by (file, scope): scanned once a run (the files do not change while the tests
+    run), a copy each time."""
+    if "app" not in _SCANNED:
+        out = {}
+        for path in sorted((ROOT / "app").rglob("*.py")):
+            rel = path.relative_to(ROOT).as_posix()
+            for scope, calls in writers(path.read_text(encoding="utf-8")).items():
+                out[(rel, scope)] = calls
+        _SCANNED["app"] = out
+    return {key: list(calls) for key, calls in _SCANNED["app"].items()}
 
 
 def unclassified(found: dict) -> dict:
@@ -602,6 +762,107 @@ def test_the_new_forms_that_read_or_hold_no_file_stay_alone():
     assert writers(source) == {}
 
 
+# Raw ways of writing a file, each added to a real function of the application: (the code, its scope).
+_MORE_FORMS = {
+    "a writer bound in a class body, called through self": (
+        "class _Saver:\n    save = os.replace\n\n    def added_writer(self, path, mode):\n"
+        "        self.save(path, mode)\n", "_Saver.added_writer"),
+    "a writer bound in a class body, called through the class": (
+        "class _Saver:\n    save = os.replace\n\n\ndef added_writer(path, mode):\n    _Saver.save(path, mode)\n",
+        "added_writer"),
+    "a file handler's subclass made": (
+        "class _Log(logging.handlers.RotatingFileHandler):\n    pass\n\n\n"
+        "def added_writer(path, mode):\n    _Log(path)\n", "added_writer"),
+    "fileinput in place": (
+        "def added_writer(path, mode):\n    import fileinput\n"
+        "    for line in fileinput.input(path, inplace=True):\n        print(line)\n", "added_writer"),
+    "a temporary directory kept": (
+        "def added_writer(path, mode):\n    import tempfile\n    tempfile.TemporaryDirectory(delete=False)\n",
+        "added_writer"),
+    "a process started": (
+        "def added_writer(path, mode):\n    import subprocess\n    subprocess.run(['cp', path, mode], check=True)\n",
+        "added_writer"),
+    "a process started without a shell": (
+        "def added_writer(path, mode):\n    os.posix_spawn('/bin/cp', ['cp', path, mode], {})\n", "added_writer"),
+    "anyio's open_file": (
+        "async def added_writer(path, mode):\n    import anyio\n    await anyio.open_file(path, 'w')\n",
+        "added_writer"),
+    "aiofiles' async os": (
+        "async def added_writer(path, mode):\n    import aiofiles.os\n    await aiofiles.os.replace(path, mode)\n",
+        "added_writer"),
+    "aiofiles' temporary file kept": (
+        "async def added_writer(path, mode):\n    import aiofiles.tempfile\n"
+        "    aiofiles.tempfile.NamedTemporaryFile(delete=False)\n", "added_writer"),
+    "a module import_module gives": (
+        "def added_writer(path, mode):\n    import importlib\n"
+        "    importlib.import_module('shutil').copyfile(path, mode)\n", "added_writer"),
+    "a module import_module gives by a name the scan cannot read": (
+        "def added_writer(path, mode):\n    import importlib\n    importlib.import_module(mode).copyfile(path, mode)\n",
+        "added_writer"),
+    "a module __import__ gives": (
+        "def added_writer(path, mode):\n    __import__('shutil').copyfile(path, mode)\n", "added_writer"),
+    "a module bound to a name": (
+        "def added_writer(path, mode):\n    import shutil\n    sh = shutil\n    sh.copyfile(path, mode)\n",
+        "added_writer"),
+    "a module import_module gives, bound to a name": (
+        "def added_writer(path, mode):\n    import importlib\n    m = importlib.import_module('shutil')\n"
+        "    m.move(path, mode)\n", "added_writer"),
+    "a writer held in a dict": (
+        "def added_writer(path, mode):\n    {'w': open}['w'](path, 'w')\n", "added_writer"),
+    "a writer held in a dict bound to a name": (
+        "_TABLE = dict(save=os.replace)\n\n\ndef added_writer(path, mode):\n    _TABLE['save'](path, mode)\n",
+        "added_writer"),
+    "a writer held in a list": (
+        "def added_writer(path, mode):\n    writers = [os.replace]\n    writers[0](path, mode)\n", "added_writer"),
+    "a default argument": (
+        "def added_writer(path, mode, w=open):\n    w(path, 'w')\n", "added_writer"),
+    "a keyword-only default argument": (
+        "def added_writer(path, mode, *, move=os.rename):\n    move(path, mode)\n", "added_writer"),
+    "__call__": (
+        "def added_writer(path, mode):\n    import shutil\n    shutil.copyfile.__call__(path, mode)\n",
+        "added_writer"),
+    "an image saved": (
+        "def added_writer(path, mode):\n    from PIL import Image\n    Image.new('RGB', (1, 1)).save(path)\n",
+        "added_writer"),
+    "a writer bound to a name, handed to a thread": (
+        "def added_writer(path, mode):\n    import threading\n    save = os.replace\n"
+        "    threading.Thread(target=save, args=(path, mode))\n", "added_writer"),
+    "a writer held in a dict, handed to a call": (
+        "def added_writer(path, mode):\n    list(map({'w': os.replace}['w'], [path], [mode]))\n", "added_writer"),
+}
+
+
+@pytest.mark.parametrize("form", sorted(_MORE_FORMS))
+def test_a_writer_of_each_further_form_added_to_the_application_is_in_no_list(form):
+    code, scope = _MORE_FORMS[form]
+    rel = "app/sftp/heartbeat.py"
+    source = (ROOT / rel).read_text(encoding="utf-8") + (
+        "\n\nimport logging  # noqa: E402\nimport logging.handlers  # noqa: E402\n\n\n" + code)
+    found = dict(_all_writers())
+    found.update({(rel, s): calls for s, calls in writers(source).items()})
+    assert (rel, scope) in unclassified(found), form
+
+
+def test_the_further_forms_that_read_or_hold_no_file_stay_alone():
+    source = (
+        "import fileinput, importlib, os, tempfile, json\n"
+        "class _Box:\n"
+        "    size = len\n"
+        "    def m(self, p):\n"
+        "        return self.size(p)\n"
+        "class _Error(ValueError):\n"
+        "    pass\n"
+        "def r(p, q, n=len, *, k=sorted):\n"
+        "    tempfile.TemporaryDirectory(); tempfile.TemporaryDirectory(delete=True)\n"
+        "    fileinput.input(p); fileinput.input(p, inplace=False)\n"
+        "    importlib.import_module('json').dumps(p); __import__('json').loads(q)\n"
+        "    {'r': len}['r'](p); [len][0](p); n(p); k(q); _Error(p)\n"
+        "    len.__call__(p); q.save(); js = json\n"
+        "    js.dumps(p)\n"
+    )
+    assert writers(source) == {}
+
+
 def test_a_new_writer_in_no_list_fails_and_so_does_a_listed_one_that_is_gone():
     found = _all_writers()
     before = set(unclassified(found))
@@ -662,4 +923,4 @@ def test_each_synced_writer_is_synced_through_durable_write_where_its_entry_says
 def test_every_entry_says_why():
     for key, (calls, reason) in NO_STORED_BYTES.items():
         assert calls and reason in (HELPER, LOG, LIVENESS, WRITE_TEST, SCRATCH, RESUME_HINT, IN_MEMORY, NOT_A_FILE,
-                                    LOCK), key
+                                    LOCK, QR_IN_MEMORY), key
