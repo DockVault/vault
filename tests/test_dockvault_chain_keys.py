@@ -11,6 +11,9 @@
 - a key change, an update and every line written into .env are refused while .env is sealed (no .env is ever
   made beside a .env.enc); the new key is on the disk in .env (file and name) before the stack is recreated under
   it, and when it cannot be, .env is put back as it was, or the operator is told what to do;
+- a backup taken during an unfinished key change carries the kept old key (sealed with its env under --lock), and
+  a restore puts it back beside .env before .env, never over another, and says to move the chain before
+  accepting the restore;
 - the split layout's SFTP container never gets the chain's key and mounts the keys volume read-only; the web
   server writes the SSH host key it needs.
 
@@ -564,3 +567,179 @@ def test_a_key_change_whose_env_can_be_neither_written_nor_put_back_keeps_the_ol
     assert kept.read_text(encoding="utf-8") == old + "\n"
     out = capsys.readouterr().out
     assert "nor put .env back" in out and str(kept) in out and "make AUDIT_CHAIN_KEY in .env that key again" in out
+
+
+# --------------------------------------------------------------------------- a backup during an unfinished change
+
+def _unfinished_change(tmp_path, **cfg):
+    """.env holding the new key, and the old key kept beside it, as a key change whose move failed leaves them."""
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32), **cfg)
+    old = dv.gen_hex(32)
+    (tmp_path / ".audit-chain-key.previous").write_text(old + "\n", encoding="utf-8")
+    return env, old
+
+
+def _backing_up(tmp_path, monkeypatch, env, **args):
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: (Path(bundle) / archive).write_bytes(b"x")
+                        or True)
+    tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups"), **args))
+    return next((tmp_path / "backups").iterdir())
+
+
+def test_a_backup_during_an_unfinished_key_change_carries_the_old_key(tmp_path, monkeypatch, capsys):
+    import os
+    env, old = _unfinished_change(tmp_path, volume_prefix="dockvault-vault-carry", deployment_id="carry")
+    bundle = _backing_up(tmp_path, monkeypatch, env)
+    assert (bundle / "audit-chain-key.previous").read_text(encoding="utf-8") == old + "\n"
+    if os.name != "nt":
+        assert (bundle / "audit-chain-key.previous").stat().st_mode & 0o077 == 0
+    assert "dockvault.py audit rekey --old-key-file" in capsys.readouterr().out
+
+
+def test_a_backup_with_no_unfinished_key_change_carries_no_old_key(tmp_path, monkeypatch):
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-plain", deployment_id="plain")
+    bundle = _backing_up(tmp_path, monkeypatch, env)
+    assert not [p for p in bundle.iterdir() if p.name.startswith("audit-chain-key")]
+
+
+def test_a_sealed_backup_seals_the_old_key_with_its_env(tmp_path, monkeypatch):
+    pytest.importorskip("cryptography")
+    env, old = _unfinished_change(tmp_path, volume_prefix="dockvault-vault-sealed", deployment_id="sealed")
+    passfile = tmp_path / "pass.txt"
+    passfile.write_text("seal-passphrase-1\n", encoding="utf-8")
+    rout = tmp_path / "recovery.txt"
+    bundle = _backing_up(tmp_path, monkeypatch, env, lock=True, passphrase_file=str(passfile),
+                         passphrase_stdin=False, hint=None, recovery_out=str(rout))
+    names = sorted(p.name for p in bundle.iterdir())
+    assert "env" not in names and "audit-chain-key.previous" not in names
+    assert {"env.enc", "audit-chain-key.previous.enc"} <= set(names)
+    sealed = (bundle / "audit-chain-key.previous.enc").read_text(encoding="utf-8")
+    fernet = dv.load_fernet()
+    assert dv.env_lock_open(fernet, sealed, passphrase="seal-passphrase-1")[0] == (old + "\n").encode()
+    assert dv.env_lock_open(fernet, sealed, recovery_key=rout.read_text().strip())[0] == (old + "\n").encode()
+
+
+def test_a_backup_whose_kept_file_holds_no_key_is_refused_and_removed(tmp_path, monkeypatch, capsys):
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-empty", deployment_id="empty")
+    (tmp_path / ".audit-chain-key.previous").write_text("\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        _backing_up(tmp_path, monkeypatch, env)
+    assert list((tmp_path / "backups").iterdir()) == []
+    assert "holds none" in capsys.readouterr().out
+
+
+def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, interactive=False):
+    """A restore of a bundle carrying the old key `carried` (or none), its env sealed or not, onto a host whose own
+    kept file holds `here` (or none). Returns (the steps, in order, and whether the kept file was there when .env
+    was installed)."""
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-rc", deployment_id="rc")
+    entries = [{"role": "keys", "name": "x", "archive": "vault_keys.tar.gz"},
+               {"role": "pg", "name": "x", "archive": "vault_pg_data.tar.gz"}]
+    bundle = _write_bundle(tmp_path, cfg, entries, name="bundle-rc")
+    for e in entries:
+        (bundle / e["archive"]).write_bytes(b"x")
+    if carried is not None:
+        (bundle / "audit-chain-key.previous").write_text(carried + "\n", encoding="utf-8")
+    passfile = tmp_path / "pass.txt"
+    passfile.write_text("seal-passphrase-1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    if sealed:
+        tool._seal_bundle_env(str(bundle), argparse.Namespace(
+            passphrase_file=str(passfile), passphrase_stdin=False, hint=None, recovery_out=None, non_interactive=True))
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    if here is not None:
+        (tmp_path / ".audit-chain-key.previous").write_text(here + "\n", encoding="utf-8")
+    kept = tmp_path / ".audit-chain-key.previous"
+    steps = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+    monkeypatch.setattr(dv, "read_volume_json", lambda vol, rel, **k: {"seq": 4, "link": "aa"})
+    monkeypatch.setattr(dv, "clear_volume", lambda vol, **k: True)
+    monkeypatch.setattr(dv, "untar_volume", lambda vol, *a, **k: steps.append("untar") or True)
+    monkeypatch.setattr(dv, "write_volume_file", lambda *a, **k: steps.append("mark") or True)
+    monkeypatch.setattr(dv, "_copy_secret", lambda *a, **k: steps.append(("env", kept.exists())))
+    monkeypatch.setattr(tool, "_atomic_write_secret", lambda *a, **k: steps.append(("env", kept.exists())))
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "dockvault-vault-rc")
+    monkeypatch.setattr(tool, "_stop_stack", lambda: steps.append("stop"))
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: steps.append("start") or True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_audit_host_command", lambda args, action: steps.append(action))
+    args = argparse.Namespace(bundle_dir=str(bundle), force=True, passphrase_file=str(passfile),
+                              passphrase_stdin=False, recovery_key_file=None, use_recovery_key=False)
+    if not interactive:
+        args.non_interactive = True
+    tool._do_restore(args)
+    return steps
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["plain", "sealed"])
+def test_a_restore_puts_the_carried_old_key_back_beside_env_before_env(tmp_path, monkeypatch, capsys, sealed):
+    if sealed:
+        pytest.importorskip("cryptography")
+    old = dv.gen_hex(32)
+    steps = _restoring(tmp_path, monkeypatch, carried=old, sealed=sealed)
+    assert ("env", True) in steps and ("env", False) not in steps
+    assert (tmp_path / ".audit-chain-key.previous").read_text(encoding="utf-8") == old + "\n"
+    out = " ".join(capsys.readouterr().out.split())
+    kept = tmp_path / ".audit-chain-key.previous"
+    rekey = "python dockvault.py audit rekey --old-key-file %s" % kept
+    assert rekey in out and out.index(rekey) < out.index("python dockvault.py audit accept-restore")
+
+
+def test_an_interactive_restore_of_a_carried_key_moves_nothing_on_its_own(tmp_path, monkeypatch, capsys):
+    """accept-restore seals under the current key: with the chain maybe still under the carried key, the restore
+    leaves both steps to the operator, in their order, and runs neither."""
+    steps = _restoring(tmp_path, monkeypatch, carried=dv.gen_hex(32), interactive=True)
+    assert "accept-restore" not in steps and "start" in steps
+    out = " ".join(capsys.readouterr().out.split())
+    assert out.index("audit rekey --old-key-file") < out.index("audit accept-restore")
+
+
+def test_an_interactive_restore_with_no_carried_key_still_accepts_the_restore(tmp_path, monkeypatch):
+    steps = _restoring(tmp_path, monkeypatch, interactive=True)
+    assert steps[-1] == "accept-restore"
+    assert not (tmp_path / ".audit-chain-key.previous").exists()
+
+
+def test_a_restore_onto_a_host_with_another_unfinished_key_change_is_refused_before_anything(tmp_path, monkeypatch,
+                                                                                            capsys):
+    mine = dv.gen_hex(32)
+    with pytest.raises(SystemExit):
+        _restoring(tmp_path, monkeypatch, carried=dv.gen_hex(32), here=mine)
+    assert (tmp_path / ".audit-chain-key.previous").read_text(encoding="utf-8") == mine + "\n"
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "x=1\n"
+    assert "Nothing was changed" in capsys.readouterr().out
+
+
+def test_a_restore_onto_a_host_holding_the_same_kept_key_goes_on(tmp_path, monkeypatch):
+    old = dv.gen_hex(32)
+    steps = _restoring(tmp_path, monkeypatch, carried=old, here=old)
+    assert "stop" in steps and ("env", True) in steps
+
+
+@pytest.mark.parametrize("text", ["", "   \n", "one\ntwo\n", "tab\there"])
+def test_a_restore_refuses_a_carried_old_key_that_is_not_a_key_before_anything(tmp_path, monkeypatch, text):
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-rd", deployment_id="rd")
+    bundle = _write_bundle(tmp_path, cfg, [], name="bundle-rd")
+    (bundle / "audit-chain-key.previous").write_text(text, encoding="utf-8")
+    (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_stop_stack", lambda: pytest.fail("the deployment was stopped"))
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=True))
+    assert not (tmp_path / ".audit-chain-key.previous").exists()
+
+
+def test_a_restore_refuses_a_sealed_old_key_beside_a_plain_env(tmp_path, monkeypatch):
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-re", deployment_id="re")
+    bundle = _write_bundle(tmp_path, cfg, [], name="bundle-re")
+    (bundle / "audit-chain-key.previous.enc").write_text("sealed", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_stop_stack", lambda: pytest.fail("the deployment was stopped"))
+    with pytest.raises(SystemExit):
+        tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=True))

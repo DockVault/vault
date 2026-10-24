@@ -943,6 +943,25 @@ def _copy_secret(src, dst):
         out.write(data)
 
 
+def write_kept_key(path, key):
+    """Create `path` holding `key` (and a line end), mode 600, and put it on the disk with its name; never over a
+    file already there (FileExistsError). A file this call created but could not finish is removed. Raises
+    OSError."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600) if os.name != "nt" else os.open(path, flags)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as out:
+            out.write(key + "\n")
+        tighten_secret_file(path)
+        sync_to_disk(path)
+    except OSError:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+
+
 # --- setup: self-signed cert (host openssl or a throwaway container) --------------------------
 def _openssl_args_self_signed(server_name):
     san = ("IP:%s" if is_ipv4(server_name) else "DNS:%s") % server_name
@@ -1870,6 +1889,21 @@ def clear_volume(volume, run=subprocess.run):
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return getattr(r, "returncode", 1) == 0
+
+
+# The old AUDIT_CHAIN_KEY a key change keeps beside .env until the audit log's chain has moved to the new one, and
+# its name in a backup bundle (sealed with env under --lock, as KEPT_CHAIN_KEY_BUNDLE + ".enc").
+KEPT_CHAIN_KEY = ".audit-chain-key.previous"
+KEPT_CHAIN_KEY_BUNDLE = "audit-chain-key.previous"
+
+
+def kept_chain_key_text(text):
+    """The key a kept file or a bundle carries (its text, the ends stripped), or None when `text` is not one: empty,
+    more than one line, a control character in it, or longer than any key."""
+    key = (text or "").strip()
+    if not key or len(key) > 4096 or not all(c.isprintable() for c in key):
+        return None
+    return key
 
 
 def chain_head_relpath(env):
@@ -5166,6 +5200,26 @@ class DockVault:
         # the paired .env FIRST, mode-600 (it holds ENCRYPTION_KEY)
         _copy_secret(self._env_path(), os.path.join(bundle, "env"))
         tighten_secret_file(os.path.join(bundle, "env"))
+        # A change of AUDIT_CHAIN_KEY that is not finished: the audit log's chain may still be under the old key,
+        # which is then only in the file kept beside .env. The bundle carries it (sealed with env under --lock),
+        # and a restore puts it back beside .env, so the restored chain's key is always in a file.
+        kept = os.path.join(self.root, KEPT_CHAIN_KEY)
+        carried = os.path.lexists(kept)
+        if carried:
+            try:
+                with open(kept, encoding="utf-8") as f:
+                    key = kept_chain_key_text(f.read())
+            except (OSError, ValueError) as exc:
+                self._fail_backup(bundle, "could not read %s, which holds the key the audit log's chain may still "
+                                          "be under (%s)" % (kept, exc))
+            if key is None:
+                self._fail_backup(bundle, "%s should hold the key the audit log's chain may still be under, and "
+                                          "holds none: finish that change first (python dockvault.py audit rekey "
+                                          "--old-key-file %s)" % (kept, kept))
+            try:
+                write_kept_key(os.path.join(bundle, KEPT_CHAIN_KEY_BUNDLE), key)
+            except OSError as exc:
+                self._fail_backup(bundle, "could not copy %s into the backup (%s)" % (kept, exc))
         entries = []
         for role in BACKUP_ROLES:
             vol = names[role]
@@ -5229,6 +5283,11 @@ class DockVault:
         else:
             print(pal.paint("  *** This bundle's 'env' holds ENCRYPTION_KEY - store the whole bundle "
                             "somewhere safe (off-host), or re-run with --lock to seal it. ***\n", "yellow"))
+        if carried:
+            print(pal.paint("  A change of AUDIT_CHAIN_KEY is not finished here: the bundle also carries the old key "
+                            "kept in %s%s, which the audit log's chain may still be under, and a restore puts it "
+                            "back beside .env. Finish the change: python dockvault.py audit rekey --old-key-file %s\n"
+                            % (kept, " (sealed with its env)" if seal else "", kept), "yellow"))
 
     def _pause_database(self):
         """Pause the running database container while its volume is archived, so the copy is one moment's (a
@@ -5254,18 +5313,22 @@ class DockVault:
         then remove the plaintext env. Verify-before-destroy: the sealed file must decrypt back to the
         exact bytes before the plaintext is removed. A seal FAILURE keeps the complete plaintext bundle
         (a valid UNSEALED backup) rather than discarding it. Reuses the same crypto as `dockvault.py
-        lock`."""
+        lock`. The old AUDIT_CHAIN_KEY a bundle carries during an unfinished key change is sealed the same way,
+        under the same data key (so the same passphrase or recovery key opens it), and verified too."""
         pal = self.pal
         env_file = os.path.join(bundle, "env")
         enc_file = os.path.join(bundle, "env.enc")
+        kept_file = os.path.join(bundle, KEPT_CHAIN_KEY_BUNDLE)
+        kept_enc = kept_file + ".enc"
 
         def _abort(msg):
             # A failed OPTIONAL seal must NOT destroy the complete plaintext bundle: drop any partial
             # env.enc and keep {env, volumes, manifest} -- it restores normally, just unsealed.
-            try:
-                os.remove(enc_file)
-            except OSError:
-                pass
+            for partial in (enc_file, kept_enc):
+                try:
+                    os.remove(partial)
+                except OSError:
+                    pass
             self._fail("could not seal the backup (%s). The backup at %s is COMPLETE but UNSEALED "
                        "(its plaintext env is kept and it restores normally); re-run backup --lock "
                        "to seal it." % (msg, bundle))
@@ -5301,7 +5364,28 @@ class DockVault:
             _abort("sealed env failed verification (%s)" % exc)
         if check_bytes != env_bytes:
             _abort("sealed env did not round-trip")
+        carried = os.path.lexists(kept_file)
+        if carried:
+            try:
+                with open(kept_file, "rb") as f:
+                    kept_bytes = f.read()
+                kept_text, _ = env_lock_seal(fernet, kept_bytes, passphrase, dek=dek, now_iso=now_iso)
+                self._atomic_write_secret(kept_enc, kept_text)
+                with open(kept_enc, encoding="utf-8") as f:
+                    sealed_kept = f.read()
+                by_passphrase, _ = env_lock_open(fernet, sealed_kept, passphrase=passphrase)
+                by_recovery_key, _ = env_lock_open(fernet, sealed_kept, recovery_key=dek)
+            except (OSError, EnvLockError) as exc:
+                _abort("the old AUDIT_CHAIN_KEY the bundle carries could not be sealed (%s)" % exc)
+            if not (by_passphrase == by_recovery_key == kept_bytes):
+                _abort("the sealed old AUDIT_CHAIN_KEY did not round-trip")
         os.remove(env_file)
+        if carried:
+            try:
+                os.remove(kept_file)
+            except OSError as exc:
+                print(pal.paint("  WARNING: could not remove the plaintext %s from the sealed bundle (%s): remove it "
+                                "yourself (its sealed copy is %s)." % (kept_file, exc, kept_enc), "red"))
         # Recovery-key output: on a controlling terminal _show_recovery_key uses /dev/tty; in a
         # non-interactive run WITHOUT --recovery-out do NOT print it to stdout (it could be captured
         # into a log kept beside the bundle) -- the passphrase already restores, and --recovery-out is
@@ -5313,9 +5397,10 @@ class DockVault:
                             "--recovery-out); restore with the passphrase, or re-run with "
                             "--recovery-out to capture a recovery key off-host.", "yellow"))
 
-    def _unseal_bundle_env(self, enc_path, args):
+    def _unseal_bundle_env(self, enc_path, args, with_key=False):
         """Decrypt a sealed bundle's env.enc and return the plaintext env BYTES (never written to
-        disk). Uses the recovery key when --recovery-key-file/-stdin or --use-recovery-key is given,
+        disk), or (the bytes, the data key) with `with_key`: the data key opens what else the bundle sealed
+        with it. Uses the recovery key when --recovery-key-file/-stdin or --use-recovery-key is given,
         else the passphrase. A wrong credential fails here, before the restore touches the stack."""
         fernet = self._require_fernet()
         try:
@@ -5327,14 +5412,41 @@ class DockVault:
                                       or getattr(args, "use_recovery_key", False)))
         try:
             if use_recovery:
-                env_bytes, _ = env_lock_open(fernet, enc_text,
-                                             recovery_key=self._read_recovery_key(args))
+                env_bytes, dek = env_lock_open(fernet, enc_text,
+                                               recovery_key=self._read_recovery_key(args))
             else:
-                env_bytes, _ = env_lock_open(fernet, enc_text,
-                                             passphrase=self._read_passphrase(args, confirm=False))
+                env_bytes, dek = env_lock_open(fernet, enc_text,
+                                               passphrase=self._read_passphrase(args, confirm=False))
         except EnvLockError as exc:
             self._fail("cannot open the sealed backup (%s) - the deployment was NOT touched." % exc)
-        return env_bytes
+        return (env_bytes, dek) if with_key else env_bytes
+
+    def _carried_chain_key(self, bundle, dek):
+        """The old AUDIT_CHAIN_KEY `bundle` carries (a backup taken during an unfinished key change): from its
+        plaintext copy, or its sealed one opened with the data key `dek` of the bundle's env.enc; None when it
+        carries none. Fails, before anything is touched, on one that cannot be read or is not a key."""
+        plain = os.path.join(bundle, KEPT_CHAIN_KEY_BUNDLE)
+        sealed = plain + ".enc"
+        try:
+            if os.path.lexists(plain):
+                with open(plain, encoding="utf-8") as f:
+                    text = f.read()
+            elif os.path.lexists(sealed):
+                if dek is None:
+                    self._fail("this backup's old AUDIT_CHAIN_KEY is sealed but its env is not - refusing to "
+                               "restore a bundle sealed in part")
+                with open(sealed, encoding="utf-8") as f:
+                    raw, _ = env_lock_open(self._require_fernet(), f.read(), recovery_key=dek)
+                text = raw.decode("utf-8")
+            else:
+                return None
+        except (OSError, ValueError, EnvLockError) as exc:
+            self._fail("could not read the old AUDIT_CHAIN_KEY this backup carries (%s) - the deployment was NOT "
+                       "touched." % exc)
+        key = kept_chain_key_text(text)
+        if key is None:
+            self._fail("the old AUDIT_CHAIN_KEY this backup carries is not a key - the deployment was NOT touched.")
+        return key
 
     def _do_restore(self, args=None):
         """Restore a bundle: verify the bundle's .env matches its volumes (coupling fingerprint),
@@ -5366,9 +5478,9 @@ class DockVault:
         # A sealed bundle carries env.enc instead of a plaintext env. Decrypt it into MEMORY here --
         # before manifest/coupling checks and long before the stack is stopped -- so a wrong
         # passphrase/recovery key aborts with the deployment intact and no plaintext ever hits disk.
-        sealed_env_bytes = None
+        sealed_env_bytes, sealed_dek = None, None
         if not os.path.exists(env_path) and os.path.exists(enc_path):
-            sealed_env_bytes = self._unseal_bundle_env(enc_path, args)
+            sealed_env_bytes, sealed_dek = self._unseal_bundle_env(enc_path, args, with_key=True)
         if not os.path.exists(man_path) or (sealed_env_bytes is None and not os.path.exists(env_path)):
             self._fail("that bundle is missing manifest.json or its env - refusing to restore")
         try:
@@ -5402,6 +5514,22 @@ class DockVault:
         for role in sorted(roles, key=lambda r: order.get(r, len(order))):
             plan.append((names[role], "%s.tar.gz" % VOLUME_BASENAMES[role]))
         head_rel = chain_head_relpath(bundle_env)
+        # The old AUDIT_CHAIN_KEY a backup taken during an unfinished key change carries: put back beside .env
+        # below, as the file the change kept. A different one already here belongs to this host's own unfinished
+        # change: it is never written over, and the restore waits until that change is settled.
+        carried = self._carried_chain_key(bundle, sealed_dek)
+        kept_here = os.path.join(self.root, KEPT_CHAIN_KEY)
+        if carried is not None and os.path.lexists(kept_here):
+            try:
+                with open(kept_here, encoding="utf-8") as f:
+                    here = kept_chain_key_text(f.read())
+            except (OSError, ValueError):
+                here = None
+            if here != carried:
+                self._fail("%s holds another old AUDIT_CHAIN_KEY: a change of the key here is not finished, and this "
+                           "backup carries the key of its own unfinished change. Finish the change here (python "
+                           "dockvault.py audit rekey --old-key-file %s), or move that file somewhere safe, then "
+                           "restore again. Nothing was changed." % (kept_here, kept_here))
         force = bool(getattr(args, "force", False)) if args else False
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
@@ -5473,6 +5601,14 @@ class DockVault:
                         self._fail("could not write the restore mark into %s - the deployment is stopped; "
                                    "retry the restore" % vol)
                     marked = True
+        # The old AUDIT_CHAIN_KEY the bundle carries, beside .env and on the disk before the .env that does not
+        # hold it: the restored chain may be under it.
+        if carried is not None and not os.path.lexists(kept_here):
+            try:
+                write_kept_key(kept_here, carried)
+            except OSError as exc:
+                self._fail("could not put the old AUDIT_CHAIN_KEY this backup carries into %s (%s) - the deployment "
+                           "is stopped; retry the restore" % (kept_here, exc))
         # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
         # the plaintext was decrypted into memory above; write those exact bytes.
         if sealed_env_bytes is not None:
@@ -5481,6 +5617,15 @@ class DockVault:
             _copy_secret(env_path, self._env_path())
         tighten_secret_file(self._env_path())
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
+        finish = "python dockvault.py audit accept-restore"
+        rekey = "python dockvault.py audit rekey --old-key-file %s" % kept_here
+        if carried is not None:
+            # The restored chain may be under the old key: it moves to the current key, with the old key's proof,
+            # before the restore is accepted (accept-restore seals under the current key).
+            finish = "%s (it says so when the chain is already under the current key), then %s, then remove %s" % (
+                rekey, finish, kept_here)
+            print(pal.paint("  This backup was taken while a change of AUDIT_CHAIN_KEY was not finished: the old key, "
+                            "which the audit log's chain may still be under, is back in %s." % kept_here, "yellow"))
         # Bring the restored set back up on ITS .env and health-check, so restore leaves a RUNNING
         # deployment serving the restored state (not a stopped stack the operator must remember to
         # start, which is what let the old no-op behaviour hide).
@@ -5488,29 +5633,37 @@ class DockVault:
         if not ok:
             print(pal.paint("  Docker is not available - start the restored set later with Start.\n",
                             "yellow"))
+            self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
             return
         print(pal.paint("  Starting the restored deployment ...", "cyan"))
         profiles = self._load_env().get("COMPOSE_PROFILES", "combined")
         if not self._start_secure_stack():
             self._tail_logs(self._web_service(profiles))
+            self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
             self._fail("restored, but the stack did not start - the last log lines are above.")
         if not self._wait_secure_healthy(profiles):
             self._tail_logs(self._web_service(profiles))
             print(pal.paint("  Restored and started, but the vault did NOT report healthy yet - "
                             "logs above.\n", "red"))
-            if marked:
-                print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: python "
-                                "dockvault.py audit accept-restore\n", "yellow"))
+            self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
             return
         print(pal.paint("  Restored and healthy.\n", "green"))
+        if marked and interactive and carried is None:
+            print(pal.paint("  Finishing the restore of the audit log's integrity chain:", "cyan"))
+            self._audit_host_command(argparse.Namespace(no_reseal=False, yes=False, confirm=None,
+                                                        old_key_file=None), "accept-restore")
+        else:
+            self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
+
+    def _say_how_to_finish(self, marked, carried, finish, rekey, kept):
+        """What is left after a restore: accepting it (`finish`, when it was marked), and finishing the change of
+        AUDIT_CHAIN_KEY the backup was taken during (`carried`: the key is back in `kept`)."""
+        pal = self.pal
         if marked:
-            if interactive:
-                print(pal.paint("  Finishing the restore of the audit log's integrity chain:", "cyan"))
-                self._audit_host_command(argparse.Namespace(no_reseal=False, yes=False, confirm=None,
-                                                            old_key_file=None), "accept-restore")
-            else:
-                print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: python "
-                                "dockvault.py audit accept-restore\n", "yellow"))
+            print(pal.paint("  Nothing in the audit log is deleted until you finish the restore: %s\n" % finish,
+                            "yellow"))
+        elif carried is not None:
+            print(pal.paint("  Finish the change of AUDIT_CHAIN_KEY: %s, then remove %s\n" % (rekey, kept), "yellow"))
 
     def _load_env(self):
         """Parse the current .env (best-effort: {} if absent or unreadable)."""
@@ -6695,7 +6848,7 @@ class DockVault:
         if not os.path.exists(self._env_path()):
             self._fail("there is no .env in %s: run audit change-key where the deployment's .env is. Nothing "
                        "changed." % self.root)
-        kept_path = os.path.join(self.root, ".audit-chain-key.previous")
+        kept_path = os.path.join(self.root, KEPT_CHAIN_KEY)
         if os.path.lexists(kept_path):
             self._unfinished_key_change(kept_path)
         env = self._load_env()

@@ -347,13 +347,17 @@ the recipients' mailboxes.
   acknowledge`** and the other host commands (`rekey`, `after-record`, `accept-database-head`,
   `accept-restore`, `acknowledge-removed-before`, `change-key`) write their seals audited as the host
   operator; `after-record --discard` saves the seals it deletes in a file beside the head record.
+  `change-key` keeps the old key in `.audit-chain-key.previous` beside `.env` (mode 600) until the chain has
+  moved to the new one.
   **`python dockvault.py audit retention`** (**new in 0.34.0**) prints how long each kind of record is kept,
   as the server has it, and where each value comes from, and the changes waiting with the username of the
   administrator who asked for each (not audited, like the other reads on the host); with `--set NAME=VALUE`
   it changes a line of `.env` once the server has checked it. `audit unarchive` restores archived
   days as audit rows; `audit compact` gives the audit tables' free space back to the system (both are on
   the `audit` menu too).
-- **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above.
+- **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above, and,
+  while a change of the chain's key is not finished, the old key kept beside `.env` (sealed with `.env`
+  under `--lock`), which a restore puts back.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
   erased.
 - **`python dockvault.py accounts`** on the host: the server's operator can look an account up (its
