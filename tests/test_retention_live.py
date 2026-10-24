@@ -26,6 +26,7 @@ import uuid
 import pytest
 
 from _account_change_helpers import DB, in_api_container, notifications, psql, second_admin
+from _chain_read import wait_for_chain_read
 from _throwaway_db import PREAMBLE, run_in, throwaway_database
 
 pytestmark = pytest.mark.integration
@@ -71,12 +72,14 @@ def _cancel_waiting(admin, key):
 
 
 @pytest.fixture(autouse=True, scope="module")
-def chain_started():
-    """The web process's pruner starts the audit chain a minute after the server starts; a change that
-    deletes sooner is refused until it has."""
+def chain_started(admin):
+    """The web process's pruner starts the audit chain a minute after the server starts, and reads it at its first
+    pass after any start: a change that deletes sooner is refused, and the panel shows no value of a setting the
+    chain records as in force, until it has."""
     ok = _wait_for(lambda: psql("SELECT count(*) FROM audit_seals WHERE kind = 'policy'") not in ("", "0"),
                    timeout=240, step=3)
     assert ok, "the audit chain never started"
+    wait_for_chain_read(admin)
 
 
 def _run_pass():

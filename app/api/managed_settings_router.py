@@ -41,6 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.user_management_api import require_interactive_admin
+from app.core import audit_chain_policy as chain_policy
 from app.core import audit_chain_policy_seals as chain_seals
 from app.core import audit_integrity
 from app.core import fixed_step_up
@@ -108,11 +109,35 @@ _CHAIN_SOURCE = {"setting": registry.SOURCE_ADMIN, "clamped": registry.SOURCE_AD
                  "env": registry.SOURCE_ENV, "default": registry.SOURCE_DEFAULT}
 
 
+# The source a row of a setting the chain records says until this process has read the chain.
+SOURCE_UNREAD = "unread"
+
+
+def chain_read(st=None) -> bool:
+    """Whether this process has read the audit chain's retention state (the pruner's first pass after a start reads
+    it, about a minute in; a change's own writer reads it too)."""
+    st = st or audit_integrity.state()
+    return bool(st.view.position) and st.view.newest_policy() is not None
+
+
 def with_chain(rows: list) -> list:
     """Each row of a setting the audit chain records shows what the pruner acts on (the chain's honoured
     entry): its value, where it came from, the administrator's setting behind it, and the entry itself beside
     them. The database's stored value alone decides nothing, so a value written into the database without the
-    chain's key is never shown as in force; it is shown apart, as ``database_stored``."""
+    chain's key is never shown as in force; it is shown apart, as ``database_stored``.
+
+    Until this process has read the chain (chain_read), no value of such a setting is shown as in force: its row
+    says ``chain_read`` false, with no value and the source ``unread``, the database's value apart as ever (a
+    setting the deployment locks keeps its value, which only .env gives). Nothing acts on a value meanwhile: the
+    pruner and a change both read the chain first."""
+    if not chain_read():
+        keys = set(chain_policy.chain_setting_keys())
+        for row in rows:
+            if row["key"] not in keys or row.get("source") == registry.SOURCE_LOCKED:
+                continue
+            row["database_stored"] = row.get("stored")
+            row.update(value=None, source=SOURCE_UNREAD, stored=None, clamped=False, chain=None, chain_read=False)
+        return rows
     entries = chain_seals.honoured_entries()
     for row in rows:
         entry = entries.get(row["key"])

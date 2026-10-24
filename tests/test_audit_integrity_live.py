@@ -22,6 +22,7 @@ import uuid
 import pytest
 
 from _account_change_helpers import API, DB, psql
+from _chain_read import wait_for_chain_read
 
 pytestmark = pytest.mark.integration
 
@@ -259,7 +260,8 @@ def _psql_json(sql):
 
 def test_a_value_written_into_the_database_is_neither_shown_nor_followed(admin):
     """managed_settings written straight into the database (no key) is never shown as in force, and an
-    administrator's change is judged against the chain: one that deletes sooner than the chain waits."""
+    administrator's change is judged against the chain: one that deletes sooner than the chain waits. The web
+    process reads the chain about a minute after it starts; the panel says until then that it has not."""
     from _account_change_helpers import second_admin
 
     def _put(client, password, key, value):
@@ -269,6 +271,7 @@ def test_a_value_written_into_the_database_is_neither_shown_nor_followed(admin):
         return client.put(f"/settings/managed/{key}", json={"value": value},
                           headers={"X-Second-Factor": r.json()["receipt"]})
     _wait_for(lambda: _status(admin).get("head"))
+    wait_for_chain_read(admin)
     state = _psql_json("SELECT detail->'state'->'audit_max_days' FROM audit_seals WHERE kind = 'policy' "
                        "ORDER BY seq DESC LIMIT 1")
     chain_value = state["value"]
@@ -284,7 +287,8 @@ def test_a_value_written_into_the_database_is_neither_shown_nor_followed(admin):
          "DO UPDATE SET value = CAST('10' AS json), version = (SELECT max(version) + 1 FROM managed_settings)")
     change = None
     try:
-        shown = _wait_for(lambda: (lambda r: r if r["database_stored"] == 10 else None)(
+        shown = _wait_for(lambda: (lambda r: r if r.get("chain_read") is not False and r["database_stored"] == 10
+                                   else None)(
             {r["key"]: r for r in admin.get("/settings/managed").json()["settings"]}["audit_max_days"]), timeout=30)
         assert shown, "the web process never read the stored value"
         assert shown["value"] == chain_value and shown["chain"]["value"] == chain_value

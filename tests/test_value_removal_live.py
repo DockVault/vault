@@ -23,6 +23,7 @@ import uuid
 import pytest
 
 from _account_change_helpers import psql, second_admin
+from _chain_read import wait_for_chain_read
 from _recording_levels import levels_restored, store  # noqa: F401 -- a fixture
 from _throwaway_db import PREAMBLE, run_in, throwaway_database
 
@@ -151,6 +152,7 @@ def test_a_level_changed_since_the_preview_is_refused_and_nothing_is_asked_for(a
 
 
 def test_the_levels_page_and_the_notice_say_how_long_addresses_stay_in_full(admin):
+    wait_for_chain_read(admin)                  # the page says the chain's value, once the web process has read it
     out = admin.get("/settings/recording").json()
     assert out["ip_full_days"] == 0
     managed = admin.get("/settings/managed").json()

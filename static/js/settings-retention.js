@@ -4,7 +4,9 @@
  * app/api/managed_settings_router.py), beside the recording levels (static/js/settings-records.js).
  *
  * Each setting shows the value in force and where it comes from (the default, .env, set here, or locked by the
- * deployment); a locked one shows the .env line to change instead of a field, and so does one only .env sets.
+ * deployment); a locked one shows the .env line to change instead of a field, and so does one only .env sets. One
+ * the audit log's integrity chain holds says, until the server has read the chain, that it has not yet, and shows
+ * neither a value nor a field.
  * Each change is saved on its own: the server asks for the password every time (apiRequest prompts for it). A
  * change that deletes records sooner first shows what it would delete (the audit numbers: the preview, as the
  * audit job counts) and asks to confirm; it then waits the deployment's delay, during which any administrator can
@@ -27,7 +29,8 @@
         ['working_records', 'Fixed periods'],
         ['compliance', 'Compliance access'],   // only .env sets them (app/core/compliance_settings.py)
     ];
-    const SOURCES = { default: 'Default', env: 'From .env', admin: 'Set here', locked: 'Locked' };
+    // "unread": the server has not read the audit log's integrity chain yet, which holds the value in force.
+    const SOURCES = { default: 'Default', env: 'From .env', admin: 'Set here', locked: 'Locked', unread: 'Not read yet' };
     // The audit numbers the preview counts for.
     const PREVIEW = { audit_max_days: 'max_days', audit_min_days: 'min_days', audit_admin_min_days: 'admin_min_days',
         audit_max_mb: 'max_mb' };
@@ -102,7 +105,9 @@
             `${a.hot_days} days, then move into compressed daily blocks`;
         text += a.starts_on ? ` (from ${when(a.starts_on)})` : '';
         text += ', which the Activity page still searches. Nothing is deleted by that.';
-        if (admin) text += ` Administration and security events are kept at least ${shown(admin, admin.value)}.`;
+        if (admin && admin.chain_read !== false) {
+            text += ` Administration and security events are kept at least ${shown(admin, admin.value)}.`;
+        }
         if ((S.data.pending || []).length) {
             text += ' A change that deletes records sooner waits below, and any administrator can cancel it.';
         }
@@ -159,6 +164,15 @@
         head.appendChild(badge);
         item.appendChild(head);
         if (row.help) item.appendChild(el('p', 'text-secondary text-sm', row.help));
+        if (row.chain_read === false) {
+            // The value in force is the audit log's integrity chain's, which this server has not read yet: no
+            // value from the database is shown as in force, and nothing can be changed from here until it has.
+            item.appendChild(el('p', 'text-secondary text-sm retention-unread',
+                'The value in force is held by the audit log\'s integrity chain, which this server has not read ' +
+                'yet (it does in the first minutes after it starts). Nothing is deleted under it before then. ' +
+                'Reload this page in a minute or two to see it and change it.'));
+            return item;
+        }
         const canEdit = row.editable === 'admin' && !row.locked;
         if (canEdit) {
             const line = el('div', 'retention-edit');

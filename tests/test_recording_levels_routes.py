@@ -101,6 +101,34 @@ def refused(status, *needles):
         assert needle in str(caught.value.detail), caught.value.detail
 
 
+# --------------------------------------------------------------------------- how long an address stays in full
+
+def test_the_days_an_address_stays_in_full_are_the_chains_never_the_databases_alone(db, monkeypatch):
+    """The page says how long an address stays in full as the managed settings panel has it: the audit chain's value,
+    which the pruner acts on. A value written into the database (the registry's alone) is never said, and until the
+    process has read the chain nothing is."""
+    from app.api import managed_settings_router as managed
+    from app.core import audit_chain_policy_seals as chain_seals
+    from app.core import audit_integrity as ai
+    from app.core import settings_registry
+    from app.core.audit_rewrite import FULL_DAYS_KEY
+    real = settings_registry.describe
+
+    def from_the_database(keys=None):
+        rows = real(keys)
+        for row in rows:
+            if row["key"] == FULL_DAYS_KEY:
+                row.update(value=10, source=settings_registry.SOURCE_ADMIN, stored=10)
+        return rows
+    monkeypatch.setattr(settings_registry, "describe", from_the_database)
+    monkeypatch.setattr(ai, "state", lambda: ai.ChainState())
+    assert routes.describe(db)["ip_full_days"] is None
+    monkeypatch.setattr(managed, "chain_read", lambda st=None: True)
+    monkeypatch.setattr(chain_seals, "honoured_entries", lambda st=None: {
+        FULL_DAYS_KEY: {"value": 30, "source": "setting", "setting": 30}})
+    assert routes.describe(db)["ip_full_days"] == 30
+
+
 # --------------------------------------------------------------------------- the routes
 
 def _routes():

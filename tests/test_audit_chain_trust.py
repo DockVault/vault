@@ -1,7 +1,8 @@
 """The audit log's integrity chain, offline: what the server takes from where.
 
 - an administrator's change is judged against the chain (the honoured entry and the chain's), never against
-  the value the database stores, and the panel shows what the pruner acts on;
+  the value the database stores, and the panel shows what the pruner acts on (until the process has read the
+  chain, that it has not, and no value as in force);
 - seals another writer appends after the head record: a request waits for the host's acknowledgment and a
   delay from when the server first accepted it; an acknowledgment in that writer's own ``ack`` seal counts for
   nothing; a writer whose own work fails still lists the seals it accepted;
@@ -196,6 +197,37 @@ def test_the_panel_row_of_a_chain_setting_the_deployment_locked_still_says_locke
     env.settings.settings_locked_keys = "logs_hold"
     (row,) = routes.with_chain(reg.describe(["logs_hold"]))
     assert (row["value"], row["source"], row["stored"], row["chain"]["source"]) == (False, "locked", None, "default")
+
+
+def test_until_the_process_has_read_the_chain_no_value_is_shown_as_in_force(env, monkeypatch):
+    """A web process reads the chain at its pruner's first pass, about a minute after it starts. Until then a row of a
+    setting the chain records shows no value as in force, the database's least of all: it says the chain is not
+    read yet, with the database's value apart. A setting the deployment locks keeps its value, which only .env gives,
+    and one the chain does not record is as the registry has it. Once read, the row is the chain's."""
+    from app.api import managed_settings_router as routes
+    env.run_until_sealed()
+    with env.session() as db:
+        db.add(ManagedSetting(key="audit_max_days", value=10, version=1))
+        db.commit()
+    reg.refresh(env.session)
+    env.settings.settings_locked_keys = "logs_hold"
+    keys = ["audit_max_days", "logs_hold", "audit_archive_start_after_days"]
+    assert "audit_archive_start_after_days" not in pol.chain_setting_keys()
+    plain = {r["key"]: r for r in reg.describe(keys)}
+    assert plain["audit_max_days"]["value"] == 10                       # the registry alone takes the database's
+    fresh = ai.ChainState(clock=env.clock)
+    monkeypatch.setattr(ai, "state", lambda: fresh)
+    assert routes.chain_read() is False
+    rows = {r["key"]: r for r in routes.with_chain(reg.describe(keys))}
+    row = rows["audit_max_days"]
+    assert (row["value"], row["source"], row["stored"], row["clamped"], row["chain"], row["chain_read"],
+            row["database_stored"]) == (None, "unread", None, False, None, False, 10)
+    assert rows["logs_hold"] == plain["logs_hold"]
+    assert rows["audit_archive_start_after_days"] == plain["audit_archive_start_after_days"]
+    monkeypatch.setattr(ai, "state", lambda: env.st)
+    assert routes.chain_read() is True
+    (row,) = routes.with_chain(reg.describe(["audit_max_days"]))
+    assert (row["value"], row["database_stored"], row["chain"]["value"]) == (0, 10, 0) and "chain_read" not in row
 
 
 def test_a_change_between_the_honoured_and_the_chains_value_is_a_reduction(env):

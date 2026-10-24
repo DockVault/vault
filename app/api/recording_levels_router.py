@@ -122,14 +122,19 @@ def describe(db: Session) -> dict:
                       "limit": limits[key], "env": ap.ENV_NAMES[key],
                       "limit_source": "env" if settings_registry._env_is_set(ap.ENV_NAMES[key]) else "default",
                       "choices": choices})
+    from app.api.managed_settings_router import with_chain
     from app.core.sftp_versions import sftp_same_version
     from app.core.audit_rewrite import FULL_DAYS_KEY
     check = sftp_same_version(db)
-    full_days = settings_registry.resolve(FULL_DAYS_KEY)
+    # As the managed settings panel has it: the audit chain's value, which the pruner acts on, never the database's
+    # alone; None until this process has read the chain.
+    (full,) = with_chain(settings_registry.describe([FULL_DAYS_KEY]))
+    full_days = full.get("value")
     return {
         "version": latest.version, "kinds": kinds, "locked": locked,
         # How many days an address stays in full before the pruner shortens it (0: as recorded), a retention setting.
-        "ip_full_days": full_days if isinstance(full_days, int) and not isinstance(full_days, bool) else 0,
+        "ip_full_days": None if full.get("chain_read") is False else (
+            full_days if isinstance(full_days, int) and not isinstance(full_days, bool) else 0),
         "lock_line": f"SETTINGS_LOCKED_KEYS={ap.LOCK_GROUP}",
         "presets": [{"key": name, "label": PRESET_LABELS[name], "levels": within(levels, limits)}
                     for name, levels in PRESETS.items()],

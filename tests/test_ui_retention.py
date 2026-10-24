@@ -1,7 +1,8 @@
 """UI — Settings -> Activity and records: how long records are kept (static/js/settings-retention.js).
 
 Each setting shows the value in force with a badge saying where it comes from; a locked setting (the page is
-served its own description with one locked) and one only .env sets show the .env line instead of a field. A change
+served its own description with one locked) and one only .env sets show the .env line instead of a field; one the
+audit chain holds shows, until the server has read the chain, neither a value nor a field, and says why. A change
 that deletes records sooner first shows what it would delete (the preview) and asks to confirm: dismissed, nothing
 is sent; confirmed, it asks for the password and then waits in the list of changes, where any administrator can
 cancel it. That list is the audit chain's: it says beside a change what the database says when that differs (and,
@@ -15,9 +16,17 @@ import re
 
 import pytest
 from playwright.sync_api import Page, expect
+from _chain_read import wait_for_chain_read
 from _settings_ui import show_advanced
 
 pytestmark = pytest.mark.ui
+
+
+@pytest.fixture(autouse=True)
+def _the_server_has_read_the_chain(admin):
+    """The page shows a setting the audit chain holds once the web process has read the chain, about a minute after
+    it starts."""
+    wait_for_chain_read(admin)
 
 
 def _login(page: Page, username: str, password: str, width=1440):
@@ -235,6 +244,42 @@ def test_before_the_chain_is_read_the_list_says_so(page: Page, admin_creds):
     box = page.locator("#retention-pending")
     expect(box).to_contain_text("which this server has not read yet", timeout=10000)
     expect(box).not_to_contain_text("No change is waiting.")
+
+
+def test_before_the_chain_is_read_a_setting_it_holds_shows_no_value_and_no_field(page: Page, admin_creds):
+    """A row the server says is not read yet (the chain holds its value, and the web process has not read the chain
+    in the first minutes after a start) shows neither a value, the database's served beside it least of all, nor a
+    field, and says why; the banner names no value from it. A setting the chain does not hold shows as ever."""
+    errors = []
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+
+    def unread(data):
+        for row in data["settings"]:
+            if row["key"] in ("audit_max_days", "audit_admin_min_days"):
+                row.update(value=None, source="unread", stored=None, clamped=False, chain=None, chain_read=False,
+                           database_stored=7)
+
+    def existing(data):
+        data["existing_install"] = True
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.evaluate("() => { try { localStorage.removeItem('dockvault.retention.banner.dismissed'); } catch (e) {} }")
+    _serve_managed(page, unread)
+    _serve_storage(page, existing)
+    _open(page)
+    for key in ("audit_max_days", "audit_admin_min_days"):
+        row = _row(page, key)
+        expect(row.locator(".retention-source")).to_have_text("Not read yet")
+        expect(row.locator(".retention-unread")).to_contain_text("which this server has not read yet")
+        expect(row.locator("input")).to_have_count(0)
+        expect(row.locator("button")).to_have_count(0)
+        expect(row).not_to_contain_text("7 days")
+    banner = page.locator("#retention-banner")
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text("keeps the audit log for good unless you choose otherwise")
+    expect(banner).not_to_contain_text("are kept at least")
+    expect(_row(page, "audit_archive_start_after_days")).to_contain_text("Set in .env: AUDIT_ARCHIVE_START_AFTER_DAYS=")
+    page.evaluate("() => { try { localStorage.removeItem('dockvault.retention.banner.dismissed'); } catch (e) {} }")
+    assert not errors, errors
 
 
 def test_the_storage_card_warns_from_80_percent_of_the_cap(page: Page, admin_creds):
