@@ -1477,6 +1477,22 @@ def test_a_cases_counts_are_kept_on_it_a_month_after_it_closed_and_read_from_the
     assert cases._counts_since_approval(db, one) == (1, 1) and owner_access._exports(db, one) == 1
 
 
+def test_an_export_streaming_when_its_case_closed_is_counted_once_it_ends(db, people):
+    """An export streaming when its case closes records its end after the close: a day after the close the counts
+    are not kept on the case yet, so the export is counted when they are."""
+    from datetime import timedelta
+    one = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
+    now = rights.utcnow()
+    one.status, one.closed_at = "closed", now - timedelta(days=1)
+    db.commit()
+    assert cases.keep_counts(db, now) == 0 and one.counts_kept_at is None
+    _viewed(db, one, uuid.uuid4(), action="case_export_completed")                 # the stream ends now
+    db.commit()
+    assert cases.keep_counts(db, now + timedelta(days=cases.COUNTS_SETTLE_DAYS)) == 1
+    db.commit()
+    assert (one.files_opened_count, one.exports_count) == (0, 1)
+
+
 def test_the_compliance_cases_job_keeps_the_counts(db, people, monkeypatch):
     from app.core import retention
     one = _approve(db, _ask(db, people.uma, _vaults(people.v1)), people.bob)
