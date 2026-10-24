@@ -1,0 +1,259 @@
+"""What a legal hold refuses, offline on a real (SQLite) database (app/core/hold_refusals.py and the routes that
+ask it).
+
+A vault a hold keeps anything of (a hold stands on it, or files a released hold kept wait for their purge) cannot
+be deleted: the route answers 409 with a sentence naming the case, records ``hold_blocked_delete`` under it, and
+leaves the vault as it was; a refusal by the database itself (a hold placed after the route asked) gets the same
+answer.
+
+SQLite has no triggers: a test writes the hold and kept rows the database and the hold routes would write.
+test_hold_refusals_live.py drives the same refusals on a running stack.
+"""
+import inspect
+import uuid
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
+import sqlalchemy as sa
+from fastapi import HTTPException
+
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
+
+from app.api import api_server as S  # noqa: E402
+from app.core import hold_refusals as hr  # noqa: E402
+from app.core import kept_tables  # noqa: E402
+from app.core import models as m  # noqa: E402
+from _async_run import run_coroutine  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+NOW = datetime(2026, 11, 2, 10, 0)
+
+
+@pytest.fixture
+def db():
+    from _kept_db import kept_database
+    with kept_database() as (make, _engine):
+        session = make()
+        yield session
+        session.close()
+
+
+def _user(db, name, role=m.RoleEnum.USER):
+    u = m.User(username=name, email=f"{name}@example.test", password_hash="x", role=role, is_active=True,
+               is_locked=False)
+    db.add(u)
+    db.commit()
+    return u
+
+
+def _vault(db, owner):
+    v = m.Vault(id=uuid.uuid4(), name="Quarterly accounts", owner_id=owner.id)
+    db.add(v)
+    db.commit()
+    return v
+
+
+def _case(db, auditor, number):
+    case = m.ComplianceCase(id=uuid.uuid4(), number=number, status="hold_only", purpose="litigation_hold",
+                            legal_basis="legal_obligation", justification_enc="sealed", owner_note_enc="sealed",
+                            auditor_id=auditor.id, auditor_username=auditor.username, requested_at=NOW,
+                            created_at=NOW, updated_at=NOW)
+    db.add(case)
+    db.commit()
+    return case
+
+
+def _hold(db, case, vault, *, released=None, purge_after=None):
+    db.add(m.LegalHoldVault(case_id=case.id, vault_id=vault.id, placed_by_username="ada", placed_at=NOW,
+                            released_at=released, purge_after=purge_after))
+    db.commit()
+
+
+def _kept_file(db, vault):
+    db.add(m.HeldFile(id=uuid.uuid4(), vault_id=vault.id, storage_path=f"{vault.id}/{uuid.uuid4()}", size_bytes=1,
+                      kept_reason="deleted", kept_at=NOW))
+    db.commit()
+
+
+@pytest.fixture
+def world(db):
+    ada = _user(db, "ada", m.RoleEnum.ADMIN)
+    olga = _user(db, "olga")
+    return SimpleNamespace(db=db, ada=ada, olga=olga, vault=_vault(db, olga), other=_vault(db, olga))
+
+
+def _blocked(db):
+    return db.query(m.AuditLog).filter(m.AuditLog.action == hr.ACTION).order_by(m.AuditLog.timestamp).all()
+
+
+# --------------------------------------------------------------------------- what keeps a vault
+
+def test_nothing_keeps_a_vault_without_a_hold_or_kept_rows(world):
+    assert hr.vault_keeping(world.db, world.vault.id) is None
+    # A hold on another vault, and a released hold whose kept rows were purged, keep nothing of this one.
+    case = _case(world.db, world.ada, "C-2026-0001")
+    _hold(world.db, case, world.other)
+    old = _case(world.db, world.ada, "C-2026-0002")
+    _hold(world.db, old, world.vault, released=NOW - timedelta(days=9), purge_after=NOW - timedelta(days=2))
+    assert hr.vault_keeping(world.db, world.vault.id) is None
+
+
+def test_a_standing_hold_keeps_the_vault_under_its_case(world):
+    case = _case(world.db, world.ada, "C-2026-0003")
+    _hold(world.db, case, world.vault)
+    keeping = hr.vault_keeping(world.db, world.vault.id)
+    assert keeping.standing == [(case.id, "C-2026-0003")] and keeping.waiting == []
+    text = hr.vault_text(keeping)
+    assert "under a legal hold until case C-2026-0003 ends" in text and "cannot be deleted" in text
+
+
+def test_kept_rows_of_a_released_hold_keep_the_vault_until_their_purge(world):
+    case = _case(world.db, world.ada, "C-2026-0004")
+    purge = NOW + timedelta(days=5)
+    _hold(world.db, case, world.vault, released=NOW - timedelta(days=2), purge_after=purge)
+    _kept_file(world.db, world.vault)
+    keeping = hr.vault_keeping(world.db, world.vault.id)
+    assert keeping.standing == [] and keeping.waiting == [(case.id, "C-2026-0004")] and keeping.purge_after == purge
+    text = hr.vault_text(keeping)
+    assert "case C-2026-0004" in text and f"until they are purged after {purge:%Y-%m-%d}" in text
+    assert "can be deleted then" in text
+
+
+def test_two_standing_holds_are_both_named(world):
+    first, second = _case(world.db, world.ada, "C-2026-0005"), _case(world.db, world.ada, "C-2026-0006")
+    _hold(world.db, second, world.vault)
+    _hold(world.db, first, world.vault)
+    keeping = hr.vault_keeping(world.db, world.vault.id)
+    assert [n for _c, n in keeping.standing] == ["C-2026-0005", "C-2026-0006"]
+    assert "cases C-2026-0005 and C-2026-0006" in hr.vault_text(keeping)
+
+
+# --------------------------------------------------------------------------- the record
+
+def test_the_refusal_is_recorded_under_each_case_with_no_name(world):
+    first, second = _case(world.db, world.ada, "C-2026-0007"), _case(world.db, world.ada, "C-2026-0008")
+    _hold(world.db, first, world.vault)
+    _hold(world.db, second, world.vault)
+    hr.record(world.db, world.olga, hr.VAULT, hr.vault_keeping(world.db, world.vault.id), vault_id=world.vault.id)
+    rows = _blocked(world.db)
+    assert sorted((r.case_id, r.details["case_number"]) for r in rows) == sorted(
+        [(first.id, "C-2026-0007"), (second.id, "C-2026-0008")])
+    for r in rows:
+        assert r.status == "failure" and r.user_id == world.olga.id
+        assert (r.resource_type, r.resource_id) == ("vault", str(world.vault.id))
+        assert r.details["kind"] == "vault" and r.details["vault_id"] == str(world.vault.id)
+        assert "Quarterly accounts" not in str(r.details), "no vault name"
+
+
+def test_a_record_that_cannot_be_written_never_raises(world, monkeypatch):
+    def broken(*_a, **_k):
+        raise RuntimeError("no database")
+    monkeypatch.setattr(world.db, "commit", broken)
+    hr.record(world.db, world.olga, hr.VAULT, hr.Keeping(), vault_id=world.vault.id)
+
+
+def test_only_the_vaults_triggers_refusal_is_taken_for_a_hold():
+    def raised(hint):
+        orig = Exception("refused")
+        orig.diag = SimpleNamespace(message_hint=hint)
+        return sa.exc.InternalError("DELETE FROM vaults", {}, orig)
+    assert hr.is_trigger_refusal(raised(kept_tables.HOLD_HINT)) is True
+    assert hr.is_trigger_refusal(raised("something else")) is False
+    assert hr.is_trigger_refusal(raised(None)) is False
+    assert hr.is_trigger_refusal(RuntimeError("no orig")) is False
+
+
+# --------------------------------------------------------------------------- the vault delete route
+
+DELETE_VAULT = inspect.unwrap(S.delete_vault)
+
+
+@pytest.fixture
+def route(world, monkeypatch):
+    """The vault delete route with the vault service standing in: get_vault returns the vault, and delete_vault
+    records the call (and does what ``then`` says)."""
+    state = SimpleNamespace(deleted=[], then=None)
+
+    class _Service:
+        def __init__(self, db, _perms):
+            self.db = db
+
+        def get_vault(self, vault_id, user, password, require_password=False):
+            return world.db.get(m.Vault, vault_id)
+
+        def delete_vault(self, vault_id, user):
+            if state.then is not None:
+                state.then()
+            state.deleted.append(vault_id)
+
+    monkeypatch.setattr(S, "VaultService", _Service)
+    monkeypatch.setattr(S, "get_client_ip", lambda request: "10.0.0.9")
+
+    def call(user):
+        return run_coroutine(DELETE_VAULT(vault_id=world.vault.id, request=None, vault_password=None,
+                                          x_vault_password=None, current_user=user, db=world.db))
+    state.call = call
+    return state
+
+
+@pytest.mark.parametrize("held", ["standing", "kept rows"])
+def test_the_route_refuses_a_held_vaults_delete_with_409_and_records_it(world, route, held):
+    case = _case(world.db, world.ada, "C-2026-0009")
+    if held == "standing":
+        _hold(world.db, case, world.vault)
+    else:
+        _hold(world.db, case, world.vault, released=NOW, purge_after=NOW + timedelta(days=7))
+        _kept_file(world.db, world.vault)
+    with pytest.raises(HTTPException) as refused:
+        route.call(world.olga)
+    assert refused.value.status_code == 409 and "C-2026-0009" in refused.value.detail
+    assert route.deleted == [], "the vault service was never asked to delete"
+    assert world.db.get(m.Vault, world.vault.id) is not None
+    (row,) = _blocked(world.db)
+    assert row.case_id == case.id and row.details["kind"] == "vault" and row.user_id == world.olga.id
+    assert not world.db.query(m.AuditLog).filter(m.AuditLog.action == "vault_deleted").count()
+
+
+def test_the_route_takes_the_databases_refusal_for_the_same_answer(world, route):
+    """A hold placed after the route asked: the vaults trigger refuses the delete, and the route answers 409 under
+    the hold's case rather than 500."""
+    case = _case(world.db, world.ada, "C-2026-0010")
+
+    def placed_meanwhile():
+        _hold(world.db, case, world.vault)
+        orig = Exception(f"vault {world.vault.id} is under a legal hold")
+        orig.diag = SimpleNamespace(message_hint=kept_tables.HOLD_HINT)
+        raise sa.exc.InternalError("DELETE FROM vaults", {}, orig)
+    route.then = placed_meanwhile
+    with pytest.raises(HTTPException) as refused:
+        route.call(world.olga)
+    assert refused.value.status_code == 409 and "C-2026-0010" in refused.value.detail
+    (row,) = _blocked(world.db)
+    assert row.case_id == case.id
+
+
+def test_another_failure_of_the_delete_is_still_a_500(world, route):
+    def fails():
+        raise RuntimeError("disk")
+    route.then = fails
+    with pytest.raises(HTTPException) as failed:
+        route.call(world.olga)
+    assert failed.value.status_code == 500 and _blocked(world.db) == []
+
+
+def test_a_vault_nothing_keeps_is_deleted_as_before(world, route):
+    """The control: the same call with no hold reaches the vault service, and nothing is refused."""
+    out = route.call(world.olga)
+    assert route.deleted == [world.vault.id] and "deleted" in out["message"] and _blocked(world.db) == []
+
+
+def test_the_route_asks_after_the_owner_check_and_before_the_service_deletes():
+    source = inspect.getsource(S.delete_vault)
+    asked = source.index("hold_refusals.vault_keeping(db, vault_id)")
+    assert source.index("Only the vault owner or an admin can delete this vault") < asked
+    assert asked < source.index("vault_service.delete_vault(vault_id, current_user)")
+    assert source.count("hold_refusals.is_trigger_refusal(e)") == 1

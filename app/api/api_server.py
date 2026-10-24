@@ -17947,6 +17947,14 @@ async def delete_vault(
                 detail="Only the vault owner or an admin can delete this vault"
             )
 
+        # A legal hold that keeps anything of the vault refuses its deletion: 409, recorded under the case
+        # (app/core/hold_refusals.py). The database refuses it too (the vaults trigger), below.
+        from app.core import hold_refusals
+        keeping = hold_refusals.vault_keeping(db, vault_id)
+        if keeping is not None:
+            hold_refusals.record(db, current_user, hold_refusals.VAULT, keeping, vault_id=vault_id)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=hold_refusals.vault_text(keeping))
+
         # Delete via the service so the on-disk encrypted blobs are removed too — the
         # route previously did a bare db.delete() that left {storage}/{vault_id}/ orphaned on
         # disk forever (disk-exhaustion DoS + broken secure-delete). The service re-checks
@@ -17980,6 +17988,16 @@ async def delete_vault(
         )
     except Exception as e:
         db.rollback()
+        from app.core import hold_refusals
+        if hold_refusals.is_trigger_refusal(e):
+            # A hold placed after the check above: the database refused the delete, and nothing was deleted.
+            try:
+                keeping = hold_refusals.vault_keeping(db, vault_id) or hold_refusals.Keeping()
+            except Exception:  # noqa: BLE001 -- the refusal stands without naming its case
+                db.rollback()
+                keeping = hold_refusals.Keeping()
+            hold_refusals.record(db, current_user, hold_refusals.VAULT, keeping, vault_id=vault_id)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=hold_refusals.vault_text(keeping))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete vault: {str(e)}"
