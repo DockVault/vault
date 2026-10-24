@@ -669,6 +669,11 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
 
 _cursors: Dict[tuple, datetime] = {}
 _EPOCH = datetime(1970, 1, 1)
+# Per run of the shortening (the key of _cursors), what it passed over because a compliance case keeps it as it is:
+# {id: time} of rows of audit_logs, and {day: how many rows} of archived days. Kept in this process only, as the
+# cursor is: after a restart the run reads everything again from the first hour.
+_kept_rows: Dict[tuple, Dict] = {}
+_kept_days: Dict[tuple, Dict] = {}
 
 
 def full_days(st) -> Optional[int]:
@@ -699,11 +704,105 @@ def cutoff(view, before: datetime) -> datetime:
     return before
 
 
+def _row_values(row) -> dict:
+    return {c.key: getattr(row, c.key) for c in row.__table__.columns}
+
+
+def _kept_to_shorten(db, now: datetime, start: datetime, end: datetime) -> Dict:
+    """{id: time} of the rows of audit_logs from ``start`` to ``end`` whose address the shortening would shorten but
+    which a compliance case keeps as they are (retention.kept_as_is)."""
+    from app.core import retention
+    from app.core.models import AuditLog as A
+    ap = _ap()
+    clause = retention.kept_as_is(A, now)
+    if clause is None or end <= start:
+        return {}
+    out = {}
+    for row in db.query(A).filter(*prefilter(A, {ap.IP: ap.SHORTENED}), A.timestamp >= start, A.timestamp < end,
+                                  clause):
+        if shortened(_row_values(row)) is not None:
+            out[row.id] = row.timestamp
+    return out
+
+
+def _in_archived_part(view, t: datetime) -> bool:
+    """Whether the hour of ``t`` is in a part of an archived day."""
+    entry = view.archives.get(t.date())
+    if entry is None or not entry.parts:
+        return False
+    hour = _ai().hour_floor(t)
+    return any(p.first_hour <= hour <= p.last_hour for p in entry.parts)
+
+
+def _let_go(w, key: tuple, before: datetime, now: datetime) -> Optional[datetime]:
+    """Where the shortening goes back to for what a compliance case kept as it was when the run passed it and has let
+    go of since: the hour of such a row that still holds a full address, or that is no longer a row because the
+    archive moved it (its day is read again there), and the start of an archived day in which fewer rows are kept
+    than when it was read. None when there is none. What a case still keeps stays noted; what it let go is not."""
+    from app.core import audit_archive as arc
+    from app.core import retention
+    from app.core.models import AuditLog as A
+    db = w.db
+    back: List[datetime] = []
+    rows = _kept_rows.get(key) or {}
+    if rows:
+        clause = retention.kept_as_is(A, now)
+        ids = list(rows)
+        still, present = set(), {}
+        for first in range(0, len(ids), 500):
+            chunk = ids[first:first + 500]
+            for row in db.query(A).filter(A.id.in_(chunk)):
+                present[row.id] = row
+            if clause is not None:
+                still |= {i for (i,) in db.query(A.id).filter(A.id.in_(chunk), clause)}
+        for row_id in [i for i in ids if i not in still]:
+            t = rows.pop(row_id)
+            row = present.get(row_id)
+            if row is None:
+                if _in_archived_part(w.st.view, t):
+                    back.append(t)
+            elif shortened(_row_values(row)) is not None:
+                back.append(t)
+    days = _kept_days.get(key) or {}
+    for day, n in sorted(days.items()):
+        try:
+            kept = kept_in_archived_day(w, day, shortened, now=now, before=before)
+        except NotRewritten:
+            continue                        # read again at the next pass
+        if kept < n:
+            back.append(arc.day_start(day))
+        if kept:
+            days[day] = kept
+        else:
+            del days[day]
+    return _ai().hour_floor(min(back)) if back else None
+
+
+def _note_kept(db, key: tuple, now: datetime, start: datetime, end: datetime, scope: "Scope") -> None:
+    """Note what a step of the shortening passed over, from ``start`` to ``end``, because a compliance case keeps it
+    as it is: the rows of audit_logs, and the archived days it read (scope.kept_archived)."""
+    rows = _kept_to_shorten(db, now, start, end)
+    if rows:
+        _kept_rows.setdefault(key, {}).update(rows)
+    if scope.kept_archived:
+        days = _kept_days.setdefault(key, {})
+        for day, n in scope.kept_archived.items():
+            if n:
+                days[day] = n
+            else:
+                days.pop(day, None)
+
+
 def shorten_job(p):
     """The pruner's audit_ip_shortening job: addresses whose rows are older than audit_ip_full_days shortened, through
     rewrite seals of reason shorten-ip (an archived day once the whole day is past the cutoff). A day archived in a
     later release's block format is passed over; a unit that does not check out, rows dated before the chain's first
-    hour among them, is reported and passed over. Returns a retention.JobResult (the rows changed, as cleared)."""
+    hour among them, is reported and passed over. Returns a retention.JobResult (the rows changed, as cleared).
+
+    The run passes over the rows a compliance case keeps as they are, and notes them as it passes (in an archived
+    day, how many the day keeps). Once a pass, each noted row is looked at again, and each noted day read again: the
+    run goes back to the first one a case has let go of since, as a row or in the archived day the archive moved it
+    into, even once it has reached the cutoff, so such an address is shortened too and never waits for a restart."""
     from app.core import person_erase as pe
     from app.core import retention
     from app.core.models import AuditLog
@@ -722,13 +821,17 @@ def shorten_job(p):
         return result
     engine = ai._engine_of(p.session_factory)
     key = (id(st), st.view.generation)
-    # A compliance case's rows stay as they are (retention.register_keep_as_is).
+    for noted in (_kept_rows, _kept_days):
+        for other in [k for k in noted if k != key]:
+            del noted[other]                        # another generation's: its run starts again from the first hour
+    # A compliance case's rows stay as they are (retention.register_keep_as_is), noted as the run passes them.
     conditions = retention.changeable(AuditLog, p.now, *prefilter(AuditLog, {ap.IP: ap.SHORTENED}))
     findings: Dict[str, str] = {}
+    looked = False
     while p.time_left() and not p.held_now():
         before = cutoff(st.view, ai.hour_floor(min(p.now, st.clock()) - timedelta(days=days)))
         cursor = _cursors.get(key, _EPOCH)
-        if cursor >= before:
+        if cursor >= before and (looked or not (_kept_rows.get(key) or _kept_days.get(key))):
             break
         outcome = None
         with ai.ChainWriter(engine, st) as w:
@@ -738,9 +841,22 @@ def shorten_job(p):
             if waits:
                 ai._say(f"The pruner's audit_ip_shortening job waits: {waits}")
                 break
+            if not looked:
+                # Once a pass: back to what a case kept when the run passed it and has let go of since.
+                looked = True
+                back = _let_go(w, key, before, p.now)
+                if back is not None and back < cursor:
+                    cursor = back
+                    _cursors[key] = cursor
+                if cursor >= before:
+                    w.written = []
+                    w.db.rollback()
+                    break
+            start = cursor
+            scope = Scope(SHORTEN, before, shortened, conditions)
             try:
-                outcome, cursor, changed, oldest, newest, _unit = step(
-                    p, w, Scope(SHORTEN, before, shortened, conditions), cursor)
+                outcome, cursor, changed, oldest, newest, _unit = step(p, w, scope, cursor)
+                _note_kept(w.db, key, p.now, start, before if outcome == FINISHED else min(cursor, before), scope)
             except NotRewritten as nr:
                 w.written = []
                 w.db.rollback()

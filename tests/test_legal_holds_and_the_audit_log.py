@@ -12,7 +12,8 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py) and th
 - A compliance case's rows that must be kept (compliance_retention.case_rows_kept) stay as they are where an
   erase, a removal or the shortening would change them; the archive leaves a day that holds one as rows, and takes
   it once they may go; the audit job's prune of an archived day keeps them in its blocks. An erase or a removal
-  that met such rows stays running and says so until the case lets them go, then changes them and completes.
+  that met such rows stays running and says so until the case lets them go, then changes them and completes; the
+  shortening goes back to them once the case lets them go, as rows or in an archived day, in the same process.
 """
 import json
 import subprocess
@@ -596,6 +597,76 @@ def test_the_shortening_leaves_a_cases_rows_that_must_be_kept_as_they_are(env30)
     rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     assert env.get(kept).ip_address == "203.0.113.9"
     assert env.get(gone).ip_address is None
+    assert failures(env.verify()) == []
+
+
+def _shorten(env):
+    env.clock.advance(hours=6)
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+
+
+def test_the_shortening_goes_back_to_a_row_a_case_let_go_after_its_run_passed_it(env30):
+    """The run passed a row a closed case kept (within the records' floor) and went on to the cutoff; while the case
+    keeps it, the next passes leave it and write nothing. Once the case lets it go, the next pass of the same
+    process goes back to it and shortens it: no restart is needed to start the run again from the first hour."""
+    env = env30
+    case = _case(env, closed_days=30)
+    gone = env.put(T0 - timedelta(days=40))
+    kept = env.put(T0 - timedelta(days=40, hours=-2), case_id=case)       # in an hour after every other row
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(gone).ip_address is None and env.get(kept).ip_address == "203.0.113.9"
+    key = (id(env.st), env.st.view.generation)
+    reached = rw._cursors[key]
+    assert reached > T0 - timedelta(days=40, hours=-2)
+    seals = len(env.rewrite_seals())
+    _shorten(env)
+    assert env.get(kept).ip_address == "203.0.113.9" and len(env.rewrite_seals()) == seals
+    _close(env, case, FLOOR_DAYS + 1)
+    _shorten(env)
+    assert env.get(kept).ip_address is None and (env.get(kept).recorded or {}).get("ip") == "203.0.113.0/24"
+    assert rw._cursors[key] >= reached
+    assert failures(env.verify()) == []
+
+
+def test_the_shortening_reaches_a_row_a_case_let_go_in_the_day_the_archive_moved_it_to(env30):
+    """The case lets the row go after the run passed it, and the archive then moves its day into a block: the next
+    pass goes back to that day and shortens the row in its block."""
+    env = env30
+    case = _case(env, closed_days=30)
+    kept = env.put(_at(120, 23), case_id=case)
+    gone = env.put(_at(120, 23, 10))
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept).ip_address == "203.0.113.9" and env.get(gone).ip_address is None
+    _close(env, case, FLOOR_DAYS + 1)
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept) is None and _archived_rows(env)[kept]["ip_address"] == "203.0.113.9"
+    _shorten(env)
+    assert _archived_rows(env)[kept]["ip_address"] is None
+    assert failures(env.verify()) == []
+
+
+def test_the_shortening_goes_back_to_an_archived_days_row_a_case_let_go(env30):
+    """A case row archived while nothing kept it, then kept again (the floor raised): the shortening leaves it in its
+    block; once the floor is back where it was, the next pass reads the day again and shortens it there."""
+    env = env30
+    case = _case(env, closed_days=FLOOR_DAYS + 30)
+    kept = env.put(_at(120, 3), case_id=case)
+    gone = env.put(_at(120, 3, 20))
+    env.run_until_sealed()
+    arc.archive_job(retention.Pass(env.session, now=env.clock()))
+    assert env.get(kept) is None and _blocks(env) == 1
+    env.settings.compliance_record_min_days = FLOOR_DAYS + 200
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    rows = _archived_rows(env)
+    assert rows[kept]["ip_address"] == "203.0.113.9" and rows[gone]["ip_address"] is None
+    _shorten(env)
+    assert _archived_rows(env)[kept]["ip_address"] == "203.0.113.9"
+    env.settings.compliance_record_min_days = FLOOR_DAYS
+    _shorten(env)
+    assert _archived_rows(env)[kept]["ip_address"] is None
     assert failures(env.verify()) == []
 
 

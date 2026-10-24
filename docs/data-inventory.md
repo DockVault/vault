@@ -221,7 +221,8 @@ Each row of `audit_logs` holds:
   day is: up to a day later). Either change gives each changed row a new
   `seal_nonce`, and the integrity chain records it and still verifies. Both wait while a legal hold stands or
   a compliance case is open, and leave a case's rows that must be kept as they are; a removal then stays
-  running, and says so, until the case lets them go, and changes them and completes then;
+  running, and says so, until the case lets them go, and changes them and completes then, and the shortening
+  comes back to them, as rows or in an archived day, once the case lets them go;
 - **New in 0.34.0:** `seal_nonce`, 16 random bytes on every row written from 0.34.0 on, under which the
   log's integrity chain hashes the row's personal values (`audit_seals`), so that once it is destroyed the
   hash reveals nothing about them. `case_id`: the compliance case a row was written under (see
