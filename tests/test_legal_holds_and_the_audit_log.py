@@ -624,9 +624,10 @@ def test_the_shortening_goes_back_to_a_row_a_case_let_go_after_its_run_passed_it
     _shorten(env)
     assert env.get(kept).ip_address == "203.0.113.9" and len(env.rewrite_seals()) == seals
     _close(env, case, FLOOR_DAYS + 1)
-    _shorten(env)
+    at = rw._cursors[key]                       # the run stands at the cutoff, which a pass at this clock keeps
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     assert env.get(kept).ip_address is None and (env.get(kept).recorded or {}).get("ip") == "203.0.113.0/24"
-    assert rw._cursors[key] >= reached
+    assert rw._cursors[key] == at > reached
     assert failures(env.verify()) == []
 
 

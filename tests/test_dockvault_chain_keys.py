@@ -388,7 +388,8 @@ def test_a_key_change_with_no_env_is_refused_with_nothing_written(tmp_path, monk
     with pytest.raises(SystemExit):
         tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
     assert list(tmp_path.iterdir()) == []
-    assert "Nothing changed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "there is no .env" in out and "Nothing changed" in out
 
 
 def test_a_sealed_env_keeps_every_secret_through_a_key_change_and_a_lock(tmp_path, monkeypatch):
