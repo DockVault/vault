@@ -740,21 +740,30 @@ def test_any_other_failure_of_the_turn_is_not_taken_for_busy():
 
 
 def test_the_routes_take_the_turn_before_the_code_is_used_and_keep_it_until_the_step_commits():
-    """A hold, an undone release and a case request: the turn is taken before the code is used, the code is used in
-    a session of its own (using it may commit), and the step runs after, in the turn. The hold and the undo ask for
-    the code before they wait for the turn when there is no receipt."""
+    """A hold, an undone release and a case request: the turn is taken before the code is used, the route's check is
+    called in a session of its own (using a code may commit), and the step runs after, in the turn. The hold and the
+    undo ask for the code before they wait for the turn when there is no receipt, and use none after it."""
     import inspect
     from app.api import compliance_router as routes
     for route, step_up, then in ((routes.place_hold, "STEP_UP_HOLD_PLACE", "holds.place_hold_only(db, "),
                                  (routes.undo_hold_release, "STEP_UP_HOLD_DECIDE", "_take_decision("),
                                  (routes.request_case, "STEP_UP_CASE_REQUEST", "case = cases.request_case(db, ")):
-        src = inspect.getsource(route)
-        turn = src.index("_take_the_turn(db, ")
-        used = src.index(f"_code_used_keeping_the_turn({step_up}, ")
-        assert turn < used < src.index(then), route.__name__
-        assert f"{step_up}(db, " not in src, route.__name__
-        if route is not routes.request_case:
-            assert src.index(f"_code_asked_first({step_up}, ") < turn, route.__name__
+        lines = inspect.getsource(route).splitlines()
+        calls = [i for i, line in enumerate(lines) if f"{step_up}(" in line]
+        for i in calls:
+            assert lines[i].strip().startswith(f"{step_up}(own, current_user, request)"), (route.__name__, lines[i])
+            assert lines[i - 1].strip() == "with _code_session() as own:", (route.__name__, lines[i - 1])
+        turns = [i for i, line in enumerate(lines) if "_take_the_turn(db, " in line]
+        assert len(turns) == 1, route.__name__
+        turn, step = turns[0], next(i for i, line in enumerate(lines) if then in line)
+        if route is routes.request_case:
+            assert len(calls) == 1 and turn < calls[0] < step, route.__name__
+            continue
+        assert len(calls) == 2, route.__name__
+        first, after = calls
+        assert first < turn < after < step, route.__name__
+        assert lines[first - 2].strip() == "if asked:" and lines[after - 2].strip() == "if not asked:", route.__name__
+        assert sum(line.strip() == "asked = _no_receipt(request)" for line in lines[:first - 2]) == 1, route.__name__
     ask = inspect.getsource(routes.request_case)
     assert "db.rollback()" not in ask
     assert ask.index("_take_the_turn(db, ") < ask.index("point = db.begin_nested()") < ask.index(

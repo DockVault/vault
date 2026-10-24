@@ -44,6 +44,7 @@ permission, and records what it reads and every refusal.
 from __future__ import annotations
 
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -385,20 +386,28 @@ def _hold_refused(db, action: str, case, actor, refused) -> None:
 # (legal_holds.take_turn), and a deletion step holds it shared for its whole transaction. The route takes it before
 # the step-up's code is used, and keeps it until the step commits: a deletion step that holds it for longer than
 # legal_holds.TURN_WAIT_SECONDS is answered 409 (deletion_running, with Retry-After) with nothing written and no code
-# used; once the code is used, the step has the turn and runs. The code is used in a session of its own, since using
-# it may commit (a code kept in the database while Redis is away), which would end the step's transaction and give
-# the turn back.
+# used; once the code is used, the step has the turn and runs. The route calls the step-up's check in a session of
+# its own (_code_session), since using a code may commit (a code kept in the database while Redis is away), which
+# would end the step's transaction and give the turn back.
 
 TURN_RETRY_AFTER_SECONDS = 60
 
 
-def _code_asked_first(step_up, db, user, request) -> bool:
-    """A request with no receipt is answered by the step-up (403, asking for the code) before anything waits for the
-    turn. True when the step-up let it through as it was (it asked for nothing), so there is no code to use."""
-    if not request.headers.get("X-Second-Factor"):
-        step_up(db, user, request)
-        return True
-    return False
+def _no_receipt(request) -> bool:
+    """Whether ``request`` carries no step-up receipt: the step-up then answers (asking for the code) before anything
+    waits for the turn, and there is no code to use after it."""
+    return not request.headers.get("X-Second-Factor")
+
+
+@contextmanager
+def _code_session():
+    """A session of its own for the step-up's check: the step's session, which holds the turn, goes on as it was."""
+    from app.core.database import SessionLocal
+    own = SessionLocal()
+    try:
+        yield own
+    finally:
+        own.close()
 
 
 def _take_the_turn(db, action: str, case, actor) -> None:
@@ -420,17 +429,6 @@ def _turn_busy(db, action: str, case, actor) -> None:
     raise HTTPException(status_code=409, detail={"reason": holds.DELETION_RUNNING,
                                                  "text": holds.text(holds.DELETION_RUNNING)},
                         headers={"Retry-After": str(TURN_RETRY_AFTER_SECONDS)})
-
-
-def _code_used_keeping_the_turn(step_up, user, request) -> None:
-    """The step-up checked and its code used in a session of its own: ``db``'s transaction, which holds the turn,
-    goes on."""
-    from app.core.database import SessionLocal
-    own = SessionLocal()
-    try:
-        step_up(own, user, request)
-    finally:
-        own.close()
 
 
 def _case_or_404(db, case_id, *, lock: bool = False):
@@ -571,11 +569,15 @@ def place_hold(body: HoldPlacement, request: Request, current_user: User = Depen
     except holds.HoldRefused as refused:
         raise HTTPException(status_code=refused.code, detail={"reason": refused.reason,
                                                               "text": holds.text(refused.reason)})
-    asked = _code_asked_first(STEP_UP_HOLD_PLACE, db, current_user, request)
+    asked = _no_receipt(request)
+    if asked:
+        with _code_session() as own:
+            STEP_UP_HOLD_PLACE(own, current_user, request)     # asks for the code before waiting for the turn
     limit_statements(db)
     _take_the_turn(db, "hold_placed", None, current_user)
     if not asked:
-        _code_used_keeping_the_turn(STEP_UP_HOLD_PLACE, current_user, request)
+        with _code_session() as own:
+            STEP_UP_HOLD_PLACE(own, current_user, request)     # the code used once the step has the turn
     try:
         case = holds.place_hold_only(db, current_user, body.vault_ids, purpose=body.purpose,
                                      legal_basis=body.legal_basis, lia_reference=body.lia_reference,
@@ -668,11 +670,15 @@ def undo_hold_release(case_id: uuid.UUID, request: Request, current_user: User =
     their confirmation. An independent administrator. Refused while an SFTP server of another version may run."""
     from app.core import legal_holds as holds
     case = _check_decision(case_id, current_user, db, action="hold_release_undone", refusal=_undo_refusal)
-    asked = _code_asked_first(STEP_UP_HOLD_DECIDE, db, current_user, request)
+    asked = _no_receipt(request)
+    if asked:
+        with _code_session() as own:
+            STEP_UP_HOLD_DECIDE(own, current_user, request)    # asks for the code before waiting for the turn
     # The undo makes the holds stand again: it takes the turn before the code is used (see _take_the_turn).
     _take_the_turn(db, "hold_release_undone", case, current_user)
     if not asked:
-        _code_used_keeping_the_turn(STEP_UP_HOLD_DECIDE, current_user, request)
+        with _code_session() as own:
+            STEP_UP_HOLD_DECIDE(own, current_user, request)    # the code used once the step has the turn
     return _take_decision(case_id, current_user, db, action="hold_release_undone", refusal=_undo_refusal,
                           guard=True, step=lambda case: holds.undo_release(db, case, by=current_user))
 
@@ -845,7 +851,8 @@ def request_case(body: CaseRequest, request: Request, current_user: User = Depen
         point.rollback()
         _turn_busy(db, "case_requested", None, current_user)
     point.rollback()
-    _code_used_keeping_the_turn(STEP_UP_CASE_REQUEST, current_user, request)
+    with _code_session() as own:
+        STEP_UP_CASE_REQUEST(own, current_user, request)       # the code used once the step has the turn
     try:
         case = cases.request_case(db, current_user, **args)
         db.commit()
