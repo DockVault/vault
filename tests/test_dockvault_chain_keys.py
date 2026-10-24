@@ -1016,3 +1016,57 @@ def test_the_key_an_update_offers_is_never_written_over_one_set_while_it_waited_
     monkeypatch.setattr(dv, "confirm", confirm)
     tool._offer_chain_key(argparse.Namespace(no_chain_key=False), True, "0.34.0")
     assert _chain_key(tmp_path) == meanwhile
+
+
+# --------------------------------------------------------------------------- on the disk, in order
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="an owner is POSIX's")
+def test_env_is_given_its_owner_before_its_new_bytes_are_synced(tmp_path, monkeypatch):
+    """The file synced is the final one, owner and all: given its owner after the sync, a power cut could leave a
+    .env on the disk the deployment's user cannot read."""
+    import os
+    (tmp_path / ".env").write_text("A=1\n", encoding="utf-8")
+    events = []
+    real_fchown, real_fsync = os.fchown, os.fsync
+
+    def fchown(fd, uid, gid):
+        events.append(("chown", os.fstat(fd).st_ino))
+        return real_fchown(fd, uid, gid)
+
+    def fsync(fd):
+        events.append(("sync", os.fstat(fd).st_ino))
+        return real_fsync(fd)
+    monkeypatch.setattr(os, "fchown", fchown)
+    monkeypatch.setattr(os, "fsync", fsync)
+    dv.replace_file_durably(str(tmp_path / ".env"), "A=2\n")
+    new = (tmp_path / ".env").stat().st_ino
+    assert ("chown", new) in events and events.index(("chown", new)) < events.index(("sync", new)), events
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "A=2\n"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "O_DIRECTORY"), reason="a directory cannot be synced here")
+def test_a_kept_key_is_on_the_disk_with_its_name_when_it_is_written(tmp_path, monkeypatch):
+    """The key a backup carries, and the one a restore puts back before the .env that does not hold it: the file is
+    synced, then its directory, before write_kept_key returns."""
+    events = []
+    _fsyncs(monkeypatch, events)
+    path = tmp_path / "audit-chain-key.previous"
+    dv.write_kept_key(str(path), "k" * 64)
+    file_sync = ("file", path.stat().st_ino)
+    assert file_sync in events and ("dir", tmp_path.stat().st_ino) in events[events.index(file_sync) + 1:], events
+    assert path.read_text(encoding="utf-8") == "k" * 64 + "\n"
+
+
+def test_the_restore_mark_is_synced_once_it_has_its_name(tmp_path):
+    """The restore mark keeps the pruner from deleting until the restore is accepted: written whole under a temporary
+    name, owned and narrowed, renamed into place, then synced, before the restore goes on to the next volume."""
+    seen = {}
+
+    def run(cmd, **k):
+        seen["cmd"], seen["input"] = cmd, k.get("input")
+        return _Result()
+    assert dv.write_volume_file("set_vault_keys", "audit-chain-head.json.restore-pending", "{}", run=run)
+    script = seen["cmd"][seen["cmd"].index("-c") + 1]
+    steps = [step.strip().split()[0] for step in script.split("&&")]
+    assert steps == ["cat", "chown", "chmod", "mv", "sync"], script
+    assert seen["cmd"][-1] == "audit-chain-head.json.restore-pending" and seen["input"] == "{}"
