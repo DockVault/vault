@@ -524,10 +524,10 @@ def kept_in_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, no
             raise NotRewritten(f"{nv}; nothing in {day.isoformat()} was read", nv.kind) from None
 
         def changing():
-            for r in reader.rows():
-                t = r.get("timestamp")
-                if t is not None and t < before and str(r["id"]) not in erased and change(r):
-                    yield r
+            for row in reader.rows():
+                t = row.get("timestamp")
+                if t is not None and t < before and str(row["id"]) not in erased and change(row):
+                    yield row
         total += len(arc.kept_as_is(w.db, changing(), now))
         try:
             reader.finish()
