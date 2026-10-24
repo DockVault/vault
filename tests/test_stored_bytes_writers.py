@@ -765,11 +765,14 @@ def test_the_new_forms_that_read_or_hold_no_file_stay_alone():
 # Raw ways of writing a file, each added to a real function of the application: (the code, its scope).
 _MORE_FORMS = {
     "a writer bound in a class body, called through self": (
+        "class _Saver:\n    put = os.replace\n\n    def added_writer(self, path, mode):\n"
+        "        self.put(path, mode)\n", "_Saver.added_writer"),
+    "a writer bound in a class body, called through the class": (
+        "class _Saver:\n    put = os.replace\n\n\ndef added_writer(path, mode):\n    _Saver.put(path, mode)\n",
+        "added_writer"),
+    "a writer bound in a class body as save, called through self": (
         "class _Saver:\n    save = os.replace\n\n    def added_writer(self, path, mode):\n"
         "        self.save(path, mode)\n", "_Saver.added_writer"),
-    "a writer bound in a class body, called through the class": (
-        "class _Saver:\n    save = os.replace\n\n\ndef added_writer(path, mode):\n    _Saver.save(path, mode)\n",
-        "added_writer"),
     "a file handler's subclass made": (
         "class _Log(logging.handlers.RotatingFileHandler):\n    pass\n\n\n"
         "def added_writer(path, mode):\n    _Log(path)\n", "added_writer"),

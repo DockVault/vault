@@ -702,6 +702,29 @@ def test_the_shortening_reads_of_a_row_only_the_columns_its_notes_and_its_look_l
     assert rw.shortened(rows[1]) is not None and rw.shortened(rows[0]) is not None
 
 
+def test_a_pass_that_only_looks_reads_no_row_a_case_still_keeps(env30, monkeypatch):
+    """The look asks the case's rule for the noted ids, and reads the address of only those a case has let go: while
+    the case keeps them all, a pass reads none of them and the run does not go back."""
+    env = env30
+    case = _case(env, closed_days=30)
+    kept = [env.put(T0 - timedelta(days=40, minutes=-i), case_id=case) for i in range(3)]
+    env.run_until_sealed()
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    key = (id(env.st), env.st.view.generation)
+    assert set(kept) <= set(rw._kept_rows[key])
+    at = rw._cursors[key]
+    read = []
+    real = rw._address_rows
+
+    def counting(db, *conditions):
+        for row in real(db, *conditions):
+            read.append(row[0])
+            yield row
+    monkeypatch.setattr(rw, "_address_rows", counting)
+    rw.shorten_job(retention.Pass(env.session, now=env.clock()))
+    assert read == [] and rw._cursors[key] == at
+    assert all(env.get(i).ip_address == "203.0.113.9" for i in kept)
+
 def test_the_shortening_goes_back_to_a_let_go_row_whose_only_full_address_is_in_its_details(env30):
     """The look loads only the columns of an address: an address under a key of details (no ip_address) is one."""
     env = env30
