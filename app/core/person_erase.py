@@ -209,7 +209,7 @@ def is_server_name(name) -> bool:
     return any(form == server_name_form(n) for n in system_names())
 
 
-# --------------------------------------------------------------------------- accounts an older release let take such a name
+# --------------------------------------------------------------------------- accounts named like the server
 
 SERVER_NAMED_NOTICE = "account_named_like_the_server"
 
@@ -774,7 +774,9 @@ def preview(db, name: str, now: datetime, st=None) -> dict:
     if undated:
         not_reached.append(f"{undated} audit rows with no time")
     if kept:
-        not_reached.append(f"{kept} audit rows of a compliance case whose records must be kept, which stay as they are")
+        not_reached.append(f"{kept} audit rows of a compliance case whose records must be kept, which stay as they are "
+                           "until the case lets them go: the erase waits for them, and completes once it has erased "
+                           "them")
     return {
         "refused": has,
         "audit_rows": len(times) if times is not None else None,

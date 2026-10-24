@@ -447,13 +447,17 @@ def rewrite_hour(w, hour: datetime, change: Callable[[dict], Optional[dict]], *,
     return len(changes), ai.hour_entry(hour, root.seq, fig)
 
 
-def rewrite_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, now: datetime, before: datetime):
+def rewrite_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, now: datetime, before: datetime,
+                         kept_out: Optional[dict] = None):
     """Rewrite the archived rows of ``day`` (those before ``before``) that ``change`` changes, in ``w``'s
     transaction, through the block-rewrite primitive: its Rewritten (the rewrite seal's entries and the new parts),
-    or None when none changes. Raises NotRewritten."""
+    or None when none changes. ``kept_out[day]``, when given, is set to how many of those rows a compliance case
+    keeps as they are (left unchanged). Raises NotRewritten."""
     from app.core import audit_archive as arc
     view = w.st.view
     erased = view.erased_rows
+    if kept_out is not None:
+        kept_out[day] = 0
 
     def wanted(row) -> Optional[dict]:
         t = row.get("timestamp")
@@ -471,6 +475,8 @@ def rewrite_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, no
                     found[r["id"]] = r["timestamp"]
                     yield r
         kept = arc.kept_as_is(w.db, changing(), now)
+        if kept_out is not None:
+            kept_out[day] = kept_out.get(day, 0) + sum(1 for i in found if i in kept)
         return {i: t for i, t in found.items() if i not in kept}
 
     def transform(row):
@@ -501,6 +507,35 @@ def rewrite_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, no
     return rw
 
 
+def kept_in_archived_day(w, day, change: Callable[[dict], Optional[dict]], *, now: datetime, before: datetime) -> int:
+    """How many archived rows of ``day`` (before ``before``) ``change`` would change that a compliance case keeps as
+    they are, each part read and checked; nothing written. Raises NotRewritten."""
+    from app.core import audit_archive as arc
+    view = w.st.view
+    entry = view.archives.get(day)
+    if entry is None or not entry.parts:
+        return 0
+    erased = view.erased_rows
+    total = 0
+    for part in sorted(entry.parts, key=lambda p: p.first_hour):
+        try:
+            reader = arc.PartReader(w.db, view, day, part)
+        except arc.NotVerified as nv:
+            raise NotRewritten(f"{nv}; nothing in {day.isoformat()} was read", nv.kind) from None
+
+        def changing():
+            for r in reader.rows():
+                t = r.get("timestamp")
+                if t is not None and t < before and str(r["id"]) not in erased and change(r):
+                    yield r
+        total += len(arc.kept_as_is(w.db, changing(), now))
+        try:
+            reader.finish()
+        except arc.NotVerified as nv:
+            raise NotRewritten(f"{nv}; nothing in {day.isoformat()} was read", nv.kind) from None
+    return total
+
+
 # --------------------------------------------------------------------------- a run over the rows
 
 class Scope:
@@ -512,6 +547,8 @@ class Scope:
                  *, request_seq: Optional[int] = None, through: Optional[str] = None):
         self.reason, self.before, self.change, self.conditions = reason, before, change, conditions
         self.request_seq, self.through = request_seq, through
+        # {day: rows a compliance case keeps as they are}, for each archived day a step reads (rewrite_archived_day).
+        self.kept_archived: dict = {}
 
     def detail(self, policy_seq: int, entries: list, *, final: bool = False) -> dict:
         d = {"reason": self.reason, "policy_seq": policy_seq, "request_seq": self.request_seq, "hours": entries}
@@ -589,7 +626,8 @@ def step(p, w, scope: Scope, cursor: datetime) -> tuple:
                 # Rows in an archived hour: no legitimate path writes them (the pruner reports them too).
                 raise NotRewritten(f"rows of audit_logs are in {fmt.hour_text(stray)}, which is archived; nothing in "
                                    f"{day.isoformat()} was rewritten", "row-in-archived-day")
-            rw = rewrite_archived_day(w, day, scope.change, now=p.now, before=scope.before)
+            rw = rewrite_archived_day(w, day, scope.change, now=p.now, before=scope.before,
+                                      kept_out=scope.kept_archived)
         except NotRewritten as nr:
             nr.until = nr.until or end
             raise

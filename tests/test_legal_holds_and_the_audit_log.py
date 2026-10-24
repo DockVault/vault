@@ -11,7 +11,8 @@ throwaway SQLite database with a chain of its own (tests/_removal_env.py) and th
   days; the deletion of ended invitations, ended one-time proofs and old notifications.
 - A compliance case's rows that must be kept (compliance_retention.case_rows_kept) stay as they are where an
   erase, a removal or the shortening would change them; the archive leaves a day that holds one as rows, and takes
-  it once they may go; the audit job's prune of an archived day keeps them in its blocks.
+  it once they may go; the audit job's prune of an archived day keeps them in its blocks. An erase or a removal
+  that met such rows stays running and says so until the case lets them go, then changes them and completes.
 """
 import json
 import subprocess
@@ -27,6 +28,7 @@ from _audit_chain_env import T0, failures
 from _erase_env import add_tables
 from _removal_env import RemovalEnv, until
 from app.core import audit_archive as arc
+from app.core import audit_chain_erase as ae
 from app.core import audit_privacy as ap
 from app.core import audit_retention as ar
 from app.core import audit_rewrite as rw
@@ -282,17 +284,31 @@ def test_an_erase_that_meets_a_hold_between_two_units_waits_there_and_completes_
     assert env.get(second).username == asked["placeholder"]
 
 
-def test_a_cases_rows_that_must_be_kept_are_not_erased(env):
-    """A row of the name written under a case closed within the records' floor stays as it is; the erase completes and
-    erases the rest, and the chain still verifies."""
+def test_a_cases_rows_that_must_be_kept_are_not_erased_until_the_case_lets_them_go(env):
+    """A row of the name written under a case closed within the records' floor stays as it is: the erase erases the
+    rest and gives the other records the placeholder, then stays running, says why and keeps the name sealed. Once
+    the case lets the row go, the erase erases it and completes; the chain verifies throughout."""
     case = _case(env, closed_days=30)
     kept = env.put(T0 - timedelta(hours=30), username="eve", case_id=case)
     gone = env.put(T0 - timedelta(hours=30, minutes=-10), username="eve")
     env.run_until_sealed()
+    record = _store_rows(env, "eve")
     asked = env.ask("eve")
-    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
+    assert not until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED, hours=24 * 12)
+    row = env.request_row(asked["id"])
+    assert row.status == pe.RUNNING and row.waiting == ae.KEPT_WAIT.format(n=1) and row.name_token
     assert env.get(kept).username == "eve" and env.get(kept).ip_address == "203.0.113.9"
     assert env.get(gone).username == asked["placeholder"]
+    with env.session() as db:
+        assert db.get(SecurityRecord, record).name == asked["placeholder"]
+    assert [s.detail.get("final") for s in env.erase_seals()] == [False]
+    assert failures(env.verify()) == []
+    _close(env, case, FLOOR_DAYS + 1)                         # its records' floor has passed: it lets the row go
+    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
+    assert env.get(kept).username == asked["placeholder"] and env.get(kept).ip_address is None
+    row = env.request_row(asked["id"])
+    assert row.name_token is None and row.counts["audit_rows"] == 2 and row.counts["stores"]["security_records"] == 1
+    assert [s.detail.get("final") for s in env.erase_seals()] == [False, True]
     assert failures(env.verify()) == []
 
 
@@ -304,13 +320,14 @@ def test_the_preview_counts_a_cases_rows_that_must_be_kept_apart(env):
     with env.session() as db:
         seen = pe.preview(db, "eve", env.clock(), env.st)
     assert seen["audit_rows"] == 1
-    assert ("1 audit rows of a compliance case whose records must be kept, which stay as they are"
-            in seen["not_reached"]), seen["not_reached"]
+    assert any(n.startswith("1 audit rows of a compliance case whose records must be kept, which stay as they are "
+                            "until the case lets them go") for n in seen["not_reached"]), seen["not_reached"]
 
 
-def test_a_cases_rows_in_an_archived_day_are_not_erased(env, monkeypatch):
+def test_a_cases_rows_in_an_archived_day_are_not_erased_until_the_case_lets_them_go(env, monkeypatch):
     """A case row archived while nothing kept it (its case closed long ago), then kept again (the floor raised): an
-    erase over the archived day leaves it as it is."""
+    erase over the archived day leaves it as it is and waits; once the floor is back, the day is read again and the
+    row erased, and the erase completes."""
     case = _case(env, closed_days=FLOOR_DAYS + 30)
     kept = env.put(_at(120, 3), username="eve", case_id=case)
     gone = env.put(_at(120, 3, 20), username="eve")
@@ -318,12 +335,14 @@ def test_a_cases_rows_in_an_archived_day_are_not_erased(env, monkeypatch):
     arc.archive_job(retention.Pass(env.session, now=env.clock()))
     env.settings.compliance_record_min_days = FLOOR_DAYS + 60
     asked = env.ask("eve")
-    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
-    with env.session() as db:
-        block = db.query(AuditArchiveBlock).one()
-        rows = {r["id"]: r for r in arc.PartReader(db, env.st.view, block.day,
-                                                   env.st.view.archives[block.day].parts[0]).rows()}
+    assert not until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED, hours=24 * 12)
+    assert env.request_row(asked["id"]).waiting == ae.KEPT_WAIT.format(n=1)
+    rows = _archived_rows(env)
     assert rows[kept]["username"] == "eve" and rows[gone]["username"] == asked["placeholder"]
+    assert failures(env.verify()) == []
+    env.settings.compliance_record_min_days = FLOOR_DAYS
+    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
+    assert _archived_rows(env)[kept]["username"] == asked["placeholder"]
     assert failures(env.verify()) == []
 
 
@@ -339,10 +358,33 @@ def test_an_archived_day_whose_only_rows_of_the_name_must_be_kept_is_not_a_unit_
     arc.archive_job(retention.Pass(env.session, now=env.clock()))
     env.settings.compliance_record_min_days = FLOOR_DAYS + 200
     asked = env.ask("eve")
-    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
+    assert not until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED, hours=24 * 12)
     assert env.get(hot).username == asked["placeholder"]
+    assert env.request_row(asked["id"]).waiting == ae.KEPT_WAIT.format(n=1)
     rows = _archived_rows(env)
     assert rows[kept]["username"] == "eve" and rows[other]["username"] == "alice"
+    assert failures(env.verify()) == []
+
+
+def test_an_erase_whose_only_rows_a_case_keeps_does_not_begin_until_the_case_lets_them_go(env):
+    """Nothing it may change yet: it does not begin (no seal, the other records untouched, still cancellable) and
+    says why; once the case lets the rows go, it runs and completes."""
+    case = _case(env, closed_days=30)
+    kept = env.put(T0 - timedelta(hours=30), username="eve", case_id=case)
+    env.run_until_sealed()
+    record = _store_rows(env, "eve")
+    asked = env.ask("eve")
+    assert not until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED, hours=24 * 12)
+    row = env.request_row(asked["id"])
+    assert row.status == pe.PENDING and row.waiting == ae.KEPT_WAIT_TO_BEGIN.format(n=1)
+    assert env.erase_seals() == [] and env.get(kept).username == "eve"
+    with env.session() as db:
+        assert db.get(SecurityRecord, record).name == "eve"
+    _close(env, case, FLOOR_DAYS + 1)
+    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
+    assert env.get(kept).username == asked["placeholder"]
+    with env.session() as db:
+        assert db.get(SecurityRecord, record).name == asked["placeholder"]
     assert failures(env.verify()) == []
 
 
@@ -436,15 +478,27 @@ def test_a_removal_waits_while_a_hold_stands_over_rows_and_archived_days_and_run
     assert failures(env.verify()) == []
 
 
-def test_a_removal_leaves_a_cases_rows_that_must_be_kept_as_they_are(env):
+def test_a_removal_leaves_a_cases_rows_that_must_be_kept_as_they_are_until_the_case_lets_them_go(env):
+    """The removal changes the rest and stays running, saying why, while a case keeps a row of its scope; once the
+    case lets it go the removal goes back to it, changes it, and completes."""
     case = _case(env, closed_days=30)
     kept = env.put(T0 - timedelta(hours=30), case_id=case, details={"email": "a@example.com"})
     gone = env.put(T0 - timedelta(hours=30, minutes=-10), details={"email": "b@example.com"})
+    later = env.put(T0 - timedelta(hours=20), details={"email": "c@example.com"})
     env.run_until_sealed()
     asked = env.ask_removal()
-    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert not until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED, hours=24 * 12)
+    row = env.removal_row(asked["id"])
+    assert row.status == vr.RUNNING and row.waiting == vr.KEPT_WAIT.format(n=1)
     assert env.get(kept).ip_address == "203.0.113.9" and env.get(kept).details == {"email": "a@example.com"}
     assert env.get(gone).ip_address is None and "email" not in (env.get(gone).details or {})
+    assert env.get(later).ip_address is None
+    assert not [s for s in env.rewrite_seals() if s.detail.get("final")]
+    assert failures(env.verify()) == []
+    _close(env, case, FLOOR_DAYS + 1)
+    assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+    assert env.get(kept).ip_address is None and "email" not in (env.get(kept).details or {})
+    assert [s.detail.get("final") for s in env.rewrite_seals()][-1] is True
     assert failures(env.verify()) == []
 
 
@@ -501,7 +555,8 @@ def test_a_removal_and_the_shortening_leave_a_cases_rows_in_an_archived_day_as_t
     env.settings.compliance_record_min_days = FLOOR_DAYS + 200
     if change == "removal":
         asked = env.ask_removal()
-        assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+        assert not until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED, hours=24 * 12)
+        assert env.removal_row(asked["id"]).waiting == vr.KEPT_WAIT.format(n=1)
     else:
         rw.shorten_job(retention.Pass(env.session, now=env.clock()))
     rows = _archived_rows(env)
@@ -509,6 +564,10 @@ def test_a_removal_and_the_shortening_leave_a_cases_rows_in_an_archived_day_as_t
     assert rows[gone]["ip_address"] is None
     if change == "removal":
         assert "email" not in json.loads(rows[gone]["details"] or "{}")
+        # The floor back where it was: the day is read again, its row changed, and the removal completes.
+        env.settings.compliance_record_min_days = FLOOR_DAYS
+        assert until(env, lambda: env.removal_row(asked["id"]).status == vr.COMPLETED)
+        assert _archived_rows(env)[kept]["ip_address"] is None
     assert failures(env.verify()) == []
 
 

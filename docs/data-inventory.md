@@ -216,7 +216,8 @@ Each row of `audit_logs` holds:
   shortened to its /24 or /48 once its row is that many days old (in a day the archive holds, once the whole
   day is: up to a day later). Either change gives each changed row a new
   `seal_nonce`, and the integrity chain records it and still verifies. Both wait while a legal hold stands or
-  a compliance case is open, and leave a case's rows that must be kept as they are;
+  a compliance case is open, and leave a case's rows that must be kept as they are; a removal then stays
+  running, and says so, until the case lets them go, and changes them and completes then;
 - **New in 0.34.0:** `seal_nonce`, 16 random bytes on every row written from 0.34.0 on, under which the
   log's integrity chain hashes the row's personal values (`audit_seals`), so that once it is destroyed the
   hash reveals nothing about them. `case_id`: the compliance case a row was written under (see
@@ -439,7 +440,10 @@ and the unlock state.
    compliance case is open (any of them: an audit row of what was done in a held vault need not name the case;
    a cancelled erase keeps its sealed name until neither holds), and, with
    `ERASE_BLOCKED_BY_PROTECTED_MINIMUM=true` (for deployments whose records must be kept intact), until
-   every audit row it would change is older than the protected minimum for its kind.
+   every audit row it would change is older than the protected minimum for its kind. Rows of the name a
+   compliance case keeps as they are (a closed case's rows within its records' floor) it leaves: the other
+   records get the placeholder, and the erase stays running, says so, and keeps the name sealed until the case
+   lets those rows go; it erases them and completes then.
 
    **What an erase does not reach:** backups, exports and copies made before it (and the database's own
    files until their space is reused: the erase runs a plain VACUUM, and `dockvault.py audit compact`
@@ -447,8 +451,8 @@ and the unlock state.
    audit rows that name the person in their details (an administrator's row recording the deletion of
    their account, for example); audit rows with no time; a compliance case's audit rows while they must be
    kept (while the case is open or a hold stands, and `COMPLIANCE_RECORD_MIN_DAYS` after it closes), which stay
-   as they are; and the records of compliance access (cases, legal holds, auditor rights, revealed names and
-   owners' notices), which keep who asked, approved and acted.
+   as they are until then (the erase waits for them, as above); and the records of compliance access (cases,
+   legal holds, auditor rights, revealed names and owners' notices), which keep who asked, approved and acted.
 
 ## Retention settings
 

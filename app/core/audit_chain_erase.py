@@ -49,6 +49,12 @@ one ``erase`` seal with no hour; so does a run whose remaining rows went meanwhi
 
 Each unit and the final stores are changed only after person_erase.rule_waits has said nothing holds erases back:
 the interface legal holds and open cases register with.
+
+Rows of the name a compliance case keeps as they are (retention.register_keep_as_is: a closed case's rows within
+its records' floor) are left by every unit. While any remain, no unit is the last: once every other row has its
+placeholder, the other stores get it too, and the erase waits, running, its name kept sealed, and says so on the
+request. When the case lets them go they are rows of the name like the others: the next pass erases them, the last
+unit gives the stores the placeholder again (whatever came since), and the erase completes.
 """
 from __future__ import annotations
 
@@ -285,16 +291,17 @@ def _hot_newest(db, name: str, fp: Optional[str], scope_end: datetime, protected
 
 
 def scan_day(w, day, name: str, fp: Optional[str] = None, now: Optional[datetime] = None) -> tuple:
-    """(rows of ``name``, newest of them, newest protected one) in ``day``'s blocks, each part read and checked.
-    A row of the name that an erase seal lists as erased already is a finding, as in an hour of rows (erase_hour):
-    the day is not erased. Raises NotVerified."""
+    """(rows of ``name``, newest of them, newest protected one, rows of ``name`` a compliance case keeps as they are)
+    in ``day``'s blocks, each part read and checked; the first three leave the kept rows out. A row of the name that
+    an erase seal lists as erased already is a finding, as in an hour of rows (erase_hour): the day is not erased.
+    Raises NotVerified."""
     from app.core import audit_archive as arc
     ai = _ai()
     db, view = w.db, w.st.view
     entry = view.archives.get(day)
-    count, newest, newest_p = 0, None, None
+    count, newest, newest_p, held = 0, None, None, 0
     if entry is None:
-        return count, newest, newest_p
+        return count, newest, newest_p, held
     arc._check_day_blocks(db, entry, day)
     protected = ai.protected_names()
     for part in sorted(entry.parts, key=lambda p: p.first_hour):
@@ -314,12 +321,13 @@ def scan_day(w, day, name: str, fp: Optional[str] = None, now: Optional[datetime
         reader.finish()
         for row_id, (t, action) in seen.items():
             if row_id in kept:
+                held += 1
                 continue
             count += 1
             newest = t if newest is None or t > newest else newest
             if action in protected:
                 newest_p = t if newest_p is None or t > newest_p else newest_p
-    return count, newest, newest_p
+    return count, newest, newest_p, held
 
 
 # --------------------------------------------------------------------------- one unit
@@ -529,9 +537,11 @@ def finish(w, row, seq: int, d: dict, name: str, now: datetime, fp: Optional[str
     from app.services.audit_logger import AuditLogger
     db = w.db
     placeholder = d["placeholder"]
-    counts = {}
+    # What the stores were given while rows a case kept held the erase open (_wait_for_kept), and what came since.
+    counts = dict(((row.counts or {}).get("stores") or {}) if row is not None else {})
     for store in pe.STORES:
-        counts[store.key] = int(store.erase(db, name, placeholder, (fp,) if fp else (), now) or 0)
+        counts[store.key] = int(counts.get(store.key, 0)) + int(
+            store.erase(db, name, placeholder, (fp,) if fp else (), now) or 0)
     audit_rows = int((row.counts or {}).get("audit_rows", 0)) if row is not None else 0
     if row is not None:
         row.status = pe.COMPLETED
@@ -617,10 +627,13 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
         return STOP, 0, None, _held_before_first(findings, seq, cache["before_first"])
     # The archived days are read first, a day per transaction, nothing written.
     days = [day for day, e in sorted(view.archives.items()) if e.parts and arc.day_start(day) < scope_end]
+    rescanned = cache.setdefault("rescanned", set())
     for day in days:
         key = (seq, day)
         scan = st.erase_scans.get(key)
-        if scan is None or scan[0] != view.archives[day].seq:
+        # A day holding rows a case keeps is read again once a pass: the case may have let them go.
+        if scan is None or scan[0] != view.archives[day].seq or (scan[4] and key not in rescanned):
+            rescanned.add(key)
             try:
                 st.erase_scans[key] = (view.archives[day].seq,) + scan_day(w, day, name, fp, now)
             except arc.NotVerified as nv:
@@ -644,7 +657,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
     if not started and pe.protected_minimum():
         newest, newest_p = _hot_newest(db, name, fp, scope_end, ai.protected_names(), now)
         for day in with_rows:
-            _s, _n, t, tp = st.erase_scans[(seq, day)]
+            _s, _n, t, tp, _k = st.erase_scans[(seq, day)]
             newest = max([x for x in (newest, t) if x is not None], default=None)
             newest_p = max([x for x in (newest_p, tp) if x is not None], default=None)
         if (numbers.min_days > 0 and newest is not None and newest > now - timedelta(days=numbers.min_days)) or (
@@ -653,9 +666,14 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
             return WAIT, 0, None, ("It waits until the rows it would change are older than the protected minimum "
                                    "(ERASE_BLOCKED_BY_PROTECTED_MINIMUM).")
     units = [("day", day) for day in with_rows] + [("hour", h) for h in hours]
+    # Rows of the name a compliance case keeps as they are: left now, reached once the case lets them go. While
+    # they remain, no unit is the last.
+    kept = kept_rows(db, name, fp, scope_end, now) + sum(st.erase_scans[(seq, day)][4] for day in days)
     policy_seq = view.newest_policy()[0]
     changed = 0
     if not units:
+        if kept:
+            return _wait_for_kept(w, row, d, name, fp, now, kept, started=started)
         w.append("erase", detail=_detail(None, seq, d, policy_seq, through, True, [], 0))
     else:
         kind, unit = units[0]
@@ -667,7 +685,7 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
                                        f"name ({unit}); it waits")
             return STOP, 0, None, held_by("unjustified")
         tried.add((kind, unit))
-        final = len(units) == 1
+        final = len(units) == 1 and not kept
         templates = route_templates()
         try:
             if kind == "hour":
@@ -696,6 +714,45 @@ def step(p, w, seq: int, findings: Dict[str, str], tried: set, cache: Optional[d
             return ERASED, changed, None, None
     _progress(row, through, now, 0)
     return ERASED, changed, finish(w, row, seq, d, name, now, fp), None
+
+
+def kept_rows(db, name: str, fp: Optional[str], scope_end: datetime, now: Optional[datetime] = None) -> int:
+    """How many rows of ``name`` before ``scope_end`` (as rows; scan_day counts those of archived days) a compliance
+    case keeps as they are (retention.kept_as_is): the erase leaves them now and must reach them once the case lets
+    them go."""
+    from app.core import retention
+    from app.core.models import AuditLog as A
+    clause = retention.kept_as_is(A, _now(now))
+    if clause is None:
+        return 0
+    found = db.query(A.username, A.recorded).filter(pe.audit_matches(A, name, fp), A.timestamp.isnot(None),
+                                                    A.timestamp < scope_end, clause).all()
+    return sum(1 for u, r in found if pe.row_matches({"username": u, "recorded": r}, name, fp))
+
+
+KEPT_WAIT = ("It waits: {n} audit rows of the name are kept as they are for a compliance case. The other records "
+             "have the placeholder; it erases those rows, and completes, once the case lets them go.")
+KEPT_WAIT_TO_BEGIN = ("It waits: the only audit rows of the name are kept as they are for a compliance case ({n}); it "
+                      "begins once the case lets them go.")
+
+
+def _wait_for_kept(w, row, d: dict, name: str, fp: Optional[str], now: datetime, kept: int, *,
+                   started: bool) -> tuple:
+    """Every row of the name the erase may change has its placeholder, but rows a compliance case keeps as they are
+    remain. Once the erase has begun (an erase seal), the other stores, which are no case's, get the placeholder now
+    (once; the last unit gives it again to what came since), and the erase stays running, its name kept sealed, until
+    the case lets those rows go: it erases them then, and completes. An erase that has not begun (only kept rows)
+    changes nothing yet and can still be cancelled. In the step's transaction, after the rules that hold erases back
+    said nothing holds them. Returns step's WAIT."""
+    if not started:
+        return WAIT, 0, None, KEPT_WAIT_TO_BEGIN.format(n=kept)
+    if row is not None and "stores" not in (row.counts or {}):
+        counts = dict(row.counts or {})
+        counts["stores"] = {s.key: int(s.erase(w.db, name, d["placeholder"], (fp,) if fp else (), now) or 0)
+                            for s in pe.STORES}
+        row.counts = counts
+        w.commit_without_seal = True
+    return WAIT, 0, None, KEPT_WAIT.format(n=kept)
 
 
 def held_by(kind: str) -> str:

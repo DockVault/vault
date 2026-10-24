@@ -32,6 +32,11 @@ the scope, the same in every seal of the run). When no unit is left, a last ``re
 ``final: true``, in the transaction that marks the row completed with its counts and writes the
 ``audit_values_removed`` audit row; then a plain VACUUM of the tables it changed, within a time budget, so the old
 values leave the live tables' pages sooner (backups keep them).
+
+Rows a compliance case keeps as they are (retention.register_keep_as_is) are left by every unit. While any in the
+scope would change, the last seal waits: at the end of the scope the removal stays running and says so on its row,
+and once the case lets them go (rows as they are now, an archived day read again once a pass) it goes back to the
+first of them, changes them, and completes.
 """
 from __future__ import annotations
 
@@ -544,10 +549,71 @@ def vetoed(st, session_factory) -> List[int]:
 
 
 _cursors: Dict[tuple, datetime] = {}
+# Per removal (_cursor_key), the rows its run left because a compliance case keeps them as they are: {id: time} of
+# rows, and {day: how many} of archived days. Kept in this process only: after a restart the run reads its scope
+# again from the start, as it does anyway.
+_kept_rows: Dict[tuple, Dict] = {}
+_kept_days: Dict[tuple, Dict] = {}
 
 
 def _cursor_key(st, seq: int) -> tuple:
     return (id(st), st.view.generation, seq)
+
+
+KEPT_WAIT = ("It waits: {n} rows in its scope are kept as they are for a compliance case. It changes them, and "
+             "completes, once the case lets them go.")
+
+
+def kept_to_change(db, levels, before: datetime, ctx, now: datetime) -> Dict:
+    """{id: time} of the rows of audit_logs before ``before`` whose values the removal would change but which a
+    compliance case keeps as they are (retention.kept_as_is)."""
+    from app.core import retention
+    from app.core.models import AuditLog
+    clause = retention.kept_as_is(AuditLog, now)
+    if clause is None:
+        return {}
+    out = {}
+    for row in db.query(AuditLog).filter(*rw.prefilter(AuditLog, levels), AuditLog.timestamp.isnot(None),
+                                         AuditLog.timestamp < before, clause):
+        values = {c.key: getattr(row, c.key) for c in AuditLog.__table__.columns}
+        if rw.reduced(values, levels, ctx) is not None:
+            out[row.id] = row.timestamp
+    return out
+
+
+def _finished_or_waiting(w, key, scope: "rw.Scope", levels, before: datetime, ctx, now: datetime, cursor: datetime,
+                         cache: dict) -> Optional[tuple]:
+    """At the end of the scope: None when nothing a case keeps is left (the removal completes), else what step
+    returns: SCANNED with the cursor moved back to rows a case has let go since, or WAIT while it keeps them."""
+    ai = _ai()
+    db = w.db
+    rows_now = kept_to_change(db, levels, before, ctx, now)
+    left = _kept_rows.get(key) or {}
+    gone = [t for i, t in left.items() if i not in rows_now]
+    days = _kept_days.get(key) or {}
+    if days and not cache.get("days_read"):
+        # Archived days holding rows a case keeps are read again once a pass: the case may have let them go.
+        cache["days_read"] = True
+        for day, n in sorted(days.items()):
+            still = rw.kept_in_archived_day(w, day, scope.change, now=now, before=before)
+            if still < n:
+                gone.append(arc_day_start(day))
+            days[day] = still
+    if gone:
+        back = ai.hour_floor(min(gone))
+        if back < cursor:
+            _kept_rows.pop(key, None)
+            return SCANNED, 0, back, None, None
+    _kept_rows[key] = rows_now
+    kept = len(rows_now) + sum(days.values())
+    if kept:
+        return WAIT, 0, cursor, None, KEPT_WAIT.format(n=kept)
+    return None
+
+
+def arc_day_start(day) -> datetime:
+    from app.core import audit_archive as arc
+    return arc.day_start(day)
 
 
 def _progress(row, now: datetime, changed: int, unit: Optional[str]) -> None:
@@ -581,10 +647,10 @@ def finish(w, row, seq: int, d: dict, now: datetime) -> dict:
     return {"rows": total, "before": scope.get("before"), "levels": scope.get("levels")}
 
 
-def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
+def step(p, w, seq: int, findings: Dict[str, str], cache: Optional[dict] = None) -> tuple:
     """One transaction of the removal of request ``seq``: (outcome, rows changed, the new cursor, the notice's facts
     when it completed, the reason it waits, or what holds it when it stops on a finding). Writes nothing unless it
-    returns REWRITTEN (or DONE after a veto)."""
+    returns REWRITTEN (or DONE after a veto). ``cache`` lasts one pass of the job."""
     from app.core import audit_chain_policy_seals as ps
     from app.core import audit_retention as ar
     from app.core import person_erase as pe
@@ -630,8 +696,18 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
     scope = rw.Scope(rw.LEVELS, before, lambda r: rw.reduced(r, levels, ctx),
                      retention.changeable(AuditLog, now, *rw.prefilter(AuditLog, levels)),
                      request_seq=seq, through=fmt.hour_text(before - HOUR))
+    key = _cursor_key(st, seq)
     try:
         outcome, cursor, changed, _oldest, _newest, unit = rw.step(p, w, scope, cursor)
+        days = _kept_days.setdefault(key, {})
+        days.update(scope.kept_archived)
+        for day in [d for d, n in days.items() if not n]:
+            del days[day]
+        if outcome == rw.FINISHED:
+            waiting = _finished_or_waiting(w, key, scope, levels, before, ctx, now, cursor,
+                                           cache if cache is not None else {})
+            if waiting is not None:
+                return waiting
     except rw.NotRewritten as nr:
         if nr.kind:
             # A unit that does not check out (rows dated before the chain's first hour among them): reported, and the
@@ -654,6 +730,8 @@ def step(p, w, seq: int, findings: Dict[str, str]) -> tuple:
     newest = view.newest_policy()
     w.append("rewrite", detail=scope.detail(newest[0], [], final=True))
     _progress(row, now, 0, None)
+    _kept_rows.pop(key, None)
+    _kept_days.pop(key, None)
     return REWRITTEN, 0, cursor, finish(w, row, seq, d, now), None
 
 
@@ -692,10 +770,11 @@ def run_job(p):
     findings: Dict[str, str] = {}
     finished = []
     for seq in sorted(set(due(st.view, st.known_record(), p.now)) | set(vetoed(st, p.session_factory))):
+        cache: dict = {}
         while p.time_left() and not p.held_now():
             outcome, changed, cursor, done, why = STOP, 0, None, None, None
             with ai.ChainWriter(engine, st) as w:
-                outcome, changed, cursor, done, why = step(p, w, seq, findings)
+                outcome, changed, cursor, done, why = step(p, w, seq, findings, cache)
                 if outcome not in (REWRITTEN, DONE) and w.written:
                     # Only a rewrite or a veto commits: anything else leaves the transaction as it found it.
                     w.written = []
@@ -712,7 +791,8 @@ def run_job(p):
                 finished.append(done)
             break
         if seq not in st.view.pending_requests():
-            _cursors.pop(_cursor_key(st, seq), None)
+            for kept in (_cursors, _kept_rows, _kept_days):
+                kept.pop(_cursor_key(st, seq), None)
     if findings:
         ai.report_failures(st, p.session_factory, findings)
     for done in finished:
