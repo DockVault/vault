@@ -82,7 +82,7 @@ def test_a_mismatch_blocks_and_everything_else_writes():
 
 def test_the_team_key_is_compared_only_at_the_current_epoch_as_it_is_unwrapped():
     dek = _function("zkGetVaultDek")
-    assert "version === keys.current_dek_version ? keys.team_public_key : null);" in dek
+    assert "version === keys.current_dek_version ? keys.team_public_key : null, noPrompt);" in dek
     team = _function("zkGetTeamPrivKey")
     assert "unwrapTeamPrivateKeyWithCheck(" in team
     # Three answers kept as they came: a comparison that could not run (null) is not recorded as a mismatch
@@ -96,6 +96,18 @@ def test_the_checks_run_on_open_and_never_ask_for_the_passphrase():
     check = _function("zkCheckVaultKey")
     assert "if (!vault || !isZkVault(vault) || !zkKeyUnlocked()) return null;" in check
     assert "zkEnsureUnlocked(" not in check and "showPrompt(" not in check
+    # Nor when the key is locked while the check runs: each key it unwraps comes with the key held now, or ends it.
+    assert re.findall(r"zkGetVaultDek\(([^)]*)\)", check) == ["vid, epoch, { noPrompt: true }",
+                                                              "vid, epoch - 1, { noPrompt: true }"]
+    held = _function("zkHeldPrivateKey")
+    assert "throw new Error(" in held and "zkEnsureUnlocked(" not in held and "showPrompt(" not in held
+    dek = _function("zkGetVaultDek")
+    assert dek.count("const priv = noPrompt ? zkHeldPrivateKey() : await zkEnsureUnlocked();") == 1
+    assert dek.count("zkEnsureUnlocked(") == 1
+    assert "version === keys.current_dek_version ? keys.team_public_key : null, noPrompt);" in dek
+    team = _function("zkGetTeamPrivKey")
+    assert team.count("const priv = noPrompt ? zkHeldPrivateKey() : await zkEnsureUnlocked();") == 1
+    assert team.count("zkEnsureUnlocked(") == 1
     open_vault = _function("openVault")
     assert open_vault.index("refreshZkRekeyNotice();") < open_vault.index("refreshZkKeyChecks();")
     assert "refreshZkKeyChecks();" in _function("loadVaultInfo")

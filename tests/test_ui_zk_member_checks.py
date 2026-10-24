@@ -10,6 +10,7 @@
 * The share dialog shows a ticked recipient's key fingerprint and when it was set up, and flags a key set up
   soon after an administrator changed the account's sign-in details.
 * A key registration whose challenge the server cannot open asks once more with a fresh one.
+* A key locked while the vault's key is checked ends the check: nothing is asked until something needs the key.
 """
 
 from __future__ import annotations
@@ -433,4 +434,44 @@ def test_the_owners_notice_of_a_members_report_opens_that_vault(page: Page, zk):
         page.wait_for_function("(v) => state.currentVaultId === v", arg=vids[1], timeout=15000)
     finally:
         for vid in vids:
+            co.delete_vault(vid)
+
+
+# The vault's key list answers slowly, so a lock lands while the check of the vault's key waits for it.
+_SLOW_KEYS = """() => {
+    window.__prompts = 0;
+    const prompt = showPrompt;
+    showPrompt = (...a) => { window.__prompts++; return prompt(...a); };
+    const original = window.fetch;
+    window.fetch = async (url, opts) => {
+        if (/\\/ecc\\/vaults\\/[0-9a-f-]+\\/keys(\\?|$)/.test(String(url))) await new Promise(r => setTimeout(r, 1500));
+        return original(url, opts);
+    };
+}"""
+
+
+def test_a_key_locked_while_the_vaults_key_is_checked_ends_the_check_and_asks_nothing(browser, zk):
+    """The check as a vault opens never asks for the passphrase, also when the key is locked while it runs (the
+    idle lock, the lock control): it ends, and the passphrase is asked for only when something needs the key."""
+    owner, co = zk()
+    ctx = browser.new_context(base_url=BASE_URL)
+    page = ctx.new_page()
+    vid = None
+    try:
+        _login(page, owner["_username"], owner["_password"])
+        vid = _create_zk_vault_via_ui(page, co, OWNER_PASS)          # leaves the key unlocked
+        page.evaluate(_SLOW_KEYS)
+        page.evaluate("(v) => { delete zkState.keyChecks[v]; delete zkState.vaultDeks[v]; }", vid)
+        _open_vault(page, vid)
+        page.evaluate("() => zkResetKeys()")
+        page.wait_for_timeout(4000)
+        assert page.evaluate("() => window.__prompts") == 0
+        assert "active" not in (page.locator("#confirm-modal").get_attribute("class") or "")
+        # Something that needs the key still asks, once.
+        page.evaluate("(v) => { zkGetVaultDek(v).catch(() => {}); }", vid)
+        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=10000)
+        assert page.evaluate("() => window.__prompts") == 1
+    finally:
+        ctx.close()
+        if vid:
             co.delete_vault(vid)

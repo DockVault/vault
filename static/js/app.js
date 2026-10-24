@@ -12215,6 +12215,13 @@ async function zkWrapPrivateKey(pem, passphrase) {
 // parallel, and each change to a vault's keys proves the identity key) wait for the same prompt
 // instead of fighting over the one dialog, and cancelling it rejects them all.
 let _zkUnlockInFlight = null;
+// The account key as it is held now, for a step that must never ask for the passphrase (the checks of a
+// vault's key as it is opened): a key locked meanwhile, by the idle lock or the lock control, ends that step.
+function zkHeldPrivateKey() {
+    if (!zkState.privateKey) throw new Error('The account key is locked.');
+    return zkState.privateKey;
+}
+
 async function zkEnsureUnlocked() {
     if (zkState.privateKey) return zkState.privateKey;
     if (!_zkUnlockInFlight) {
@@ -12816,10 +12823,12 @@ async function zkUploadNameCandidates(lib, name, vaultId, currentEpoch, currentD
 // keyVersion null/undefined => the vault's CURRENT epoch (for upload/encrypt/share). To
 // read an existing file, pass that file's epoch (item.key_version, defaulting to 1) so a
 // file written before a rotation is decrypted with the DEK it was actually encrypted under.
-async function zkGetVaultDek(vaultId, keyVersion = null) {
+// opts.noPrompt: only with the account key held now, never asking for the passphrase (zkHeldPrivateKey).
+async function zkGetVaultDek(vaultId, keyVersion = null, opts = null) {
+    const noPrompt = !!(opts && opts.noPrompt);
     const perVault = zkState.vaultDeks[vaultId] || (zkState.vaultDeks[vaultId] = {});
     if (keyVersion != null && perVault[keyVersion]) return perVault[keyVersion];
-    const priv = await zkEnsureUnlocked();
+    const priv = noPrompt ? zkHeldPrivateKey() : await zkEnsureUnlocked();
     const q = keyVersion != null ? `?key_version=${encodeURIComponent(keyVersion)}` : '';
     const keys = await apiRequest(`/ecc/vaults/${vaultId}/keys${q}`, { silent: true });
     if (!keys || !keys.has_access || !keys.wrapped_dek) {
@@ -12842,7 +12851,7 @@ async function zkGetVaultDek(vaultId, keyVersion = null) {
         const teamPriv = await zkGetTeamPrivKey(
             vaultId, keys.team_key_version, keys.wrapped_team_privkey,
             keys.team_ephemeral_public_key, keys.recipient_user_id,
-            version === keys.current_dek_version ? keys.team_public_key : null);
+            version === keys.current_dek_version ? keys.team_public_key : null, noPrompt);
         // teamMode says which purpose this caller will accept. The payload's own byte never
         // gets to choose; it is compared against this and rejected if it disagrees.
         dek = await eccLib().unwrapVaultDEK(
@@ -12931,7 +12940,7 @@ async function zkGetVaultIndexKey(vaultId) {
 // blob + its ephemeral come from the /keys response (no extra fetch). Cached per (vault, team
 // epoch); the runtime key is non-extractable. Cleared on logout via zkResetKeys.
 async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphemeralPublicKey,
-                                recipientUserId, teamPublicKeyPem = null) {
+                                recipientUserId, teamPublicKeyPem = null, noPrompt = false) {
     const perVault = zkState.teamKeys[vaultId] || (zkState.teamKeys[vaultId] = {});
     const compared = zkState.teamKeyMatches[vaultId] || (zkState.teamKeyMatches[vaultId] = {});
     // With the vault's team public key: whether the key unwrapped is its pair, found while the key is being
@@ -12939,7 +12948,7 @@ async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphe
     const pem = teamPublicKeyPem ? String(teamPublicKeyPem).trim() : null;
     const check = !!pem && teamEpoch != null && !(compared[teamEpoch] && compared[teamEpoch].pem === pem);
     if (teamEpoch != null && perVault[teamEpoch] && !check) return perVault[teamEpoch];
-    const priv = await zkEnsureUnlocked();
+    const priv = noPrompt ? zkHeldPrivateKey() : await zkEnsureUnlocked();
     // The account this wrap was made for. It has to come from the caller: this function is
     // handed the vault, the epoch and the two blobs, and an absent id would be encoded as
     // nothing rather than refused -- a wrap that authenticates against nothing.
@@ -13080,7 +13089,8 @@ async function zkCheckVaultKey(vault) {
     const epoch = keys.key_version;
     const summary = { epoch, mode: null, write: null, seal: null, lineage: null, view: keys.key_proof || null };
     try {
-        const dek = await zkGetVaultDek(vid, epoch);
+        // The key may be locked while this runs (the idle lock, the lock control): then it ends, unasked.
+        const dek = await zkGetVaultDek(vid, epoch, { noPrompt: true });
         const info = (zkState.keyChecks[vid] || {})[epoch] || zkRecordKeyView(vid, keys, epoch);
         summary.mode = info ? info.mode : 'direct';
         summary.write = await zkWriteKeyVerdict(vid, epoch, dek);
@@ -13098,7 +13108,7 @@ async function zkCheckVaultKey(vault) {
         if (epoch > 1) {
             try {
                 const prev = await apiRequest(`/ecc/vaults/${vid}/keys?key_version=${epoch - 1}`, { silent: true });
-                if (prev && prev.has_access) prevDek = await zkGetVaultDek(vid, epoch - 1);
+                if (prev && prev.has_access) prevDek = await zkGetVaultDek(vid, epoch - 1, { noPrompt: true });
             } catch (_) { /* the previous key is not this member's: not verifiable */ }
         }
         summary.lineage = await ZkKeyChecks.lineageState(eccLib(), {
