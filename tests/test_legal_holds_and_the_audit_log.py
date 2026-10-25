@@ -81,16 +81,16 @@ def env30(monkeypatch, tmp_path):
     e.close()
 
 
-def _case(env, *, closed_days=None):
+def _case(env, *, closed_days=None, number=None):
     """A compliance case: open, or closed ``closed_days`` before the test's clock (its counts kept on it, as the
-    compliance cases' job does 30 days after the close)."""
+    compliance cases' job does 30 days after the close); with ``number`` once approved, none before."""
     case_id = uuid.uuid4()
     closed = None if closed_days is None else T0 - timedelta(days=closed_days)
     with env.session() as db:
         db.add(ComplianceCase(id=case_id, status="closed" if closed_days is not None else "active",
                               purpose="internal_investigation", legal_basis="f", justification_enc="x",
                               owner_note_enc="x", auditor_id=uuid.uuid4(), auditor_username="aud",
-                              closed_at=closed, counts_kept_at=closed))
+                              closed_at=closed, counts_kept_at=closed, number=number))
         db.commit()
     return case_id
 
@@ -123,9 +123,9 @@ def _close(env, case_id, days):
         db.commit()
 
 
-def _held(env):
+def _held(env, number=None):
     """A case closed long ago (past the records' floor) with a hold that stands."""
-    case = _case(env, closed_days=FLOOR_DAYS + 100)
+    case = _case(env, closed_days=FLOOR_DAYS + 100, number=number)
     _hold(env, case)
     return case
 
@@ -169,6 +169,39 @@ def test_the_rule_says_why_while_a_hold_stands_or_a_case_is_open_and_nothing_onc
             synchronize_session=False)
         db.commit()
         assert cr.holds_back(db, env.clock()) is None
+
+
+def test_the_rule_names_the_cases_it_waits_for(env):
+    """What waits shows the reason to the administrators, who see the cases: it names the case of each hold that
+    stands, then of each open case, at most three and then how many more. A case not yet approved has no number."""
+    first = _held(env, "C-2026-0101")
+    with env.session() as db:
+        assert cr.holds_back(db, env.clock()) == "the legal hold of case C-2026-0101 stands"
+    _held(env, "C-2026-0102")
+    with env.session() as db:
+        assert cr.holds_back(db, env.clock()) == "the legal holds of cases C-2026-0101 and C-2026-0102 stand"
+    _hold(env, first)                                           # a second vault of the same case: still one case
+    _held(env, "C-2026-0103")
+    with env.session() as db:
+        assert cr.holds_back(db, env.clock()) == ("the legal holds of cases C-2026-0101, C-2026-0102 and "
+                                                  "C-2026-0103 stand")
+    _held(env, "C-2026-0104")
+    _held(env)
+    with env.session() as db:
+        assert cr.holds_back(db, env.clock()) == ("the legal holds of cases C-2026-0101, C-2026-0102, "
+                                                  "C-2026-0103 and 2 more stand")
+        db.query(LegalHoldVault).update({LegalHoldVault.released_at: env.clock()}, synchronize_session=False)
+        db.commit()
+    open_case = _case(env, number="C-2026-0201")
+    with env.session() as db:
+        assert cr.holds_back(db, env.clock()) == "case C-2026-0201 is open"
+    _case(env)                                                  # requested, not approved yet
+    with env.session() as db:
+        assert cr.holds_back(db, env.clock()) == "cases C-2026-0201 and 1 more are open"
+    _close(env, open_case, 1)
+    _case(env)
+    with env.session() as db:
+        assert cr.holds_back(db, env.clock()) == "compliance cases are open"
 
 
 def test_the_rule_is_registered_wherever_the_erase_is_imported():
@@ -253,6 +286,23 @@ def test_an_open_case_holds_an_erase_back(env):
     assert env.request_row(asked["id"]).waiting == "It waits: a compliance case is open."
     assert env.erase_seals() == []
     _close(env, case, FLOOR_DAYS + 1)
+    assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
+
+
+def test_an_erase_says_which_case_it_waits_for(env):
+    """The erase's waiting text names the case whose hold stands, then the case that is open, as each holds it."""
+    env.put(T0 - timedelta(hours=30), username="eve")
+    env.run_until_sealed()
+    held = _held(env, "C-2026-0301")
+    open_case = _case(env, number="C-2026-0302")
+    asked = env.ask("eve")
+    env.passes(24 * 9)
+    assert env.request_row(asked["id"]).waiting == "It waits: the legal hold of case C-2026-0301 stands."
+    _release(env, held)
+    env.passes(2)
+    row = env.request_row(asked["id"])
+    assert row.status == pe.PENDING and row.waiting == "It waits: case C-2026-0302 is open."
+    _close(env, open_case, FLOOR_DAYS + 1)
     assert until(env, lambda: env.request_row(asked["id"]).status == pe.COMPLETED)
 
 

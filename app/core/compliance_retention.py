@@ -83,23 +83,63 @@ def compliance_rows_kept(model, now: datetime):
                 model.timestamp >= now - timedelta(days=floor_days()))
 
 
+# How many case numbers a reason names before it says how many more there are.
+NAMED_CASES = 3
+
+
+def _cases(numbers: list, unnumbered: int) -> str:
+    """"case C-2026-0001", "cases C-2026-0001 and C-2026-0002", "cases C-..., C-..., C-... and 2 more": the
+    numbered cases first, at most NAMED_CASES of them, then how many more (a case not yet approved has no number)."""
+    shown = numbers[:NAMED_CASES]
+    more = len(numbers) - len(shown) + unnumbered
+    if len(shown) == 1 and not more:
+        return f"case {shown[0]}"
+    if more:
+        return "cases " + ", ".join(shown) + f" and {more} more"
+    return "cases " + ", ".join(shown[:-1]) + " and " + shown[-1]
+
+
+def _numbered(rows) -> tuple:
+    """(the case numbers, sorted, and how many cases have none) of distinct (case id, number) rows."""
+    numbers = sorted({n for _cid, n in rows if n})
+    unnumbered = len({cid for cid, n in rows if not n})
+    return numbers, unnumbered
+
+
 def holds_back(db, now: datetime) -> Optional[str]:
     """Why every path that changes or deletes what a hold or a case may need waits now, or None: a legal hold stands
     (placed, neither released nor lapsed), a case is open (not closed, whatever its state), or a step that would
     place a hold or open a case gave up waiting for its turn a moment ago (legal_holds.want_turn). Any hold and any
     case, not only those of the rows a path would touch: an audit row of what was done in a held vault need not carry
     the case. In the caller's transaction, after taking the turn of holds and deletions shared, so a hold or a case
-    committed before this check is seen, and one placed meanwhile waits until the caller's transaction ends."""
+    committed before this check is seen, and one placed meanwhile waits until the caller's transaction ends.
+
+    The reason names the cases (at most NAMED_CASES, then how many more): an erase, a removal of earlier values and
+    the other paths that wait show it to the administrators, who see the cases, so they know which one to wait
+    for."""
     from app.core import legal_holds
     from app.core.models import ComplianceCase, LegalHoldVault
     legal_holds.take_turn(db, shared=True)
     if legal_holds.turn_wanted(db):
         return "a legal hold or a compliance case is being asked for"
-    if db.query(LegalHoldVault.vault_id).filter(LegalHoldVault.released_at.is_(None),
-                                                 LegalHoldVault.lapsed_at.is_(None)).first() is not None:
-        return "a legal hold stands"
-    if db.query(ComplianceCase.id).filter(ComplianceCase.closed_at.is_(None)).first() is not None:
-        return "a compliance case is open"
+    held = (db.query(LegalHoldVault.case_id, ComplianceCase.number)
+            .outerjoin(ComplianceCase, ComplianceCase.id == LegalHoldVault.case_id)
+            .filter(LegalHoldVault.released_at.is_(None), LegalHoldVault.lapsed_at.is_(None)).distinct().all())
+    if held:
+        numbers, unnumbered = _numbered(held)
+        if not numbers:
+            return "a legal hold stands" if unnumbered == 1 else "legal holds stand"
+        if len(numbers) == 1 and not unnumbered:
+            return f"the legal hold of case {numbers[0]} stands"
+        return f"the legal holds of {_cases(numbers, unnumbered)} stand"
+    open_cases = db.query(ComplianceCase.id, ComplianceCase.number).filter(ComplianceCase.closed_at.is_(None)).all()
+    if open_cases:
+        numbers, unnumbered = _numbered(open_cases)
+        if not numbers:
+            return "a compliance case is open" if unnumbered == 1 else "compliance cases are open"
+        if len(numbers) == 1 and not unnumbered:
+            return f"case {numbers[0]} is open"
+        return f"{_cases(numbers, unnumbered)} are open"
     return None
 
 

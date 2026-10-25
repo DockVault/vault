@@ -126,7 +126,7 @@ about a person (its custodian) keeps their account as well: it cannot be deleted
 what the hold kept waits for its purge. Each refusal is recorded under the case (`hold_blocked_delete`), and says
 why: to the vault's owner and to an administrator it names the case, while another manager of the vault refused a
 retire is told only that a legal hold keeps it. A per-person erase waits while any hold stands or any case is
-open.
+open, and says which case it waits for.
 
 ### Upgrading with SFTP in its own container
 
