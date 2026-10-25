@@ -44,6 +44,20 @@ const ZkKeyChecks = (() => {
     }
 
     /**
+     * What the comparison of an unwrapped team private key with the vault's team public key answered, as the
+     * write path keeps it: true (it is the pair), false (it is not: a mismatch, which stops a write), or null
+     * (the comparison could not run: a stored team public key the browser cannot read, which writes as before).
+     * Anything but true or false is null: only a positive mismatch may stop an honest member.
+     *
+     * @returns {boolean|null}
+     */
+    function teamKeyAnswer(matchesPublic) {
+        if (matchesPublic === true) return true;
+        if (matchesPublic === false) return false;
+        return null;
+    }
+
+    /**
      * May a member write under the key they hold for this epoch?
      *
      * opts: {mode ('direct' | 'hierarchical'), vaultId, epoch, view (the epoch's key_proof, or null),
@@ -128,7 +142,7 @@ const ZkKeyChecks = (() => {
         WRITE_OK, WRITE_MISMATCH, WRITE_UNCHECKED,
         LINEAGE_VERIFIED, LINEAGE_UNVERIFIABLE, LINEAGE_RESET, LINEAGE_FAILED, LINEAGE_FIRST,
         LINEAGE_TEXT,
-        writeVerdict, lineageState,
+        teamKeyAnswer, writeVerdict, lineageState,
     };
 })();
 

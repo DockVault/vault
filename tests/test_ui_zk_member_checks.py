@@ -1,7 +1,8 @@
 """In real browsers: what a member's browser finds about the zero-knowledge key it holds, and what it does.
 
 * A member given a key that is not the vault's cannot upload with it: the upload is refused with the
-  reason, nothing reaches the server, the vault shows a warning, and the owner is told.
+  reason, nothing reaches the server, the vault shows a warning, and the owner is told. A team vault whose
+  stored team public key the browser cannot read is a check that could not run: the upload goes through.
 * The key details show the current epoch's lineage: verified after a rotation by a key holder; failed when
   the tag does not check out (a warning, and uploads still go through); reset by the owner; not verifiable
   for a member who never held the previous key, or an epoch with no stored material.
@@ -400,6 +401,45 @@ def test_a_member_whose_team_key_is_not_the_vaults_cannot_write_with_it(browser,
         _wait_for(lambda: _psql("SELECT count(*) FROM audit_logs WHERE action = 'zk_key_check_mismatch' "
                                 f"AND resource_id = '{vid}' AND details->>'finding' = 'team_key'") == "1",
                   "the team key report")
+    finally:
+        ctx_o.close()
+        ctx_m.close()
+        for v in vids:
+            co.delete_vault(v)
+
+
+def test_a_team_vault_whose_stored_team_key_cannot_be_read_still_takes_a_members_upload(browser, zk):
+    """The vault's team public key in the database is not a key the browser can read (an edit, or damage): the
+    member's browser cannot compare the team key it unwraps with it, which is a check that could not run, not a
+    mismatch. The member's upload goes through and nothing is reported; what it recorded is "could not run"."""
+    from test_ui_zk_rekey_notice import _create_team_vault_via_ui
+    owner, co = zk()
+    member, cm = zk()
+    ctx_o, ctx_m = browser.new_context(base_url=BASE_URL), browser.new_context(base_url=BASE_URL)
+    page_o, page_m = ctx_o.new_page(), ctx_m.new_page()
+    vids = []
+    try:
+        _login(page_o, owner["_username"], owner["_password"])
+        vids.append(_create_zk_vault_via_ui(page_o, co, OWNER_PASS))   # sets up the owner's key
+        vid = _create_team_vault_via_ui(page_o, co)
+        vids.append(vid)
+        _login(page_m, member["_username"], member["_password"])
+        _set_up_key(page_m, MEMBER_PASS)
+        assert page_o.evaluate(SHARE, [vid, member["id"]]) is True
+        co.post(f"/vaults/{vid}/permissions", json={"user_id": member["id"], "level": "write"}).raise_for_status()
+        _psql(f"UPDATE vaults SET team_public_key = '-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----' "
+              f"WHERE id = '{vid}'")
+
+        _open_vault(page_m, vid)
+        page_m.set_input_files("#file-upload-input", files=[{
+            "name": "team.txt", "mimeType": "text/plain", "buffer": b"uploaded all the same"}])
+        _wait_for(lambda: _psql(f"SELECT count(*) FROM files WHERE vault_id = '{vid}'") == "1", "the upload")
+        recorded = page_m.evaluate("(v) => Object.values(zkState.teamKeyMatches[v] || {}).map(e => e.matches)",
+                                   vid)
+        assert recorded == [None], recorded
+        assert _psql("SELECT count(*) FROM audit_logs WHERE action = 'zk_key_check_mismatch' "
+                     f"AND resource_id = '{vid}'") == "0"
+        expect(page_m.locator("#vault-key-warning")).to_be_hidden()
     finally:
         ctx_o.close()
         ctx_m.close()

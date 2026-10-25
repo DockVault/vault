@@ -52,6 +52,15 @@ async function main() {
          'direct: an older server (no key_proof) never blocks');
     note((await verdict({ state: 'set', source: 'rotate' }, other)).verdict === Checks.WRITE_UNCHECKED,
          'direct: a row without a key check never blocks');
+    // The stored check compared whole: one that only begins with the key's own check is another value.
+    for (const [what, extra] of [['a character more', 'A'], ['four characters more', 'AAAA'],
+                                 ['itself twice', set.dek_check]]) {
+        const longer = await verdict({ ...set, dek_check: set.dek_check + extra }, dek);
+        note(longer.verdict === Checks.WRITE_MISMATCH && longer.finding === 'dek_check',
+             `direct: a stored check that only begins with the key's check does not pass (${what})`);
+    }
+    const shorter = await verdict({ ...set, dek_check: set.dek_check.slice(0, -4) }, dek);
+    note(shorter.verdict === Checks.WRITE_MISMATCH, 'direct: a stored check cut short does not pass');
     // An owner's reset: a new epoch with fresh material made with the new key, which every remaining
     // member is given.
     const reset = await lib.generateVaultDEK();
@@ -93,8 +102,8 @@ async function main() {
     const unreadable = [['a stored team public key that does not parse',
                          '-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----'],
                         ['a P-256 key stored as the team key', p256Pem]];
-    // What app.js zkGetTeamPrivKey records from the answer (true, false, or null).
-    const recorded = m => (m === true ? true : (m === false ? false : null));
+    // What app.js zkGetTeamPrivKey records from the answer (true, false, or null): the module's own mapping.
+    const recorded = m => Checks.teamKeyAnswer(m);
     const unreadableCheckWrap = await lib.wrapTeamPrivateKeyV2(teamB.privateKey, member.publicKey, ctx);
     const teamPkcs8 = await lib._subtle().exportKey('pkcs8', teamB.privateKey);
     for (const [what, pem] of unreadable) {
@@ -110,6 +119,8 @@ async function main() {
     }
     note(recorded(true) === true && recorded(false) === false && recorded(undefined) === null,
          'team: the recorded answer keeps a mismatch a mismatch');
+    note([null, undefined, 0, 1, '', 'false', 'true', {}, []].every(v => recorded(v) === null),
+         'team: an answer that is neither true nor false is recorded as a comparison that could not run');
 
     let refused = 'NONE';
     try {
@@ -159,6 +170,12 @@ async function main() {
          'lineage: a member who never held the previous key cannot verify');
     note(await lineage(row({ source: 'create', lineage_tag: null })) === Checks.LINEAGE_FAILED,
          'lineage: a later epoch claiming to be the first fails');
+    // A tag that would verify, on a row whose source is neither a rotation nor an owner's reset: only those two
+    // make a later epoch with a tag, so the row is not one the checks know, and it fails rather than passes.
+    for (const source of ['create', 'bootstrap-later', 'proof', '']) {
+        note(await lineage(row({ source })) === Checks.LINEAGE_FAILED,
+             `lineage: a tag on a row of another source (${source || 'empty'}) fails`);
+    }
     note(await lineage(row(), prev, 1) === Checks.LINEAGE_FIRST, "lineage: the first epoch has no previous key");
 
     // A team vault: the tag binds the team DEK wrap and the team public key of the new epoch.

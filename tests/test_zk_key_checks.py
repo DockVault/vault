@@ -44,6 +44,14 @@ def test_a_key_that_is_not_the_vaults_is_refused_on_the_write_path(run):
     _ok(run, "team: a current team key that is not the vault's is refused, as a team_key finding")
 
 
+@pytest.mark.parametrize("extra", ["a character more", "four characters more", "itself twice"])
+def test_the_stored_check_is_compared_whole(run, extra):
+    """A stored check that only begins with the one the key makes is another value: comparing the key's check
+    as a prefix would let a longer stored value through."""
+    _ok(run, f"direct: a stored check that only begins with the key's check does not pass ({extra})")
+    _ok(run, "direct: a stored check cut short does not pass")
+
+
 @pytest.mark.parametrize("case", [
     "direct: an epoch rotated while rolled back (no row) never blocks",
     "direct: an older server (no key_proof) never blocks",
@@ -75,6 +83,7 @@ def test_a_team_key_comparison_that_cannot_run_is_not_a_mismatch(run):
         _ok(run, f"team: {what} is a comparison that could not run, not a mismatch")
         _ok(run, f"team: {what} still fails the yes-or-no comparison closed")
     _ok(run, "team: the recorded answer keeps a mismatch a mismatch")
+    _ok(run, "team: an answer that is neither true nor false is recorded as a comparison that could not run")
 
 
 @pytest.mark.parametrize("case", [
@@ -89,6 +98,10 @@ def test_a_team_key_comparison_that_cannot_run_is_not_a_mismatch(run):
     "lineage: an older server is not verifiable",
     "lineage: a member who never held the previous key cannot verify",
     "lineage: a later epoch claiming to be the first fails",
+    "lineage: a tag on a row of another source (create) fails",
+    "lineage: a tag on a row of another source (bootstrap-later) fails",
+    "lineage: a tag on a row of another source (proof) fails",
+    "lineage: a tag on a row of another source (empty) fails",
     "lineage: the first epoch has no previous key",
     "team lineage: a team rotation by a holder verifies",
     "team lineage: a substituted team DEK wrap fails",

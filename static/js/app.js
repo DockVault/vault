@@ -12958,9 +12958,8 @@ async function zkGetTeamPrivKey(vaultId, teamEpoch, wrappedTeamPrivkey, teamEphe
             wrappedTeamPrivkey, teamEphemeralPublicKey, priv, { vaultId, recipientUserId }, pem);
         teamPriv = out.privateKey;
         // Three answers: only a positive mismatch (false) stops a write; null, a comparison that could not run
-        // (a stored team public key that cannot be read), writes as before.
-        const m = out.matchesPublic;
-        compared[teamEpoch] = { pem, matches: m === true ? true : (m === false ? false : null) };
+        // (a stored team public key that cannot be read), writes as before (static/js/zk_key_checks.js).
+        compared[teamEpoch] = { pem, matches: ZkKeyChecks.teamKeyAnswer(out.matchesPublic) };
     } else {
         teamPriv = await eccLib().unwrapPrivateKeyFromWrapped(
             wrappedTeamPrivkey, teamEphemeralPublicKey, priv, false,
