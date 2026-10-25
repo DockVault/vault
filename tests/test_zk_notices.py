@@ -238,6 +238,17 @@ def test_without_another_known_address_only_the_account_is_told(world, payload, 
     assert [m[1] for m in world.mails] == [user.email]
 
 
+def test_of_two_changes_the_address_before_the_first_is_told(world):
+    """An administrator changed the password, the address was then moved to one of the administrator's, and the
+    password was changed again: the later change kept the administrator's address, the first the person's. The
+    notice goes to the address before the first change, so it still reaches the person."""
+    user = _person(world)
+    _changed(world, user, cc.PASSWORD, {"email_at_change": "person@example.com"}, days_ago=5)
+    _changed(world, user, cc.PASSWORD, {"email_at_change": "taker@example.com"}, days_ago=1)
+    N.key_registered(world.db, user)
+    assert sorted(m[1] for m in world.mails) == sorted([user.email, "person@example.com"])
+
+
 def test_the_same_address_is_told_once(world):
     user = _person(world)
     _changed(world, user, cc.PASSWORD, {"email_at_change": user.email.upper()})
