@@ -123,8 +123,10 @@ While a legal hold stands on a vault, or what it kept waits for its purge (files
 vault, and the old names of those renamed in it), the vault cannot be deleted, and a zero-knowledge vault's older
 key versions are not retired: what was kept was sealed under them, and only their owner's keys open it. A case
 about a person (its custodian) keeps their account as well: it cannot be deleted while the case's hold stands or
-what the hold kept waits for its purge. Each refusal names the case and is recorded (`hold_blocked_delete`). A
-per-person erase waits while any hold stands or any case is open.
+what the hold kept waits for its purge. Each refusal is recorded under the case (`hold_blocked_delete`), and says
+why: to the vault's owner and to an administrator it names the case, while another manager of the vault refused a
+retire is told only that a legal hold keeps it. A per-person erase waits while any hold stands or any case is
+open.
 
 ### Upgrading with SFTP in its own container
 
