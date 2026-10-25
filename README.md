@@ -447,11 +447,18 @@ it never replaces a published image with a local build. The `build:` path stays 
 files, so you can always build your own (modified) image, which the AGPL license requires you be
 able to do.
 
-### Upgrading to 0.34.0 with legal holds
+### Upgrading to 0.34.0
 
 - **SFTP in its own container (the split profile, the trial compose):** update the SFTP container together with the
   web one. A legal hold cannot be placed while an SFTP server of another version may be running: an older one would
   delete what a hold keeps.
+- **Encryption keys of accounts an administrator changed lately:** for `ZK_ENVELOPE_HOLD_DAYS` days (14 by default)
+  after an administrator changed a person's sign-in details, their zero-knowledge key opens in a browser only after
+  they enter a code sent by email, and changes made before the upgrade count. Someone whose first such change in the
+  14 days before the upgrade was not an email change gets no code (the earlier release kept no address for it), nor
+  does anyone on a deployment without mail: release them with `python dockvault.py accounts --action
+  release-key-hold`, or the hold ends `ZK_ENVELOPE_HOLD_DAYS` days after the last change. `ZK_ENVELOPE_HOLD_DAYS=0`
+  in `.env` turns it off.
 - **Going back:** while a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones)
   waits for its purge, a release before 0.34.0 refuses to start (from 0.33.1 on) and `dockvault.py update` refuses
   the rollback. Release the holds, wait for the purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more,

@@ -5,7 +5,9 @@ and each branch alone: audit rows of the days archiving moves when it starts and
 security alerts with a name and an address, a name only, an address only or neither, one a day past 30 days
 and one just inside them; invitations ended by acceptance, revocation or expiry 31 days ago and 29 days ago, and
 a pending one; reset links, codes and email-change codes used 31 days ago before an expiry still ahead, or
-expired, beside ones that ended 29 days ago and live ones; an archived day and a value set in the panel.
+expired, beside ones that ended 29 days ago and live ones; an archived day and a value set in the panel; accounts
+with an encryption key whose sign-in details were changed 1 to 13 days ago, the first change an email change or
+another kind, beside an account without a key, a change 15 days ago and changes never applied.
 test_release_conditions.py checks the queries offline.
 """
 import json
@@ -19,8 +21,8 @@ pytestmark = pytest.mark.integration
 
 SCRIPT = PREAMBLE + r'''
 from datetime import date
-from app.core.models import (AccountInvitation, AuditArchiveBlock, AuditLog, EmailChangeCode, ManagedSetting,
-                             OtpCode, PasswordResetToken, RoleEnum, SecurityAlert, User)
+from app.core.models import (AccountInvitation, AuditArchiveBlock, AuditLog, CredentialChange, EmailChangeCode,
+                             ManagedSetting, OtpCode, PasswordResetToken, RoleEnum, SecurityAlert, User, UserKeyPair)
 QUERIES = json.loads(__QUERIES__)
 
 def run_all():
@@ -74,6 +76,29 @@ db.add(AuditArchiveBlock(day=date(2026, 1, 3), part=0, first_hour=datetime(2026,
                          raw_bytes=1, aggregates={}, created_at=now))
 db.add(ManagedSetting(key="audit_hot_days", value=120, version=1, updated_at=now))
 db.add(ManagedSetting(key="logs_hold", value=None, version=2, updated_at=now))
+# Accounts and the changes of their sign-in details: (has a key, [(kind, status, days ago)]).
+ACCOUNTS = {
+    "password-3-days": (True, [("password", "made", 3)]),                         # held, host only
+    "email-then-password": (True, [("email", "made", 5), ("password", "made", 1)]),  # held, the code reaches it
+    "password-then-email": (True, [("password", "made", 6), ("email", "made", 2)]),  # held, host only
+    "approved-ssh-key": (True, [("ssh_key", "approved", 10)]),                     # held, host only
+    "email-13-days": (True, [("email", "made", 13)]),                              # held, the code reaches it
+    "no-key": (False, [("password", "made", 2)]),                                  # nothing to hold
+    "15-days": (True, [("password", "made", 15)]),                                 # the hold has ended
+    "held-for-approval": (True, [("password", "held", 1)]),                        # never applied
+    "denied": (True, [("reset_link", "denied", 1)]),                               # never applied
+}
+for name, (key, changes) in ACCOUNTS.items():
+    account = User(id=uuid.uuid4(), username="cond-" + name, email=name + "@example.com", password_hash="x",
+                   role=RoleEnum.USER, is_active=True)
+    db.add(account)
+    db.flush()
+    if key:
+        db.add(UserKeyPair(user_id=account.id, public_key="P", fingerprint="f" * 64, encrypted_private_key="E"))
+    for kind, status, days in changes:
+        db.add(CredentialChange(target_user_id=account.id, kind=kind, status=status, requested_by_name="admin",
+                                requested_at=ago(days),
+                                applied_at=ago(days) if status in ("made", "approved") else None))
 db.commit()
 db.close()
 out["after"] = run_all()
@@ -114,3 +139,8 @@ def test_each_detect_query_finds_what_was_seeded_and_only_that(throwaway):
     assert after[q] == [{"days": "2", "rows": "12", "first_day": "2026-01-02", "last_day": "2026-01-03"}]
     q = "panel-retention-not-read"
     assert before[q] == [] and after[q] == [{"key": "audit_hot_days", "value": "120"}]
+    # Five accounts with a key and an applied change in the last 14 days; of them, the three whose first such change
+    # was not an email change only the server's operator can release.
+    q = "zk-envelope-held-after-admin-reset"
+    assert before[q] == []
+    assert after[q] == [{"held_accounts": "5", "released_only_by_the_host": "3"}]
