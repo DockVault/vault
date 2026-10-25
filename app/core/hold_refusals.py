@@ -75,7 +75,26 @@ def _numbers(db, case_ids) -> dict:
             .filter(ComplianceCase.id.in_(ids)).all()}
 
 
-def vault_keeping(db, vault_id) -> Optional[Keeping]:
+def _now() -> datetime:
+    from app.core.legal_holds import utcnow
+    return utcnow()
+
+
+def _waits(purge_after, now: datetime) -> bool:
+    """Whether a released hold still keeps what it kept: its purge time has not come (or is not known), so the
+    release can still be undone (legal_holds.purgeable_vaults_clause, undo_refusal)."""
+    return purge_after is None or purge_after > now
+
+
+def _latest(purges) -> Optional[datetime]:
+    """The latest of the purge times, or None when one of them is not known."""
+    purges = list(purges)
+    if not purges or any(p is None for p in purges):
+        return None
+    return max(purges)
+
+
+def vault_keeping(db, vault_id, now: Optional[datetime] = None) -> Optional[Keeping]:
     """What keeps ``vault_id``, or None when nothing does. Nothing on a database without the kept tables; on
     Postgres a read that fails is raised, so the caller's step fails with nothing done."""
     from app.core import kept_tables
@@ -87,28 +106,36 @@ def vault_keeping(db, vault_id) -> Optional[Keeping]:
             .filter(LegalHoldVault.vault_id == vid).all())
     numbers = _numbers(db, [r[0] for r in rows])
     keeping = Keeping()
-    standing = sorted((r for r in rows if r[1] is None), key=lambda r: str(numbers.get(r[0]) or ""))
+    by_number = lambda r: str(numbers.get(r[0]) or "")  # noqa: E731
+    standing = sorted((r for r in rows if r[1] is None), key=by_number)
     keeping.standing = [(r[0], numbers.get(r[0])) for r in standing]
     if not keeping.standing:
-        # Released: the kept rows wait for the purge after the latest release (the others' purge has run, or
-        # waits as long).
-        released = sorted((r for r in rows if r[1] is not None), key=lambda r: r[1], reverse=True)
-        if released:
-            latest = released[0][1]
-            keeping.waiting = [(r[0], numbers.get(r[0])) for r in released if r[1] == latest]
-            purges = [r[2] for r in released if r[1] == latest and r[2] is not None]
-            keeping.purge_after = max(purges) if purges else None
+        # Released: what the holds kept waits until no release of them waits any more (the purge's own rule), so
+        # every release whose purge time has not come is named, with the latest of their purge times. A case's
+        # delay is the stricter of its value at approval and now, so an earlier release can wait longer than a
+        # later one. When every purge time has come, the next pass of the purge takes the rows: the releases of
+        # the latest purge time are named.
+        now = now or _now()
+        released = [r for r in rows if r[1] is not None]
+        waiting = [r for r in released if _waits(r[2], now)]
+        if not waiting and released:
+            last = max(r[2] for r in released)
+            waiting = [r for r in released if r[2] == last]
+        keeping.waiting = [(r[0], numbers.get(r[0])) for r in sorted(waiting, key=by_number)]
+        keeping.purge_after = _latest(r[2] for r in waiting)
     return keeping
 
 
-def custodian_keeping(db, user_id) -> Optional[Keeping]:
+def custodian_keeping(db, user_id, now: Optional[datetime] = None) -> Optional[Keeping]:
     """What keeps the account ``user_id``, or None: a case about the person (its custodian) with a hold that stands,
-    or a released hold on a vault whose kept rows still wait for their purge. Takes the turn of holds and deletions
-    shared first (Postgres only); on Postgres a read that fails is raised, so the delete fails with nothing done."""
+    or a released hold whose purge time has not come on a vault whose kept rows still wait for their purge (with
+    the latest of those purge times). Takes the turn of holds and deletions shared first (Postgres only); on
+    Postgres a read that fails is raised, so the delete fails with nothing done."""
     from app.core import kept_tables, legal_holds
     from app.core.models import ComplianceCasePerson, ComplianceCaseScope, LegalHoldVault
     if _dialect(db) == "postgresql":
         legal_holds.take_turn(db, shared=True)
+    now = now or _now()
     uid = uuid.UUID(str(user_id))
     cases = {r[0] for r in db.query(ComplianceCasePerson.case_id)
              .filter(ComplianceCasePerson.user_id == uid, ComplianceCasePerson.why == "custodian").all()}
@@ -120,7 +147,7 @@ def custodian_keeping(db, user_id) -> Optional[Keeping]:
                      LegalHoldVault.purge_after)
             .filter(LegalHoldVault.case_id.in_(sorted(cases, key=str))).all())
     numbers = _numbers(db, [r[0] for r in rows])
-    keeping, kept = Keeping(), {}
+    keeping, kept, purges = Keeping(), {}, []
     for case_id, vault_id, released_at, purge_after in sorted(
             rows, key=lambda r: (str(numbers.get(r[0]) or ""), str(r[1]))):
         entry = (case_id, numbers.get(case_id))
@@ -128,15 +155,19 @@ def custodian_keeping(db, user_id) -> Optional[Keeping]:
             if entry not in keeping.standing:
                 keeping.standing.append(entry)
             continue
+        # A release whose purge time has come can no longer be undone: what the vault still keeps then is kept
+        # for another hold, not for this case.
+        if not _waits(purge_after, now):
+            continue
         if vault_id not in kept:
             kept[vault_id] = kept_tables.has_kept_rows(db, vault_id)
         if kept[vault_id]:
             if entry not in keeping.waiting:
                 keeping.waiting.append(entry)
-            if purge_after is not None and (keeping.purge_after is None or purge_after > keeping.purge_after):
-                keeping.purge_after = purge_after
+            purges.append(purge_after)
     if not keeping.standing and not keeping.waiting:
         return None
+    keeping.purge_after = _latest(purges)
     return keeping
 
 

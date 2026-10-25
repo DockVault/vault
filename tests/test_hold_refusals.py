@@ -48,6 +48,13 @@ def text_ids(monkeypatch):
     monkeypatch.setattr(sqltypes.Uuid, "bind_processor", bind_processor)
 
 
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    """The refusals read the time to tell a release that still waits from one whose purge time has come: here it
+    is NOW, whatever the day the tests run."""
+    monkeypatch.setattr(hr, "_now", lambda: NOW)
+
+
 @pytest.fixture
 def db(text_ids):
     from _kept_db import kept_database
@@ -171,6 +178,59 @@ def test_two_standing_holds_are_both_named(world):
     keeping = hr.vault_keeping(world.db, world.vault.id)
     assert [n for _c, n in keeping.standing] == ["C-2026-0005", "C-2026-0006"]
     assert "cases C-2026-0005 and C-2026-0006" in hr.vault_text(keeping)
+
+
+def test_two_releases_that_both_wait_are_both_named_with_the_latest_purge_time(world):
+    """What a vault kept waits until no release of it waits (the purge's own rule). A case's purge delay is the
+    stricter of its value at approval and now, so a release made earlier can wait longer than a later one: both
+    can still be undone, both are named, and the vault can be deleted after the later of their two purge times."""
+    earlier, later = _case(world.db, world.ada, "C-2026-0022"), _case(world.db, world.ada, "C-2026-0023")
+    long_wait, short_wait = NOW + timedelta(days=27), NOW + timedelta(days=6)
+    _hold(world.db, earlier, world.vault, released=NOW - timedelta(days=3), purge_after=long_wait)
+    _hold(world.db, later, world.vault, released=NOW - timedelta(days=1), purge_after=short_wait)
+    _kept_file(world.db, world.vault)
+    keeping = hr.vault_keeping(world.db, world.vault.id)
+    assert keeping.standing == []
+    assert keeping.waiting == [(earlier.id, "C-2026-0022"), (later.id, "C-2026-0023")]
+    assert keeping.purge_after == long_wait
+    text = hr.vault_text(keeping)
+    assert "cases C-2026-0022 and C-2026-0023" in text and f"purged after {long_wait:%Y-%m-%d}" in text
+    assert f"{short_wait:%Y-%m-%d}" not in text
+
+
+def test_a_release_whose_purge_time_has_come_is_not_named_while_another_waits(world):
+    """The first release's purge time has come (it can no longer be undone); a later one still waits: the vault is
+    kept for that one, and its date is the one given."""
+    done, waits = _case(world.db, world.ada, "C-2026-0024"), _case(world.db, world.ada, "C-2026-0025")
+    _hold(world.db, done, world.vault, released=NOW - timedelta(days=10), purge_after=NOW - timedelta(days=3))
+    _hold(world.db, waits, world.vault, released=NOW - timedelta(days=1), purge_after=NOW + timedelta(days=6))
+    _kept_name(world.db, world.vault)
+    keeping = hr.vault_keeping(world.db, world.vault.id)
+    assert keeping.waiting == [(waits.id, "C-2026-0025")] and keeping.purge_after == NOW + timedelta(days=6)
+    assert "C-2026-0024" not in hr.vault_text(keeping) and "C-2026-0024" not in hr.key_versions_text(keeping)
+
+
+def test_when_every_purge_time_has_come_the_latest_is_named_until_the_purge_runs(world):
+    """Kept rows the purge has not taken yet, though every release's time has come (its next pass takes them):
+    the vault still waits, for the release of the latest purge time."""
+    first, last = _case(world.db, world.ada, "C-2026-0026"), _case(world.db, world.ada, "C-2026-0027")
+    _hold(world.db, first, world.vault, released=NOW - timedelta(days=12), purge_after=NOW - timedelta(days=5))
+    _hold(world.db, last, world.vault, released=NOW - timedelta(days=8), purge_after=NOW - timedelta(hours=1))
+    _kept_folder(world.db, world.vault)
+    keeping = hr.vault_keeping(world.db, world.vault.id)
+    assert keeping.waiting == [(last.id, "C-2026-0027")] and keeping.purge_after == NOW - timedelta(hours=1)
+
+
+def test_a_release_with_no_purge_time_keeps_its_date_untold(world):
+    """A released hold with no purge time (which no path writes) still waits, and no date is given rather than
+    another release's earlier one."""
+    told, untold = _case(world.db, world.ada, "C-2026-0028"), _case(world.db, world.ada, "C-2026-0029")
+    _hold(world.db, told, world.vault, released=NOW - timedelta(days=1), purge_after=NOW + timedelta(days=6))
+    _hold(world.db, untold, world.vault, released=NOW - timedelta(days=1), purge_after=None)
+    _kept_file(world.db, world.vault)
+    keeping = hr.vault_keeping(world.db, world.vault.id)
+    assert [n for _c, n in keeping.waiting] == ["C-2026-0028", "C-2026-0029"] and keeping.purge_after is None
+    assert "until they are purged:" in hr.vault_text(keeping)
 
 
 # --------------------------------------------------------------------------- the record
@@ -521,6 +581,31 @@ def test_another_cases_hold_on_the_vault_does_not_keep_a_custodian_whose_own_hol
     _hold(world.db, own, world.vault, released=NOW, purge_after=NOW - timedelta(days=1))
     _hold(world.db, _case(world.db, world.ada, "C-2026-0017"), world.vault)
     assert hr.custodian_keeping(world.db, otto.id) is None
+    # Not even while the other case's hold keeps rows of the vault: the custodian's own release can no longer be
+    # undone, so what the vault keeps now is kept for the other case.
+    _kept_file(world.db, world.vault)
+    assert hr.custodian_keeping(world.db, otto.id) is None
+
+
+def test_a_custodian_whose_case_held_two_vaults_waits_for_the_later_purge(world):
+    """The case held two vaults, both released and both keeping rows, with different purge times (a vault can wait
+    for another case's longer delay too, which is that case's): the account can be deleted after the later."""
+    otto = _user(world.db, "otto")
+    case = _custodian_case(world.db, world.ada, "C-2026-0030", otto)
+    sooner, later = NOW + timedelta(days=2), NOW + timedelta(days=9)
+    _hold(world.db, case, world.other, released=NOW - timedelta(days=5), purge_after=later)
+    _hold(world.db, case, world.vault, released=NOW - timedelta(days=1), purge_after=sooner)
+    _kept_file(world.db, world.vault)
+    _kept_name(world.db, world.other)
+    keeping = hr.custodian_keeping(world.db, otto.id)
+    assert keeping.waiting == [(case.id, "C-2026-0030")] and keeping.purge_after == later
+    assert f"until they are purged after {later:%Y-%m-%d}" in hr.account_text(keeping)
+    # Only a vault that keeps rows counts: with the later one's rows purged, the sooner date is the one.
+    world.db.query(m.HeldNameHistory).delete()
+    world.db.commit()
+    assert hr.custodian_keeping(world.db, otto.id).purge_after == sooner
+    # And with both of its purge times come, the account is kept no more.
+    assert hr.custodian_keeping(world.db, otto.id, now=later + timedelta(minutes=1)) is None
 
 
 def test_on_postgres_the_check_takes_the_turn_of_holds_and_deletions_shared_first(world, monkeypatch):
