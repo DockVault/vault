@@ -119,11 +119,12 @@ hold also tells the owner). The purpose "Regulator or authority request" does no
 
 ### What a legal hold refuses
 
-While a legal hold stands on a vault, or files it kept wait for their purge, the vault cannot be deleted, and a
-zero-knowledge vault's older key versions are not retired: the kept files were sealed under them, and only their
-owner's keys open them. A case about a person (its custodian) keeps their account as well: it cannot be deleted
-while the case's hold stands or what the hold kept waits for its purge. Each refusal names the case and is recorded
-(`hold_blocked_delete`). A per-person erase waits while any hold stands or any case is open.
+While a legal hold stands on a vault, or what it kept waits for its purge (files and folders deleted from the
+vault, and the old names of those renamed in it), the vault cannot be deleted, and a zero-knowledge vault's older
+key versions are not retired: what was kept was sealed under them, and only their owner's keys open it. A case
+about a person (its custodian) keeps their account as well: it cannot be deleted while the case's hold stands or
+what the hold kept waits for its purge. Each refusal names the case and is recorded (`hold_blocked_delete`). A
+per-person erase waits while any hold stands or any case is open.
 
 ### Upgrading with SFTP in its own container
 
@@ -134,11 +135,11 @@ together with the web container, then place holds.
 
 ### Going back to an older release
 
-While a legal hold stands, or files a hold kept wait for their purge, a release before 0.34.0 would destroy the
-kept files. From 0.33.1 on, an older release refuses to start on such data, and `dockvault.py update` refuses the
-rollback. To roll back: release every hold (on the Compliance page or with `dockvault.py cases`), wait until what
-they kept is purged (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS` after the release), then start this version once more so it
-removes the marker. A release before 0.33.1 does not read the marker: never roll back that far while holds exist.
+While a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones) waits for its purge,
+a release before 0.34.0 would destroy it. From 0.33.1 on, an older release refuses to start on such data, and
+`dockvault.py update` refuses the rollback. To roll back: release every hold (on the Compliance page or with
+`dockvault.py cases`), wait until what they kept is purged (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS` after the release),
+then start this version once more so it removes the marker. A release before 0.33.1 does not read the marker: never roll back that far while holds exist.
 
 ### Someone else giving access
 

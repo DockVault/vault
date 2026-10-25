@@ -47,9 +47,12 @@ def test_the_condition_is_one_the_matrix_accepts_and_blocks_a_rollback():
 
 
 def test_the_condition_finds_a_standing_hold_or_any_kept_row():
+    """A kept file, folder or old name: an older release would retire the keys the kept rows were sealed under, as
+    it would destroy a kept file's bytes."""
     sql = marker.DETECT_SQL
     assert "FROM legal_hold_vaults WHERE released_at IS NULL" in sql
-    assert "SELECT 1 FROM held_files" in sql and "SELECT 1 FROM held_folders" in sql
+    for table in ("held_files", "held_folders", "held_name_history"):
+        assert sql.count(f"UNION ALL SELECT 1 FROM {table} ") == 1, table
 
 
 @pytest.fixture
@@ -66,7 +69,7 @@ def _row(db):
     return db.execute(text("SELECT key, requires_at_least, reason, undo FROM data_requirements")).fetchall()
 
 
-@pytest.mark.parametrize("what", ["hold", "file", "folder"])
+@pytest.mark.parametrize("what", ["hold", "file", "folder", "old name"])
 def test_the_marker_is_there_while_a_hold_stands_or_a_kept_row_remains(db, what, monkeypatch):
     monkeypatch.setattr(recording_marker, "running_version", lambda: "0.34.0")
     vault_id = uuid.uuid4()
@@ -74,8 +77,11 @@ def test_the_marker_is_there_while_a_hold_stands_or_a_kept_row_remains(db, what,
         db.add(m.LegalHoldVault(case_id=uuid.uuid4(), vault_id=vault_id, placed_by_username="a"))
     elif what == "file":
         db.add(m.HeldFile(id=uuid.uuid4(), vault_id=vault_id, storage_path="p"))
-    else:
+    elif what == "folder":
         db.add(m.HeldFolder(id=uuid.uuid4(), vault_id=vault_id))
+    else:
+        db.add(m.HeldNameHistory(id=uuid.uuid4(), object_id=uuid.uuid4(), vault_id=vault_id, kind="file",
+                                 enc_name="zk2:old", name_key_version=1))
     assert marker.sync(db) is True
     ((key, needs, reason, undo),) = _row(db)
     assert (key, needs) == ("legal-holds", "0.34.0")

@@ -173,6 +173,20 @@ def test_a_held_vault_or_one_with_kept_rows_cannot_be_deleted_even_bypassing_the
     assert psql(f"SELECT count(*) FROM vaults WHERE id = '{vid}'") == "1"
 
 
+def test_nor_one_whose_released_hold_kept_only_an_old_name(admin, held):
+    """A rename under the hold, nothing deleted: only the old name is kept, and it keeps the vault through the
+    release's window, as a kept file does (the undo of the release must find the vault)."""
+    vid, f = held["vault"], held["files"][0]
+    r = admin.put(f"/vaults/{vid}/files/{f}/rename", json={"new_name": "renamed.txt"})
+    assert r.status_code == 200, r.text
+    psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE vault_id = '{vid}'")
+    assert psql(f"SELECT (SELECT count(*) FROM held_files WHERE vault_id = '{vid}') + "
+                f"(SELECT count(*) FROM held_folders WHERE vault_id = '{vid}')") == "0"
+    assert psql(f"SELECT count(*) FROM held_name_history WHERE vault_id = '{vid}'") == "1"
+    assert "legal hold" in _sql_error(f"DELETE FROM vaults WHERE id = '{vid}'"), "its old name waits for a purge"
+    assert psql(f"SELECT count(*) FROM vaults WHERE id = '{vid}'") == "1"
+
+
 def test_the_tables_cannot_be_emptied_while_a_hold_stands(held):
     for table in ("files", "folders", "vaults"):
         # Inside a transaction rolled back either way: a missing trigger must not cost the stack its data.
@@ -187,6 +201,20 @@ def test_nor_while_kept_rows_wait_for_their_purge_once_no_hold_stands(held):
     assert psql("SELECT count(*) FROM legal_hold_vaults WHERE released_at IS NULL") == "0", \
         "no hold may stand anywhere on the stack for this test to mean anything"
     assert psql(f"SELECT count(*) FROM held_files WHERE vault_id = '{vid}'") == "1"
+    for table in ("files", "folders", "vaults"):
+        error = _sql_error(f"BEGIN; TRUNCATE {table} CASCADE; ROLLBACK;")
+        assert "cannot be emptied" in error, (table, error)
+
+
+def test_nor_while_only_old_names_wait_for_their_purge(admin, held):
+    vid, f = held["vault"], held["files"][0]
+    r = admin.put(f"/vaults/{vid}/files/{f}/rename", json={"new_name": "renamed.txt"})
+    assert r.status_code == 200, r.text
+    psql(f"UPDATE legal_hold_vaults SET released_at = now() WHERE vault_id = '{vid}'")
+    assert psql("SELECT (SELECT count(*) FROM legal_hold_vaults WHERE released_at IS NULL) + "
+                "(SELECT count(*) FROM held_files) + (SELECT count(*) FROM held_folders)") == "0", \
+        "no hold may stand and no file or folder be kept anywhere on the stack for this test to mean anything"
+    assert psql(f"SELECT count(*) FROM held_name_history WHERE vault_id = '{vid}'") == "1"
     for table in ("files", "folders", "vaults"):
         error = _sql_error(f"BEGIN; TRUNCATE {table} CASCADE; ROLLBACK;")
         assert "cannot be emptied" in error, (table, error)
@@ -241,7 +269,13 @@ def test_the_starts_check_refuses_a_missing_disabled_or_stale_trigger_each_in_a_
                # only its WHEN clause changed.
                ("when false", "CREATE OR REPLACE TRIGGER trg_files_keep_name AFTER UPDATE OF name, enc_name ON files "
                               "FOR EACH ROW WHEN (false) EXECUTE FUNCTION dv_keep_file_name(); "
-                              "ALTER TABLE files ENABLE ALWAYS TRIGGER trg_files_keep_name")]
+                              "ALTER TABLE files ENABLE ALWAYS TRIGGER trg_files_keep_name"),
+               # The vaults trigger's function as a build made it before it counted the old names.
+               ("vault body", "CREATE OR REPLACE FUNCTION dv_hold_vault_delete() RETURNS trigger LANGUAGE plpgsql AS "
+                              "$f$ BEGIN IF EXISTS (SELECT 1 FROM held_files k WHERE k.vault_id = OLD.id) THEN "
+                              "RAISE EXCEPTION 'held'; END IF; RETURN OLD; END $f$"),
+               ("no old names", "DROP TABLE held_name_history"),
+               ("no epoch", "ALTER TABLE held_name_history DROP COLUMN name_key_version")]
     out = in_api_container("CHANGES = " + repr(changes) + "\n" + _CHECK)
     found = json.loads([ln for ln in out.stdout.splitlines() if ln.startswith("OUT=")][0][4:])
     assert "trg_files_keep is missing" in found["dropped"]
@@ -251,6 +285,10 @@ def test_the_starts_check_refuses_a_missing_disabled_or_stale_trigger_each_in_a_
     assert "held_files.probe_after_start" in found["new column"] and "dv_keep_files" in found["new column"]
     assert "trg_files_keep_name does not fire on every change of a name" in found["when false"]
     assert "trg_files_keep_name" not in (found["dropped"] or ""), "the WHEN clause Postgres prints passes"
+    assert "dv_hold_vault_delete" in found["vault body"]
+    assert "the table held_name_history is missing" in found["no old names"]
+    assert "held_name_history.name_key_version is missing" in found["no epoch"]
+    assert "held_name_history" not in (found["dropped"] or ""), "the table as the start leaves it passes"
 
 
 _START = """

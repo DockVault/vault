@@ -452,10 +452,10 @@ able to do.
 - **SFTP in its own container (the split profile, the trial compose):** update the SFTP container together with the
   web one. A legal hold cannot be placed while an SFTP server of another version may be running: an older one would
   delete what a hold keeps.
-- **Going back:** while a legal hold stands, or files a hold kept wait for their purge, a release before 0.34.0
-  refuses to start (from 0.33.1 on) and `dockvault.py update` refuses the rollback. Release the holds, wait for the
-  purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more, then roll back. Never roll back below 0.33.1
-  while holds exist: those releases do not check.
+- **Going back:** while a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones)
+  waits for its purge, a release before 0.34.0 refuses to start (from 0.33.1 on) and `dockvault.py update` refuses
+  the rollback. Release the holds, wait for the purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more,
+  then roll back. Never roll back below 0.33.1 while holds exist: those releases do not check.
 
 ### Database migrations
 

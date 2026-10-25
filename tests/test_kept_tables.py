@@ -48,7 +48,8 @@ class _Rows:
 class _Catalog:
     """A session answering kept_tables' catalog reads from dicts, as Postgres would."""
 
-    def __init__(self, live=None, kept=None, triggers=None, functions=None, keyed=("held_files", "held_folders")):
+    def __init__(self, live=None, kept=None, triggers=None, functions=None, keyed=("held_files", "held_folders"),
+                 names=None):
         self.keyed = set(keyed)       # the kept tables that have their primary key
         self.columns = {"files": list(FILES), "folders": list(FOLDERS)}
         self.columns.update(live or {})
@@ -57,6 +58,9 @@ class _Catalog:
                           [(n, k, False) for n, k in kt.EXTRA_COLUMNS],
             "held_folders": [(n, k, False) for n, k, _ in self.columns["folders"]] +
                             [(n, k, False) for n, k in kt.EXTRA_COLUMNS]})
+        # The old names, as create_all builds them from the model.
+        self.columns["held_name_history"] = names if names is not None else [
+            (c.name, "text", False) for c in m.HeldNameHistory.__table__.columns]
         self.triggers = triggers if triggers is not None else _healthy_triggers()
         self.functions = functions if functions is not None else kt.function_bodies(
             {"files": [c[0] for c in FILES], "folders": [c[0] for c in FOLDERS]})
@@ -138,15 +142,32 @@ def test_the_rename_functions_keep_the_old_sealed_name_of_a_held_vaults_object()
         assert f"VALUES (gen_random_uuid(), OLD.id, OLD.vault_id, '{kind}', OLD.name, OLD.enc_name, " in body
     assert "OLD.name_key_version" in bodies["dv_keep_folder_name"]
     assert "(OLD.encryption_metadata ->> 'key_version')::integer" in bodies["dv_keep_file_name"]
+    # Into every column of the old names' table but none it does not have.
+    for name in ("dv_keep_file_name", "dv_keep_folder_name"):
+        assert bodies[name].count("INSERT INTO held_name_history (id, object_id, vault_id, kind, name, enc_name, "
+                                  "name_key_version, renamed_at)\n") == 1
+    assert set(kt.NAME_HISTORY_COLUMNS) == set(m.HeldNameHistory.__table__.columns.keys())
 
 
 def test_the_vault_trigger_refuses_a_held_vault_or_one_with_kept_rows_and_lets_others_go():
+    """Kept rows of each of the three kept tables refuse it: a vault whose released hold kept only the old name of
+    something renamed in it is kept too, or the undo of the release would find no vault."""
     body = kt.VAULT_FUNCTION_BODY
     assert "SELECT 1 FROM legal_hold_vaults h WHERE h.vault_id = OLD.id AND h.released_at IS NULL" in body
     assert "SELECT 1 FROM held_files k WHERE k.vault_id = OLD.id" in body
     assert "SELECT 1 FROM held_folders k WHERE k.vault_id = OLD.id" in body
+    assert "SELECT 1 FROM held_name_history k WHERE k.vault_id = OLD.id" in body
+    assert body.count("OR EXISTS (SELECT 1 FROM held_") == 3
     assert "RAISE EXCEPTION" in body and f"HINT = '{kt.HOLD_HINT}'" in body
     assert body.rstrip().endswith("RETURN OLD;\nEND")
+
+
+def test_the_truncate_trigger_refuses_while_any_hold_stands_or_any_kept_table_has_a_row():
+    body = kt.TRUNCATE_FUNCTION_BODY
+    assert "EXISTS (SELECT 1 FROM legal_hold_vaults h WHERE h.released_at IS NULL)" in body
+    for table in ("held_files", "held_folders", "held_name_history"):
+        assert body.count(f"OR EXISTS (SELECT 1 FROM {table})") == 1, table
+    assert "RAISE EXCEPTION" in body and f"HINT = '{kt.HOLD_HINT}'" in body
 
 
 def test_each_trigger_is_made_enable_always_and_of_its_kind():
@@ -294,6 +315,31 @@ def test_a_kept_table_missing_a_live_column_or_of_another_type_is_a_problem():
     assert any("held_files.kept_reason" in p for p in kt.problems(_Catalog(kept=no_extra)))
     gone = {"held_files": kept["held_files"], "held_folders": []}
     assert any("held_folders is missing" in p for p in kt.problems(_Catalog(kept=gone)))
+
+
+def test_the_old_names_table_missing_or_without_a_column_its_triggers_write_is_a_problem():
+    """The rename triggers write into held_name_history, and the vaults and truncate triggers count its rows: a
+    start without it, or without one of those columns, could not keep a name or would let a vault go."""
+    assert kt.problems(_Catalog(names=[])) == ["the table held_name_history is missing"]
+    names = _Catalog().columns["held_name_history"]
+    for column in kt.NAME_HISTORY_COLUMNS:
+        short = [c for c in names if c[0] != column]
+        assert kt.problems(_Catalog(names=short)) == [f"held_name_history.{column} is missing"], column
+    # A column it has beyond those is no problem.
+    assert kt.problems(_Catalog(names=names + [("noted", "text", False)])) == []
+
+
+def test_a_vault_or_truncate_function_made_before_the_old_names_counted_is_a_problem():
+    """The bodies an earlier build installed, without held_name_history: the start's check finds them stale (the
+    start installs the current ones before it checks)."""
+    healthy = _Catalog().functions
+    for function, line in (("dv_hold_vault_delete",
+                            "\n       OR EXISTS (SELECT 1 FROM held_name_history k WHERE k.vault_id = OLD.id)"),
+                           ("dv_hold_no_truncate", "\n       OR EXISTS (SELECT 1 FROM held_name_history)")):
+        assert healthy[function].count(line) == 1, function
+        older = dict(healthy, **{function: healthy[function].replace(line, "")})
+        assert kt.problems(_Catalog(functions=older)) == [
+            f"the function {function} is missing, or was not made for the columns its table has now"]
 
 
 def test_a_function_not_made_for_the_columns_the_table_has_now_is_a_problem():

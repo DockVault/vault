@@ -20,16 +20,18 @@ column but ``id`` refuses a NULL. The trigger functions are generated then with 
 columns, in one transaction with the triggers themselves, so there is never a moment without them.
 
 The other triggers:
-- ``vaults``, BEFORE DELETE, per row: refuses to delete a vault under a hold, or one whose kept rows still
-  wait for their purge. Deleting a vault removes its directory, kept blobs and all.
+- ``vaults``, BEFORE DELETE, per row: refuses to delete a vault under a hold, or one whose kept rows (kept
+  files, folders or old names) still wait for their purge. Deleting a vault removes its directory, kept blobs
+  and all, and the release can be undone until the purge.
 - ``files`` and ``folders``, AFTER UPDATE OF name, enc_name, per row: a rename in a held vault keeps the old
   sealed name in ``held_name_history``. Audit rows carry no names, so it would otherwise be lost.
-- ``files``, ``folders`` and ``vaults``, BEFORE TRUNCATE: refused while any hold stands or kept rows remain.
+- ``files``, ``folders`` and ``vaults``, BEFORE TRUNCATE: refused while any hold stands or kept rows (of the
+  three tables) remain.
 
 Every trigger is ENABLE ALWAYS, so it fires under ``session_replication_role = replica`` too (a logical
 replication worker, ``pg_restore --disable-triggers``), and the start refuses to serve unless each one is there,
-on its table, of its kind, enabled always and calling the function generated for the columns the table has now
-(verify()).
+on its table, of its kind, enabled always and calling the function generated for the columns the table has now,
+and ``held_name_history`` is there with the columns its triggers write (verify()).
 
 The deleting code says why and as whom through two transaction-local settings (mark_deletes):
 ``dockvault.delete_reason`` (``deleted`` when unset; ``replaced``, ``expired``, ``moved``, ``duplicate``) and
@@ -46,6 +48,10 @@ from sqlalchemy import text
 
 # The live tables and the tables that keep their deleted rows.
 KEPT = (("files", "held_files"), ("folders", "held_folders"))
+# The old sealed names of objects renamed in a held vault, and the columns the rename triggers write. The table is
+# the model's (create_all builds it); the vaults and truncate triggers count its rows as kept rows too.
+NAME_HISTORY = "held_name_history"
+NAME_HISTORY_COLUMNS = ("id", "object_id", "vault_id", "kind", "name", "enc_name", "name_key_version", "renamed_at")
 # What a kept table has beyond the live table's columns.
 EXTRA_COLUMNS = (("kept_at", "timestamp without time zone"),
                  ("kept_reason", "character varying(16)"),
@@ -151,8 +157,7 @@ def _name_function_body(kind: str) -> str:
     return (
         "\nBEGIN\n"
         f"    IF EXISTS ({_LIVE_HOLD.format(vault='OLD.vault_id')}) THEN\n"
-        "        INSERT INTO held_name_history (id, object_id, vault_id, kind, name, enc_name, name_key_version, "
-        "renamed_at)\n"
+        f"        INSERT INTO {NAME_HISTORY} ({', '.join(NAME_HISTORY_COLUMNS)})\n"
         f"        VALUES (gen_random_uuid(), OLD.id, OLD.vault_id, '{kind}', OLD.name, OLD.enc_name, {epoch}, "
         "(statement_timestamp() AT TIME ZONE 'utc'));\n"
         "    END IF;\n"
@@ -164,8 +169,9 @@ VAULT_FUNCTION_BODY = (
     "\nBEGIN\n"
     f"    IF EXISTS ({_LIVE_HOLD.format(vault='OLD.id')})\n"
     "       OR EXISTS (SELECT 1 FROM held_files k WHERE k.vault_id = OLD.id)\n"
-    "       OR EXISTS (SELECT 1 FROM held_folders k WHERE k.vault_id = OLD.id) THEN\n"
-    "        RAISE EXCEPTION 'vault % is under a legal hold, or keeps files for one until they are purged: it "
+    "       OR EXISTS (SELECT 1 FROM held_folders k WHERE k.vault_id = OLD.id)\n"
+    "       OR EXISTS (SELECT 1 FROM held_name_history k WHERE k.vault_id = OLD.id) THEN\n"
+    "        RAISE EXCEPTION 'vault % is under a legal hold, or keeps what one kept until it is purged: it "
     "cannot be deleted', OLD.id\n"
     f"            USING HINT = '{HOLD_HINT}';\n"
     "    END IF;\n"
@@ -175,7 +181,8 @@ VAULT_FUNCTION_BODY = (
 TRUNCATE_FUNCTION_BODY = (
     "\nBEGIN\n"
     "    IF EXISTS (SELECT 1 FROM legal_hold_vaults h WHERE h.released_at IS NULL)\n"
-    "       OR EXISTS (SELECT 1 FROM held_files) OR EXISTS (SELECT 1 FROM held_folders) THEN\n"
+    "       OR EXISTS (SELECT 1 FROM held_files) OR EXISTS (SELECT 1 FROM held_folders)\n"
+    "       OR EXISTS (SELECT 1 FROM held_name_history) THEN\n"
     "        RAISE EXCEPTION '% cannot be emptied while a legal hold stands or kept rows wait for their purge', "
     "TG_TABLE_NAME\n"
     f"            USING HINT = '{HOLD_HINT}';\n"
@@ -291,6 +298,14 @@ def problems(db) -> list:
         for name, kind in EXTRA_COLUMNS:
             if kept_cols.get(name) != kind:
                 found.append(f"{kept}.{name} is missing or not {kind}")
+    # The old names: the rename triggers write into it, and the vaults and truncate triggers count its rows.
+    named = {name for name, _kind, _ in columns_of(db, NAME_HISTORY)}
+    if not named:
+        found.append(f"the table {NAME_HISTORY} is missing")
+    else:
+        for name in NAME_HISTORY_COLUMNS:
+            if name not in named:
+                found.append(f"{NAME_HISTORY}.{name} is missing")
     rows = {r[0]: r for r in db.execute(text(_TRIGGER_SQL), {"names": [t.name for t in TRIGGERS]}).fetchall()}
     for trigger in TRIGGERS:
         row = rows.get(trigger.name)
@@ -427,42 +442,50 @@ def kept_ids(db, file_ids: Iterable) -> set:
     return {str(r[0]) for r in db.query(HeldFile.id).filter(HeldFile.id.in_(ids)).all()}
 
 
+def _kept_of(db, vid) -> bool:
+    """Whether anything a hold kept of the vault ``vid`` waits for its purge: a file or folder deleted from it, or
+    the old name of an object renamed in it (the purge takes the names with the last of the vault's files)."""
+    from app.core.models import HeldFile, HeldFolder, HeldNameHistory
+    return any(q.first() is not None for q in (db.query(HeldFile.id).filter(HeldFile.vault_id == vid),
+                                               db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid),
+                                               db.query(HeldNameHistory.id).filter(HeldNameHistory.vault_id == vid)))
+
+
 def vault_keeps(db, vault_id) -> bool:
     """Whether a hold stands on ``vault_id``, or kept rows of it wait for their purge."""
-    from app.core.models import HeldFile, HeldFolder, LegalHoldVault
+    from app.core.models import LegalHoldVault
     if not _readable(db):
         return False
     vid = uuid.UUID(str(vault_id))
-    return any(q.first() is not None for q in (
-        db.query(LegalHoldVault.vault_id).filter(LegalHoldVault.vault_id == vid,
-                                                 LegalHoldVault.released_at.is_(None)),
-        db.query(HeldFile.id).filter(HeldFile.vault_id == vid),
-        db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid)))
+    held = db.query(LegalHoldVault.vault_id).filter(LegalHoldVault.vault_id == vid,
+                                                    LegalHoldVault.released_at.is_(None)).first()
+    return held is not None or _kept_of(db, vid)
 
 
 def has_kept_rows(db, vault_id) -> bool:
-    """Whether files or folders a hold kept of ``vault_id`` still wait for their purge (whether or not a hold
-    stands on it now)."""
-    from app.core.models import HeldFile, HeldFolder
+    """Whether files, folders or old names a hold kept of ``vault_id`` still wait for their purge (whether or not a
+    hold stands on it now)."""
     if not _readable(db):
         return False
-    vid = uuid.UUID(str(vault_id))
-    return any(q.first() is not None for q in (db.query(HeldFile.id).filter(HeldFile.vault_id == vid),
-                                               db.query(HeldFolder.id).filter(HeldFolder.vault_id == vid)))
+    return _kept_of(db, uuid.UUID(str(vault_id)))
 
 
 def kept_epochs(db, vault_id) -> tuple:
-    """(the encryption metadata of each kept file, the name epoch of each kept folder) of ``vault_id``: what they
-    were sealed under. A zero-knowledge vault's lowest epoch in use counts them (ecc_router._lowest_epoch_in_use), so
-    no retire drops a key a kept file or folder needs. Nothing on a database without the kept tables; on Postgres a
-    failing read is raised to the caller, which then retires nothing."""
-    from app.core.models import HeldFile, HeldFolder
+    """(the encryption metadata of each kept file, the name epoch of each kept folder, the name epoch of each kept
+    old name) of ``vault_id``: what they were sealed under. A zero-knowledge vault's lowest epoch in use counts them
+    (ecc_router._lowest_epoch_in_use), so no retire drops a key a kept file, folder or name needs. An old name's
+    epoch is its object's then: a folder's name epoch, a file's content epoch (a file's name follows it), None when
+    nothing recorded one. Nothing on a database without the kept tables; on Postgres a failing read is raised to the
+    caller, which then retires nothing."""
+    from app.core.models import HeldFile, HeldFolder, HeldNameHistory
     if not _readable(db):
-        return [], []
+        return [], [], []
     vid = uuid.UUID(str(vault_id))
     files = [r[0] for r in db.query(HeldFile.encryption_metadata).filter(HeldFile.vault_id == vid).all()]
     folders = [r[0] for r in db.query(HeldFolder.name_key_version).filter(HeldFolder.vault_id == vid).all()]
-    return files, folders
+    names = [r[0] for r in db.query(HeldNameHistory.name_key_version)
+             .filter(HeldNameHistory.vault_id == vid).all()]
+    return files, folders, names
 
 
 def totals(db) -> dict:

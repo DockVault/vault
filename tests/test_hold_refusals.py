@@ -1,9 +1,9 @@
 """What a legal hold refuses, offline on a real (SQLite) database (app/core/hold_refusals.py and the routes that
 ask it).
 
-A vault a hold keeps anything of (a hold stands on it, or files a released hold kept wait for their purge) cannot
-be deleted: the route answers 409 with a sentence naming the case, records ``hold_blocked_delete`` under it, and
-leaves the vault as it was; a refusal by the database itself (a hold placed after the route asked) gets the same
+A vault a hold keeps anything of (a hold stands on it, or files, folders or old names a released hold kept wait for
+their purge) cannot be deleted: the route answers 409 with a sentence naming the case, records
+``hold_blocked_delete`` under it, and leaves the vault as it was; a refusal by the database itself (a hold placed after the route asked) gets the same
 answer.
 
 SQLite has no triggers: a test writes the hold and kept rows the database and the hold routes would write.
@@ -88,10 +88,29 @@ def _hold(db, case, vault, *, released=None, purge_after=None):
     db.commit()
 
 
-def _kept_file(db, vault):
+def _kept_file(db, vault, epoch=None):
     db.add(m.HeldFile(id=uuid.uuid4(), vault_id=vault.id, storage_path=f"{vault.id}/{uuid.uuid4()}", size_bytes=1,
+                      encryption_metadata={"key_version": epoch} if epoch is not None else None,
                       kept_reason="deleted", kept_at=NOW))
     db.commit()
+
+
+def _kept_folder(db, vault, epoch=None):
+    db.add(m.HeldFolder(id=uuid.uuid4(), vault_id=vault.id, name_key_version=epoch, kept_reason="deleted",
+                        kept_at=NOW))
+    db.commit()
+
+
+def _kept_name(db, vault, *, kind="folder", epoch=None):
+    """The old sealed name of an object renamed while a hold stood, as the rename triggers keep it."""
+    db.add(m.HeldNameHistory(id=uuid.uuid4(), object_id=uuid.uuid4(), vault_id=vault.id, kind=kind,
+                             enc_name="zk2:old-sealed-name", name_key_version=epoch, renamed_at=NOW))
+    db.commit()
+
+
+# What a released hold can leave waiting for its purge: a file or folder deleted from the vault, or only the old
+# name of something renamed in it.
+KEPT = {"a file": _kept_file, "a folder": _kept_folder, "an old name": _kept_name}
 
 
 @pytest.fixture
@@ -126,11 +145,18 @@ def test_a_standing_hold_keeps_the_vault_under_its_case(world):
     assert "under a legal hold until case C-2026-0003 ends" in text and "cannot be deleted" in text
 
 
-def test_kept_rows_of_a_released_hold_keep_the_vault_until_their_purge(world):
+@pytest.mark.parametrize("kept", sorted(KEPT))
+def test_kept_rows_of_a_released_hold_keep_the_vault_until_their_purge(world, kept):
+    """Whatever the hold kept waits for its purge, an old name alone included: until then the release can be
+    undone, and what was kept must still open."""
     case = _case(world.db, world.ada, "C-2026-0004")
     purge = NOW + timedelta(days=5)
     _hold(world.db, case, world.vault, released=NOW - timedelta(days=2), purge_after=purge)
-    _kept_file(world.db, world.vault)
+    assert hr.vault_keeping(world.db, world.vault.id) is None
+    assert not kept_tables.has_kept_rows(world.db, world.vault.id)
+    KEPT[kept](world.db, world.vault)
+    assert kept_tables.has_kept_rows(world.db, world.vault.id) and kept_tables.vault_keeps(world.db, world.vault.id)
+    assert not kept_tables.has_kept_rows(world.db, world.other.id), "only that vault's"
     keeping = hr.vault_keeping(world.db, world.vault.id)
     assert keeping.standing == [] and keeping.waiting == [(case.id, "C-2026-0004")] and keeping.purge_after == purge
     text = hr.vault_text(keeping)
@@ -215,14 +241,16 @@ def route(world, monkeypatch):
     return state
 
 
-@pytest.mark.parametrize("held", ["standing", "kept rows"])
+@pytest.mark.parametrize("held", ["standing"] + sorted(KEPT))
 def test_the_route_refuses_a_held_vaults_delete_with_409_and_records_it(world, route, held):
+    """Under the hold, or in the release's window while what it kept waits: a vault whose hold kept only the old
+    name of something renamed in it too, since the undo of the release would then find no vault."""
     case = _case(world.db, world.ada, "C-2026-0009")
     if held == "standing":
         _hold(world.db, case, world.vault)
     else:
         _hold(world.db, case, world.vault, released=NOW, purge_after=NOW + timedelta(days=7))
-        _kept_file(world.db, world.vault)
+        KEPT[held](world.db, world.vault)
     with pytest.raises(HTTPException) as refused:
         route.call(world.olga)
     assert refused.value.status_code == 409 and "C-2026-0009" in refused.value.detail
@@ -304,14 +332,16 @@ def _retire(world, vault):
     return run_coroutine(RETIRE(vault_id=str(vault.id), current_user=world.olga, db=world.db))
 
 
-@pytest.mark.parametrize("held", ["standing", "kept rows"])
+@pytest.mark.parametrize("held", ["standing"] + sorted(KEPT))
 def test_retiring_older_key_versions_is_refused_while_a_hold_keeps_the_vault(world, zk, held):
+    """A kept old name was sealed under its epoch's key like a kept file: retired in the release's window, the
+    name could never be opened again, even once the release is undone."""
     case = _case(world.db, world.ada, "C-2026-0011")
     if held == "standing":
         _hold(world.db, case, zk)
     else:
         _hold(world.db, case, zk, released=NOW, purge_after=NOW + timedelta(days=7))
-        _kept_file(world.db, zk)
+        KEPT[held](world.db, zk)
     with pytest.raises(HTTPException) as refused:
         _retire(world, zk)
     assert refused.value.status_code == 409 and "C-2026-0011" in refused.value.detail
@@ -396,19 +426,43 @@ def test_the_lowest_epoch_in_use_counts_what_a_hold_kept(world):
     assert E._lowest_epoch_in_use(world.db, v.id, v) == 1
 
 
+@pytest.mark.parametrize("kind", ["folder", "file"])
+def test_the_lowest_epoch_in_use_counts_an_old_name_a_hold_kept(world, kind):
+    """A folder sealed at epoch 1, then renamed at epoch 2 while a hold stood: its live name is at 2, and the
+    name the hold kept is at 1. After the release, while the release can still be undone, the floor stays at 1,
+    so a retire keeps the epoch-1 key the kept name opens with. A file's old name is at its content epoch then;
+    an old name with no recorded epoch is at 1, as everything is."""
+    v = m.Vault(id=uuid.uuid4(), owner_id=world.olga.id, type="zero_knowledge", key_wrapping_mode="direct",
+                dek_version=3)
+    world.db.add(v)
+    world.db.add(m.Folder(id=uuid.uuid4(), vault_id=v.id, name=None, enc_name="zk2:renamed", name_key_version=3))
+    world.db.commit()
+    assert E._lowest_epoch_in_use(world.db, v.id, v) == 3
+    _kept_name(world.db, v, kind=kind, epoch=2)
+    assert E._lowest_epoch_in_use(world.db, v.id, v) == 2
+    assert kept_tables.kept_epochs(world.db, v.id) == ([], [], [2])
+    _kept_name(world.db, v, kind=kind, epoch=None)
+    assert E._lowest_epoch_in_use(world.db, v.id, v) == 1
+
+
 def test_only_this_vaults_kept_rows_count(world):
+    """Kept files, folders and old names of another vault count for nothing here, each table's on its own."""
     v = m.Vault(id=uuid.uuid4(), owner_id=world.olga.id, type="zero_knowledge", dek_version=5)
     world.db.add(v)
-    world.db.add(m.HeldFile(id=uuid.uuid4(), vault_id=world.vault.id, storage_path="x", size_bytes=1,
-                            encryption_metadata={"key_version": 1}, kept_reason="deleted", kept_at=NOW))
     world.db.commit()
-    assert E._lowest_epoch_in_use(world.db, v.id, v) is None
-    assert kept_tables.kept_epochs(world.db, v.id) == ([], [])
+    for kept in (_kept_file, _kept_folder, _kept_name):
+        kept(world.db, world.vault, epoch=1)
+        assert E._lowest_epoch_in_use(world.db, v.id, v) is None
+        assert kept_tables.kept_epochs(world.db, v.id) == ([], [], [])
+        assert not kept_tables.has_kept_rows(world.db, v.id) and not kept_tables.vault_keeps(world.db, v.id)
+    files, folders, names = kept_tables.kept_epochs(world.db, world.vault.id)
+    assert (len(files), folders, names) == (1, [1], [1])
 
 
 def test_a_database_without_the_kept_tables_counts_none(monkeypatch):
     """A stand-in session (no database behind it) reads no kept rows rather than failing."""
-    assert kept_tables.kept_epochs(SimpleNamespace(), uuid.uuid4()) == ([], [])
+    assert kept_tables.kept_epochs(SimpleNamespace(), uuid.uuid4()) == ([], [], [])
+    assert kept_tables.has_kept_rows(SimpleNamespace(), uuid.uuid4()) is False
 
 
 # --------------------------------------------------------------------------- a custodian's account
@@ -436,13 +490,14 @@ def test_the_custodian_of_a_case_whose_hold_stands_is_kept(world, how):
     assert "custodian of case C-2026-0013" in text and "cannot be deleted until the hold ends" in text
 
 
-def test_a_released_hold_keeps_its_custodian_while_what_it_kept_waits_for_its_purge(world):
+@pytest.mark.parametrize("kept", sorted(KEPT))
+def test_a_released_hold_keeps_its_custodian_while_what_it_kept_waits_for_its_purge(world, kept):
     otto = _user(world.db, "otto")
     case = _custodian_case(world.db, world.ada, "C-2026-0014", otto)
     purge = NOW + timedelta(days=6)
     _hold(world.db, case, world.vault, released=NOW, purge_after=purge)
     assert hr.custodian_keeping(world.db, otto.id) is None, "it kept nothing"
-    _kept_file(world.db, world.vault)
+    KEPT[kept](world.db, world.vault)
     keeping = hr.custodian_keeping(world.db, otto.id)
     assert keeping.standing == [] and keeping.waiting == [(case.id, "C-2026-0014")] and keeping.purge_after == purge
     assert f"cannot be deleted until they are purged after {purge:%Y-%m-%d}" in hr.account_text(keeping)

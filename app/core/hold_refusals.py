@@ -1,19 +1,22 @@
 """What a legal hold refuses, beside the deletions it keeps (app/core/kept_tables.py): deleting a vault it keeps
 anything of, retiring a zero-knowledge vault's older key versions while it keeps anything of the vault, and
 deleting the account of a person a held case is about (its custodian). Each refusal answers 409 with a sentence
-that names the case, and records ``hold_blocked_delete`` under it (audit_logs.case_id).
+that says why, and records ``hold_blocked_delete`` under the case (audit_logs.case_id). The sentence names the
+case to whoever may know it: the vault's owner (who was told of it) and an administrator; another manager of the
+vault refused a retire is told only that a hold keeps it (app/core/owner_access.py).
 
 A hold keeps a vault while it stands (a row of ``legal_hold_vaults`` with ``released_at`` NULL: a lapse sets it
-too), and after its release while files or folders it kept still wait for their purge: until then the release
-can be undone, and the kept files must still open. So:
+too), and after its release while what it kept still waits for its purge -- files and folders deleted from the
+vault, and the old names of objects renamed in it (kept_tables.has_kept_rows): until then the release can be
+undone, and what was kept must still open. So:
 
 - **Deleting the vault.** Its directory holds the kept blobs, and the database refuses the delete on its own (the
   ``vaults`` trigger). The route asks first, so the answer says why, and takes the trigger's refusal (a hold placed
   in between) for the same answer (is_trigger_refusal).
 - **Retiring older key versions** of a zero-knowledge vault deletes the wrapped keys of the epochs below the lowest
-  one in use: the kept files and folders were sealed under their epochs, and their owner needs those keys to open
-  them for the case. The route asks under the vault's row lock, which a placing waits for, so a hold placed
-  meanwhile comes after the retire.
+  one in use: the kept files, folders and old names were sealed under their epochs, and their owner needs those
+  keys to open them for the case. The route asks under the vault's row lock, which a placing waits for, so a hold
+  placed meanwhile comes after the retire.
 - **Deleting a custodian's account.** A case can be about a person (a custodian, in its scope or among the people
   it concerns): a hold under it covers the account too, which cannot be deleted while a vault the case holds is
   kept as above. The check takes the turn of holds and deletions shared (legal_holds.take_turn), so a hold an
@@ -157,8 +160,8 @@ def vault_text(keeping: Keeping) -> str:
     if keeping.standing:
         return (f"This vault is under a legal hold until {_cases_text(keeping.standing)} ends: it cannot be deleted "
                 "while it is. Your administrator can tell you more.")
-    return (f"This vault keeps files a legal hold of {_cases_text(keeping.waiting)} kept, {_until(keeping)}: it can "
-            "be deleted then. Your administrator can tell you more.")
+    return (f"This vault keeps files, folders or names a legal hold of {_cases_text(keeping.waiting)} kept, "
+            f"{_until(keeping)}: it can be deleted then. Your administrator can tell you more.")
 
 
 def key_versions_text(keeping: Keeping, *, name_cases: bool = True) -> str:
@@ -169,16 +172,16 @@ def key_versions_text(keeping: Keeping, *, name_cases: bool = True) -> str:
         return (f"This vault is under {hold}: its older key versions are kept while it is, so what the hold keeps "
                 "can still be opened.")
     of_case = f" of {_cases_text(keeping.waiting)}" if name_cases else ""
-    return (f"This vault keeps files a legal hold{of_case} kept, {_until(keeping)}: its older key versions are kept "
-            "until then, so they can still be opened.")
+    return (f"This vault keeps files, folders or names a legal hold{of_case} kept, {_until(keeping)}: its older key "
+            "versions are kept until then, so they can still be opened.")
 
 
 def account_text(keeping: Keeping) -> str:
     if keeping.standing:
         return (f"This person is the custodian of {_cases_text(keeping.standing)}, whose legal hold stands: the "
                 "account cannot be deleted until the hold ends.")
-    return (f"This person is the custodian of {_cases_text(keeping.waiting)}, whose legal hold kept files that "
-            f"wait for their purge: the account cannot be deleted {_until(keeping)}.")
+    return (f"This person is the custodian of {_cases_text(keeping.waiting)}, whose legal hold kept files, folders "
+            f"or names that wait for their purge: the account cannot be deleted {_until(keeping)}.")
 
 
 # --------------------------------------------------------------------------- recording it
