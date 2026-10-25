@@ -349,7 +349,8 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "recording levels is asked for, cancelled or completed — says what, when and by whom.", SYSTEM),
     ("encryption_key_release_code", "Encryption key release code",
      "Sent to a user whose sign-in details an administrator changed recently, when a browser asks to open "
-     "their encryption key — carries the code that releases it (to the address before an email change). "
+     "their encryption key — carries the code that releases it, to the address the account had before the "
+     "first of those changes (for an email change, the address it replaced), never to the one it has now. "
      "Its wording is fixed: it cannot be changed or turned off.", LOCKED),
     ("encryption_key_notice", "Encryption key notice",
      "Sent to a user when a change to a zero-knowledge vault's key was refused because it did not come with "

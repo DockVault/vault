@@ -882,13 +882,18 @@ while it is (§12). Ask people to set their own password before they set up an e
 
 The code's email ("Encryption key release code") is locked, as is "Encryption key notice": it always goes out with
 its built-in text through the deployment's default sending profile. A template bound to it is ignored, and so is
-that template's sending profile, and Email Studio refuses to bind one; otherwise an administrator could route every
-code through a relay of their own, or carry it in a link. **What remains:** an administrator who repoints the
-default sending profile itself -- its server, or its address -- at a relay they run can read the code as it passes,
-and use it before the person does. Every change to a sending profile is recorded in the audit log
-(`email_profile_created`, `email_profile_updated`); a deployment that relies on the hold should keep its sending profile out of
-administrators' hands where it can, and check that entry after a change to someone's sign-in details. Without mail, the server's operator releases an account with `python dockvault.py accounts --action
-release-key-hold`, and the person is told. The records the hold reads (`credential_changes`) are kept for 14 days
-after a change, which is why the hold cannot be longer; `app/core/envelope_hold.py` has the rest. Audit entries:
-`zk_envelope_release_code_sent` (info), `zk_envelope_release_failed` (warning), `zk_envelope_released` (notice).
-A release before 0.34.0 does not hold the envelope, so a rollback lifts the hold.
+that template's sending profile, and Email Studio refuses any change to it; otherwise an administrator could route
+every code through a relay of their own, or carry it in a link. **What remains:** an administrator who changes
+where the deployment's own mail goes can read the code as it passes, and use it before the person does: by
+repointing the default sending profile -- its server, or its address -- at a relay they run, by making another
+profile the default or deleting the default (the oldest profile left becomes the default; with none, system mail
+goes through the older SMTP settings saved with the general settings), or by changing those settings while no
+profile exists. Each is in the audit log: `email_profile_created`, `email_profile_updated` and
+`email_profile_deleted` for the profiles, `settings_updated` for the general settings. A deployment that relies on
+the hold should keep its mail settings out of administrators' hands where it can, and check those entries after a
+change to someone's sign-in details. Without mail, the server's operator releases an account with `python
+dockvault.py accounts --action release-key-hold`, and the person is told. The records the hold reads
+(`credential_changes`) are kept for 14 days after a change, which is why the hold cannot be longer;
+`app/core/envelope_hold.py` has the rest. Audit entries: `zk_envelope_release_code_sent` (info),
+`zk_envelope_release_failed` (warning), `zk_envelope_released` (notice). A release before 0.34.0 does not hold the
+envelope, so a rollback lifts the hold.
