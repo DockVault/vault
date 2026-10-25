@@ -5,7 +5,9 @@
 * An owner's reset of a vault's key tells every other manager, and not a plain member or the owner.
 * Setting up an encryption key tells the account's user.
 * The share dialog's lookup of a recipient's key says when it was set up, and whether that was within 14
-  days after an administrator changed the account's sign-in details: on at 13 days, off at 15.
+  days after an administrator changed the account's sign-in details (on at 13 days, off at 15), or while its
+  password was one an administrator chose (on for an account an administrator created, off once the person
+  set their own).
 test_zk_notices.py pins the same offline.
 """
 import contextlib
@@ -159,29 +161,50 @@ def _applied_change(user_id, days_ago):
           f"(now() AT TIME ZONE 'utc') - interval '{int(days_ago)} days')")
 
 
-@pytest.mark.parametrize("days_ago,flagged", [(13, True), (15, False)])
-def test_the_share_dialog_flags_a_key_set_up_soon_after_an_administrators_change(admin, people, days_ago, flagged):
-    user, client = people("znflag", key=False)
-    _applied_change(user["id"], days_ago)
-    ensure_ecc_keypair(client)
+def _with_own_password(user):
+    """The account's password made the person's own, as they would (PATCH /users/me), and a session with it. An
+    account a test creates holds the password the administrator chose, which alone flags a key set up with it."""
+    from _account_change_helpers import own_password
+    own_password(user)
+    assert _psql(f"SELECT password_set_by_other_at IS NULL FROM users WHERE id = '{user['id']}'") == "t"
+    client = ApiClient()
+    client.login(user["_username"], user["_password"])
+    return client
+
+
+def _flag(admin, user_id):
     ensure_ecc_keypair(admin)
     with _zk_enabled(admin):
         vid = create_zk_vault(admin)["id"]      # the lookup is for people who manage a vault
     try:
-        pk = admin.get(f"/ecc/users/{user['id']}/public-key").json()
+        pk = admin.get(f"/ecc/users/{user_id}/public-key").json()
         assert pk["has_keypair"] is True and pk["registered_at"], pk
-        assert pk["registered_after_admin_change"] is flagged, pk
+        return pk["registered_after_admin_change"]
     finally:
         admin.delete_vault(vid)
+
+
+@pytest.mark.parametrize("days_ago,flagged", [(13, True), (15, False)])
+def test_the_share_dialog_flags_a_key_set_up_soon_after_an_administrators_change(admin, people, days_ago, flagged):
+    user, _ = people("znflag", key=False)
+    client = _with_own_password(user)
+    _applied_change(user["id"], days_ago)
+    ensure_ecc_keypair(client)
+    assert _flag(admin, user["id"]) is flagged
 
 
 def test_a_key_set_up_with_no_administrators_change_is_not_flagged(admin, people):
-    user, client = people("znplain")
-    ensure_ecc_keypair(admin)
-    with _zk_enabled(admin):
-        vid = create_zk_vault(admin)["id"]
-    try:
-        pk = admin.get(f"/ecc/users/{user['id']}/public-key").json()
-        assert pk["registered_after_admin_change"] is False, pk
-    finally:
-        admin.delete_vault(vid)
+    user, _ = people("znplain", key=False)
+    ensure_ecc_keypair(_with_own_password(user))
+    assert _flag(admin, user["id"]) is False
+
+
+def test_a_key_set_up_with_the_password_an_administrator_chose_is_flagged(admin, people):
+    """An administrator created the account with a password it chose, and nothing since recorded a change of its
+    sign-in details: whoever chose the password can sign in as the person and set up the key first. The key set
+    up with it is flagged, as one set up after a recorded change is."""
+    user, client = people("znmade", key=False)
+    assert _psql(f"SELECT password_set_by_other_at IS NOT NULL FROM users WHERE id = '{user['id']}'") == "t"
+    assert _psql(f"SELECT count(*) FROM credential_changes WHERE target_user_id = '{user['id']}'") == "0"
+    ensure_ecc_keypair(client)
+    assert _flag(admin, user["id"]) is True

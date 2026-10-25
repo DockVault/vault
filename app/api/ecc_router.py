@@ -539,6 +539,18 @@ def _verify_registration_pop(db: Session, user: User, request: "KeypairRegisterR
         raise HTTPException(status_code=400, detail="Proof of possession failed for this public key.")
 
 
+def _registered_after_admin_change(db: Session, user: User) -> bool:
+    """Whether a key the account sets up now may be someone else's: whoever sets up an account's key first owns
+    it, and someone other than the person could sign in as them. So when an administrator (or the server's
+    operator) changed the account's sign-in details within the last 14 days (app/core/credential_changes.py), or
+    the account's password is one someone else set and the person has not changed it since -- an administrator
+    who created the account with a password, or set it later (app/core/password_origin.py) -- whoever chose it
+    can sign in as them. Recorded when the key is set up, for the share dialog."""
+    from app.core import credential_changes as _cc
+    from app.core import password_origin as _origin
+    return _cc.last_applied(db, user.id) is not None or _origin.is_set_by_other(user)
+
+
 @router.post("/keys/register", status_code=status.HTTP_201_CREATED, response_model=KeypairRegisterResponse)
 async def register_public_key(
     request: KeypairRegisterRequest,
@@ -611,10 +623,10 @@ async def register_public_key(
         # substituted / not-held key can't be registered. Raises 400 on missing/invalid/expired.
         _verify_registration_pop(db, current_user, request)
 
-        # A key set up within 14 days after an administrator changed the account's sign-in details may be
-        # someone else's: whoever sets up the key first owns it. Recorded now, while the record of the change
-        # still exists, so the share dialog can say so for as long as the key lives.
-        from app.core import credential_changes as _cc
+        # A key set up within 14 days after an administrator changed the account's sign-in details, or while its
+        # password is one someone else chose, may be someone else's: whoever sets up the key first owns it.
+        # Recorded now, while the record of the change still exists, so the share dialog can say so for as long
+        # as the key lives.
         keypair = UserKeyPair(
             user_id=current_user.id,
             public_key=request.public_key,
@@ -624,7 +636,7 @@ async def register_public_key(
             version=1,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
-            registered_after_admin_change=_cc.last_applied(db, current_user.id) is not None,
+            registered_after_admin_change=_registered_after_admin_change(db, current_user),
         )
         db.add(keypair)
         db.commit()

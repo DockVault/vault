@@ -84,15 +84,17 @@ member); retroactive secrecy for content a removed member could already read.
   be at least 12 characters and not a common one, and for up to 14 days after an administrator changed the
   account's sign-in details the envelope goes only to a session that entered a code sent by email (§13).
   Neither helps against a weak passphrase set before 0.34.0 and never changed, a stolen session outside the
-  hold, a hold switched off (`ZK_ENVELOPE_HOLD_DAYS=0`), or someone who can read the person's email -- which
+  hold, a hold switched off (`ZK_ENVELOPE_HOLD_DAYS=0`), someone who can read the person's email -- which
   includes an administrator who repoints the deployment's default sending profile at a relay of their own
-  (§13.2). Choose a long passphrase.
+  (§13.2) -- or whoever chose the password of an account they created: that records no change of its sign-in
+  details, so the hold does not cover it while the person keeps that password (§13.2). Choose a long
+  passphrase.
 - **An account with no identity key yet.** Whoever registers first owns the account's identity. If someone
   signs in as a person before that person has registered a key, and an honest manager then shares a vault to
   that account, the key goes to the attacker's key. From 0.34.0 the person is told, in the app and by email,
   when a key is set up for their account, and the share dialog shows the recipient's key fingerprint and flags
-  a key set up within 14 days after an administrator changed that account's sign-in details (§12); it does not
-  stop the share.
+  a key set up within 14 days after an administrator changed that account's sign-in details, or while its
+  password was one an administrator chose (§12); it does not stop the share.
 - **An account that wrongly holds a current key row** (a bug, a database edit) passes the setup of a direct
   epoch that has no proof key yet (§4). Members' clients detect it with the key check (§3.5), and from 0.34.0
   the web app refuses to write under a key that fails it (§11); the owner repairs it with an owner reset (§4.4).
@@ -823,10 +825,13 @@ None names a vault: a zero-knowledge vault's name is sealed, and the server does
 
 The share dialog of a zero-knowledge vault shows, for each person ticked, their key's fingerprint (the one they
 see for their own key) and when it was set up, and flags a key set up within 14 days after an administrator
-changed that account's sign-in details. Whether it was is decided when the key is set up, while the record of the
+changed that account's sign-in details, or while the account's password was one someone else chose: an
+administrator who created the account with a password, or set it, until the person sets their own
+(`users.password_set_by_other_at`, `app/core/password_origin.py`). Either way someone other than the person could
+sign in as them and set up the key first. Whether it was is decided when the key is set up, while the record of the
 change still exists. `GET /ecc/users/{id}/public-key` gives when and whether only for someone the caller could pick
 in the recipient picker (the directory's own rule, `directory_search_scope`); for anyone else it would say of any
-account that an administrator changed its sign-in details shortly before.
+account that an administrator changed its sign-in details shortly before, or chose its password.
 
 ---
 
@@ -867,6 +872,13 @@ by email:
 
 The person's own sessions are held too: the server cannot tell them from the administrator's, and the mailbox is
 what does.
+
+**What the hold does not cover:** an account whose password an administrator chose, when creating it (which
+records no change of the account's sign-in details, so nothing holds it) or by a change whose hold has ended.
+Whoever chose the password can sign in as the person and take the envelope for as long as the person keeps that
+password -- or set up the account's key before the person does. The account records that its password is someone
+else's (`users.password_set_by_other_at`, until the person sets their own), and the share dialog flags a key set up
+while it is (§12). Ask people to set their own password before they set up an encryption key.
 
 The code's email ("Encryption key release code") is locked, as is "Encryption key notice": it always goes out with
 its built-in text through the deployment's default sending profile. A template bound to it is ignored, and so is

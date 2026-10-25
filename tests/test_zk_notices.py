@@ -391,6 +391,7 @@ def test_the_share_dialog_shows_a_ticked_recipients_key_for_a_zero_knowledge_vau
     assert "zkKeyFingerprint(pub.public_key)" in _function("refreshEncryptionKeyStatus")
     assert "pk.registered_after_admin_change === true" in show
     assert "Set up within 14 days after an administrator changed this account" in show
+    assert "or while its password was one an administrator chose" in show
     # Built as text, never markup: the answer comes from the server.
     assert "innerHTML" not in show and "textContent" in show
     # An answer that arrives after the box was unticked is dropped.
@@ -403,9 +404,41 @@ def test_the_public_key_lookup_says_when_the_key_was_set_up_and_whether_it_is_fl
     assert '"registered_at": (kp.created_at.isoformat() if kp.created_at else None) if shareable else None,' in lookup
     assert '"registered_after_admin_change": kp.registered_after_admin_change if shareable else None,' in lookup
     register = _slice(router, "async def register_public_key(", "\n@router.get(\"/keys/public\"")
-    assert "registered_after_admin_change=_cc.last_applied(db, current_user.id) is not None," in register
+    assert register.count("registered_after_admin_change=_registered_after_admin_change(db, current_user),") == 1
     from app.core import credential_changes as cc
     assert cc.WINDOW == timedelta(days=14)
+
+
+@pytest.mark.parametrize("case,change_days_ago,held,chosen_days_ago,own_since,flagged", [
+    ("nothing changed, the person's own password", None, False, None, False, False),
+    ("an administrator changed it a day ago", 1, False, None, False, True),
+    ("an administrator changed it 13 days ago", 13, False, None, False, True),
+    ("an administrator changed it 15 days ago", 15, False, None, False, False),
+    ("a change held for approval, not applied", None, True, None, False, False),
+    ("an administrator created it with a password", None, False, 0, False, True),
+    ("an administrator chose its password long ago", None, False, 400, False, True),
+    ("the person set their own password since", None, False, 30, True, False),
+])
+def test_a_key_set_up_now_is_flagged_when_someone_else_could_sign_in_as_the_person(
+        world, case, change_days_ago, held, chosen_days_ago, own_since, flagged):
+    """Whoever sets up an account's key first owns it. Someone other than the person could have: after an
+    administrator changed the account's sign-in details within 14 days, or while its password is one someone else
+    chose (an administrator who created the account with a password, or set it, however long ago), until the person
+    sets their own. A change held for approval and not applied changed nothing."""
+    from app.api import ecc_router as E
+    from app.core import password_origin
+    user = _person(world)
+    if change_days_ago is not None:
+        _changed(world, user, cc.PASSWORD, {"email_at_change": user.email}, days_ago=change_days_ago)
+    if held:
+        world.db.add(CredentialChange(target_user_id=user.id, kind=cc.PASSWORD, status=cc.HELD,
+                                      requested_by_name="admin", requested_at=cc.utcnow()))
+    if chosen_days_ago is not None:
+        password_origin.set_by_other(user, None, now=cc.utcnow() - timedelta(days=chosen_days_ago))
+    if own_since:
+        password_origin.set_by_self(user)
+    world.db.commit()
+    assert E._registered_after_admin_change(world.db, user) is flagged, case
 
 
 @pytest.mark.parametrize("case,given", [

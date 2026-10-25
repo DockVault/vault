@@ -315,6 +315,7 @@ def test_the_share_dialog_shows_the_recipients_key_and_flags_one_set_up_after_an
             flag = row.locator(".grant-key-flag")
             if flagged:
                 expect(flag).to_contain_text("Set up within 14 days after an administrator changed")
+                expect(flag).to_contain_text("or while its password was one an administrator chose")
             else:
                 expect(flag).to_have_count(0)
             row.locator("input[type=checkbox]").uncheck()

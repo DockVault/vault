@@ -18937,7 +18937,8 @@ function renderVaultGrantList() {
 // A zero-knowledge vault is shared with a person's encryption key, and whoever sets up an account's key
 // first owns it. So for each person ticked, the dialog shows their key's fingerprint -- the one they see
 // under "Your account" -- and when it was set up, and flags a key set up within 14 days after an
-// administrator changed that account's sign-in details: that key may be someone else's.
+// administrator changed that account's sign-in details, or while its password was one an administrator
+// chose: that key may be someone else's.
 async function showGrantRecipientKey(userId, box) {
     const seq = String(Number(box.dataset.seq || 0) + 1);
     box.dataset.seq = seq;
@@ -18967,8 +18968,8 @@ async function showGrantRecipientKey(userId, box) {
         flag.className = 'text-xs text-warning grant-key-flag';
         flag.setAttribute('role', 'note');
         flag.textContent = "Set up within 14 days after an administrator changed this account's sign-in "
-            + 'details. Whoever sets up a key first owns it: check this fingerprint with the person before '
-            + 'sharing.';
+            + 'details, or while its password was one an administrator chose. Whoever sets up a key first owns '
+            + 'it: check this fingerprint with the person before sharing.';
         box.appendChild(flag);
     }
 }
