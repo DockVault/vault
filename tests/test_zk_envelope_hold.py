@@ -291,6 +291,27 @@ def test_a_held_session_gets_the_hold_refusal_and_the_rest_get_the_envelope(worl
     assert (refused.value.status_code, refused.value.reason) == (403, "zk-envelope-hold")
 
 
+def test_a_key_set_up_after_the_change_is_held_until_the_hold_ends(world, routes, monkeypatch):
+    """The hold reads the changes, not the key. An account whose sign-in details were changed before it had a key
+    (before the upgrade too) has nothing to hold, and is held as soon as it sets one up, until the hold ends: the
+    upgrade's check, which counts only accounts with a key, cannot count it."""
+    user = _account(world)
+    _change(world, user, days_ago=3)
+    assert run_coroutine(GET_PRIVATE(current_user=user, db=world.db)) == {"has_keypair": False,
+                                                                          "encrypted_private_key": None}
+    # Set up two days after the change.
+    world.db.add(UserKeyPair(user_id=user.id, public_key="P", fingerprint="f", encrypted_private_key="ENV",
+                             created_at=NOW - timedelta(days=1)))
+    world.db.commit()
+    with pytest.raises(KeyProofRefusal) as refused:
+        run_coroutine(GET_PRIVATE(current_user=user, db=world.db))
+    assert (refused.value.status_code, refused.value.reason) == (403, "zk-envelope-hold")
+    ends = H.held_until(world.db, user, NOW)
+    assert ends == NOW - timedelta(days=3) + timedelta(days=14)
+    monkeypatch.setattr(H, "utcnow", lambda: ends + timedelta(seconds=1))
+    assert run_coroutine(GET_PRIVATE(current_user=user, db=world.db))["encrypted_private_key"] == "ENV"
+
+
 def test_the_code_goes_to_the_address_before_the_change_and_releases_this_session(world, routes):
     user = _account(world)
     _keyed(world, user)

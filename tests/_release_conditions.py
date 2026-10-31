@@ -44,7 +44,8 @@ DETECT = {
     # hold covers them at once (app/core/envelope_hold.py). Of each, the earliest of those changes decides where the
     # code goes (envelope_hold.code_destination): only an email change recorded before 0.34.0 kept the address it
     # replaced (credential_changes.address_before), so for any other, and for an email change of an account that had
-    # no address then, the server's operator alone can release the account.
+    # no address then, the server's operator alone can release the account. An account changed then that has no key
+    # yet is not counted, though the hold reads no key and covers it once it sets one up: the text says so.
     "zk-envelope-held-after-admin-reset": (
         "SELECT count(*) AS held_accounts, count(*) FILTER (WHERE kind <> 'email' "
         "OR coalesce(btrim(previous_email), '') = '') AS released_only_by_the_host "
@@ -63,13 +64,15 @@ SUMMARY = {
         "browser only after it enters a code sent by email to the address the account had before the first of "
         "those changes. Changes made before the upgrade count: an account with an encryption key whose sign-in "
         "details were changed in the 14 days before the upgrade is held from the first start (opening the key "
-        "answers 403 zk-envelope-hold). Only an email change recorded before 0.34.0 kept the address it replaced, "
+        "answers 403 zk-envelope-hold), and an account changed then that has no key yet is held as soon as it sets "
+        "one up, until the hold ends. Only an email change recorded before 0.34.0 kept the address it replaced, "
         "so for an account whose first such change was of another kind or an email change of an account that had no "
         "address, or on a deployment without mail, no code can be sent (409 zk-envelope-hold-no-mail): the server's "
         "operator releases it with python dockvault.py accounts --action release-key-hold, or the hold ends "
-        "ZK_ENVELOPE_HOLD_DAYS days after the last change. The check below counts the accounts held and those only "
-        "the server's operator can release. ZK_ENVELOPE_HOLD_DAYS=0 in .env before the upgrade turns the hold off. "
-        "Going back to an earlier release lifts the hold."),
+        "ZK_ENVELOPE_HOLD_DAYS days after the last change. The check below counts the accounts held at the first "
+        "start and those only the server's operator can release; it cannot count an account that sets up a key "
+        "later, so a check that finds none does not mean no account will be held. ZK_ENVELOPE_HOLD_DAYS=0 in .env "
+        "before the upgrade turns the hold off. Going back to an earlier release lifts the hold."),
 }
 
 # The one whose rows stop the upgraded deployment going back across the edge.

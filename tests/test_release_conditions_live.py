@@ -7,9 +7,9 @@ and one just inside them; invitations ended by acceptance, revocation or expiry 
 a pending one; reset links, codes and email-change codes used 31 days ago before an expiry still ahead, or
 expired, beside ones that ended 29 days ago and live ones; an archived day and a value set in the panel; accounts
 with an encryption key whose sign-in details were changed 1 to 13 days ago, the first change an email change (from
-an address, or of an account that had none) or another kind, beside an account without a key, a change 15 days ago
-and changes never applied, counted as the hold's own code counts them. test_release_conditions.py checks the
-queries offline.
+an address, or of an account that had none) or another kind, beside accounts without a key (which the hold covers
+once they set one up, and which no query can count), a change 15 days ago and changes never applied, counted as
+the hold's own code counts them. test_release_conditions.py checks the queries offline.
 """
 import json
 
@@ -86,7 +86,8 @@ ACCOUNTS = {
     "approved-ssh-key": (True, [("ssh_key", "approved", 10)]),                     # held, host only
     "email-13-days": (True, [("email", "made", 13)]),                              # held, the code reaches it
     "email-to-no-address": (True, [("email", "made", 4)]),                         # held, host only: none before
-    "no-key": (False, [("password", "made", 2)]),                                  # nothing to hold
+    "no-key": (False, [("password", "made", 2)]),                                  # not counted, held with a key
+    "no-key-15-days": (False, [("password", "made", 15)]),                         # not counted, the hold ended
     "15-days": (True, [("password", "made", 15)]),                                 # the hold has ended
     "held-for-approval": (True, [("password", "held", 1)]),                        # never applied
     "denied": (True, [("reset_link", "denied", 1)]),                               # never applied
@@ -112,8 +113,12 @@ db.commit()
 # What the code itself says of each account with a key: whether the hold covers it now, and whether a code can be
 # sent (envelope_hold.code_destination, which the code route reads).
 code = {"held_accounts": 0, "released_only_by_the_host": 0}
-for account in db.query(User).filter(User.username.like("cond-%")).all():
+# And the accounts without a key the hold covers all the same, which no query can count: held once they set one up.
+out["held_once_a_key_is_set_up"] = []
+for account in db.query(User).filter(User.username.like("cond-%")).order_by(User.username).all():
     if db.query(UserKeyPair).filter(UserKeyPair.user_id == account.id).first() is None:
+        if envelope_hold.holding_changes(db, account.id, now):
+            out["held_once_a_key_is_set_up"].append(account.username)
         continue
     if envelope_hold.holding_changes(db, account.id, now):
         code["held_accounts"] += 1
@@ -167,3 +172,6 @@ def test_each_detect_query_finds_what_was_seeded_and_only_that(throwaway):
     assert before[q] == []
     assert after[q] == [{"held_accounts": "7", "released_only_by_the_host": "4"}]
     assert after[q][0] == out["by_the_code"]
+    # The account without a key changed 2 days ago is held as soon as it sets one up; the query does not count it,
+    # and the condition's text says so. The one changed 15 days ago is not held.
+    assert out["held_once_a_key_is_set_up"] == ["cond-no-key"]

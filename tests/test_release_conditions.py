@@ -150,6 +150,27 @@ def test_the_envelope_holds_text_and_query_say_what_the_code_does():
     assert '("release-key-hold", ' in tool and "python dockvault.py accounts --action release-key-hold" in text
 
 
+def test_the_envelope_holds_text_says_whom_its_check_cannot_count():
+    """The query counts the accounts that have a key at the upgrade. The hold reads no key: an account changed in
+    the 14 days before that sets up a key while the hold lasts is held too (tests/test_zk_envelope_hold.py), and no
+    query run before can count it, so the text and the README say a check that finds none is not the all-clear."""
+    cid = "zk-envelope-held-after-admin-reset"
+    text, sql = rc.SUMMARY[cid], rc.DETECT[cid]
+    assert sql.count("JOIN user_keypairs k ON k.user_id = c.target_user_id") == 1
+    assert text.count("and an account changed then that has no key yet is held as soon as it sets one up, until the "
+                      "hold ends.") == 1
+    assert text.count("The check below counts the accounts held at the first start and those only the server's "
+                      "operator can release; it cannot count an account that sets up a key later, so a check that "
+                      "finds none does not mean no account will be held.") == 1
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    start = readme.index("### Upgrading to 0.34.0")
+    section = " ".join(readme[start:readme.index("\n### ", start + 1)].split())
+    item = section[section.index("**Encryption keys of accounts an administrator changed lately:**"):]
+    item = item[:item.index(" - **")]
+    assert item.count("and changes made before the upgrade count, also for someone who sets up a key only after the "
+                      "upgrade, while the hold lasts.") == 1
+
+
 def test_the_condition_ids_are_ones_the_matrix_accepts_and_the_rollback_one_has_a_query():
     um = _matrix_script()
     for cid in list(rc.DETECT) + list(rc.WITHOUT_DETECT):
