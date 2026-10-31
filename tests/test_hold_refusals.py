@@ -250,6 +250,24 @@ def test_the_refusal_is_recorded_under_each_case_with_no_name(world):
         assert "Quarterly accounts" not in str(r.details), "no vault name"
 
 
+def test_a_refusal_for_what_a_released_hold_kept_records_when_it_is_purged(world):
+    """Kept rows of a released hold that wait for their purge: the refusal's row says when they are purged (the
+    latest purge time of the releases that wait), which is when the delete can be asked again; under a hold that
+    stands no date is known, and none is recorded."""
+    case = _case(world.db, world.ada, "C-2026-0031")
+    purge = NOW + timedelta(days=5)
+    _hold(world.db, case, world.vault, released=NOW - timedelta(days=2), purge_after=purge)
+    _kept_file(world.db, world.vault)
+    hr.record(world.db, world.olga, hr.VAULT, hr.vault_keeping(world.db, world.vault.id), vault_id=world.vault.id)
+    (row,) = _blocked(world.db)
+    assert row.case_id == case.id and row.details["purge_after"] == purge.isoformat()
+    standing = _case(world.db, world.ada, "C-2026-0032")
+    _hold(world.db, standing, world.other)
+    hr.record(world.db, world.olga, hr.VAULT, hr.vault_keeping(world.db, world.other.id), vault_id=world.other.id)
+    (later,) = [r for r in _blocked(world.db) if r.case_id == standing.id]
+    assert "purge_after" not in later.details
+
+
 def test_a_record_that_cannot_be_written_never_raises(world, monkeypatch):
     def broken(*_a, **_k):
         raise RuntimeError("no database")
@@ -666,3 +684,39 @@ def test_the_delete_asks_before_it_locks_any_vault_row():
     asked = source.index("hold_refusals.custodian_keeping(db, user.id)")
     assert source.index("Cannot delete your own account") < asked
     assert asked < source.index("record_rotations_owed_by(db, user.id)") < source.index("db.delete(user)")
+
+
+class _Locked(Exception):
+    """Raised at the first vault row the delete locks: the test needs only the order up to there."""
+
+
+@pytest.mark.parametrize("custodian", [False, True])
+def test_the_delete_takes_the_turn_of_holds_before_it_locks_any_vault_row(world, monkeypatch, custodian):
+    """On Postgres a hold being placed takes the turn of holds and deletions, then the vault's row: a delete that
+    locked a vault row (the rotations its key rows owe) before it asked the hold, which takes that turn, would take
+    the two the other way round, and the two could wait on each other. Recorded as the delete runs, whoever is
+    deleted: the turn first; for a custodian under a hold, no vault row at all."""
+    from app.core import legal_holds
+    otto = _user(world.db, "otto")
+    world.db.add(m.VaultMemberKey(vault_id=world.vault.id, user_id=otto.id, encrypted_dek="sealed",
+                                  ephemeral_public_key="key", key_version=1))
+    world.db.commit()
+    if custodian:
+        _hold(world.db, _custodian_case(world.db, world.ada, "C-2026-0033", otto), world.other)
+    seen = []
+    real = sa.orm.Query.with_for_update
+
+    def with_for_update(self, *a, **k):
+        if any(d.get("entity") is m.Vault for d in self.column_descriptions):
+            seen.append("vault row")
+            raise _Locked()
+        return real(self, *a, **k)
+    monkeypatch.setattr(hr, "_dialect", lambda db: "postgresql")
+    monkeypatch.setattr(legal_holds, "take_turn", lambda db, *, shared: seen.append(("turn", shared)))
+    monkeypatch.setattr(sa.orm.Query, "with_for_update", with_for_update)
+    with pytest.raises(HTTPException if custodian else _Locked) as stopped:
+        _delete_user(world, otto)
+    if custodian:
+        assert stopped.value.status_code == 409 and seen == [("turn", True)]
+    else:
+        assert seen == [("turn", True), "vault row"]
