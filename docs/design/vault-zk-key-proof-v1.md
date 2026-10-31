@@ -58,7 +58,7 @@ closes a hole inside it.
 | **An insider**: a manager who really holds the key and acts maliciously | everything a holder has | - | cannot make things worse than before; the owner can repair (§4.4) |
 | **A database reader** (a backup, a read-only hole), alone or with a session | database rows | `.env`, live keys | cannot forge a proof: the one secret a proof is checked with is sealed with `ENCRYPTION_KEY` |
 | **A downgrade**: an old client, a request without a proof, a rollback, the enforcement switch | - | - | fails safe; never silently lowers the requirement (§3.8, §9) |
-| **A database writer** who is not the code | row writes | the JavaScript | server checks cannot stop it; the stored key check and lineage tag let members' clients detect a substituted key (§3.5, §3.6), which the web app does from 0.34.0 (§11) |
+| **A database writer** who is not the code | row writes | the JavaScript | server checks cannot stop it; from 0.34.0 members' clients (§11) see a key put in place at an epoch whose stored key check is left as it was (§3.5), and a rotation with a lineage tag that does not check out (§3.6); they cannot see an epoch written with no stored material at all, nor one whose row says the owner reset it |
 | **A host operator** who serves the code | everything | - | out of reach in the browser, as before |
 
 Out of scope: script injection on the vault's origin; a member whose passphrase is compromised (they *are* that
@@ -774,7 +774,7 @@ and the current epoch's lineage is verified. The vault's key details show one of
 |---|---|
 | verified | the current epoch's tag checks out against the previous epoch's key |
 | not verifiable | the member never held the previous key, or the epoch has no row, or was set up afterwards |
-| reset by the owner | an owner reset without the previous key (no tag) |
+| reset by the owner | the epoch's row records an owner's reset without the previous key (no tag); a database writer can write such a row too |
 | failed | a tag that does not check out, or none where a rotation should have left one |
 | first | the vault's first epoch |
 

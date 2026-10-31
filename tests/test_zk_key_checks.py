@@ -92,6 +92,7 @@ def test_a_team_key_comparison_that_cannot_run_is_not_a_mismatch(run):
     "lineage: a tag over other material fails",
     "lineage: a rotation that should carry a tag and does not fails",
     "lineage: an owner's reset without the previous key is told as a reset",
+    "lineage: a reset is told as what the server records, not as what the owner did",
     "lineage: an owner's reset with the previous key verifies",
     "lineage: an epoch set up afterwards has nothing to verify",
     "lineage: an epoch rotated while rolled back is not verifiable",

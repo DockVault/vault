@@ -13224,7 +13224,10 @@ function zkRenderKeyDetails(vault, summary) {
         let history = ZkKeyChecks.LINEAGE_TEXT[summary.lineage] || '';
         if (summary.lineage === ZkKeyChecks.LINEAGE_RESET && summary.view && summary.view.created_at) {
             const when = parseServerTime(summary.view.created_at);
-            if (when) history = `The owner reset this vault's key on ${when.toLocaleDateString()} without the previous one.`;
+            if (when) {
+                history = `The server records an owner's reset of this vault's key on ${when.toLocaleDateString()}, ` +
+                    'without the previous key.';
+            }
         }
         const h = row('Key history', history, 'vault-key-history',
                       summary.lineage === ZkKeyChecks.LINEAGE_FAILED ? 'text-warning' : null);

@@ -217,7 +217,11 @@ def test_the_key_details_show_the_lineage_of_the_current_key(browser, zk):
               f"WHERE vault_id = '{vid}' AND dek_epoch = 2")
         _recheck(page_m, vid)
         _expect_history(page_m, "reset-by-owner")
-        expect(page_m.locator("#vault-key-history")).to_contain_text("The owner reset this vault's key on")
+        # A database writer can write such a row too: the key details say what the server records, not that the
+        # owner did it.
+        history = page_m.locator("#vault-key-history")
+        expect(history).to_contain_text("The server records an owner's reset of this vault's key on")
+        expect(history).not_to_contain_text("The owner reset")
 
         # An epoch with no stored material (made while the server was rolled back): nothing to verify, and
         # the key cannot be checked, which writes as before.

@@ -132,7 +132,8 @@ const ZkKeyChecks = (() => {
         [LINEAGE_VERIFIED]: 'This key was made by someone who held the previous key.',
         [LINEAGE_UNVERIFIABLE]: 'Who made this key cannot be checked here: you did not hold the previous '
             + 'key, or the key was made before this check existed.',
-        [LINEAGE_RESET]: "The owner reset this vault's key without the previous one.",
+        // What the server records: a database writer can write such a row too, so it is not said as a fact.
+        [LINEAGE_RESET]: "The server records an owner's reset of this vault's key, without the previous key.",
         [LINEAGE_FAILED]: 'This key could not be traced to someone who held the previous key. It may have '
             + 'been changed by someone who should not have been able to. The owner has been told.',
         [LINEAGE_FIRST]: "This is the vault's first key.",
