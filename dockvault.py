@@ -7095,18 +7095,27 @@ class DockVault:
                        % (why, unrestored, kept, kept))
         print(pal.paint("  Wrote the new AUDIT_CHAIN_KEY (on the disk); recreating the stack ...", "cyan"))
         if not self._recreate_stack(build=False):
-            self._fail("the stack did not come up with the new key; the old key is in %s" % (kept or "(none)"))
+            if kept is None:
+                self._fail("the stack did not come up with the new key. Once it is up, the audit log's chain "
+                           "moves to the new key on its own, with a proof, at the next sealing pass.")
+            print(pal.paint("ERROR: the stack did not come up with the new key; the old key is in %s" % kept, "red"))
+            self._finish_key_change_hint(kept, "Once the stack is up (python dockvault.py status), move the chain")
+            raise SystemExit(1)
         self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
         if not old:
             print(pal.paint("  The chain was under the key derived from ENCRYPTION_KEY: it moves to the new key on "
                             "its own, with a proof, at the next sealing pass.\n", "green"))
             return
-        done = self._audit_tool("rekey", "--old-key-stdin", "--now", input_text=old + "\n")
+        try:
+            done = self._audit_tool("rekey", "--old-key-stdin", "--now", input_text=old + "\n")
+        except SystemExit:
+            # The tool did not answer, or could not be run (an outage, a failed docker exec): it has said which.
+            # The new key is in .env and the chain is still under the old one, which only the kept file holds.
+            self._finish_key_change_hint(kept, "The chain was not moved. Sealing waits until it is")
+            raise
         if not done.get("ok"):
             print(pal.paint("  The chain was not moved: %s" % server_text(done.get("error")), "red"))
-            print(pal.paint("  Sealing waits until it is: python dockvault.py audit rekey --old-key-file %s\n"
-                            "  then remove %s once the rekey says the key it holds is no longer needed (a new key\n"
-                            "  change of this set is refused while it is there).\n" % (kept, kept), "yellow"))
+            self._finish_key_change_hint(kept, "Sealing waits until it is")
             raise SystemExit(1)
         try:
             os.remove(kept)
@@ -7114,6 +7123,13 @@ class DockVault:
             print(pal.paint("  Could not remove %s (%s): remove it yourself, as the key it holds is no longer in "
                             "use (a new key change is refused while it is there)." % (kept, exc), "yellow"))
         print(pal.paint("  The chain is under the new key (seal %s).\n" % server_text(done.get("sealed")), "green"))
+
+    def _finish_key_change_hint(self, kept, lead):
+        """How to finish a key change whose chain was not moved: the command that moves it with the old key `kept`
+        holds, and when that file may go. `lead` is the start of the sentence that names the command."""
+        print(self.pal.paint("  %s: python dockvault.py audit rekey --old-key-file %s\n"
+                             "  then remove %s once the rekey says the key it holds is no longer needed (a new key\n"
+                             "  change of this set is refused while it is there).\n" % (lead, kept, kept), "yellow"))
 
     def _unfinished_key_change(self, kept, prefix):
         """Refuse a key change while an earlier one of the same set is not finished, naming the commands that finish

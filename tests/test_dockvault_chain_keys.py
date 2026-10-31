@@ -270,6 +270,41 @@ def test_a_key_change_that_cannot_move_the_chain_keeps_the_old_key_aside(tmp_pat
     assert _kept(tmp_path).read_text(encoding="utf-8") == env["AUDIT_CHAIN_KEY"] + "\n"
 
 
+def _no_answer(*a, **k):
+    return _Result(1, "")
+
+
+def _exec_fails(*a, **k):
+    raise OSError("docker exec failed")
+
+
+@pytest.mark.parametrize("case", ["no answer", "exec fails", "stack not up"])
+def test_a_key_change_whose_move_never_happened_says_how_to_finish_it(tmp_path, monkeypatch, capsys, case):
+    """After the restart the new key is in .env and the chain is still under the old one, which only the kept file
+    holds. When the audit tool then gives no answer (an outage), cannot be run (docker exec fails), or the stack does
+    not come up at all, the command that finishes the change is printed, with when the kept file may go; the kept
+    file holds the old key."""
+    env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
+    monkeypatch.setattr(tool, "_recreate_stack", lambda build: case != "stack not up")
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_dc", lambda *a: ["docker", "compose"] + list(a))
+    monkeypatch.setattr(dv.subprocess, "run", _exec_fails if case == "exec fails" else _no_answer)
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))
+    out = capsys.readouterr().out
+    kept = _kept(tmp_path)
+    assert kept.read_text(encoding="utf-8") == env["AUDIT_CHAIN_KEY"] + "\n"
+    assert _chain_key(tmp_path) != env["AUDIT_CHAIN_KEY"]
+    assert f"python dockvault.py audit rekey --old-key-file {kept}" in out, out
+    assert f"then remove {kept} once the rekey says the key it holds is no longer needed" in out, out
+    why = {"no answer": "the audit tool did not answer", "exec fails": "could not run the audit tool",
+           "stack not up": "the stack did not come up with the new key"}[case]
+    assert why in out, out
+
+
 def _key_change_with_a_failed_move(tmp_path, monkeypatch):
     """A key change whose move failed: .env holds the new key, the kept file the key the chain is under."""
     env = _env_file(tmp_path, audit_chain_key=dv.gen_hex(32))
