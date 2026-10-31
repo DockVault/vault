@@ -71,7 +71,7 @@ def _served(token):
     pull = requests.get(f"{BASE}/logs", params={"service": "web", "tail": 5000},
                         headers={"Authorization": f"Bearer {token}"}, timeout=30)
     if pull.status_code == 404:
-        pytest.skip("log endpoint disabled (ceiling) - not testable on this round")
+        pytest.skip("log endpoint off (set PLAN_LOG_PULL=true + LOG_TOKEN_PEPPER>=32 to test)")
     assert pull.status_code == 200, pull.text[:300]
     return pull.json()["lines"]
 
