@@ -23,9 +23,11 @@ SECRET = "Early-Secret-81c7-qx"
 EMAIL = "early-5d2f@example.com"
 TYPED = (USER, SECRET, EMAIL)
 
-# Records each submit event that reaches the window (after the document's listeners), so a test
-# knows the browser really tried to send the form and the check below is not vacuous.
-_COUNT_SUBMITS = "window.__submits = []; window.addEventListener('submit', e => window.__submits.push(e.target.id));"
+# Records each submit event as it starts down to the form (the window's capture phase, before any listener of
+# the document's), so a test knows the browser really tried to send the form and the check below is not
+# vacuous. A sign-in sent before the page is ready goes no further than the document: it is held.
+_COUNT_SUBMITS = ("window.__submits = []; "
+                  "window.addEventListener('submit', e => window.__submits.push(e.target.id), true);")
 
 
 class _AppHeld:
@@ -92,6 +94,12 @@ def test_sign_in_before_app_js_sends_nothing_and_works_once_it_loads(page: Page,
     held.release()
     expect(page.locator("#login-screen")).to_be_visible()
     page.wait_for_load_state("load", timeout=30000)  # app.js (and what follows it) has run
+    # The sign-in held while app.js was away is sent now, once, as app.js sends one: a POST to /auth/login,
+    # nothing typed in an address. It is refused (no such account), and the page says so.
+    expect(page.locator("#login-error")).to_be_visible(timeout=15000)
+    posts = [(m, u) for m, u, _ in held.requests if m != "GET"]
+    assert [(m, u) for m, u in posts if "/auth/login" in u] == [("POST", held.home + "auth/login")], posts
+    assert [u for _, u, _ in held.requests if any(t in u for t in TYPED)] == []
     page.fill("#username", admin_creds["username"])
     page.fill("#password", admin_creds["password"])
     page.click("#login-form button[type=submit]")
