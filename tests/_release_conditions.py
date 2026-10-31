@@ -42,11 +42,14 @@ DETECT = {
         "SELECT key, value FROM managed_settings WHERE value IS NOT NULL AND value::text <> 'null' ORDER BY key"),
     # The accounts with an encryption key whose sign-in details were changed in the 14 days before the upgrade: the
     # hold covers them at once (app/core/envelope_hold.py). Of each, the earliest of those changes decides where the
-    # code goes; only an email change recorded before 0.34.0 kept the address it replaced, so for any other the
-    # server's operator alone can release the account.
+    # code goes (envelope_hold.code_destination): only an email change recorded before 0.34.0 kept the address it
+    # replaced (credential_changes.address_before), so for any other, and for an email change of an account that had
+    # no address then, the server's operator alone can release the account.
     "zk-envelope-held-after-admin-reset": (
-        "SELECT count(*) AS held_accounts, count(*) FILTER (WHERE kind <> 'email') AS released_only_by_the_host "
-        "FROM (SELECT DISTINCT ON (c.target_user_id) c.target_user_id, c.kind FROM credential_changes c "
+        "SELECT count(*) AS held_accounts, count(*) FILTER (WHERE kind <> 'email' "
+        "OR coalesce(btrim(previous_email), '') = '') AS released_only_by_the_host "
+        "FROM (SELECT DISTINCT ON (c.target_user_id) c.target_user_id, c.kind, "
+        "c.payload->>'previous_email' AS previous_email FROM credential_changes c "
         "JOIN user_keypairs k ON k.user_id = c.target_user_id WHERE c.status IN ('made', 'approved') "
         "AND c.applied_at > (now() AT TIME ZONE 'utc') - interval '14 days' "
         "ORDER BY c.target_user_id, c.applied_at) t HAVING count(*) > 0"),
@@ -61,12 +64,12 @@ SUMMARY = {
         "those changes. Changes made before the upgrade count: an account with an encryption key whose sign-in "
         "details were changed in the 14 days before the upgrade is held from the first start (opening the key "
         "answers 403 zk-envelope-hold). Only an email change recorded before 0.34.0 kept the address it replaced, "
-        "so for an account whose first such change was of another kind, or on a deployment without mail, no code "
-        "can be sent (409 zk-envelope-hold-no-mail): the server's operator releases it with python dockvault.py "
-        "accounts --action release-key-hold, or the hold ends ZK_ENVELOPE_HOLD_DAYS days after the last change. The "
-        "check below counts the accounts held and those only the server's operator can release. "
-        "ZK_ENVELOPE_HOLD_DAYS=0 in .env before the upgrade turns the hold off. Going back to an earlier release "
-        "lifts the hold."),
+        "so for an account whose first such change was of another kind or an email change of an account that had no "
+        "address, or on a deployment without mail, no code can be sent (409 zk-envelope-hold-no-mail): the server's "
+        "operator releases it with python dockvault.py accounts --action release-key-hold, or the hold ends "
+        "ZK_ENVELOPE_HOLD_DAYS days after the last change. The check below counts the accounts held and those only "
+        "the server's operator can release. ZK_ENVELOPE_HOLD_DAYS=0 in .env before the upgrade turns the hold off. "
+        "Going back to an earlier release lifts the hold."),
 }
 
 # The one whose rows stop the upgraded deployment going back across the edge.
@@ -94,6 +97,6 @@ OLDER_SCHEMA = {
     "password_reset_tokens": {"consumed_at", "expires_at"},
     "otp_codes": {"consumed_at", "expires_at"},
     "email_change_codes": {"consumed_at", "expires_at"},
-    "credential_changes": {"target_user_id", "kind", "status", "applied_at"},
+    "credential_changes": {"target_user_id", "kind", "status", "applied_at", "payload"},
     "user_keypairs": {"user_id"},
 }

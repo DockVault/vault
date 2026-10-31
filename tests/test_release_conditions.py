@@ -108,8 +108,10 @@ def test_a_text_kept_here_is_for_a_condition_listed_and_one_the_matrix_takes():
 
 def test_the_envelope_holds_text_and_query_say_what_the_code_does():
     """Each fact the text states is the code's: the setting and its default, the window the query counts and the
-    statuses and kinds it reads, the two refusals and their statuses, and the host operator's action."""
+    statuses and kinds it reads, where the code goes and when none can be sent, the two refusals and their statuses,
+    and the host operator's action."""
     from datetime import timedelta
+    from types import SimpleNamespace
     from app.core import credential_changes as cc
     from app.core import envelope_hold
     from app.core.config import Settings
@@ -122,15 +124,28 @@ def test_the_envelope_holds_text_and_query_say_what_the_code_does():
     assert cc.WINDOW == timedelta(days=14) and "in the 14 days before the upgrade" in text
     assert "c.applied_at > (now() AT TIME ZONE 'utc') - interval '14 days'" in sql
     assert set(cc.APPLIED) == {"made", "approved"} and "c.status IN ('made', 'approved')" in sql
-    assert cc.EMAIL == "email" and "FILTER (WHERE kind <> 'email')" in sql
-    # Of each account, the earliest change: the one the code's address is read from.
+    # Of each account, the earliest change: the one the code's address is read from. Only an email change kept the
+    # address it replaced, as 0.33.x recorded it; one that replaced no address sends no code, like any other kind.
     assert "DISTINCT ON (c.target_user_id)" in sql and "ORDER BY c.target_user_id, c.applied_at)" in sql
+    assert cc.EMAIL == "email" and "c.payload->>'previous_email' AS previous_email" in sql
+    assert "FILTER (WHERE kind <> 'email' OR coalesce(btrim(previous_email), '') = '')" in sql
+    def recorded(before):
+        return cc.applied_email_payload({"old_email": before, "new_email": "new@example.com"})
+    assert recorded("old@example.com")["previous_email"] == "old@example.com"
+    assert cc.address_before(SimpleNamespace(kind=cc.EMAIL, payload=recorded("old@example.com"))) == "old@example.com"
+    assert cc.address_before(SimpleNamespace(kind=cc.EMAIL, payload=recorded(None))) == ""
+    assert cc.address_before(SimpleNamespace(kind="password", payload=None)) is None
+    assert "or an email change of an account that had no address, or on a deployment without mail" in text
     assert "JOIN user_keypairs k ON k.user_id = c.target_user_id" in sql
     for reason in ("zk-envelope-hold", "zk-envelope-hold-no-mail"):
         status = zk_key_proof.REFUSALS[reason][0]
         assert f"({status} {reason})" in text or f"answers {status} {reason})" in text, reason
     router = (ROOT / "app" / "api" / "ecc_router.py").read_text(encoding="utf-8")
     assert 'raise zk_key_proof.KeyProofRefusal("zk-envelope-hold")' in router
+    # No address to send the code to is the refusal without mail.
+    assert ('address = (envelope_hold.code_destination(db, current_user) or "").strip()\n'
+            '    if not address or not _smtp_configured(db):\n'
+            '        raise zk_key_proof.KeyProofRefusal("zk-envelope-hold-no-mail")') in router
     tool = (ROOT / "dockvault.py").read_text(encoding="utf-8")
     assert '("release-key-hold", ' in tool and "python dockvault.py accounts --action release-key-hold" in text
 

@@ -456,9 +456,9 @@ able to do.
   after an administrator changed a person's sign-in details, their zero-knowledge key opens in a browser only after
   they enter a code sent by email, and changes made before the upgrade count. Someone whose first such change in the
   14 days before the upgrade was not an email change gets no code (the earlier release kept no address for it), nor
-  does anyone on a deployment without mail: release them with `python dockvault.py accounts --action
-  release-key-hold`, or the hold ends `ZK_ENVELOPE_HOLD_DAYS` days after the last change. `ZK_ENVELOPE_HOLD_DAYS=0`
-  in `.env` turns it off.
+  does someone whose account had no address before that change, or anyone on a deployment without mail: release
+  them with `python dockvault.py accounts --action release-key-hold`, or the hold ends `ZK_ENVELOPE_HOLD_DAYS` days
+  after the last change. `ZK_ENVELOPE_HOLD_DAYS=0` in `.env` turns it off.
 - **Going back:** while a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones)
   waits for its purge, a release before 0.34.0 refuses to start (from 0.33.1 on) and `dockvault.py update` refuses
   the rollback. Release the holds, wait for the purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more,

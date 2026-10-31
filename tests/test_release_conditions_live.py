@@ -6,9 +6,10 @@ security alerts with a name and an address, a name only, an address only or neit
 and one just inside them; invitations ended by acceptance, revocation or expiry 31 days ago and 29 days ago, and
 a pending one; reset links, codes and email-change codes used 31 days ago before an expiry still ahead, or
 expired, beside ones that ended 29 days ago and live ones; an archived day and a value set in the panel; accounts
-with an encryption key whose sign-in details were changed 1 to 13 days ago, the first change an email change or
-another kind, beside an account without a key, a change 15 days ago and changes never applied.
-test_release_conditions.py checks the queries offline.
+with an encryption key whose sign-in details were changed 1 to 13 days ago, the first change an email change (from
+an address, or of an account that had none) or another kind, beside an account without a key, a change 15 days ago
+and changes never applied, counted as the hold's own code counts them. test_release_conditions.py checks the
+queries offline.
 """
 import json
 
@@ -80,14 +81,17 @@ db.add(ManagedSetting(key="logs_hold", value=None, version=2, updated_at=now))
 ACCOUNTS = {
     "password-3-days": (True, [("password", "made", 3)]),                         # held, host only
     "email-then-password": (True, [("email", "made", 5), ("password", "made", 1)]),  # held, the code reaches it
+    "email-then-ssh-key": (True, [("email", "made", 8), ("ssh_key", "made", 3)]),    # held, the code reaches it
     "password-then-email": (True, [("password", "made", 6), ("email", "made", 2)]),  # held, host only
     "approved-ssh-key": (True, [("ssh_key", "approved", 10)]),                     # held, host only
     "email-13-days": (True, [("email", "made", 13)]),                              # held, the code reaches it
+    "email-to-no-address": (True, [("email", "made", 4)]),                         # held, host only: none before
     "no-key": (False, [("password", "made", 2)]),                                  # nothing to hold
     "15-days": (True, [("password", "made", 15)]),                                 # the hold has ended
     "held-for-approval": (True, [("password", "held", 1)]),                        # never applied
     "denied": (True, [("reset_link", "denied", 1)]),                               # never applied
 }
+from app.core import credential_changes as cc, envelope_hold
 for name, (key, changes) in ACCOUNTS.items():
     account = User(id=uuid.uuid4(), username="cond-" + name, email=name + "@example.com", password_hash="x",
                    role=RoleEnum.USER, is_active=True)
@@ -96,10 +100,26 @@ for name, (key, changes) in ACCOUNTS.items():
     if key:
         db.add(UserKeyPair(user_id=account.id, public_key="P", fingerprint="f" * 64, encrypted_private_key="E"))
     for kind, status, days in changes:
+        # An applied email change keeps the address before and after, as 0.33.x recorded it.
+        payload = None
+        if kind == "email" and status in ("made", "approved"):
+            before = None if name == "email-to-no-address" else "before-" + name + "@example.com"
+            payload = cc.applied_email_payload({"old_email": before, "new_email": name + "@example.com"})
         db.add(CredentialChange(target_user_id=account.id, kind=kind, status=status, requested_by_name="admin",
-                                requested_at=ago(days),
+                                requested_at=ago(days), payload=payload,
                                 applied_at=ago(days) if status in ("made", "approved") else None))
 db.commit()
+# What the code itself says of each account with a key: whether the hold covers it now, and whether a code can be
+# sent (envelope_hold.code_destination, which the code route reads).
+code = {"held_accounts": 0, "released_only_by_the_host": 0}
+for account in db.query(User).filter(User.username.like("cond-%")).all():
+    if db.query(UserKeyPair).filter(UserKeyPair.user_id == account.id).first() is None:
+        continue
+    if envelope_hold.holding_changes(db, account.id, now):
+        code["held_accounts"] += 1
+        if not (envelope_hold.code_destination(db, account, now) or "").strip():
+            code["released_only_by_the_host"] += 1
+out["by_the_code"] = {k: str(v) for k, v in code.items()}
 db.close()
 out["after"] = run_all()
 print(json.dumps(out))
@@ -139,8 +159,11 @@ def test_each_detect_query_finds_what_was_seeded_and_only_that(throwaway):
     assert after[q] == [{"days": "2", "rows": "12", "first_day": "2026-01-02", "last_day": "2026-01-03"}]
     q = "panel-retention-not-read"
     assert before[q] == [] and after[q] == [{"key": "audit_hot_days", "value": "120"}]
-    # Five accounts with a key and an applied change in the last 14 days; of them, the three whose first such change
-    # was not an email change only the server's operator can release.
+    # Seven accounts with a key and an applied change in the last 14 days; of them, the three whose first such change
+    # was not an email change, and the one whose email change gave it its first address, only the server's operator
+    # can release (were the latest change to decide, two whose email change came first would count too, and one
+    # whose came last would not): what the hold's own code says of the same accounts.
     q = "zk-envelope-held-after-admin-reset"
     assert before[q] == []
-    assert after[q] == [{"held_accounts": "5", "released_only_by_the_host": "3"}]
+    assert after[q] == [{"held_accounts": "7", "released_only_by_the_host": "4"}]
+    assert after[q][0] == out["by_the_code"]
