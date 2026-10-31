@@ -2104,9 +2104,10 @@ async def get_user_public_key(
     if not kp:
         return {"user_id": user_id, "public_key": None, "fingerprint": None, "has_keypair": False}
     # When the key was set up, and whether that was within 14 days after an administrator changed the
-    # account's sign-in details (null: set up before this was recorded). Shown in the share dialog, so given
-    # only for someone the caller could pick there (the recipient picker's own rule): for anyone else it
-    # would say, of any account, that an administrator changed its sign-in details shortly before.
+    # account's sign-in details or while its password was one someone else chose (null: set up before this
+    # was recorded). Shown in the share dialog, so given only for someone the caller could pick there (the
+    # recipient picker's own rule): for anyone else it would say, of any account, that an administrator
+    # changed its sign-in details shortly before or chose its password.
     from app.api.api_server import _share_eligible_ids
     shareable = str(kp.user_id) in _share_eligible_ids(db, current_user, [kp.user_id])
     return {

@@ -2323,8 +2323,9 @@ class UserKeyPair(Base):
     last_used = Column(DateTime, nullable=True)
 
     # Whether the key was set up within 14 days after an administrator (or the server's operator) changed
-    # the account's sign-in details. Whoever sets up an account's key first owns it, so a key set up in that
-    # window may be someone else's; the share dialog says so beside it. Decided at registration, from the
+    # the account's sign-in details, or while the account's password was one someone else chose
+    # (users.password_set_by_other_at). Whoever sets up an account's key first owns it, so a key set up then
+    # may be someone else's; the share dialog says so beside it. Decided at registration, from the
     # credential-change records, which are kept only for those 14 days. NULL for a key set up before this
     # was recorded; an older release ignores the column.
     registered_after_admin_change = Column(Boolean, nullable=True)

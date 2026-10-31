@@ -25536,8 +25536,9 @@ END $$;""",
             # default: nothing is owed on an existing vault, and an older release ignores the column.
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS rotation_owed_epoch INTEGER",
             # Whether an account's encryption key was set up within 14 days after an administrator changed
-            # its sign-in details, shown beside the key when a vault is shared with the account. Nullable,
-            # no default: unknown for a key set up before, and an older release ignores the column.
+            # its sign-in details, or while its password was one someone else chose, shown beside the key
+            # when a vault is shared with the account. Nullable, no default: unknown for a key set up
+            # before, and an older release ignores the column.
             "ALTER TABLE user_keypairs ADD COLUMN IF NOT EXISTS registered_after_admin_change BOOLEAN",
             # The hold on an account's zero-knowledge key envelope after an administrator changed its
             # sign-in details: when a session entered the emailed code, and when the host operator released
