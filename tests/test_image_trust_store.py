@@ -1,11 +1,12 @@
 """The image refuses a certificate made with a disclosed eMudhra intermediate key.
 
 In October 2026 the private keys of eight eMudhra intermediate authorities were found to be trivially
-weak (CVE-2026-115557); one of them, EM OV TLS CA - G3C, has the secp384r1 scalar 4 for its key. The
-images up to 0.33.5 trusted emSign ECC Root CA - G3, which vouches for that intermediate's issuer
-through a cross-certificate, and their Python had no list of keys to refuse. So a certificate anyone
-could make with that key, for any name, was accepted by the vault's default TLS context, and the
-vault's own mail sender sent the relay's password and the message to whoever presented it.
+weak (Python's fix is CVE-2026-115557); one of them, EM OV TLS CA - G3C, has the secp384r1 scalar 4
+for its key. The images up to 0.33.5 trusted emSign ECC Root CA - G3, which vouches for that
+intermediate's issuer through a cross-certificate, and their Python had no list of keys to refuse. So
+a certificate anyone could make with that key, for any name, was accepted by the vault's default TLS
+context, and the vault's own mail sender sent the relay's password and the message to whoever
+presented it.
 
 Since 0.33.6 the image refuses that chain twice over: its Python refuses any chain that holds one of
 the eight keys (verify code 28, certificate rejected), and its trust store no longer holds the root

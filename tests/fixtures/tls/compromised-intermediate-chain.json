@@ -1,5 +1,5 @@
 {
-  "about": "Two public certificates, as published by crt.sh. The intermediate authority is one of the eight eMudhra intermediates whose private keys were found in October 2026 to be trivially weak (CVE-2026-115557): its private key is the secp384r1 scalar 4. The cross-certificate is the one through which emSign ECC Root CA - G3, a root the images up to 0.33.5 trusted, vouches for the intermediate's issuer, emSign Root TLS CA - G3. With the two, anyone can make a server certificate for any name that chains to that root.",
+  "about": "Two public certificates, as published by crt.sh. The intermediate authority is one of the eight eMudhra intermediates whose private keys were found in October 2026 to be trivially weak (Python's fix is CVE-2026-115557): its private key is the secp384r1 scalar 4. The cross-certificate is the one through which emSign ECC Root CA - G3, a root the images up to 0.33.5 trusted, vouches for the intermediate's issuer, emSign Root TLS CA - G3. With the two, anyone can make a server certificate for any name that chains to that root.",
   "curve": "secp384r1",
   "intermediate_private_scalar": 4,
   "intermediate": {
