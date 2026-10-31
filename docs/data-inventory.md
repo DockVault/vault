@@ -576,8 +576,9 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
   [The audit log](#the-audit-log)).
 - Working records: invitations, and used or expired reset links, one-time codes and email-change codes, are
   deleted 30 days after they end (they were kept); notifications after `NOTIFICATION_RETENTION_DAYS` when
-  set (0 keeps them, as before). None of them is deleted while a legal hold stands or a compliance case is
-  open. The log-access file holds `LOG_PULL_SINK_MAX_MB` (15) in all.
+  set (0 keeps them, as before). The pruner deletes none of them while a legal hold stands or a compliance case
+  is open; a new reset link or one-time code still replaces an unused one at once, and a reset link refused when
+  it is used is deleted. The log-access file holds `LOG_PULL_SINK_MAX_MB` (15) in all.
 - Container output rotates in the shipped compose files (`DOCKER_LOG_MAX_SIZE`, `DOCKER_LOG_MAX_FILE`), on
   installs whose compose files come from 0.34.0.
 - Zero-knowledge keys: for `ZK_ENVELOPE_HOLD_DAYS` (14 by default, 0 to 14; 0 turns it off) after an
