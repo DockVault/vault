@@ -89,6 +89,27 @@ def test_the_marker_comes_and_goes_with_the_versions(factory, monkeypatch):
     assert _marker(factory) is None
 
 
+@pytest.mark.parametrize("running", ["0.34.0", "0.33.6"])
+def test_the_refusal_an_older_release_prints_names_the_release_that_removes_the_marker(factory, monkeypatch, running):
+    """The released 0.33.x prints the undo after "To go back to this version, first undo it with the newer version:",
+    where "this version" is itself, the release that refuses: the undo names the release to start instead, the one
+    the marker asks for (an earlier build of this one asks for its own version)."""
+    from app.core import data_requirements as dr
+    monkeypatch.setattr(rm, "running_version", lambda: running)
+    ap.prepare(factory)
+    db = factory()
+    ap.lock_policies(db)
+    ap.write_version(db, {**ap.POLICY_ONE, "emails": "none"}, previous=ap.read_latest(db), reason="admin")
+    db.commit()
+    rows = dr.unmet(dr.read_requirements(db.connection()), "0.33.5")
+    db.close()
+    message = dr.refusal_message(rows, "0.33.5")
+    assert f"Needs DockVault {running} or later (recording-levels)" in message
+    (undo,) = [line for line in message.splitlines() if "first undo it with the newer version" in line]
+    assert undo.endswith(f"then start DockVault {running} or later once so it removes this marker.")
+    assert "this version once" not in undo
+
+
 def test_a_version_rolled_back_leaves_no_marker(factory):
     ap.prepare(factory)
     db = factory()

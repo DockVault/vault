@@ -91,6 +91,24 @@ def test_the_marker_is_there_while_a_hold_stands_or_a_kept_row_remains(db, what,
     assert marker.sync(db) is True and len(_row(db)) == 1, "written once, then kept"
 
 
+@pytest.mark.parametrize("running", ["0.34.0", "0.33.6"])
+def test_the_refusal_an_older_release_prints_names_the_release_that_removes_the_marker(db, monkeypatch, running):
+    """The released 0.33.x prints the undo after "To go back to this version, first undo it with the newer version:",
+    where "this version" is itself, the release that refuses: the undo names the release to start instead, the one
+    the marker asks for (an earlier build of this one asks for its own version)."""
+    from app.core import data_requirements as dr
+    monkeypatch.setattr(recording_marker, "running_version", lambda: running)
+    db.add(m.HeldFile(id=uuid.uuid4(), vault_id=uuid.uuid4(), storage_path="p"))
+    assert marker.sync(db) is True
+    db.commit()
+    rows = dr.unmet(dr.read_requirements(db.connection()), "0.33.5")
+    message = dr.refusal_message(rows, "0.33.5")
+    assert f"Needs DockVault {running} or later (legal-holds)" in message
+    (undo,) = [line for line in message.splitlines() if "first undo it with the newer version" in line]
+    assert undo.endswith(f"then start DockVault {running} or later once so it removes this marker.")
+    assert "this version once" not in undo
+
+
 def test_the_marker_goes_when_nothing_is_held_or_kept(db, monkeypatch):
     monkeypatch.setattr(recording_marker, "running_version", lambda: "0.34.0")
     hold = m.LegalHoldVault(case_id=uuid.uuid4(), vault_id=uuid.uuid4(), placed_by_username="a")

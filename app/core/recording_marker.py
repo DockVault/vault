@@ -29,9 +29,12 @@ TABLE = "data_requirements"
 INTRODUCED = "0.34.0"
 REASON = ("The recording levels record less than releases before {introduced} do (names typed at sign-in, email "
           "addresses, IP addresses or browser descriptions). An earlier release would record them all in full.")
+# How to undo it, as an older release prints it after "To go back to this version, first undo it with the newer
+# version:", so it names the release that removes the marker ({version}: the one the marker asks for), never "this
+# version", which there reads as the older release that refuses.
 UNDO = ("Set the recording levels back to Full for names typed at sign-in, email addresses, IP addresses and browser "
         "descriptions (Settings, Activity and records), and remove any AUDIT_MAX_* line in .env that lowers one, then "
-        "start this version once so it removes this marker.")
+        "start DockVault {version} or later once so it removes this marker.")
 
 # The detect query of the upgrade condition: a row when the newest version records less than earlier releases.
 STRICTER_SQL = ("SELECT 1 FROM audit_privacy_policies WHERE version = (SELECT max(version) FROM audit_privacy_policies) "
@@ -98,8 +101,9 @@ def sync(db, levels=None, *, now=None) -> bool:
         db.execute(text(f"DELETE FROM {TABLE} WHERE key = :key"), {"key": KEY})
         return False
     when = now or datetime.now(timezone.utc).replace(tzinfo=None)
-    params = {"key": KEY, "version": required_version(), "reason": REASON.format(introduced=INTRODUCED),
-              "undo": UNDO, "since": when}
+    version = required_version()
+    params = {"key": KEY, "version": version, "reason": REASON.format(introduced=INTRODUCED),
+              "undo": UNDO.format(version=version), "since": when}
     updated = db.execute(text(f"UPDATE {TABLE} SET requires_at_least = :version, reason = :reason, undo = :undo "
                               "WHERE key = :key"), params).rowcount
     if not updated:
