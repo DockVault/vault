@@ -160,8 +160,9 @@ What this does not cover:
   people to set their own password before they set up an encryption key. So is the code itself to an
   administrator who changes where the deployment's own mail goes: who repoints the default sending
   profile at a relay of their own, makes another profile the default, deletes the default (the
-  oldest profile left becomes the default, and with none the older SMTP settings saved with the
-  general settings are used), or changes those settings. Keep the mail settings out of
+  oldest profile left becomes the default) or takes the default mark off it, or changes the older
+  SMTP settings saved with the general settings, which system mail uses while no profile is the
+  default. Keep the mail settings out of
   administrators' hands where you can, and check the audit log for `email_profile_created`,
   `email_profile_updated`, `email_profile_deleted` and `settings_updated` after a change to
   someone's sign-in details. Use a long passphrase.

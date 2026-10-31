@@ -886,9 +886,9 @@ that template's sending profile, and Email Studio refuses any change to it; othe
 every code through a relay of their own, or carry it in a link. **What remains:** an administrator who changes
 where the deployment's own mail goes can read the code as it passes, and use it before the person does: by
 repointing the default sending profile -- its server, or its address -- at a relay they run, by making another
-profile the default or deleting the default (the oldest profile left becomes the default; with none, system mail
-goes through the older SMTP settings saved with the general settings), or by changing those settings while no
-profile exists. Each is in the audit log: `email_profile_created`, `email_profile_updated` and
+profile the default, by deleting the default (the oldest profile left becomes the default) or taking the default
+mark off it, or by changing the older SMTP settings saved with the general settings, which system mail goes through
+while no profile is the default. Each is in the audit log: `email_profile_created`, `email_profile_updated` and
 `email_profile_deleted` for the profiles, `settings_updated` for the general settings. A deployment that relies on
 the hold should keep its mail settings out of administrators' hands where it can, and check those entries after a
 change to someone's sign-in details. Without mail, the server's operator releases an account with

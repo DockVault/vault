@@ -241,6 +241,31 @@ def test_the_passphrase_section_is_the_codes():
     assert "`python dockvault.py accounts --action" in section and "release-key-hold`" in section
 
 
+def test_every_change_that_reroutes_the_release_code_is_named_with_its_audit_entry():
+    """The code goes through the deployment's own mail: the default sending profile, or, while no profile is the
+    default, the older SMTP settings saved with the general settings. The design and the security policy name each
+    change that moves it and the audit entry each leaves, as the code writes them."""
+    import inspect
+    from app.core import email_send
+    resolve = inspect.getsource(email_send.resolve_default_config)
+    assert "p = default_profile(db)" in resolve and "_profile_to_cfg(p) if p else _legacy_cfg(db)" in resolve
+    studio = (ROOT / "app" / "api" / "email_studio_router.py").read_text(encoding="utf-8")
+    server = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    assert "promoted.is_default = True" in studio and "elif payload.is_default is False and p.is_default:" in studio
+    assert 'action="settings_updated"' in server
+    spec = _section(_doc(), "## 13. The passphrase and its envelope (0.34.0)")
+    policy = _section((ROOT / ".github" / "SECURITY.md").read_text(encoding="utf-8"),
+                      "## Zero-knowledge key changes need proof of the key")
+    for action in ("email_profile_created", "email_profile_updated", "email_profile_deleted"):
+        assert f'admin, "{action}"' in studio, action
+    for name, text in (("specification", spec), ("SECURITY.md", policy)):
+        flat = " ".join(text.split())
+        for action in ("email_profile_created", "email_profile_updated", "email_profile_deleted", "settings_updated"):
+            assert f"`{action}`" in flat, (name, action)
+        assert "the oldest profile left becomes the default" in flat, name
+        assert "no profile is the default" in flat, name
+
+
 # What a public document must not carry: a work-item or decision label (capitals then a number, such as
 # "AB12", "AB-1" or "X-Y3"; the format names the document uses are allowed), a path on someone's machine,
 # or a commit trailer.
