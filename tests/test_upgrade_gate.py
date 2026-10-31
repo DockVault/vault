@@ -223,11 +223,59 @@ def test_a_downgrade_takes_a_backup_even_across_a_reversible_hop(tmp_path, monke
     monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.2.0", "the running container"))
     _update(tool, tag="v0.1.0")
     out = capsys.readouterr().out
-    # The matrix describes forward edges only, so a downgrade is undescribed -- and says so, rather
-    # than claiming the matrix asked for the backup.
-    assert "A backup is required: the matrix does not describe this change" in out
+    # The downgrade is described by the upgrade it takes back, and the backup is asked for the
+    # downgrade's own reason, not as for a change the matrix does not describe.
+    assert "A backup is required: this is a downgrade, and there are no down-migrations" in out
+    assert "the matrix does not describe this change" not in out
     assert "the matrix marks this change as needing one" not in out
     assert backups, "the downgrade proceeded without a backup"
+
+
+def test_a_downgrade_is_described_by_the_upgrade_it_takes_back(tmp_path, monkeypatch, capsys):
+    """The matrix marks each upgrade reversible or not. Going back along one it marks reversible is described
+    as such, not as an undescribed and possibly irreversible change."""
+    tool = _deployment(tmp_path, version="0.2.0", matrix=_matrix(backup=False, reversible=True))
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.2.0", "the running container"))
+    _update(tool, tag="v0.1.0", dry_run=True)
+    out = capsys.readouterr().out
+    assert "NOT DESCRIBED" not in out and "possibly irreversible" not in out, out
+    assert "steps        : 1 adjacent release(s) back, taking back the upgrade 0.1.0 -> 0.2.0" in out, out
+    assert "reversible   : yes" in out, out
+    assert "backup       : required (this is a downgrade, and there are no down-migrations)" in out, out
+
+
+def test_a_downgrade_back_across_a_one_way_upgrade_is_described_as_one_and_refused(tmp_path, monkeypatch,
+                                                                                    capsys):
+    tool = _deployment(tmp_path, version="0.2.0", matrix=_matrix(backup=True, reversible=False))
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.2.0", "the running container"))
+    with pytest.raises(SystemExit):
+        _update(tool, tag="v0.1.0", dry_run=True)
+    out = capsys.readouterr().out
+    assert "reversible   : no" in out and "NOT DESCRIBED" not in out, out
+    assert "is a downgrade this deployment cannot take" in out, out
+
+
+@pytest.mark.parametrize("current, target, expected", [
+    ("0.2.0", "0.1.0", True),      # the upgrade 0.1.0 -> 0.2.0, taken back
+    ("0.1.0", "0.2.0", False),     # an upgrade: plan_upgrade_path describes it
+    ("0.2.0", "0.2.0", False),
+    ("0.2.0", "9.9.9", False),     # not in the matrix
+    ("9.9.9", "0.1.0", False),
+])
+def test_only_a_downgrade_the_matrix_has_a_route_for_is_described(current, target, expected):
+    plan = dv.plan_downgrade_path(_matrix(), current, target)
+    assert plan["known"] is expected
+    if not expected:
+        assert plan["requires_backup"] and plan["irreversible"]
+    for junk in (None, [], {"versions": "no"}):
+        assert not dv.plan_downgrade_path(junk, current, target)["known"]
+
+
+def test_a_downgrade_across_a_blocked_upgrade_is_never_reversible():
+    plan = dv.plan_downgrade_path(_matrix(kind="blocked", reversible=True), "0.2.0", "0.1.0")
+    assert plan["known"] and plan["irreversible"]
 
 
 def test_a_one_way_hop_is_summarised_as_needing_the_backup_it_takes(tmp_path, monkeypatch, capsys):
@@ -1229,6 +1277,40 @@ def test_a_line_older_than_every_supported_one_says_it_gets_no_fixes(tmp_path, m
     _list_only(tool)
     assert ("release line    : 0.32 -- no longer receives security fixes (lines before 0.33 are not "
             "supported)") in capsys.readouterr().out
+
+
+def _row(out, tag):
+    return next(line for line in out.splitlines() if line == "    " + tag or line.startswith("    %s " % tag))
+
+
+def test_the_list_names_support_as_the_security_policy_defines_it(tmp_path, monkeypatch, capsys):
+    """End-of-life is the upgrade floor, not the end of support: a release that is not end-of-life is listed as
+    supported only while its line gets security fixes. A line older than every line the matrix lists gets none,
+    and a line past its day has ended; the newest line and a line inside its period are supported."""
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1", today="2027-02-01")
+    _list_only(tool)
+    out = capsys.readouterr().out
+    older = _row(out, "v0.32.6")
+    assert "(no security fixes -- " in older and "supported" not in older, older
+    assert "supported" not in _row(out, "v0.33.2") and "ended" not in _row(out, "v0.33.2"), out
+
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1", today="2027-06-11")
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "(security fixes ended on 2027-06-10)" in _row(out, "v0.33.2"), out
+    assert "(security fixes ended on 2027-06-10 -- " in _row(out, "v0.33.1"), out
+    assert "ended" not in _row(out, "v0.34.1") and "no security fixes" not in _row(out, "v0.34.1"), out
+
+
+def test_support_line_reads_the_release_lines():
+    m = _two_lines()
+    assert dv.support_line(m, "0.32.6", today="2027-02-01").startswith("no security fixes -- ")
+    assert dv.support_line(m, "0.33.2", today="2027-02-01") == "supported"
+    assert dv.support_line(m, "0.33.2", today="2027-06-10") == "supported"          # its last day is inside
+    assert dv.support_line(m, "0.33.2", today="2027-06-11") == "security fixes ended on 2027-06-10"
+    assert dv.support_line(m, "0.34.1", today="2099-01-01") == "supported"          # the newest line
+    m.pop("lines")
+    assert dv.support_line(m, "0.32.6", today="2027-02-01").startswith("supported -- ")  # the matrix does not say
 
 
 def test_only_a_published_release_is_named_as_the_newest_of_the_line(tmp_path, monkeypatch, capsys):

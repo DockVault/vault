@@ -504,7 +504,9 @@ description is not something a release might forget to write.
 `dockvault.py update` reads it. It tells you what the hop involves before doing anything, takes a
 backup when one is required, and, run interactively, asks you to type an acknowledgement for a change
 that cannot be rolled back. `--dry-run` reports the plan and changes nothing. An upgrade it cannot find a
-description for is treated as the riskiest case rather than assumed safe.
+description for is treated as the riskiest case rather than assumed safe. A downgrade is described by the
+upgrade it takes back: along upgrades the matrix marks reversible it says so, and it is refused across one
+it marks irreversible; it always takes a backup first, as there are no down-migrations.
 
 ### Support lifecycle and the minimum supported version
 
@@ -512,7 +514,9 @@ Each version in the matrix also declares a support lifecycle: whether it is **en
 it is **secure** (free of known unpatched vulnerabilities), and — for an end-of-life version kept on
 extended support — the dates its code fixes and its (usually longer) security-only support run until.
 `dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
-one, and warns before moving to a version with known unpatched vulnerabilities.
+one, and warns before moving to a version with known unpatched vulnerabilities. A release it lists is
+called supported only while its line still receives security fixes, as `.github/SECURITY.md` defines
+support; one on a line that does not says so.
 
 End-of-life is not the end of security support. It marks the releases an install can no longer move
 to or from in place (see the minimum supported version below). Which release lines still receive

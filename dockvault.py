@@ -2404,8 +2404,8 @@ def plan_upgrade_path(matrix, current, target):
         return unknown
     if _semver_key(target) < _semver_key(current):
         # A downgrade. The matrix describes forward edges only, and reversing one is not the same
-        # claim, so this is deliberately not classified from it here -- the host tool asks
-        # `downgrade_refusal` separately when it needs the reverse verdict.
+        # claim, so this is deliberately not classified from it here -- a downgrade is described by
+        # `plan_downgrade_path`, and refused by `downgrade_refusal`, from each edge's `reversible`.
         return unknown
 
     steps = _walk_edges(matrix, current, target)
@@ -2422,6 +2422,44 @@ def plan_upgrade_path(matrix, current, target):
         "blocked": next((e for e in steps if e.get("kind") == "blocked"), None),
         "conditions": [c for e in steps for c in (e.get("conditions") or [])],
         "known": True,
+    }
+
+
+def plan_downgrade_path(matrix, current, target):
+    """What a downgrade from `current` to `target` involves, as the matrix describes it, in the shape
+    plan_upgrade_path returns.
+
+    The matrix declares each upgrade between adjacent releases, and on each one whether it can be taken
+    back (`reversible`). So a downgrade is described by the upgrade route from `target` up to `current`:
+    reversible when every edge on it is, never across a blocked one (an upgrade that must not be taken has
+    no reverse). It is one recreate, so it has no legs, and the conditions on the way up are the upgrade's,
+    not carried. Whether it needs a backup is the downgrade's own rule (backup_reason): the backup flags on
+    the way up are about the upgrade. Unknown, as before, when that route is not in the matrix, or when this
+    is not a downgrade."""
+    unknown = {"steps": [], "legs": [], "requires_backup": True, "irreversible": True,
+               "blocked": None, "conditions": [], "known": False}
+    if not isinstance(matrix, dict):
+        return unknown
+    versions = matrix.get("versions") or {}
+    cur = (current or "").lstrip("vV")
+    tgt = (target or "").lstrip("vV")
+    try:
+        if cur not in versions or tgt not in versions or _semver_key(tgt) >= _semver_key(cur):
+            return unknown
+    except (TypeError, ValueError):
+        return unknown
+    route = _walk_edges(matrix, tgt, cur)
+    if not route:
+        return unknown
+    return {
+        "steps": route,
+        "legs": [],
+        "requires_backup": False,
+        "irreversible": any(not e.get("reversible", True) or e.get("kind") == "blocked" for e in route),
+        "blocked": None,
+        "conditions": [],
+        "known": True,
+        "downgrade": True,
     }
 
 
@@ -2518,8 +2556,9 @@ def backup_reason(plan, down=False):
     ONE rule, read by both the summary the operator sees and the gate that enforces it, so the tool
     can never print "backup: not required" and then demand one. A change needs a backup when the
     matrix does not describe it, when the matrix says so, when it cannot be rolled back, or when it
-    is a downgrade, since there are no down-migrations. (The matrix describes forward edges only, so
-    a downgrade always arrives here undescribed; the downgrade test is the backstop behind that.)
+    is a downgrade, since there are no down-migrations. (A downgrade arrives here described by the
+    upgrade it takes back, plan_downgrade_path, or undescribed when the matrix has no such route; it
+    needs a backup either way.)
     """
     if not plan.get("known", True):
         return "the matrix does not describe this change"
@@ -2844,13 +2883,18 @@ def safer_alternative(matrix, target, candidates):
     return min(better)[-1] if better else None
 
 
-def support_line(matrix, version):
+def support_line(matrix, version, today=None):
     """A one-line human summary of a version's lifecycle, or '' when nothing is stated. Names the
     end-of-life state, any extended-support tail dates, and whether the version is insecure -- and,
     when the matrix lists them, how many known vulnerabilities it has by severity, and the releases
     that fix them. The titles and details are for the chosen version only (describe_vulnerabilities):
     one line per release has no room for them. Every matrix-sourced fragment is escape-stripped
-    before it reaches a terminal."""
+    before it reaches a terminal.
+
+    A version that is not end-of-life is "supported" only while its release line receives security
+    fixes, as .github/SECURITY.md defines support and the matrix's `lines` map states it: end-of-life
+    is the upgrade floor, not the end of support. A line whose fixes have ended, or one older than every
+    line the map lists, reads "no security fixes" (or the day they ended)."""
     s = version_support(matrix, version)
     if not s:
         return ""
@@ -2862,7 +2906,13 @@ def support_line(matrix, version):
             parts.append("security support until %s" % clean_matrix_text(s["security_support"]))
         head = "; ".join(parts)
     else:
-        head = "supported"
+        line = line_support_note(matrix, version, today=today)
+        if line.startswith("security fixes ended"):
+            head = clean_matrix_text(line)
+        elif line.startswith("no longer"):
+            head = "no security fixes"
+        else:
+            head = "supported"
     if s.get("secure") is False:
         vulns = version_vulnerabilities(matrix, version)
         if not vulns:
@@ -6047,7 +6097,11 @@ class DockVault:
                 "not a safe one -- read the release notes before continuing."
                 % (current, tag), "yellow"))
             return
-        print("    steps        : %d adjacent release(s)" % len(plan["steps"]))
+        if plan.get("downgrade"):
+            print("    steps        : %d adjacent release(s) back, taking back the upgrade %s -> %s"
+                  % (len(plan["steps"]), tag.lstrip("vV"), current.lstrip("vV")))
+        else:
+            print("    steps        : %d adjacent release(s)" % len(plan["steps"]))
         print("    reversible   : %s" % ("no" if plan["irreversible"] else "yes"))
         why = backup_reason(plan, down)
         print("    backup       : %s" % (("required (%s)" % why) if why else "not required"))
@@ -6189,7 +6243,8 @@ class DockVault:
         print(pal.paint("  to start (a downgrade especially).", "yellow"))
 
         matrix, matrix_source = fetch_describing_matrix(tag, current, root=self.root)
-        plan = plan_upgrade_path(matrix, current, tag)
+        # A downgrade is described by the upgrade it takes back (plan_downgrade_path), not left undescribed.
+        plan = plan_downgrade_path(matrix, current, tag) if down else plan_upgrade_path(matrix, current, tag)
 
         # A hop planned from the FILE is planned from a guess. The pull path never rewrites
         # VERSION, so a deployment installed from source at 0.6.0 and pull-upgraded since still
