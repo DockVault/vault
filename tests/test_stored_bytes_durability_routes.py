@@ -100,7 +100,12 @@ def test_a_file_row_is_committed_only_after_the_upload_context_has_closed(handle
               and any(isinstance(item.context_expr, ast.Name) and item.context_expr.id == "stream_ctx"
                       for item in w.items)]
     assert len(blocks) == 1, f"{handler}: expected one `with stream_ctx` block, found {len(blocks)}"
-    final = _one(node, "finalize_streaming_upload", "vault_service")
+    # Called, or handed to off_loop.run_to_end, which calls it off the event loop and waits for it.
+    finals = _calls(node, "finalize_streaming_upload", "vault_service") + [
+        c for c in _calls(node, "run_to_end", "off_loop")
+        if c.args and ast.unparse(c.args[0]) == "vault_service.finalize_streaming_upload"]
+    assert len(finals) == 1, f"{handler}: expected one finalize, found {len(finals)}"
+    final = finals[0]
     assert final.lineno > blocks[0].end_lineno, (
         f"{handler}: the row is committed at line {final.lineno}, inside the upload context that "
         f"ends at line {blocks[0].end_lineno}, before the file is synced")

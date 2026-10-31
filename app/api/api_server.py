@@ -79,6 +79,7 @@ from app.core.upload_chunk_crypto import (
 )
 from app.core.upload_attempt_header import HeadPeek, header_token_mismatch
 from app.core import durable_write
+from app.core import off_loop
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -7372,17 +7373,22 @@ async def upload_brand_asset(
     # the slot's old image removed. A write or a save that fails leaves the old image in place, and
     # still shown, instead of a setting that names a file already gone.
     tmp = dest + ".tmp"
-    try:
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-            # The content is on the disk before the rename, and the name after it, before the brand row
-            # points at the file: a power cut must not leave the row naming an empty or missing image.
-            durable_write.sync_file(fh)
-        os.replace(tmp, dest)  # atomic publish
-        durable_write.sync_directory(BRAND_ASSET_DIR)
-        written = True
-    except OSError:
-        written = False
+
+    def _write_image():
+        # Off the event loop, to its end (app/core/off_loop.py).
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                # The content is on the disk before the rename, and the name after it, before the brand row
+                # points at the file: a power cut must not leave the row naming an empty or missing image.
+                durable_write.sync_file(fh)
+            os.replace(tmp, dest)  # atomic publish
+            durable_write.sync_directory(BRAND_ASSET_DIR)
+            return True
+        except OSError:
+            return False
+
+    written = await off_loop.run_to_end(_write_image)
     if written:
         try:
             _update_brand_row(db, set_map={f: url for f in fields})
@@ -15582,14 +15588,18 @@ async def receiver_complete_upload(
 
         file_info = None
 
-        def _remove_orphan_blob():
+        async def _remove_orphan_blob():
+            # Off the event loop: a file is overwritten before it is removed.
             try:
                 if file_info and file_info.get('storage_path'):
-                    vault_service._remove_blobs([file_info['storage_path']])
+                    await off_loop.run_to_end(vault_service._remove_blobs, [file_info['storage_path']])
             except Exception:
                 pass
 
-        try:
+        # The assembly and the row run off the event loop, each to its end (app/core/off_loop.py), as the
+        # signed-in upload's do.
+        def _assemble():
+            nonlocal file_info
             file_info, stream_ctx = vault_service.upload_file_streaming(
                 vault_id=vault.id, file_name=fname, user=owner, folder_id=None,
                 mime_type=session.mime_type, file_id=None)
@@ -15598,9 +15608,9 @@ async def receiver_complete_upload(
                     for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
                         if buf:
                             ctx.write_chunk(buf)
-                final_checksum = ctx.get_checksum()
-                final_size = ctx.get_total_size()
+                return ctx.get_checksum(), ctx.get_total_size()
 
+        def _record(final_checksum, final_size):
             if final_size != session.total_size:
                 raise HTTPException(status_code=409, detail={
                     "code": "size_mismatch",
@@ -15614,11 +15624,15 @@ async def receiver_complete_upload(
 
             # An anonymous drop never OVERWRITES an existing file (no delete authority): a same-name
             # clash is a clean 409, not a silent replace.
-            file = vault_service.finalize_streaming_upload(
+            return vault_service.finalize_streaming_upload(
                 file_info=file_info, total_size=final_size, checksum=final_checksum,
                 replace_same_name=False)
+
+        try:
+            final_checksum, final_size = await off_loop.run_to_end(_assemble)
+            file = await off_loop.run_to_end(_record, final_checksum, final_size)
         except HTTPException:
-            _remove_orphan_blob()
+            await _remove_orphan_blob()
             _receiver_release_bytes(db, receiver.id, session.total_size)
             try:
                 db.delete(session); db.commit()
@@ -15627,7 +15641,7 @@ async def receiver_complete_upload(
             shutil.rmtree(sdir, ignore_errors=True)
             raise
         except DuplicateNameError as e:
-            _remove_orphan_blob()
+            await _remove_orphan_blob()
             _receiver_release_bytes(db, receiver.id, session.total_size)
             try:
                 db.delete(session); db.commit()
@@ -15636,7 +15650,7 @@ async def receiver_complete_upload(
             shutil.rmtree(sdir, ignore_errors=True)
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except Exception as e:
-            _remove_orphan_blob()
+            await _remove_orphan_blob()
             _receiver_release_bytes(db, receiver.id, session.total_size)
             fail_chunk_session(db, session, sdir, e)
             raise HTTPException(status_code=500, detail="Failed to finalize the upload.")
@@ -20163,8 +20177,9 @@ async def upload_file(
                 # Same-name policy = replace; reject up front if the uploader can't.
                 _reject_unreplaceable_upload(db, vault_id, folder_uuid, upload_file.filename, current_user)
 
-                # Start streaming upload
-                file_info, stream_ctx = vault_service.upload_file_streaming(
+                # Start streaming upload (it may make and sync the folder's directory: off the event loop)
+                file_info, stream_ctx = await off_loop.run_to_end(
+                    vault_service.upload_file_streaming,
                     vault_id=vault_id,
                     file_name=upload_file.filename,
                     user=current_user,
@@ -20272,8 +20287,8 @@ async def upload_file(
                                 detail=f"File '{upload_file.filename}' exceeds the maximum size of {_max_upload_bytes // (1024 * 1024)}MB",
                             )
 
-                        # Write and encrypt chunk immediately
-                        ctx.write_chunk(chunk)
+                        # Write and encrypt chunk immediately, off the event loop
+                        await off_loop.run_to_end(ctx.write_chunk, chunk)
                         bytes_uploaded += len(chunk)
                         
                         # Broadcast progress every 5MB
@@ -20328,6 +20343,10 @@ async def upload_file(
                             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                             detail="Upload rejected: Vault size limit would be exceeded")
 
+                    # The file's bytes go to the disk off the event loop, so other requests are answered
+                    # meanwhile; the stream's clean exit then syncs only its last record, and its name.
+                    await off_loop.run_to_end(ctx.sync_written)
+
                 # Broadcast final progress (100%)
                 broadcast_event({
                     "event": {
@@ -20352,7 +20371,9 @@ async def upload_file(
                 # on the principal's file.delete capability — matching the pre-check — so a
                 # clash that appears after the pre-check can't let an upload-only cred
                 # silently overwrite (it surfaces as a 409 via the unique index instead).
-                file = vault_service.finalize_streaming_upload(
+                # Off the event loop, to its end: a replaced file is overwritten before it goes.
+                file = await off_loop.run_to_end(
+                    vault_service.finalize_streaming_upload,
                     file_info=file_info,
                     total_size=final_size,
                     checksum=final_checksum,
@@ -21803,14 +21824,20 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     # chunk dirs, never the final blob). Best-effort remove it on ANY failure. No-op if never assembled.
     file_info = None
 
-    def _remove_orphan_blob():
+    async def _remove_orphan_blob():
+        # Off the event loop: a file is overwritten before it is removed.
         try:
             if file_info and file_info.get('storage_path'):
-                vault_service._remove_blobs([file_info['storage_path']])
+                await off_loop.run_to_end(vault_service._remove_blobs, [file_info['storage_path']])
         except Exception:
             pass
 
-    try:
+    # The assembly and the row run off the event loop (app/core/off_loop.py), each to its end: reading the
+    # staged chunks, encrypting them into the file and syncing it took seconds per GiB, and every other
+    # request waited for it. No row lock is held across a wait: the zero-knowledge vault's lock is taken,
+    # and committed, inside _record.
+    def _assemble():
+        nonlocal file_info
         file_info, stream_ctx = vault_service.upload_file_streaming(
             vault_id=vault_id,
             file_name=session.filename if not is_zk else '(encrypted)',
@@ -21827,9 +21854,9 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
                 for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
                     if buf:
                         ctx.write_chunk(buf)
-            final_checksum = ctx.get_checksum()
-            final_size = ctx.get_total_size()
+            return ctx.get_checksum(), ctx.get_total_size()
 
+    def _record(final_checksum, final_size):
         # A short delivery must not commit. Every other size check in this path is a one-sided
         # upper bound, so a session that declared N bytes and delivered fewer was assembled and
         # stored without complaint.
@@ -21905,7 +21932,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
                 raise HTTPException(status_code=409, detail=_stale)
             zk_kv = current_epoch
 
-        file = vault_service.finalize_streaming_upload(
+        return vault_service.finalize_streaming_upload(
             file_info=file_info, total_size=final_size, checksum=final_checksum,
             zk_key_version=zk_kv,
             # ZK: stamp the browser-encrypted name/MIME + client blind index onto the File
@@ -21919,11 +21946,15 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
             # temp-cred cap — a write-but-no-delete member must not overwrite via upload.
             replace_same_name=_principal_can_replace_file(db, current_user, vault_id),
         )
+
+    try:
+        final_checksum, final_size = await off_loop.run_to_end(_assemble)
+        file = await off_loop.run_to_end(_record, final_checksum, final_size)
     except HTTPException:
-        _remove_orphan_blob()
+        await _remove_orphan_blob()
         raise
     except DuplicateNameError as e:
-        _remove_orphan_blob()   # (finalize already removed it on this path; no-op safety net)
+        await _remove_orphan_blob()   # (finalize already removed it on this path; no-op safety net)
         # Lost a same-name replace race against the name unique index — a clean 409. finalize
         # already rolled back, but the session ROW survives intact (status='active') and for a
         # Standard vault still holds the plaintext filename/MIME as working state; the chunk
@@ -21938,7 +21969,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         _release_web_upload_name(vault_id, _lock_folders, _lock_name, _lock_session)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
-        _remove_orphan_blob()
+        await _remove_orphan_blob()
         # A client-supplied file id that collided (a fresh-UUID race that slipped past the
         # pre-check) -> a clean 409, not a 500. Any other ValueError keeps the generic handling.
         if "id already in use" in str(e):
@@ -21953,7 +21984,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # the session/blob for the TTL cleanup rather than force-failing it here.
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except Exception as e:
-        _remove_orphan_blob()
+        await _remove_orphan_blob()
         # Genuine finalize failure: fail the session and clear its plaintext name/MIME + staged
         # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
         fail_chunk_session(db, session, sdir, e)
@@ -23361,8 +23392,9 @@ async def copy_file_endpoint(
         # the DESTINATION vault — the client flag alone must not let an upload-only principal destroy
         # another user's file (same rule as every other replace path, _principal_can_replace_file).
         replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
-        new_file = vault_service.copy_file(
-            file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+        # Off the event loop, to its end: the copy reads, re-encrypts and syncs the whole file.
+        new_file = await off_loop.run_to_end(
+            vault_service.copy_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
             source_file_password=x_file_password, replace_same_name=replace)
         audit_logger.log_action(
             action='file_copy', status='success', user=current_user, resource_type='file',
@@ -23413,8 +23445,10 @@ async def move_file_endpoint(
         # Same rule as copy: overwriting a same-name file in the destination needs delete authority
         # there, not just the client flag.
         replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
-        new_file = vault_service.move_file(
-            file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+        # Off the event loop, to its end: a move to another vault reads, re-encrypts and syncs the whole
+        # file, then removes the source.
+        new_file = await off_loop.run_to_end(
+            vault_service.move_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
             source_file_password=x_file_password, replace_same_name=replace)
         audit_logger.log_action(
             action='file_move', status='success', user=current_user, resource_type='file',
@@ -23505,8 +23539,9 @@ async def copy_folder_endpoint(
         # the read + write caps too (all within the one vault).
         require_cap(current_user, vault_id, "file.download")
         require_cap(current_user, vault_id, "file.upload")
-        folder = vault_service.copy_folder(
-            folder_id, current_user, body.dest_vault_id, body.dest_parent_folder_id)
+        # Off the event loop, to its end: every file in the tree is read, re-encrypted and synced.
+        folder = await off_loop.run_to_end(
+            vault_service.copy_folder, folder_id, current_user, body.dest_vault_id, body.dest_parent_folder_id)
         audit_logger.log_action(
             action='folder_copy', status='success', user=current_user, resource_type='folder',
             resource_id=str(folder_id),

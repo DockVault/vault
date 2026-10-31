@@ -39,7 +39,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # what they write; the durable_write calls that function makes).
 SYNCED = {
     # A brand image: written to a temporary name, synced, renamed into place, its directory synced.
-    ("app/api/api_server.py", "upload_brand_asset"): (
+    # (Written in a function of its own, run off the event loop; the brand directory made before it.)
+    ("app/api/api_server.py", "upload_brand_asset._write_image"): (
         ["open", "os.replace"], "upload_brand_asset", {"make_directories", "sync_file", "sync_directory"}),
     # A chunk sealed into its .part file (seal_stream_to_file syncs it), renamed into place, the directory
     # synced before the session row counts it.
@@ -541,14 +542,18 @@ def _functions(source: str) -> dict:
 
 
 def durable_calls(source: str, function: str) -> set:
-    """The durable_write functions ``function`` in ``source`` calls, through the module or imported by name."""
+    """The durable_write functions ``function`` in ``source`` calls, through the module or imported by name, or hands
+    to app/core/off_loop.py's run_to_end, which calls it off the event loop and waits for it."""
     tree = ast.parse(source)
     imports = _imports(tree)
     node = _functions(source)[function]
     out = set()
     for call in ast.walk(node):
         if isinstance(call, ast.Call):
-            name = _qualified(call.func, imports)
+            callee = call.func
+            if _qualified(callee, imports) in ("app.core.off_loop.run_to_end", "off_loop.run_to_end") and call.args:
+                callee = call.args[0]
+            name = _qualified(callee, imports)
             if name.startswith("app.core.durable_write.") or name.startswith("durable_write."):
                 out.add(name.rsplit(".", 1)[1])
     return out
@@ -877,7 +882,7 @@ def test_a_new_writer_in_no_list_fails_and_so_does_a_listed_one_that_is_gone():
     added[("app/services/vault_service.py", "VaultService.new_writer")] = ["open"]
     assert new_problems(added) == {("app/services/vault_service.py", "VaultService.new_writer"): {
         "found": ["open"], "listed": []}}
-    brand = ("app/api/api_server.py", "upload_brand_asset")
+    brand = ("app/api/api_server.py", "upload_brand_asset._write_image")
     another = dict(found)
     another[brand] = found[brand] + ["shutil.copy"]
     assert list(new_problems(another)) == [brand]
@@ -902,6 +907,14 @@ def test_a_durable_call_imported_by_name_counts():
               "    from app.core.durable_write import make_directories\n"
               "    make_directories(p)\n")
     assert durable_calls(source, "f") == {"make_directories"}
+
+
+def test_a_durable_call_run_off_the_loop_counts_and_one_only_named_does_not():
+    source = ("from app.core import durable_write, off_loop\n"
+              "async def f(h):\n"
+              "    await off_loop.run_to_end(durable_write.sync_file, h)\n"
+              "    print(durable_write.sync_directory)\n")
+    assert durable_calls(source, "f") == {"sync_file"}
 
 
 # --------------------------------------------------------------------------- the application

@@ -1,0 +1,65 @@
+"""Blocking work on stored bytes, run off the web server's event loop, and always to its end.
+
+The web server is one process with one event loop, and its handlers are async: blocking work inside a
+handler holds every other request until it ends. Finishing an upload is such work. Its staged chunks are
+read, encrypted and written into the file, and the file is forced to the disk; on a 1 GiB file that took 8
+to 10 seconds, and every other request (the health check, a listing, a sign-in) waited that long. Every
+step that finishes stored bytes inside an async handler runs here instead, in a thread of this module's
+own pool: an upload's encryption, assembly, close and sync, the row that lists its file, a copy or a move
+between vaults, and the removal of a file that never got its row.
+
+``run_to_end(fn, *args, **kwargs)`` runs ``fn`` in that pool, with the caller's context variables, and
+returns what it returns or raises what it raises. Once called, the work runs to its end and the request
+waits for it:
+
+- a cancellation of the request while the work runs (the server stopping) does not abandon it: the work
+  goes on, the request waits for its end, and the cancellation is passed on after it. So what one call
+  does, a file forced to the disk and the row that lists it committed, happens whole or not at all, and
+  nothing the request does next (its error handling, closing its database session) runs beside it;
+- a cancellation that was already asked for when the call is made does not stop it either; it is passed
+  on at the request's next pause after the call.
+
+Two rules for what is run here, which every caller keeps:
+
+- ``fn`` must not need the event loop (no awaiting, no loop-bound objects);
+- no database row lock is held across a call. A lock taken on the loop and held while the request waits
+  here would let another request on the loop wait for that lock synchronously, stopping the loop; and a
+  lock released only after the call would then never be released. Work that takes a lock takes it, and
+  commits, inside ``fn``.
+
+The pool is this module's own: not the event loop's default executor, which the /ws/monitor poller parks
+threads in, and not the thread pool Starlette runs synchronous endpoints and dependencies in, which work
+this long would take from every other request. More calls than it has threads wait their turn there, off
+the loop.
+"""
+import asyncio
+import concurrent.futures
+import contextvars
+import functools
+
+import anyio
+
+# Uploads that are finishing at once are bounded by the transfer ceiling (MAX_CONCURRENT_TRANSFERS, 16 by
+# default, and a quarter of it for public upload links); a chunk's sync is short. Room for both, and for
+# copies and moves between vaults, which are not admitted on that ceiling.
+WORKERS = 32
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="stored-bytes")
+
+
+async def run_to_end(fn, /, *args, **kwargs):
+    """Run ``fn(*args, **kwargs)`` in this module's thread pool and return its result; see the module."""
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(_pool, functools.partial(contextvars.copy_context().run, fn, *args, **kwargs))
+    cancelled = None
+    # Shielded from the cancellation the web framework asks for, which it would otherwise ask again at every
+    # pause until the request ended. A cancellation of the task itself still arrives, once: it is kept, and
+    # passed on once the work has ended. asyncio.wait never cancels the work, and never raises its error.
+    with anyio.CancelScope(shield=True):
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+    return future.result()
