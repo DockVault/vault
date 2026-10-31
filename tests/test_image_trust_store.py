@@ -14,6 +14,13 @@ the eight keys (verify code 28, certificate rejected), and its trust store no lo
 stack, with the two public certificates in tests/fixtures/tls/compromised-intermediate-chain.json: it
 rebuilds the intermediate's key, makes a server certificate with it, and checks that the default
 context and app.core.email_send.smtp_send both refuse it, with either code, before anything is sent.
+
+The database driver (psycopg2's libpq) has a TLS library of its own, with no list of keys to refuse,
+and a vault told to check its database's certificate against the system trust store
+(sslrootcert=system) uses the image's trust store there. Up to 0.33.5 it accepted the chain and handed
+the database password to whoever presented it; only the trust store stops it now. So the check also
+connects the driver to a stand-in database server presenting the chain, and, as a control, to one
+whose certificate comes from an authority named by file, which the driver must accept.
 """
 import json
 import os
@@ -104,6 +111,90 @@ with MailServer(chain) as mail:
     except email_send.EmailSendError as error:
         result["smtp_send"] = {"sent": False, "refusal": refusal(error)}
 result["sessions"] = mail.sessions
+
+# The database driver: psycopg2's libpq, with its own TLS library, against a stand-in PostgreSQL server
+# that presents a chain, then asks for the password in clear text as a real server may. Told
+# sslrootcert=system, libpq checks the server against the image's trust store.
+import struct
+import psycopg2
+
+def recv_exact(sock, count):
+    data = b""
+    while len(data) < count:
+        part = sock.recv(count - len(data))
+        if not part:
+            raise OSError("closed")
+        data += part
+    return data
+
+def postgres_server(chain_file):
+    seen = {"handshake": None, "startup": False, "password": None}
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(chain_file)
+    sock = socket.create_server(("127.0.0.1", 0))
+    sock.settimeout(30)
+
+    def serve():
+        try:
+            conn, _ = sock.accept()
+        except OSError:
+            return
+        try:
+            conn.settimeout(30)
+            length, code = struct.unpack("!II", recv_exact(conn, 8))
+            if (length, code) != (8, 80877103):
+                seen["handshake"] = "no TLS request"
+                return
+            conn.sendall(b"S")
+            try:
+                tls = context.wrap_socket(conn, server_side=True)
+            except (ssl.SSLError, OSError):
+                seen["handshake"] = "refused"
+                return
+            seen["handshake"] = "ok"
+            size = struct.unpack("!I", recv_exact(tls, 4))[0]
+            recv_exact(tls, size - 4)
+            seen["startup"] = True
+            tls.sendall(b"R" + struct.pack("!II", 8, 3))
+            kind = recv_exact(tls, 1)
+            size = struct.unpack("!I", recv_exact(tls, 4))[0]
+            body = recv_exact(tls, size - 4)
+            if kind == b"p":
+                seen["password"] = body.rstrip(bytes(1)).decode(errors="replace")
+            text = b"SFATAL" + bytes(1) + b"C28P01" + bytes(1) + b"Mstand-in server" + bytes(2)
+            tls.sendall(b"E" + struct.pack("!I", len(text) + 4) + text)
+        except (OSError, struct.error):
+            pass
+        finally:
+            conn.close()
+            sock.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return sock.getsockname()[1], seen, thread
+
+def connect_database(chain_file, root):
+    port, seen, thread = postgres_server(chain_file)
+    try:
+        psycopg2.connect(host="localhost", hostaddr="127.0.0.1", port=port, user="vault_user",
+                         password="database-password-for-this-test", dbname="vault_db",
+                         sslmode="verify-full", sslrootcert=root, gssencmode="disable",
+                         connect_timeout=15)
+        error = None
+    except psycopg2.OperationalError as exc:
+        error = " ".join(str(exc).split())[:300]
+    thread.join(20)
+    return dict(seen, error=error)
+
+control_authority = authority("Test Database Authority")
+control_cert, control_key = server_certificate(["localhost", "127.0.0.1"], issuer=control_authority)
+control_dir = tempfile.mkdtemp()
+control_root = os.path.join(control_dir, "root.pem")
+with open(control_root, "wb") as handle:
+    handle.write(certificate_pem(control_authority[0]))
+control_chain = write_chain(control_dir, control_key, control_cert)
+result["database_control"] = connect_database(control_chain, control_root)
+result["database"] = connect_database(chain, "system")
 print(json.dumps(result))
 """
 
@@ -161,3 +252,17 @@ def test_the_mail_sender_refuses_it_before_sending_the_password_or_the_message(i
     assert result["sessions"], result
     for session in result["sessions"]:
         assert session["tls"] == "refused" and session["auth"] is None and session["message"] is None, result
+
+
+@pytest.mark.docker
+def test_the_database_driver_refuses_it_from_the_system_trust_store(in_the_image):
+    control = in_the_image["database_control"]
+    # The same driver, server and password exchange with a certificate from an authority named by file:
+    # the driver gets through and hands over the password, so a refusal below is the certificate's.
+    assert control["handshake"] == "ok", control
+    assert control["password"] == "database-password-for-this-test", control
+    database = in_the_image["database"]
+    assert database["handshake"] == "refused", (
+        f"the database driver accepted the forged chain from the system trust store: {database}")
+    assert database["startup"] is False and database["password"] is None, database
+    assert "certificate verify failed" in (database["error"] or ""), database
