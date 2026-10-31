@@ -4298,9 +4298,11 @@ async def send_test_email(
 ):
     """Send a test email to the requesting admin using the stored SMTP settings, to verify the
     Settings -> Email configuration end to end. Fails cleanly (not a 500) when SMTP isn't
-    configured, and never echoes the stored SMTP password."""
+    configured, and never echoes the stored SMTP password. The server's TLS certificate is checked
+    exactly as system mail checks it for these settings, before the password is sent."""
     import smtplib
     from email.message import EmailMessage
+    from app.core import email_send as _email_send
     from app.core.rate_limiter import rate_limiter as _rl
     from app.core.models import SystemSetting
 
@@ -4347,15 +4349,21 @@ async def send_test_email(
             "If you received it, outbound email delivery is working."
         )
 
+        # Verify the server's certificate on implicit TLS (465) and on STARTTLS, with the context
+        # system mail uses for these same stored settings: smtplib's own default verifies nothing,
+        # so without it anyone able to intercept the connection could present any certificate and
+        # receive the SMTP username and password. The stored settings carry no opt-out of the check
+        # (only a sending profile can allow an unverified certificate), so it always applies here.
+        tls_ctx = _email_send._smtp_tls_context(_email_send._legacy_cfg(db))
         if port == 465:
-            server = smtplib.SMTP_SSL(host, port, timeout=15)
+            server = smtplib.SMTP_SSL(host, port, timeout=15, context=tls_ctx)
         else:
             server = smtplib.SMTP(host, port, timeout=15)
         with server:
             server.ehlo()
             encrypted = port == 465
             if port != 465 and server.has_extn("starttls"):
-                server.starttls()
+                server.starttls(context=tls_ctx)
                 server.ehlo()
                 encrypted = True
             if username and not encrypted:
