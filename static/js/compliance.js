@@ -176,8 +176,17 @@
 
     async function unlock(vaultId) {
         if (typeof showPrompt !== 'function') return;
-        const password = await showPrompt('Give this vault\'s password to see the names of the files opened in it.',
-            'Unlock ' + vaultName(vaultId), { password: true, placeholder: 'Vault password' });
+        // The prompt is asked from within Access to my vaults: lifted above that dialog while it asks, as the
+        // step-up is above any dialog, or it opens behind it and its buttons cannot be reached.
+        const prompt = document.getElementById('confirm-modal');
+        if (prompt) prompt.style.zIndex = '1100';
+        let password;
+        try {
+            password = await showPrompt('Give this vault\'s password to see the names of the files opened in it.',
+                'Unlock ' + vaultName(vaultId), { password: true, placeholder: 'Vault password' });
+        } finally {
+            if (prompt) prompt.style.zIndex = '';
+        }
         if (!password) return;
         try {
             const out = await call('/me/compliance-access/vaults/' + encodeURIComponent(vaultId) + '/unlock',
