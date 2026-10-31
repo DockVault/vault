@@ -39,7 +39,11 @@ def _naive(dt):
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-NOW = datetime.now(timezone.utc)
+def _now():
+    """The time a case builds its rows at. Read when the case runs, not once when the module is imported: a
+    lane can reach a case long after collection, and a signed-in temporary credential's last activity older
+    than its idle grace (65 minutes) is one get_current_user refuses."""
+    return datetime.now(timezone.utc)
 
 
 @pytest.fixture
@@ -81,14 +85,15 @@ def _regular(db, user, **session):
 
 def _temporary(db, user, session=None, **cred):
     token = secrets.token_urlsafe(32)
-    fields = {"expires_at": _naive(NOW + timedelta(hours=1)), "deactivate_at": _naive(NOW + timedelta(hours=1)),
+    now = _now()
+    fields = {"expires_at": _naive(now + timedelta(hours=1)), "deactivate_at": _naive(now + timedelta(hours=1)),
               "is_active": True}
     fields.update(cred)
     c = TemporaryCredential(id=uuid.uuid4(), user_id=user.id, temp_username=f"t_{uuid.uuid4().hex[:8]}",
                             credential_hash="x", **fields)
     db.add(c)
     db.commit()
-    row = {"is_active": True, "last_activity": _naive(NOW)}
+    row = {"is_active": True, "last_activity": _naive(now)}
     row.update(session or {})
     db.add(ActiveSession(session_token=hash_session_token(token), user_id=user.id, temp_credential_id=c.id,
                          ip_address="198.51.100.7", revoked=False, **row))
@@ -161,7 +166,7 @@ def _(db):
 
 @case("account locked automatically after wrong passwords")
 def _(db):
-    return _regular(db, _account(db, is_locked=True, locked_until=_naive(NOW + timedelta(minutes=15)))), True
+    return _regular(db, _account(db, is_locked=True, locked_until=_naive(_now() + timedelta(minutes=15)))), True
 
 
 @case("account deleted")
@@ -185,7 +190,7 @@ def _(db):
 
 @case("temporary credential, idle past the grace")
 def _(db):
-    return _temporary(db, _account(db), session={"last_activity": _naive(NOW - timedelta(minutes=66))})[0], False
+    return _temporary(db, _account(db), session={"last_activity": _naive(_now() - timedelta(minutes=66))})[0], False
 
 
 @case("temporary credential, switched off")
@@ -195,17 +200,17 @@ def _(db):
 
 @case("temporary credential, finished (its connection closed)")
 def _(db):
-    return _temporary(db, _account(db), slot_released_at=_naive(NOW - timedelta(minutes=1)))[0], False
+    return _temporary(db, _account(db), slot_released_at=_naive(_now() - timedelta(minutes=1)))[0], False
 
 
 @case("temporary credential, past deactivate_at")
 def _(db):
-    return _temporary(db, _account(db), deactivate_at=_naive(NOW - timedelta(minutes=1)))[0], False
+    return _temporary(db, _account(db), deactivate_at=_naive(_now() - timedelta(minutes=1)))[0], False
 
 
 @case("temporary credential, past expires_at")
 def _(db):
-    return _temporary(db, _account(db), expires_at=_naive(NOW - timedelta(minutes=1)))[0], False
+    return _temporary(db, _account(db), expires_at=_naive(_now() - timedelta(minutes=1)))[0], False
 
 
 @case("temporary credential, row gone")
@@ -233,6 +238,37 @@ def test_the_check_agrees_with_get_current_user(db, name):
     claims, expected = CASES[name](db)
     assert ls.session_is_live(db, claims) is expected, name
     assert _web_door_admits(db, claims) is expected, f"the case no longer says what get_current_user does: {name}"
+
+
+def test_every_case_takes_its_times_when_it_runs(db, monkeypatch):
+    """A lane can reach these cases more than an hour after this module is imported, on a slow or busy runner.
+    A time read once, at import, then put a signed-in temporary credential's last activity past its idle grace,
+    and that case failed with nothing wrong. With the clock three hours on, every time a case sets is within its own
+    offsets of that clock (66 minutes back to an hour on), checked as each case is built."""
+    later = datetime.now(timezone.utc) + timedelta(hours=3)
+
+    class _Later(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return later.astimezone(tz) if tz is not None else _naive(later)
+
+    monkeypatch.setitem(globals(), "datetime", _Later)
+    set_by_the_cases = [
+        sa.select(TemporaryCredential.expires_at), sa.select(TemporaryCredential.deactivate_at),
+        sa.select(TemporaryCredential.slot_released_at), sa.select(User.locked_until),
+        # A regular session's row takes the model's own default; a temporary one's is set by the case.
+        sa.select(ActiveSession.last_activity).where(ActiveSession.temp_credential_id.isnot(None)),
+    ]
+    low, high = _naive(later - timedelta(minutes=66)), _naive(later + timedelta(hours=1))
+    seen = 0
+    for name in sorted(CASES):
+        CASES[name](db)
+        for query in set_by_the_cases:
+            for (value,) in db.execute(query).all():
+                if value is not None:
+                    assert low <= value <= high, (name, str(query), value)
+                    seen += 1
+    assert seen >= len(CASES)
 
 
 def test_the_cases_cover_every_refusal_get_current_user_makes():
