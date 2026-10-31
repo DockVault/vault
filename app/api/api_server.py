@@ -4301,6 +4301,7 @@ async def send_test_email(
     configured, and never echoes the stored SMTP password. The server's TLS certificate is checked
     exactly as system mail checks it for these settings, before the password is sent."""
     import smtplib
+    import ssl
     from email.message import EmailMessage
     from app.core import email_send as _email_send
     from app.core.rate_limiter import rate_limiter as _rl
@@ -4381,6 +4382,11 @@ async def send_test_email(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="SMTP authentication failed — check the username and password.",
         )
+    except ssl.SSLCertVerificationError as e:
+        # Before the ValueError branch below, which this error would otherwise land in: the same
+        # answer, and the same log line, as every other send gives for a certificate it cannot verify.
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=_email_send.certificate_not_verified(e, host, port).message)
     except (ValueError, UnicodeError) as e:
         # Malformed From name/address (control chars) or SMTP host (bad IDNA) — a configuration
         # problem, returned cleanly instead of propagating as an unhandled 500.

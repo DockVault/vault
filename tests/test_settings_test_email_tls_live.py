@@ -7,7 +7,8 @@ completed, and whether the server was sent a password (AUTH) or a message.
 
 POST /settings/test-email sends through the stored settings, as system mail does when no sending
 profile is the default. A certificate the vault cannot verify must end every such conversation before
-AUTH; only a sending profile can turn the check off, for itself. A certificate the vault can verify is
+AUTH, and the answer must say so (502, the server's certificate could not be verified, with OpenSSL's
+reason); only a sending profile can turn the check off, for itself. A certificate the vault can verify is
 accepted: the web process trusts only public authorities, so that case runs the route in a second
 process inside the same container whose trust store also holds the test's authority.
 
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.integration
 API = os.environ.get("VAULT_API_CONTAINER", "vault-api")
 SERVER_SOURCE = Path(__file__).with_name("_mail_tls_server.py").read_text(encoding="utf-8")
 PASSWORD = "relay-password-for-this-test"
+REFUSED = "The mail server's certificate could not be verified: self-signed certificate. "
 SETTINGS = ("smtp_server", "smtp_port", "smtp_username", "from_email", "from_name",
             "smtp_allow_insecure_tls", "email_change_requires_verification")
 
@@ -71,6 +73,12 @@ def mail_server(names, *, issuer="self", implicit_tls=False, port=0):
         lines = [line for line in out.splitlines() if line.strip()]
         assert proc.returncode == 0 and lines, f"the mail server failed: {err[-800:]}"
         server.sessions = json.loads(lines[-1])
+
+
+def assert_reported_as_a_certificate_failure(answer):
+    assert answer.status_code == 502, answer.text
+    assert (answer.json().get("detail") or "").startswith(REFUSED), answer.text
+    assert PASSWORD not in answer.text
 
 
 def assert_refused_before_auth(sessions):
@@ -118,8 +126,7 @@ def test_test_send_refuses_a_self_signed_certificate_over_starttls(sender):
     with mail_server(["mail.example.invalid"]) as server:
         _store(sender.client, server.port)
         r = sender.client.post("/settings/test-email")
-    assert r.status_code in (400, 502), r.text
-    assert PASSWORD not in r.text
+    assert_reported_as_a_certificate_failure(r)
     assert_refused_before_auth(server.sessions)
 
 
@@ -127,7 +134,7 @@ def test_test_send_refuses_a_self_signed_certificate_on_port_465(sender):
     with mail_server(["mail.example.invalid"], implicit_tls=True, port=465) as server:
         _store(sender.client, 465)
         r = sender.client.post("/settings/test-email")
-    assert r.status_code in (400, 502), r.text
+    assert_reported_as_a_certificate_failure(r)
     assert_refused_before_auth(server.sessions)
 
 
@@ -149,14 +156,14 @@ def test_a_stored_opt_out_changes_nothing_while_a_profile_opt_out_applies_to_tha
             test_send = sender.client.post("/settings/test-email")
             change = person.post("/users/me/request-email-change", json={
                 "new_email": unique("moved") + "@example.com", "current_password": user["_password"]})
-        assert test_send.status_code in (400, 502), test_send.text
-        assert change.status_code in (400, 502), change.text
+        assert_reported_as_a_certificate_failure(test_send)
+        assert_reported_as_a_certificate_failure(change)
         assert_refused_before_auth(server.sessions)
 
         with mail_server(["mail.example.invalid"]) as server:
             refused = _profile_test(admin, server.port, False)
             allowed = _profile_test(admin, server.port, True)
-        assert refused.status_code in (400, 502), refused.text
+        assert_reported_as_a_certificate_failure(refused)
         assert allowed.status_code == 200, allowed.text
         assert [s["tls"] for s in server.sessions] == ["refused", "ok"], server.sessions
         assert server.sessions[0]["auth"] is None and server.sessions[1]["auth"], server.sessions
