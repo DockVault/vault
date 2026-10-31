@@ -891,8 +891,8 @@ goes through the older SMTP settings saved with the general settings), or by cha
 profile exists. Each is in the audit log: `email_profile_created`, `email_profile_updated` and
 `email_profile_deleted` for the profiles, `settings_updated` for the general settings. A deployment that relies on
 the hold should keep its mail settings out of administrators' hands where it can, and check those entries after a
-change to someone's sign-in details. Without mail, the server's operator releases an account with `python
-dockvault.py accounts --action release-key-hold`, and the person is told. The records the hold reads
+change to someone's sign-in details. Without mail, the server's operator releases an account with
+`python dockvault.py accounts --action release-key-hold`, and the person is told. The records the hold reads
 (`credential_changes`) are kept for 14 days after a change, which is why the hold cannot be longer;
 `app/core/envelope_hold.py` has the rest. Audit entries: `zk_envelope_release_code_sent` (info),
 `zk_envelope_release_failed` (warning), `zk_envelope_released` (notice). A release before 0.34.0 does not hold the
