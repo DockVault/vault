@@ -1,5 +1,5 @@
 """The tables, and their columns, that the models of 0.33.5 declare (app/core/models.py at the v0.33.5 tag), for
-test_upgrade_schema_divergence.py. Holds no tests.
+test_columns_reach_an_upgraded_install.py. Holds no tests.
 
 An install upgraded from 0.33.5 has these tables already, so create_all builds none of them again: a column a later
 model declares on one of them reaches that install only through an ADD COLUMN of the start's statements. A table

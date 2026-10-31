@@ -97,6 +97,7 @@ GUARD = "require_zk_first_chunk"
 #: body, each with the reason no first chunk is ever sent from there. Anything not listed here and
 #: not a declaration (below) fails the scan, so a new form cannot slip past unexamined.
 OTHER_MENTIONS = {
+    "_schema_0_33_5.py": "lists the columns of the tables 0.33.5 had (chunked_upload_sessions among them): no request",
     "test_ui_e2e.py": "reads back the init the BROWSER sent; the page seals the bytes itself",
     "test_upload_object_id.py": "a Standard upload carrying the field is refused at init: no chunk",
     "test_upload_session_principal.py": "a Standard upload carrying the field is refused at init: no chunk",
