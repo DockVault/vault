@@ -68,10 +68,7 @@ def _sign_in(page: Page, account, codes=None):
     if page.url in ("", "about:blank"):
         page.goto("/")
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
-    # A two-factor sign-in hides the form for its second step, and a sign-out shows the login screen without it:
-    # it is shown again here as the screen's own "Back to sign in" shows it.
-    page.evaluate("() => { const f = document.getElementById('login-form');"
-                  " if (f && f.style.display === 'none') _sfRestoreLoginForm(); }")
+    # After a two-factor sign-in (uma's, bob's) the sign-out shows the form again (test_ui_sign_out_hand_over.py).
     page.fill("#username", account["_username"])
     page.fill("#password", account["_password"])
     page.click("#login-form button[type=submit]")

@@ -2046,7 +2046,10 @@ function logout() {
     // Clear the pre-paint boot state so the splash-override CSS releases and the
     // login screen shows (matters when logout runs from the boot verify path).
     document.documentElement.removeAttribute('data-auth');
-    document.getElementById('login-form').reset();
+    // The sign-in form as the login screen's own "Back to sign in" leaves it: emptied and shown, with the second
+    // step's card empty and hidden. A two-factor sign-in hides the form for its second step and nothing else
+    // shows it again, so after such a sign-in the next person found a login screen with no fields to sign in with.
+    _sfRestoreLoginForm();
     // Dismiss any dialog still standing, and empty what it was holding.
     //
     // showScreen only swaps `.screen` elements; a modal is not one, so a dialog open at logout is

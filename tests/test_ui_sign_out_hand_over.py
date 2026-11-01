@@ -10,6 +10,8 @@ who left that still acts, and nothing that takes what they type.
 - An answer that comes after the sign-out to a request of the session that ended, refused because that session
   is over, signs nobody out: neither the form the next person is filling in is emptied, nor are they signed out
   once they are in. Only a refusal of the session the tab holds now ends it.
+- After a two-factor sign-in the sign-out leaves the form to sign in with: the second step hid it, and nothing but
+  the screen's own "Back to sign in" showed it again.
 
 tests/test_ui_compliance_sign_out.py holds the same hand-over for a vault's password asked on Access to my
 vaults. Waits are on state, never on time (the timing rules of the browser tests).
@@ -18,6 +20,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import signed_in
+from _sf_helpers import enroll_totp
 from _ui_hand_over import new_folder_through_the_page, sign_in_on_the_tab, sign_out
 from conftest import unique
 
@@ -169,3 +172,33 @@ def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out(page: Page, t
     assert _settled(page, 2) == "Session expired. Please log in again."
     expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
     assert page.evaluate("() => authToken") is None
+
+
+def test_after_a_two_factor_sign_in_the_sign_out_leaves_a_form_to_sign_in_with(page: Page, admin):
+    eve = admin.create_user()
+    _secret, codes = enroll_totp(eve, signed_in(eve))
+    ben = admin.create_user()
+    try:
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.fill("#username", eve["_username"])
+        page.fill("#password", eve["_password"])
+        page.click("#login-form button[type=submit]")
+        card = page.locator("#login-second-factor")
+        expect(card).to_be_visible(timeout=15000)
+        expect(page.locator("#login-form")).to_be_hidden()
+        card.get_by_role("button", name="Use a recovery code instead").click()
+        page.fill("#sf-code-input", codes.pop(0))
+        card.locator("button").last.click()
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        sign_out(page)
+        # The form is there again, empty, and the second step's card is gone.
+        expect(page.locator("#login-form")).to_be_visible()
+        expect(page.locator("#username")).to_have_value("")
+        expect(page.locator("#password")).to_have_value("")
+        expect(card).to_be_hidden()
+        assert card.inner_html() == ""
+        sign_in_on_the_tab(page, ben)
+    finally:
+        admin.delete_user(eve["id"])
+        admin.delete_user(ben["id"])
