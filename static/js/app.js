@@ -741,11 +741,16 @@ async function apiRequest(endpoint, options = {}) {
         'Content-Type': 'application/json',
         ...options.headers
     };
-    
-    if (authToken) {
-        headers['Authorization'] = `Bearer ${authToken}`;
+
+    // The session this request is sent for. A 401, or a refusal for the account, ends the tab's session below
+    // only when the request carried the session the tab still holds. One sent with no token (after a sign-out,
+    // by code of the session that ended) or for a session the tab has left since says nothing of whoever is
+    // signed in now, or about to: signing out again would empty the form they are filling in, or sign them out.
+    const sentToken = authToken;
+    if (sentToken) {
+        headers['Authorization'] = `Bearer ${sentToken}`;
     }
-    
+
     // Silent mode suppresses error logging (for optional endpoints)
     const silent = options.silent || false;
     if (options.silent) {
@@ -787,10 +792,12 @@ async function apiRequest(endpoint, options = {}) {
                 console.log('Password required for resource');
                 throw new Error(errorDetail);
             } else {
-                // Session expired - log out user
-                console.error('Session expired, logging out');
-                if (!silent) showError('Session expired. Please log in again.');
-                logout();
+                // Session expired - log out user (only the session this request was sent for: sentToken)
+                if (sentToken && sentToken === authToken) {
+                    console.error('Session expired, logging out');
+                    if (!silent) showError('Session expired. Please log in again.');
+                    logout();
+                }
                 throw new Error('Session expired. Please log in again.');
             }
         }
@@ -821,10 +828,12 @@ async function apiRequest(endpoint, options = {}) {
 
             // Check if this is an account issue (inactive/terminated)
             if (errorDetail.includes('inactive') || errorDetail.includes('terminated') || errorDetail.includes('locked')) {
-                // Account issue - log out user
-                console.error('Account issue, logging out');
-                if (!silent) showError(errorDetail);
-                logout();
+                // Account issue - log out user (only the session this request was sent for: sentToken)
+                if (sentToken && sentToken === authToken) {
+                    console.error('Account issue, logging out');
+                    if (!silent) showError(errorDetail);
+                    logout();
+                }
                 throw new Error(errorDetail);
             } else {
                 // Permission denied - show specific message but don't log out
