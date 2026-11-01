@@ -29,6 +29,7 @@ from app.core.config import settings
 from app.core.database import redis_client
 from app.services.encrypted_file_storage import EncryptedFileStorage
 
+import contextlib
 import contextvars
 
 # The X-Vault-Passcode header value for the CURRENT HTTP request, captured by a pure-ASGI middleware
@@ -186,10 +187,11 @@ def would_exceed_deployment_storage(db, additional_bytes: int):
 
     This counts STORED bytes only — declaring a vault size allocates against the owner's own
     account budget, never against the deployment, so a thousand empty vaults leave this number
-    untouched. The per-vault size_limit remains the atomic per-upload guard.
+    untouched.
 
-    Under concurrency the limit is best-effort (a SUM, not a reservation): worst-case overshoot
-    ≈ (concurrent finalizes) × (per-vault size_limit)."""
+    On its own this is a SUM read at one moment, so it is an early answer, not the guard: two
+    files can both pass it where together they would not. The guard is the same check made again
+    as each file's row is written, in turns (VaultService._claim_room)."""
     from app.core import storage_quota
     cap_bytes = deployment_storage_limit_bytes(db)
     if cap_bytes is None:
@@ -236,6 +238,34 @@ class RateLimitExceededError(FileServiceError):
 class FileTooLargeError(FileServiceError):
     """Raised when file exceeds size limit."""
     pass
+
+
+class StorageLimitExceeded(FileTooLargeError):
+    """No room for a file: storing it would pass the vault's size limit (``kind`` 'vault') or the
+    deployment's storage limit (``kind`` 'deployment'). ``used`` is what is stored and ``cap`` the
+    limit, both in bytes. Raised by finalize_streaming_upload, which decides it under locks held until
+    the file's row commits; the new file is removed before it is raised."""
+
+    def __init__(self, message, *, kind, used, cap):
+        super().__init__(message)
+        self.kind = kind
+        self.used = used
+        self.cap = cap
+
+
+# What a copy, a move to another vault or a folder copy answers when the destination has no room.
+_COPY_REFUSALS = {
+    'vault': "The copy would exceed the destination vault's size limit",
+    'deployment': "The destination is out of storage",
+}
+
+# The transaction-level advisory lock that takes the deployment's stored total in turns
+# (VaultService.take_storage_turn). Stable and arbitrary, distinct from every other advisory lock class.
+STORAGE_TURN = (0x7362, 1)
+# In a session's info: the transaction that decided its turn, and the deployment's storage limit it read.
+STORAGE_TURN_TAKEN = "storage_turn"
+# How long a finish waits for its turn, and for its vault's row, at most (VaultService._waiting_longer).
+STORAGE_TURN_WAIT_SECONDS = 30
 
 
 class DuplicateNameError(FileServiceError):
@@ -1602,6 +1632,100 @@ class VaultService:
             synchronize_session=False,
         )
 
+    def take_storage_turn(self):
+        """Take this transaction's turn at the deployment's stored total, and return the deployment's
+        storage limit in bytes: None when it has none, and then no turn is taken. Decided once per
+        transaction; asked again in it, this answers as it did the first time.
+
+        The turn is a transaction-level advisory lock, let go at the commit or the rollback. Every
+        finish takes it before it locks its vault's row (_claim_room), so a finish waiting its turn
+        holds no row lock, and a request that opens that vault does not wait behind the deployment's
+        queue. A caller that locks the vault's row itself before it calls finalize_streaming_upload
+        (a zero-knowledge completion, an SFTP write) calls this first, for the same order; finalize
+        then reuses the decision, so a limit set meanwhile cannot put the turn after the row. The
+        wait is up to STORAGE_TURN_WAIT_SECONDS (_waiting_longer)."""
+        held = self.db.info.get(STORAGE_TURN_TAKEN)
+        if held is not None and held[0] is not None and held[0] is self.db.get_transaction():
+            return held[1]
+        cap = deployment_storage_limit_bytes(self.db)
+        if cap is not None and self._on_postgres():
+            from sqlalchemy import text
+            with self._waiting_longer():
+                self.db.execute(text("SELECT pg_advisory_xact_lock(:c, :k)"),
+                                {"c": STORAGE_TURN[0], "k": STORAGE_TURN[1]})
+        self.db.info[STORAGE_TURN_TAKEN] = (self.db.get_transaction(), cap)
+        return cap
+
+    def _on_postgres(self) -> bool:
+        bind = self.db.get_bind()
+        return bind is not None and bind.dialect.name == "postgresql"
+
+    @contextlib.contextmanager
+    def _waiting_longer(self):
+        """Let the lock waits inside wait up to STORAGE_TURN_WAIT_SECONDS rather than the connection's
+        lock_timeout (app/core/database.py), then put it back. A burst of finishes queues behind one
+        another, each holding the turn, or its vault's row, for its row and its commit; the wait runs
+        off the event loop. A wait that runs out raises, and the caller's rollback puts the setting back."""
+        if not self._on_postgres():
+            yield
+            return
+        from sqlalchemy import text
+        before = self.db.execute(text("SELECT current_setting('lock_timeout')")).scalar()
+        self.db.execute(text("SELECT set_config('lock_timeout', :wait, true)"),
+                        {"wait": f"{STORAGE_TURN_WAIT_SECONDS * 1000}ms"})
+        yield
+        self.db.execute(text("SELECT set_config('lock_timeout', :wait, true)"), {"wait": before})
+
+    def _claim_room(self, file_info: dict, total_size: int) -> None:
+        """Refuse a file the vault's size limit or the deployment's storage limit has no room for;
+        otherwise hold that room until this transaction ends.
+
+        A check that reads a total, decides, and commits later lets two files that finish at the
+        same moment both pass where together they would not. While every upload finished on the
+        event loop, nothing ran between the read and the commit. Uploads, copies and moves now finish
+        in threads of their own (app/core/off_loop.py), so the turns are taken in the database:
+
+        - when the deployment has a storage limit, the deployment's turn first (take_storage_turn):
+          one finish at a time across every vault reads the deployment's stored total and commits;
+        - then the vault's row, FOR NO KEY UPDATE as every writer of it takes it (the replace below,
+          set_file_expiry, a file or folder delete), and its stored total and limit are read under
+          the lock. A file finishing into the same vault waits for this one's commit, then reads a
+          total that counts it.
+
+        Always in that order, and a finish needs no other vault's row while it holds them, so two
+        finishes never each hold what the other waits for. Both are let go at this transaction's
+        commit or rollback. Nothing slow runs under them: the file is encrypted and on the disk
+        already, and what is left is its row and the commit.
+
+        A refusal rolls the transaction back, removes the new file (a copy or a move has no removal
+        of its own) and raises StorageLimitExceeded. The file counts whole, also when it replaces a
+        file of the same name, as in the callers' own checks."""
+        from app.core import storage_quota
+        cap = self.take_storage_turn()
+        with self._waiting_longer():
+            locked = (self.db.query(Vault.total_size_bytes, Vault.size_limit)
+                      .filter(Vault.id == file_info['vault_id'])
+                      .with_for_update(key_share=True).first())
+        if locked is not None:
+            stored, limit = int(locked.total_size_bytes or 0), locked.size_limit
+            if limit and stored + total_size > limit:
+                self._refuse_room(file_info, StorageLimitExceeded(
+                    "The file would exceed the vault's size limit",
+                    kind='vault', used=stored, cap=limit))
+        if cap is None:
+            return
+        used = deployment_storage_used(self.db)
+        if storage_quota.would_exceed_deployment(used, total_size, cap):
+            self._refuse_room(file_info, StorageLimitExceeded(
+                "This deployment's storage limit would be exceeded",
+                kind='deployment', used=used, cap=cap))
+
+    def _refuse_room(self, file_info: dict, refusal: StorageLimitExceeded) -> None:
+        """Roll back (letting go of _claim_room's locks), remove the file that got no row, raise."""
+        self.db.rollback()
+        self._remove_blobs([file_info['storage_path']])
+        raise refusal
+
     def finalize_streaming_upload(self, file_info: dict, total_size: int, checksum: str,
                                   zk_key_version: Optional[int] = None,
                                   zk_enc_name: Optional[str] = None,
@@ -1630,6 +1754,9 @@ class VaultService:
                 old file). The CALLER must pre-authorize replacement (the upload paths gate
                 this on the principal's file.delete capability); when the principal cannot
                 replace, pass False and a same-name clash surfaces as DuplicateNameError (409).
+
+        Raises StorageLimitExceeded, the new file removed, when the vault's size limit or the
+        deployment's storage limit has no room for it (_claim_room).
         """
         # Check file size
         max_size_bytes = settings.max_file_size_mb * 1024 * 1024
@@ -1640,6 +1767,10 @@ class VaultService:
 
         vault_obj = file_info['vault']
         is_zk = getattr(vault_obj, 'type', 'standard') == 'zero_knowledge'
+
+        # Whether the vault and the deployment have room is decided here, under locks this transaction
+        # holds until the row below commits, and not only by the caller before it.
+        self._claim_room(file_info, total_size)
 
         # Replace-on-clash: delete any prior same-name row BEFORE inserting the new one,
         # within this transaction (blobs removed only after a successful commit, below).
@@ -1713,9 +1844,9 @@ class VaultService:
         # which is why it went unnoticed.
         #
         # Letting the database do the addition makes each increment atomic regardless of what any
-        # session last read. The row lock taken by the caller before the limit check is what stops
-        # two uploads both passing a check they would jointly fail; this is what stops the totals
-        # from being wrong even when they legitimately both pass.
+        # session last read. The row lock _claim_room took before the limit check is what stops two
+        # uploads both passing a check they would jointly fail; this is what stops the totals from
+        # being wrong even when they legitimately both pass.
         vault = file_info['vault']
         self.db.query(Vault).filter(Vault.id == vault.id).update(
             {
@@ -2573,15 +2704,17 @@ class VaultService:
         # Quota: the destination gains a full copy of the bytes, so enforce the SAME two limits every
         # upload path does — the per-vault size_limit AND the deployment-wide stored-bytes cap. Doing
         # it here covers every re-encrypt caller (file copy, cross-vault move, recursive folder copy),
-        # so none can bypass a limit the normal upload honours.
+        # so none can bypass a limit the normal upload honours. This is the early answer, before the
+        # whole file is re-encrypted; finalize checks both again under lock as the row is written, which
+        # is what holds when several copies finish at once.
         add_bytes = source_file.size_bytes or 0
         dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
         if (dest_vault is not None and dest_vault.size_limit
                 and (dest_vault.total_size_bytes or 0) + add_bytes > dest_vault.size_limit):
-            raise FileTooLargeError("The copy would exceed the destination vault's size limit")
+            raise FileTooLargeError(_COPY_REFUSALS['vault'])
         exceeds, _used, _cap = would_exceed_deployment_storage(self.db, add_bytes)
         if exceeds:
-            raise FileTooLargeError("The destination is out of storage")
+            raise FileTooLargeError(_COPY_REFUSALS['deployment'])
         name = source_file.original_name or source_file.name
         mime = source_file.mime_type
         # Open the decrypting reader first: this authorizes READ on the source vault and enforces any
@@ -2600,9 +2733,14 @@ class VaultService:
             total = ctx.total_bytes
         finally:
             reader.close()
-        new_file = self.finalize_streaming_upload(
-            file_info, total, hasher.hexdigest(), replace_same_name=replace_same_name,
-        )
+        try:
+            new_file = self.finalize_streaming_upload(
+                file_info, total, hasher.hexdigest(), replace_same_name=replace_same_name,
+            )
+        except StorageLimitExceeded as refused:
+            # Another file took the room since the check above; the copy is removed already.
+            raise StorageLimitExceeded(_COPY_REFUSALS[refused.kind], kind=refused.kind,
+                                       used=refused.used, cap=refused.cap) from None
         # Preserve a file-level password on the copy (same hash → same protection). The reader above
         # already proved the caller can read the source, so this grants no new access.
         if source_file.password_hash:

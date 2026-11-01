@@ -68,7 +68,7 @@ from app.config.branding import branding
 # as a 500 instead of a 429.
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, SessionLimitExceededError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
-from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter, is_refundable_serve_failure
+from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, StorageLimitExceeded, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter, is_refundable_serve_failure
 from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, folder_ancestry, filter_listing_for_scope
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
@@ -15618,16 +15618,15 @@ async def receiver_complete_upload(
                     "message": (f"This upload delivered {final_size} bytes but declared "
                                 f"{session.total_size}. Nothing has been stored.")})
 
-            stored_now = db.query(Vault.total_size_bytes).filter(Vault.id == vault.id).scalar() or 0
-            if vault.size_limit and stored_now + final_size > vault.size_limit:
-                raise HTTPException(status_code=413, detail="This upload would exceed the link's space.")
-            _enforce_deployment_storage_quota(db, final_size)
-
             # An anonymous drop never OVERWRITES an existing file (no delete authority): a same-name
-            # clash is a clean 409, not a silent replace.
-            return vault_service.finalize_streaming_upload(
-                file_info=file_info, total_size=final_size, checksum=final_checksum,
-                replace_same_name=False)
+            # clash is a clean 409, not a silent replace. The vault's size limit and the deployment's
+            # storage limit are checked inside finalize, under lock, as the row is written.
+            try:
+                return vault_service.finalize_streaming_upload(
+                    file_info=file_info, total_size=final_size, checksum=final_checksum,
+                    replace_same_name=False)
+            except StorageLimitExceeded as refused:
+                raise _no_room(refused, "This upload would exceed the link's space.") from None
 
         try:
             final_checksum, final_size = await off_loop.run_to_end_on_session(db, _assemble)
@@ -17101,12 +17100,24 @@ def _enforce_deployment_storage_quota(db, additional_bytes: int) -> None:
     from app.services.vault_service import would_exceed_deployment_storage
     exceeds, used, cap_bytes = would_exceed_deployment_storage(db, additional_bytes)
     if exceeds:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=(f"This deployment's {storage_quota.format_bytes(cap_bytes)} storage limit would "
-                    f"be exceeded ({storage_quota.format_bytes(used)} already stored). Free up space "
-                    f"or ask an administrator to raise the limit."),
-        )
+        raise _deployment_storage_refusal(used, cap_bytes)
+
+
+def _deployment_storage_refusal(used: int, cap_bytes: int) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        detail=(f"This deployment's {storage_quota.format_bytes(cap_bytes)} storage limit would "
+                f"be exceeded ({storage_quota.format_bytes(used)} already stored). Free up space "
+                f"or ask an administrator to raise the limit."),
+    )
+
+
+def _no_room(refused: StorageLimitExceeded, vault_detail: str) -> HTTPException:
+    """The 413 for a file finalize_streaming_upload found no room for: the deployment's answer, or
+    `vault_detail` for the vault's size limit (each upload path words its own)."""
+    if refused.kind == 'deployment':
+        return _deployment_storage_refusal(refused.used, refused.cap)
+    return HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=vault_detail)
 
 
 def _enforce_user_cap(db) -> None:
@@ -20334,9 +20345,10 @@ async def upload_file(
                     # 400%, every one of them returning success. Sequentially the same
                     # uploads are refused correctly, which is why it survived.
                     #
-                    # Read fresh, like the resumable path's guard. This does not make the
-                    # check atomic -- see the note there -- but it removes the two holes that
-                    # make this path bypassable without any timing skill at all.
+                    # Read fresh. This does not make the check atomic -- finalize checks again
+                    # under the vault's row lock as the row is written, and that is what holds
+                    # under concurrency -- but it refuses an upload with no room before its file
+                    # is synced, and the stream's exit removes it.
                     _vault_now = (db.query(Vault.total_size_bytes)
                                   .filter(Vault.id == vault_id).scalar() or 0)
                     if vault_size_limit and _vault_now + final_size > vault_size_limit:
@@ -20430,6 +20442,11 @@ async def upload_file(
             except DuplicateNameError as e:
                 # Lost a same-name replace race against the name unique index — a clean 409.
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+            except StorageLimitExceeded as refused:
+                # finalize found no room under its lock: another upload took it after the checks
+                # in the stream above. The file is removed already.
+                raise _no_room(refused, "Upload rejected: Vault size limit would be exceeded") from None
 
             except PermissionDeniedError as e:
                 # A write-permission denial is a 403, not a 500 (the broad handler below).
@@ -21887,24 +21904,13 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
                             + str(session.total_size) + ". Nothing has been stored."),
             })
 
-        # Final size-limit guard now that the true plaintext size is known.
-        #
-        # The stored total is read FRESH, and that is the whole fix. `vault` was loaded when this
-        # request began, before any overlapping upload committed, so its copy is stale by exactly
-        # the amount being checked against: three consecutive completions were observed all seeing
-        # the same total and each concluding there was room. Five accounts sharing one vault,
-        # released together, put 120 MB into a 64 MB vault that way, with all five returning
-        # success.
-        #
-        # Two heavier answers were built and discarded, each disproved by the tests that cover
-        # this. A row lock around the check is held while the file is encrypted, so concurrent
-        # uploads then exceed the client's timeout. An atomic Redis reservation is no better than
-        # the total it is handed -- with a stale read it still admits everyone, and with a fresh
-        # read it changes nothing. Measured both ways before being removed.
-        stored_now = db.query(Vault.total_size_bytes).filter(Vault.id == vault_id).scalar() or 0
-        if vault.size_limit and stored_now + final_size > vault.size_limit:
-            raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
-        _enforce_deployment_storage_quota(db, final_size)   # deployment-wide stored-bytes limit
+        # The size-limit guard, now that the true plaintext size is known, is finalize's: it reads the
+        # vault's stored total under the vault's row lock, and the deployment's under a lock of its
+        # own, as the row is written (VaultService._claim_room). A total read here, even fresh, is
+        # read before an overlapping completion commits: five accounts sharing one vault, released
+        # together, put 120 MB into a 64 MB vault that way, all five answered with success. A row
+        # lock taken around the encryption instead kept concurrent uploads past the client's
+        # timeout; finalize's lock is taken after it.
 
         # Zero-knowledge upload-vs-rekey race guard. Lock the vault row and confirm the
         # client encrypted under the CURRENT DEK epoch; if the vault was re-keyed during
@@ -21916,7 +21922,9 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
             # populate_existing() is what makes the lock mean anything: this session already
             # holds the vault from the checks above, and without it the epoch compared below
             # would be the one read before the lock -- so the rotation this guard exists to
-            # catch would sail straight past it.
+            # catch would sail straight past it. The deployment's storage turn comes first, as every
+            # finish takes it before its vault's row (VaultService.take_storage_turn).
+            vault_service.take_storage_turn()
             locked_vault = (db.query(Vault).populate_existing()
                             .filter(Vault.id == vault_id).with_for_update().first())
             current_epoch = getattr(locked_vault, 'dek_version', 1) or 1
@@ -21939,20 +21947,23 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
                 raise HTTPException(status_code=409, detail=_stale)
             zk_kv = current_epoch
 
-        return vault_service.finalize_streaming_upload(
-            file_info=file_info, total_size=final_size, checksum=final_checksum,
-            zk_key_version=zk_kv,
-            # ZK: stamp the browser-encrypted name/MIME + client blind index onto the File
-            # (server stores them verbatim and decrypts nothing). NULL/no-op for Standard.
-            zk_enc_name=session.enc_name if is_zk else None,
-            zk_enc_mime=session.enc_mime if is_zk else None,
-            zk_name_bi=zk_name_bi,
-            zk_name_bi_candidates=zk_name_bi_candidates,
-            # Replace-on-clash, transactionally inside finalize (see the multipart path).
-            # Gated on the principal's real DELETE authority (cap + RBAC), not just the
-            # temp-cred cap — a write-but-no-delete member must not overwrite via upload.
-            replace_same_name=_principal_can_replace_file(db, current_user, vault_id),
-        )
+        try:
+            return vault_service.finalize_streaming_upload(
+                file_info=file_info, total_size=final_size, checksum=final_checksum,
+                zk_key_version=zk_kv,
+                # ZK: stamp the browser-encrypted name/MIME + client blind index onto the File
+                # (server stores them verbatim and decrypts nothing). NULL/no-op for Standard.
+                zk_enc_name=session.enc_name if is_zk else None,
+                zk_enc_mime=session.enc_mime if is_zk else None,
+                zk_name_bi=zk_name_bi,
+                zk_name_bi_candidates=zk_name_bi_candidates,
+                # Replace-on-clash, transactionally inside finalize (see the multipart path).
+                # Gated on the principal's real DELETE authority (cap + RBAC), not just the
+                # temp-cred cap — a write-but-no-delete member must not overwrite via upload.
+                replace_same_name=_principal_can_replace_file(db, current_user, vault_id),
+            )
+        except StorageLimitExceeded as refused:
+            raise _no_room(refused, "File would exceed the vault size limit") from None
 
     try:
         final_checksum, final_size = await off_loop.run_to_end_on_session(db, _assemble)

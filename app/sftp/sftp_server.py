@@ -989,7 +989,7 @@ class _StreamingUpload:
                 self._ctx.sync_written()
             with get_db_context() as db:
                 authz = self._interface._authorize_upload_persist(
-                    db, self._vault_id, self._folder_id, total_size)
+                    db, self._vault_id, self._folder_id, total_size, persisting=True)
                 if authz is None:
                     self._abort()
                     return
@@ -1753,7 +1753,7 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         _write_progress.watch(handle)
         return handle
 
-    def _authorize_upload_persist(self, db, vault_id, folder_id, size):
+    def _authorize_upload_persist(self, db, vault_id, folder_id, size, *, persisting=False):
         """Persist-time re-authorization shared by the buffered and streaming SFTP upload paths.
 
         Runs EVERY TOCTOU gate that must still hold at close — an account locked/deactivated or a
@@ -1762,7 +1762,11 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         FRESH session. Returns ``(user, vault, vault_service)`` when the write may land, or ``None``
         (having logged the specific reason) when it must be dropped. `get_vault` can itself raise on a
         membership/scope loss; that is caught and mapped to a drop so both callers see one contract
-        (a None means "do not persist")."""
+        (a None means "do not persist").
+
+        ``persisting``: this transaction goes on to write the file's row (finalize_streaming_upload),
+        so the deployment's storage turn is taken before the vault's row is locked, the order every
+        finish takes them in (VaultService.take_storage_turn)."""
         user = self._load_principal(db)
         if user is None or not self._check_session_valid():
             safe_event('upload.aborted.principal-invalid')
@@ -1802,6 +1806,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         from sqlalchemy.exc import OperationalError as _OperationalError
         from app.core.models import Vault as _Vault
         try:
+            if persisting:
+                vault_service.take_storage_turn()
             locked_vault = (db.query(_Vault).filter(_Vault.id == vault_id)
                             .populate_existing().with_for_update(key_share=True).first())
         except _OperationalError:
@@ -1881,7 +1887,8 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                     total_size = ctx.get_total_size()
 
                 with get_db_context() as db:
-                    authz = interface._authorize_upload_persist(db, vault_id, folder_id, total_size)
+                    authz = interface._authorize_upload_persist(db, vault_id, folder_id, total_size,
+                                                                 persisting=True)
                     if authz is None:
                         return
                     user, vault, vault_service = authz
