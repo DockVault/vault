@@ -4,7 +4,9 @@ Uploads, copies and moves write the file first and its row last, and nothing hol
 folder deleted in between makes the row's insert fail on the folder it names. That failure used to be read as
 a name clash ("A file with that name already exists in this folder"), which there was not. It is now answered
 as what happened, nothing stored and the new file removed, and every route answers it 409. A vault deleted in
-between is found when its row is locked, before the insert.
+between is found when its row is locked, before the insert. The row also names the account it is stored for
+(files.uploaded_by): an account deleted meanwhile fails the insert on that, and is said so, by the constraint
+PostgreSQL names.
 
 tests/test_upload_completion_answers_others_live.py deletes a folder while an upload into it completes, on a
 running stack.
@@ -30,11 +32,13 @@ API = Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py"
 
 
 class _DB(MemoryDB):
-    """A session whose commit fails as PostgreSQL fails it, with `code`."""
+    """A session whose commit fails as PostgreSQL fails it, with `code`, naming `constraint` (psycopg2 gives it
+    as the error's diag.constraint_name)."""
 
-    def __init__(self, tables, code=None):
+    def __init__(self, tables, code=None, constraint=None):
         super().__init__(tables)
         self.code = code
+        self.constraint = constraint
 
     def get_bind(self):
         return SimpleNamespace(dialect=SimpleNamespace(name="memory"))
@@ -42,7 +46,8 @@ class _DB(MemoryDB):
     def commit(self):
         if self.code is not None:
             self.log.append(("commit failed", self.code))
-            raise IntegrityError("INSERT INTO files ...", {}, SimpleNamespace(pgcode=self.code))
+            raise IntegrityError("INSERT INTO files ...", {}, SimpleNamespace(
+                pgcode=self.code, diag=SimpleNamespace(constraint_name=self.constraint)))
         super().commit()
 
 
@@ -60,7 +65,12 @@ def finish(monkeypatch):
         svc = vs.VaultService.__new__(vs.VaultService)
         svc.db = db
         svc.storage_path = None
-        svc._remove_blobs = lambda paths: removed.extend(paths)
+
+        def remove(paths):
+            if paths:
+                db.log.append(("removed",))     # in the log, so a test sees it comes after the rollback
+            removed.extend(paths)
+        svc._remove_blobs = remove
         vault = SimpleNamespace(id=vault_id, type="standard")
         info = {"id": uuid.uuid4(), "name": "a.bin", "original_name": "a.bin", "vault_id": vault_id,
                 "folder_id": folder_id, "mime_type": "application/octet-stream",
@@ -80,13 +90,38 @@ def test_an_insert_that_names_a_deleted_folder_is_answered_as_that(finish):
     import app.services.vault_service as vs
     call, removed = finish
     vault = _vault()
-    db = _DB({Vault: [vault]}, code="23503")
+    db = _DB({Vault: [vault]}, code="23503", constraint="files_folder_id_fkey")
     with pytest.raises(vs.DestinationGoneError) as gone:
         call(db, vault.id, folder_id=uuid.uuid4())
     assert str(gone.value) == vs._GONE["folder"]
     assert "Nothing has been stored" in str(gone.value) and "already exists" not in str(gone.value)
-    assert [e[0] for e in db.log][-2:] == ["commit failed", "rollback"]
+    # Rolled back, then the new file removed: its removal overwrites the whole file, which must not happen
+    # while the transaction still holds the vault's row.
+    assert [e[0] for e in db.log][-3:] == ["commit failed", "rollback", "removed"]
     assert len(removed) == 1 and removed[0].endswith("/new"), removed
+
+
+@pytest.mark.parametrize("constraint, said", [
+    ("files_folder_id_fkey", "folder"),
+    ("files_uploaded_by_fkey", "account"),
+    ("files_modified_by_fkey", "account"),
+    ("files_vault_id_fkey", "vault"),
+    (None, "either"),
+    ("another_fkey", "either"),
+])
+def test_the_text_names_what_the_insert_found_gone(finish, constraint, said):
+    """files names its folder and the account it is stored for (uploaded_by, modified_by), each by a foreign key:
+    an account deleted while its own upload, or one through a link it made, finished is not said to be a folder.
+    A constraint the database does not name, or one finalize does not know, is said as either of the two."""
+    import app.services.vault_service as vs
+    call, removed = finish
+    vault = _vault()
+    db = _DB({Vault: [vault]}, code="23503", constraint=constraint)
+    with pytest.raises(vs.DestinationGoneError) as gone:
+        call(db, vault.id)
+    assert str(gone.value) == vs._GONE[said]
+    assert str(gone.value).endswith("Nothing has been stored.")
+    assert len(removed) == 1
 
 
 def test_a_name_clash_is_still_a_name_clash(finish):
@@ -108,7 +143,7 @@ def test_a_vault_deleted_before_the_row_is_answered_as_that(finish):
     with pytest.raises(vs.DestinationGoneError) as gone:
         call(db, uuid.uuid4())
     assert str(gone.value) == vs._GONE["vault"]
-    assert [e[0] for e in db.log] == ["lock", "rollback"], db.log
+    assert [e[0] for e in db.log] == ["lock", "rollback", "removed"], db.log
     assert len(removed) == 1
 
 

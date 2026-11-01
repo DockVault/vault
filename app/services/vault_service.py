@@ -254,9 +254,9 @@ class StorageLimitExceeded(FileTooLargeError):
 
 
 class DestinationGoneError(FileServiceError):
-    """The folder, or the vault, a file was being stored into was deleted before the file's row was
-    written. Nothing is stored: finalize_streaming_upload rolls back and removes the new file, and
-    the routes answer 409."""
+    """The folder or the vault a file was being stored into, or the account it was being stored for,
+    was deleted before the file's row was written. Nothing is stored: finalize_streaming_upload rolls
+    back and removes the new file, and the routes answer 409."""
     pass
 
 
@@ -266,10 +266,31 @@ _GONE = {
              "Nothing has been stored.",
     'folder': "The folder this file was going into was deleted before the file was stored. "
               "Nothing has been stored.",
+    # The account a file's row names (files.uploaded_by, as modified_by): deleted while its own upload, or
+    # an upload through a link it made, was finishing.
+    'account': "The account this file was being stored for was deleted before the file was stored. "
+               "Nothing has been stored.",
+    # A foreign key the database did not name: the folder or the account, as far as finalize can tell.
+    'either': "The folder this file was going into, or the account it was being stored for, was deleted "
+              "before the file was stored. Nothing has been stored.",
 }
 
 # PostgreSQL's code for an insert that names a row which does not exist.
 _FOREIGN_KEY_VIOLATION = "23503"
+
+
+def _gone_by(error) -> str:
+    """Which of _GONE a file insert that failed on a foreign key is, from the constraint PostgreSQL names
+    (files_folder_id_fkey, files_uploaded_by_fkey and so on); 'either' when it names none of them."""
+    diag = getattr(getattr(error, 'orig', None), 'diag', None)
+    name = str(getattr(diag, 'constraint_name', None) or '')
+    if 'folder_id' in name:
+        return 'folder'
+    if 'uploaded_by' in name or 'modified_by' in name:
+        return 'account'
+    if 'vault_id' in name:
+        return 'vault'
+    return 'either'
 
 # What a copy, a move to another vault or a folder copy answers when the destination has no room.
 _COPY_REFUSALS = {
@@ -1897,11 +1918,12 @@ class VaultService:
             # blob already written during streaming, then surface a clean 409.
             #
             # Or the insert named a row that is gone (a foreign key): the folder, deleted while the
-            # file was written -- the vault's row is locked, so not the vault. Said as what it is.
+            # file was written, or the account the row names, deleted meanwhile -- the vault's row is
+            # locked, so not the vault. Said as what it is, by the constraint the database names.
             self.db.rollback()
             self._remove_blobs([file_info['storage_path']])
             if getattr(getattr(e, 'orig', None), 'pgcode', None) == _FOREIGN_KEY_VIOLATION:
-                raise DestinationGoneError(_GONE['folder']) from None
+                raise DestinationGoneError(_GONE[_gone_by(e)]) from None
             raise DuplicateNameError("A file with that name already exists in this folder.")
         # A refresh failure AFTER a successful commit is non-fatal — the row is already durable. Guard
         # it so finalize never raises past the commit: otherwise the exception would reach a caller's
