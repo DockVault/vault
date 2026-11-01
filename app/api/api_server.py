@@ -68,7 +68,7 @@ from app.config.branding import branding
 # as a 500 instead of a 429.
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, SessionLimitExceededError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
-from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, StorageLimitExceeded, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, _name_match_filter, is_refundable_serve_failure
+from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, StorageLimitExceeded, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, DestinationGoneError, _name_match_filter, is_refundable_serve_failure
 from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, folder_ancestry, filter_listing_for_scope
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
@@ -193,6 +193,9 @@ async def _file_service_error_handler(request: StarletteRequest, exc: FileServic
         status_code = status.HTTP_429_TOO_MANY_REQUESTS
     elif isinstance(exc, FileTooLargeError):
         status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+    elif isinstance(exc, DestinationGoneError):
+        # A copy or a move whose destination folder was deleted while the copy was written.
+        status_code = status.HTTP_409_CONFLICT
     else:
         status_code = status.HTTP_400_BAD_REQUEST
     return JSONResponse(status_code=status_code, content={"detail": str(exc)})
@@ -15640,7 +15643,7 @@ async def receiver_complete_upload(
                 db.rollback()
             shutil.rmtree(sdir, ignore_errors=True)
             raise
-        except DuplicateNameError as e:
+        except (DuplicateNameError, DestinationGoneError) as e:
             await _remove_orphan_blob()
             _receiver_release_bytes(db, receiver.id, session.total_size)
             try:
@@ -20439,8 +20442,9 @@ async def upload_file(
                 # Re-raise HTTP exceptions (size limit violations, cancellations, etc.)
                 raise
 
-            except DuplicateNameError as e:
-                # Lost a same-name replace race against the name unique index — a clean 409.
+            except (DuplicateNameError, DestinationGoneError) as e:
+                # Lost a same-name replace race against the name unique index, or the folder was
+                # deleted while the file was written — a clean 409 saying which.
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
             except StorageLimitExceeded as refused:
@@ -21971,9 +21975,10 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     except HTTPException:
         await _remove_orphan_blob()
         raise
-    except DuplicateNameError as e:
+    except (DuplicateNameError, DestinationGoneError) as e:
         await _remove_orphan_blob()   # (finalize already removed it on this path; no-op safety net)
-        # Lost a same-name replace race against the name unique index — a clean 409. finalize
+        # Lost a same-name replace race against the name unique index, or the folder (or vault) was
+        # deleted while the file was assembled — a clean 409 saying which. finalize
         # already rolled back, but the session ROW survives intact (status='active') and for a
         # Standard vault still holds the plaintext filename/MIME as working state; the chunk
         # files are still on disk. Tear both down immediately (rather than leaving it for the

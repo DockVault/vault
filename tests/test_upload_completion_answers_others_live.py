@@ -12,6 +12,8 @@ Here another client asks the health check and a vault listing over and over whil
   and no file is left on the disk that no row lists;
 - a copy of a large file to another vault (read, decrypted, encrypted again and synced): the others are
   answered meanwhile, and the copy reads back the same;
+- a folder deleted while an upload into it completes: the delete is answered meanwhile, and the completion
+  then says the folder was deleted, with nothing stored;
 - a zero-knowledge upload refused at completion because the vault's key changed meanwhile: the refusal takes
   the vault's row lock, and the assembled file is then removed, which takes seconds. Every request that opens
   the vault (a listing records when it was opened) still answers at once, not after waiting for that lock.
@@ -98,9 +100,10 @@ def _payload(seed: bytes, size: int):
     return pieces, digest.hexdigest()
 
 
-def _staged(admin, vault_id, name, pieces, size):
+def _staged(admin, vault_id, name, pieces, size, folder_id=None):
     r = admin.post(f"/vaults/{vault_id}/uploads", json={
-        "file_name": name, "total_size": size, "total_chunks": len(pieces), "chunk_size": CHUNK})
+        "file_name": name, "total_size": size, "total_chunks": len(pieces), "chunk_size": CHUNK,
+        **({"folder_id": folder_id} if folder_id else {})})
     assert r.status_code in (200, 201), r.text
     sid = r.json()["session_id"]
     for i, piece in enumerate(pieces):
@@ -241,6 +244,45 @@ def test_others_are_answered_while_a_file_is_copied_to_another_vault(admin, vaul
         assert _read_back(admin, other["id"], item["id"]) == sha
     finally:
         admin.delete_vault(other["id"])
+
+
+def test_a_folder_deleted_while_an_upload_into_it_completes_is_said_so(admin, vault):
+    """Nothing holds the folder while the file is assembled, so a delete of it sent meanwhile is answered at
+    once, and the file's row then cannot name it. The completion says the folder was deleted, not that a file
+    of that name exists (there is none); nothing is stored, the session is gone and no file is left on the
+    disk."""
+    made = admin.post(f"/vaults/{vault['id']}/folders", json={"name": "going"})
+    assert made.status_code in (200, 201), made.text
+    folder_id = made.json()["folder"]["id"]
+    size = 256 * 1024 * 1024
+    pieces, _sha = _payload(b"gone", size)
+    sid = _staged(admin, vault["id"], "into-gone.bin", pieces, size, folder_id=folder_id)
+    answers = {}
+
+    def complete():
+        client = requests.Session()
+        client.headers.update(admin.session.headers)
+        start = time.monotonic()
+        answers["complete"] = client.post(f"{BASE}/vaults/{vault['id']}/uploads/{sid}/complete", timeout=600)
+        answers["took"] = time.monotonic() - start
+
+    thread = threading.Thread(target=complete)
+    thread.start()
+    time.sleep(0.5)
+    start = time.monotonic()
+    deleted = admin.post(f"/vaults/{vault['id']}/folders/{folder_id}/delete")
+    delete_took = time.monotonic() - start
+    thread.join(620)
+    assert deleted.status_code == 200, deleted.text
+    r = answers["complete"]
+    assert 0.5 + delete_took < answers["took"], (
+        f"the completion took {answers['took']:.2f} s, ending before the folder's delete did: nothing raced")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == ("The folder this file was going into was deleted before the file was "
+                                  "stored. Nothing has been stored."), r.text
+    assert admin.get(f"/vaults/{vault['id']}/files").json()["items"] == []
+    assert all(s["session_id"] != sid for s in admin.get(f"/vaults/{vault['id']}/uploads").json())
+    assert _blobs_on_disk(vault["id"]) == 0
 
 
 @pytest.fixture

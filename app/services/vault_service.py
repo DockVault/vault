@@ -253,6 +253,24 @@ class StorageLimitExceeded(FileTooLargeError):
         self.cap = cap
 
 
+class DestinationGoneError(FileServiceError):
+    """The folder, or the vault, a file was being stored into was deleted before the file's row was
+    written. Nothing is stored: finalize_streaming_upload rolls back and removes the new file, and
+    the routes answer 409."""
+    pass
+
+
+# What finalize_streaming_upload says when what the file was going into was deleted meanwhile.
+_GONE = {
+    'vault': "The vault this file was going into was deleted before the file was stored. "
+             "Nothing has been stored.",
+    'folder': "The folder this file was going into was deleted before the file was stored. "
+              "Nothing has been stored.",
+}
+
+# PostgreSQL's code for an insert that names a row which does not exist.
+_FOREIGN_KEY_VIOLATION = "23503"
+
 # What a copy, a move to another vault or a folder copy answers when the destination has no room.
 _COPY_REFUSALS = {
     'vault': "The copy would exceed the destination vault's size limit",
@@ -1698,33 +1716,36 @@ class VaultService:
         already, and what is left is its row and the commit.
 
         A refusal rolls the transaction back, removes the new file (a copy or a move has no removal
-        of its own) and raises StorageLimitExceeded. The file counts whole, also when it replaces a
-        file of the same name, as in the callers' own checks."""
+        of its own) and raises StorageLimitExceeded; DestinationGoneError when the vault was deleted
+        meanwhile. The file counts whole, also when it replaces a file of the same name, as in the
+        callers' own checks."""
         from app.core import storage_quota
         cap = self.take_storage_turn()
         with self._waiting_longer():
             locked = (self.db.query(Vault.total_size_bytes, Vault.size_limit)
                       .filter(Vault.id == file_info['vault_id'])
                       .with_for_update(key_share=True).first())
-        if locked is not None:
-            stored, limit = int(locked.total_size_bytes or 0), locked.size_limit
-            if limit and stored + total_size > limit:
-                self._refuse_room(file_info, StorageLimitExceeded(
-                    "The file would exceed the vault's size limit",
-                    kind='vault', used=stored, cap=limit))
+        if locked is None:
+            # Deleted while the file was written: a row inserted now would fail on the vault it names.
+            self._give_up(file_info, DestinationGoneError(_GONE['vault']))
+        stored, limit = int(locked.total_size_bytes or 0), locked.size_limit
+        if limit and stored + total_size > limit:
+            self._give_up(file_info, StorageLimitExceeded(
+                "The file would exceed the vault's size limit",
+                kind='vault', used=stored, cap=limit))
         if cap is None:
             return
         used = deployment_storage_used(self.db)
         if storage_quota.would_exceed_deployment(used, total_size, cap):
-            self._refuse_room(file_info, StorageLimitExceeded(
+            self._give_up(file_info, StorageLimitExceeded(
                 "This deployment's storage limit would be exceeded",
                 kind='deployment', used=used, cap=cap))
 
-    def _refuse_room(self, file_info: dict, refusal: StorageLimitExceeded) -> None:
+    def _give_up(self, file_info: dict, error: FileServiceError) -> None:
         """Roll back (letting go of _claim_room's locks), remove the file that got no row, raise."""
         self.db.rollback()
         self._remove_blobs([file_info['storage_path']])
-        raise refusal
+        raise error
 
     def finalize_streaming_upload(self, file_info: dict, total_size: int, checksum: str,
                                   zk_key_version: Optional[int] = None,
@@ -1868,14 +1889,19 @@ class VaultService:
 
         try:
             self.db.commit()
-        except IntegrityError:
+        except IntegrityError as e:
             # The (vault, folder, name_bi) unique index rejected the insert — a same-name
             # row already exists (a lost concurrent race, or a non-replacing principal hit a
             # clash that appeared after the open() pre-check). Roll back (the old file's row,
             # only marked-deleted in this txn, is restored intact) and remove just the new
             # blob already written during streaming, then surface a clean 409.
+            #
+            # Or the insert named a row that is gone (a foreign key): the folder, deleted while the
+            # file was written -- the vault's row is locked, so not the vault. Said as what it is.
             self.db.rollback()
             self._remove_blobs([file_info['storage_path']])
+            if getattr(getattr(e, 'orig', None), 'pgcode', None) == _FOREIGN_KEY_VIOLATION:
+                raise DestinationGoneError(_GONE['folder']) from None
             raise DuplicateNameError("A file with that name already exists in this folder.")
         # A refresh failure AFTER a successful commit is non-fatal — the row is already durable. Guard
         # it so finalize never raises past the commit: otherwise the exception would reach a caller's
