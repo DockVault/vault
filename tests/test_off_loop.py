@@ -177,20 +177,38 @@ class _StaleEpoch(Exception):
     pass
 
 
-def test_work_on_the_session_that_fails_has_released_its_lock_before_the_request_goes_on():
+def _http_refusal():
+    from fastapi import HTTPException
+    return HTTPException(status_code=409, detail={"code": "stale_zk_epoch"})
+
+
+def _service_refusal():
+    from app.services.vault_service import StorageLimitExceeded
+    return StorageLimitExceeded("no room", kind="vault", used=1, cap=1)
+
+
+# What the work on a session raises after it took a lock: its own error, the HTTP refusal a completion raises
+# (a key that changed meanwhile), and a refusal of the service's (no room for the file).
+REFUSALS = [lambda: _StaleEpoch("the vault key changed during upload"), _http_refusal, _service_refusal]
+
+
+@pytest.mark.parametrize("refusal", REFUSALS, ids=["own", "http", "service"])
+def test_work_on_the_session_that_fails_has_released_its_lock_before_the_request_goes_on(refusal):
     """A completion takes the vault's row lock, then refuses the upload. Its error handling waits for the file's
     removal; another request that opens the vault must not find the lock still held meanwhile, or it waits for it
-    on the loop until the lock timeout, and every request with it."""
+    on the loop until the lock timeout, and every request with it. Whatever the refusal is."""
     db = _Session()
+    raised = refusal()
 
     def refuse_after_the_lock():
         db.lock_the_row()
-        raise _StaleEpoch("the vault key changed during upload")
+        raise raised
 
     async def scenario():
         try:
             await off_loop.run_to_end_on_session(db, refuse_after_the_lock)
-        except _StaleEpoch:
+        except type(raised) as caught:
+            assert caught is raised
             free_while_handling = db.row_lock.acquire(blocking=False)
             if free_while_handling:
                 db.row_lock.release()
