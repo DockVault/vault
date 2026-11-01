@@ -20179,8 +20179,8 @@ async def upload_file(
                 _reject_unreplaceable_upload(db, vault_id, folder_uuid, upload_file.filename, current_user)
 
                 # Start streaming upload (it may make and sync the folder's directory: off the event loop)
-                file_info, stream_ctx = await off_loop.run_to_end(
-                    vault_service.upload_file_streaming,
+                file_info, stream_ctx = await off_loop.run_to_end_on_session(
+                    db, vault_service.upload_file_streaming,
                     vault_id=vault_id,
                     file_name=upload_file.filename,
                     user=current_user,
@@ -20372,9 +20372,11 @@ async def upload_file(
                 # on the principal's file.delete capability — matching the pre-check — so a
                 # clash that appears after the pre-check can't let an upload-only cred
                 # silently overwrite (it surfaces as a 409 via the unique index instead).
-                # Off the event loop, to its end: a replaced file is overwritten before it goes.
-                file = await off_loop.run_to_end(
-                    vault_service.finalize_streaming_upload,
+                # Off the event loop, to its end: a replaced file is overwritten before it goes. When it fails,
+                # the replace's row locks and the rows it marked are rolled back before the error is handled,
+                # so the failure's audit record does not commit them.
+                file = await off_loop.run_to_end_on_session(
+                    db, vault_service.finalize_streaming_upload,
                     file_info=file_info,
                     total_size=final_size,
                     checksum=final_checksum,
@@ -23398,8 +23400,8 @@ async def copy_file_endpoint(
         # another user's file (same rule as every other replace path, _principal_can_replace_file).
         replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
         # Off the event loop, to its end: the copy reads, re-encrypts and syncs the whole file.
-        new_file = await off_loop.run_to_end(
-            vault_service.copy_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+        new_file = await off_loop.run_to_end_on_session(
+            db, vault_service.copy_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
             source_file_password=x_file_password, replace_same_name=replace)
         audit_logger.log_action(
             action='file_copy', status='success', user=current_user, resource_type='file',
@@ -23452,8 +23454,8 @@ async def move_file_endpoint(
         replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
         # Off the event loop, to its end: a move to another vault reads, re-encrypts and syncs the whole
         # file, then removes the source.
-        new_file = await off_loop.run_to_end(
-            vault_service.move_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+        new_file = await off_loop.run_to_end_on_session(
+            db, vault_service.move_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
             source_file_password=x_file_password, replace_same_name=replace)
         audit_logger.log_action(
             action='file_move', status='success', user=current_user, resource_type='file',
@@ -23545,8 +23547,9 @@ async def copy_folder_endpoint(
         require_cap(current_user, vault_id, "file.download")
         require_cap(current_user, vault_id, "file.upload")
         # Off the event loop, to its end: every file in the tree is read, re-encrypted and synced.
-        folder = await off_loop.run_to_end(
-            vault_service.copy_folder, folder_id, current_user, body.dest_vault_id, body.dest_parent_folder_id)
+        folder = await off_loop.run_to_end_on_session(
+            db, vault_service.copy_folder, folder_id, current_user, body.dest_vault_id,
+            body.dest_parent_folder_id)
         audit_logger.log_action(
             action='folder_copy', status='success', user=current_user, resource_type='folder',
             resource_id=str(folder_id),

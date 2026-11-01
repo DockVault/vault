@@ -5,16 +5,20 @@ encrypts them into the stored file and forces the file to the disk: seconds per 
 loop, so for its whole length the server answered nobody else, not even its health check. It now runs off
 the loop (app/core/off_loop.py), each step to its end.
 
-Here another client asks the health check and a vault listing over and over while uploads complete:
+Here another client asks the health check and a vault listing over and over while the work runs:
 - one resumable upload: none of those requests waits as long as a third of the completion, nor a second;
 - two at once: both are stored whole and read back the same, and the others are answered meanwhile;
 - a client that goes away the moment it asked for the completion: the upload is stored whole, listed once,
   and no file is left on the disk that no row lists;
+- a copy of a large file to another vault (read, decrypted, encrypted again and synced): the others are
+  answered meanwhile, and the copy reads back the same;
 - a zero-knowledge upload refused at completion because the vault's key changed meanwhile: the refusal takes
   the vault's row lock, and the assembled file is then removed, which takes seconds. Every request that opens
   the vault (a listing records when it was opened) still answers at once, not after waiting for that lock.
 
-The sizes are a few hundred MiB, so that a completion takes long enough to show a pause.
+The sizes are a few hundred MiB, so that the work takes long enough to show a pause. A single-request upload
+is capped at 64 MiB by default, too short for that; tests/test_off_loop_callers.py reads its steps, and
+every other step run off the loop, from the source.
 """
 import base64
 import hashlib
@@ -213,6 +217,30 @@ def test_a_client_that_leaves_as_it_asks_for_the_completion_still_gets_its_file_
         time.sleep(0.5)
     assert all(s["session_id"] != sid for s in admin.get(f"/vaults/{vault['id']}/uploads").json())
     assert _blobs_on_disk(vault["id"]) == 1
+
+
+def test_others_are_answered_while_a_file_is_copied_to_another_vault(admin, vault):
+    size = 256 * 1024 * 1024
+    pieces, sha = _payload(b"copied", size)
+    sid = _staged(admin, vault["id"], "copied.bin", pieces, size)
+    r = admin.session.post(f"{BASE}/vaults/{vault['id']}/uploads/{sid}/complete", timeout=600)
+    assert r.status_code == 200, r.text
+    source_id = r.json()["id"]
+    other = admin.create_vault(name="copy-to-" + uuid.uuid4().hex[:8])
+    try:
+        with _Asker(admin, vault["id"]) as asker:
+            start = time.monotonic()
+            r = admin.session.post(f"{BASE}/vaults/{vault['id']}/files/{source_id}/copy",
+                                   json={"dest_vault_id": other["id"]}, timeout=600)
+            end = time.monotonic()
+            time.sleep(0.3)
+        assert r.status_code == 200, r.text
+        _check_answered_during(asker, start, end)
+        (item,) = _listed(admin, other["id"], "copied.bin")
+        assert item["id"] == r.json()["id"]
+        assert _read_back(admin, other["id"], item["id"]) == sha
+    finally:
+        admin.delete_vault(other["id"])
 
 
 @pytest.fixture
