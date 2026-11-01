@@ -472,3 +472,13 @@ def test_the_page_lists_at_most_its_cap_of_reveals_and_says_more_were_left(db, p
         _revealed(db, people.v1, at=now - timedelta(minutes=minutes), by=f"auditor{minutes}")
     page = oa.page(db, people.olga)
     assert [r["auditor"] for r in page["reveals"]] == ["auditor1", "auditor2"] and page["reveals_more"] is True
+
+
+def test_exactly_the_cap_of_reveals_is_listed_whole_with_none_said_to_be_left(db, people, monkeypatch):
+    monkeypatch.setattr(oa, "REVEALS_SHOWN", 2)
+    now = rights.utcnow()
+    for minutes in (1, 2):
+        _revealed(db, people.v1, at=now - timedelta(minutes=minutes), by=f"auditor{minutes}")
+    page = oa.page(db, people.olga)
+    assert [r["auditor"] for r in page["reveals"]] == ["auditor1", "auditor2"]
+    assert page["reveals_more"] is False, "as many reveals as the cap: none was left out"

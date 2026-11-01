@@ -113,8 +113,21 @@
         pending: 'Waiting for approval', rejected: 'Turned down', withdrawn: 'Withdrawn',
         expired_unapproved: 'Expired before approval' };
 
+    // A sign-out here begins the next person's time on this tab (forgetStanding counts it). The answer to a call made
+    // before it is kept from them: its promise never settles, so no page, banner, count or receipt of the person who
+    // signed out is drawn or kept after they have gone.
+    let signIns = 0;
+    function forThisSignIn(promise) {
+        const asked = signIns;
+        const dropped = () => new Promise(() => {});
+        return promise.then((value) => (asked === signIns ? value : dropped()),
+            (err) => (asked === signIns ? Promise.reject(err) : dropped()));
+    }
+
     function call(path, options) {
-        if (typeof apiRequest === 'function') return apiRequest(path, Object.assign({ silent: true }, options || {}));
+        if (typeof apiRequest === 'function') {
+            return forThisSignIn(apiRequest(path, Object.assign({ silent: true }, options || {})));
+        }
         return Promise.reject(new Error('not signed in'));
     }
 
@@ -176,8 +189,17 @@
 
     async function unlock(vaultId) {
         if (typeof showPrompt !== 'function') return;
-        const password = await showPrompt('Give this vault\'s password to see the names of the files opened in it.',
-            'Unlock ' + vaultName(vaultId), { password: true, placeholder: 'Vault password' });
+        // The prompt is asked from within Access to my vaults: lifted above that dialog while it asks, as the
+        // step-up is above any dialog, or it opens behind it and its buttons cannot be reached.
+        const prompt = document.getElementById('confirm-modal');
+        if (prompt) prompt.style.zIndex = '1100';
+        let password;
+        try {
+            password = await showPrompt('Give this vault\'s password to see the names of the files opened in it.',
+                'Unlock ' + vaultName(vaultId), { password: true, placeholder: 'Vault password' });
+        } finally {
+            if (prompt) prompt.style.zIndex = '';
+        }
         if (!password) return;
         try {
             const out = await call('/me/compliance-access/vaults/' + encodeURIComponent(vaultId) + '/unlock',
@@ -445,8 +467,12 @@
     // A call to the server: JSON in and out (``json``), or the Response itself (``raw``). A step the server guards
     // with the step-up comes back as its 403 (second_factor_required): the app's dialog asks for the password and the
     // code, and the call is made once more with the receipt. Every other refusal is thrown with its status, reason and
-    // the server's own words.
-    async function cmp(path, opts) {
+    // the server's own words. An answer that comes after a sign-out is kept from the next person (forThisSignIn).
+    function cmp(path, opts) {
+        return forThisSignIn(cmpNow(path, opts));
+    }
+
+    async function cmpNow(path, opts) {
         opts = opts || {};
         const headers = Object.assign({}, opts.headers || {});
         if (opts.json !== undefined) headers['Content-Type'] = 'application/json';
@@ -694,7 +720,21 @@
         else setCount(0);
     }
 
+    // On sign-out: nothing of this person stays for the next one on the tab. Their standing and receipts are
+    // forgotten, an answer still on its way is dropped (forThisSignIn), and what the pages drew is taken out of the
+    // page: the Compliance page (a case, its files and their names), Access to my vaults, an open sheet (a case's
+    // justification as typed) and a vault's review banner. Each is drawn again from the server for the next person.
     function forgetStanding() {
+        signIns += 1;
+        const page = root();
+        if (page) page.replaceChildren();
+        const mine = document.getElementById('my-access-body');
+        if (mine) mine.replaceChildren();
+        const dialogBox = document.getElementById('my-access-modal');
+        if (dialogBox) dialogBox.classList.remove('active');
+        document.querySelectorAll('.cmp-sheet').forEach((s) => s.remove());
+        const review = document.getElementById('vault-review-banner');
+        if (review) review.remove();
         CP.admin = false; CP.me = null; CP.live = false;
         CP.cases = CP.holds = CP.grants = null; CP.screen = 'list'; CP.caseId = null;
         window.complianceAuditorLive = false;

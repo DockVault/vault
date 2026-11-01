@@ -188,6 +188,50 @@ def test_newer_and_older_work_on_an_event_opened_from_a_link(page: Page, admin, 
     expect(pane).to_be_visible()
 
 
+# Marks, in the page, when the body of the answer to a given address has been read (the page reads it with
+# .json()): what the page does with it runs right after, before the next task.
+_WATCH_READ = """(part) => {
+    window.__readDone = false;
+    const json = Response.prototype.json;
+    Response.prototype.json = function () {
+        const url = this.url;
+        const read = json.call(this);
+        read.then(() => { if (url.includes(part)) window.__readDone = true; }, () => {});
+        return read;
+    };
+}"""
+
+
+def test_a_row_chosen_while_an_event_from_a_link_is_read_stands(page: Page, admin, activity_admin):
+    """The event a link names is not on the list's page, so it is read on its own; that read is held while another
+    row is chosen. When it comes, the chosen row stays in the details: the linked event is neither drawn nor opened
+    over it."""
+    events = admin.get("/activity/events", params={"limit": 100}).json()["events"]
+    assert len(events) == 100
+    target, chosen = events[70], events[5]
+    linked = f"**/activity/events/{target['id']}*"
+    held = []
+    page.route(linked, lambda route: held.append(route))
+    login(page, activity_admin, path=f"/#activity?range=all&ev={target['id']}")
+    for _ in range(300):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "the linked event is read on its own"
+    pane = page.locator("#act-detail")
+    stored = pane.locator(".act-d-stored")
+    page.locator(f'#activity-rows tr.act-row[data-id="{chosen["id"]}"]').click()
+    expect(stored).to_contain_text(chosen["id"][:8], timeout=10000)
+    page.evaluate(_WATCH_READ, target["id"])
+    for route in held:
+        route.continue_()
+    page.unroute(linked)
+    page.wait_for_function("() => window.__readDone === true", timeout=15000)
+    page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
+    expect(stored).to_contain_text(chosen["id"][:8])
+    expect(stored).not_to_contain_text(target["id"][:8])
+
+
 def test_the_page_size_is_kept_after_signing_in_again(page: Page, activity_admin):
     login(page, activity_admin)
     open_activity(page)
