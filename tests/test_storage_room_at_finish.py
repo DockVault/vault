@@ -9,7 +9,8 @@ every one of them reaches, now reads both totals under locks held until its comm
 it finds no room for is refused there, rolled back and removed.
 
 These run the real finalize against an in-memory session that applies the queries' filters
-(tests/_memory_db.py) and records each lock, statement and lock_timeout change in order.
+(tests/_memory_db.py) and records each lock, statement and lock_timeout change in order, and the removal of a
+refused file.
 tests/test_vault_size_accounting.py finishes uploads, copies and moves at the same moment on a running stack.
 """
 import ast
@@ -77,7 +78,14 @@ def _service(db, removed):
     svc = vs.VaultService.__new__(vs.VaultService)
     svc.db = db
     svc.storage_path = None
-    svc._remove_blobs = lambda paths: removed.extend(paths)
+
+    def remove(paths):
+        # In the session's log too, so a test sees whether the file went before or after the rollback. (A finish
+        # that stores its file asks for the removal of the files it replaced, none here.)
+        if paths:
+            db.log.append(("removed",))
+        removed.extend(paths)
+    svc._remove_blobs = remove
 
     def staged(*a, **k):
         db.log.append(("replace staged",))
@@ -190,8 +198,9 @@ def test_a_file_the_vault_has_no_room_for_is_refused_rolled_back_and_removed(fin
     assert refused.value.kind == "vault"
     assert isinstance(refused.value, vs.FileTooLargeError), "the routes answer it as a 413"
     # Refused before anything was staged or written, then rolled back: the lock is let go, and a file it
-    # was to replace is untouched.
-    assert _kinds(db) == VAULT_ROW + [("rollback",)], _kinds(db)
+    # was to replace is untouched. The new file is removed only after that: its removal overwrites the whole
+    # file, and every request that opens the vault would wait for the row lock meanwhile.
+    assert _kinds(db) == VAULT_ROW + [("rollback",), ("removed",)], _kinds(db)
     assert len(removed) == 1 and removed[0].startswith(f"{vault.id}/files/new-"), removed
     assert vault.total_size_bytes == 48 * MB
 
@@ -236,7 +245,9 @@ def test_a_file_the_deployment_has_no_room_for_is_refused_rolled_back_and_remove
     with pytest.raises(vs.StorageLimitExceeded) as refused:
         call(db, vault, 16 * MB, cap=100 * MB, used=90 * MB)
     assert (refused.value.kind, refused.value.used, refused.value.cap) == ("deployment", 90 * MB, 100 * MB)
-    assert _kinds(db) == TURN + VAULT_ROW + [("deployment total",), ("rollback",)], _kinds(db)
+    # The turn and the row let go before the new file is removed, as for the vault's limit: no finish anywhere
+    # in the deployment waits for its turn while this one overwrites a file nobody will keep.
+    assert _kinds(db) == TURN + VAULT_ROW + [("deployment total",), ("rollback",), ("removed",)], _kinds(db)
     assert len(removed) == 1
 
 
@@ -249,7 +260,8 @@ def test_the_turn_and_the_longer_wait_are_only_postgres(finish):
     db = _DB({Vault: [vault]}, dialect="sqlite")
     with pytest.raises(vs.StorageLimitExceeded):
         call(db, vault, 16 * MB, cap=10 * MB, used=0)
-    assert _kinds(db) == [("lock", "Vault", {"key_share": True}), ("deployment total",), ("rollback",)]
+    assert _kinds(db) == [("lock", "Vault", {"key_share": True}), ("deployment total",), ("rollback",),
+                          ("removed",)]
 
 
 def test_the_turn_is_decided_once_a_transaction(limits):
