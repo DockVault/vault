@@ -278,6 +278,35 @@ def test_a_downgrade_across_a_blocked_upgrade_is_never_reversible():
     assert plan["known"] and plan["irreversible"]
 
 
+def _three_releases(first_reversible, second_reversible):
+    """0.1.0 -> 0.2.0 -> 0.3.0: two upgrades, each reversible or not as asked."""
+    matrix = _matrix(reversible=first_reversible)
+    matrix["versions"]["0.3.0"] = {"released": "2026-01-03", "notes": "c"}
+    matrix["edges"].append({"from": "0.2.0", "to": "0.3.0", "kind": "direct",
+                            "reversible": second_reversible, "requires_backup": False})
+    return matrix
+
+
+@pytest.mark.parametrize("first, second", [(True, True), (True, False), (False, True), (False, False)])
+def test_a_downgrade_over_two_upgrades_is_reversible_only_when_both_are(first, second):
+    plan = dv.plan_downgrade_path(_three_releases(first, second), "0.3.0", "0.1.0")
+    assert plan["known"] and len(plan["steps"]) == 2
+    assert plan["irreversible"] is not (first and second)
+
+
+def test_a_downgrade_over_two_upgrades_one_of_them_one_way_says_so_and_is_refused(tmp_path, monkeypatch,
+                                                                                    capsys):
+    tool = _deployment(tmp_path, version="0.3.0", matrix=_three_releases(True, False))
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.3.0", "the running container"))
+    with pytest.raises(SystemExit):
+        _update(tool, tag="v0.1.0", dry_run=True)
+    out = capsys.readouterr().out
+    assert "steps        : 2 adjacent release(s) back, taking back the upgrade 0.1.0 -> 0.3.0" in out, out
+    assert "reversible   : no" in out and "reversible   : yes" not in out, out
+    assert "is a downgrade this deployment cannot take" in out, out
+
+
 def test_a_one_way_hop_is_summarised_as_needing_the_backup_it_takes(tmp_path, monkeypatch, capsys):
     """The summary and the gate read one rule. A one-way hop whose edge does not itself ask for a
     backup -- the shape two real edges had -- used to print "backup: not required" and then demand
