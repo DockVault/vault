@@ -320,7 +320,12 @@ def test_the_band_stays_one_row_in_classic_at_1280_px(page: Page, activity_admin
     so the list starts near the top of the window instead of below a band twice as tall."""
     page.add_init_script("try { localStorage.setItem('ui', 'v1'); } catch (e) {}")
     login(page, activity_admin, width=1280, height=800)
-    open_activity(page)
+    # The integrity strip above the band is drawn from its own answer, which may come after the list's: measured
+    # before it is drawn, the strip reads 0 and the list is then moved down by it.
+    with page.expect_response(lambda r: "/activity/integrity" in r.url, timeout=15000) as integrity:
+        open_activity(page)
+    if integrity.value.ok:
+        expect(page.locator("#act-integrity")).to_be_visible(timeout=10000)
     at = page.evaluate("""() => {
         const band = document.querySelector('.act-band');
         const tops = ['now', 'time', 'cat', 'signin', 'active']
