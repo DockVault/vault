@@ -141,7 +141,7 @@ While a legal hold stands, or what a hold kept (files, folders, the old names of
 a release before 0.34.0 would destroy it. From 0.33.1 on, an older release refuses to start on such data, and
 `dockvault.py update` refuses the rollback. To roll back: release every hold (on the Compliance page or with
 `dockvault.py cases`), wait until what they kept is purged (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS` after the release),
-then start this version once more so it removes the marker. A release before 0.33.1 does not read the marker: never roll back that far while holds exist.
+then start 0.34.0 or later once more so it removes the marker. A release before 0.33.1 does not read the marker: never roll back that far while holds exist.
 
 ### Someone else giving access
 

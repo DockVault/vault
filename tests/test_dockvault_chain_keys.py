@@ -1105,3 +1105,23 @@ def test_the_restore_mark_is_synced_once_it_has_its_name(tmp_path):
     steps = [step.strip().split()[0] for step in script.split("&&")]
     assert steps == ["cat", "chown", "chmod", "mv", "sync"], script
     assert seen["cmd"][-1] == "audit-chain-head.json.restore-pending" and seen["input"] == "{}"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "O_DIRECTORY"), reason="a directory cannot be synced here")
+def test_reset_moves_the_kept_key_aside_and_syncs_the_move_before_it_returns(tmp_path, monkeypatch):
+    """Reset moves the destroyed set's kept old key aside under a name no set reads; the move is on the disk (the
+    directory synced after the rename) before it returns, or a power cut could put the file back under the set's
+    name, and a new set of that prefix would be refused its key change until it is moved by hand."""
+    import os
+    kept = _kept(tmp_path)
+    kept.write_text(dv.gen_hex(32) + "\n", encoding="utf-8")
+    events = []
+    real_rename = os.rename
+    monkeypatch.setattr(os, "rename", lambda a, b: (events.append(("rename", str(a), str(b))), real_rename(a, b))[1])
+    _fsyncs(monkeypatch, events)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    moved = tool._archive_kept_key(dv.DEFAULT_PROJECT)
+    assert moved is not None and not kept.exists() and Path(moved).is_file()
+    renames = [i for i, e in enumerate(events) if e[0] == "rename"]
+    assert [events[i][1:] for i in renames] == [(str(kept), moved)], events
+    assert ("dir", tmp_path.stat().st_ino) in events[renames[0] + 1:], events

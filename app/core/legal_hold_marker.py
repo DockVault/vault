@@ -29,9 +29,12 @@ TABLE = "data_requirements"
 INTRODUCED = "0.34.0"
 REASON = ("Legal holds keep files deleted from vaults, and the old names of renamed ones, until their release and "
           "purge. A release before {introduced} would destroy the kept files and keep nothing more.")
+# How to undo it, as an older release prints it after "To go back to this version, first undo it with the newer
+# version:", so it names the release that removes the marker ({version}: the one the marker asks for), never "this
+# version", which there reads as the older release that refuses.
 UNDO = ("Release every legal hold (on the Compliance page, or with dockvault.py cases), wait until what they kept "
-        "is purged (COMPLIANCE_HOLD_PURGE_DELAY_DAYS after the release), then start this version once so it "
-        "removes this marker.")
+        "is purged (COMPLIANCE_HOLD_PURGE_DELAY_DAYS after the release), then start DockVault {version} or later "
+        "once so it removes this marker.")
 
 # The detect query of the upgrade condition: a row while a hold stands or a kept row remains (the three kept tables
 # the vaults trigger counts, app/core/kept_tables.py).
@@ -75,8 +78,9 @@ def sync(db, *, now: Optional[datetime] = None) -> bool:
         db.execute(text(f"DELETE FROM {TABLE} WHERE key = :key"), {"key": KEY})
         return False
     when = now or datetime.now(timezone.utc).replace(tzinfo=None)
-    params = {"key": KEY, "version": required_version(), "reason": REASON.format(introduced=INTRODUCED),
-              "undo": UNDO, "since": when}
+    version = required_version()
+    params = {"key": KEY, "version": version, "reason": REASON.format(introduced=INTRODUCED),
+              "undo": UNDO.format(version=version), "since": when}
     updated = db.execute(text(f"UPDATE {TABLE} SET requires_at_least = :version, reason = :reason, undo = :undo "
                               "WHERE key = :key"), params).rowcount
     if not updated:

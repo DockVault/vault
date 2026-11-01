@@ -3,15 +3,17 @@
 Stored bytes reach the disk before a row or an answer says they exist (app/core/durable_write.py): every
 writer of stored bytes syncs the file, its name in its directory, and each directory it makes, before
 the commit. That holds only while no writer is added that skips it, so this lists every call in app/
-that writes a file -- an open for writing (open, io.FileIO, the gzip, bz2, lzma and tar files, anyio's
-open_file, a file database, fileinput in place), write_bytes and write_text, a rename or a replace into
-place (os's, or aiofiles' async os), a shutil copy or move, Path's copy and move, an archive extracted, a
+that writes a file -- an open for writing (open, io.FileIO, the gzip, bz2, lzma, zstd and tar files, under
+their names in the compression package too, a zip file, anyio's open_file, a file database, fileinput in
+place), write_bytes and write_text, a rename or a replace into place (os's, aiofiles' async os, or Path's,
+its target given by keyword too), a shutil copy or move, Path's copy and move, an archive extracted, a
 node made, a temporary file or directory that is kept, a log file handler (or a class made from one) or a
 logging configuration given a file, an image or a document saved, a process started, a directory made,
 any of them called through another name an assignment, a default argument or a class body gives it, held
-in a dict, a list or a tuple, named by getattr, through a module import_module or __import__ gives,
-through __call__, brought in by a star import, or handed to another call to run -- by the function it is
-in, and requires each one to be either:
+in a dict, a list or a tuple, named by getattr (with a name the scan cannot read, on anything), by a
+namespace's subscript (globals(), vars(), a module's __dict__, the builtins) or by a methodcaller, through
+a module import_module, __import__ or sys.modules gives, through __call__, brought in by a star import,
+or handed to another call to run -- by the function it is in, and requires each one to be either:
 
 - a writer of stored bytes, synced through durable_write: the entry names the function that syncs it
   and the durable_write calls made there, and the test checks that they are; or
@@ -109,7 +111,12 @@ _MODE = re.compile(r"^[rwxabtU+]{1,5}$")
 # Functions and classes that open a file by name, with the mode as their second argument.
 _OPENERS = {"open", "builtins.open", "io.open", "io.FileIO", "os.fdopen", "codecs.open", "gzip.open", "gzip.GzipFile",
             "bz2.open", "bz2.BZ2File", "lzma.open", "lzma.LZMAFile", "tarfile.open", "tarfile.TarFile",
-            "anyio.open_file"}
+            "anyio.open_file",
+            # Python 3.14's compression package: zstd, and the others under their new names.
+            "compression.zstd.open", "compression.zstd.ZstdFile", "compression.gzip.open", "compression.gzip.GzipFile",
+            "compression.bz2.open", "compression.bz2.BZ2File", "compression.lzma.open", "compression.lzma.LZMAFile"}
+# Archives opened by name, with the mode as their second argument (a ZipFile's subclasses too).
+_ZIP_OPENERS = {"zipfile.ZipFile", "zipfile.PyZipFile"}
 # Databases kept in a file, with their flag as the second argument and the flag they take when given none: they
 # write unless opened read-only ("r").
 _FLAGGED_OPENERS = {"shelve.open": "c", "dbm.open": "r", "dbm.gnu.open": "r", "dbm.ndbm.open": "r",
@@ -144,13 +151,11 @@ _TARGET_METHODS = {"copy", "move", "save"}
 _NOT_TARGET_METHODS = {"copy.copy", "copy.deepcopy"}
 # Every function the scan knows to write, by its full name: what a module's star import may bring in, and what a
 # call may be handed to run.
-_KNOWN = (_OPENERS | set(_FLAGGED_OPENERS) | _WRITERS
+_KNOWN = (_OPENERS | set(_FLAGGED_OPENERS) | _WRITERS | _ZIP_OPENERS
           | {"os.open", "sqlite3.connect", "tempfile.NamedTemporaryFile", "tempfile.TemporaryDirectory",
-             "zipfile.ZipFile", "logging.basicConfig", "fileinput.input", "fileinput.FileInput"})
+             "logging.basicConfig", "fileinput.input", "fileinput.FileInput"})
 # The last part of each such name: what an attribute of a module the scan cannot name may be.
 _KNOWN_LAST = {name.rsplit(".", 1)[1] for name in _KNOWN if "." in name}
-# Modules whose attribute named by a string the scan cannot read may be any of their writers.
-_WRITER_MODULES = {name.rsplit(".", 1)[0] for name in _KNOWN if "." in name} | {"builtins", "pathlib"}
 # Calls that run a function they are handed, by where it is among their arguments (its own arguments follow it).
 _RUNNERS = {"asyncio.to_thread": 0, "anyio.to_thread.run_sync": 0}
 _RUNNER_METHODS = {"run_in_executor": 1, "submit": 0}
@@ -190,8 +195,11 @@ def _text(node) -> str:
 
 
 def _given_module(node, imports):
-    """The module ``importlib.import_module("name")`` or ``__import__("name")`` gives: its name, "" for a name the scan
-    cannot read, None when ``node`` is no such call."""
+    """The module ``importlib.import_module("name")``, ``__import__("name")`` or ``sys.modules["name"]`` gives: its
+    name, "" for a name the scan cannot read, None when ``node`` is no such call or subscript."""
+    if isinstance(node, ast.Subscript) and _qualified(node.value, imports) == "sys.modules":
+        key = node.slice
+        return key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else ""
     if not (isinstance(node, ast.Call) and node.args and _qualified(node.func, imports) in _MODULE_GIVERS):
         return None
     first = node.args[0]
@@ -228,11 +236,66 @@ def _named_attribute(call: ast.Call):
     return None
 
 
-def _unknown_attribute_of_a_writer_module(call: ast.Call, imports) -> bool:
-    """``getattr(module, name)`` with a name the scan cannot read, of a module that has writers."""
-    return (isinstance(call.func, ast.Name) and call.func.id == "getattr" and len(call.args) >= 2
-            and not (isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str))
-            and _qualified(call.args[0], imports) in _WRITER_MODULES)
+def _unread_attribute(call: ast.Call) -> bool:
+    """``getattr(obj, name)`` with a name the scan cannot read, of anything (a module that has writers, a Path): called,
+    it may be any of their writers, so it counts as a write, as a mode the scan cannot read does."""
+    return (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "getattr"
+            and len(call.args) >= 2
+            and not (isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str)))
+
+
+def _method_caller(node, imports):
+    """``operator.methodcaller("name", ...)``: the name of the method it calls ("" for one the scan cannot read); None
+    when ``node`` is no such call."""
+    if not (isinstance(node, ast.Call) and node.args and _qualified(node.func, imports) == "operator.methodcaller"):
+        return None
+    first = node.args[0]
+    return first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else ""
+
+
+def _method_called(caller: ast.Call, call: ast.Call, imports):
+    """The call a methodcaller ``caller`` makes when it is called as ``call``: its method, of the object ``call`` is
+    given, with the methodcaller's own arguments; None when the scan cannot read the method's name."""
+    name = _method_caller(caller, imports)
+    if not name:
+        return None
+    target = call.args[0] if call.args else ast.Name(id="_", ctx=ast.Load())
+    return ast.Call(func=ast.Attribute(value=target, attr=name, ctx=ast.Load()), args=list(caller.args[1:]),
+                    keywords=list(caller.keywords))
+
+
+def _namespace(node):
+    """What a subscript of ``node`` by a string gives, when ``node`` is a namespace: "" when its entries are names
+    (``globals()``, ``locals()``, ``vars()`` and the builtins: ``__builtins__``, ``builtins.__dict__``,
+    ``vars(builtins)``), the object whose attributes they are for ``vars(obj)`` and ``obj.__dict__``; None for anything
+    else."""
+    node = _resolved(node)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+        if node.func.id in ("globals", "locals", "vars") and not node.args:
+            return ""
+        if node.func.id == "vars" and len(node.args) == 1:
+            return "" if _text(node.args[0]) in ("builtins", "__builtins__") else node.args[0]
+        return None
+    if isinstance(node, ast.Name) and node.id == "__builtins__":
+        return ""
+    if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+        return "" if _text(node.value) in ("builtins", "__builtins__") else node.value
+    return None
+
+
+def _resolved(node):
+    """``node`` with each subscript of a namespace by a string read as what it names: ``globals()["__builtins__"]
+    ["open"]`` as ``open``, ``vars(shutil)["copyfile"]`` as ``shutil.copyfile``; ``node`` itself when it holds none."""
+    if isinstance(node, ast.Attribute):
+        value = _resolved(node.value)
+        return node if value is node.value else ast.Attribute(value=value, attr=node.attr, ctx=ast.Load())
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+        space = _namespace(node.value)
+        if isinstance(space, str):
+            return ast.Name(id=node.slice.value, ctx=ast.Load())
+        if space is not None:
+            return ast.Attribute(value=space, attr=node.slice.value, ctx=ast.Load())
+    return node
 
 
 def _is_writer_reference(node, imports, aliases=None, depth: int = 0) -> bool:
@@ -240,7 +303,14 @@ def _is_writer_reference(node, imports, aliases=None, depth: int = 0) -> bool:
     __call__, a name an assignment binds to one, or a dict, a list or a tuple holding one."""
     if depth > 5:
         return False
+    resolved = _resolved(node)
+    if resolved is not node:
+        return _is_writer_reference(resolved, imports, aliases, depth + 1)
     if isinstance(node, ast.Call):
+        if _method_caller(node, imports) is not None:
+            # A methodcaller handed to a call: judged as the method call it makes.
+            made = _method_called(node, ast.Call(func=node, args=[], keywords=[]), imports)
+            return made is None or is_writer(made, imports, aliases, depth + 1)
         named = _named_attribute(node)
         return named is not None and _is_writer_reference(named, imports, aliases, depth + 1)
     if isinstance(node, ast.Subscript):
@@ -362,9 +432,12 @@ def _flags_write(flags) -> bool:
     return bool(flags_named & _WRITE_FLAGS) or not flags_named
 
 
-def _through(bound, call: ast.Call) -> ast.Call:
-    """``call`` made through a name bound to ``bound``: the call of what it names, a partial's own arguments first."""
-    if isinstance(bound, ast.Call):
+def _through(bound, call: ast.Call, imports: dict = None) -> ast.Call:
+    """``call`` made through a name bound to ``bound``: the call of what it names, a partial's own arguments first.
+    Given ``imports``, a bound call that is no partial (a methodcaller, a getattr) is a call that gives the function,
+    which ``call`` then calls."""
+    if isinstance(bound, ast.Call) and (
+            imports is None or _qualified(bound.func, imports) in ("functools.partial", "partial")):
         return ast.Call(func=bound.args[0], args=list(bound.args[1:]) + list(call.args),
                         keywords=list(bound.keywords) + list(call.keywords))
     return ast.Call(func=bound, args=list(call.args), keywords=list(call.keywords))
@@ -381,6 +454,8 @@ def _bindings(func, imports: dict, aliases: dict) -> list:
                 out.append(named)
             elif _qualified(bound.func, imports) in ("functools.partial", "partial") and bound.args:
                 out.append(bound)
+            elif _method_caller(bound, imports) is not None or _unread_attribute(bound):
+                out.append(bound)                       # a call that gives the function: m = methodcaller(...)
         elif isinstance(bound, (ast.Name, ast.Attribute, ast.Subscript)) and _text(bound) != _text(func):
             out.append(bound)
     if isinstance(func, ast.Attribute):
@@ -408,9 +483,14 @@ def _through_held(held, call: ast.Call) -> ast.Call:
 
 def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 0) -> bool:
     func = call.func
+    resolved = _resolved(func)
+    if resolved is not func and depth < 5:
+        # A function a namespace's subscript names: globals()["__builtins__"]["open"](p, "w") is open(p, "w").
+        return is_writer(ast.Call(func=resolved, args=list(call.args), keywords=list(call.keywords)), imports,
+                         aliases, depth + 1)
     if aliases and depth < 5:
         # A writer called through another name: `o = open` then `o(p, "w")`.
-        if any(is_writer(_through(bound, call), imports, aliases, depth + 1)
+        if any(is_writer(_through(bound, call, imports), imports, aliases, depth + 1)
                for bound in _bindings(func, imports, aliases)):
             return True
     if isinstance(func, ast.Subscript) and depth < 5:
@@ -428,8 +508,12 @@ def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 
         if named is not None:
             return is_writer(ast.Call(func=named, args=list(call.args), keywords=list(call.keywords)), imports,
                              aliases, depth + 1)
-        if _unknown_attribute_of_a_writer_module(func, imports):
-            return True                                 # a writer module's attribute the scan cannot name
+        if _unread_attribute(func):
+            return True                                 # an attribute the scan cannot name: getattr(p, name)(...)
+        if _method_caller(func, imports) is not None:
+            # operator.methodcaller("write_text", "x")(p) is p.write_text("x").
+            made = _method_called(func, call, imports)
+            return made is None or is_writer(made, imports, aliases, depth + 1)
         if _qualified(func.func, imports) in ("functools.partial", "partial") and func.args:
             return is_writer(_through(func, call), imports, aliases, depth + 1)
         return False
@@ -463,7 +547,7 @@ def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 
         if inplace is None and len(call.args) > 1:
             inplace = call.args[1]
         return inplace is not None and not (isinstance(inplace, ast.Constant) and not inplace.value)
-    if name == "zipfile.ZipFile":
+    if name in _ZIP_OPENERS:
         mode = _keyword(call, "mode") or (call.args[1] if len(call.args) > 1 else None)
         return _writes_in_mode(mode)
     if isinstance(func, ast.Attribute):
@@ -483,9 +567,11 @@ def is_writer(call: ast.Call, imports: dict, aliases: dict = None, depth: int = 
             return True
         if func.attr in _TARGET_METHODS and (call.args or call.keywords) and name not in _NOT_TARGET_METHODS:
             return True                                 # Path.copy(target), Path.move(target)
-        # Path.rename(target) and Path.replace(target): one argument, where str.replace takes two and
-        # datetime.replace keywords.
-        if func.attr in ("rename", "replace") and len(call.args) == 1 and not call.keywords:
+        # Path.rename(target) and Path.replace(target): one argument, or the keyword target alone, where str.replace
+        # takes two and datetime.replace other keywords.
+        if func.attr in ("rename", "replace") and (
+                (len(call.args) == 1 and not call.keywords)
+                or (not call.args and [k.arg for k in call.keywords] == ["target"])):
             return True
     return False
 
@@ -760,7 +846,7 @@ def test_the_new_forms_that_read_or_hold_no_file_stay_alone():
         "def r(p, d, x, loop, pool, name):\n"
         "    d.copy(); copy.copy(x); copy.deepcopy(x); x.copy()\n"
         "    loop.run_in_executor(None, open, p); asyncio.to_thread(open, p, 'rb'); pool.submit(len, p)\n"
-        "    loop.run_in_executor(None, lambda: len(p)); getattr(shutil, 'which')(p); getattr(x, name)()\n"
+        "    loop.run_in_executor(None, lambda: len(p)); getattr(shutil, 'which')(p); getattr(x, 'upper')()\n"
         "    logging.basicConfig(level=10); sorted(p, key=len); partial(open, mode='rb')(p)\n"
         "    os.open(p, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))\n"
     )
@@ -837,6 +923,61 @@ _MORE_FORMS = {
         "    threading.Thread(target=save, args=(path, mode))\n", "added_writer"),
     "a writer held in a dict, handed to a call": (
         "def added_writer(path, mode):\n    list(map({'w': os.replace}['w'], [path], [mode]))\n", "added_writer"),
+    # Python 3.14's compression package: zstd, and the others under their new names.
+    "the compression package's zstd file": (
+        "def added_writer(path, mode):\n    from compression import zstd\n    zstd.ZstdFile(path, 'wb').write(b'x')\n",
+        "added_writer"),
+    "the compression package's gzip file, by another name": (
+        "def added_writer(path, mode):\n    from compression import gzip as cgzip\n"
+        "    cgzip.GzipFile(path, 'wb').write(b'x')\n", "added_writer"),
+    "the compression package's bz2 file": (
+        "def added_writer(path, mode):\n    import compression.bz2\n"
+        "    compression.bz2.BZ2File(path, 'wb').write(b'x')\n", "added_writer"),
+    "the compression package's lzma file, imported by its name": (
+        "def added_writer(path, mode):\n    from compression.lzma import LZMAFile\n"
+        "    LZMAFile(path, 'wb').write(b'x')\n", "added_writer"),
+    "the compression package's zstd opener": (
+        "def added_writer(path, mode):\n    from compression import zstd\n    zstd.open(path, 'wb').write(b'x')\n",
+        "added_writer"),
+    "Path.rename given its target by keyword": (
+        "def added_writer(path, mode):\n    from pathlib import Path\n    Path(path).rename(target=mode)\n",
+        "added_writer"),
+    "Path.replace given its target by keyword": (
+        "def added_writer(path, mode):\n    from pathlib import Path\n    Path(path).replace(target=mode)\n",
+        "added_writer"),
+    "a PyZipFile": (
+        "def added_writer(path, mode):\n    import zipfile\n    zipfile.PyZipFile(path, 'w').writestr('a', 'b')\n",
+        "added_writer"),
+    "a methodcaller": (
+        "def added_writer(path, mode):\n    import operator\n    from pathlib import Path\n"
+        "    operator.methodcaller('write_text', 'x')(Path(path))\n", "added_writer"),
+    "a methodcaller bound to a name": (
+        "def added_writer(path, mode):\n    from operator import methodcaller\n    from pathlib import Path\n"
+        "    save = methodcaller('write_text', 'x')\n    save(Path(path))\n", "added_writer"),
+    "a methodcaller handed to a call": (
+        "def added_writer(path, mode):\n    import operator\n    from pathlib import Path\n"
+        "    list(map(operator.methodcaller('write_text', 'x'), [Path(path)]))\n", "added_writer"),
+    "a methodcaller of a method the scan cannot name": (
+        "def added_writer(path, mode):\n    import operator\n    from pathlib import Path\n"
+        "    operator.methodcaller(mode, 'x')(Path(path))\n", "added_writer"),
+    "open named in the builtins through globals()": (
+        "def added_writer(path, mode):\n    globals()['__builtins__']['open'](path, 'w')\n", "added_writer"),
+    "open named through vars(builtins)": (
+        "def added_writer(path, mode):\n    import builtins\n    vars(builtins)['open'](path, 'w')\n", "added_writer"),
+    "open as an attribute of __builtins__": (
+        "def added_writer(path, mode):\n    getattr(__builtins__, 'open')(path, 'w')\n", "added_writer"),
+    "a writer named through its module's __dict__": (
+        "def added_writer(path, mode):\n    import shutil\n    shutil.__dict__['copyfile'](path, mode)\n",
+        "added_writer"),
+    "a module sys.modules gives": (
+        "def added_writer(path, mode):\n    import sys\n    sys.modules['shutil'].copyfile(path, mode)\n",
+        "added_writer"),
+    "getattr with a name the scan cannot read, on a Path": (
+        "def added_writer(path, mode):\n    from pathlib import Path\n    getattr(Path(path), mode)('x')\n",
+        "added_writer"),
+    "getattr with a name the scan cannot read, bound to a name": (
+        "def added_writer(path, mode):\n    from pathlib import Path\n    put = getattr(Path(path), mode)\n"
+        "    put('x')\n", "added_writer"),
 }
 
 
@@ -867,6 +1008,24 @@ def test_the_further_forms_that_read_or_hold_no_file_stay_alone():
         "    {'r': len}['r'](p); [len][0](p); n(p); k(q); _Error(p)\n"
         "    len.__call__(p); q.save(); js = json\n"
         "    js.dumps(p)\n"
+    )
+    assert writers(source) == {}
+
+
+def test_the_forms_of_the_compression_package_methodcaller_and_namespaces_that_read_stay_alone():
+    """A zstd file or a PyZipFile opened to read (the archive's blocks are read from a buffer so), a rename or replace
+    with keywords that are not a target, a methodcaller of a method that writes nothing, and a function a namespace
+    names that writes nothing."""
+    source = (
+        "import builtins, io, operator, sys, zipfile\n"
+        "from compression import zstd, gzip as cgzip\n"
+        "def r(p, d, x, frame):\n"
+        "    zstd.ZstdFile(io.BytesIO(x), mode='rb'); zstd.open(p); zstd.ZstdFile(p); cgzip.GzipFile(p)\n"
+        "    zipfile.PyZipFile(p); zipfile.PyZipFile(p, 'r')\n"
+        "    d.replace(year=2000, month=1); frame.rename(columns=d)\n"
+        "    operator.methodcaller('upper')(x); list(map(operator.methodcaller('strip'), x))\n"
+        "    globals()['__builtins__']['open'](p); vars(builtins)['len'](p); globals()['helper'](p)\n"
+        "    sys.modules['json'].dumps(x); getattr(__builtins__, 'open')(p, 'rb')\n"
     )
     assert writers(source) == {}
 

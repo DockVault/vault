@@ -159,6 +159,10 @@ async function main() {
          'lineage: a rotation that should carry a tag and does not fails');
     note(await lineage(row({ source: 'owner_reset', lineage_tag: null })) === Checks.LINEAGE_RESET,
          "lineage: an owner's reset without the previous key is told as a reset");
+    // A database writer can write such a row too: the key details say what the server records.
+    const resetText = Checks.LINEAGE_TEXT[Checks.LINEAGE_RESET];
+    note(resetText.startsWith("The server records an owner's reset") && !resetText.includes('The owner reset'),
+         'lineage: a reset is told as what the server records, not as what the owner did');
     note(await lineage(row({ source: 'owner_reset' })) === Checks.LINEAGE_VERIFIED,
          "lineage: an owner's reset with the previous key verifies");
     note(await lineage(row({ source: 'bootstrap', lineage_tag: null })) === Checks.LINEAGE_UNVERIFIABLE,

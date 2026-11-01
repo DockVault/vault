@@ -505,3 +505,32 @@ def test_a_seal_after_a_key_seal_in_the_same_transaction_goes_under_the_key_move
     env.clock.advance(hours=1)
     assert env.seal().stopped is None
     assert "key-sequence" not in failures(env.verify())
+
+
+def test_a_discarded_key_seal_takes_its_ack_under_the_key_in_force_before_it(env, monkeypatch):
+    """rekey's key seal committed, its head record write lost: a discard of it goes back to the key in force before
+    it, so the ack is under the old key (given with --old-key-file), never the key the discarded seal moved to, which
+    is not in force where the ack goes. Then rekey moves the chain again, and it verifies."""
+    _key_changed_without_the_old_one(env)
+    old = fmt.chain_key(KEY_TEXT)
+    old_kid = fmt.key_id(old)
+    seen = recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    with monkeypatch.context() as m:
+        m.setattr(hr.HeadStore, "write", lambda self, change, now: (_ for _ in ()).throw(OSError("full")))
+        with pytest.raises(Exception):
+            recovery.rekey(env.engine, _host(env), old_key=old, expect=seen["state"])
+    key_seal = env.seals()[-1]
+    assert key_seal.kind == "key" and key_seal.detail["old_key_id"] == old_kid and key_seal.key_id != old_kid
+    env.fresh_process()
+    seen = recovery.after_record(env.engine, _host(env), discard=True, read=True)
+    assert any(f"The ack seal goes under {old_kid}" in ln for ln in seen["lines"]), seen["lines"]
+    seen = recovery.after_record(env.engine, _host(env), discard=True, read=True, old_key=old)
+    done = recovery.after_record(env.engine, _host(env), discard=True, expect=seen["state"], old_key=old)
+    assert done["discarded"] == [key_seal.seq]
+    ack = env.seals()[-1]
+    assert (ack.seq, ack.kind, ack.key_id) == (key_seal.seq, "ack", old_kid)
+    seen = recovery.rekey(env.engine, _host(env), old_key=old, read=True)
+    recovery.rekey(env.engine, _host(env), old_key=old, expect=seen["state"])
+    env.clock.advance(hours=1)
+    assert env.seal().stopped is None
+    assert failures(env.verify()) == []
