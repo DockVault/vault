@@ -6,8 +6,9 @@ After a sign-out nothing of the Compliance pages stays for the next person on th
 password was given) are taken out of the page at sign-out: the next person who signs in on the same tab and opens
 either page sees none of it while their own page loads. An answer the server sends after the sign-out to a request
 made before it is drawn for nobody. The owner's vault receipts are forgotten too: no request after the sign-out
-carries them, and the name is hidden again until the password is given again. test_ui_owner_unlock.py holds the
-owner's unlock itself.
+carries them, and the name is hidden again until the password is given again. A vault's password asked on Access
+to my vaults and left open at the sign-out is answered as cancelled then: what the next person types in that
+dialog goes to their own question only. test_ui_owner_unlock.py holds the owner's unlock itself.
 
 Waits are on state, never on time (the timing rules of the browser tests); a request is held by routing it and let
 go by continuing it.
@@ -15,8 +16,10 @@ go by continuing it.
 import pytest
 from playwright.sync_api import Page, expect
 
+from _account_change_helpers import signed_in
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault
+from _ui_hand_over import new_folder_through_the_page
 from conftest import unique
 
 pytestmark = pytest.mark.ui
@@ -258,3 +261,35 @@ def test_the_owners_page_and_receipts_are_gone_for_the_next_person_on_the_tab(pa
     expect(dialog.locator(".my-access-unlock")).to_have_count(1)
     assert sent[before:] and not any(sent[before:]), f"no request after the sign-out carries a receipt: {sent}"
     assert errors == []
+
+
+def test_a_password_asked_on_access_to_my_vaults_and_left_open_takes_nothing_of_the_next_person(page: Page, world):
+    """olga asks to unlock a vault on Access to my vaults and is signed out with the prompt open. mia signs in on
+    the same tab and makes a folder: New folder asks in the same dialog, and the name she types goes to her folder
+    only, never to olga's vault as its password."""
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    unlocks = []
+    page.on("request", lambda r: "/me/compliance-access/vaults/" in r.url and r.url.endswith("/unlock")
+            and unlocks.append(r.post_data or ""))
+    mia_c = signed_in(world["mia"])
+    vault = mia_c.create_vault(name=unique("mias"))["id"]
+    try:
+        _sign_in(page, world["olga"])
+        page.evaluate("() => window.openMyAccess()")
+        dialog = page.locator("#my-access-modal")
+        expect(dialog.locator(".my-access-file").filter(has_text=HIDDEN)).to_have_count(1, timeout=15000)
+        dialog.locator(".my-access-unlock").click()
+        expect(page.locator("#confirm-modal.active")).to_be_visible(timeout=10000)
+        _sign_out(page)
+        expect(page.locator("#confirm-modal.active")).to_have_count(0)
+        # The prompt was lifted above Access to my vaults while it asked; it is put back with the answer.
+        assert page.evaluate("() => document.getElementById('confirm-modal').style.zIndex") == ""
+
+        _sign_in(page, world["mia"])
+        name = unique("mias-folder")
+        new_folder_through_the_page(page, mia_c, vault, name)
+        assert unlocks == [], unlocks
+        assert errors == []
+    finally:
+        mia_c.delete_vault(vault)

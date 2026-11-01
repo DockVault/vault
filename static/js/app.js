@@ -533,7 +533,18 @@ function showInfo(message) {
 // CONFIRMATION MODAL
 // ============================================================================
 
+// showConfirm and showPrompt ask in one dialog, one question at a time. The question open in it is answered
+// as cancelled (false, or null) by settleConfirmModal, which also takes its handlers off the dialog's buttons
+// and field. It runs when another question opens there, and at a sign-out (logout): a question left open would
+// otherwise keep its handlers, and the next answer typed in the dialog, the next person's included, would go to
+// it as well (a vault's password, a passphrase, a reason, a folder's name).
 let confirmModalResolver = null;
+
+function settleConfirmModal() {
+    const cancel = confirmModalResolver;
+    confirmModalResolver = null;
+    if (typeof cancel === 'function') cancel();
+}
 
 function showConfirm(message, title = 'Confirm Action', requireInput = null, confirmLabel = null) {
     return new Promise((resolve) => {
@@ -549,6 +560,7 @@ function showConfirm(message, title = 'Confirm Action', requireInput = null, con
             resolve(false);
             return;
         }
+        settleConfirmModal();
         
         // Set content
         titleEl.textContent = title;
@@ -599,6 +611,7 @@ function showConfirm(message, title = 'Confirm Action', requireInput = null, con
         
         // Cleanup function
         const cleanup = () => {
+            if (confirmModalResolver === cancelHandler) confirmModalResolver = null;
             modal.classList.remove('active');
             // Clear here as well as in showPrompt, so "the field is empty once a dialog closes"
             // holds for both primitives rather than one. Today's requireInput callers pass a
@@ -619,6 +632,7 @@ function showConfirm(message, title = 'Confirm Action', requireInput = null, con
         confirmBtn.addEventListener('click', confirmHandler);
         cancelBtn.addEventListener('click', cancelHandler);
         closeBtn.addEventListener('click', cancelHandler);
+        confirmModalResolver = cancelHandler;   // settleConfirmModal answers it as cancelled
         
         // ESC key to cancel
         const escHandler = (e) => {
@@ -644,6 +658,7 @@ function showPrompt(message, title = 'Enter value', options = {}) {
         const cancelBtn = document.getElementById('confirm-modal-cancel-btn');
         const closeBtn = document.getElementById('confirm-modal-close-btn');
         if (!modal) { resolve(null); return; }
+        settleConfirmModal();
 
         titleEl.textContent = title;
         messageEl.textContent = message;
@@ -665,6 +680,7 @@ function showPrompt(message, title = 'Enter value', options = {}) {
         setTimeout(() => inputEl.focus(), 50);
 
         const cleanup = () => {
+            if (confirmModalResolver === onCancel) confirmModalResolver = null;
             modal.classList.remove('active');
             // Clear before anything else. This one input is reused by every prompt, including the
             // zero-knowledge master passphrase — the value the interface itself calls unrecoverable
@@ -696,6 +712,7 @@ function showPrompt(message, title = 'Enter value', options = {}) {
         inputEl.addEventListener('keydown', onKey);
         document.addEventListener('keydown', onEsc);
         modal.addEventListener('click', onBackdrop);
+        confirmModalResolver = onCancel;   // settleConfirmModal answers it as cancelled
     });
 }
 
@@ -2029,6 +2046,11 @@ function logout() {
     // while the user has typed their master passphrase and not yet submitted, and the login screen
     // would then appear with that passphrase still in the page — which is exactly the shared-tab
     // hand-off this function's own storage scrub exists to prevent.
+    //
+    // A question still open in the shared confirm dialog is answered as cancelled first: closing the dialog
+    // alone leaves its handlers on the dialog's buttons and field, and the next person's first answer there
+    // would go to this person's question too (settleConfirmModal).
+    settleConfirmModal();
     closeModal();
     showScreen('login-screen');
 }
