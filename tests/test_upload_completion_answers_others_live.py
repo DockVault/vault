@@ -5,8 +5,10 @@ encrypts them into the stored file and forces the file to the disk: seconds per 
 loop, so for its whole length the server answered nobody else, not even its health check. It now runs off
 the loop (app/core/off_loop.py), each step to its end.
 
-Here another client asks the health check and a vault listing over and over while the work runs:
-- one resumable upload: none of those requests waits as long as a third of the completion, nor a second;
+Here another client asks, one after the other and over and over while the work runs, the health check, a
+vault listing, and a path the server does not have, which it answers on the loop alone, with no database:
+- one resumable upload: every one of those requests is answered, the health check and the unknown path
+  never wait as long as half of the work, and the unknown path never waits a second;
 - two at once: both are stored whole and read back the same, and the others are answered meanwhile;
 - a client that goes away the moment it asked for the completion: the upload is stored whole, listed once,
   and no file is left on the disk that no row lists;
@@ -21,6 +23,13 @@ Here another client asks the health check and a vault listing over and over whil
 The sizes are a few hundred MiB, so that the work takes long enough to show a pause. A single-request upload
 is capped at 64 MiB by default, too short for that; tests/test_off_loop_callers.py reads its steps, and
 every other step run off the loop, from the source.
+
+Why those bounds. Work back on the loop stops it for most of its length, so a request asked then waits about
+that long, more than half of it, or so few are asked during the work that it shows that way. A busy host with
+room does neither. A listing does work of its own on the loop (it writes when the vault was opened), and that
+write can wait a second or more on a disk busy with the upload, holding the loop as long; the requests above
+are asked one after the other, so the unknown path is never asked while a listing is, and a listing's own
+wait is reported, not bounded.
 """
 import base64
 import hashlib
@@ -49,13 +58,14 @@ def _container():
 
 
 class _Asker:
-    """Another client: asks the health check and a listing, one after the other, and records when each
-    request was sent and how long its answer took."""
+    """Another client: asks the health check, a listing and an unknown path, one after the other, and records
+    when each request was sent and how long its answer took."""
 
     def __init__(self, admin, vault_id):
         self.session = requests.Session()
         self.session.headers.update(admin.session.headers)
-        self.urls = [f"{BASE}/health", f"{BASE}/vaults/{vault_id}/files"]
+        self.unknown = f"{BASE}/no-such-path-{uuid.uuid4().hex}"
+        self.urls = [f"{BASE}/health", f"{BASE}/vaults/{vault_id}/files", self.unknown]
         self.asked = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -146,11 +156,19 @@ def vault(admin):
 def _check_answered_during(asker, start, end):
     took = end - start
     during = asker.during(start, end)
-    assert len(during) >= 3, f"too few requests were sent during a {took:.2f} s completion: {during}"
-    assert all(status == 200 for *_, status in during), during
-    worst = max(t for _, t, _, _ in during)
-    assert worst < min(1.0, took / 3), (
-        f"a request sent while the upload completed waited {worst:.2f} s, in a completion of {took:.2f} s")
+    assert len(during) >= 3, f"too few requests were sent during {took:.2f} s of work: {during}"
+    expected = {url: (404 if url == asker.unknown else 200) for url in asker.urls}
+    assert all(status == expected[url] for _, _, url, status in during), during
+    waits = {url.rsplit("/", 1)[-1]: max(t for _, t, u, _ in during if u == url) for url in asker.urls}
+    listing = asker.urls[1].rsplit("/", 1)[-1]
+    worst = max(t for name, t in waits.items() if name != listing)
+    assert worst < took / 2, (
+        f"a request sent during {took:.2f} s of work waited {worst:.2f} s, more than half of it: the work "
+        f"stopped the loop (the longest wait of each: {waits})")
+    alone = waits[asker.unknown.rsplit("/", 1)[-1]]
+    assert alone < 1.0, (
+        f"a request the server answers on the loop alone waited {alone:.2f} s during {took:.2f} s of work "
+        f"(the longest wait of each: {waits})")
 
 
 def test_others_are_answered_while_a_large_upload_completes(admin, vault):
