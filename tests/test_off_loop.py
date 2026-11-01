@@ -3,8 +3,10 @@
 The web server answers every request from one event loop, so blocking work inside a handler held every other
 request until it ended: finishing a large upload froze the server for seconds. run_to_end runs such work in a
 thread of its own pool and waits for it there, so the loop answers others meanwhile; and the work always runs
-to its end, whatever happens to the request, so a file and its row are written whole or not at all. These run
-the helper on a real event loop (tests/_async_run.py) against work that blocks for a set time.
+to its end, whatever happens to the request, so a file and its row are written whole or not at all. Work on the
+request's database session that fails is rolled back in that thread, so a row lock it took is not held while the
+request handles the error. These run the helper on a real event loop (tests/_async_run.py) against work that
+blocks for a set time.
 """
 import asyncio
 import contextvars
@@ -148,3 +150,80 @@ def test_calls_more_than_the_pool_has_threads_all_run_and_the_loop_still_answers
     results, worst = run_coroutine(scenario())
     assert results == ["stored"] * n
     assert worst < 0.2
+
+
+class _Session:
+    """The request's database session as the work sees it: a row lock the work takes is held until the session
+    commits or rolls back."""
+
+    def __init__(self, rollback_fails=False):
+        self.row_lock = threading.Lock()
+        self.rollbacks = []
+        self.rollback_fails = rollback_fails
+
+    def lock_the_row(self):
+        assert self.row_lock.acquire(timeout=5)
+
+    def rollback(self):
+        self.rollbacks.append(threading.current_thread().name)
+        if self.row_lock.locked():
+            self.row_lock.release()
+        if self.rollback_fails:
+            raise RuntimeError("the connection went away")
+
+
+class _StaleEpoch(Exception):
+    pass
+
+
+def test_work_on_the_session_that_fails_has_released_its_lock_before_the_request_goes_on():
+    """A completion takes the vault's row lock, then refuses the upload. Its error handling waits for the file's
+    removal; another request that opens the vault must not find the lock still held meanwhile, or it waits for it
+    on the loop until the lock timeout, and every request with it."""
+    db = _Session()
+
+    def refuse_after_the_lock():
+        db.lock_the_row()
+        raise _StaleEpoch("the vault key changed during upload")
+
+    async def scenario():
+        try:
+            await off_loop.run_to_end_on_session(db, refuse_after_the_lock)
+        except _StaleEpoch:
+            free_while_handling = db.row_lock.acquire(blocking=False)
+            if free_while_handling:
+                db.row_lock.release()
+            # The error handling waits for other work, as the removal of the file does.
+            await off_loop.run_to_end(_blocking, 0.05)
+            return free_while_handling, list(db.rollbacks), threading.current_thread().name
+        return None
+
+    free, rollbacks, loop_thread = run_coroutine(scenario())
+    assert free is True, "the row lock was still held while the request handled the error"
+    assert len(rollbacks) == 1 and rollbacks[0] != loop_thread, rollbacks
+    assert rollbacks[0].startswith("stored-bytes"), "the session was not rolled back in the pool's thread"
+
+
+def test_work_on_the_session_that_succeeds_is_not_rolled_back():
+    db = _Session()
+
+    async def scenario():
+        return await off_loop.run_to_end_on_session(db, lambda a, b=0: a + b, 2, b=3)
+
+    assert run_coroutine(scenario()) == 5
+    assert db.rollbacks == []
+
+
+def test_a_rollback_that_fails_does_not_hide_what_the_work_raised():
+    db = _Session(rollback_fails=True)
+
+    def refuse():
+        raise _StaleEpoch("refused")
+
+    async def scenario():
+        with pytest.raises(_StaleEpoch, match="refused"):
+            await off_loop.run_to_end_on_session(db, refuse)
+        return list(db.rollbacks)
+
+    assert len(run_coroutine(scenario())) == 1
+

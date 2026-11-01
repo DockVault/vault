@@ -9,10 +9,14 @@ Here another client asks the health check and a vault listing over and over whil
 - one resumable upload: none of those requests waits as long as a third of the completion, nor a second;
 - two at once: both are stored whole and read back the same, and the others are answered meanwhile;
 - a client that goes away the moment it asked for the completion: the upload is stored whole, listed once,
-  and no file is left on the disk that no row lists.
+  and no file is left on the disk that no row lists;
+- a zero-knowledge upload refused at completion because the vault's key changed meanwhile: the refusal takes
+  the vault's row lock, and the assembled file is then removed, which takes seconds. Every request that opens
+  the vault (a listing records when it was opened) still answers at once, not after waiting for that lock.
 
 The sizes are a few hundred MiB, so that a completion takes long enough to show a pause.
 """
+import base64
 import hashlib
 import os
 import subprocess
@@ -23,7 +27,10 @@ import uuid
 import pytest
 import requests
 
-from conftest import ApiClient
+from conftest import (
+    ApiClient, create_zk_vault, ensure_ecc_keypair, post_zk, require_zk_first_chunk, zk_encrypt_name,
+    zk_name_blind_index,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -206,3 +213,64 @@ def test_a_client_that_leaves_as_it_asks_for_the_completion_still_gets_its_file_
         time.sleep(0.5)
     assert all(s["session_id"] != sid for s in admin.get(f"/vaults/{vault['id']}/uploads").json())
     assert _blobs_on_disk(vault["id"]) == 1
+
+
+@pytest.fixture
+def zk_vault(admin):
+    """A zero-knowledge vault, with the deployment's zero-knowledge setting put back as it was."""
+    ensure_ecc_keypair(admin)
+    before = admin.get("/settings").json().get("zero_knowledge_enabled") is True
+    r = admin.put("/settings", json={"zero_knowledge_enabled": True})
+    assert r.status_code == 200, r.text
+    try:
+        v = create_zk_vault(admin)
+        try:
+            yield v
+        finally:
+            admin.delete_vault(v["id"])
+    finally:
+        admin.put("/settings", json={"zero_knowledge_enabled": before})
+
+
+def test_a_zero_knowledge_upload_refused_at_completion_keeps_the_vault_answering(admin, zk_vault):
+    vid = zk_vault["id"]
+    size = 52 * CHUNK                       # every chunk sent below is CHUNK bytes
+    dek = os.urandom(32)
+    name = "refused-%s.bin" % uuid.uuid4().hex[:8]
+    object_id = str(uuid.uuid4())
+    sealed = os.urandom(CHUNK)              # the browser's ciphertext: the server reads none of it
+    require_zk_first_chunk(sealed)          # the session declares an attempt token
+    r = admin.post(f"/vaults/{vid}/uploads", json={
+        "total_size": size, "total_chunks": size // CHUNK, "chunk_size": CHUNK,
+        "enc_name": zk_encrypt_name(name, dek, vid, "name", 1, obj_id=object_id),
+        "name_bi": zk_name_blind_index(name, dek, vid, 1),
+        "file_id": object_id, "blob_id": uuid.uuid4().hex, "zk_key_version": 1})
+    assert r.status_code == 200, r.text
+    sid = r.json()["session_id"]
+    try:
+        for i in range(size // CHUNK):
+            r = admin.session.put(f"{BASE}/vaults/{vid}/uploads/{sid}/chunks/{i}", data=sealed, timeout=120,
+                                  headers={"Content-Type": "application/octet-stream"})
+            assert r.status_code == 200, r.text
+        # The vault's key changes while the upload waits to be completed: it was encrypted under the old one.
+        post_zk(admin, f"/ecc/vaults/{vid}/rekey", json={
+            "from_version": 1, "to_version": 2, "revoke_user_id": None,
+            "member_keys": [{"user_id": str(admin.user["id"]),
+                             "wrapped_dek": base64.b64encode(os.urandom(48)).decode(),
+                             "ephemeral_public_key": base64.b64encode(os.urandom(48)).decode()}],
+        }).raise_for_status()
+
+        with _Asker(admin, vid) as asker:
+            start = time.monotonic()
+            r = admin.session.post(f"{BASE}/vaults/{vid}/uploads/{sid}/complete", json={"file_id": object_id},
+                                   timeout=600)
+            end = time.monotonic()
+            time.sleep(0.3)
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["code"] == "stale_zk_epoch", r.text
+        _check_answered_during(asker, start, end)
+        # Nothing was stored: the assembled file is gone from the disk.
+        assert not [it for it in admin.get(f"/vaults/{vid}/files").json()["items"] if it.get("type") == "file"]
+        assert _blobs_on_disk(vid) == 0
+    finally:
+        admin.delete(f"/vaults/{vid}/uploads/{sid}")

@@ -15592,12 +15592,13 @@ async def receiver_complete_upload(
             # Off the event loop: a file is overwritten before it is removed.
             try:
                 if file_info and file_info.get('storage_path'):
-                    await off_loop.run_to_end(vault_service._remove_blobs, [file_info['storage_path']])
+                    await off_loop.run_to_end_on_session(db, vault_service._remove_blobs,
+                                                         [file_info['storage_path']])
             except Exception:
                 pass
 
         # The assembly and the row run off the event loop, each to its end (app/core/off_loop.py), as the
-        # signed-in upload's do.
+        # signed-in upload's do; a step that fails has its transaction rolled back before the error comes back.
         def _assemble():
             nonlocal file_info
             file_info, stream_ctx = vault_service.upload_file_streaming(
@@ -15629,8 +15630,8 @@ async def receiver_complete_upload(
                 replace_same_name=False)
 
         try:
-            final_checksum, final_size = await off_loop.run_to_end(_assemble)
-            file = await off_loop.run_to_end(_record, final_checksum, final_size)
+            final_checksum, final_size = await off_loop.run_to_end_on_session(db, _assemble)
+            file = await off_loop.run_to_end_on_session(db, _record, final_checksum, final_size)
         except HTTPException:
             await _remove_orphan_blob()
             _receiver_release_bytes(db, receiver.id, session.total_size)
@@ -21828,14 +21829,18 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # Off the event loop: a file is overwritten before it is removed.
         try:
             if file_info and file_info.get('storage_path'):
-                await off_loop.run_to_end(vault_service._remove_blobs, [file_info['storage_path']])
+                await off_loop.run_to_end_on_session(db, vault_service._remove_blobs,
+                                                     [file_info['storage_path']])
         except Exception:
             pass
 
     # The assembly and the row run off the event loop (app/core/off_loop.py), each to its end: reading the
     # staged chunks, encrypting them into the file and syncing it took seconds per GiB, and every other
-    # request waited for it. No row lock is held across a wait: the zero-knowledge vault's lock is taken,
-    # and committed, inside _record.
+    # request waited for it. No row lock is held across a wait: the row locks _record takes (the
+    # zero-knowledge vault's, and a replace's vault and file rows) end inside it, committed by finalize or,
+    # when _record fails, rolled back in the pool's thread (run_to_end_on_session). The error handling below
+    # waits for the assembled file's removal, seconds per GiB: a lock still held then would stop every
+    # request that opens the vault, each waiting for it on the loop until the lock timeout.
     def _assemble():
         nonlocal file_info
         file_info, stream_ctx = vault_service.upload_file_streaming(
@@ -21948,8 +21953,8 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         )
 
     try:
-        final_checksum, final_size = await off_loop.run_to_end(_assemble)
-        file = await off_loop.run_to_end(_record, final_checksum, final_size)
+        final_checksum, final_size = await off_loop.run_to_end_on_session(db, _assemble)
+        file = await off_loop.run_to_end_on_session(db, _record, final_checksum, final_size)
     except HTTPException:
         await _remove_orphan_blob()
         raise

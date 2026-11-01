@@ -22,10 +22,13 @@ waits for it:
 Two rules for what is run here, which every caller keeps:
 
 - ``fn`` must not need the event loop (no awaiting, no loop-bound objects);
-- no database row lock is held across a call. A lock taken on the loop and held while the request waits
-  here would let another request on the loop wait for that lock synchronously, stopping the loop; and a
-  lock released only after the call would then never be released. Work that takes a lock takes it, and
-  commits, inside ``fn``.
+- no database row lock is held across a call, nor after one that failed. A lock taken on the loop and held
+  while the request waits here would let another request on the loop wait for that lock synchronously,
+  stopping the loop; and a lock released only after the call would then never be released. Work that takes
+  a lock takes it, and commits, inside ``fn``. Work that uses the request's database session runs through
+  ``run_to_end_on_session``, which rolls the session back in the pool's thread when ``fn`` raises: a lock
+  taken before the error is released before the request goes on, so its error handling (which may wait here
+  again, to remove a file that got no row) holds none, and commits nothing ``fn`` left half done.
 
 The pool is this module's own: not the event loop's default executor, which the /ws/monitor poller parks
 threads in, and not the thread pool Starlette runs synchronous endpoints and dependencies in, which work
@@ -63,3 +66,21 @@ async def run_to_end(fn, /, *args, **kwargs):
     if cancelled is not None:
         raise cancelled
     return future.result()
+
+
+async def run_to_end_on_session(db, fn, /, *args, **kwargs):
+    """``run_to_end`` for work that uses the request's database session ``db``: when ``fn`` raises, ``db`` is
+    rolled back in the pool's thread, before the error comes back to the request. What ``fn`` raises is what
+    comes back, also when the rollback fails."""
+    return await run_to_end(_rolled_back_when_it_fails, db, fn, *args, **kwargs)
+
+
+def _rolled_back_when_it_fails(db, fn, /, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except BaseException:
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 -- the error fn raised is the one the request answers for
+            pass
+        raise
