@@ -124,7 +124,11 @@
                             <input type="password" id="password" name="password" class="form-control" required autocomplete="current-password">
                         </div>
                         
-                        <button type="submit" class="btn btn-primary btn-block"><svg class="icon"><use href="#i-login"/></svg> Sign in</button>
+                        <!-- Says the page is still loading until it can sign in: app.js names it Sign in once every
+                             script has run. A sign-in sent before then is held by auth-boot.js, the note below says
+                             so, and it is sent once, as soon as the page is ready. -->
+                        <button type="submit" id="login-submit" class="btn btn-primary btn-block" aria-describedby="login-loading-note"><svg class="icon" aria-hidden="true"><use href="#i-login"/></svg> <span id="login-submit-label">Loading&hellip;</span></button>
+                        <div id="login-loading-note" class="text-secondary" role="status" aria-live="polite" style="font-size: 0.9em;"></div>
                     </form>
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>

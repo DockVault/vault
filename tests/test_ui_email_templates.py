@@ -15,6 +15,11 @@ MAILPIT_SMTP_HOST = os.environ.get("VAULT_MAILPIT_SMTP_HOST")
 MAILPIT_SMTP_PORT = os.environ.get("VAULT_MAILPIT_SMTP_PORT", "1025")
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+# How long a step that waits on the server may take (the email tab loading, a preview rendered from a
+# request, a row written). Each is quick, but on a host running several suites at once some have taken
+# more than ten seconds.
+SLOW_S = 30
+SLOW_MS = SLOW_S * 1000
 
 
 def _login(page: Page, username: str, password: str):
@@ -30,7 +35,7 @@ def _open_email_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     page.click('.tab-btn[data-tab="email"]')
     show_advanced(page, "email")
-    expect(page.locator("#email-templates-grid")).to_be_visible(timeout=10000)
+    expect(page.locator("#email-templates-grid")).to_be_visible(timeout=SLOW_MS)
 
 
 @pytest.fixture
@@ -85,7 +90,7 @@ def test_create_template_and_card_shows_profile_preview(admin_page: Page, admin)
     page.select_option("#et-profile", prof["id"])
     page.click("#et-save")
     card = page.locator('.email-profile-card:has-text("Profiled Card")')
-    expect(card).to_be_visible(timeout=10000)
+    expect(card).to_be_visible(timeout=SLOW_MS)
     expect(card.locator(".epc-meta")).to_contain_text("from@example.com")
     expect(card.locator(".epc-meta")).to_contain_text("smtp.example.com")
     assert len(_user_templates(admin)) == 1
@@ -116,7 +121,7 @@ def test_preview_renders_sanitized_and_personalized(admin_page: Page):
     # the sandboxed iframe's srcdoc is the server-sanitized + personalized preview
     def srcdoc():
         return page.locator("#et-preview").get_attribute("srcdoc") or ""
-    deadline = time.time() + 8
+    deadline = time.time() + SLOW_S
     while time.time() < deadline and "jsmith" not in srcdoc():
         page.wait_for_timeout(200)
     doc = srcdoc()
@@ -207,10 +212,10 @@ def test_delete_template(admin_page: Page, admin):
     _open_email_tab(page)
     _new_template(page, name="Doomed")
     page.click("#et-save")
-    expect(page.locator('.email-profile-card:has-text("Doomed")')).to_be_visible(timeout=10000)
+    expect(page.locator('.email-profile-card:has-text("Doomed")')).to_be_visible(timeout=SLOW_MS)
     page.locator('.email-profile-card:has-text("Doomed") .etc-delete').click()
     page.click("#confirm-modal-confirm-btn")         # themed confirm for the delete
-    expect(page.locator('.email-profile-card:has-text("Doomed")')).to_have_count(0, timeout=10000)
+    expect(page.locator('.email-profile-card:has-text("Doomed")')).to_have_count(0, timeout=SLOW_MS)
 
 
 def test_edit_loads_full_body_and_saves_via_put(admin_page: Page, admin):
@@ -220,13 +225,13 @@ def test_edit_loads_full_body_and_saves_via_put(admin_page: Page, admin):
                                              "body_html": "<p>original body</p>"}).json()
     page = admin_page
     _open_email_tab(page)
-    expect(page.locator('.email-profile-card:has-text("Editable")')).to_be_visible(timeout=10000)
+    expect(page.locator('.email-profile-card:has-text("Editable")')).to_be_visible(timeout=SLOW_MS)
     page.locator('.email-profile-card:has-text("Editable") .etc-edit').click()
     expect(page.locator("#email-template-editor")).to_be_visible()
     expect(page.locator("#et-body")).to_have_value("<p>original body</p>")   # full body loaded
     page.fill("#et-body", "<p>edited body</p>")
     page.click("#et-save")
-    expect(page.locator("#email-template-editor")).to_be_hidden(timeout=10000)
+    expect(page.locator("#email-template-editor")).to_be_hidden(timeout=SLOW_MS)
     rows = _user_templates(admin)
     assert len(rows) == 1 and rows[0]["id"] == t["id"]                       # PUT, not a new row
     assert admin.get(f"/email/templates/{t['id']}").json()["body_html"] == "<p>edited body</p>"
@@ -267,12 +272,12 @@ def test_upload_via_file_input_adds_a_resource(admin_page: Page, admin):
     page.set_input_files("#et-image-upload",
                          files=[{"name": "up.png", "mimeType": "image/png", "buffer": PNG}])
     # the upload posts to /email/resources; wait for the server to reflect the new row.
-    deadline = time.time() + 10
+    deadline = time.time() + SLOW_S
     while time.time() < deadline and not admin.get("/email/resources").json().get("resources"):
         page.wait_for_timeout(200)
     res = admin.get("/email/resources").json()["resources"]
     assert len(res) == 1 and res[0]["content_type"] == "image/png"
-    expect(page.locator(".et-image-item")).to_have_count(1, timeout=10000)   # thumb rendered
+    expect(page.locator(".et-image-item")).to_have_count(1, timeout=SLOW_MS)   # thumb rendered
 
 
 def test_send_modal_empty_recipient_is_guarded(admin_page: Page, admin):
@@ -296,7 +301,7 @@ def test_no_console_errors_across_the_template_flow(admin_page: Page):
     page.click('.et-view[data-view="split"]')
     page.wait_for_timeout(800)      # let the debounced preview fetch + render settle
     page.click("#et-save")
-    expect(page.locator('.email-profile-card:has-text("Clean")')).to_be_visible(timeout=10000)
+    expect(page.locator('.email-profile-card:has-text("Clean")')).to_be_visible(timeout=SLOW_MS)
     assert errors == [], f"console/page errors during the flow: {errors}"
 
 
@@ -321,7 +326,7 @@ def test_edit_refuses_to_open_when_body_fetch_fails(admin_page: Page, admin):
                                              "body_html": "<p>b</p>"}).json()
     page = admin_page
     _open_email_tab(page)
-    expect(page.locator('.email-profile-card:has-text("Vanishing")')).to_be_visible(timeout=10000)
+    expect(page.locator('.email-profile-card:has-text("Vanishing")')).to_be_visible(timeout=SLOW_MS)
     admin.delete(f"/email/templates/{t['id']}")       # card id is now stale
     with page.expect_response(lambda r: f"/email/templates/{t['id']}" in r.url) as resp:
         page.locator('.email-profile-card:has-text("Vanishing") .etc-edit').click()
@@ -385,7 +390,7 @@ def test_send_flow_delivers_to_a_free_form_address(admin_page: Page, admin):
     _new_template(page, name="Blast", subject="Hi {{user.username}}", body="<p>Hi {{user.username}}</p>")
     page.click("#et-save")
     card = page.locator('.email-profile-card:has-text("Blast")')
-    expect(card).to_be_visible(timeout=10000)
+    expect(card).to_be_visible(timeout=SLOW_MS)
     card.locator(".etc-send").click()
     expect(page.locator("#email-send-modal")).to_have_class(re.compile(r"\bactive\b"))
     page.fill("#et-send-addresses", "someone@example.com")

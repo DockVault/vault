@@ -463,7 +463,7 @@ def _sftp_fakes(monkeypatch, tmp_path, disk):
     # The persist check locks the vault row until its session ends; "lock" marks where it starts.
     answers = []
 
-    def authorize(db, v, f, size):
+    def authorize(db, v, f, size, **kw):
         disk.mark("lock")
         verdict = answers.pop(0) if answers else True
         return (SimpleNamespace(id="U"), SimpleNamespace(id="V"), vault_service) if verdict else None

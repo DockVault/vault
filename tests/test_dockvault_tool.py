@@ -1119,7 +1119,11 @@ def test_probe_pg_password_live_distinguishes_secrets():
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
     import time
-    vol, cont = "dvpgprobe_pgdata", "dvpgprobe_db"
+    import uuid
+    # Names of this run's own: two runs of the suite on one Docker host would otherwise share (and remove)
+    # one container and volume.
+    run_id = uuid.uuid4().hex[:10]
+    vol, cont = "dvpgprobe_%s_pgdata" % run_id, "dvpgprobe_%s_db" % run_id
     try:
         try:
             subprocess.run(["docker", "run", "-d", "--rm", "--name", cont,
@@ -1128,15 +1132,23 @@ def test_probe_pg_password_live_distinguishes_secrets():
                             "postgres:15-alpine"], check=True, capture_output=True, timeout=90)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker daemon/image unavailable: %s" % exc)
+        # Ready the way the probe connects: over the container's own address. On its first start the image
+        # runs a server on the local socket only while it creates the database, then stops it and starts the
+        # real one; the socket answers during that first phase, so a check over it let the probe run into the
+        # restart.
         ready = False
-        for _ in range(30):
-            r = subprocess.run(["docker", "exec", cont, "pg_isready", "-U", "sftp_user", "-d", "sftp_db"],
-                               capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                ready = True
-                break
+        for _ in range(90):
+            ip = subprocess.run(["docker", "exec", cont, "hostname", "-i"],
+                                capture_output=True, text=True, timeout=15)
+            host = (ip.stdout or "").split()[0] if ip.returncode == 0 and (ip.stdout or "").split() else None
+            if host:
+                r = subprocess.run(["docker", "exec", cont, "pg_isready", "-h", host, "-U", "sftp_user",
+                                    "-d", "sftp_db"], capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    ready = True
+                    break
             time.sleep(2)
-        assert ready, "throwaway postgres never became ready"
+        assert ready, "throwaway postgres never accepted connections on its own address"
         # the SAME scram path the app uses: correct password authenticates, wrong one is a mismatch
         assert dv.probe_pg_password(cont, "sftp_user", "sftp_db", "passA_1234") == "ok"
         assert dv.probe_pg_password(cont, "sftp_user", "sftp_db", "wrongB_9999") == "mismatch"

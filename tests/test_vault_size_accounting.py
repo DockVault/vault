@@ -10,11 +10,19 @@ already wrong.
 Found by measurement, not by review: a run that moved 2.5 GB into a 1 GB vault succeeded while a
 smaller sequential run of 1.5 GB was correctly refused. Sequentially the limit holds. That
 asymmetry is the whole bug.
+
+The check itself is a read and a decision, and the commit comes later. Uploads, copies and moves
+finish in threads of their own, so two of them can read the same total; the check that holds is the
+one made again as each file's row is written, under the vault's row lock and, for the deployment's
+storage limit, a lock of its own (tests/test_storage_room_at_finish.py reads it offline). The tests
+here finish several at the same moment and count what was stored.
 """
 
 from __future__ import annotations
 
 import http.client
+import os
+import subprocess
 import threading
 import uuid
 from urllib.parse import urlparse
@@ -143,14 +151,10 @@ def test_a_vault_cannot_be_filled_past_its_limit_by_uploading_in_parallel(admin)
     limit. Some of these uploads must be refused; what must never happen is all of them being
     accepted.
 
-    WHAT THIS DOES NOT PROVE. Correct counting turns out to be sufficient at the concurrency one
-    account can reach, because an account has a ceiling on simultaneous upload sessions and it
-    throttles this test below the racing threshold -- verified by mutation: removing an atomic
-    reservation entirely leaves this test green. The check at completion is still a read-decide-act
-    with nothing serialising it, so it should still be reachable by several DIFFERENT accounts
-    uploading into one shared vault, which no test here does. Until such a test exists, the extra
-    machinery for it is not in the tree: shipping concurrency code that nothing exercises is how
-    the original defect survived.
+    Correct counting alone does not hold it. With completions running in threads of their own and
+    nothing serialising the check, one account's six parallel uploads were all accepted into a
+    64 MB vault. What serialises it is the vault's row lock, taken for the check as each file's row
+    is written and held until that row commits.
     """
     made = admin.post("/vaults", json={
         "name": unique("ceiling"), "vault_type": "standard", "size_limit_gb": 64 / 1024,
@@ -195,21 +199,13 @@ def test_a_vault_cannot_be_filled_past_its_limit_by_uploading_in_parallel(admin)
 
 
 def test_the_limit_holds_when_separate_accounts_upload_into_one_vault(admin):
-    """The case a single account cannot reach, and the one that decided against a reservation.
+    """Separate accounts, which do not share an account's ceiling on simultaneous upload sessions.
 
-    An account has a ceiling on simultaneous upload sessions, so a single-account test is throttled
-    below the threshold where the check-then-act at completion could race. Separate accounts do not
-    share that ceiling, so this is where the race should surface if it is reachable at all -- and
-    it is the reason an atomic reservation was written for this path.
-
-    It does not surface. Five accounts, released together from a barrier so their completions land
-    at the same moment, still cannot put 120 MB into a 64 MB vault: the atomic counter is committed
-    before the next completion reads it, and the reads serialise. That measurement is why the
-    reservation is not in the tree -- machinery nothing can show a need for is machinery nothing
-    exercises.
-
-    If this test ever fails, the reservation is the answer and the reasoning above is where to
-    start.
+    Five accounts, released together from a barrier so their completions land at the same moment,
+    must not put 120 MB into a 64 MB vault. Each completion reads the vault's total under the
+    vault's row lock as its row is written, and holds the lock until that row commits, so the next
+    completion reads a total that counts it: the reads serialise. Read without that lock, all five
+    were accepted. If this test ever fails, start from that lock (VaultService._claim_room).
     """
     from conftest import ApiClient
 
@@ -279,8 +275,8 @@ def test_the_limit_holds_when_separate_accounts_upload_into_one_vault(admin):
         reported = admin.get(f"/vaults/{vault_id}").json().get("total_size_bytes") or 0
         assert reported <= limit, (
             f"five accounts put {reported / MB:.0f} MB into a {limit / MB:.0f} MB vault "
-            f"({sorted(map(str, statuses))}); the limit does not survive concurrent accounts and "
-            "an atomic reservation at the completion check is what closes it")
+            f"({sorted(map(str, statuses))}); the limit does not survive concurrent accounts: the "
+            "check as each row is written must read the vault's total under its row lock")
     finally:
         # POST, not DELETE: there is no DELETE route and the 405 was never asserted,
         # so every run of this file used to leave its vaults behind.
@@ -367,3 +363,165 @@ def test_the_direct_multipart_path_cannot_exceed_the_ceiling_either(admin, admin
             "ceiling under concurrency")
     finally:
         admin.post(f"/vaults/{vault_id}/delete")
+
+
+def _store(client, vault_id, name, body):
+    """One resumable upload, start to finish, that must succeed. Returns the new file's id."""
+    init = client.post(f"/vaults/{vault_id}/uploads", json={
+        "file_name": name, "total_size": len(body), "total_chunks": 1,
+        "chunk_size": len(body), "mime_type": "application/octet-stream",
+    })
+    assert init.status_code == 200, init.text
+    session = init.json()["session_id"]
+    put = client.put(f"/vaults/{vault_id}/uploads/{session}/chunks/0", data=body, headers=_OCTET)
+    assert put.status_code == 200, put.text
+    done = client.post(f"/vaults/{vault_id}/uploads/{session}/complete")
+    assert done.status_code == 200, done.text
+    return done.json()["id"]
+
+
+def _files_on_disk(vault_id):
+    """How many files the vault's storage directory holds, asked of the running container."""
+    container = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+    out = subprocess.run(["docker", "exec", container, "sh", "-c",
+                          f"find /app/storage/{vault_id} -type f 2>/dev/null | wc -l"],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return int(out.stdout.strip())
+
+
+def _clients(admin_creds, count):
+    """`count` clients of their own, so that requests sent together really overlap (one shared client
+    shares one pooled connection, which serialises them)."""
+    out = []
+    for _ in range(count):
+        one = ApiClient()
+        one.login(admin_creds["username"], admin_creds["password"])
+        out.append(one)
+    return out
+
+
+def _all_at_once(calls):
+    """Run each call in its own thread, released together. Returns their answers, in order."""
+    answers = [None] * len(calls)
+    gate = threading.Barrier(len(calls))
+
+    def _run(index):
+        try:
+            gate.wait(timeout=120)
+            answers[index] = calls[index]()
+        except Exception as exc:                     # noqa: BLE001
+            answers[index] = exc
+
+    threads = [threading.Thread(target=_run, args=(i,), daemon=True) for i in range(len(calls))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    assert all(not t.is_alive() for t in threads), "a request sent together with the others did not finish"
+    return answers
+
+
+@pytest.mark.parametrize("action", ["copy", "move"])
+def test_copies_and_moves_finishing_at_once_cannot_fill_a_vault_past_its_limit(admin, admin_creds, action):
+    """A copy, or a move to another vault, re-encrypts the whole file into the destination. Its limit is
+    checked before that, and again as the new row is written. Twelve started together all pass the first
+    check (the destination is empty) and finish together, so the second check is the one that holds: 17 MB
+    take four 4 MB files, and the other eight are refused. A refused copy leaves no file on the disk, and a
+    refused move leaves its source where it was. (Many small ones: the more finish at the same moment, the
+    surer two of them meet at the check.)"""
+    each, count, fit = 4 * MB, 12, 4
+    room = fit * each + MB
+    source = admin.post("/vaults", json={"name": unique(f"{action}-from"), "vault_type": "standard",
+                                         "size_limit_gb": 1})
+    assert source.status_code == 200, source.text
+    source_id = source.json()["id"]
+    made = admin.post("/vaults", json={"name": unique(f"{action}-into"), "vault_type": "standard",
+                                       "size_limit_gb": room / 1024 ** 3})
+    assert made.status_code == 200, made.text
+    dest_id = made.json()["id"]
+    try:
+        limit = admin.get(f"/vaults/{dest_id}").json().get("size_limit") or 0
+        assert fit * each <= limit < (fit + 1) * each, limit
+        file_ids = [_store(admin, source_id, f"{action}-{i}.bin", os.urandom(each)) for i in range(count)]
+        clients = _clients(admin_creds, count)
+
+        def _one(client, file_id):
+            return lambda: client.post(f"/vaults/{source_id}/files/{file_id}/{action}",
+                                       json={"dest_vault_id": dest_id}).status_code
+
+        answers = _all_at_once([_one(c, f) for c, f in zip(clients, file_ids)])
+        assert sorted(map(str, answers)) == ["200"] * fit + ["413"] * (count - fit), (
+            f"{action}: {sorted(map(str, answers))}; {limit // MB} MB hold exactly {fit} of {count} "
+            f"{each // MB} MB files")
+
+        stored = admin.get(f"/vaults/{dest_id}").json().get("total_size_bytes") or 0
+        listed = [it for it in admin.get(f"/vaults/{dest_id}/files").json()["items"] if it["type"] == "file"]
+        assert (stored, len(listed)) == (fit * each, fit), (stored, len(listed))
+        # The refused ones were removed: the destination holds the files it lists, nothing else.
+        assert _files_on_disk(dest_id) == fit
+        left = [it for it in admin.get(f"/vaults/{source_id}/files").json()["items"] if it["type"] == "file"]
+        assert len(left) == (count if action == "copy" else count - fit), [it["name"] for it in left]
+    finally:
+        admin.post(f"/vaults/{dest_id}/delete")
+        admin.post(f"/vaults/{source_id}/delete")
+
+
+def test_the_deployment_storage_limit_holds_when_uploads_into_different_vaults_finish_at_once(admin, admin_creds):
+    """The deployment's storage limit sums every vault, so no single vault's lock serialises it. Twelve
+    uploads into twelve vaults with no limit of their own, completed together, with 17 MB of the deployment
+    left: four 4 MB files fit, and the other eight are refused with the deployment's answer. (Many small ones:
+    the more finish at the same moment, the surer two of them meet at the check.)"""
+    each, count, fit = 4 * MB, 12, 4
+    room = fit * each + MB
+    gib = 1024 ** 3
+    vaults = []
+    before = admin.get("/settings").json().get("deployment_storage_limit_gb")
+    try:
+        for i in range(count):
+            made = admin.post("/vaults", json={"name": unique(f"deployment-{i}"), "vault_type": "standard"})
+            assert made.status_code == 200, made.text
+            vaults.append(made.json()["id"])
+        sessions = []
+        for vault_id in vaults:
+            init = admin.post(f"/vaults/{vault_id}/uploads", json={
+                "file_name": "share.bin", "total_size": each, "total_chunks": 1, "chunk_size": each,
+                "mime_type": "application/octet-stream"})
+            assert init.status_code == 200, init.text
+            session = init.json()["session_id"]
+            put = admin.put(f"/vaults/{vault_id}/uploads/{session}/chunks/0", data=os.urandom(each),
+                            headers=_OCTET)
+            assert put.status_code == 200, put.text
+            sessions.append(session)
+
+        # The live limit, as an administrator sets it: what is stored now, and room for four more.
+        used = admin.get("/storage/stats").json()["used"]
+        pinned = admin.put("/settings", json={"deployment_storage_limit_gb": (used + room) / gib})
+        assert pinned.status_code in (200, 204), pinned.text
+        limit = admin.get("/storage/stats").json()["limit_bytes"]
+        assert fit * each <= limit - used < (fit + 1) * each, (used, limit)
+
+        clients = _clients(admin_creds, count)
+
+        def _one(client, vault_id, session):
+            def call():
+                r = client.post(f"/vaults/{vault_id}/uploads/{session}/complete")
+                return r.status_code, r.text
+            return call
+
+        answers = _all_at_once([_one(c, v, s) for c, v, s in zip(clients, vaults, sessions)])
+        codes = sorted(str(a[0]) if isinstance(a, tuple) else repr(a) for a in answers)
+        assert codes == ["200"] * fit + ["413"] * (count - fit), (
+            f"{codes}; {room // MB} MB of the deployment hold exactly {fit} of {count} {each // MB} MB files")
+        assert all("storage limit" in a[1] for a in answers if isinstance(a, tuple) and a[0] == 413), answers
+
+        added = sum(admin.get(f"/vaults/{v}").json().get("total_size_bytes") or 0 for v in vaults)
+        assert added == fit * each, f"{added / MB:.0f} MB were stored with {room // MB} MB of the deployment left"
+        assert sum(_files_on_disk(v) for v in vaults) == fit
+        assert admin.get("/storage/stats").json()["used"] == used + fit * each
+    finally:
+        # The vaults first: a limit cannot be put back below what is stored.
+        for vault_id in vaults:
+            admin.post(f"/vaults/{vault_id}/delete")
+        restored = admin.put("/settings", json={"deployment_storage_limit_gb": before})
+    assert restored.status_code in (200, 204), restored.text

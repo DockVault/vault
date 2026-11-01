@@ -197,6 +197,17 @@ def test_wrong_passwords_are_still_refused_at_the_limit_for_a_name(Session, limi
     assert [_sign_in(Session, name, "wrong") for _ in range(LIMIT + 1)] == [401] * LIMIT + [429]
 
 
+def test_settings_installed_again_halfway_do_not_split_a_names_count(Session, limits, cache, monkeypatch):
+    """The fixture makes the name keys with a fixed secret: settings installed again from elsewhere in the process,
+    with secrets of their own, cannot move a name's attempts into a second bucket halfway through a test."""
+    from app.core import config
+    name = _add(Session)
+    assert [_sign_in(Session, name, "wrong") for _ in range(LIMIT - 1)] == [401] * (LIMIT - 1)
+    monkeypatch.setattr(config.settings, "jwt_secret_key", "another deployment's signing secret")
+    monkeypatch.setattr(config.settings, "log_token_pepper", "another deployment's pepper")
+    assert [_sign_in(Session, name, "wrong") for _ in range(2)] == [401, 429]
+
+
 def test_wrong_passwords_are_still_refused_at_twice_the_limit_for_an_address(Session, limits, cache):
     names = [_add(Session) for _ in range(2 * LIMIT + 1)]
     seen = [_sign_in(Session, n, "wrong") for n in names]

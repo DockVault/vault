@@ -8,13 +8,15 @@ and from there into the browser history and a reverse proxy's access log.
 Two things keep it out, both pinned here without a browser:
 
 - static/js/auth-boot.js, a synchronous script in <head> that runs before the first form is parsed,
-  puts a capture-phase submit listener on the document that calls preventDefault() and nothing
-  else, so the browser never sends a form while the forms' own handlers still run. It is run here in
-  Node against a stand-in document, for a plain load and for the invitation and password-reset
-  links (where the script returns early from its screen choice).
+  puts a capture-phase submit listener on the document that calls preventDefault(), so the browser
+  never sends a form while the forms' own handlers still run. A sign-in sent before the page is
+  ready is also held there (and said so), for app.js to send once it is. It is run here in Node
+  against a stand-in document, for a plain load and for the invitation and password-reset links
+  (where the script returns early from its screen choice).
 - every <form> says method="post", so with scripts off nothing typed goes into an address.
 
-tests/test_ui_forms_before_the_app_loads.py drives the same thing in a real browser.
+tests/test_ui_forms_before_the_app_loads.py and tests/test_ui_sign_in_while_loading.py drive the same
+thing in a real browser.
 """
 import json
 import re
@@ -137,3 +139,59 @@ def test_the_guard_stops_the_browser_sending_and_nothing_else_on_every_load():
     assert out["plain"]["attrs"] == {"data-auth": "pending"}
     assert out["?invite=abc"]["attrs"] == {"data-invite": "1"}
     assert out["?reset=def"]["attrs"] == {"data-reset": "1"}
+
+
+_HELD_HARNESS = r"""
+const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(%(path)s, 'utf8');
+const listeners = [];
+const rootAttrs = {};
+const note = { textContent: '', style: {} };
+const sandbox = {
+  document: {
+    addEventListener: (type, fn, opt) => listeners.push({ type, fn, opt }),
+    documentElement: {
+      setAttribute: (k, v) => { rootAttrs[k] = v; },
+      hasAttribute: (k) => Object.prototype.hasOwnProperty.call(rootAttrs, k),
+    },
+    getElementById: (id) => (id === 'login-loading-note' ? note : null),
+  },
+  location: { search: '' },
+  localStorage: { getItem: () => null },
+  sessionStorage: { getItem: () => null },
+};
+vm.runInNewContext(src, sandbox, { filename: 'auth-boot.js' });
+const guard = listeners.find(l => l.type === 'submit').fn;
+function send(id) {
+  const attrs = {};
+  const calls = [];
+  guard({
+    type: 'submit',
+    target: { id, setAttribute: (k, v) => { attrs[k] = v; } },
+    preventDefault: () => calls.push('preventDefault'),
+    stopPropagation: () => calls.push('stopPropagation'),
+    stopImmediatePropagation: () => calls.push('stopImmediatePropagation'),
+  });
+  return { calls, attrs, note: note.textContent };
+}
+const out = { other: send('signup-form'), login: send('login-form') };
+note.textContent = '';
+rootAttrs['data-sign-in-ready'] = '1';
+out.ready = send('login-form');
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def test_a_sign_in_before_the_page_is_ready_is_held_and_said_so():
+    """Before app.js marks the page ready, a sign-in goes no further than the guard (not even to a handler app.js
+    has bound by then): the form is marked as held and the note under the button says the page is still loading.
+    Any other form is only kept from the browser's own sending, as before; and once the page is ready a sign-in
+    goes to its handler."""
+    out = _node(_HELD_HARNESS % {"path": json.dumps(str(AUTH_BOOT))})
+    assert out["other"] == {"calls": ["preventDefault"], "attrs": {}, "note": ""}, out
+    assert out["login"]["calls"] == ["preventDefault", "stopImmediatePropagation"], out
+    assert out["login"]["attrs"] == {"data-sign-in-queued": "1"}, out
+    assert out["login"]["note"] == "The page is still loading. You will be signed in as soon as it is ready.", out
+    assert out["ready"] == {"calls": ["preventDefault"], "attrs": {}, "note": ""}, out
+

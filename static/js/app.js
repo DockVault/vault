@@ -1497,6 +1497,31 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     }
 });
 
+// The sign-in button says the page is still loading until every script has run (index.html), and a sign-in sent
+// before then is held by auth-boot.js. From here the page can sign in: the button says so, and a held sign-in is
+// sent, once, with what the fields hold now. Sent a turn later, so every script's own start-up has run first.
+function _signInReady() {
+    const root = document.documentElement;
+    if (root.hasAttribute('data-sign-in-ready')) return;
+    root.setAttribute('data-sign-in-ready', '1');
+    const label = document.getElementById('login-submit-label');
+    if (label) label.textContent = 'Sign in';
+    const form = document.getElementById('login-form');
+    if (!form || !form.hasAttribute('data-sign-in-queued')) return;
+    form.removeAttribute('data-sign-in-queued');
+    setTimeout(() => {
+        const note = document.getElementById('login-loading-note');
+        if (note) { note.textContent = ''; note.style.marginTop = ''; }
+        if (form.style.display === 'none' || !document.getElementById('login-screen')?.classList.contains('active')) return;
+        // Fields emptied meanwhile are said so, as a press of Sign in would. The submit event is the page's own:
+        // the sign-in handler sends it, and the browser never sends this form itself.
+        if (!form.checkValidity()) { form.reportValidity(); return; }
+        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    }, 0);
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _signInReady);
+else _signInReady();
+
 // ============================================================================
 // TWO-STEP LOGIN: second-factor code card + forced-enrollment wizard
 // ============================================================================

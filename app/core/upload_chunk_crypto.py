@@ -39,7 +39,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from app.core import durable_write
+from app.core import durable_write, off_loop
 
 _MAGIC = b'DVUPLD1\x00'                 # 8 bytes; the '1' is the format version
 _LEN_FIELD = 8                          # big-endian plaintext byte count
@@ -148,8 +148,8 @@ async def seal_stream_to_file(stream, dest_path: Path, limit: int, session_id, c
             # The whole chunk, length included, is on the disk before the caller renames it into
             # place and answers that it was received. A resuming client skips the chunks the server
             # lists, so one that came back empty after a power cut would fail the whole upload at
-            # completion.
-            durable_write.sync_file(handle)
+            # completion. Off the event loop: other requests are answered while it is written out.
+            await off_loop.run_to_end(durable_write.sync_file, handle)
     except BaseException:
         # Mirror receive_bounded: nothing else reclaims an individual temp file mid-session.
         try:

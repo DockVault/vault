@@ -35,7 +35,9 @@ T0 = datetime(2026, 9, 1, 8, 0, 0)        # every row's modified time; clearing 
 
 
 def _vault(value, unit="days"):
-    return SimpleNamespace(id=uuid.uuid4(), expire_files_after_days=value, expire_files_unit=unit)
+    # Room for any file: finalize reads the stored total and the size limit under the row's lock.
+    return SimpleNamespace(id=uuid.uuid4(), expire_files_after_days=value, expire_files_unit=unit,
+                           total_size_bytes=0, size_limit=None)
 
 
 def _file(vault, expires_at, size=10):
@@ -165,6 +167,9 @@ def _finalize(monkeypatch, db, vault, expires_at):
     monkeypatch.setattr(vs, "_seal_named_object", lambda *a, **k: None)
     monkeypatch.setattr(vs, "_seal_file_checksum", lambda *a, **k: None)
     monkeypatch.setattr(security, "content_mac", lambda *a, **k: "mac")
+    # Not PostgreSQL: finalize takes no advisory lock and sets no lock_timeout here.
+    monkeypatch.setattr(db, "get_bind", lambda: SimpleNamespace(dialect=SimpleNamespace(name="memory")),
+                        raising=False)
     info = {"id": uuid.uuid4(), "name": "a.txt", "original_name": "a.txt", "vault_id": vault.id,
             "folder_id": None, "mime_type": "text/plain", "storage_path": "blob",
             "is_encrypted": True, "password_hash": None, "expires_at": expires_at,

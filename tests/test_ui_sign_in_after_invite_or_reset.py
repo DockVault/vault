@@ -94,6 +94,9 @@ def _leave_confirmation(page: Page, card: str, route: str):
         page.locator(f"{card} button", has_text="Go to sign in").click()
     # route == "timer": touch nothing; the confirmation moves on by itself after a few seconds
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    # The app opened this page by itself, and its sign-in screen is up before the page's scripts have all run.
+    # Wait for them, as a person waits for a page to load before signing in.
+    page.wait_for_load_state("load", timeout=30000)
 
 
 def _arrived_at_sign_in_signed_out(page: Page, param: str, history_before: int):

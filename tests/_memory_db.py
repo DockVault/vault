@@ -18,7 +18,8 @@ skips the rows whose id is in ``db.held`` (locked by someone else). Without it, 
 reaches a held row fails as Postgres fails it when the app's lock_timeout runs out: OperationalError,
 and the transaction is then unusable -- any further query, and a commit, fails until a rollback.
 Anything this does not model raises, so a test never passes by accident on an expression it silently
-ignored.
+ignored. ``info`` and ``get_transaction()`` (a new token after each commit and rollback) answer as a
+session's do. There is no ``get_bind()``: code that asks for the database's dialect is given one by the test.
 """
 import operator
 
@@ -57,6 +58,12 @@ class MemoryDB:
         self.on_lock = []        # callables run once, in order, before the next locking read
         self.added, self.deleted = [], []
         self.aborted = False     # a statement failed; only a rollback makes the session usable again
+        self.info = {}           # as a session's info
+        self._transaction = object()
+
+    def get_transaction(self):
+        """A token for the transaction in progress: a new one after each commit and rollback."""
+        return self._transaction
 
     # -- the session surface the code under test uses ---------------------------------------
     def query(self, *entities):
@@ -81,10 +88,12 @@ class MemoryDB:
     def commit(self):
         self.usable()
         self.log.append(("commit",))
+        self._transaction = object()
 
     def rollback(self):
         self.aborted = False
         self.log.append(("rollback",))
+        self._transaction = object()
 
     def usable(self):
         if self.aborted:

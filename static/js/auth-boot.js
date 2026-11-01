@@ -23,10 +23,32 @@
  * first, on the document in the capture phase, for every load; preventDefault()
  * stops only the browser's own sending, so the forms' handlers still run. The
  * forms also say method="post", so with scripts off nothing goes into an address.
+ *
+ * A sign-in sent before the page can sign in (app.js marks <html data-sign-in-ready>
+ * once every script has run) is held instead of lost: it goes no further, the form
+ * is marked data-sign-in-queued, and the note under the button says the page is
+ * still loading. app.js sends a held sign-in once, when it is ready, with what the
+ * fields hold then. Until then the button itself says the page is loading.
  */
 (function () {
     'use strict';
-    document.addEventListener('submit', function (e) { e.preventDefault(); }, true);
+    document.addEventListener('submit', function (e) {
+        e.preventDefault();
+        try {
+            var form = e.target;
+            if (!form || form.id !== 'login-form' || document.documentElement.hasAttribute('data-sign-in-ready')) {
+                return;
+            }
+            // Not to the form's own handler either: one bound before the page is ready sends it then.
+            e.stopImmediatePropagation();
+            form.setAttribute('data-sign-in-queued', '1');
+            var note = document.getElementById('login-loading-note');
+            if (note) {
+                note.style.marginTop = 'var(--space-sm)';
+                note.textContent = 'The page is still loading. You will be signed in as soon as it is ready.';
+            }
+        } catch (err) { /* the browser's own sending is stopped above whatever happens here */ }
+    }, true);
 })();
 
 (function () {

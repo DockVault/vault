@@ -117,7 +117,9 @@ def _complete_upload_handlers():
               if isinstance(n, ast.AsyncFunctionDef) and n.name == "_complete_chunked_upload")
 
     def _type_names(try_node):
-        return {ast.unparse(h.type) for h in try_node.handlers if h.type is not None}
+        # Each name a handler catches, one by one when it catches several.
+        return {ast.unparse(e) for h in try_node.handlers if h.type is not None
+                for e in (h.type.elts if isinstance(h.type, ast.Tuple) else [h.type])}
 
     finalize_try = next(
         t for t in ast.walk(fn)
