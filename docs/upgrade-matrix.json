@@ -358,6 +358,18 @@
       "id": null,
       "fixed_in": "0.33.2",
       "published": "2026-10-03"
+    },
+    "mail-server-certificate-from-a-compromised-authority-accepted": {
+      "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+      "description": "In October 2026 the private keys of eight intermediate certificate authorities of eMudhra were found to be trivially weak: anyone can compute them, and so make a certificate for any server name (Python's fix is CVE-2026-115557). The trust store in the vault's image trusted emSign ECC Root CA - G3, an eMudhra root that vouches for those authorities through a cross-certificate, and the image's Python had no list of such keys to refuse. So the vault accepted a certificate made with those keys as proof that it was talking to its mail server, over STARTTLS and on port 465, and to GitHub when the optional update check is on. A vault set to check its database's certificate against the system trust store (libpq's sslrootcert=system from 0.9.0 on, or sslrootcert naming the image's bundle file, /etc/ssl/certs/ca-certificates.crt, in every release; the vault's setup sets neither) accepted such a certificate for its database too. The cause is an upstream certificate authority the image trusted, and every published release trusted it. Releases before 0.14.0 also checked no mail server certificate at all, and in every release the settings test send (POST /settings/test-email, which the web app's email settings page called up to 0.13.0 and no page has called since) checked none. 0.33.6 fixes this. Its base image carries Python 3.14.10, whose ssl module refuses any certificate chain that holds one of the eight keys, and ca-certificates 20261020, which no longer trusts three eMudhra roots; each refuses the chain on its own, and the trust store alone protects the database connection. The settings test send now checks the mail server's certificate as system mail does. A mail server whose certificate depends on one of the removed roots is refused from 0.33.6 on, and the vault then says that the mail server's certificate could not be verified. One thing 0.33.6 does not change: on any port but 465 the vault encrypts the connection only when the mail server offers STARTTLS, and someone on the path can remove that offer. The vault then refuses to send a password, but with no username set it sends the message unencrypted. Over a network you do not control, use port 465 or a relay that requires a username and password.",
+      "impact": "Someone on the path to the vault's mail server, or answering for its name, could pose as that server and receive the vault's username and password there and every message it sent meanwhile: reset and invitation links, email-change codes, notifications. A reset link let them set that account's password, an invitation create the invited account, and so act as it (an administrator can change or delete anything). A held-back link works until it expires, even after an upgrade: an invitation up to 30 days, a reset link up to an hour. With self-service reset on (off by default) they could take any account with an email address and no second factor; with the update check on, change the update notice. Where the vault checked its database's certificate against the system trust store, someone on that path got the database password. Zero-knowledge vault content was not exposed by mail. An install with no mail set up, the update check off and no such database setting was not exposed.",
+      "remediation": "Upgrade to 0.33.6. Then, if the vault sent mail over a network someone else could be on: change the password it uses at the mail server; revoke the invitations still pending that were sent by mail before the upgrade, and send them again; check the audit log for password_reset_requested, password_reset_completed, account_invitation_accepted and email_change_confirmed entries nobody recognises, now and again an hour later; lock each such account (locking ends its sessions), remove the SSH keys, second factor, devices, temporary credentials, shares and links its owner did not add, and give it back with a new password; for an administrator's account, also check the accounts, roles, settings and sending profiles changed while it was taken; delete an account made from an invitation its person never accepted. If the vault checked its database's certificate against the system trust store over such a network, change the database password too.",
+      "mitigation": "Until you upgrade: switch self-service password reset off (it is off by default), so that nobody can ask for a reset link and intercept it; if the network between the vault and its mail server is not under your control, have the vault send through a relay on a network you control, or leave its mail settings empty so that it sends no mail; leave the update check off, its default; and if the vault checks its database's certificate against the system trust store (sslrootcert=system or the image's bundle file), point sslrootcert at a file that holds only the authority of your database's certificate instead.",
+      "severity": "critical",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:L/SA:N",
+      "id": null,
+      "fixed_in": "0.33.6",
+      "published": "2026-11-01"
     }
   },
   "versions": {
@@ -428,6 +440,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -498,6 +513,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -568,6 +586,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -638,6 +659,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -708,6 +732,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -778,6 +805,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -848,6 +878,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -918,6 +951,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -988,6 +1024,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1058,6 +1097,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1128,6 +1170,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1201,6 +1246,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1274,6 +1322,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1356,6 +1407,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1441,6 +1495,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1526,6 +1583,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1611,6 +1671,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1696,6 +1759,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1781,6 +1847,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1866,6 +1935,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -1951,6 +2023,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2036,6 +2111,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2121,6 +2199,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2206,6 +2287,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2291,6 +2375,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2376,6 +2463,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2461,6 +2551,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2546,6 +2639,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2631,6 +2727,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2716,6 +2815,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2804,6 +2906,9 @@
         },
         {
           "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -2944,6 +3049,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -3099,6 +3209,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -3254,6 +3369,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -3399,6 +3519,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -3529,6 +3654,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -3649,6 +3779,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -3769,6 +3904,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -3889,6 +4029,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4009,6 +4154,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4129,6 +4279,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4244,6 +4399,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4359,6 +4519,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4459,6 +4624,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4534,6 +4704,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4569,6 +4744,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4589,6 +4769,11 @@
           "advisory": "sign-in-form-sent-credentials-in-the-url",
           "title": "A sign-in sent before the page had loaded put the password in the address",
           "fixed_in": "0.33.2"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
         }
       ]
     },
@@ -4597,28 +4782,64 @@
       "notes": "Security fixes, two advisories (zero-knowledge-key-changed-through-a-taken-over-account, medium; sign-in-form-sent-credentials-in-the-url, medium). Creating or sharing a zero-knowledge vault, rotating its key and setting its name-index key now each carry a proof, made in the person's browser over a one-time challenge and the exact request, that they hold their own encryption key, the vault's current key and the key the change puts in place. The server refuses such a change without a proof (428) or with a wrong one (403), changes nothing when it refuses, and records each failed proof as zk_key_proof_failed, so signing in as someone who holds a vault's key, as an administrator who set their password can, or with a stolen session, is no longer enough to change that vault's key. A vault made before 0.33.2 gets its key check the first time a manager who holds its key makes such a change (zk_key_proof_bootstrapped); a vault's owner whose key check cannot be opened can replace it after a step-up (zk_owner_key_reset). Reload browser tabs opened before the upgrade. DockVault Desktop builds whose built-in web app predates 0.33.2 cannot make these changes, and cannot remove a member from a zero-knowledge vault, until they are updated; reading, uploading, downloading and syncing are unaffected, and nobody is signed out. A temporary credential can create a zero-knowledge vault only if it may unlock the account's encryption key. A reverse proxy must pass the X-ZK-Key-Proof request header and the request body on unchanged. ZK_KEY_PROOF_ENFORCE=false in .env, which the settings page cannot change, accepts changes without a proof again, each recorded as zk_key_proof_absent, and the web container says at start that it is off; it reopens the problem this release fixes. docs/design/vault-zk-key-proof-v1.md specifies the protocol. Personal data this release stores (docs/data-inventory.md lists every store): vault_key_proofs records the account that installed each key epoch's proof material (a public key, a sealed key and two MACs, none of them personal), and zk_key_proof_challenges the account a challenge was issued to, for five minutes; the audit log records each refused key proof, each change accepted without one, each key check set up and each owner reset. Schema: new tables vault_key_proofs and zk_key_proof_challenges, created at the first start; this release writes no mark in data_requirements. A rollback to 0.33.1 or 0.33.0 works and strands nothing: every file and key stays readable, the new tables are ignored, and deleting a vault or an account still removes its rows by the database's own rules. It turns the protection off until the next upgrade, and a vault whose key was rotated while rolled back gets its key check again the next time a manager changes it. The web app's forms are now sent only by its scripts, never by the browser itself: before, a sign-in sent while the page was still loading went out as a GET with the username and password in the address, and so in the browser history and in a reverse proxy's access log (and, before 0.32.3, the vault container's log). A script in the page head now stops the browser sending any form, and every form says method=\"post\", so nothing typed goes into an address even with scripts off. Whoever pressed Sign in on a slow load should change their password, and reverse-proxy access logs may still hold such addresses.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
+        }
+      ]
     },
     "0.33.3": {
       "released": "2026-10-05",
       "notes": "Downloads of small files start every time. Since 0.30.0 the web app streams a download straight to disk. When the page finished writing a file before the browser asked for it, which happens with small files, the download did not start, though the page said it was downloading. It happened most with files of up to about 150 KB in a zero-knowledge vault, and could happen with a Standard vault's files too. If the browser has not asked for a download within a minute of the page finishing, the page now says it did not start. Reload browser tabs opened before the upgrade; a download that was running during the upgrade may need to be started again.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
+        }
+      ]
     },
     "0.33.4": {
       "released": "2026-10-16",
       "notes": "Public file and folder links with a download limit deliver every download they allow. Since public file links first shipped in 0.21.0, the download after a link's last allowed use was refused. A link limited to one download, which is what the shipped Confidential tag makes, never delivered its file: the recipient saw \"That file is no longer available\", and the link then counted as used up. A link limited to N downloads, or a folder link limited to N files, delivered N-1. Links without a limit were not affected. A link the fault already used up stays used up; create a new one. The base image moves to Python 3.14.8, which fixes CVE-2026-19445 and CVE-2026-19553 (which scanners rate Critical and High) and several Medium and Low findings in Python. Scanners report them on 0.33.3 and earlier, but DockVault does not reach the affected code: the first needs a TLS server that switches certificates through an SNI callback, and the second a TLS connection opened without a host name to check, and DockVault does neither. The image now runs Python's standard library unmodified. Earlier images replaced two of its files with reviewed copies, which on 3.14.8 would have replaced a newer file with an older one. This release fixes no advisory: neither Python finding is reachable, and the link fault only refused downloads; it never served a file it should not have. This release attaches no VEX document: it holds no reviewed scanner exception, so scanners need none.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
+        }
+      ]
     },
     "0.33.5": {
       "released": "2026-10-18",
       "notes": "Uploads are on the disk before they are confirmed. Until now an upload could be confirmed while its content was still waiting in memory to be written out, so a host that lost power, or whose system crashed, within about half a minute of an upload could come back with the file listed and its content missing: its download failed. Every upload now waits until the file's content and its name are on the disk before it is recorded and confirmed: web uploads, resumable uploads (each part as it is acknowledged), uploads through an upload link, zero-knowledge uploads, SFTP uploads, copies, moves to another vault and replacements of a file of the same name. So do an uploaded logo or icon, a newly generated SFTP host key, and the storage and host-key directories when a start creates them. A file already lost this way cannot be recovered: upload it again. This is a durability fix, not a security fix. Waiting for the disk takes time. On the cloud disk it was measured on, each small upload took about 5 to 25 ms longer, depending on how busy the disk was; a file of a few tens of MiB sent in a single request took up to about two and a half times as long (60 MiB: 0.4 to 0.8 s more); and a 1 GiB upload took up to about a fifth longer over the web and up to about a seventh longer over SFTP. A vault that starts at the same time as its database, as after a host restart, now waits up to two minutes for the database to answer, with one log line per try, instead of stopping at once to be started again by Docker. Once the database answers, the start checks for data a newer release changed, as before; a database that refuses the connection, for a wrong password say, still stops the start at once. So does a connection that cannot be made as configured, such as one without a password, or one that requires SSL of a database that offers none, and any error not known to mean that the database is not up yet. When one container runs both the web app and SFTP, SFTP now starts only once the web app's start, that wait included, is done. The launcher used to wait one minute for the web app and then start SFTP anyway, so a database that answered later than that could let SFTP start before the web app had finished preparing the database; it now waits up to three minutes. A connection to the SFTP port that never speaks SSH, as internet scanners' probes do, is now logged as one line naming what it sent, `event connection.not-ssh.http`, `.text`, `.binary`, `.silent` or `.closed` with the peer's address, instead of error tracebacks. The line `event connection.accepted` is now written once a client has said it speaks SSH, not when the connection opens, so a probe no longer writes one. SSH clients are logged as before, their failures included, and so is a failure on the server's own side before a client has said anything, with its detail. Nothing changes in what is refused, rate-limited, blocked, or recorded in the audit and activity logs. This release fixes no advisory: none of these changes is a security fix. It attaches no VEX document: it holds no reviewed scanner exception, so scanners need none.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
+          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
+          "fixed_in": "0.33.6"
+        }
+      ]
+    },
+    "0.33.6": {
+      "released": "2026-11-01",
+      "notes": "Security release, one advisory (mail-server-certificate-from-a-compromised-authority-accepted, critical). Upgrade. Then, if the vault sent mail over a network someone else could be on: change the password it uses at the mail server; revoke the invitations still pending that were sent by mail before the upgrade, and send them again; check the audit log for password resets, accepted invitations and email changes that nobody recognises, now and again an hour later; and lock each account where you find one, remove what was added to it and give it back with a new password. If the vault checked its database's certificate against the system trust store over such a network, change the database password too. Until now the image trusted emSign ECC Root CA - G3, a root that vouches through a cross-certificate for eMudhra intermediate authorities whose private keys anyone can compute (Python's fix is CVE-2026-115557). Someone able to intercept the vault's connection to its mail server could therefore pose as that server with a certificate made with those keys, and receive the username and password the vault uses there and the mail it sent, password-reset and invitation links included; a vault set to check its database's certificate against the system trust store (sslrootcert=system from 0.9.0 on, or sslrootcert naming the image's bundle file, in every release) accepted such a certificate for its database too. An install that sends no mail, has the update check off and has no such database setting made no such connection. The base image moves to Python 3.14.10 on Alpine 3.24.3. Its Python refuses any certificate chain that holds one of the eight disclosed keys, and its ca-certificates (20261020) no longer trusts three eMudhra roots. A mail server whose certificate depends on one of those roots is now refused, and the vault says so: the mail server's certificate could not be verified, with the reason, and no password or message was sent. It used to call such a failure an invalid SMTP configuration. The settings test send, Email Studio's sends and an email change answer 502 with that message; invitations, reset links and notifications say at most that the mail was not sent, and the log gives the reason. The settings test send (POST /settings/test-email) now checks the mail server's certificate as system mail does; it checked none before. One thing does not change: on any port but 465 the vault encrypts the connection to its mail server only when the server offers STARTTLS, and someone on the path can remove that offer; the vault then sends no password, but with no username set it sends the message unencrypted. Over a network you do not control, use port 465 or a relay that requires a username and password. The image also takes the other fixes of Python 3.14.9 and 3.14.10 (CVE-2026-114583 and CVE-2026-87910 in tarfile, CVE-2026-12345 in tempfile), musl 1.2.6-r3 (CVE-2026-107891, in its regular expressions), and dnspython 2.9.1, which fixes GHSA-45c3-73f7-pv4m. None of those is reached by the vault: it extracts no tar archives, never uses tempfile's TemporaryDirectory, never loads dnspython, as it checks addresses without DNS lookups, and passes no outside pattern to musl's regular expressions: Python's re does not use them, and the BusyBox tools that do are given none. Nothing in the stored data changes and the upgrade can be undone by going back to 0.33.5, which trusts those keys again. It attaches no VEX document: it holds no reviewed scanner exception, so scanners need none.",
       "support": {
         "eol": false,
         "secure": true
@@ -5049,6 +5270,19 @@
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
+    },
+    {
+      "from": "0.33.5",
+      "to": "0.33.6",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "steps-after-intercepted-mail",
+          "summary": "Upgrading stops the interception that the advisory mail-server-certificate-from-a-compromised-authority-accepted describes, but does not undo what it took. If the vault sent mail over a network someone else could be on, after upgrading: change the password the vault uses at its mail server; revoke the invitations still pending that were sent by mail before the upgrade, and send them again; on the Activity page, check the audit log for password resets, accepted invitations and email changes nobody recognises, now and again an hour later; lock each such account (locking ends its sessions), remove the SSH keys, second factor, devices, temporary credentials, shares and links its owner did not add, and give it back with a new password; delete an account made from an invitation its person never accepted; for an administrator's account, also check the accounts, roles, settings and sending profiles changed while it was taken. If the vault checked its database's certificate against the system trust store over such a network, change the database password too. From 0.33.6 the vault refuses a mail server whose certificate depends on emSign ECC Root CA - C3, emSign ECC Root CA - G3 or emSign Root CA - C1, and says that the mail server's certificate could not be verified."
+        }
+      ]
     }
   ],
   "waivers": [
