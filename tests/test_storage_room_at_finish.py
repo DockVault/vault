@@ -14,6 +14,7 @@ refused file.
 tests/test_vault_size_accounting.py finishes uploads, copies and moves at the same moment on a running stack.
 """
 import ast
+import re
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,12 +46,15 @@ class _Result:
 
 
 class _DB(MemoryDB):
-    """MemoryDB as PostgreSQL: it answers the statements the turn and the longer wait send."""
+    """MemoryDB as PostgreSQL: it answers the statements the turn and the longer wait send. A setting made
+    with set_config(..., true) lasts until the transaction ends, as PostgreSQL keeps it; one made for the session
+    (false) stays on the connection after the commit or the rollback."""
 
     def __init__(self, tables, dialect="postgresql"):
         super().__init__(tables)
         self.dialect = dialect
         self.lock_timeout = CONNECTION
+        self.session_lock_timeout = CONNECTION
 
     def get_bind(self):
         return SimpleNamespace(dialect=SimpleNamespace(name=self.dialect))
@@ -62,10 +66,20 @@ class _DB(MemoryDB):
             return _Result(self.lock_timeout)
         if "set_config('lock_timeout'" in sql:
             self.lock_timeout = params["wait"]
+            if not re.search(r",\s*true\s*\)\s*$", sql.strip(), re.IGNORECASE):
+                self.session_lock_timeout = params["wait"]
             self.log.append(("lock_timeout", params["wait"]))
             return _Result(params["wait"])
         self.log.append(("execute", sql, params))
         return _Result(None)
+
+    def commit(self):
+        super().commit()
+        self.lock_timeout = self.session_lock_timeout
+
+    def rollback(self):
+        super().rollback()
+        self.lock_timeout = self.session_lock_timeout
 
 
 def _vault(stored, limit):
@@ -262,6 +276,22 @@ def test_the_turn_and_the_longer_wait_are_only_postgres(finish):
         call(db, vault, 16 * MB, cap=10 * MB, used=0)
     assert _kinds(db) == [("lock", "Vault", {"key_share": True}), ("deployment total",), ("rollback",),
                           ("removed",)]
+
+
+def test_the_longer_wait_ends_with_its_transaction_when_a_wait_runs_out(finish):
+    """A wait that runs out raises before the longer wait is put back. It is set for the transaction only
+    (set_config's third argument), so the rollback that follows puts the connection's own lock_timeout back. Set
+    for the session, the 30 s would stay on the pooled connection for every request that uses it next."""
+    from sqlalchemy.exc import OperationalError
+    call, removed = finish
+    vault = _vault(0, 64 * MB)
+    db = _DB({Vault: [vault]})
+    db.held.add(vault.id)           # another transaction holds the vault's row past the wait
+    with pytest.raises(OperationalError):
+        call(db, vault, 16 * MB)
+    assert db.lock_timeout == LONGER, "the wait raised, so nothing put the setting back yet"
+    db.rollback()                   # what the request's session does with the error
+    assert db.lock_timeout == CONNECTION
 
 
 def test_the_turn_is_decided_once_a_transaction(limits):
