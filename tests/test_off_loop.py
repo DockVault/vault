@@ -9,6 +9,7 @@ request handles the error. These run the helper on a real event loop (tests/_asy
 blocks for a set time.
 """
 import asyncio
+import concurrent.futures
 import contextvars
 import threading
 import time
@@ -227,3 +228,32 @@ def test_a_rollback_that_fails_does_not_hide_what_the_work_raised():
 
     assert len(run_coroutine(scenario())) == 1
 
+
+def test_the_work_is_not_queued_behind_the_loops_default_executor():
+    """The /ws/monitor poller parks threads in the event loop's default executor for as long as it polls. Work run
+    here does not wait for them: it has a pool of its own."""
+    release = threading.Event()
+    timer = threading.Timer(3.0, release.set)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        parked_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(parked_pool)
+        parked = loop.run_in_executor(None, release.wait, 10)
+        timer.start()
+        try:
+            started = time.monotonic()
+            result = await off_loop.run_to_end(_blocking, 0.1)
+            return result, time.monotonic() - started
+        finally:
+            release.set()
+            await parked
+            parked_pool.shutdown(wait=False)
+
+    try:
+        result, took = run_coroutine(scenario())
+    finally:
+        release.set()
+        timer.cancel()
+    assert result == "stored"
+    assert took < 1.5, f"the work waited {took:.2f} s for a thread the loop's default executor had parked"
