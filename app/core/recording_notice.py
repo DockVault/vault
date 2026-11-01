@@ -219,7 +219,7 @@ def compliance_notice() -> dict:
         "using the vault see the deletion as done.",
         "When anyone but a vault's owner gives another person access to it, or more access than they had, the owner "
         "is told in the app, with who that person is and where their account came from; by email too when the one "
-        "who gave it could not open that vault themselves.",
+        "who gave it could not open that vault themselves, this server sends email and the owner has an address.",
         f"The records of compliance access are kept at least {_days(cs.current(cs.RECORD_MIN_DAYS))} after a case "
         "closes, whatever the activity log's own retention says.",
     ]}

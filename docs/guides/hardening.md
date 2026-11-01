@@ -148,9 +148,9 @@ then start 0.34.0 or later once more so it removes the marker. A release before 
 When someone other than the owner gives another person access to a vault (a grant to the person or to their
 department, adding them to a department, removing their own access row so their departments' wider access applies),
 the vault's owner is told at once in the app, and by email too when that someone could not open the vault themselves
-(an administrator who is not one of its members). The notice says who the person is, how old their account is, who
-created it and whether its password was set by someone else. This is how an owner learns that an administrator made
-an account and gave it their vault.
+(an administrator who is not one of its members), this server sends email and the owner has an address. The notice
+says who the person is, how old their account is, who created it and whether its password was set by someone else.
+This is how an owner learns that an administrator made an account and gave it their vault.
 
 ### A data protection impact assessment
 

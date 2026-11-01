@@ -368,7 +368,8 @@ def test_the_notice_says_what_compliance_access_lets_an_auditor_do_as_configured
             "address), and sees every file opened") in text
     assert "When anyone but a vault's owner gives another person access to it" in text
     assert "is told in the app, with who that person is" in text
-    assert "by email too when the one who gave it could not open that vault themselves" in text
+    assert ("by email too when the one who gave it could not open that vault themselves, this server sends email "
+            "and the owner has an address.") in text
     assert "sees each reveal on Access to my vaults. Never for a vault that has a password now" in text
     assert "never opens a zero-knowledge vault" in text and rn.PASSWORD_WORDS["with_password"] in text
     assert rn.AUDITORS_CAN_SEE in out["who_can_see"]

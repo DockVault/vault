@@ -69,7 +69,7 @@ decide which vaults a case names]**
 - **Members of a covered vault** see a neutral banner: the vault is part of an authorised review until a date.
 - **When anyone but the owner gives a person access** to an owner's vault, the owner is told in the app, with who
   that person is and where their account came from; by email too when the one who gave it could not open the vault
-  themselves.
+  themselves, this server sends email and the owner has an address.
 - **When an auditor reveals a recorded name** from an owner's vault outside a case, the owner is told (once a day
   per auditor and vault) and sees each reveal on *Access to my vaults*: when, by whom and the reason's category.
 - **The page *What this vault records*** describes compliance access as configured.
