@@ -617,6 +617,14 @@ bundle really is the one those volumes were created with. **Restore** verifies t
 recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
+Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
+the set the host was on; `.env.<prefix>.1`, `.2`, ... when that name is taken, never over a file already
+there) and says where. Restoring **another set's** backup leaves the current set's volumes as they were,
+and that kept file is the only way to read them again: restore prints the `volumes --action repoint`
+command that goes back to them. It refuses to start if the copy cannot be made, and while `.env` is
+sealed by `lock` (unlock it first). Nothing is kept when there is no `.env`, or when it is the backup's
+own `.env`.
+
 > **The `env` file in a backup holds `ENCRYPTION_KEY`.** Treat the whole bundle as a secret — store it
 > off-host, encrypted or access-controlled. Anyone with the bundle can read the vault's data.
 

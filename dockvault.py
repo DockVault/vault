@@ -5606,8 +5606,17 @@ class DockVault:
         then STOP the stack, REPLACE each target volume's contents from the backup, install the
         paired .env, and restart + health-check. Refuses a mismatched bundle, a bundle missing its
         .env/manifest, or clobbering existing volumes without --force; confirms an over-existing
-        interactive restore with a typed set-name gate."""
+        interactive restore with a typed set-name gate.
+
+        The current .env is kept before anything is stopped (_keep_env_before_restore): it is the only key to the
+        volumes of the set the host was on, which a restore of another set's backup leaves as they were. A copy
+        that cannot be made refuses the restore with nothing changed, and so does a .env sealed by `lock` (a lock
+        after the restore would seal the backup's .env over it)."""
         pal = self.pal
+        if self._is_locked():
+            self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then restore "
+                       "again, so that the restore can keep it before it installs the backup's .env (a lock after the "
+                       "restore would seal the backup's .env over it). Nothing changed.")
         interactive = not (args and getattr(args, "non_interactive", False))
         bundle = getattr(args, "bundle_dir", None) if args else None
         if not bundle and interactive:
@@ -5708,72 +5717,81 @@ class DockVault:
             if typed != prefix:
                 print(pal.paint("  Cancelled - nothing was changed.\n", "yellow"))
                 return
-        # Stop the stack FIRST: extracting pg_data under a live Postgres both fails to take effect (the
-        # running server keeps serving its cached state - the "restored, saw the same files" trap) and
-        # risks corrupting the cluster. down (no -v) removes the containers but KEEPS every volume,
-        # which we then overwrite in place.
-        current_prefix = volume_prefix(self._load_env())
-        if current_prefix and current_prefix != prefix and container_running(DB_CONTAINER):
-            print(pal.paint("  Note: a different deployment (set '%s') is running and will be stopped "
-                            "to restore set '%s' (its data is kept)." % (current_prefix, prefix), "yellow"))
-        print(pal.paint("  Stopping the deployment before restore (data volumes are kept) ...", "cyan"))
-        self._stop_stack()
-        # `down` can fail or time out (e.g. a slow Postgres checkpoint) and _stop_stack swallows that.
-        # NEVER clear a volume out from under a live container: if the database is still up after the
-        # stop attempt, abort with the data intact (a fresh-host restore has no container, so this is
-        # skipped there).
-        if container_running(DB_CONTAINER):
-            self._fail("could not stop the running deployment before restore (the database is still "
-                       "up) - aborting; your data is intact. Stop the stack and retry.")
-        # The head record of the keys volume about to be replaced (a restore over the same set), kept for the
-        # restore mark: what it knew the restore then undoes.
-        replaced_record = None
-        if head_rel and volume_exists(names["keys"]):
-            replaced_record = read_volume_json(names["keys"], head_rel)
-        # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
-        # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
-        marked = False
-        for vol, archive in plan:
-            print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
-            # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
-            # silently degrade to the old MERGE (the exact "restored, saw the same files" trap). The
-            # stack is already stopped, so aborting loudly is the safe state.
-            if not clear_volume(vol):
-                self._fail("could not clear volume %s before restore - the deployment is stopped; free "
-                           "the volume and retry (refusing to merge the backup over stale data)." % vol)
-            if not untar_volume(vol, bundle, archive):
-                self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
-                           "bundle and retry." % (vol, archive))
-            if vol == names["keys"] and head_rel:
-                # Right after the keys volume, before any other volume or .env: the restore mark. While it is
-                # there the audit pruner deletes nothing, until `audit accept-restore` (run below once the
-                # stack is up, or by hand) accepts the restore. A restore stopped part way leaves it in place.
-                restored_record = read_volume_json(vol, head_rel)
-                if restored_record is not None or replaced_record is not None:
-                    import datetime as _dt
-                    mark = {"at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                            "bundle": os.path.basename(os.path.normpath(bundle)), "record": replaced_record,
-                            "restored_record": restored_record}
-                    if not write_volume_file(vol, head_rel + ".restore-pending", json.dumps(mark)):
-                        self._fail("could not write the restore mark into %s - the deployment is stopped; "
-                                   "retry the restore" % vol)
-                    marked = True
-        # The old AUDIT_CHAIN_KEY the bundle carries, beside .env and on the disk before the .env that does not
-        # hold it: the restored chain may be under it.
-        if carried is not None and not os.path.lexists(kept_here):
-            try:
-                write_kept_key(kept_here, carried)
-            except OSError as exc:
-                self._fail("could not put the old AUDIT_CHAIN_KEY this backup carries into %s (%s) - the deployment "
-                           "is stopped; retry the restore" % (kept_here, exc))
-        # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
-        # the plaintext was decrypted into memory above; write those exact bytes.
-        if sealed_env_bytes is not None:
-            self._atomic_write_secret(self._env_path(), sealed_env_bytes)
-        else:
-            _copy_secret(env_path, self._env_path())
-        tighten_secret_file(self._env_path())
+        # Keep the current .env before anything is stopped or replaced (see _keep_env_before_restore). A restore
+        # that ends before the backup's .env is installed leaves the current one in place, so the copy is then
+        # removed again: it would be a second plaintext copy of the same secrets.
+        current_prefix, kept_env = self._keep_env_before_restore(prefix, sealed_env_bytes, env_path)
+        try:
+            # Stop the stack FIRST: extracting pg_data under a live Postgres both fails to take effect (the
+            # running server keeps serving its cached state - the "restored, saw the same files" trap) and
+            # risks corrupting the cluster. down (no -v) removes the containers but KEEPS every volume,
+            # which we then overwrite in place.
+            if current_prefix != prefix and container_running(DB_CONTAINER):
+                print(pal.paint("  Note: a different deployment (set '%s') is running and will be stopped "
+                                "to restore set '%s' (its data and its .env are kept)." % (current_prefix, prefix),
+                                "yellow"))
+            print(pal.paint("  Stopping the deployment before restore (data volumes are kept) ...", "cyan"))
+            self._stop_stack()
+            # `down` can fail or time out (e.g. a slow Postgres checkpoint) and _stop_stack swallows that.
+            # NEVER clear a volume out from under a live container: if the database is still up after the
+            # stop attempt, abort with the data intact (a fresh-host restore has no container, so this is
+            # skipped there).
+            if container_running(DB_CONTAINER):
+                self._fail("could not stop the running deployment before restore (the database is still "
+                           "up) - aborting; your data is intact. Stop the stack and retry.")
+            # The head record of the keys volume about to be replaced (a restore over the same set), kept for the
+            # restore mark: what it knew the restore then undoes.
+            replaced_record = None
+            if head_rel and volume_exists(names["keys"]):
+                replaced_record = read_volume_json(names["keys"], head_rel)
+            # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
+            # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
+            marked = False
+            for vol, archive in plan:
+                print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
+                # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
+                # silently degrade to the old MERGE (the exact "restored, saw the same files" trap). The
+                # stack is already stopped, so aborting loudly is the safe state.
+                if not clear_volume(vol):
+                    self._fail("could not clear volume %s before restore - the deployment is stopped; free "
+                               "the volume and retry (refusing to merge the backup over stale data)." % vol)
+                if not untar_volume(vol, bundle, archive):
+                    self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
+                               "bundle and retry." % (vol, archive))
+                if vol == names["keys"] and head_rel:
+                    # Right after the keys volume, before any other volume or .env: the restore mark. While it is
+                    # there the audit pruner deletes nothing, until `audit accept-restore` (run below once the
+                    # stack is up, or by hand) accepts the restore. A restore stopped part way leaves it in place.
+                    restored_record = read_volume_json(vol, head_rel)
+                    if restored_record is not None or replaced_record is not None:
+                        import datetime as _dt
+                        mark = {"at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                "bundle": os.path.basename(os.path.normpath(bundle)), "record": replaced_record,
+                                "restored_record": restored_record}
+                        if not write_volume_file(vol, head_rel + ".restore-pending", json.dumps(mark)):
+                            self._fail("could not write the restore mark into %s - the deployment is stopped; "
+                                       "retry the restore" % vol)
+                        marked = True
+            # The old AUDIT_CHAIN_KEY the bundle carries, beside .env and on the disk before the .env that does not
+            # hold it: the restored chain may be under it.
+            if carried is not None and not os.path.lexists(kept_here):
+                try:
+                    write_kept_key(kept_here, carried)
+                except OSError as exc:
+                    self._fail("could not put the old AUDIT_CHAIN_KEY this backup carries into %s (%s) - the "
+                               "deployment is stopped; retry the restore" % (kept_here, exc))
+            # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
+            # the plaintext was decrypted into memory above; write those exact bytes.
+            if sealed_env_bytes is not None:
+                self._atomic_write_secret(self._env_path(), sealed_env_bytes)
+            else:
+                _copy_secret(env_path, self._env_path())
+            tighten_secret_file(self._env_path())
+        except BaseException:
+            self._drop_kept_env_if_unneeded(kept_env)
+            raise
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
+        self._say_what_the_restore_kept(kept_env, current_prefix, prefix)
         finish = "python dockvault.py audit accept-restore"
         rekey = "python dockvault.py audit rekey --old-key-file %s" % kept_here
         if carried is not None:
@@ -5812,6 +5830,120 @@ class DockVault:
                                                         old_key_file=None), "accept-restore")
         else:
             self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
+
+    def _keep_env_before_restore(self, prefix, sealed_env_bytes, env_path):
+        """Keep the current .env before a restore installs the backup's .env over it. `prefix` is the set the
+        backup restores; `sealed_env_bytes` / `env_path` hold the backup's .env. Returns (the prefix of the set the
+        host is on, the kept copy's path or None).
+
+        The current .env holds the secrets of the set the host is on (its database password, ENCRYPTION_KEY):
+        without it that set's volumes cannot be read. A restore of another set's backup leaves those volumes as
+        they were, so the copy is the way back to them. A restore over the same set replaces its data, and the .env
+        it had is kept as well, for a setting changed since the backup. Nothing is kept when there is no .env, or
+        when it is the backup's own .env byte for byte (nothing would be lost).
+
+        The copy is .env.<prefix of the set the host is on>, the name Volumes' repoint finds a set's .env by, or
+        .env.<prefix>.1, .2, ... when that name is taken: never written over a file already there. A copy that
+        cannot be made refuses the restore here, before anything is stopped or replaced, with nothing changed."""
+        current_prefix = volume_prefix(self._load_env())
+        env_now = self._env_path()
+        if not os.path.exists(env_now):
+            return current_prefix, None
+        try:
+            with open(env_now, "rb") as f:
+                current = f.read()
+            if sealed_env_bytes is not None:
+                restored = bytes(sealed_env_bytes)
+            else:
+                with open(env_path, "rb") as f:
+                    restored = f.read()
+        except OSError as exc:
+            self._fail("could not read the current .env or the backup's to keep the current one before the restore "
+                       "(%s). Nothing changed." % exc)
+        if current == restored:
+            return current_prefix, None
+        label = current_prefix if valid_volume_prefix(current_prefix) else "before-restore"
+        try:
+            kept = self._keep_env_copy(label, current)
+        except OSError as exc:
+            self._fail("could not keep the current .env as %s (%s): without it the volumes of set '%s' could not be "
+                       "read again after the restore. Nothing changed."
+                       % (os.path.join(self.root, ".env." + label), exc, current_prefix))
+        print(self.pal.paint("  Kept the current .env (set '%s') as %s before the restore." % (current_prefix, kept),
+                             "cyan"))
+        return current_prefix, kept
+
+    def _keep_env_copy(self, label, data):
+        """Write `data` (the current .env's bytes) to .env.<label>, or to .env.<label>.1, .2, ... when that name is
+        taken (a file, a folder or a link: never followed, never written over). Created mode 600, written through
+        to the disk with its name, tightened like .env and read back to the same bytes before its path is returned.
+        Raises OSError; a file this call created but could not finish is removed."""
+        base = os.path.join(self.root, ".env." + label)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        dest, n = base, 1
+        while True:
+            try:
+                fd = os.open(dest, flags, 0o600) if os.name != "nt" else os.open(dest, flags)
+                break
+            except FileExistsError:
+                dest = "%s.%d" % (base, n)
+                n += 1
+        try:
+            with os.fdopen(fd, "wb") as out:
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+            tighten_secret_file(dest)
+            sync_directory(self.root)
+            with open(dest, "rb") as f:
+                if f.read() != data:
+                    raise OSError("%s does not read back as it was written" % dest)
+        except BaseException:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+        return dest
+
+    def _drop_kept_env_if_unneeded(self, kept):
+        """After a restore that ended before it installed the backup's .env: remove the copy
+        _keep_env_before_restore made, as long as .env still reads exactly as the copy (the current one is then
+        still in place, and the copy would only be a second plain-text copy of its secrets). Left alone whenever
+        .env reads otherwise (the install had begun) or either file cannot be read."""
+        if not kept:
+            return
+        try:
+            with open(kept, "rb") as a, open(self._env_path(), "rb") as b:
+                unneeded = a.read() == b.read()
+        except OSError:
+            return
+        if unneeded:
+            try:
+                os.remove(kept)
+            except OSError:
+                pass
+
+    def _say_what_the_restore_kept(self, kept, current_prefix, prefix):
+        """After the backup's .env is installed: what the copy _keep_env_before_restore made is for, and for a
+        restore of another set, the command that goes back to the set the host was on."""
+        if not kept:
+            return
+        pal = self.pal
+        arg = '"%s"' % kept if any(c.isspace() for c in kept) else kept
+        if current_prefix != prefix:
+            print(pal.paint("  The set this host was on, '%s', is as it was: its volumes are untouched, and its .env "
+                            "is kept in %s." % (current_prefix, kept), "yellow"))
+            print(pal.paint("  To go back to it: python dockvault.py volumes --non-interactive --action repoint "
+                            "--target-prefix %s --env-source %s" % (current_prefix, arg), "yellow"))
+            print(pal.paint("  That file is plain text and holds the ENCRYPTION_KEY and database password of set '%s', "
+                            "and 'lock' does not seal it: keep it, and a copy of it off this host, for as long as you "
+                            "may want that set back." % current_prefix, "yellow"))
+        else:
+            print(pal.paint("  The .env this set had before the restore is kept in %s. It does not open the restored "
+                            "data (the backup's own .env does): copy from it any setting you changed since the "
+                            "backup, then delete it (it is plain text and holds secrets, and 'lock' does not seal "
+                            "it)." % kept, "yellow"))
 
     def _say_how_to_finish(self, marked, carried, finish, rekey, kept):
         """What is left after a restore: accepting it (`finish`, when it was marked), and finishing the change of
