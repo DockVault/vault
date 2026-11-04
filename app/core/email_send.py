@@ -25,12 +25,36 @@ _LEGACY_SETTINGS_KEY = "global"
 
 
 class EmailSendError(Exception):
-    """A send failure classified as 'config' (400-worthy), 'auth', or 'transport' (502-worthy)."""
+    """A send failure classified as 'config' (400-worthy), or 'auth', 'certificate' or 'transport'
+    (502-worthy)."""
 
     def __init__(self, category: str, message: str):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+def _one_line(value, limit: int = 200) -> str:
+    """``value`` as one printable line of at most ``limit`` characters."""
+    return "".join(ch if ch.isprintable() else " " for ch in str(value or "")).strip()[:limit]
+
+
+def certificate_not_verified(exc: "ssl.SSLCertVerificationError", host: str, port) -> EmailSendError:
+    """The error for a mail server whose certificate the vault could not verify, logged like the other
+    send failures. It has its own category and says what happened, with OpenSSL's reason, rather than
+    blaming the server address or the From address: an installation whose mail server presents a
+    certificate from an authority the vault no longer trusts must be able to tell. It is raised during
+    the TLS handshake, before the vault has sent the server a password or a message."""
+    reason = _one_line(getattr(exc, "verify_message", None) or getattr(exc, "reason", None)
+                       or "no reason given").rstrip(".")
+    where = f"{_one_line(host)}:{port}"
+    print(f"[email] send refused: the certificate of the mail server at {where} could not be "
+          f"verified: {reason} (verify code {getattr(exc, 'verify_code', None)})")
+    return EmailSendError(
+        "certificate",
+        f"The mail server's certificate could not be verified: {reason}. No password or message was "
+        f"sent to {where}. Check that the server address is the name on its certificate and that the "
+        "certificate comes from an authority the vault trusts.")
 
 
 def _profile_to_cfg(p) -> dict:
@@ -198,6 +222,9 @@ def smtp_send(cfg: dict, msg: EmailMessage) -> None:
         raise
     except smtplib.SMTPAuthenticationError:
         raise EmailSendError("auth", "SMTP authentication failed — check the username and password.")
+    except ssl.SSLCertVerificationError as e:
+        # Before the ValueError branch below: this error is also a ValueError.
+        raise certificate_not_verified(e, host, port)
     except (ValueError, UnicodeError) as e:
         print(f"[email] send config invalid: {type(e).__name__}: {e}")
         raise EmailSendError(
@@ -262,6 +289,9 @@ def smtp_send_batch(cfg: dict, messages: list) -> list:
         raise
     except smtplib.SMTPAuthenticationError:
         raise EmailSendError("auth", "SMTP authentication failed — check the username and password.")
+    except ssl.SSLCertVerificationError as e:
+        # Before the ValueError branch below: this error is also a ValueError.
+        raise certificate_not_verified(e, host, port)
     except (ValueError, UnicodeError) as e:
         print(f"[email] batch config invalid: {type(e).__name__}: {e}")
         raise EmailSendError(
