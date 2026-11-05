@@ -44,11 +44,13 @@ def _job_text(name: str, next_name: str | None) -> str:
     return body.split(f"\n  {next_name}:\n", 1)[0]
 
 
-# The six configuration scenarios. Each reconfigures the stack, so they run in a job of their own.
+# The configuration scenarios. Each reconfigures the stack, so they run in a job of their own.
+_SIZE_WITHOUT_A_CEILING = "Exercise the size accounting with no storage ceiling"
 _SCENARIO_STEPS = (
     "Exercise the transfer ceiling on a deployment that refuses",
     "Exercise the log-pull endpoint with its ceiling on",
     "Exercise the vault-type allowlist against a forbidden type",
+    _SIZE_WITHOUT_A_CEILING,
     "Exercise the general API fail-open during a Redis outage",
     "Exercise login throttling and Redis outage fallback",
     "Exercise the device-sync pre-flight states",
@@ -71,7 +73,7 @@ def test_preflight_blocks_expensive_integration_work():
 
 
 def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
-    """The six reconfiguring scenarios used to follow the suite in one job and one 60-minute cap,
+    """The reconfiguring scenarios (six then) used to follow the suite in one job and one 60-minute cap,
     which the suite plus 0.33.0's new tests would have run out. They now run in a second job, beside
     the suite, on a stack of their own. What must hold for that to be the same check, not a weaker one:
 
@@ -141,6 +143,67 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
         ]
     # Artifact names are unique within a run: a second upload under a taken name fails its step.
     assert len(artifacts) == len(set(artifacts)) == 3
+
+
+def _size_step_run() -> str:
+    import yaml
+
+    steps = yaml.safe_load(_WORKFLOW)["jobs"]["scenarios"]["steps"]
+    (step,) = [s for s in steps if s.get("name") == _SIZE_WITHOUT_A_CEILING]
+    return step["run"]
+
+
+def _heredocs(run: str) -> list:
+    """The Python each `python - <<'PY'` of a step runs, in order."""
+    parts = run.split("python - <<'PY'\n")[1:]
+    return [p.split("\nPY\n", 1)[0] + "\n" for p in parts]
+
+
+def test_the_size_accounting_runs_once_more_without_the_storage_ceiling():
+    """Both stack jobs write MAX_STORAGE_GB=64, so every finish there also takes the deployment's storage turn; the
+    shipped default has no ceiling, and then the vault's row lock alone holds a vault's size limit. One scenario
+    removes the line, recreates the API, refuses to go on while the deployment still has a maximum or a live
+    limit, runs tests/test_vault_size_accounting.py with a report, and puts the ceiling back after it."""
+    for job in ("integration", "scenarios"):
+        assert 'echo "MAX_STORAGE_GB=64"' in _job_text(job, "scenarios" if job == "integration" else None)
+    run = _size_step_run()
+    removed = run.index("sed -i '/^MAX_STORAGE_GB=/d' .env\n")
+    recreated = run.index("docker compose up -d --force-recreate vault-api\n", removed)
+    checked, report = _heredocs(run)
+    assert recreated < run.index(checked) < run.index("python -m pytest")
+    assert 'body.get("deployment_storage_max_gb") is not None' in checked
+    assert 'body.get("deployment_storage_limit_bytes") is not None' in checked and "sys.exit(" in checked
+    (pytest_line,) = [ln for ln in run.splitlines() if "python -m pytest" in ln]
+    assert pytest_line.split() == ["python", "-m", "pytest", "tests/test_vault_size_accounting.py",
+                                   "--maxfail=1", "--junitxml=size-junit.xml"]
+    restored = run.index("echo 'MAX_STORAGE_GB=64' >> .env\n")
+    assert run.index(report) < restored < run.index("docker compose up -d --force-recreate vault-api\n", restored)
+
+
+def _junit(path, cases):
+    body = "".join(
+        f'<testcase classname="tests.test_vault_size_accounting" name="{name}">{inner}</testcase>'
+        for name, inner in cases)
+    path.write_text(f'<testsuites><testsuite name="pytest">{body}</testsuite></testsuites>', encoding="utf-8")
+
+
+_ALL_SEVEN = [(f"test_{i}", "") for i in range(7)]
+
+
+@pytest.mark.parametrize("cases,passes", [
+    (_ALL_SEVEN, True),
+    (_ALL_SEVEN[:6] + [("test_6", '<skipped message="no stack"/>')], False),
+    (_ALL_SEVEN[:6] + [("test_6", '<failure message="413"/>')], False),
+    (_ALL_SEVEN[:6], False),
+    ([], False),
+], ids=["all-ran", "one-skipped", "one-failed", "six-only", "none"])
+def test_the_step_fails_unless_every_size_accounting_test_ran(tmp_path, cases, passes):
+    _checked, report = _heredocs(_size_step_run())
+    _junit(tmp_path / "size-junit.xml", cases)
+    done = subprocess.run([sys.executable, "-c", report], cwd=tmp_path, capture_output=True, text=True)
+    assert (done.returncode == 0) is passes, done.stdout + done.stderr
+    if passes:
+        assert "7 of 7 ran and passed" in done.stdout and "ran: test_6" in done.stdout
 
 
 def test_a_candidate_or_release_tests_run_includes_the_fast_lanes():
