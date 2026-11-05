@@ -352,6 +352,27 @@ def test_the_text_on_older_images_names_the_reader_and_the_escape():
                                                            f"FROM {dr.TABLE} ORDER BY key")
 
 
+def test_the_text_on_older_images_names_every_record_kept_in_data_requirements():
+    """Every module that writes a row into data_requirements, by the key it writes, and the words the text uses for
+    it: a record added later that an earlier release cannot read must be named there too."""
+    from app.core import audit_archive, compliance_marker, legal_hold_marker, recording_marker
+    named = {"app/core/audit_archive.py": (audit_archive.MARKER_KEY, "archived audit days"),
+             "app/core/legal_hold_marker.py": (legal_hold_marker.KEY, "legal holds and what they kept"),
+             "app/core/recording_marker.py": (recording_marker.KEY, "recording levels below Full"),
+             "app/core/compliance_marker.py": (compliance_marker.KEY, "open compliance cases and the records of "
+                                                                      "compliance access while they must be kept")}
+    writes = re.compile(r"INSERT INTO \{(?:\w+\.)?TABLE\} \(key, requires_at_least")
+    writers = sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "app").rglob("*.py")
+                     if writes.search(path.read_text(encoding="utf-8")))
+    assert writers == sorted(named)
+    assert len({key for key, _words in named.values()}) == len(named)
+    text = rc.SUMMARY["older-images-refuse-newer-data"]
+    for path, (key, words) in named.items():
+        assert text.count(words) == 1, (path, key)
+    assert ("for as long as it lasts: archived audit days, legal holds and what they kept, recording levels below "
+            "Full, and open compliance cases and the records") in text
+
+
 def test_the_promotion_text_says_what_a_rollback_leaves_unrecorded():
     """The origin of a password is read from the audit log once, when 0.34.0 adds its columns; nothing reads what an
     earlier release did after a rollback (app/core/password_origin.py, add_columns_once)."""

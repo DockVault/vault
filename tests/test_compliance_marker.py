@@ -224,6 +224,22 @@ def test_the_undo_holds_with_no_case_and_names_only_what_the_host_tool_can_do():
     assert '("close' not in actions and '("release' not in actions
 
 
+@pytest.mark.parametrize("running, asked", [("0.33.6", "0.33.6"), ("0.34.0", "0.34.0"), ("0.34.2", "0.34.0"),
+                                            ("1.0.0", "0.34.0"), ("", "0.34.0")])
+def test_the_marker_asks_for_0_34_0_or_a_build_before_it_its_own_version(db, monkeypatch, running, asked):
+    """A build made before the release (its VERSION still below 0.34.0) starts on the data it marked itself; every
+    later build asks for 0.34.0, the release that keeps the records, not for its own version."""
+    from app.core import data_requirements as dr
+    monkeypatch.setattr(recording_marker, "running_version", lambda: running)
+    _case(db)
+    assert marker.required_version() == asked
+    assert marker.sync(db, now=NOW) is True
+    ((_key, needs, _reason, undo),) = _rows(db)
+    assert needs == asked and undo.endswith(f"start DockVault {asked} or later once so it removes this marker.")
+    if dr._parse(running) is not None:
+        assert dr.check(db.connection(), running, allow=False) == [], "the build that marked it starts on it"
+
+
 def test_the_marker_goes_once_its_records_may_go(db):
     _row(db, FLOOR - 1)
     assert marker.sync(db, now=NOW) is True

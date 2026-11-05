@@ -410,6 +410,21 @@ def test_a_return_after_a_short_rollback_an_earlier_release_wrote_in_waits_the_g
     assert _hot(env) == 0
 
 
+def test_the_settings_page_dates_the_start_from_a_return_an_earlier_release_wrote_in(env, monkeypatch):
+    """The page reads the rows an earlier release wrote, through a session of the process, as the job does: after 2
+    days on one that wrote to the log it shows the grace from the return. A process with no database yet can tell
+    only the gaps' lengths, so it shows the grace from genesis."""
+    from app.core import database
+    back = _after_a_gap(env, before_days=13, away=dict(days=2), written=True)
+    monkeypatch.setattr(database, "started_session", env.session)
+    assert arc.summary(env.st)["starts_on"] == fmt.time_text(back + timedelta(days=14))
+
+    def not_yet():
+        raise database.RuntimeNotReady("no runtime")
+    monkeypatch.setattr(database, "started_session", not_yet)
+    assert arc.summary(env.st)["starts_on"] == fmt.time_text(T0 + timedelta(days=14))
+
+
 @pytest.mark.parametrize("away", [dict(hours=11), dict(hours=13), dict(days=2, hours=23)])
 def test_a_stop_with_nothing_written_leaves_the_grace_as_it_was(env, away):
     """A stop of less than 12 hours is no gap; a longer one up to 3 days in which nothing was written, a server
