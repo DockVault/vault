@@ -138,7 +138,7 @@ def test_the_frameworks_cancellation_lets_the_work_end_and_its_result_come_back(
 
 
 def test_calls_more_than_the_pool_has_threads_all_run_and_the_loop_still_answers():
-    n = off_loop.WORKERS + 4
+    n = off_loop.pool_size() + 4
 
     async def scenario():
         stop, gaps = asyncio.Event(), []
@@ -275,3 +275,50 @@ def test_the_work_is_not_queued_behind_the_loops_default_executor():
         timer.cancel()
     assert result == "stored"
     assert took < 1.5, f"the work waited {took:.2f} s for a thread the loop's default executor had parked"
+
+
+def test_the_pool_has_a_thread_for_every_transfer_the_ceilings_admit_and_room_for_the_rest():
+    from app.core.transfer_admission import admitted_at_most
+    for limit in list(range(-1, 130)) + [256]:
+        assert off_loop.workers(limit) >= off_loop.MIN_WORKERS == 32
+        assert off_loop.workers(limit) - admitted_at_most(limit) >= off_loop.HEADROOM == 12, limit
+    assert off_loop.workers(16) == 32, "the default ceiling's pool changed"
+
+
+def test_at_a_raised_ceiling_a_chunk_sync_is_not_kept_waiting_behind_every_admitted_transfer(monkeypatch):
+    """At a ceiling of 40 the two ceilings admit 50 transfers, each of which may hold a thread here for minutes (a
+    folder copy). The pool had 32 threads: those took every one, and a chunk's sync, which takes milliseconds,
+    waited behind them. With every admitted transfer running, a sync is still done at once."""
+    from app.core.config import settings
+    from app.core.transfer_admission import admitted_at_most
+    monkeypatch.setattr(settings, "max_concurrent_transfers", 40)
+    monkeypatch.setattr(off_loop, "_pool", None)
+    admitted = admitted_at_most(40)
+    release = threading.Event()
+
+    def transfer():
+        assert release.wait(10)
+        return "copied"
+
+    async def scenario():
+        running = [asyncio.ensure_future(off_loop.run_to_end(transfer)) for _ in range(admitted)]
+        await asyncio.sleep(0.2)
+        started = time.monotonic()
+        try:
+            synced = await asyncio.wait_for(off_loop.run_to_end(lambda: "synced"), timeout=3)
+        except asyncio.TimeoutError:
+            synced = None
+        took = time.monotonic() - started
+        release.set()
+        return synced, took, await asyncio.gather(*running)
+
+    try:
+        synced, took, copied = run_coroutine(scenario())
+    finally:
+        release.set()
+        pool = off_loop._pool
+        if pool is not None:
+            pool.shutdown(wait=True)
+    assert off_loop.workers(40) == 62
+    assert synced == "synced" and took < 1, f"the sync waited {took:.1f} s behind {admitted} transfers"
+    assert copied == ["copied"] * admitted

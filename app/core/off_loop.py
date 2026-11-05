@@ -42,25 +42,63 @@ The pool is this module's own: not the event loop's default executor, which the 
 threads in, and not the thread pool Starlette runs synchronous endpoints and dependencies in, which work
 this long would take from every other request. More calls than it has threads wait their turn there, off
 the loop.
+
+It is sized from the transfer ceiling (``workers``): a thread for each transfer the ceilings admit, each of which
+holds its thread for as long as its work runs (a folder copy for minutes), and HEADROOM more for what runs here
+without a slot (a chunk's sync, a direct upload's chunk write, the brand image), which is short. At a fixed 32,
+a raised ceiling let admitted copies and completions take every thread, and every chunk sync then waited behind
+them.
 """
 import asyncio
 import concurrent.futures
 import contextvars
 import functools
+import threading
 
 import anyio
 
-# What uses the request's session here (uploads finishing, copies and moves) is bounded by the transfer
-# ceilings (MAX_CONCURRENT_TRANSFERS, 16 by default, and a quarter of it for public upload links); a chunk's sync
-# is short. Room for both at the default ceilings.
-WORKERS = 32
-_pool = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="stored-bytes")
+from app.core.transfer_admission import admitted_at_most
+
+# Threads beyond the transfers the ceilings admit, for the short work that runs here without a slot.
+HEADROOM = 12
+# The least the pool has, as it always had: 20 transfers and 12 more at the default ceiling of 16.
+MIN_WORKERS = 32
+
+_pool = None
+_pool_size = None
+_pool_lock = threading.Lock()
+
+
+def workers(max_concurrent_transfers) -> int:
+    """The pool's threads for the transfer ceiling configured as ``max_concurrent_transfers``: one for each transfer
+    the two ceilings admit, and HEADROOM more; never fewer than MIN_WORKERS."""
+    return max(MIN_WORKERS, admitted_at_most(max_concurrent_transfers) + HEADROOM)
+
+
+def _executor():
+    """The pool, made at its first use, sized from the ceiling this process was configured with."""
+    global _pool, _pool_size
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                from app.core.config import settings
+                _pool_size = workers(settings.max_concurrent_transfers)
+                _pool = concurrent.futures.ThreadPoolExecutor(max_workers=_pool_size,
+                                                              thread_name_prefix="stored-bytes")
+    return _pool
+
+
+def pool_size() -> int:
+    """How many threads the pool has."""
+    _executor()
+    return _pool_size
 
 
 async def run_to_end(fn, /, *args, **kwargs):
     """Run ``fn(*args, **kwargs)`` in this module's thread pool and return its result; see the module."""
     loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(_pool, functools.partial(contextvars.copy_context().run, fn, *args, **kwargs))
+    future = loop.run_in_executor(_executor(), functools.partial(contextvars.copy_context().run, fn, *args,
+                                                                 **kwargs))
     cancelled = None
     # Shielded from the cancellation the web framework asks for, which it would otherwise ask again at every
     # pause until the request ended. A cancellation of the task itself still arrives, once: it is kept, and
