@@ -854,8 +854,21 @@ def test_the_vault_picker_names_only_what_the_auditor_can_already_read(db, peopl
     assert out["vaults"][0]["file_count"] == 3
     (row,) = _rows(db, "case_picker_viewed")
     assert row.resource_id == str(people.olga.id) and row.user_id == people.uma.id
-    _, err = _call(cr.vault_picker, owner=str(uuid.uuid4()), current_user=people.uma, db=db)
-    assert err.status_code == 404
+
+
+def test_a_vault_picker_lookup_of_no_account_is_recorded_without_what_it_named(db, people):
+    """Looking names up leaves a record whether or not they exist: a lookup that finds no account answers 404 and is
+    recorded as a failure, with whether it named an id or a username, never what it named."""
+    missing = str(uuid.uuid4())
+    for owner in (missing, "no-such-person"):
+        _, err = _call(cr.vault_picker, owner=owner, current_user=people.uma, db=db)
+        assert err.status_code == 404 and err.detail == "No such account."
+    rows = _rows(db, "case_picker_viewed", "failure")
+    assert [(r.user_id, r.resource_type, r.resource_id) for r in rows] == [(people.uma.id, "user", None)] * 2
+    assert [(r.details["reason"], r.details["via"]) for r in rows] == [("no_such_account", "id"),
+                                                                    ("no_such_account", "username")]
+    assert not any(missing in str(r.details) or "no-such-person" in str(r.details) for r in rows)
+    assert _rows(db, "case_picker_viewed", "success") == []
 
 
 def _host_act(db, *argv):

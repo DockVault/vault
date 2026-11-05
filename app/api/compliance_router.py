@@ -1047,7 +1047,8 @@ def vault_picker(owner: str = Query(..., min_length=1, max_length=255),
                  current_user: User = Depends(require_live_auditor_or_admin), db: Session = Depends(get_db)):
     """One owner's vaults for a case or a legal hold (by account id or username): type, size, file count, creation
     date and id; a name only where the caller can already read the vault. A live auditor, or an administrator (who
-    places holds). Each query is recorded."""
+    places holds). Each query is recorded, one that finds no account too (as a failure, with whether it named an id
+    or a username, never what it named): looking names up leaves a record whether or not they exist."""
     from app.core import cases
     from app.core.authorization import PermissionService
     from app.core.models import Vault
@@ -1057,6 +1058,11 @@ def vault_picker(owner: str = Query(..., min_length=1, max_length=255),
     person = db.get(User, person_id) if person_id is not None else (
         db.query(User).filter(User.username == owner.strip()).first())
     if person is None:
+        db.add(AuditLogger(db).build_row(action="case_picker_viewed", status="failure", user=current_user,
+                                         resource_type="user", resource_id=None,
+                                         details={"reason": "no_such_account",
+                                                  "via": "id" if person_id is not None else "username"}))
+        db.commit()
         raise HTTPException(status_code=404, detail="No such account.")
     permissions = PermissionService(db)
     out = []

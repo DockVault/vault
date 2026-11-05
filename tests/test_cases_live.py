@@ -19,6 +19,7 @@ from _auditor_helpers import (compliance_receipt, forget_grants, grant_right, ne
                               two_admins)
 from _owner_notice_helpers import mail_to, outbox, owner_with_vault, sender_held, sending_to_sink, wait_for
 from _sf_helpers import enroll_totp
+from conftest import unique
 
 pytestmark = pytest.mark.integration
 
@@ -230,6 +231,13 @@ def test_refusals_are_recorded(world, admin):
     assert r.status_code == 200 and [v["name"] for v in r.json()["vaults"]] == [None]
     assert psql("SELECT count(*) FROM audit_logs WHERE action = 'case_picker_viewed' "
                 f"AND user_id = '{uma['id']}' AND resource_id = '{olga['id']}'") == "1"
+    # A look for an account that does not exist is recorded too, without what it named.
+    nobody = unique("nobody")
+    r = uma_c.get("/compliance/vault-picker", params={"owner": nobody})
+    assert r.status_code == 404, r.text
+    assert psql("SELECT count(*) FROM audit_logs WHERE action = 'case_picker_viewed' AND status = 'failure' "
+                f"AND user_id = '{uma['id']}' AND details->>'reason' = 'no_such_account' "
+                f"AND details->>'via' = 'username' AND details::text NOT LIKE '%{nobody}%'") == "1"
     # Withdrawn by its auditor while it waits.
     r = uma_c.post(f"/compliance/cases/{case['id']}/withdraw")
     assert r.status_code == 200 and r.json()["status"] == "withdrawn"
