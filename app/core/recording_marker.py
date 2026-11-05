@@ -85,9 +85,23 @@ def stricter_now(db) -> bool:
     return db.execute(text(STRICTER_SQL)).first() is not None
 
 
+def _on_postgres(db) -> bool:
+    return db.bind is not None and db.bind.dialect.name == "postgresql"
+
+
 def _ensure_table(db) -> None:
-    postgres = db.bind is not None and db.bind.dialect.name == "postgresql"
-    db.execute(text(_DDL_POSTGRES if postgres else _DDL_OTHER))
+    db.execute(text(_DDL_POSTGRES if _on_postgres(db) else _DDL_OTHER))
+
+
+def write_row(db, key: str, version: str, reason: str, undo: Optional[str], since) -> None:
+    """Write the marker row ``key`` (its version, reason and undo; ``since`` only when the row is new) with one
+    upsert, in the caller's transaction: two transactions that both found no row both write it, and neither fails
+    on the key."""
+    db.execute(text(f"INSERT INTO {TABLE} (key, requires_at_least, reason, undo, since) "
+                    "VALUES (:key, :version, :reason, :undo, :since) "
+                    "ON CONFLICT (key) DO UPDATE SET requires_at_least = excluded.requires_at_least, "
+                    "reason = excluded.reason, undo = excluded.undo"),
+               {"key": key, "version": version, "reason": reason, "undo": undo, "since": since})
 
 
 def sync(db, levels=None, *, now=None) -> bool:
@@ -102,13 +116,7 @@ def sync(db, levels=None, *, now=None) -> bool:
         return False
     when = now or datetime.now(timezone.utc).replace(tzinfo=None)
     version = required_version()
-    params = {"key": KEY, "version": version, "reason": REASON.format(introduced=INTRODUCED),
-              "undo": UNDO.format(version=version), "since": when}
-    updated = db.execute(text(f"UPDATE {TABLE} SET requires_at_least = :version, reason = :reason, undo = :undo "
-                              "WHERE key = :key"), params).rowcount
-    if not updated:
-        db.execute(text(f"INSERT INTO {TABLE} (key, requires_at_least, reason, undo, since) "
-                        "VALUES (:key, :version, :reason, :undo, :since)"), params)
+    write_row(db, KEY, version, REASON.format(introduced=INTRODUCED), UNDO.format(version=version), when)
     return True
 
 

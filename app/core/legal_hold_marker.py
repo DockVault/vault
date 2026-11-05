@@ -12,6 +12,12 @@ released and what the holds kept is purged. It is written in the transaction tha
 removed by the one that purges the last kept row, and checked again at each start and by every pass of the
 pruner's legal_holds job.
 
+Those transactions do not all take the same turn (the purge's last one takes none), so the row is written and
+removed in a way that holds when two of them run at once (sync): its row is locked before the detect query runs,
+so a placing that refreshed it is waited for and its hold seen; it is written with one upsert, so two first writers
+do not collide; and it is removed only while the detect query still finds nothing, so one that commits a hold
+before the removal's statement starts keeps it.
+
 A release older than the reader of that table (before 0.33.1) is not protected by the row; the upgrade notes
 say so. CONDITION is the upgrade matrix's condition for the edge back to an earlier release, written into the
 matrix in the release commit.
@@ -69,23 +75,28 @@ def required_version() -> str:
 
 def sync(db, *, now: Optional[datetime] = None) -> bool:
     """Bring the marker in line with the holds, in the caller's transaction (the caller commits): kept while a
-    hold stands or a kept row remains, removed otherwise. Returns whether the marker is there."""
+    hold stands or a kept row remains, removed otherwise. Returns whether the marker is there.
+
+    Safe beside another transaction doing the same (see the module's docstring). At READ COMMITTED each statement
+    reads what was committed when it starts, and a removal that waited for the row's lock checks again only its own
+    row, not the holds; so the row is locked first (on Postgres), and the detect query runs after: a placing that
+    refreshed the row has committed by then, and its hold is seen. The row is written with one upsert (two first
+    writers would collide on its key), and removed only while the detect query, run again by the removal itself,
+    finds nothing."""
     from app.core import recording_marker
     db.flush()      # the caller's own holds and kept rows, not yet written (the sessions do not autoflush)
-    there = holds_or_kept(db)
     recording_marker._ensure_table(db)
+    if recording_marker._on_postgres(db):
+        db.execute(text(f"SELECT key FROM {TABLE} WHERE key = :key FOR UPDATE"), {"key": KEY})
+    there = holds_or_kept(db)
     if not there:
-        db.execute(text(f"DELETE FROM {TABLE} WHERE key = :key"), {"key": KEY})
-        return False
+        db.execute(text(f"DELETE FROM {TABLE} WHERE key = :key AND NOT EXISTS ({DETECT_SQL})"), {"key": KEY})
+        # Kept when a hold committed before the removal started: say so.
+        return db.execute(text(f"SELECT 1 FROM {TABLE} WHERE key = :key"), {"key": KEY}).first() is not None
     when = now or datetime.now(timezone.utc).replace(tzinfo=None)
     version = required_version()
-    params = {"key": KEY, "version": version, "reason": REASON.format(introduced=INTRODUCED),
-              "undo": UNDO.format(version=version), "since": when}
-    updated = db.execute(text(f"UPDATE {TABLE} SET requires_at_least = :version, reason = :reason, undo = :undo "
-                              "WHERE key = :key"), params).rowcount
-    if not updated:
-        db.execute(text(f"INSERT INTO {TABLE} (key, requires_at_least, reason, undo, since) "
-                        "VALUES (:key, :version, :reason, :undo, :since)"), params)
+    recording_marker.write_row(db, KEY, version, REASON.format(introduced=INTRODUCED),
+                               UNDO.format(version=version), when)
     return True
 
 
