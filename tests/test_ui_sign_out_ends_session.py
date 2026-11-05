@@ -13,14 +13,21 @@ the token back from the server afterwards:
 - a session that has run out: its expired token's refusal signs the page out, and the session's row is ended too;
 - a sign-out after a two-factor sign-in;
 - a sign-out in another tab: a tab holding the same token signs out at once (told by the other tab, not by a
-  refusal), while a tab of another account stays signed in;
+  refusal), sends nothing of its own, asks for the sign-in screen's policy only when it is next shown (once), and
+  leaves a session stored since by another tab, while a tab of another account stays signed in;
+- the sign-in check of a tab being loaded: a refusal of the session (a 401, an account's 403) ends the session and
+  signs out the other tabs; a check that could not be answered (a server error, a proxy's 502 or 503 while the
+  vault restarts, a rate limit, no answer at all) signs out that tab alone, as it always did, and the session and
+  the other tabs using it go on;
 - no answer from the server (offline): the page is signed out all the same;
 - a preference saved at the sign-out is sent before the session is ended, so it is not refused; a save that does
   not come back holds the sign-out for at most three seconds.
 
 The idle lock of zero-knowledge keys does not sign out (it forgets the keys only), so it has no call to make.
-Waits are on state, never on time, but for the bound on the held save.
+Waits are on state, never on time, but for the bound on the held save and the moments in which something must
+not happen.
 """
+import json
 import time
 
 import pytest
@@ -153,6 +160,8 @@ def test_a_sign_out_in_another_tab_signs_out_the_tabs_of_that_session_only(page:
         sign_in_on_the_tab(other, ben)
         ben_token = other.evaluate("() => authToken")
         assert ben_token != token
+        sent = []
+        context.on("request", lambda r: _is_sign_out(r) and sent.append(r))
 
         _signed_out_by(page, lambda: sign_out(page), token)
         # The tab holding the same token signs out at once, told so by the first tab rather than by a refusal of
@@ -161,6 +170,9 @@ def test_a_sign_out_in_another_tab_signs_out_the_tabs_of_that_session_only(page:
         assert same.evaluate("() => authToken") is None
         expect(same.locator("#toast-container .toast", has_text="Signed out in another tab.")).to_have_count(1)
         expect(same.locator("#toast-container .toast", has_text="Session expired")).to_have_count(0)
+        # It sent no sign-out of its own: the first tab's ended the session.
+        same.wait_for_timeout(1000)
+        assert len(sent) == 1, f"{len(sent)} sign-outs sent for one session"
         # ben's tab stays signed in, and so does his session.
         expect(other.locator("#dashboard-screen")).to_be_visible()
         expect(other.locator("#toast-container .toast", has_text="Signed out in another tab.")).to_have_count(0)
@@ -168,6 +180,123 @@ def test_a_sign_out_in_another_tab_signs_out_the_tabs_of_that_session_only(page:
         assert _refused(ben_token) == 200 and _refused(token) == 401
     finally:
         admin.delete_user(ben["id"])
+
+
+def test_a_tab_told_late_leaves_the_session_stored_since_by_another_tab(page: Page, ana):
+    """A tab the browser froze in the background is told of a sign-out when it wakes, and the person may have
+    signed in again in another tab since: the session then stored for this browser is that new one. The told tab
+    signs out (it held the ended session) and leaves the stored one where it is, so the other tab's next load still
+    finds it."""
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    sent = []
+    page.context.on("request", lambda r: _is_sign_out(r) and sent.append(r))
+    # Signed in again since, in another tab, which stored its session for this browser.
+    page.evaluate("() => { localStorage.setItem('authToken', 'stored-since'); "
+                  "localStorage.setItem('currentUser', '{\"username\": \"since\"}'); }")
+    # The message of the tab that ended this tab's session, delivered late.
+    page.evaluate("(tail) => new BroadcastChannel('dockvault-sign-out').postMessage({ type: 'signed-out', token: tail })",
+                  token[-24:])
+    expect(page.locator("#login-screen")).to_be_visible(timeout=5000)
+    assert page.evaluate("() => authToken") is None
+    assert page.evaluate("() => [localStorage.getItem('authToken'), localStorage.getItem('currentUser')]") \
+        == ["stored-since", '{"username": "since"}']
+    page.wait_for_timeout(1000)
+    assert sent == [], "a tab told of the sign-out sent one of its own"
+
+
+def _is_policy(request):
+    return request.method == "GET" and request.url.endswith("/auth/policy")
+
+
+def test_a_tab_told_of_a_sign_out_asks_for_the_sign_in_policy_when_it_is_next_shown_once(page: Page, ana):
+    """Told of a sign-out, a tab does not ask for the sign-in screen's policy at once (every tab of the session is
+    told at the same moment, and those requests count against the address the person signs in from again); it asks
+    when it is next shown or focused, once, so the screen it shows then is labelled by the policy of that moment."""
+    sign_in_on_the_tab(page, ana)
+    same = page.context.new_page()
+    same.goto("/")
+    expect(same.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    asked = []
+    same.on("request", lambda r: _is_policy(r) and asked.append(r))
+    sign_out(page)
+    expect(same.locator("#login-screen")).to_be_visible(timeout=5000)
+    same.wait_for_timeout(1000)
+    assert asked == [], "the told tab asked for the policy at once"
+    # Hidden first: not yet.
+    same.evaluate("() => { Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });"
+                  " document.dispatchEvent(new Event('visibilitychange')); }")
+    same.wait_for_timeout(500)
+    assert asked == [], "asked while the tab was hidden"
+    # Shown again: once.
+    with same.expect_request(_is_policy, timeout=5000):
+        same.evaluate("() => { Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });"
+                      " document.dispatchEvent(new Event('visibilitychange')); }")
+    same.evaluate("() => { window.dispatchEvent(new Event('focus')); }")
+    same.wait_for_timeout(1000)
+    assert len(asked) == 1, f"asked {len(asked)} times"
+
+
+def _load_check_answered(tab: Page, answer):
+    """Answer the sign-in check of `tab`'s next load (GET /users/me) with `answer`: a status and a detail, or
+    "no answer" (the request fails, so the fetch throws)."""
+    if answer == "no answer":
+        tab.route("**/users/me", lambda route: route.abort("connectionrefused"))
+        return
+    status, detail = answer
+    tab.route("**/users/me", lambda route: route.fulfill(status=status, content_type="application/json",
+                                                         body=json.dumps({"detail": detail})))
+
+
+@pytest.mark.parametrize("answer", [
+    (503, "Service Unavailable"),
+    (502, "Bad Gateway"),
+    (500, "Internal Server Error"),
+    (429, "Rate limit exceeded. Please try again later."),
+    (403, "Forbidden"),
+    "no answer",
+], ids=["503", "502", "500", "429", "403-not-the-account", "no-answer"])
+def test_a_sign_in_check_at_load_that_could_not_be_answered_signs_out_that_tab_alone(page: Page, ana, answer):
+    """One reload while the vault restarts behind a proxy, or a network blip: that tab goes to the sign-in screen as
+    it always did, but nothing refused the session, so it is not ended and the other tab using it stays signed
+    in."""
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    sent = []
+    page.context.on("request", lambda r: _is_sign_out(r) and sent.append(r))
+    second = page.context.new_page()
+    _load_check_answered(second, answer)
+    second.goto("/")
+    expect(second.locator("#login-screen")).to_be_visible(timeout=15000)
+    assert second.evaluate("() => authToken") is None
+    page.wait_for_timeout(1500)                   # a moment in which a call or another tab's message would come
+    assert sent == [], "the session was ended on the server"
+    assert page.evaluate("() => authToken") == token
+    expect(page.locator("#dashboard-screen")).to_be_visible()
+    expect(page.locator("#toast-container .toast", has_text="Signed out in another tab.")).to_have_count(0)
+    assert _refused(token) == 200 and session_row(token) == "t|f"
+
+
+@pytest.mark.parametrize("refusal", [
+    (401, "Could not validate credentials"),
+    (403, "User account is locked"),
+    (403, "User account is inactive"),
+], ids=["401", "403-locked", "403-inactive"])
+def test_a_refusal_of_the_sign_in_check_at_load_ends_the_session_for_every_tab(page: Page, ana, refusal):
+    """The control: a refusal of the session at a tab's load (here from a proxy, while the session is still live on
+    the server) ends the session there, with the tab's token, and the other tab of the session is told."""
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    second = page.context.new_page()
+    _load_check_answered(second, refusal)
+    with second.expect_request(_is_sign_out, timeout=15000) as sent:
+        second.goto("/")
+    assert sent.value.headers.get("authorization") == f"Bearer {token}"
+    expect(second.locator("#login-screen")).to_be_visible(timeout=15000)
+    expect(page.locator("#login-screen")).to_be_visible(timeout=5000)
+    expect(page.locator("#toast-container .toast", has_text="Signed out in another tab.")).to_have_count(1)
+    _ended(token)
+    assert _refused(token) == 401
 
 
 def test_the_page_signs_out_even_when_the_server_cannot_be_reached(page: Page, ana):

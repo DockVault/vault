@@ -392,7 +392,9 @@ display choices (theme, skin, layout, sort order). Signing out removes the token
 and the unlock state. **New in 0.34.0:** it also ends the session on the server at once (its row in
 `active_sessions` is marked ended, and its token is refused everywhere from then on), and signs out the
 other tabs of the same browser that hold the same token; before, a session signed out of in the web app
-stayed valid on the server until it expired. Display choices are kept.
+stayed valid on the server until it expired. Display choices are kept. A tab that could not check its
+session as it loaded (no answer from the server, a server error, a rate limit) signs out only itself, as
+before, and ends nothing: the session is refused only when the server says so.
 
 ## Erasing a person
 
