@@ -17,6 +17,9 @@ route ends the session as logout does and answers without that header. What is h
   begun before, its completion, the direct upload), a download, the live-monitor socket (a new one and one already
   open), and the minting of SFTP temporary credentials;
 - a temporary credential's web session ends and frees the credential's slot, as logout does;
+- at the auth requests' limit a vault ships with, sign-outs are counted in a budget of their own, by the account
+  the token names (expired or not) and by address for any other token: they never use up the sign-in that follows
+  from the same address, nor the account's other auth requests;
 - POST /api/logout keeps its answer for its callers.
 
 tests/test_ui_sign_out_ends_session.py holds the web app's side: every sign-out path calls this route.
@@ -31,6 +34,7 @@ import requests
 
 from _account_change_helpers import psql, signed_in
 from _sign_out_helpers import claims as _claims, expired_copy as _expired_copy, signed_by_the_server as _signed
+from _sign_out_helpers import shipped_auth_limit
 from _sign_out_helpers import session_row as _row, sign_outs_recorded as _sign_outs_recorded
 from _sf_helpers import enroll_totp
 from conftest import BASE_URL, unique
@@ -159,6 +163,44 @@ def test_a_token_naming_another_account_does_not_end_the_session(admin, person):
         assert one.get("/users/me").status_code == 200 and _row(one.token) == "t|f"
     finally:
         admin.delete_user(other["id"])
+
+
+def _sign_in_status(account):
+    return requests.post(f"{BASE_URL}/auth/login",
+                         json={"username": account["_username"], "password": account["_password"]},
+                         timeout=30).status_code
+
+
+def test_the_sign_outs_of_a_session_that_ran_out_are_counted_by_its_account_in_a_budget_of_their_own(
+        admin, person):
+    """Every tab of a session signs out at the same moment, and a session that has run out is signed out with its
+    expired token. Counted with the sign-ins by address (an expired token names no one to the other readers), ten of
+    them used up the sign-in that follows; they are counted by the account the token names, in the sign-out's own
+    budget: past the limit only the account's further sign-outs wait, not another account's, not the sign-in, not
+    the account's other auth requests."""
+    expired = _expired_copy(signed_in(person).token)
+    other = admin.create_user()
+    try:
+        other_expired = _expired_copy(signed_in(other).token)
+        with shipped_auth_limit(admin) as limit:
+            answers = [_sign_out(expired).status_code for _ in range(limit + 1)]
+            assert answers[-1] == 429 and answers[:-1] == [200] * limit, answers
+            assert _sign_out(other_expired).status_code == 200, "another account's sign-out was refused"
+            assert _sign_in_status(person) == 200, "the sign-in after the sign-outs was refused"
+            again = signed_in(person)
+            assert again.get("/auth/session").status_code == 200, "the account's other auth requests were refused"
+    finally:
+        admin.delete_user(other["id"])
+
+
+def test_sign_outs_with_a_token_this_server_did_not_sign_do_not_use_up_the_sign_in(admin, person):
+    """Such a token names no one: its sign-outs are counted by address, in the sign-out's budget, and refused past
+    it; the sign-in from that address goes on."""
+    forged = jwt.encode(_claims(signed_in(person).token), "not-this-servers-key-" + "x" * 32, algorithm="HS256")
+    with shipped_auth_limit(admin) as limit:
+        answers = [_sign_out(forged).status_code for _ in range(limit + 1)]
+        assert answers[-1] == 429 and answers[:-1] == [401] * limit, answers
+        assert _sign_in_status(person) == 200, "the sign-in after the sign-outs was refused"
 
 
 def _upload(client, vault_id, name, body):

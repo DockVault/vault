@@ -60,7 +60,8 @@ RATE_LIMIT_EXCLUDE_PATHS = ("/docs", "/openapi.json", "/redoc", "/health")
 def classify_api_rate_limit(method: str, path: str) -> str:
     """Return one general-API class with auth > upload(_chunk) > download > poll > default precedence.
 
-    Auth covers every /auth route plus logout. A resumable upload's per-CHUNK PUTs go to their own
+    Auth covers every /auth route plus logout (the web app's sign-out at the auth budget in a bucket
+    of its own: SIGN_OUT_BUCKET, below). A resumable upload's per-CHUNK PUTs go to their own
     high-limit `upload_chunk` bucket (one upload is dozens–thousands of requests, so they must NOT
     share the small operation-level `upload` bucket used for init/complete — that throttled large
     files mid-transfer). Download covers the file-content GET. Poll covers the timer-polled read
@@ -99,6 +100,23 @@ def classify_api_rate_limit(method: str, path: str) -> str:
     if method == "GET" and path in POLL_GET_PATHS:
         return "poll"
     return "default"
+
+
+# The web app's sign-out, POST /auth/sign-out. It is in the auth class, at that class's limit and window, but it
+# is counted in a bucket of its own (SIGN_OUT_BUCKET), by the account its token names whether or not the token has
+# expired (RateLimitMiddleware._get_client_identifier); a token this server did not sign is counted by address, in
+# that bucket too. Sign-outs come in bursts that are nobody's abuse: every tab of a session signs out at the same
+# moment, a session that has run out is signed out with its expired token, and the person signs in again from the
+# same address a moment later. Counted with the sign-ins, by address (an expired token names no one to the other
+# readers), those sign-outs used up that sign-in; counted with the account's other auth requests, the sign-outs
+# sent with an old token of the account could use up those.
+SIGN_OUT_PATH = "/auth/sign-out"
+SIGN_OUT_BUCKET = "auth_sign_out"
+
+
+def is_sign_out_request(method: str, path: str) -> bool:
+    """Whether a request is the web app's sign-out (method and path as classify_api_rate_limit reads them)."""
+    return (method or "").upper() == "POST" and ((path or "/").rstrip("/") or "/") == SIGN_OUT_PATH
 
 
 def resolve_api_rate_limit_policy(
@@ -801,7 +819,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         })
         self.exclude_paths = exclude_paths or list(RATE_LIMIT_EXCLUDE_PATHS)
     
-    def _get_client_identifier(self, request: Request) -> str:
+    def _get_client_identifier(self, request: Request, sign_out: bool = False) -> str:
         """
         Extract client identifier from request.
 
@@ -815,6 +833,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         still buckets by trusted-proxy-aware IP. The token decode is best-effort — a missing or
         invalid token silently falls through to the IP bucket (the request will be rejected by the
         real auth dependency downstream anyway).
+
+        `sign_out` (the web app's sign-out, is_sign_out_request): the token is read as that route
+        reads it, expired or not (verify_access_token_for_sign_out), so the sign-out of a session that
+        has run out is counted by the account it names, as the sign-out of a live one is. Its
+        signature is checked all the same: a token this server did not sign names no one, and is
+        counted by address.
         """
         # 1. Explicit request.state (kept for forward-compat with an auth middleware).
         if hasattr(request.state, "user_id") and request.state.user_id:
@@ -824,8 +848,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         auth = request.headers.get("Authorization") or request.headers.get("authorization")
         if auth and auth.lower().startswith("bearer "):
             try:
-                from app.core.security import verify_access_token
-                payload = verify_access_token(auth.split(" ", 1)[1].strip())
+                from app.core import security
+                read = security.verify_access_token_for_sign_out if sign_out else security.verify_access_token
+                payload = read(auth.split(" ", 1)[1].strip())
                 sub = payload.get("sub") if payload else None
                 if sub:
                     return f"user:{sub}"
@@ -866,14 +891,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             except Exception:  # noqa: BLE001 - retain deployment defaults on provider failure
                 logger.warning("Could not resolve the live API rate-limit policy; using deployment defaults")
         rule = policy.get(category, self._static_policy["default"])
-        identifier = self._get_client_identifier(request)
+        # The web app's sign-out: the auth class's rule, in a bucket of its own (SIGN_OUT_BUCKET).
+        sign_out = category == "auth" and is_sign_out_request(request.method, path)
+        identifier = self._get_client_identifier(request, sign_out=sign_out)
+        bucket = SIGN_OUT_BUCKET if sign_out else category
 
         # Class prefixes isolate budgets: traffic in one class cannot consume another.
         allowed, remaining, reset_time = self.rate_limiter.check_rate_limit(
             identifier,
             rule.limit,
             rule.window,
-            prefix=f"rate_limit:api:{category}",
+            prefix=f"rate_limit:api:{bucket}",
         )
         headers = self.rate_limiter.get_rate_limit_headers(
             rule.limit,
