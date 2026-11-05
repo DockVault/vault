@@ -1,0 +1,235 @@
+"""Every way the web app signs out ends the session on the server, in a real browser (static/js/app.js:
+logout, _endServerSession).
+
+Every sign-out goes through logout(), which signs the page out at once and asks the server to end the session it
+held (POST /auth/sign-out, which answers without Clear-Site-Data). Held here, path by path, each time by reading
+the token back from the server afterwards:
+
+- the sign-out button, through the profile menu: the call carries the tab's token, and the token is refused from
+  then on, while the look stored in this browser stays (the answer itself, without Clear-Site-Data, is held by
+  tests/test_api_sign_out.py: the browser does not hand a kept-alive request's answer to a test);
+- a refusal of the session the tab holds (a 401): the page signs out, and the session, still live on the server,
+  is ended;
+- a session that has run out: its expired token's refusal signs the page out, and the session's row is ended too;
+- a sign-out after a two-factor sign-in;
+- a sign-out in another tab: a tab holding the same token signs out at once (told by the other tab, not by a
+  refusal), while a tab of another account stays signed in;
+- no answer from the server (offline): the page is signed out all the same;
+- a preference saved at the sign-out is sent before the session is ended, so it is not refused; a save that does
+  not come back holds the sign-out for at most three seconds.
+
+The idle lock of zero-knowledge keys does not sign out (it forgets the keys only), so it has no call to make.
+Waits are on state, never on time, but for the bound on the held save.
+"""
+import time
+
+import pytest
+import requests
+from playwright.sync_api import Page, expect
+
+from _account_change_helpers import signed_in
+from _sf_helpers import enroll_totp
+from _sign_out_helpers import expired_copy, session_row
+from _ui_hand_over import sign_in_on_the_tab, sign_out
+from conftest import BASE_URL
+
+pytestmark = pytest.mark.ui
+
+SIGN_OUT = "/auth/sign-out"
+
+
+def _is_sign_out(request):
+    return request.method == "POST" and request.url.endswith(SIGN_OUT)
+
+
+def _refused(token):
+    return requests.get(f"{BASE_URL}/users/me", headers={"Authorization": f"Bearer {token}"}, timeout=30).status_code
+
+
+@pytest.fixture
+def ana(admin):
+    user = admin.create_user()
+    yield user
+    admin.delete_user(user["id"])
+
+
+def _ended(token, seconds=15):
+    """Wait until the server shows the session `token` names ended (its row inactive and revoked)."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if session_row(token) == "f|t":
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"the session was not ended on the server: {session_row(token)}")
+
+
+def _signed_out_by(page: Page, action, token, session_of=None):
+    """Run `action` (which signs the page out); the page sends the sign-out with `token`, is signed out at once,
+    and the server ends the session (of `session_of`, `token` by default). What the call did is read back from the
+    server, not from its answer: the request is kept alive, and the browser does not hand the answer of a kept-alive
+    request to the test (tests/test_api_sign_out.py holds the answer itself)."""
+    with page.expect_request(_is_sign_out, timeout=15000) as sent:
+        action()
+    assert sent.value.headers.get("authorization") == f"Bearer {token}"
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => authToken") is None
+    _ended(session_of or token)
+
+
+def test_the_sign_out_button_ends_the_session_and_keeps_the_stored_look(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    page.evaluate("() => { localStorage.setItem('theme', 'dark'); localStorage.setItem('accent', 'teal'); }")
+    token = page.evaluate("() => authToken")
+    assert _refused(token) == 200
+
+    def button():
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
+
+    _signed_out_by(page, button, token)
+    assert _refused(token) == 401
+    assert session_row(token) == "f|t"
+    assert page.evaluate("() => [localStorage.getItem('theme'), localStorage.getItem('accent')]") == ["dark", "teal"]
+    assert page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')") is None
+
+
+def test_a_refusal_of_the_session_signs_out_and_ends_it_on_the_server(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    # A refusal of the tab's own session (a proxy's, say), while the session is still live on the server.
+    page.route("**/sign-out-probe", lambda route: route.fulfill(
+        status=401, content_type="application/json", body='{"detail": "Could not validate credentials"}'))
+    _signed_out_by(page, lambda: page.evaluate("() => { apiRequest('/sign-out-probe').catch(() => {}); }"), token)
+    assert _refused(token) == 401 and session_row(token) == "f|t"
+
+
+def test_a_session_that_has_run_out_is_ended_at_its_sign_out(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    expired = expired_copy(token)
+    assert _refused(expired) == 401 and session_row(token) == "t|f"
+    page.evaluate("(t) => { authToken = t; }", expired)       # the tab's token runs out
+    _signed_out_by(page, lambda: page.evaluate("() => { apiRequest('/users/me').catch(() => {}); }"), expired)
+    assert session_row(token) == "f|t"
+    assert _refused(token) == 401, "the session's unexpired token still works"
+
+
+def test_a_sign_out_after_a_two_factor_sign_in_ends_that_session(page: Page, admin):
+    eve = admin.create_user()
+    try:
+        _secret, codes = enroll_totp(eve, signed_in(eve))
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.fill("#username", eve["_username"])
+        page.fill("#password", eve["_password"])
+        page.click("#login-form button[type=submit]")
+        card = page.locator("#login-second-factor")
+        expect(card).to_be_visible(timeout=15000)
+        card.get_by_role("button", name="Use a recovery code instead").click()
+        page.fill("#sf-code-input", codes.pop(0))
+        card.locator("button").last.click()
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        token = page.evaluate("() => authToken")
+        assert _refused(token) == 200
+        _signed_out_by(page, lambda: sign_out(page), token)
+        assert _refused(token) == 401 and session_row(token) == "f|t"
+    finally:
+        admin.delete_user(eve["id"])
+
+
+def test_a_sign_out_in_another_tab_signs_out_the_tabs_of_that_session_only(page: Page, admin, ana):
+    ben = admin.create_user()
+    try:
+        sign_in_on_the_tab(page, ana)
+        token = page.evaluate("() => authToken")
+        context = page.context
+        same = context.new_page()                    # opened after: it takes the stored session, ana's
+        same.goto("/")
+        expect(same.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        assert same.evaluate("() => authToken") == token
+        # ben signs in on a third tab, which finds no stored session when it loads (the other two keep theirs).
+        other = context.new_page()
+        other.add_init_script("localStorage.removeItem('authToken'); sessionStorage.removeItem('authToken');")
+        sign_in_on_the_tab(other, ben)
+        ben_token = other.evaluate("() => authToken")
+        assert ben_token != token
+
+        _signed_out_by(page, lambda: sign_out(page), token)
+        # The tab holding the same token signs out at once, told so by the first tab rather than by a refusal of
+        # its next request, and says why.
+        expect(same.locator("#login-screen")).to_be_visible(timeout=5000)
+        assert same.evaluate("() => authToken") is None
+        expect(same.locator("#toast-container .toast", has_text="Signed out in another tab.")).to_have_count(1)
+        expect(same.locator("#toast-container .toast", has_text="Session expired")).to_have_count(0)
+        # ben's tab stays signed in, and so does his session.
+        expect(other.locator("#dashboard-screen")).to_be_visible()
+        expect(other.locator("#toast-container .toast", has_text="Signed out in another tab.")).to_have_count(0)
+        assert other.evaluate("() => authToken") == ben_token
+        assert _refused(ben_token) == 200 and _refused(token) == 401
+    finally:
+        admin.delete_user(ben["id"])
+
+
+def test_the_page_signs_out_even_when_the_server_cannot_be_reached(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    page.route(f"**{SIGN_OUT}", lambda route: route.abort("internetdisconnected"))
+    with page.expect_request(_is_sign_out, timeout=15000):
+        page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => authToken") is None
+    assert page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')") is None
+    # The call never reached the server, so the session there runs on until it expires: nothing else could end it.
+    assert _refused(token) == 200
+
+
+def _hold_preference_saves(page: Page):
+    """Hold each save of a preference (PUT /users/me/preferences) until the test lets it go."""
+    held = []
+    page.route("**/users/me/preferences",
+               lambda route: held.append(route) if route.request.method == "PUT" else route.continue_())
+    return held
+
+
+def _until(page: Page, condition, what):
+    for _ in range(200):
+        if condition():
+            return
+        page.wait_for_timeout(25)
+    raise AssertionError(what)
+
+
+def test_a_preference_saved_at_the_sign_out_is_sent_before_the_session_ends(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    held = _hold_preference_saves(page)
+    sent = []
+    page.on("request", lambda r: _is_sign_out(r) and sent.append(r))
+    page.evaluate("() => { saveUserPreference({ activity_page_size: '25' }); logout(); }")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    _until(page, lambda: len(held) == 1, "the save was not sent")
+    page.wait_for_timeout(500)                    # a moment in which an early sign-out would have been sent
+    assert sent == [], "the session was ended while a save of its own was on its way"
+    with page.expect_request(_is_sign_out, timeout=15000):
+        with page.expect_response(lambda r: r.request.method == "PUT" and r.url.endswith("/users/me/preferences"),
+                                  timeout=15000) as saved:
+            held.pop().continue_()
+    assert saved.value.status == 200, "the save was refused: the session had ended before it"
+    _ended(token)
+    assert _refused(token) == 401
+    kept = signed_in(ana).get("/users/me/preferences")
+    assert kept.status_code == 200 and kept.json().get("activity_page_size") == "25", kept.text
+
+
+def test_a_save_that_does_not_come_back_holds_the_sign_out_three_seconds_at_most(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    held = _hold_preference_saves(page)
+    started = time.monotonic()
+    with page.expect_request(_is_sign_out, timeout=15000):
+        page.evaluate("() => { saveUserPreference({ activity_page_size: '25' }); logout(); }")
+    waited = time.monotonic() - started
+    assert len(held) == 1 and 2.5 <= waited < 10, waited
+    _ended(token)
+    assert _refused(token) == 401
+    held.pop().abort()

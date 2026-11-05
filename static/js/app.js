@@ -1932,12 +1932,77 @@ function _buildStepUpBody(action, methods) {
     if (!codeInput && pwInput) pwInput.focus();
 }
 
+// ----------------------------------------------------------------------------------------------------------------
+// Ending the session on the server at a sign-out.
+//
+// Every sign-out goes through logout(): the sign-out button, a refusal of the session (it ran out, it was ended
+// elsewhere, the account was locked) answered with a 401 or an account's 403, a sign-in check that fails at load,
+// a sign-out after a two-factor sign-in, and a sign-out in another tab of this browser (below). logout() signs the
+// page out at once, and asks the server to end the session it held (POST /auth/sign-out), so that its token is
+// refused everywhere from then on rather than until it expires. The page never waits for that answer: offline,
+// refused or slow, it is signed out all the same.
+//
+// Not POST /api/logout: its answer carries Clear-Site-Data, which clears this origin's storage in every tab (the
+// skin and theme read before the page paints, saved zero-knowledge uploads, the download worker).
+//
+// A preference saved at the sign-out (the Activity page's page size, saved as the page is left) is sent before
+// the session ends, or the server would refuse it: the call waits for saves still on their way, at most
+// SIGN_OUT_WAIT_MS. Once sent, the request is kept alive, so it completes even when the page goes away; a page
+// closed while it still waits for such a save sends nothing, and that session then ends when it expires.
+const SIGN_OUT_WAIT_MS = 3000;
+const _preferenceSaves = new Set();
+
+function _endServerSession(token) {
+    if (!token) return;
+    _tellOtherTabsSignedOut(token);
+    let sent = false;
+    const send = () => {
+        if (sent) return;
+        sent = true;
+        try {
+            fetch(`${API_BASE}/auth/sign-out`, {
+                method: 'POST', keepalive: true, cache: 'no-store',
+                headers: { 'Authorization': `Bearer ${token}` },
+            }).catch(() => {});
+        } catch (_) { /* signed out all the same */ }
+    };
+    const saving = Array.from(_preferenceSaves);
+    if (!saving.length) { send(); return; }
+    Promise.allSettled(saving).then(send);
+    setTimeout(send, SIGN_OUT_WAIT_MS);
+}
+
+// A sign-out in another tab of this browser. The tabs share one stored session, so the session another tab has
+// just ended is this tab's too when it holds the same token: told so, this tab signs out at once, instead of at its
+// next request (which the server now refuses). Only the token's last characters (its signature's) are sent, to
+// tell the token apart; a tab of another account, signed in since, is left alone.
+let _signOutChannel = null;
+try { if (typeof BroadcastChannel === 'function') _signOutChannel = new BroadcastChannel('dockvault-sign-out'); } catch (_) {}
+
+function _tokenTail(token) { return String(token || '').slice(-24); }
+
+function _tellOtherTabsSignedOut(token) {
+    try { if (_signOutChannel) _signOutChannel.postMessage({ type: 'signed-out', token: _tokenTail(token) }); } catch (_) {}
+}
+
+if (_signOutChannel) {
+    _signOutChannel.addEventListener('message', (event) => {
+        const told = event && event.data;
+        if (!told || told.type !== 'signed-out' || !authToken || told.token !== _tokenTail(authToken)) return;
+        logout();
+        try { showInfo('Signed out in another tab.'); } catch (_) {}
+    });
+}
+
 // Logout
 function logout() {
+    const endingToken = authToken;
     // The Activity page first, while the session still holds its token: a page size or range chosen in
     // the last second, which the page saves to the account a second after the last change, is saved now.
     // It also forgets everything it held, so none of it carries over to the next person on this tab.
     if (typeof window.resetActivity === 'function') { try { window.resetActivity(); } catch (_) {} }
+    // Then the session is ended on the server (see above), after that save.
+    _endServerSession(endingToken);
     authToken = null;
     currentUser = null;
     userPermissions = [];
@@ -22128,14 +22193,18 @@ function applyNotesHidePref(prefs) {
 
 // Persist a UI preference change to the server (fire-and-forget) so it follows the
 // account. No-op when logged out — the pre-login theme is a local-only default.
-// Exposed on window so theme.js's pickers can call it without importing app.js.
+// Exposed on window so theme.js's pickers can call it without importing app.js. A save still on its way is
+// kept in _preferenceSaves until it is answered: a sign-out ends the session only after it (_endServerSession).
 function saveUserPreference(patch) {
     if (!authToken) return Promise.resolve();
-    return fetch(`${API_BASE}/users/me/preferences`, {
+    const saving = fetch(`${API_BASE}/users/me/preferences`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
         body: JSON.stringify(patch)
     }).catch(() => {});   // best-effort; localStorage already holds the local copy
+    _preferenceSaves.add(saving);
+    saving.then(() => _preferenceSaves.delete(saving));
+    return saving;
 }
 window.saveUserPreference = saveUserPreference;
 

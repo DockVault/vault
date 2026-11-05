@@ -389,7 +389,10 @@ the recipients' mailboxes.
 The web app keeps the sign-in token and the signed-in account's basic details in the browser's local
 storage (session storage in a private window), the tab's vault unlock state in session storage, and
 display choices (theme, skin, layout, sort order). Signing out removes the token, the account details
-and the unlock state.
+and the unlock state. **New in 0.34.0:** it also ends the session on the server at once (its row in
+`active_sessions` is marked ended, and its token is refused everywhere from then on), and signs out the
+other tabs of the same browser that hold the same token; before, a session signed out of in the web app
+stayed valid on the server until it expired. Display choices are kept.
 
 ## Erasing a person
 
