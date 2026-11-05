@@ -61,7 +61,8 @@ process says at start what to change. An IPv6 check is reported as skipped where
 relays no IPv6 loopback. Run it locally with `python3 .github/scripts/proxy_matrix.py --image <image>`; it removes
 everything it created when it ends.
 
-The image runs the base image's standard library unmodified. Releases up to 0.33.3 copied
+The image runs the base image's standard library unmodified, but for one module it removes
+(`sqlite3`'s `_sqlite3`, below): nothing in it is replaced or added. Releases up to 0.33.3 copied
 `Lib/tarfile.py` and `Lib/html/parser.py` over it from a reviewed CPython 3.14 snapshot, checked by
 hash during the build. Python 3.14.8, the base from 0.33.4, carries newer fixes in `tarfile.py` than
 that snapshot, so the copy would have replaced the file with an older one, undoing a fix without any
@@ -69,6 +70,22 @@ scanner noticing (a scanner reads the Python version, not the file). The copy wa
 move to 3.14.8. A future patch to the standard library must check the base image's own file hash
 before it overwrites anything, so that a base which has moved on fails the build instead of being
 undone. The Docker build removes pip after the locked dependency installation.
+
+No SQLite in the image. The vault keeps its data in PostgreSQL, and nothing that runs in the image
+(the application, its locked dependencies, the commands `dockvault.py` runs in the container) imports
+Python's `sqlite3`. The base image installs Alpine's `sqlite-libs` only for that module: its
+`.python-rundeps` virtual package, which holds Python's own run-time libraries, lists
+`libsqlite3.so.0`. In November 2026 four High findings were published against that library
+(CVE-2026-119586, CVE-2026-119374, CVE-2026-119379, CVE-2026-119373) with no fixed package for the
+base's Alpine branch, so the build now declares `.python-rundeps` again without that one entry
+(`apk add --no-network`: nothing is fetched), apk removes `sqlite-libs`, and the build deletes the
+`_sqlite3` module that needed it. `import sqlite3` then fails as it does on a Python built without
+SQLite (`No module named '_sqlite3'`), rather than on a library that is missing. The build imports the
+modules that load every other library `.python-rundeps` lists, and stops if the base no longer lists
+`libsqlite3.so.0` there, so a changed base is looked at again rather than guessed at.
+`tests/test_image_without_sqlite.py` checks the running image: no `sqlite-libs`, no library file, the
+module absent rather than broken, and every other extension module of the standard library loading
+(but `_tkinter`, which the base ships without the Tk library it needs).
 
 The reviewed OpenVEX template, `security/vex.openvex.json`, holds the findings the maintainers have
 reviewed as not affecting the image, each with its justification. It holds no statements now. The
@@ -119,7 +136,9 @@ package would fail the release scan with nothing patching it). What the image ac
 recorded in the per-release SPDX SBOM and bound to the pushed digest by attestation, so the shipped
 content is auditable after the fact. `tests/test_supply_chain_contract.py` asserts this `apk` line is
 the **only** unpinned install in the Dockerfile, so the exception stays one line and a second one
-cannot be added quietly; any change to it is a reviewed source change.
+cannot be added quietly; any change to it is a reviewed source change. The SQLite removal's `apk`
+calls (above) fetch nothing: they read the installed database or run with `--no-network`, and the
+same test holds them word for word.
 
 ## Hosted settings evidence
 
