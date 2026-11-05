@@ -17,6 +17,8 @@ route ends the session as logout does and answers without that header. What is h
   begun before, its completion, the direct upload), a download, the live-monitor socket (a new one and one already
   open), and the minting of SFTP temporary credentials;
 - a temporary credential's web session ends and frees the credential's slot, as logout does;
+- the token is held in the cache's denylist for the rest of its life (none for a token that has run out, none for
+  a token naming another account);
 - at the auth requests' limit a vault ships with, sign-outs are counted in a budget of their own, by the account
   the token names (expired or not) and by address for any other token: they never use up the sign-in that follows
   from the same address, nor the account's other auth requests;
@@ -34,7 +36,7 @@ import requests
 
 from _account_change_helpers import psql, signed_in
 from _sign_out_helpers import claims as _claims, expired_copy as _expired_copy, signed_by_the_server as _signed
-from _sign_out_helpers import shipped_auth_limit
+from _sign_out_helpers import redis_cli, session_digest, shipped_auth_limit
 from _sign_out_helpers import session_row as _row, sign_outs_recorded as _sign_outs_recorded
 from _sf_helpers import enroll_totp
 from conftest import BASE_URL, unique
@@ -161,8 +163,32 @@ def test_a_token_naming_another_account_does_not_end_the_session(admin, person):
         r = _sign_out(crossed)
         assert r.status_code == 200 and r.json() == {"signed_out": True, "session_ended": False}, r.text
         assert one.get("/users/me").status_code == 200 and _row(one.token) == "t|f"
+        assert redis_cli("EXISTS", _denylisted(one.token)) == "0", "the session's token was denylisted"
     finally:
         admin.delete_user(other["id"])
+
+
+def _denylisted(token):
+    """The cache's denylist entry for the session a token names."""
+    return f"denylist:session:{session_digest(token)}"
+
+
+def test_the_sign_out_holds_the_token_in_the_denylist_for_the_rest_of_its_life(person):
+    """The revoked flag on the session's row refuses the token on its own (every reader re-checks it); the denylist
+    entry refuses it before the database is read, as logout's does. Written for what is left of the token's life:
+    none for a token that has run out."""
+    one = signed_in(person)
+    key = _denylisted(one.token)
+    assert redis_cli("EXISTS", key) == "0"
+    left = _claims(one.token)["exp"] - time.time()
+    assert _sign_out(one.token).json()["session_ended"] is True
+    assert redis_cli("EXISTS", key) == "1", "the signed-out token is not in the denylist"
+    ttl = int(redis_cli("TTL", key))
+    assert 0 < ttl <= left + 1, (ttl, left)
+
+    two = signed_in(person)
+    assert _sign_out(_expired_copy(two.token)).json()["session_ended"] is True
+    assert redis_cli("EXISTS", _denylisted(two.token)) == "0", "an entry was written for a token that had run out"
 
 
 def _sign_in_status(account):
