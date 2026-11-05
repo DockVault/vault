@@ -70,7 +70,8 @@
     }
 
     // Settings -> Storage: what legal holds keep after their deletion (GET /storage/stats, kept_for_cases). Those
-    // bytes are on the disk but in no vault's size, so the line says so beside the totals.
+    // bytes are on the disk and count toward the deployment's storage limit, but in no vault's size, so the line
+    // says so beside the totals.
     function renderKeptForCases(stats) {
         const anchor = document.getElementById('storage-stat-allocated');
         if (!anchor) return;
@@ -87,7 +88,8 @@
             anchor.insertAdjacentElement('afterend', line);
         }
         line.textContent = 'Kept for cases: ' + kept.files + (kept.files === 1 ? ' file, ' : ' files, ')
-            + sizeText(kept.bytes) + ' (deleted under a legal hold; on this disk, in no vault\'s size)';
+            + sizeText(kept.bytes) + ' (deleted under a legal hold; on this disk and counted in the deployment\'s '
+            + 'storage limit, in no vault\'s size)';
     }
 
     window.renderKeptForCases = renderKeptForCases;

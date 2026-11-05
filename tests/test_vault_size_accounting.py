@@ -494,12 +494,14 @@ def test_the_deployment_storage_limit_holds_when_uploads_into_different_vaults_f
             assert put.status_code == 200, put.text
             sessions.append(session)
 
-        # The live limit, as an administrator sets it: what is stored now, and room for four more.
-        used = admin.get("/storage/stats").json()["used"]
-        pinned = admin.put("/settings", json={"deployment_storage_limit_gb": (used + room) / gib})
+        # The live limit, as an administrator sets it: what it counts now (the vaults' stored bytes and those
+        # legal holds keep), and room for four more.
+        stats = admin.get("/storage/stats").json()
+        used, counted = stats["used"], stats["on_disk_bytes"]
+        pinned = admin.put("/settings", json={"deployment_storage_limit_gb": (counted + room) / gib})
         assert pinned.status_code in (200, 204), pinned.text
         limit = admin.get("/storage/stats").json()["limit_bytes"]
-        assert fit * each <= limit - used < (fit + 1) * each, (used, limit)
+        assert fit * each <= limit - counted < (fit + 1) * each, (counted, limit)
 
         clients = _clients(admin_creds, count)
 

@@ -5,8 +5,10 @@ For users, an expired file is gone whether or not a hold keeps it: the sweep del
 file_expired row. When a hold kept it (the database's trigger copied the row into held_files in the sweep's own
 transaction), the sweep reads that back and its file_expired row says held_by_case, and its stored bytes stay.
 Kept bytes leave the vault's counters but are on the deployment's disk: the storage page shows "Kept for cases",
-and counts them in what the vaults' files take on the disk; after the purge they drop. SQLite has no trigger: a
-test writes the kept row the trigger would write. test_legal_holds_live.py runs it on Postgres.
+and counts them in what the vaults' files take on the disk; after the purge they drop. The deployment's storage
+limit counts them too (each upload's early check and the check as its row is written, and the lowest limit an
+administrator may set); a vault's own size limit does not, since nobody using the vault can remove them. SQLite has
+no trigger: a test writes the kept row the trigger would write. test_legal_holds_live.py runs it on Postgres.
 """
 import uuid
 from datetime import datetime, timedelta
@@ -111,6 +113,61 @@ def test_the_storage_page_counts_what_holds_keep(world):
     assert stats["kept_for_cases"] == {"files": 0, "folders": 0, "bytes": 0} and stats["on_disk_bytes"] == 30
 
 
+def _kept_file(db, vault, size):
+    """A file deleted under a hold, as the trigger keeps it: in no vault's counters, its bytes on the disk."""
+    db.add(m.HeldFile(id=uuid.uuid4(), vault_id=vault.id, storage_path=f"{vault.id}/{uuid.uuid4()}.enc",
+                      size_bytes=size, kept_reason="deleted", kept_at=datetime.utcnow()))
+    db.commit()
+
+
+def test_the_deployment_limit_counts_what_holds_keep(world, monkeypatch):
+    """A member of a held vault who uploads and deletes in turn leaves each file on the disk: the early check every
+    upload, copy and SFTP write makes counts it against the deployment's limit."""
+    from app.services import vault_service as vs
+    db, _root, _owner, vault = world
+    monkeypatch.setattr(vs, "deployment_storage_limit_bytes", lambda _db: 1100)
+    assert vs.would_exceed_deployment_storage(db, 1000) == (False, 30, 1100)
+    _kept_file(db, vault, 1000)
+    assert vs.vaults_stored_bytes(db) == 30, "the vaults' counters hold only what is in them"
+    assert vs.deployment_storage_used(db) == 1030
+    assert vs.would_exceed_deployment_storage(db, 70) == (False, 1030, 1100)
+    assert vs.would_exceed_deployment_storage(db, 71) == (True, 1030, 1100)
+
+
+def _claim(db, root, vault, size, removed):
+    """VaultService._claim_room for a file of ``size`` written into ``vault``: the check as its row is written."""
+    svc = _service(db, root)
+    svc._remove_blobs = removed.extend
+    svc._claim_room({"vault_id": vault.id, "storage_path": f"{vault.id}/{uuid.uuid4()}.enc"}, size)
+
+
+def test_the_check_as_a_files_row_is_written_counts_them_and_a_vaults_own_limit_does_not(world, monkeypatch):
+    from app.services import vault_service as vs
+    db, root, _owner, vault = world
+    _kept_file(db, vault, 1000)
+    removed = []
+    # The vault's own size limit: what it holds (30), never what was kept of it (1000), which nobody using the
+    # vault can remove.
+    vault.size_limit = 100
+    db.commit()
+    monkeypatch.setattr(vs, "deployment_storage_limit_bytes", lambda _db: None)
+    _claim(db, root, vault, 70, removed)
+    db.rollback()
+    with pytest.raises(vs.StorageLimitExceeded) as refused:
+        _claim(db, root, vault, 71, removed)
+    assert refused.value.kind == "vault" and refused.value.used == 30
+    # The deployment's limit: what the vaults hold and what is kept.
+    vault.size_limit = None
+    db.commit()
+    monkeypatch.setattr(vs, "deployment_storage_limit_bytes", lambda _db: 1100)
+    _claim(db, root, vault, 70, removed)
+    db.rollback()
+    with pytest.raises(vs.StorageLimitExceeded) as refused:
+        _claim(db, root, vault, 71, removed)
+    assert (refused.value.kind, refused.value.used, refused.value.cap) == ("deployment", 1030, 1100)
+    assert len(removed) == 2, "each refused file is removed"
+
+
 def test_the_settings_storage_view_shows_the_kept_line():
     app_js = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     body = app_js.split("async function loadStorageStats()", 1)[1].split("\n}\n", 1)[0]
@@ -120,5 +177,6 @@ def test_the_settings_storage_view_shows_the_kept_line():
     js = (ROOT / "static" / "js" / "compliance.js").read_text(encoding="utf-8")
     fn = js.split("function renderKeptForCases(stats)", 1)[1].split("\n    }\n", 1)[0]
     assert "stats.kept_for_cases" in fn and "'Kept for cases: '" in fn and "line.remove()" in fn
+    assert "counted in the deployment" in fn and "in no vault" in fn
     assert "innerHTML" not in js
     assert "window.renderKeptForCases = renderKeptForCases;" in js

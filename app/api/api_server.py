@@ -9576,8 +9576,8 @@ async def storage_stats(
     limit — reported so an operator can see how much has been promised, NOT enforced against this
     limit: an empty vault costs nothing until files land in it."""
     from sqlalchemy import func as _f
-    from app.services.vault_service import deployment_storage_used, deployment_storage_limit_bytes
-    used = deployment_storage_used(db)
+    from app.services.vault_service import vaults_stored_bytes, deployment_storage_limit_bytes
+    used = vaults_stored_bytes(db)
     total = available = 0
     try:
         usage = shutil.disk_usage(settings.file_storage_path)
@@ -9595,7 +9595,8 @@ async def storage_stats(
         "total": total,
         "used": used,
         "kept_for_cases": kept,
-        # What the vaults' files take on the disk: their counted bytes and the kept ones.
+        # What the vaults' files take on the disk: their counted bytes and the kept ones. The
+        # deployment's storage limit counts both (vault_service.deployment_storage_used).
         "on_disk_bytes": used + kept["bytes"],
         "available": available,
         "allocated_bytes": allocated,

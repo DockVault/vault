@@ -498,3 +498,14 @@ def totals(db) -> dict:
     files, size = db.query(func.count(HeldFile.id), func.coalesce(func.sum(HeldFile.size_bytes), 0)).one()
     folders = db.query(func.count(HeldFolder.id)).scalar()
     return {"files": int(files or 0), "folders": int(folders or 0), "bytes": int(size or 0)}
+
+
+def kept_bytes(db) -> int:
+    """The bytes of the kept files: on the deployment's disk, in no vault's counters, so the deployment's storage
+    limit counts them beside the vaults' (app/services/vault_service.py, deployment_storage_used). On Postgres a
+    failing read is raised, never taken for "nothing kept"."""
+    from sqlalchemy import func
+    from app.core.models import HeldFile
+    if not _readable(db):
+        return 0
+    return int(db.query(func.coalesce(func.sum(HeldFile.size_bytes), 0)).scalar() or 0)
