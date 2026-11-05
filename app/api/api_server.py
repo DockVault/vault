@@ -7115,17 +7115,21 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
         legal_holds.after_starter_change(db, user, "password")
     else:
         password_origin.set_by_self(user)
-    db.commit()
     try:
-        # _revoke_sessions mutates session rows but does NOT commit — commit it ourselves so the durable
-        # DB-level revocation persists (a hijacked session must not outlive the reset).
+        # The account's sessions end in the transaction that writes the password: both commit, or neither does
+        # (a hijacked session must not outlive the reset). _revoke_sessions mutates the session rows but does not
+        # commit. On a failure nothing changed, the link is not used, and the person is told to try it again.
         _revoke_sessions(db, user_id=user.id, actor_username="password-reset")   # force re-login everywhere
         db.commit()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         try:
             db.rollback()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
+        from app.core.safe_log import log_failure
+        error_id = log_failure("password reset not completed", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"The password was not changed: try the link again (error {error_id}).")
     try:
         AuditLogger(db).log_action(action="password_reset_completed", status="success", user=user,
                                    ip_address=ip, details={"link_made_by_other": bool(made_by_other)})
