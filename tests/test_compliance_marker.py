@@ -86,10 +86,16 @@ def _matrix_module():
     return module
 
 
-def test_the_condition_is_the_one_kept_for_the_release_and_one_the_matrix_takes():
+@pytest.mark.parametrize("released", [False, True], ids=["now", "at-the-release"])
+def test_the_condition_is_the_one_kept_for_the_release_and_one_the_matrix_takes(released):
+    """Added to the newest edge below 0.34.0, which carries none of 0.34.0's conditions, whether or not the matrix
+    declares 0.34.0 already (it does from the release commit on)."""
     um = _matrix_module()
     data = json.loads((ROOT / "docs" / "upgrade-matrix.json").read_text(encoding="utf-8"))
-    data["edges"][-1].setdefault("conditions", []).append(dict(marker.CONDITION))
+    data = rc.before_the_release(rc.with_the_release(data) if released else data)
+    edge = data["edges"][-1]
+    assert marker.CONDITION["id"] not in {c["id"] for c in edge.get("conditions", [])}
+    edge.setdefault("conditions", []).append(dict(marker.CONDITION))
     um.validate_matrix(data, released_ceiling=None)
     cid = marker.CONDITION["id"]
     assert marker.CONDITION["blocks_rollback"] is True and cid in rc.BLOCKS_ROLLBACK and cid in rc.ON_UPGRADED

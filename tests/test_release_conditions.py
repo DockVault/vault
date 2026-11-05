@@ -216,30 +216,19 @@ def test_the_matrix_carries_every_condition_on_every_edge_into_0_34_0_from_0_33_
     assert rc.edge_problems(matrix) == []
 
 
-def _condition(cid):
-    out = {"id": cid, "summary": rc.SUMMARY.get(cid, "What the release commit writes.")}
-    if cid in rc.DETECT:
-        out["detect"] = rc.DETECT[cid]
-    if cid in rc.BLOCKS_ROLLBACK:
-        out["blocks_rollback"] = True
-    return out
-
-
 def _with_the_release():
-    """The matrix as the release commit would make it from this file: 0.34.0 declared, its line listed, and one
-    edge into it, from 0.33.6, with every condition."""
-    data = copy.deepcopy(_matrix())
-    newest = max(data["versions"], key=_key)
-    assert newest == rc.SOURCE_FLOOR, "a later release of the line before needs its own edge into 0.34.0 here"
-    entry = copy.deepcopy(data["versions"][newest])
-    entry.update(released="2026-11-15", notes="The release.")
-    entry["support"] = {"eol": False, "secure": True}
-    entry.pop("vulnerabilities", None)
-    data["versions"][rc.INTO] = entry
-    data["lines"] = {"0.33": {"security_fixes_until": "2027-05-15"}, "0.34": {"security_fixes_until": None}}
-    data["edges"].append({"from": rc.SOURCE_FLOOR, "to": rc.INTO, "kind": "direct", "reversible": True,
-                          "requires_backup": True, "conditions": [_condition(cid) for cid in rc.CONDITIONS]})
-    return data
+    """The matrix as the release commit would make it from this file (_release_conditions.with_the_release)."""
+    return rc.with_the_release(_matrix())
+
+
+def test_the_tests_build_the_same_release_from_the_matrix_the_release_commit_leaves(monkeypatch):
+    """At the release commit docs/upgrade-matrix.json declares 0.34.0 and its edge from 0.33.6 itself: the release
+    these tests check is built from the releases before 0.34.0, so it is the same one then as now."""
+    released = _with_the_release()
+    monkeypatch.setitem(globals(), "_matrix", lambda: copy.deepcopy(released))
+    assert _with_the_release() == released
+    assert rc.before_the_release(released) == rc.before_the_release(json.loads(
+        (ROOT / "docs" / "upgrade-matrix.json").read_text(encoding="utf-8")))
 
 
 def _edge(data, source):
@@ -276,7 +265,7 @@ def _edge_from(source, kind="direct", conditions=True):
         if kind == "blocked":
             edge["reason"] = "Upgrade to 0.33.6 first."
         if conditions:
-            edge["conditions"] = [_condition(cid) for cid in rc.CONDITIONS]
+            edge["conditions"] = [rc.condition(cid) for cid in rc.CONDITIONS]
         data["edges"].append(edge)
     return change
 

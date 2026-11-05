@@ -8,7 +8,12 @@ A query finds rows only where its condition applies: an aggregate is given HAVIN
 concern gets no row. A condition that blocks a rollback is checked on the upgraded database (0.34.0's tables); the
 others on the database being upgraded, so they read only tables and columns 0.33.2 already has (every edge into
 0.34.0 leaves from 0.33.6 or later, whose tables have them all).
+
+The tests build the matrix the release commit makes (with_the_release) from the releases before 0.34.0
+(before_the_release), so they give the same answers before that commit and after it, when docs/upgrade-matrix.json
+declares 0.34.0 itself.
 """
+import copy
 
 # The edges every condition below goes on: each edge into INTO. None of them leaves from a release below
 # SOURCE_FLOOR, the only release of the line before that no advisory affects: such an edge would let an upgrade skip
@@ -92,8 +97,8 @@ SUMMARY = {
         "removed; nothing is deleted. Archiving starts 14 days after 0.34.0 first starts "
         "(AUDIT_ARCHIVE_START_AFTER_DAYS, 0 to 90), and again 14 days after it starts once more following more than "
         "12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or stopped, so going "
-        "back to an earlier release within that time needs nothing. The Activity page and its exports read archived days; a tool that reads audit_logs directly sees "
-        "only the newer days. python dockvault.py audit unarchive puts days back as rows once they fit. The check "
+        "back to an earlier release within that time needs nothing. The Activity page and its exports read archived "
+        "days; a tool that reads audit_logs directly sees only the newer days. python dockvault.py audit unarchive puts days back as rows once they fit. The check "
         "counts the rows archiving will move when it starts, with the default windows: those of the days before the "
         "day 76 days ago."),
     "archived-audit-history-hidden": (
@@ -254,3 +259,50 @@ def edge_problems(matrix: dict) -> list:
             if cid in SUMMARY and condition.get("summary") != SUMMARY[cid]:
                 problems.append(f"{where} gives {cid} another text than the one kept here")
     return problems
+
+
+def condition(cid: str) -> dict:
+    """The condition ``cid`` as the release commit writes it on an edge into INTO: the text kept here (a stand-in
+    where none is kept yet), the query and the rollback flag."""
+    out = {"id": cid, "summary": SUMMARY.get(cid, "What the release commit writes.")}
+    if cid in DETECT:
+        out["detect"] = DETECT[cid]
+    if cid in BLOCKS_ROLLBACK:
+        out["blocks_rollback"] = True
+    return out
+
+
+def before_the_release(matrix: dict) -> dict:
+    """A copy of ``matrix`` with only the releases below INTO: every release from INTO on, every edge to or from
+    one, and the lines from INTO's on taken out, and the newest line left the newest again (no end date). The same
+    matrix whether or not ``matrix`` already declares INTO."""
+    out = copy.deepcopy(matrix)
+    floor = _version_key(INTO)
+    out["versions"] = {v: entry for v, entry in out["versions"].items() if _version_key(v) < floor}
+    out["edges"] = [edge for edge in out["edges"]
+                    if _version_key(edge["from"]) < floor and _version_key(edge["to"]) < floor]
+    if "lines" in out:
+        lines = {line: dict(entry) for line, entry in out["lines"].items() if _version_key(line + ".0") < floor}
+        if lines:
+            newest = max(lines, key=lambda line: _version_key(line + ".0"))
+            lines[newest]["security_fixes_until"] = None
+        out["lines"] = lines
+    return out
+
+
+def with_the_release(matrix: dict) -> dict:
+    """``matrix`` as the release commit makes it from this file: the releases below INTO, then INTO declared (its
+    entry made from SOURCE_FLOOR's), its line listed, and one edge into it, from SOURCE_FLOOR, with every condition.
+    SOURCE_FLOOR must be the newest release below INTO: a later one needs its own edge into INTO."""
+    data = before_the_release(matrix)
+    newest = max(data["versions"], key=_version_key)
+    assert newest == SOURCE_FLOOR, "a later release of the line before needs its own edge into 0.34.0 here"
+    entry = copy.deepcopy(data["versions"][newest])
+    entry.update(released="2026-11-15", notes="The release.")
+    entry["support"] = {"eol": False, "secure": True}
+    entry.pop("vulnerabilities", None)
+    data["versions"][INTO] = entry
+    data["lines"] = {"0.33": {"security_fixes_until": "2027-05-15"}, "0.34": {"security_fixes_until": None}}
+    data["edges"].append({"from": SOURCE_FLOOR, "to": INTO, "kind": "direct", "reversible": True,
+                          "requires_backup": True, "conditions": [condition(cid) for cid in CONDITIONS]})
+    return data
