@@ -632,8 +632,17 @@ def confirm_hold(case_id: uuid.UUID, request: Request, current_user: User = Depe
                  db: Session = Depends(get_db)):
     """Confirm a case's legal hold, as an administrator independent of whoever placed it."""
     from app.core import legal_holds as holds
-    _check_decision(case_id, current_user, db, action="hold_confirmed", refusal=_confirm_refusal)
-    STEP_UP_HOLD_DECIDE(db, current_user, request)
+    case = _check_decision(case_id, current_user, db, action="hold_confirmed", refusal=_confirm_refusal)
+    asked = _no_receipt(request)
+    if asked:
+        with _code_session() as own:
+            STEP_UP_HOLD_DECIDE(own, current_user, request)    # asks for the code before waiting for the turn
+    # From its confirmation the hold holds back every deletion step (legal_holds.confirm): it takes the turn before
+    # the code is used (see _take_the_turn).
+    _take_the_turn(db, "hold_confirmed", case, current_user)
+    if not asked:
+        with _code_session() as own:
+            STEP_UP_HOLD_DECIDE(own, current_user, request)    # the code used once the step has the turn
     return _take_decision(case_id, current_user, db, action="hold_confirmed", refusal=_confirm_refusal,
                           step=lambda case: holds.confirm(db, case, by=current_user))
 

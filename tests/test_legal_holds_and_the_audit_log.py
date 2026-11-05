@@ -2,8 +2,9 @@
 throwaway SQLite database with a chain of its own (tests/_removal_env.py) and the compliance tables.
 
 - The rule compliance access registers with person_erase.register_wait (compliance_retention.holds_back) says why
-  everything waits while any legal hold stands or any case is open, and nothing once neither does; it is registered
-  wherever person_erase is imported.
+  everything waits while any confirmed legal hold stands or any case is open, and nothing once neither does (a
+  hold-only case whose hold nobody has confirmed yet holds nothing back); it is registered wherever person_erase is
+  imported.
 - Each path waits under a standing hold, with nothing changed, and goes on once the hold is released and its case
   closed: an erase of rows and of an archived day, and of the other records (person_erase.STORES); the deletion of
   an ended erase's sealed name (a cancel, a veto by the database), which the erase job makes once nothing holds it;
@@ -169,6 +170,38 @@ def test_the_rule_says_why_while_a_hold_stands_or_a_case_is_open_and_nothing_onc
             synchronize_session=False)
         db.commit()
         assert cr.holds_back(db, env.clock()) is None
+
+
+def test_a_hold_nobody_confirmed_holds_nothing_back_until_it_is_confirmed(env):
+    """One person places a hold-only case alone: until a second person confirms its hold, no erase or other
+    deletion of records waits for it (it keeps what is deleted from its vaults all the same). Confirmed, it holds
+    back as any other. A case asking for access holds back from its request on, unconfirmed hold or not."""
+    case_id, vault = uuid.uuid4(), uuid.uuid4()
+    with env.session() as db:
+        db.add(ComplianceCase(id=case_id, status="hold_only", purpose="litigation_hold", legal_basis="c",
+                              justification_enc="x", owner_note_enc="x", auditor_id=uuid.uuid4(),
+                              auditor_username="ada", number="C-2026-0301"))
+        db.add(LegalHoldVault(case_id=case_id, vault_id=vault, placed_by_username="ada", placed_at=env.clock(),
+                              confirm_by_deadline=env.clock() + timedelta(days=7)))
+        db.commit()
+        assert cr.holds_back(db, env.clock()) is None
+        assert pe.rule_waits(db, env.clock()) is None
+        db.query(LegalHoldVault).filter(LegalHoldVault.case_id == case_id).update(
+            {LegalHoldVault.confirmed_at: env.clock(), LegalHoldVault.confirmed_by_username: "bob"},
+            synchronize_session=False)
+        db.commit()
+        assert cr.holds_back(db, env.clock()) == "the legal hold of case C-2026-0301 stands"
+        db.query(LegalHoldVault).update({LegalHoldVault.released_at: env.clock()}, synchronize_session=False)
+        db.query(ComplianceCase).filter(ComplianceCase.id == case_id).update(
+            {ComplianceCase.status: "closed", ComplianceCase.closed_at: env.clock()}, synchronize_session=False)
+        db.commit()
+        assert cr.holds_back(db, env.clock()) is None
+    asked = _case(env)
+    with env.session() as db:
+        db.query(ComplianceCase).filter(ComplianceCase.id == asked).update(
+            {ComplianceCase.status: "pending"}, synchronize_session=False)
+        db.commit()
+        assert cr.holds_back(db, env.clock()) == "a compliance case is open"
 
 
 def test_the_rule_names_the_cases_it_waits_for(env):

@@ -1,8 +1,9 @@
 """Legal holds and the deletions they hold back take turns, on a running stack's Postgres (a throwaway database of
 its own, tests/_throwaway_db.py): app/core/legal_holds.py take_turn and app/core/compliance_retention.py holds_back.
 
-- A hold being placed (the turn taken exclusively, the hold written, not yet committed) makes a deletion's check
-  wait until it commits, and the check then sees the hold: it cannot read the database as it was just before.
+- A hold being placed confirmed, as an approval places one (the turn taken exclusively, the hold written, not yet
+  committed), makes a deletion's check wait until it commits, and the check then sees the hold: it cannot read the
+  database as it was just before.
 - A deletion that has checked (the turn taken shared, nothing holding) makes a hold being placed wait until the
   deletion's transaction ends: the hold is then written after what the deletion did, not beside it.
 - That wait outlasts the connection's 5 s lock_timeout (a deletion step can hold the turn longer), up to
@@ -10,6 +11,8 @@ its own, tests/_throwaway_db.py): app/core/legal_holds.py take_turn and app/core
   statement settings as they were; taken again in a transaction that holds it, it returns at once, and a savepoint
   rolled back keeps it. A step that gave up says so (want_turn): no deletion step's check passes until it has had
   the turn.
+- A hold nobody has confirmed holds nothing back; its confirmation (the turn taken exclusively, as
+  legal_holds.confirm takes it) makes a deletion's check wait until it commits, and the check then sees the hold.
 """
 import pytest
 
@@ -38,7 +41,7 @@ with SessionLocal() as s:
                           auditor_username=auditor.username, closed_at=now - timedelta(days=3000))
     s.add(case)
     s.commit()
-    case_id = case.id
+    case_id, auditor_id = case.id, auditor.id
 
 
 def check(result, key):
@@ -55,7 +58,8 @@ def check(result, key):
 # A hold being placed: the check waits for it, and sees it.
 placing = SessionLocal()
 legal_holds.take_turn(placing, shared=False)
-placing.add(LegalHoldVault(case_id=case_id, vault_id=uuid.uuid4(), placed_by_username="aud", placed_at=now))
+placing.add(LegalHoldVault(case_id=case_id, vault_id=uuid.uuid4(), placed_by_username="aud", placed_at=now,
+                           confirmed_by_username="bea", confirmed_at=now))
 placing.flush()
 t = threading.Thread(target=check, args=(out, "during_placing"))
 t.start()
@@ -82,7 +86,8 @@ def place():
         t0 = time.monotonic()
         legal_holds.take_turn(db, shared=False)
         placed["seconds"] = round(time.monotonic() - t0, 2)
-        db.add(LegalHoldVault(case_id=case_id, vault_id=uuid.uuid4(), placed_by_username="aud", placed_at=now))
+        db.add(LegalHoldVault(case_id=case_id, vault_id=uuid.uuid4(), placed_by_username="aud", placed_at=now,
+                              confirmed_by_username="bea", confirmed_at=now))
         db.commit()
     finally:
         db.close()
@@ -95,6 +100,34 @@ deleting.close()
 p.join(20)
 out["placed_after_seconds"] = placed.get("seconds")
 check(out, "after_the_new_hold")
+
+# A hold-only case's hold nobody has confirmed: nothing waits for it. Its confirmation takes the turn: the check
+# waits for it, and sees it.
+with SessionLocal() as s:
+    s.query(LegalHoldVault).filter(LegalHoldVault.case_id == case_id).update(
+        {LegalHoldVault.released_at: now}, synchronize_session=False)
+    only = ComplianceCase(id=uuid.uuid4(), status="hold_only", purpose="litigation_hold", legal_basis="c",
+                          justification_enc="x", owner_note_enc="x", auditor_id=auditor_id, auditor_username="aud")
+    s.add(only)
+    s.flush()
+    s.add(LegalHoldVault(case_id=only.id, vault_id=uuid.uuid4(), placed_by=auditor_id, placed_by_username="aud",
+                         placed_at=now, confirm_by_deadline=now + timedelta(days=7)))
+    s.commit()
+    only_id = only.id
+check(out, "unconfirmed")
+confirming = SessionLocal()
+legal_holds.take_turn(confirming, shared=False)
+confirming.query(LegalHoldVault).filter(LegalHoldVault.case_id == only_id).update(
+    {LegalHoldVault.confirmed_at: now, LegalHoldVault.confirmed_by_username: "bea"}, synchronize_session=False)
+confirming.flush()
+t = threading.Thread(target=check, args=(out, "during_confirming"))
+t.start()
+time.sleep(2.0)
+out["check_waited_for_the_confirmation"] = t.is_alive()
+confirming.commit()
+confirming.close()
+t.join(20)
+check(out, "after_confirming")
 print(json.dumps(out))
 '''
 
@@ -107,6 +140,10 @@ def test_a_hold_and_a_deletions_check_take_turns_on_postgres(db_name):
     assert out["deletion_checked"] is None, out
     assert out["placing_waited_for_the_deletion"] is True and out["placed_after_seconds"] >= 1.5, out
     assert out["after_the_new_hold"] == "a legal hold stands", out
+    assert out["unconfirmed"] is None, out
+    assert out["check_waited_for_the_confirmation"] is True, out
+    assert out["during_confirming"] == "a legal hold stands" and out["during_confirming_seconds"] >= 1.5, out
+    assert out["after_confirming"] == "a legal hold stands", out
 
 
 BOUNDED = PREAMBLE + r'''

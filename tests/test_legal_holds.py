@@ -235,6 +235,28 @@ def test_while_compliance_access_is_off_no_hold_is_placed(db, people, settings):
         holds.ACCESS_OFF
 
 
+def test_one_person_keeps_at_most_five_hold_only_cases_waiting_for_confirmation(db, people):
+    """Placing a hold needs no second person, and each keeps what is deleted from its vaults until it is confirmed
+    or lapses: one person may have MAX_UNCONFIRMED_CASES of them waiting at once. Another person may still place
+    one, and the placer may again once one of theirs is confirmed, or past its confirm deadline (it lapses then,
+    whether or not the job has run yet)."""
+    assert holds.MAX_UNCONFIRMED_CASES == 5
+    cases = [_place(db, people.ada, [people.v1, people.v2]) for _ in range(5)]
+    refused = _refused(holds.place_hold_only, db, people.ada, [people.v2.id], now=NOW, **TEXT)
+    assert refused.reason == holds.TOO_MANY_UNCONFIRMED and refused.code == 409
+    assert holds.text(refused.reason).startswith("5 legal holds you placed are waiting for another person")
+    db.rollback()
+    assert db.query(m.ComplianceCase).count() == 5
+    _place(db, people.bob, [people.v2])
+    holds.confirm(db, cases[0], by=people.bob, now=NOW)
+    db.commit()
+    _place(db, people.ada, [people.v2])
+    assert _refused(holds.place_hold_only, db, people.ada, [people.v2.id], now=NOW,
+                    **TEXT).reason == holds.TOO_MANY_UNCONFIRMED
+    db.rollback()
+    assert _place(db, people.ada, [people.v2], now=NOW + timedelta(days=7)).status == "hold_only"
+
+
 def test_each_vault_is_locked_for_update_before_its_hold_is_written(db, people, monkeypatch):
     """The lock waits for a deletion holding the vault's row (FOR NO KEY UPDATE), so the hold covers every
     deletion that commits after it. test_legal_holds_live.py shows the wait on Postgres."""
@@ -466,6 +488,33 @@ def test_past_its_confirm_deadline_a_hold_is_confirmed_by_nobody_before_the_job_
     assert "passed" in done.value.obj["error"]
     assert holds.standing(db, case.id)[0].confirmed_at is None
     assert holds.lapse_due(db, late) == 1
+
+
+def test_a_confirmation_takes_the_turn_of_holds_and_deletions_before_it_writes(db, people, monkeypatch):
+    """From its confirmation a hold holds back every erase and other deletion of records, so the confirmation takes
+    the turn as a placing does: exclusively, before it writes (test_legal_hold_turn_routes_live.py shows the wait on
+    Postgres). A deletion step that keeps the turn too long refuses the host's confirmation, recorded, and nothing
+    is confirmed."""
+    from app.core.host_operator import _Answer
+    case = _place(db, people.ada, [people.v1])
+    seen = []
+    monkeypatch.setattr(holds, "take_turn", lambda db_, shared: seen.append(
+        (shared, [h.confirmed_at for h in holds.standing(db_, case.id)])))
+    assert holds.confirm(db, case, by=people.bob, now=NOW) == 1
+    assert seen == [(False, [None])], "taken exclusively, before the hold was confirmed"
+    db.rollback()
+
+    def busy(db_, shared):
+        raise holds.TurnBusy()
+    monkeypatch.setattr(holds, "take_turn", busy)
+    wanted = []
+    monkeypatch.setattr(holds, "want_turn", lambda: wanted.append(True))
+    with pytest.raises(_Answer) as done:
+        host_compliance.CASE_STEPS["confirm-hold"](db, case)
+    assert done.value.code == 2 and "try again" in done.value.obj["error"] and wanted == [True]
+    assert holds.standing(db, case.id)[0].confirmed_at is None
+    (refused,) = [r for r in _rows(db, "hold_confirmed") if r.status == "failure"]
+    assert refused.details["reason"] == holds.DELETION_RUNNING and refused.username == "operator@host"
 
 
 def test_run_as_a_program_the_tool_looks_its_case_steps_up_in_the_module_they_register_in():

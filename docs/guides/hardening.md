@@ -125,8 +125,11 @@ key versions are not retired: what was kept was sealed under them, and only thei
 about a person (its custodian) keeps their account as well: it cannot be deleted while the case's hold stands or
 what the hold kept waits for its purge. Each refusal is recorded under the case (`hold_blocked_delete`), and says
 why: to the vault's owner and to an administrator it names the case, while another manager of the vault refused a
-retire is told only that a legal hold keeps it. A per-person erase waits while any hold stands or any case is
-open, and says which case it waits for.
+retire is told only that a legal hold keeps it. A per-person erase waits while any confirmed hold stands or any
+case is open, and says which case it waits for. A hold nobody has confirmed yet keeps what is deleted from its
+vaults, which counts toward the deployment's storage limit (`MAX_STORAGE_GB`, or the lower limit set on the
+Settings page), but holds no erase back: one person places it alone. One person can have at most five hold-only
+cases waiting for confirmation at once.
 
 ### Upgrading with SFTP in its own container
 
