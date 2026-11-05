@@ -1621,8 +1621,9 @@ def volume_set_prefix(name):
 # (lock's .env.enc) and the template (.env.example). A plain .env under the first would be taken for the sealed one
 # (lock would refuse to seal, status would call it sealed, and deleting it as a stale sealed file would delete the
 # set's only key) and kept out of the list of plain-text archives; under the second, for the template. A set named
-# 'enc' or 'example' has its .env kept as .env.enc.1, .env.example.1 instead. Compared without case: where file
-# names ignore case, .env.ENC is the sealed file.
+# 'enc' or 'example' has its .env kept as .env.enc.1, .env.example.1 instead. Compared without case, and without
+# trailing dots and spaces: where file names ignore case, .env.ENC is the sealed file, and Windows opens .env.enc.
+# (the name for a set called 'enc.', a valid volume name) as .env.enc.
 RESERVED_ENV_NAMES = (".env.enc", ".env.example")
 
 
@@ -1634,7 +1635,7 @@ def env_copy_names(root, label):
     while True:
         name = base if n == 0 else "%s.%d" % (base, n)
         n += 1
-        if os.path.basename(name).lower() not in RESERVED_ENV_NAMES:
+        if os.path.basename(name).rstrip(". ").lower() not in RESERVED_ENV_NAMES:
             yield name
 
 
@@ -5909,9 +5910,12 @@ class DockVault:
             try:
                 fd = os.open(dest, flags, 0o600) if os.name != "nt" else os.open(dest, flags)
                 break
-            except FileExistsError:
-                continue
             except OSError as exc:
+                # A name already there, of any kind, is passed over, whatever the refusal said: Windows refuses
+                # to create a file over a folder with PermissionError, not FileExistsError. Only a refusal for a
+                # name that is free (a folder that cannot be written to, a full disk) stops the copy.
+                if os.path.lexists(dest):
+                    continue
                 exc.kept_as = dest
                 raise
         try:

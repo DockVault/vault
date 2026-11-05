@@ -8,12 +8,14 @@ never over a file already there, says where it is and how to go back to that set
 copy cannot be made or when .env is sealed by `lock`.
 
 Every path through it: another set's backup (in a root whose path holds a space too); the same set's, with its own
-.env and with one changed since the backup; no .env at all; a kept file (and a folder) already there; a copy that
-cannot be made, or that reads back otherwise, and the name the refusal gives; a current .env or a backup's that
-cannot be read; a restore that stops before it installs the backup's .env, and one that fails while installing it;
-a sealed .env; a current prefix that is no set's name; a set named like the sealed file or the template (whose names
-a kept or archived .env never takes); the note on a running set. With real Docker, the volumes of the set the host
-was on open again from the kept file, through the command the restore prints.
+.env and with one changed since the backup; no .env at all; a kept file (and a folder) already there, also where
+creating a file over a name already there is refused as Windows refuses it, and a link to nothing (for a kept and
+an archived .env); a copy that cannot be made, or that reads back otherwise, and the name the refusal gives; a
+current .env or a backup's that cannot be read; a restore that stops before it installs the backup's .env, and one
+that fails while installing it; a sealed .env; a current prefix that is no set's name; a set named like the sealed
+file or the template, in any case or with a trailing dot (whose names a kept or archived .env never takes); the note
+on a running set. With real Docker, the volumes of the set the host was on open again from the kept file, through
+the command the restore prints.
 """
 import argparse
 import importlib.util
@@ -191,6 +193,95 @@ def test_a_kept_file_already_there_is_never_written_over(tmp_path, monkeypatch, 
     said = _said(capsys)
     assert "Kept the current .env (set '%s') as %s" % (HERE, kept) in said
     assert _go_back_command(kept) in said
+
+
+class _OsRefusingAsWindowsDoes:
+    """dockvault's os, but for os.open, which refuses to create a .env copy over a name already there with
+    PermissionError, as Windows refuses to create a file over a folder (POSIX says FileExistsError)."""
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+    def open(self, path, flags, *a, **k):
+        if os.path.basename(path).startswith(".env.") and flags & os.O_EXCL and os.path.lexists(path):
+            raise PermissionError(13, "Permission denied", path)
+        return os.open(path, flags, *a, **k)
+
+
+@pytest.mark.parametrize("first_taken_by", ["a-folder", "a-file"])
+def test_a_name_already_there_is_passed_over_whatever_the_refusal_to_create_it_says(
+        tmp_path, monkeypatch, capsys, first_taken_by):
+    """On Windows, creating the copy over a folder already there is refused with PermissionError: the copy goes on
+    to the next name, as it does where the refusal is FileExistsError. os.open answers as on Windows here, so this
+    holds on every system the tests run on. (A refusal for a name that is free stops the restore: below.)"""
+    current = _env_bytes(HERE)
+    (tmp_path / ".env").write_bytes(current)
+    first = tmp_path / (".env." + HERE)
+    if first_taken_by == "a-folder":
+        first.mkdir()
+        (first / "inside").write_bytes(b"left alone\n")
+    else:
+        first.write_bytes(b"an older one\n")
+    (tmp_path / (".env." + HERE + ".1")).mkdir()               # a folder holds the next name
+    theirs = _env_bytes(THERE)
+    bundle = _bundle(tmp_path, theirs)
+    steps = []
+    tool = _tool(tmp_path, monkeypatch, steps)
+    monkeypatch.setattr(dv, "os", _OsRefusingAsWindowsDoes())
+    _restore(tool, bundle)
+
+    kept = tmp_path / (".env." + HERE + ".2")
+    assert kept.read_bytes() == current
+    assert (tmp_path / ".env").read_bytes() == theirs
+    if first_taken_by == "a-folder":
+        assert (first / "inside").read_bytes() == b"left alone\n"
+    else:
+        assert first.read_bytes() == b"an older one\n"
+    assert os.listdir(tmp_path / (".env." + HERE + ".1")) == []
+    assert steps[0] == ("stop", True), steps
+    said = _said(capsys)
+    assert "Kept the current .env (set '%s') as %s" % (HERE, kept) in said
+    assert _go_back_command(kept) in said
+
+
+def _link_to_nothing(path):
+    """A symbolic link at `path` to a name that is not there. Skipped where no link can be made (Windows, without
+    the right to make one)."""
+    try:
+        os.symlink(str(path) + "-gone", str(path))
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip("no symbolic link can be made here: %s" % exc)
+    assert os.path.lexists(path) and not os.path.exists(path)
+
+
+def test_a_link_to_nothing_holds_its_name_against_the_kept_env(tmp_path, monkeypatch, capsys):
+    """Not followed (the copy would be written where the link points) and not replaced: the next name is taken."""
+    current = _env_bytes(HERE)
+    (tmp_path / ".env").write_bytes(current)
+    link = tmp_path / (".env." + HERE)
+    _link_to_nothing(link)
+    bundle = _bundle(tmp_path, _env_bytes(THERE))
+    _restore(_tool(tmp_path, monkeypatch, []), bundle)
+
+    kept = tmp_path / (".env." + HERE + ".1")
+    assert kept.read_bytes() == current
+    assert os.path.islink(link) and os.readlink(link) == str(link) + "-gone"
+    assert not os.path.lexists(str(link) + "-gone"), "the copy was written through the link"
+    assert "Kept the current .env (set '%s') as %s" % (HERE, kept) in _said(capsys)
+
+
+def test_a_link_to_nothing_holds_its_name_against_an_archived_env(tmp_path):
+    """The same where repoint, a new set and Reset move .env aside (_archive_env): the link is neither replaced nor
+    followed."""
+    (tmp_path / ".env").write_bytes(b"VAULT_VOLUME_PREFIX=%s\n" % HERE.encode())
+    link = tmp_path / (".env." + HERE)
+    _link_to_nothing(link)
+    archived = dv.DockVault(dv.Palette(False), root=str(tmp_path))._archive_env(HERE)
+
+    assert archived == str(tmp_path / (".env." + HERE + ".1"))
+    assert Path(archived).read_bytes() == b"VAULT_VOLUME_PREFIX=%s\n" % HERE.encode()
+    assert os.path.islink(link) and os.readlink(link) == str(link) + "-gone"
+    assert not os.path.lexists(str(link) + "-gone")
 
 
 def _no_sync(_directory):
@@ -391,13 +482,14 @@ def test_a_current_env_whose_prefix_is_no_sets_name_is_kept_as_before_restore(tm
     assert "repoint" not in said
 
 
-@pytest.mark.parametrize("prefix", ["enc", "example", "ENC", "Example"])
+@pytest.mark.parametrize("prefix", ["enc", "example", "ENC", "Example", "enc.", "Example."])
 def test_a_set_named_like_the_sealed_file_or_the_template_never_has_its_env_kept_under_their_names(
         tmp_path, monkeypatch, capsys, prefix):
     """.env.enc is the sealed .env: a plain .env kept under that name would be taken for it (lock would refuse to
     seal, status would call it sealed, and deleting it as a stale sealed file would delete the set's only key), and
     left out of the plain-text archives lock warns about. .env.example is the template. Where file names ignore
-    case, .env.ENC is .env.enc. The copy goes on to .env.<prefix>.1, and the printed command names it."""
+    case, .env.ENC is .env.enc, and Windows opens .env.enc. (for a set called 'enc.', a valid volume name) as
+    .env.enc. The copy goes on to .env.<prefix>.1, and the printed command names it."""
     current = _env_bytes(prefix)
     (tmp_path / ".env").write_bytes(current)
     bundle = _bundle(tmp_path, _env_bytes(THERE))
@@ -414,9 +506,10 @@ def test_a_set_named_like_the_sealed_file_or_the_template_never_has_its_env_kept
     assert ("--target-prefix %s --env-source %s" % (prefix, kept)) in said
 
 
-@pytest.mark.parametrize("prefix", ["enc", "example", "ENC"])
+@pytest.mark.parametrize("prefix", ["enc", "example", "ENC", "enc.", "example. "])
 def test_an_env_archived_aside_never_takes_the_sealed_files_or_the_templates_name(tmp_path, prefix):
-    """The same rule where repoint, a new set and Reset move .env aside (_archive_env)."""
+    """The same rule where repoint, a new set and Reset move .env aside (_archive_env), whose name comes from .env
+    unchecked: Windows drops trailing dots and spaces from a name."""
     (tmp_path / ".env").write_bytes(b"VAULT_VOLUME_PREFIX=%s\n" % prefix.encode())
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     archived = tool._archive_env(prefix)
