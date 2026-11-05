@@ -32,9 +32,9 @@ REASON = ("Legal holds keep files deleted from vaults, and the old names of rena
 # How to undo it, as an older release prints it after "To go back to this version, first undo it with the newer
 # version:", so it names the release that removes the marker ({version}: the one the marker asks for), never "this
 # version", which there reads as the older release that refuses.
-UNDO = ("Release every legal hold (on the Compliance page, or with dockvault.py cases), wait until what they kept "
-        "is purged (COMPLIANCE_HOLD_PURGE_DELAY_DAYS after the release), then start DockVault {version} or later "
-        "once so it removes this marker.")
+UNDO = ("Release every legal hold on the Compliance page (dockvault.py cases cannot release one), wait until what "
+        "they kept is purged (COMPLIANCE_HOLD_PURGE_DELAY_DAYS after the release), then start DockVault {version} or "
+        "later once so it removes this marker.")
 
 # The detect query of the upgrade condition: a row while a hold stands or a kept row remains (the three kept tables
 # the vaults trigger counts, app/core/kept_tables.py).

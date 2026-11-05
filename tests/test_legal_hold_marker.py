@@ -157,6 +157,17 @@ def test_the_host_action_names_the_holds_to_an_older_target_only(db, monkeypatch
     assert _downgrade_answer(db, "0.34.0")["blockers"] == []
 
 
+def test_the_undo_names_only_what_releases_a_hold():
+    """A hold is released on the Compliance page (or by closing its case there); the host tool releases none."""
+    from app.core import host_compliance
+    undo = marker.UNDO.format(version="0.34.0")
+    assert undo.startswith("Release every legal hold on the Compliance page (dockvault.py cases cannot release one)")
+    assert not any(a.startswith(("close", "release")) for a in host_compliance.ACTIONS)
+    tool = (ROOT / "dockvault.py").read_text(encoding="utf-8")
+    actions = tool.split("\nCASE_ACTIONS = (", 1)[1].split("\n)\n", 1)[0]
+    assert "release" not in actions.lower()
+
+
 def test_dockvault_refuses_to_go_back_over_the_holds_unless_forced(db, monkeypatch, tmp_path, capsys):
     from test_data_requirements import _Deployment, _answers
     monkeypatch.setattr(recording_marker, "running_version", lambda: "0.34.0")
