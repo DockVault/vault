@@ -23,10 +23,14 @@ same; an earlier release started anyway may delete them. A refusal under a case 
 which keep the marker while they must stay.
 
 The row is written in the transaction of the change that makes it needed: every audit row that counts is built with
-it (ensure(), from app/services/audit_row_hooks.py), and a case opens with such a row. Only sync() removes it, once
-nothing needs it, at each start and by every pass of the pruner's compliance_cases job, and only while it holds a
-lock that every ensure() takes shared for the rest of its transaction: a row that counts not yet committed keeps the
-marker. When the lock is taken, sync() leaves the marker as it is until a later pass.
+it (ensure(), from app/services/audit_row_hooks.py), and a case opens with such a row. ``audit unarchive`` puts
+archived rows back without building them, so it writes the marker itself, in the transaction of each day it restores
+(restored(), from app/core/audit_archive.py, restore_day): a row that counts may be archived, since only a case's
+rows stay rows, and while it is archived only the archive's own marker stands, which the last unarchived day
+removes. Only sync() removes the marker, once nothing needs it, at each start and by every pass of the pruner's
+compliance_cases job, and only while it holds a lock that every write of it takes shared for the rest of its
+transaction: a row that counts not yet committed keeps the marker. When the lock is taken, sync() leaves the marker
+as it is until a later pass.
 
 A release older than the reader of that table (before 0.33.1) is not protected by the row. CONDITION is the upgrade
 matrix's condition for the edge back to an earlier release, written into the matrix in the release commit.
@@ -61,8 +65,11 @@ UNDO = ("Wait until no compliance case is open and the records of compliance acc
 TAKEN = "success"
 OWN_STEPS = frozenset({"owner_access_unlocked", "owner_notice_seen"})
 
-# The lock sync() takes alone to remove the marker, and every ensure() shared (distinct from the other lock classes).
+# The lock sync() takes alone to remove the marker, and every write of it (ensure(), restored()) shared (distinct
+# from the other lock classes).
 LOCK = (0x6372, 1)
+# Postgres' code for a serialization failure (restored()).
+SERIALIZATION_FAILURE = "40001"
 
 # The matrix's condition on the edge from 0.34.0 back to earlier releases (written in the release commit). Its query
 # reads the marker itself: what it stands for depends on COMPLIANCE_RECORD_MIN_DAYS, which only .env sets.
@@ -176,6 +183,41 @@ def ensure(db, *, now: Optional[datetime] = None) -> None:
                 pass
         print(f"Warning: the compliance records' rollback marker was not written ({type(exc).__name__}); "
               "the pruner's next pass writes it")
+
+
+def restored(db, newest: Optional[datetime], *, now: Optional[datetime] = None) -> bool:
+    """In the transaction of a day ``audit unarchive`` restores (app/core/audit_archive.py, restore_day), given the
+    time of the newest restored row that counts (``newest``, None when none did): the marker, unless it is there,
+    when that row is younger than COMPLIANCE_RECORD_MIN_DAYS, under the lock taken shared as ensure() takes it.
+    Raises when it cannot be written, so the day stays archived, behind the archive's own marker, rather than come
+    back as rows an earlier release would start on. Returns whether the rows needed it."""
+    from datetime import timedelta
+    from sqlalchemy.exc import DBAPIError
+    from app.core import compliance_retention as cr
+    from app.core import recording_marker
+    when = now or _utcnow()
+    if newest is None or newest < when - timedelta(days=cr.floor_days()):
+        return False
+    recording_marker._ensure_table(db)
+    params = _params(when)
+    if not _postgres(db):
+        db.execute(text(_INSERT + "NOTHING"), params)
+        return True
+    connection = db.connection()
+    connection.execute(text("SELECT pg_advisory_xact_lock_shared(:c, :k)"), {"c": LOCK[0], "k": LOCK[1]})
+    point = connection.begin_nested()
+    try:
+        connection.execute(text(_INSERT + "NOTHING"), params)
+    except DBAPIError as exc:
+        point.rollback()
+        # The unarchive reads in one snapshot (repeatable read), and Postgres will not skip an insert over a marker
+        # another transaction committed after that snapshot: it raises a serialization failure instead. That marker
+        # is there, and the lock now held keeps sync() from removing it before this transaction ends.
+        if getattr(getattr(exc, "orig", None), "pgcode", None) != SERIALIZATION_FAILURE:
+            raise
+        return True
+    point.commit()
+    return True
 
 
 def _take_alone(db) -> bool:

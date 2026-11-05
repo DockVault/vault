@@ -50,7 +50,9 @@ bytes of the hours it holds (app/core/audit_chain_size.py).
 
 The host's ``audit unarchive`` restores a range of days as rows (identical rows, so the seals still hold), writes
 back each hour's working data (row_ids, checked against the seal, and the salt the block kept), removes the
-blocks and writes an ``archive`` seal with no parts, in two phases like every host command that writes a seal.
+blocks and writes an ``archive`` seal with no parts, in two phases like every host command that writes a seal. A
+day whose rows include the record of a step of compliance access younger than COMPLIANCE_RECORD_MIN_DAYS gets the
+compliance records' marker back in its own transaction (app/core/compliance_marker.py).
 ``audit compact`` is a VACUUM FULL of the audit tables: Postgres gives freed space back to the system only that
 way, and it blocks audit writes while it runs.
 """
@@ -1019,8 +1021,10 @@ def _restore_rows(db, rows: List[dict]) -> None:
 
 
 def restore_day(w, day: date, now: datetime) -> int:
-    """Put ``day``'s archived rows back into audit_logs, in ``w``'s transaction (see the module's docstring).
-    Returns the rows restored. Raises NotVerified."""
+    """Put ``day``'s archived rows back into audit_logs, in ``w``'s transaction (see the module's docstring), with the
+    compliance records' marker when a row it restores keeps it (app/core/compliance_marker.py, restored). Returns the
+    rows restored. Raises NotVerified."""
+    from app.core import compliance_marker
     from app.core.models import AuditArchiveBlock as B, AuditLog as A
     ai = _ai()
     db, view = w.db, w.st.view
@@ -1029,6 +1033,7 @@ def restore_day(w, day: date, now: datetime) -> int:
         return 0
     _check_day_blocks(db, entry, day)
     restored = 0
+    counted: Optional[datetime] = None     # the newest restored row that keeps the compliance records' marker
     for part in sorted(entry.parts, key=lambda p: p.first_hour):
         hours = hours_between(part.first_hour, part.last_hour)
         if db.query(func.count()).select_from(A).filter(A.timestamp >= part.first_hour,
@@ -1040,6 +1045,8 @@ def restore_day(w, day: date, now: datetime) -> int:
         chunk: List[dict] = []
         for row in reader.rows():
             by_hour.setdefault(ai.hour_floor(row["timestamp"]), bytearray()).extend(row["id"].bytes)
+            if compliance_marker.counts(row.get("action"), row.get("status")):
+                counted = row["timestamp"] if counted is None else max(counted, row["timestamp"])
             chunk.append(row)
             if len(chunk) >= PROBE_CHUNK:
                 _restore_rows(db, chunk)
@@ -1066,6 +1073,9 @@ def restore_day(w, day: date, now: datetime) -> int:
     db.query(B).filter(B.day == day).delete(synchronize_session=False)
     db.flush()
     sync_marker(db, now)
+    # The rows come back without build_row, which writes the compliance records' marker for a row that keeps it; the
+    # archive's own marker may have just gone with the last block.
+    compliance_marker.restored(db, counted, now=now)
     _write_archive_seal(w, day, "unarchive", [])
     return restored
 

@@ -5,8 +5,9 @@ while a case is open, a case's records must stay, or the record of a step of com
 than COMPLIANCE_RECORD_MIN_DAYS, a row in data_requirements stops such a release from starting (0.33.1 and later),
 and dockvault.py update refuses to go back unless forced. Every audit row of such a step writes the marker in its own
 transaction; a refusal, which any account can cause, and a vault owner's own steps on Access to my vaults do not.
-sync() removes it once nothing needs it, at the start and at each pass of the pruner's compliance_cases job. test_compliance_marker_live.py checks on Postgres that sync() never removes it while a
-transaction that wrote such a row is still open.
+sync() removes it once nothing needs it, at the start and at each pass of the pruner's compliance_cases job.
+test_compliance_marker_live.py checks on Postgres that sync() never removes it while a transaction that wrote such a
+row is still open.
 """
 import importlib.util
 import json

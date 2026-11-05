@@ -6,7 +6,9 @@ marker as it is rather than remove it, so the new row, once committed, is still 
 marker for it, and removes it once that row is past the floor too. Writing the marker flushes nothing the caller has
 not written yet. A change whose marker cannot be written still commits, and the next sync() writes the marker. An
 ordinary account's refused case read and refused hold, and a vault owner's own step, write their rows and no marker.
-test_compliance_marker.py covers the rest offline.
+A day ``audit unarchive`` restores, which reads in one snapshot (repeatable read), writes the marker for the rows it
+puts back, also when another transaction committed one after its snapshot, and holds the lock so that a sync() which
+cannot see those rows leaves the marker. test_compliance_marker.py covers the rest offline.
 """
 import pytest
 
@@ -125,6 +127,57 @@ print(json.dumps(out))
 '''
 
 
+RESTORED = PREAMBLE + r'''
+from app.core import compliance_marker as marker
+from app.core import recording_marker
+
+def marked():
+    with engine.connect() as c:
+        return [r[0] for r in c.execute(text("SELECT key FROM data_requirements ORDER BY key"))]
+
+def a_day():
+    """The transaction of a day audit unarchive restores: one snapshot, taken by its first read."""
+    day = SessionLocal()
+    day.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+    day.execute(text("SELECT key FROM data_requirements")).all()
+    return day
+
+with SessionLocal() as s:
+    recording_marker._ensure_table(s)
+    s.commit()
+out = {"before": marked()}
+# Nothing marked: the day writes the marker for a restored row that keeps it.
+day = a_day()
+out["written"] = marker.restored(day, now, now=now)
+day.commit()
+day.close()
+out["after_the_day"] = marked()
+# The marker is there: a sync() meanwhile, which cannot see the rows the day puts back, leaves it.
+day = a_day()
+out["again"] = marker.restored(day, now, now=now)
+with SessionLocal() as s:
+    out["sync_while_restoring"] = marker.sync(s, now=now)
+    s.commit()
+day.commit()
+day.close()
+out["after_the_sync"] = marked()
+# Removed, then committed again by a step taken after the day's snapshot: the day's write finds it there.
+with SessionLocal() as s:
+    out["sync_alone"] = marker.sync(s, now=now)
+    s.commit()
+out["removed"] = marked()
+day = a_day()
+with SessionLocal() as other:
+    marker.ensure(other)
+    other.commit()
+out["restored_over_a_later_one"] = marker.restored(day, now, now=now)
+day.commit()
+day.close()
+out["after_both"] = marked()
+print(json.dumps(out))
+'''
+
+
 @pytest.fixture
 def throwaway():
     yield from throwaway_database()
@@ -150,3 +203,13 @@ def test_a_refused_request_or_an_owners_own_step_writes_no_marker(throwaway):
                            ["owner_access_unlocked", "success"]], "the rows are written all the same"
     assert out["after_them"] == [] and out["sync"] is False and out["after_the_sync"] == []
     assert out["after_a_step_taken"] == ["compliance-records"]
+
+
+def test_a_restored_day_writes_the_marker_under_its_snapshot_and_the_lock(throwaway):
+    out = run_in(throwaway, RESTORED)
+    assert out["before"] == []
+    assert out["written"] is True and out["after_the_day"] == ["compliance-records"]
+    assert out["again"] is True and out["sync_while_restoring"] is None, "left as it was: the day holds the lock"
+    assert out["after_the_sync"] == ["compliance-records"]
+    assert out["sync_alone"] is False and out["removed"] == []
+    assert out["restored_over_a_later_one"] is True and out["after_both"] == ["compliance-records"]

@@ -1276,6 +1276,85 @@ def test_unarchive_clears_the_link_of_an_account_deleted_since(env):
     assert failures(env.verify()) == []
 
 
+def _keys(env):
+    with env.session() as db:
+        try:
+            return [k for (k,) in db.execute(text("SELECT key FROM data_requirements ORDER BY key"))]
+        except Exception:  # noqa: BLE001 -- no table yet
+            return []
+
+
+@pytest.fixture
+def released(env, monkeypatch):
+    """The archive of a 0.34.0 build, which keeps the records of compliance access 2190 days."""
+    from app.core import recording_marker
+    monkeypatch.setattr(recording_marker, "running_version", lambda: "0.34.0")
+    env.settings.compliance_record_min_days = 2190
+    return env
+
+
+def _compliance_day(env, action="auditor_granted", status="success"):
+    for hour in (3, 4, 6):
+        _put(env, at(hour), action=action, status=status, username="admin")
+    env.run_until_sealed()
+    assert failures(env.verify()) == []
+
+
+def test_an_unarchive_brings_back_the_compliance_records_marker_with_the_rows_that_keep_it(released):
+    """Only a case's rows stay rows: an auditor right's steps older than the row window are archived like any row,
+    and while they are, the archive's own marker alone stops an earlier release. Put back as rows they bring the
+    compliance records' marker back in their day's transaction, the one that removes the archive's marker: in no
+    moment does an earlier release start on them. (They come back as they were, not through build_row, which writes
+    that marker for a row it builds.)"""
+    from app.core import host_compliance
+    env = released
+    _compliance_day(env)
+    _archive(env)
+    assert _hot(env) == 0 and _keys(env) == [arc.MARKER_KEY]
+    _unarchive(env)
+    assert _hot(env) == 3 and _blocks(env) == [] and _keys(env) == ["compliance-records"]
+    with env.session() as db:
+        assert [b["key"] for b in host_compliance.downgrade_blockers(db, "0.33.6")] == ["compliance-records"]
+    assert failures(env.verify()) == []
+
+
+@pytest.mark.parametrize("rows, floor", [
+    (dict(action="case_access_refused", status="failure"), None),   # a refusal keeps no marker
+    (dict(action="owner_notice_seen"), None),                       # nor an owner's own step
+    (dict(action="file_uploaded"), None),                           # nor a row of another category
+    (dict(action="auditor_granted"), 99),                           # nor a step past the floor (DAY is 100 days ago)
+])
+def test_an_unarchive_brings_back_no_compliance_records_marker_for_rows_that_do_not_keep_it(
+        released, monkeypatch, rows, floor):
+    from app.core import compliance_retention
+    env = released
+    if floor is not None:
+        monkeypatch.setattr(compliance_retention, "floor_days", lambda: floor)
+    _compliance_day(env, **rows)
+    _archive(env)
+    _unarchive(env)
+    assert _hot(env) == 3 and _keys(env) == []
+
+
+def test_a_day_whose_compliance_records_marker_cannot_be_written_stays_archived(released, monkeypatch):
+    from app.core import compliance_marker
+    env = released
+    _compliance_day(env)
+    _archive(env)
+
+    params = compliance_marker._params
+
+    def broken(_when):
+        raise RuntimeError("no version")
+    monkeypatch.setattr(compliance_marker, "_params", broken)
+    with pytest.raises(RuntimeError):
+        _unarchive(env)
+    assert _hot(env) == 0 and len(_blocks(env)) == 1 and _keys(env) == [arc.MARKER_KEY]
+    monkeypatch.setattr(compliance_marker, "_params", params)
+    _unarchive(env)
+    assert _hot(env) == 3 and _keys(env) == ["compliance-records"]
+
+
 def test_a_late_row_after_an_unarchive_of_a_legacy_day_is_sealed_again(env):
     """The day's nonce-less rows verify with the salt put back, and a row added to one of its hours is sealed
     over by the host as in any hour."""
