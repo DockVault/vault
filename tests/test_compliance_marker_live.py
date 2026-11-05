@@ -8,7 +8,8 @@ not written yet. A change whose marker cannot be written still commits, and the 
 ordinary account's refused case read and refused hold, and a vault owner's own step, write their rows and no marker.
 A day ``audit unarchive`` restores, which reads in one snapshot (repeatable read), writes the marker for the rows it
 puts back, also when another transaction committed one after its snapshot, and holds the lock so that a sync() which
-cannot see those rows leaves the marker. test_compliance_marker.py covers the rest offline.
+cannot see those rows leaves the marker; any other error of that write is raised, so the day stays archived.
+test_compliance_marker.py covers the rest offline.
 """
 import pytest
 
@@ -128,6 +129,7 @@ print(json.dumps(out))
 
 
 RESTORED = PREAMBLE + r'''
+from sqlalchemy.exc import DBAPIError
 from app.core import compliance_marker as marker
 from app.core import recording_marker
 
@@ -174,6 +176,31 @@ out["restored_over_a_later_one"] = marker.restored(day, now, now=now)
 day.commit()
 day.close()
 out["after_both"] = marked()
+# Any other error of the write is raised, so the day stays archived: here a trigger refuses every new requirement.
+with SessionLocal() as s:
+    out["cleared"] = marker.sync(s, now=now)
+    s.commit()
+with engine.begin() as c:
+    c.execute(text("CREATE FUNCTION refuse_requirement() RETURNS trigger LANGUAGE plpgsql AS "
+                   "$$BEGIN RAISE EXCEPTION 'requirement refused'; END$$"))
+    c.execute(text("CREATE TRIGGER refuse_requirement BEFORE INSERT ON data_requirements FOR EACH ROW "
+                   "EXECUTE FUNCTION refuse_requirement()"))
+day = a_day()
+try:
+    marker.restored(day, now, now=now)
+    out["refused"] = None
+except DBAPIError as exc:
+    out["refused"] = [getattr(exc.orig, "pgcode", None), "requirement refused" in str(exc.orig)]
+day.rollback()
+day.close()
+out["after_the_refusal"] = marked()
+with engine.begin() as c:
+    c.execute(text("DROP TRIGGER refuse_requirement ON data_requirements"))
+day = a_day()
+out["written_once_it_can_be"] = marker.restored(day, now, now=now)
+day.commit()
+day.close()
+out["at_last"] = marked()
 print(json.dumps(out))
 '''
 
@@ -213,3 +240,7 @@ def test_a_restored_day_writes_the_marker_under_its_snapshot_and_the_lock(throwa
     assert out["after_the_sync"] == ["compliance-records"]
     assert out["sync_alone"] is False and out["removed"] == []
     assert out["restored_over_a_later_one"] is True and out["after_both"] == ["compliance-records"]
+    assert out["cleared"] is False
+    assert out["refused"] == ["P0001", True], "another error of the write was taken for the marker being there"
+    assert out["after_the_refusal"] == []
+    assert out["written_once_it_can_be"] is True and out["at_last"] == ["compliance-records"]
