@@ -23435,13 +23435,19 @@ class FolderMoveCopy(BaseModel):
 
 
 def _gate_move_copy_destination(db, vault_service, current_user, dest_vault_id, dest_folder_id,
-                                dest_password, caps):
+                                dest_password, caps, *, again=False, password_hash_before=None):
     """Shared destination gate for move/copy: prove access + password to the destination vault, the
     scoped-temp caps hold on the destination, and (for a scoped temp) the destination folder — INCLUDING
-    the vault root — is in scope. Returns the destination vault."""
+    the vault root — is in scope. Returns the destination vault.
+
+    `again`: asked once more after the wait for a transfer slot, with the destination's password compared
+    with `password_hash_before` (its hash at the door) rather than verified again (_vault_again)."""
     from app.core.temp_scope import require_cap
-    dest_vault = vault_service.get_vault(dest_vault_id, current_user, dest_password,
-                                         require_password=True)
+    if again:
+        dest_vault = _vault_again(db, current_user, dest_vault_id, password_hash_before)
+    else:
+        dest_vault = vault_service.get_vault(dest_vault_id, current_user, dest_password,
+                                             require_password=True)
     for cap in caps:
         require_cap(current_user, dest_vault_id, cap)
     # Unconditional (NOT `if dest_folder_id is not None`): require_folder_scope denies the vault ROOT
@@ -23536,27 +23542,43 @@ async def copy_file_endpoint(
     audit_logger = AuditLogger(db)
     transfer_slot = None
     try:
-        # Source: access + password on the path vault, the file belongs to it, item in scope.
-        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id,
-                                        file_expiry.live_clause()).first():
-            raise HTTPException(status_code=404, detail="File not found in this vault")
-        require_item_scope(db, current_user, vault_id, file_id)
-        # Destination: access + password + the write cap + folder scope.
-        _gate_move_copy_destination(db, vault_service, current_user, body.dest_vault_id,
-                                    body.dest_folder_id, x_dest_vault_password, ["file.upload"])
-        # Overwriting a same-name file in the destination DELETES it, so it needs delete authority on
-        # the DESTINATION vault — the client flag alone must not let an upload-only principal destroy
-        # another user's file (same rule as every other replace path, _principal_can_replace_file).
-        replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
+        def _admitted(user, again=False):
+            """The copy's checks, at the door and (`again`) once more after its wait for a slot; returns the
+            principal and whether a same-name file in the destination may be replaced."""
+            if again:
+                user, _ = _admitted_again(db, token, vault_id, source_password, "FILE_DOWNLOAD", "file.download")
+            else:
+                # Source: access + password on the path vault.
+                vault_service.get_vault(vault_id, user, x_vault_password, require_password=True)
+            # The file belongs to the source vault, and the item is in scope.
+            if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id,
+                                            file_expiry.live_clause()).first():
+                raise HTTPException(status_code=404, detail="File not found in this vault")
+            require_item_scope(db, user, vault_id, file_id)
+            # Destination: access + password + the write cap + folder scope.
+            _gate_move_copy_destination(db, vault_service, user, body.dest_vault_id, body.dest_folder_id,
+                                        x_dest_vault_password, ["file.upload"], again=again,
+                                        password_hash_before=dest_password if again else None)
+            # Overwriting a same-name file in the destination DELETES it, so it needs delete authority on
+            # the DESTINATION vault — the client flag alone must not let an upload-only principal destroy
+            # another user's file (same rule as every other replace path, _principal_can_replace_file).
+            return user, body.replace_same_name and _principal_can_replace_file(db, user, body.dest_vault_id)
+
+        _admitted(current_user)
+        token = _bearer_credentials(request).credentials
+        source_password = _vault_credential_fingerprint(db, vault_id)
+        dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
         client_ip = get_client_ip(request)
 
         def _copy_and_record():
+            # Asked again once the copy has its slot, here in the thread it runs in: the session, the scope, either
+            # vault's access or password, or the file itself may have changed while it waited.
+            user, replace = _admitted(current_user, again=True)
             new_id = str(vault_service.copy_file(
-                file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+                file_id, user, body.dest_vault_id, body.dest_folder_id,
                 source_file_password=x_file_password, replace_same_name=replace).id)
             audit_logger.log_action(
-                action='file_copy', status='success', user=current_user, resource_type='file',
+                action='file_copy', status='success', user=user, resource_type='file',
                 resource_id=str(file_id),
                 details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
                          'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
@@ -23605,24 +23627,39 @@ async def move_file_endpoint(
     audit_logger = AuditLogger(db)
     transfer_slot = None
     try:
-        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id,
-                                        file_expiry.live_clause()).first():
-            raise HTTPException(status_code=404, detail="File not found in this vault")
-        require_item_scope(db, current_user, vault_id, file_id)
-        _gate_move_copy_destination(db, vault_service, current_user, body.dest_vault_id,
-                                    body.dest_folder_id, x_dest_vault_password, ["file.upload"])
-        # Same rule as copy: overwriting a same-name file in the destination needs delete authority
-        # there, not just the client flag.
-        replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
+        def _admitted(user, again=False):
+            """The move's checks, at the door and (`again`) once more after its wait for a slot; returns the
+            principal and whether a same-name file in the destination may be replaced."""
+            if again:
+                user, _ = _admitted_again(db, token, vault_id, source_password, "FILE_DELETE", "file.delete")
+            else:
+                vault_service.get_vault(vault_id, user, x_vault_password, require_password=True)
+            if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id,
+                                            file_expiry.live_clause()).first():
+                raise HTTPException(status_code=404, detail="File not found in this vault")
+            require_item_scope(db, user, vault_id, file_id)
+            _gate_move_copy_destination(db, vault_service, user, body.dest_vault_id, body.dest_folder_id,
+                                        x_dest_vault_password, ["file.upload"], again=again,
+                                        password_hash_before=dest_password if again else None)
+            # Same rule as copy: overwriting a same-name file in the destination needs delete authority
+            # there, not just the client flag.
+            return user, body.replace_same_name and _principal_can_replace_file(db, user, body.dest_vault_id)
+
+        at_the_door = _admitted(current_user)
+        token = _bearer_credentials(request).credentials
+        source_password = _vault_credential_fingerprint(db, vault_id)
+        dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
         client_ip = get_client_ip(request)
 
-        def _move_and_record():
+        def _move_and_record(waited):
+            # A move that waited for its slot asks again, here in the thread it runs in: the session, the scope,
+            # either vault's access or password, or the file itself may have changed while it waited.
+            user, replace = _admitted(current_user, again=True) if waited else at_the_door
             new_id = str(vault_service.move_file(
-                file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+                file_id, user, body.dest_vault_id, body.dest_folder_id,
                 source_file_password=x_file_password, replace_same_name=replace).id)
             audit_logger.log_action(
-                action='file_move', status='success', user=current_user, resource_type='file',
+                action='file_move', status='success', user=user, resource_type='file',
                 resource_id=str(file_id),
                 details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
                          'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
@@ -23635,11 +23672,11 @@ async def move_file_endpoint(
             # copied. It takes no transfer slot, as a folder move takes none, so a full ceiling never refuses
             # it; and it runs here, as a folder move and a rename do (work on the request's session runs off
             # the event loop only under a slot: app/core/off_loop.py).
-            return {'message': 'File moved', 'id': _move_and_record()}
+            return {'message': 'File moved', 'id': _move_and_record(False)}
         transfer_slot = await _admitted_holding_no_connection(db)
         # Off the event loop, to its end: a move to another vault reads, re-encrypts and syncs the whole
         # file, then removes the source; its audit row commits there too.
-        new_id = await off_loop.run_to_end_on_session(db, _move_and_record)
+        new_id = await off_loop.run_to_end_on_session(db, _move_and_record, True)
         return {'message': 'File moved', 'id': new_id}
     except DuplicateNameError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
@@ -23716,23 +23753,38 @@ async def copy_folder_endpoint(
     transfer_slot = None
     try:
         from app.core.temp_scope import require_cap
-        vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
-        if not db.query(Folder.id).filter(Folder.id == folder_id, Folder.vault_id == vault_id).first():
-            raise HTTPException(status_code=404, detail="Folder not found in this vault")
-        require_item_scope(db, current_user, vault_id, folder_id)
-        # Unconditional: denies the vault ROOT for an id-scoped temp (a no-op otherwise).
-        require_folder_scope(db, current_user, vault_id, body.dest_parent_folder_id)
-        # A recursive copy reads every descendant file and writes a duplicate, so a scoped temp needs
-        # the read + write caps too (all within the one vault).
-        require_cap(current_user, vault_id, "file.download")
-        require_cap(current_user, vault_id, "file.upload")
+
+        def _admitted(user, again=False):
+            """The folder copy's checks, at the door and (`again`) once more after its wait for a slot; returns
+            the principal."""
+            if again:
+                user, _ = _admitted_again(db, token, vault_id, password, "FOLDER_MANAGE", "folder.create")
+            else:
+                vault_service.get_vault(vault_id, user, x_vault_password, require_password=True)
+            if not db.query(Folder.id).filter(Folder.id == folder_id, Folder.vault_id == vault_id).first():
+                raise HTTPException(status_code=404, detail="Folder not found in this vault")
+            require_item_scope(db, user, vault_id, folder_id)
+            # Unconditional: denies the vault ROOT for an id-scoped temp (a no-op otherwise).
+            require_folder_scope(db, user, vault_id, body.dest_parent_folder_id)
+            # A recursive copy reads every descendant file and writes a duplicate, so a scoped temp needs
+            # the read + write caps too (all within the one vault).
+            require_cap(user, vault_id, "file.download")
+            require_cap(user, vault_id, "file.upload")
+            return user
+
+        _admitted(current_user)
+        token = _bearer_credentials(request).credentials
+        password = _vault_credential_fingerprint(db, vault_id)
         client_ip = get_client_ip(request)
 
         def _copy_folder_and_record():
-            new_id = str(vault_service.copy_folder(folder_id, current_user, body.dest_vault_id,
+            # Asked again once the copy has its slot, here in the thread it runs in: the session, the scope, the
+            # vault's access or password, or the folder itself may have changed while it waited.
+            user = _admitted(current_user, again=True)
+            new_id = str(vault_service.copy_folder(folder_id, user, body.dest_vault_id,
                                                    body.dest_parent_folder_id).id)
             audit_logger.log_action(
-                action='folder_copy', status='success', user=current_user, resource_type='folder',
+                action='folder_copy', status='success', user=user, resource_type='folder',
                 resource_id=str(folder_id),
                 details={'vault_id': str(vault_id), 'new_folder_id': new_id,
                          'dest_parent_folder_id': (str(body.dest_parent_folder_id)

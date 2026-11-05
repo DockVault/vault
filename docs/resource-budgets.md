@@ -256,8 +256,9 @@ suits 1 GB and above.
 host reaches 11%.
 
 **Concurrency is now enforced, not merely described.** `MAX_CONCURRENT_TRANSFERS` (16 by default)
-caps how many transfers are carried at once, counting downloads, upload assembly, and copies and
-moves of files and folders together. Arrivals beyond it wait — a burst is normal traffic — and are
+caps how many transfers are carried at once, counting downloads, upload assembly, copies of files
+and folders and moves of files to another vault together (a move within one vault copies no bytes
+and is not counted). Arrivals beyond it wait — a burst is normal traffic — and are
 only turned away once the queue (`MAX_QUEUED_TRANSFERS`, 32) is also full or the wait
 (`TRANSFER_QUEUE_WAIT_SECONDS`, 20) expires. A refusal is a `503` with `Retry-After`, deliberately
 distinct from a failure, so a client can tell "come back shortly" from "this file is broken".
@@ -266,10 +267,12 @@ distinct from a failure, so a client can tell "come back shortly" from "this fil
 run in threads of their own, each on its request's connection, and a download holds one while it
 streams; a transfer waiting for a slot holds none (a download, a preview or a public link's download
 waited holding one, and 16 streaming with 32 waiting held the whole pool: nobody was answered). Once a
-download or a preview that waited has its slot, what let it in is asked again: the session, the
-account, a temporary credential's scope, the vault's access and its password (a changed password
-refuses it), and the file's row, so a sign-out or a change made during the wait applies to it; a
-public link's download asks its link's gates again. The API's connection pool is
+download, a preview, a copy, a move to another vault or a folder copy that waited has its slot, what
+let it in is asked again (by a copy, in the thread it runs in): the session, the account, a temporary
+credential's scope, each vault's access and its password (a changed password refuses it), the item's
+row and, for a copy or a move, whether a same-name file may be replaced, so a sign-out or a change
+made during the wait applies to it; a public link's download asks its link's gates again. A move
+within one vault copies no bytes and takes no slot. The API's connection pool is
 therefore sized from the ceiling: one connection for each transfer the two ceilings admit (this one
 and the upload links' quarter of it), 8 for sign-ins, and 10 more for everything else the server
 answers meanwhile: 38 at the default ceiling, never fewer than 30. Before copies and moves were

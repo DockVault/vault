@@ -109,8 +109,13 @@ class _World:
         monkeypatch.setattr(S, "require_folder_scope", lambda *a, **k: world.db._query_ran())
         monkeypatch.setattr(S, "_principal_can_replace_file", lambda *a, **k: False)
         monkeypatch.setattr(S, "get_client_ip", lambda request: "192.0.2.1")
+        # What is asked again once it has its slot (tests/test_transfers_asked_again_after_the_wait.py).
+        monkeypatch.setattr(S, "_user_for_token", lambda token, db: SimpleNamespace(id=uuid.uuid4()))
+        monkeypatch.setattr(S, "_vault_credential_fingerprint", lambda db, vault_id: None)
+        import app.core.endpoint_permissions as endpoint_permissions
         import app.core.temp_scope as temp_scope
         monkeypatch.setattr(temp_scope, "require_cap", lambda *a, **k: None)
+        monkeypatch.setattr(endpoint_permissions, "check_endpoint_permission", lambda *a, **k: None)
 
 
 def _raw(endpoint):
@@ -119,19 +124,22 @@ def _raw(endpoint):
     return endpoint
 
 
+REQUEST = SimpleNamespace(headers={"authorization": "Bearer t"})
+
+
 def _call(kind, world):
     """The endpoint's coroutine for `kind`, as FastAPI would call it."""
     user = SimpleNamespace(id=uuid.uuid4())
     vid, item = uuid.uuid4(), uuid.uuid4()
     if kind == "copy":
-        return _raw(S.copy_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), None,
+        return _raw(S.copy_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), REQUEST,
                                           current_user=user, db=world.db, x_vault_password=None,
                                           x_dest_vault_password=None, x_file_password=None)
     if kind == "move":
-        return _raw(S.move_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), None,
+        return _raw(S.move_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), REQUEST,
                                           current_user=user, db=world.db, x_vault_password=None,
                                           x_dest_vault_password=None, x_file_password=None)
-    return _raw(S.copy_folder_endpoint)(vid, item, S.FolderMoveCopy(dest_vault_id=vid), None,
+    return _raw(S.copy_folder_endpoint)(vid, item, S.FolderMoveCopy(dest_vault_id=vid), REQUEST,
                                         current_user=user, db=world.db, x_vault_password=None)
 
 
@@ -237,7 +245,7 @@ def test_a_move_within_one_vault_takes_no_slot_and_a_full_ceiling_never_refuses_
         world = _World(monkeypatch, gate)
         other = await gate.acquire()
         vid = uuid.uuid4()
-        answer = await _raw(S.move_file_endpoint)(vid, uuid.uuid4(), S.ItemMoveCopy(dest_vault_id=vid), None,
+        answer = await _raw(S.move_file_endpoint)(vid, uuid.uuid4(), S.ItemMoveCopy(dest_vault_id=vid), REQUEST,
                                                   current_user=SimpleNamespace(id=uuid.uuid4()), db=world.db,
                                                   x_vault_password=None, x_dest_vault_password=None,
                                                   x_file_password=None)

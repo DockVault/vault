@@ -382,3 +382,123 @@ def test_a_move_within_one_vault_is_answered_while_every_slot_is_held(admin, vau
         assert _files_in(admin, elsewhere) == {answers["across"].json()["id"]}
     finally:
         admin.delete_vault(elsewhere)
+
+
+def test_a_transfer_waiting_for_its_slot_is_refused_when_what_let_it_in_changes(admin, vault):
+    """Every slot held. Sent meanwhile, each waiting for a slot: a download and a copy from two sessions of one
+    account, which are then signed out; a move to another vault by an account an administrator then locks; a
+    download by a temporary credential that is then switched off; a download from a vault whose password then
+    changes; and a copy nothing changed for. Once the slots come back, the five are refused (401: the lock ends
+    the account's sessions, and the password's asks for it again) and did nothing; the last is copied. Before, a
+    waiting copy or move ran after its session was signed out."""
+    limit = _setting("MAX_CONCURRENT_TRANSFERS", 16)
+    queue = _setting("MAX_QUEUED_TRANSFERS", 32)
+    if limit > 64 or queue < 6:
+        pytest.skip(f"needs a ceiling of at most 64 and room for 6 to wait (ceiling {limit}, queue {queue})")
+    from conftest import ApiClient
+    held = _upload(admin, vault, "held.bin", os.urandom(HELD_SIZE))
+    users, vaults, lock, minted = [], [], {"on": False}, []
+    try:
+        signed_out = admin.create_user(role="user")
+        locked = admin.create_user(role="user")
+        users += [signed_out, locked]
+        first, second, mover = ApiClient(), ApiClient(), ApiClient()
+        first.login(signed_out["_username"], signed_out["_password"])
+        second.login(signed_out["_username"], signed_out["_password"])
+        mover.login(locked["_username"], locked["_password"])
+        theirs = first.create_vault(name=unique("waits-out"))["id"]
+        moving_from = mover.create_vault(name=unique("waits-from"))["id"]
+        moving_to = mover.create_vault(name=unique("waits-to"))["id"]
+        protected = admin.create_vault(name=unique("waits-pw"))["id"]
+        vaults += [(signed_out, theirs, None), (locked, moving_from, None), (locked, moving_to, None),
+                   (None, protected, "After-Change-2")]
+        their_file = _upload(first, theirs, "theirs.bin", os.urandom(1024))
+        copied_into = _folder(first, theirs, "copied")
+        moved_file = _upload(mover, moving_from, "moved.bin", os.urandom(1024))
+        protected_file = _upload(admin, protected, "protected.bin", os.urandom(1024))
+        r = admin.put(f"/vaults/{protected}/password", json={"new_password": "Before-Change-1"})
+        assert r.status_code == 200, r.text
+        control_file = _upload(admin, vault, "control.bin", os.urandom(1024))
+        control_into = _folder(admin, vault, "control")
+        temp_file = _upload(admin, vault, "temporary.bin", os.urandom(1024))
+        caps = ["vault.see_info", "vault.see_files", "file.download"]
+        r = admin.post("/auth/temp-credentials", json={
+            "validity_minutes": 60, "vault_access_mode": "selected",
+            "selected_vaults": [{"vault_id": vault, "caps": caps}],
+            "scope": {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": caps,
+                      "temp": {"view": False, "create": False, "invalidate": False, "clear": False,
+                               "delegate": False}}})
+        assert r.status_code == 200, r.text
+        minted.append(r.json()["temp_username"])
+        temporary = ApiClient()
+        temporary.login(r.json()["temp_username"], r.json()["credential"])
+
+        sends = {
+            "signed-out download": (_session(first), "GET", f"/vaults/{theirs}/files/{their_file}/download", {}),
+            "signed-out copy": (_session(second), "POST", f"/vaults/{theirs}/files/{their_file}/copy",
+                                {"json": {"dest_vault_id": theirs, "dest_folder_id": copied_into}}),
+            "locked move": (_session(mover), "POST", f"/vaults/{moving_from}/files/{moved_file}/move",
+                            {"json": {"dest_vault_id": moving_to}}),
+            "switched-off credential download": (_session(temporary), "GET",
+                                                 f"/vaults/{vault}/files/{temp_file}/download", {}),
+            "changed password download": (_session(admin), "GET",
+                                          f"/vaults/{protected}/files/{protected_file}/download",
+                                          {"headers": {"X-Vault-Password": "Before-Change-1"}}),
+            "control copy": (_session(admin), "POST", f"/vaults/{vault}/files/{control_file}/copy",
+                             {"json": {"dest_vault_id": vault, "dest_folder_id": control_into}}),
+        }
+        answers = {}
+
+        def send(name, session, method, path, kw):
+            answers[name] = session.request(method, f"{BASE}{path}", timeout=120, **kw)
+
+        threads = [threading.Thread(target=send, args=(name, *how), daemon=True) for name, how in sends.items()]
+        with _EverySlotHeld(admin, vault, held, limit):
+            for t in threads:
+                t.start()
+            _until(admin, lambda flying, waiting: waiting == len(sends), f"all {len(sends)} waiting", 15)
+            for client in (first, second):
+                r = client.post("/auth/sign-out")
+                assert r.status_code == 200 and r.json()["session_ended"] is True, r.text
+            r = admin.post(f"/api/user-management/users/{locked['id']}/toggle-locked")
+            assert r.status_code == 200, r.text
+            lock["on"] = True
+            r = admin.post(f"/temp-creds/{minted[0]}/deactivate")
+            assert r.status_code == 200, r.text
+            r = admin.put(f"/vaults/{protected}/password",
+                          json={"current_password": "Before-Change-1", "new_password": "After-Change-2"})
+            assert r.status_code == 200, r.text
+            assert _metrics(admin) == (limit, len(sends)), "a request stopped waiting before the slots came back"
+        for t in threads:
+            t.join(130)
+        got = {name: (r.status_code, r.text[:200]) for name, r in answers.items()}
+        assert got["signed-out download"][0] == 401, got
+        assert got["signed-out copy"][0] == 401, got
+        assert got["locked move"][0] == 401, got
+        assert got["switched-off credential download"][0] == 401, got
+        assert got["changed password download"][0] == 401 and "password" in got["changed password download"][1], got
+        assert got["control copy"][0] == 200, got
+        # What the refused ones would have done, not done (seen by each owner, signed in again).
+        unlocked = admin.post(f"/api/user-management/users/{locked['id']}/toggle-locked")
+        assert unlocked.status_code == 200, unlocked.text
+        lock["on"] = False
+        first, mover = ApiClient(), ApiClient()
+        first.login(signed_out["_username"], signed_out["_password"])
+        mover.login(locked["_username"], locked["_password"])
+        assert _files_in(first, theirs, copied_into) == set(), "a copy ran after its session was signed out"
+        assert moved_file in _files_in(mover, moving_from) and _files_in(mover, moving_to) == set(), (
+            "a move ran after its account was locked")
+        assert _files_in(admin, vault, control_into) == {answers["control copy"].json()["id"]}
+    finally:
+        for name in minted:
+            admin.post(f"/temp-creds/{name}/delete")
+        if lock["on"]:
+            admin.post(f"/api/user-management/users/{locked['id']}/toggle-locked")
+        for owner, vid, password in vaults:
+            client = admin
+            if owner is not None:
+                client = ApiClient()
+                client.login(owner["_username"], owner["_password"])
+            client.delete_vault(vid, vault_password=password)
+        for user in users:
+            admin.delete_user(user["id"])
