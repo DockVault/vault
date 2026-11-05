@@ -1478,6 +1478,27 @@ def verify_access_token(token: str) -> Optional[dict]:
         return None
 
 
+def verify_access_token_for_sign_out(token: str) -> Optional[dict]:
+    """The claims of a token this server signed, whether or not it has expired; None otherwise.
+
+    For one use only: ending the session a token names when the web app signs out (POST
+    /auth/sign-out). A sign-out also follows a session that has run out, and ending the session
+    then still matters: its row stays listed as signed in until it is ended. The signature, the
+    algorithm and the length limit are checked exactly as verify_access_token checks them; only the
+    expiry is not. Never use it to let a request in."""
+    if isinstance(token, (str, bytes)) and len(token) > MAX_ACCESS_TOKEN_LENGTH:
+        return None
+    try:
+        return jwt.decode(
+            token,
+            _runtime_settings().jwt_secret_key,
+            algorithms=[_runtime_settings().jwt_algorithm],
+            options={"verify_exp": False},
+        )
+    except (jwt.PyJWTError, RecursionError):
+        return None
+
+
 # Session Token Generation
 def generate_session_token() -> str:
     """

@@ -271,7 +271,11 @@ def test_the_web_door_slot_release_is_wired_on_logout_terminate_and_the_reaper()
         nxt = tail.find("\n@app.", 1)
         return tail if nxt == -1 else tail[:nxt]
 
-    assert "release_ended_session_slots(" in _fn('@app.post("/api/logout")')
+    # Logout, and the web app's sign-out, end their session through one helper that releases the slot.
+    ended = api_src[api_src.index("def _end_web_session("):api_src.index('@app.post("/api/logout")')]
+    assert "release_ended_session_slots(" in ended
+    assert "_end_web_session(db, session_token)" in _fn('@app.post("/api/logout")')
+    assert "_end_web_session(db, session_token, user_id=user_id)" in _fn('@app.post("/auth/sign-out")')
     assert "release_ended_session_slots(" in _fn("async def terminate_temp_credential_sessions(")
     reaper = api_src[api_src.index("async def cleanup_expired_sessions"):]
     assert "release_ended_session_slots(" in reaper[:3500]

@@ -24001,6 +24001,36 @@ async def get_dashboard_stats(
     )
 
 
+def _end_web_session(db, session_token: str, user_id=None):
+    """End the session behind ``session_token`` (the plain value inside a token) at once. Returns (its row, or
+    None when there is none, or it is not ``user_id``'s; whether this call ended it). Commits.
+
+    Its row is marked inactive and `revoked`, so its token is refused on every request even while the Redis
+    denylist cannot be read (get_current_user, the upload size check in app/core/live_session.py and the
+    live-monitor socket all read the flag), and a temporary credential spent at the web door frees its cap slot
+    when this was its last session, the web twin of the SFTP close release (it never touches the credential's
+    is_used or is_active). Idempotent: the row is ended by one conditional UPDATE, so of two calls at once only
+    one ends it, and only that one says so (and records the sign-out)."""
+    from app.core.models import ActiveSession
+    session = db.query(ActiveSession).filter(
+        ActiveSession.session_token == hash_session_token(session_token)
+    ).first()
+    if session is None or (user_id is not None and str(session.user_id) != str(user_id)):
+        return None, False
+    row = db.query(ActiveSession).filter(ActiveSession.id == session.id)
+    ended = row.filter(ActiveSession.revoked == False).update(  # noqa: E712
+        {ActiveSession.is_active: False, ActiveSession.revoked: True}, synchronize_session=False) == 1
+    if not ended:
+        row.update({ActiveSession.is_active: False}, synchronize_session=False)
+    if session.temp_credential_id is not None:
+        from app.core.temp_cred_slot import release_ended_session_slots
+        from app.core.models import TemporaryCredential as _TC_ended
+        db.flush()
+        release_ended_session_slots(db, _TC_ended, ActiveSession, {session.temp_credential_id})
+    db.commit()
+    return session, ended
+
+
 @app.post("/api/logout")
 async def logout(
     request: Request,
@@ -24008,35 +24038,23 @@ async def logout(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Logout user and invalidate session."""
-    from app.core.models import ActiveSession
-    
+    """Logout user and invalidate session.
+
+    Kept as it is for its callers (scripts and other clients). Its answer carries Clear-Site-Data, which also
+    clears the origin's storage in every tab of a browser that acts on it, so the web app ends its session with
+    POST /auth/sign-out instead."""
     # Get JWT token from request
     token = request.headers.get('Authorization', '').replace('Bearer ', '')
     payload = verify_access_token(token)
-    
+
     session_invalidated = False
     if payload:
         session_token = payload.get("session_token")
         if session_token:
-            # Invalidate session in database
-            session = db.query(ActiveSession).filter(
-                ActiveSession.session_token == hash_session_token(session_token)
-            ).first()
+            # Invalidate session in database: durably revoked, so rejected per request even if the Redis
+            # denylist read fails open during an outage (see _end_web_session).
+            session, _ended = _end_web_session(db, session_token)
             if session:
-                session.is_active = False
-                # Durable revocation: rejected per-request even if the Redis denylist read
-                # fails open during an outage (get_current_user checks ActiveSession.revoked).
-                session.revoked = True
-                # A hand-out credential spent at the web door frees its cap slot when its (only) web
-                # session ends -- release it here on logout, the web twin of the SFTP close release.
-                # Never touches is_used/is_active on the credential.
-                if session.temp_credential_id is not None:
-                    from app.core.temp_cred_slot import release_ended_session_slots
-                    from app.core.models import TemporaryCredential as _TC_logout
-                    db.flush()
-                    release_ended_session_slots(db, _TC_logout, ActiveSession, {session.temp_credential_id})
-                db.commit()
                 session_invalidated = True
                 print(f"🔓 Session invalidated for user {current_user.username} (session_token: {session_token[:16]}...)")
             else:
@@ -24074,6 +24092,77 @@ async def logout(
     })
     
     return {"message": "Logged out successfully", "session_invalidated": session_invalidated}
+
+
+# The sign-out route reads the token itself: a missing one is answered by the route (401, without
+# Clear-Site-Data), not by the scheme's own refusal.
+_sign_out_bearer = HTTPBearer(auto_error=False)
+
+
+@app.post("/auth/sign-out")
+async def sign_out(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_sign_out_bearer),
+    db: Session = Depends(get_db),
+):
+    """End the session of the token sent, on the server, at once: the web app calls it on every sign-out.
+
+    POST /api/logout does the same for its callers, but its answer carries Clear-Site-Data, which a browser
+    applies to the whole origin, in every tab: the stored skin and theme, the saved zero-knowledge uploads, the
+    download worker. So the web app never called it, and its sessions stayed valid on the server until they
+    expired. This route ends the session the same way (_end_web_session: the row inactive and revoked, a
+    temporary credential's slot released when this was its last session, the token denylisted for the rest of
+    its life) and answers without that header and without touching cookies.
+
+    - A token this server signed is enough, expired or not (verify_access_token_for_sign_out): the page also
+      signs out after its session has run out, and the row stays listed as signed in until it is ended. Ending
+      a session is all it allows; it lets no request in.
+    - The account's state does not matter: a locked or deactivated account's session is ended as well.
+    - Idempotent: a second call, from this tab or another holding the same token, answers 200 again with
+      session_ended false, and records nothing.
+    - The call that ends the session records the sign-out as POST /api/logout does (the audit log's logout row,
+      attributed to the temporary credential when it is one, and the live event).
+    - A token that is not one this server signed for a session (a second-factor pending token, a forged or
+      malformed one, none at all) is refused with 401, also without Clear-Site-Data.
+    """
+    import time as _time
+    from app.core.security import verify_access_token_for_sign_out
+    from app.services.auth_service import denylist_token
+    payload = verify_access_token_for_sign_out(credentials.credentials) if credentials is not None else None
+    session_token = payload.get("session_token") if isinstance(payload, dict) else None
+    user_id = payload.get("sub") if isinstance(payload, dict) else None
+    if not session_token or not user_id or not isinstance(session_token, str):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid authentication credentials",
+                            headers={"WWW-Authenticate": "Bearer"})
+    session, ended = _end_web_session(db, session_token, user_id=user_id)
+    # The denylist holds the session's token for what is left of its life, as logout does; only for a session this
+    # token is the account's own (one naming another account's session ends nothing, there or in the database).
+    exp = payload.get("exp")
+    ttl = int(exp - _time.time()) if isinstance(exp, (int, float)) else 0
+    if session is not None and ttl > 0:
+        denylist_token(session_token, ttl)
+    if ended:
+        user = db.query(User).filter(User.id == session.user_id).first()
+        if user is not None:
+            if session.temp_credential_id is not None:
+                from app.core.models import TemporaryCredential as _TC_signed_out
+                user._temp_cred_id = session.temp_credential_id
+                user._temp_cred_username = db.query(_TC_signed_out.temp_username).filter(
+                    _TC_signed_out.id == session.temp_credential_id).scalar()
+            client_ip = get_client_ip(request)
+            AuditLogger(db).log_logout(user, client_ip)
+            broadcast_event({
+                "event": {
+                    "type": "logout",
+                    "title": "User logged out",
+                    "description": f"{user.username} logged out",
+                    "user": user.username,
+                    "ip": client_ip,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            })
+    return {"signed_out": True, "session_ended": ended}
 
 
 @app.get("/api/monitoring/metrics")
