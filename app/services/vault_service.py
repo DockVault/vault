@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.models import User, Vault, Folder, File, VaultPermissionEnum
 from app.core import durable_write, file_expiry
 from app.core import kept_tables
+from app.core import vault_access
 from app.core.safe_log import safe_event
 from app.core.security import (
     encrypt_file_content, decrypt_file_content,
@@ -887,10 +888,11 @@ class VaultService:
                     _burn()
                     raise InvalidPasswordError("Invalid vault password")
 
-        # Update last accessed time
-        vault.last_accessed = datetime.now(timezone.utc)
+        # When the vault was opened: written at most once a minute, by a thread of its own, never by the
+        # request (app/core/vault_access.py). The commit ends the transaction as it always did.
+        vault_access.opened(self.db, vault)
         self.db.commit()
-        
+
         return vault
     
     def list_vaults(

@@ -80,6 +80,7 @@ from app.core.upload_chunk_crypto import (
 from app.core.upload_attempt_header import HeadPeek, header_token_mismatch
 from app.core import durable_write
 from app.core import off_loop
+from app.core import vault_access
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -17558,7 +17559,7 @@ async def create_vault(
         'file_count': vault.file_count,
         'created_at': vault.created_at,
         'updated_at': vault.updated_at,
-        'last_accessed': vault.last_accessed,
+        'last_accessed': vault_access.last_access(vault.id, vault.last_accessed),
         'is_active': vault.is_active,
         'type': vault.type,
         'my_permission': 'owner',  # creator owns it
@@ -17693,7 +17694,7 @@ async def list_vaults(
             'department_count': _access_counts.get(vault.id, (None, None))[1],
             'created_at': vault.created_at,
             'updated_at': vault.updated_at,
-            'last_accessed': vault.last_accessed,
+            'last_accessed': vault_access.last_access(vault.id, vault.last_accessed),
             'is_active': vault.is_active,
             'type': vault.type,
             # Zero-knowledge: the browser-sealed name/description, so the client can decrypt them
@@ -17808,7 +17809,7 @@ async def get_vault(
             'file_count': None if _id_scoped else vault.file_count,
             'created_at': vault.created_at,
             'updated_at': vault.updated_at,
-            'last_accessed': vault.last_accessed,
+            'last_accessed': vault_access.last_access(vault.id, vault.last_accessed),
             'is_active': vault.is_active,
             'type': vault.type,
             'my_permission': _effective_vault_permission(vault, base_perms, current_user),
