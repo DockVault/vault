@@ -1,11 +1,11 @@
 """The rollback marker of the records of compliance access, offline (app/core/compliance_marker.py).
 
 A release before 0.34.0 knows no cases and deletes every audit row older than a positive AUDIT_LOG_RETENTION_DAYS. So
-while a case is open, a case's records must stay, or a row of the compliance category is younger than
-COMPLIANCE_RECORD_MIN_DAYS, a row in data_requirements stops such a release from starting (0.33.1 and later), and
-dockvault.py update refuses to go back unless forced. Every audit row of the compliance category writes the marker
-in its own transaction; sync() removes it once nothing needs it, at the start and at each pass of the pruner's
-compliance_cases job. test_compliance_marker_live.py checks on Postgres that sync() never removes it while a
+while a case is open, a case's records must stay, or the record of a step of compliance access taken is younger
+than COMPLIANCE_RECORD_MIN_DAYS, a row in data_requirements stops such a release from starting (0.33.1 and later),
+and dockvault.py update refuses to go back unless forced. Every audit row of such a step writes the marker in its own
+transaction; a refusal, which any account can cause, and a vault owner's own steps on Access to my vaults do not.
+sync() removes it once nothing needs it, at the start and at each pass of the pruner's compliance_cases job. test_compliance_marker_live.py checks on Postgres that sync() never removes it while a
 transaction that wrote such a row is still open.
 """
 import importlib.util
@@ -73,8 +73,8 @@ def _case(db, *, closed_days=None, kept_until_days=None, counts_kept=True):
     db.commit()
 
 
-def _row(db, days, action="auditor_granted"):
-    db.add(AuditLog(id=uuid.uuid4(), action=action, status="success", timestamp=NOW - timedelta(days=days)))
+def _row(db, days, action="auditor_granted", status="success"):
+    db.add(AuditLog(id=uuid.uuid4(), action=action, status=status, timestamp=NOW - timedelta(days=days)))
     db.commit()
 
 
@@ -119,9 +119,9 @@ def test_the_marker_is_there_while_a_case_is_open_or_its_records_or_a_compliance
     assert marker.sync(db, now=NOW) is True
     ((key, needs, reason, undo),) = _rows(db)
     assert (key, needs) == ("compliance-records", "0.34.0")
-    assert "deletes every audit row older than AUDIT_LOG_RETENTION_DAYS" in reason
-    assert undo.startswith("Close every compliance case") and undo.endswith(
-        "then start DockVault 0.34.0 or later once so it removes this marker.")
+    assert "while AUDIT_LOG_RETENTION_DAYS is positive it deletes every audit row older than that" in reason
+    assert undo.startswith("Wait until no compliance case is open") and undo.endswith(
+        "Then start DockVault 0.34.0 or later once so it removes this marker.")
     db.commit()
     assert marker.sync(db, now=NOW) is True and len(_rows(db)) == 1, "written once, then kept"
 
@@ -138,6 +138,89 @@ def test_no_marker_when_nothing_must_be_kept(db, state):
     if "row" in state:
         _row(db, state["row"], action=state.get("action", "auditor_granted"))
     assert marker.sync(db, now=NOW) is False and _rows(db) == []
+
+
+# A refused step, which any signed-in account can cause, and a vault owner's own steps on Access to my vaults.
+NOT_COUNTED = [
+    ("case_access_refused", "failure"),     # a read of a case that does not exist
+    ("hold_placed", "failure"),             # a hold its account may not place
+    ("auditor_grant_refused", "failure"),
+    ("audit_name_revealed", "failure"),
+    ("case_requested", "error"),
+    ("owner_access_unlocked", "success"),   # an owner shows their own vault's names on their page
+    ("owner_access_unlocked", "failure"),   # with a wrong vault password
+    ("owner_notice_seen", "success"),       # an owner reads their notices
+]
+
+
+@pytest.mark.parametrize("action, status", NOT_COUNTED)
+def test_a_refused_step_or_a_vault_owners_own_writes_and_keeps_no_marker(db, action, status):
+    """Neither may stop every rollback for COMPLIANCE_RECORD_MIN_DAYS on a deployment that never used compliance
+    access. The row is written all the same, and the pruner keeps it as long as any row of the category."""
+    from app.core import compliance_retention as cr
+    row = AuditLogger(db).build_row(action=action, status=status, username="someone")
+    db.add(row)
+    db.commit()
+    assert db.get(AuditLog, row.id) is not None and _rows(db) == [], "its transaction wrote no marker"
+    _row(db, 1, action=action, status=status)
+    assert db.query(AuditLog).filter(cr.compliance_rows_kept(AuditLog, NOW)).count() == 2, "kept all the same"
+    assert marker.kept_now(db, NOW) is False and marker.sync(db, now=NOW) is False and _rows(db) == []
+
+
+def test_an_ordinary_accounts_refused_case_read_and_hold_record_their_refusals_and_no_marker(db):
+    """Through the code that records them: a signed-in account with no right asks for a case that does not exist and
+    tries to place a legal hold."""
+    from app.core import case_access, legal_holds
+    from app.core.models import RoleEnum, User
+    user = User(id=uuid.uuid4(), username="plain", email="plain@example.com", password_hash="x", role=RoleEnum.USER,
+                is_active=True)
+    db.add(user)
+    db.commit()
+    case_access.record_refused(db, uuid.uuid4(), user, case_access.Refused(case_access.NO_CASE))
+    legal_holds.record_refusal(db, "hold_placed", None, actor=user, reason=legal_holds.NOT_ALLOWED)
+    rows = db.query(AuditLog.action, AuditLog.status).filter(AuditLog.user_id == user.id).all()
+    assert sorted(rows) == [("case_access_refused", "failure"), ("hold_placed", "failure")]
+    assert _rows(db) == [] and marker.sync(db, now=NOW) is False
+
+
+def test_every_step_of_the_category_taken_counts_but_a_vault_owners_own(db):
+    """counts() (the row's own transaction) and counted_rows() (sync) take the same rows: every action of the
+    compliance category taken (status success) but OWN_STEPS; no refusal, no row of another category."""
+    from app.core import audit_catalog
+    actions = list(audit_catalog.stored_names(["compliance"]))
+    assert marker.OWN_STEPS == {"owner_access_unlocked", "owner_notice_seen"} and marker.OWN_STEPS < set(actions)
+    statuses = ("success", "failure", "error")
+    for action in actions:
+        assert marker.counts(action, "success") is (action not in marker.OWN_STEPS), action
+        assert not marker.counts(action, "failure") and not marker.counts(action, "error"), action
+    assert not marker.counts("file_uploaded", "success") and not marker.counts(None, "success")
+    for action in actions + ["file_uploaded"]:
+        for status in statuses:
+            db.add(AuditLog(id=uuid.uuid4(), action=action, status=status, timestamp=NOW - timedelta(days=1)))
+    db.add(AuditLog(id=uuid.uuid4(), action="auditor_granted", status="success",
+                    timestamp=NOW - timedelta(days=FLOOR + 1)))
+    db.commit()
+    found = set(db.query(AuditLog.action, AuditLog.status).filter(marker.counted_rows(AuditLog, NOW)).all())
+    assert found == {(a, st) for a in actions + ["file_uploaded"] for st in statuses if marker.counts(a, st)}
+    assert len(found) == len(actions) - len(marker.OWN_STEPS)
+
+
+def test_the_undo_holds_with_no_case_and_names_only_what_the_host_tool_can_do():
+    """The marker stands without any case (an auditor right's steps, a name revealed): the undo asks to wait, and
+    closes a case only where one is open. From the host a case can only be turned down while it waits for approval:
+    dockvault.py cases neither closes one nor releases a hold."""
+    from app.core import case_rules, host_compliance
+    undo = marker.UNDO.format(version="0.34.0")
+    assert undo.startswith("Wait until no compliance case is open and the records of compliance access are older "
+                           "than COMPLIANCE_RECORD_MIN_DAYS")
+    assert "dockvault.py cases can only turn down one not yet approved" in undo
+    assert not any(a.startswith(("close", "release")) for a in host_compliance.ACTIONS)
+    assert "reject" in host_compliance.STEP_ACTIONS
+    assert [old for (old, step) in case_rules.TRANSITIONS if step == case_rules.REJECT] == [case_rules.PENDING]
+    tool = (ROOT / "dockvault.py").read_text(encoding="utf-8")
+    actions = tool.split("\nCASE_ACTIONS = (", 1)[1].split("\n)\n", 1)[0]
+    assert '("reject", "Turn a case down")' in actions
+    assert '("close' not in actions and '("release' not in actions
 
 
 def test_the_marker_goes_once_its_records_may_go(db):
@@ -207,7 +290,7 @@ def test_dockvault_refuses_to_go_back_over_the_records_unless_forced(db, monkeyp
     with pytest.raises(SystemExit):
         deployment.update("v0.33.6")
     out = capsys.readouterr().out
-    assert "Compliance cases are open" in out and "Close every compliance case" in out
+    assert "Compliance cases are open" in out and "Wait until no compliance case is open" in out
     assert deployment.image() == deployment.dv.LOCAL_IMAGE, "it did not go back"
     deployment.update("v0.33.6", force_downgrade=True)
     assert deployment.image().endswith(":v0.33.6")

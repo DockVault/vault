@@ -98,9 +98,9 @@ SUMMARY = {
         "(AUDIT_ARCHIVE_START_AFTER_DAYS, 0 to 90), and again 14 days after it starts once more following more than "
         "12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or stopped, so going "
         "back to an earlier release within that time needs nothing. The Activity page and its exports read archived "
-        "days; a tool that reads audit_logs directly sees only the newer days. python dockvault.py audit unarchive puts days back as rows once they fit. The check "
-        "counts the rows archiving will move when it starts, with the default windows: those of the days before the "
-        "day 76 days ago."),
+        "days; a tool that reads audit_logs directly sees only the newer days. python dockvault.py audit unarchive "
+        "puts days back as rows once they fit. The check counts the rows archiving will move when it starts, with "
+        "the default windows: those of the days before the day 76 days ago."),
     "archived-audit-history-hidden": (
         "An earlier release cannot read the audit log's compressed daily blocks. While any block exists, 0.33.1 and "
         "later refuse to start on this database, and 0.33.0 and earlier start without seeing those days. Before "
@@ -140,17 +140,17 @@ SUMMARY = {
         "first."),
     # The compliance records' own condition (app/core/compliance_marker.py, CONDITION), word for word.
     "compliance-records-block-rollback": (
-        "From 0.34.0, while a compliance case is open, a case's records must still be kept, or a row of the audit "
-        "log's compliance category (an auditor right given or taken, a case's steps, a name revealed, a refused "
-        "request) is younger than COMPLIANCE_RECORD_MIN_DAYS (2190 by default, at least 365), an earlier release "
-        "would not keep them: it knows no cases, and with a positive AUDIT_LOG_RETENTION_DAYS, which 0.34.0 leaves in "
-        ".env as a waiting change, it deletes every older audit row the first time an administrator opens the "
-        "dashboard's activity feed. So 0.33.1 and later refuse to start on this database, and python dockvault.py "
-        "update refuses to go back unless --force-downgrade is given. Close the cases and wait until their records "
-        "and the compliance rows are older than COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the "
-        "record that stops the earlier release. An earlier release started sooner with "
-        "ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env sets no AUDIT_LOG_RETENTION_DAYS. The "
-        "check finds that record."),
+        "From 0.34.0, while a compliance case is open, a case's records must still be kept, or the record of a step of "
+        "compliance access taken (an auditor right given or taken, a case's steps, a name revealed) is younger than "
+        "COMPLIANCE_RECORD_MIN_DAYS (2190 by default, at least 365), an earlier release would not keep them: it knows "
+        "no cases, and with a positive AUDIT_LOG_RETENTION_DAYS, which 0.34.0 leaves in .env as a waiting change, it "
+        "deletes every older audit row the first time an administrator opens the dashboard's activity feed. So 0.33.1 "
+        "and later refuse to start on this database, and python dockvault.py update refuses to go back unless "
+        "--force-downgrade is given. A refused request, which any account can make, and a vault owner's own steps on "
+        "Access to my vaults do not count. Wait until no case is open and those records are older than "
+        "COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the record that stops the earlier release. "
+        "An earlier release started sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env "
+        "sets no AUDIT_LOG_RETENTION_DAYS. The check finds that record."),
     "older-images-refuse-newer-data": (
         "From 0.34.0 the release records in the table data_requirements each state of the data that an earlier "
         "release cannot read or would destroy, for as long as it lasts: archived audit days, legal holds and what "

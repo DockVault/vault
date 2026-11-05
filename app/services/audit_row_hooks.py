@@ -12,8 +12,9 @@ this order, once each:
     seal_nonce(row)             the value per row under which the log's integrity chain commits to the
                                 row's personal values (row.seal_nonce);
     kept_records(row, db)       what the row's being written keeps in the database: a row of the compliance
-                                category keeps the data marker that stops an earlier release from starting,
-                                written in db, the session build_row was given, which writes the row.
+                                category that records a step taken keeps the data marker that stops an
+                                earlier release from starting, written in db, the session build_row was
+                                given, which writes the row.
 
 The row's id is set before the first hook runs, so a hook may bind something to it; SQLAlchemy would
 otherwise give the row its id only when it is flushed. A hook changes the row in place and returns
@@ -63,8 +64,10 @@ _compliance_actions = None
 
 def kept_records(row, db=None) -> None:
     """A row of the compliance category (app/core/audit_catalog.py) is kept COMPLIANCE_RECORD_MIN_DAYS, which an
-    earlier release would not do: the marker that stops one from starting is written in ``db``'s transaction, the
-    one that writes the row (app/core/compliance_marker.py, ensure). Any other row: nothing. Never raises."""
+    earlier release would not do. When the row records a step of compliance access taken (compliance_marker.counts:
+    not a refusal, not a vault owner's own step), the marker that stops one from starting is written in ``db``'s
+    transaction, the one that writes the row (app/core/compliance_marker.py, ensure). Any other row: nothing. Never
+    raises."""
     global _compliance_actions
     try:
         if _compliance_actions is None:
@@ -73,6 +76,8 @@ def kept_records(row, db=None) -> None:
         if row.action not in _compliance_actions or db is None:
             return
         from app.core import compliance_marker
+        if not compliance_marker.counts(row.action, row.status):
+            return
         compliance_marker.ensure(db)
     except Exception:  # noqa: BLE001 -- a hook never fails the change its row records; the pruner writes it
         return

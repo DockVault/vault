@@ -4,7 +4,8 @@ COMPLIANCE_RECORD_MIN_DAYS: a transaction writes a new row of the compliance cat
 sync() in another transaction, which cannot see that row yet, finds the older row past the floor. sync() leaves the
 marker as it is rather than remove it, so the new row, once committed, is still covered; a later sync() keeps the
 marker for it, and removes it once that row is past the floor too. Writing the marker flushes nothing the caller has
-not written yet. A change whose marker cannot be written still commits, and the next sync() writes the marker.
+not written yet. A change whose marker cannot be written still commits, and the next sync() writes the marker. An
+ordinary account's refused case read and refused hold, and a vault owner's own step, write their rows and no marker.
 test_compliance_marker.py covers the rest offline.
 """
 import pytest
@@ -84,6 +85,46 @@ print(json.dumps(out))
 '''
 
 
+NOT_COUNTED = PREAMBLE + r'''
+from app.core import case_access, legal_holds
+from app.core import compliance_marker as marker
+from app.core.models import AuditLog, RoleEnum, User
+from app.services.audit_logger import AuditLogger
+
+def marked():
+    with engine.connect() as c:
+        return [r[0] for r in c.execute(text("SELECT key FROM data_requirements ORDER BY key"))]
+
+out = {"before": marked()}
+with SessionLocal() as s:
+    user = User(id=uuid.uuid4(), username="cond-plain", email="plain@example.com", password_hash="x",
+                role=RoleEnum.USER, is_active=True)
+    s.add(user)
+    s.commit()
+    uid = user.id
+    # A signed-in account with no right: a read of a case that does not exist, a legal hold it may not place.
+    case_access.record_refused(s, uuid.uuid4(), user, case_access.Refused(case_access.NO_CASE))
+    legal_holds.record_refusal(s, "hold_placed", None, actor=user, reason=legal_holds.NOT_ALLOWED)
+    # The owner of a vault with a password shows its names on Access to my vaults.
+    s.add(AuditLogger(s).build_row(action="owner_access_unlocked", status="success", user=user, resource_type="vault",
+                                   resource_id=str(uuid.uuid4()), details={}))
+    s.commit()
+with SessionLocal() as s:
+    out["rows"] = sorted([a, st] for a, st in s.query(AuditLog.action, AuditLog.status)
+                         .filter(AuditLog.user_id == uid).all())
+out["after_them"] = marked()
+with SessionLocal() as s:
+    out["sync"] = marker.sync(s)
+    s.commit()
+out["after_the_sync"] = marked()
+with SessionLocal() as s:
+    s.add(AuditLogger(s).build_row(action="auditor_granted", status="success", username="cond-admin"))
+    s.commit()
+out["after_a_step_taken"] = marked()
+print(json.dumps(out))
+'''
+
+
 @pytest.fixture
 def throwaway():
     yield from throwaway_database()
@@ -100,3 +141,12 @@ def test_sync_never_removes_the_marker_while_a_transaction_that_wrote_a_complian
     assert out["sync_past_the_floor"] is False and out["past_the_floor"] == []
     assert out["second_committed"] is True and out["after_the_failed_write"] == []
     assert out["sync_writes_it"] is True and out["after_the_sync"] == ["compliance-records"]
+
+
+def test_a_refused_request_or_an_owners_own_step_writes_no_marker(throwaway):
+    out = run_in(throwaway, NOT_COUNTED)
+    assert out["before"] == []
+    assert out["rows"] == [["case_access_refused", "failure"], ["hold_placed", "failure"],
+                           ["owner_access_unlocked", "success"]], "the rows are written all the same"
+    assert out["after_them"] == [] and out["sync"] is False and out["after_the_sync"] == []
+    assert out["after_a_step_taken"] == ["compliance-records"]

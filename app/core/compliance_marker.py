@@ -8,17 +8,25 @@ revealed, a refused request) for COMPLIANCE_RECORD_MIN_DAYS after it was written
 It turns a positive AUDIT_LOG_RETENTION_DAYS into a waiting change (app/core/audit_retention.py), so the line stays
 in .env, and an earlier release would apply it at once.
 
-So while a case is open, a case's records must stay, or a row of the compliance category is younger than
-COMPLIANCE_RECORD_MIN_DAYS (kept_now), this module keeps a row in ``data_requirements``, as the legal holds do
-(app/core/legal_hold_marker.py): every release from the one that reads that table refuses to start when a row names
-a version above its own (the operator's undo, or the escape variable, lets it start), and ``dockvault.py update``
-refuses the rollback unless forced, naming the row (app/core/host_operator.py, downgrade-blockers).
+So while a case is open, a case's records must stay, or a step of compliance access recorded in the compliance
+category is younger than COMPLIANCE_RECORD_MIN_DAYS (kept_now), this module keeps a row in ``data_requirements``, as
+the legal holds do (app/core/legal_hold_marker.py): every release from the one that reads that table refuses to
+start when a row names a version above its own (the operator's undo, or the escape variable, lets it start), and
+``dockvault.py update`` refuses the rollback unless forced, naming the row (app/core/host_operator.py,
+downgrade-blockers).
 
-The row is written in the transaction of the change that makes it needed: every audit row of the compliance
-category is built with it (ensure(), from app/services/audit_row_hooks.py), and a case opens with such a row. Only
-sync() removes it, once nothing needs it, at each start and by every pass of the pruner's compliance_cases job, and
-only while it holds a lock that every ensure() takes shared for the rest of its transaction: a row of the category
-not yet committed keeps the marker. When the lock is taken, sync() leaves the marker as it is until a later pass.
+Not every row of the category is such a step (counts): a refused one is not, since any signed-in account can cause
+one (a read of a case that does not exist, a hold it may not place), and neither are a vault owner's own steps on
+Access to my vaults (OWN_STEPS). Were they counted, one request from anyone would stop every rollback for
+COMPLIANCE_RECORD_MIN_DAYS on a deployment that never used compliance access. This release keeps those rows all the
+same; an earlier release started anyway may delete them. A refusal under a case stays with the case's records,
+which keep the marker while they must stay.
+
+The row is written in the transaction of the change that makes it needed: every audit row that counts is built with
+it (ensure(), from app/services/audit_row_hooks.py), and a case opens with such a row. Only sync() removes it, once
+nothing needs it, at each start and by every pass of the pruner's compliance_cases job, and only while it holds a
+lock that every ensure() takes shared for the rest of its transaction: a row that counts not yet committed keeps the
+marker. When the lock is taken, sync() leaves the marker as it is until a later pass.
 
 A release older than the reader of that table (before 0.33.1) is not protected by the row. CONDITION is the upgrade
 matrix's condition for the edge back to an earlier release, written into the matrix in the release commit.
@@ -35,13 +43,23 @@ TABLE = "data_requirements"
 # The first release with compliance access: the oldest that can be rolled back to while its records must be kept.
 INTRODUCED = "0.34.0"
 REASON = ("Compliance cases are open, or the records of compliance access must still be kept (a case's audit rows, "
-          "and the audit log's compliance rows for COMPLIANCE_RECORD_MIN_DAYS). A release before {introduced} knows "
-          "no cases, and deletes every audit row older than AUDIT_LOG_RETENTION_DAYS, whatever it records.")
+          "and those of every step of compliance access taken, for COMPLIANCE_RECORD_MIN_DAYS). A release before "
+          "{introduced} knows no cases, and while AUDIT_LOG_RETENTION_DAYS is positive it deletes every audit row "
+          "older than that, whatever it records.")
 # How to undo it, as an older release prints it after "To go back to this version, first undo it with the newer
-# version:", so it names the release that removes the marker ({version}: the one the marker asks for).
-UNDO = ("Close every compliance case (on the Compliance page, or with dockvault.py cases) and wait until their "
-        "records and the audit log's compliance rows are older than COMPLIANCE_RECORD_MIN_DAYS, then start "
-        "DockVault {version} or later once so it removes this marker.")
+# version:", so it names the release that removes the marker ({version}: the one the marker asks for). True whether
+# or not a case was ever opened: the steps of an auditor right, or a name revealed, write it without one.
+UNDO = ("Wait until no compliance case is open and the records of compliance access are older than "
+        "COMPLIANCE_RECORD_MIN_DAYS (a case's from its close): a case is closed, or its legal hold released, on the "
+        "Compliance page, and dockvault.py cases can only turn down one not yet approved. Then start DockVault "
+        "{version} or later once so it removes this marker.")
+
+# The rows of the compliance category that do not keep the marker though they are kept as long (see the module's
+# docstring): a step not taken (any status but TAKEN), and a vault owner's own steps on Access to my vaults, showing
+# their own vault's names there and reading their notices (a case or a reveal wrote those notices, with rows of
+# their own that count).
+TAKEN = "success"
+OWN_STEPS = frozenset({"owner_access_unlocked", "owner_notice_seen"})
 
 # The lock sync() takes alone to remove the marker, and every ensure() shared (distinct from the other lock classes).
 LOCK = (0x6372, 1)
@@ -50,17 +68,18 @@ LOCK = (0x6372, 1)
 # reads the marker itself: what it stands for depends on COMPLIANCE_RECORD_MIN_DAYS, which only .env sets.
 CONDITION = {
     "id": "compliance-records-block-rollback",
-    "summary": ("From 0.34.0, while a compliance case is open, a case's records must still be kept, or a row of the "
-                "audit log's compliance category (an auditor right given or taken, a case's steps, a name revealed, "
-                "a refused request) is younger than COMPLIANCE_RECORD_MIN_DAYS (2190 by default, at least 365), an "
-                "earlier release would not keep them: it knows no cases, and with a positive "
-                "AUDIT_LOG_RETENTION_DAYS, which 0.34.0 leaves in .env as a waiting change, it deletes every older "
-                "audit row the first time an administrator opens the dashboard's activity feed. So 0.33.1 and later "
-                "refuse to start on this database, and python dockvault.py update refuses to go back unless "
-                "--force-downgrade is given. Close the cases and wait until their records and the compliance rows are "
-                "older than COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the record that stops "
-                "the earlier release. An earlier release started sooner with ALLOW_START_ON_NEWER_DATA=true keeps "
-                "the audit rows only while .env sets no AUDIT_LOG_RETENTION_DAYS. The check finds that record."),
+    "summary": ("From 0.34.0, while a compliance case is open, a case's records must still be kept, or the record of "
+                "a step of compliance access taken (an auditor right given or taken, a case's steps, a name "
+                "revealed) is younger than COMPLIANCE_RECORD_MIN_DAYS (2190 by default, at least 365), an earlier "
+                "release would not keep them: it knows no cases, and with a positive AUDIT_LOG_RETENTION_DAYS, which "
+                "0.34.0 leaves in .env as a waiting change, it deletes every older audit row the first time an "
+                "administrator opens the dashboard's activity feed. So 0.33.1 and later refuse to start on this "
+                "database, and python dockvault.py update refuses to go back unless --force-downgrade is given. A "
+                "refused request, which any account can make, and a vault owner's own steps on Access to my vaults "
+                "do not count. Wait until no case is open and those records are older than "
+                "COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the record that stops the earlier "
+                "release. An earlier release started sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows "
+                "only while .env sets no AUDIT_LOG_RETENTION_DAYS. The check finds that record."),
     "detect": f"SELECT key, requires_at_least, since FROM {TABLE} WHERE key = '{KEY}'",
     "blocks_rollback": True,
 }
@@ -75,10 +94,32 @@ def _postgres(db) -> bool:
     return bind is not None and bind.dialect.name == "postgresql"
 
 
+_actions = None
+
+
+def counts(action: Optional[str], status: Optional[str]) -> bool:
+    """Whether an audit row of ``action`` with ``status`` keeps the marker while it is younger than
+    COMPLIANCE_RECORD_MIN_DAYS: a step of the compliance category (app/core/audit_catalog.py) that was taken
+    (TAKEN), other than a vault owner's own (OWN_STEPS)."""
+    global _actions
+    if _actions is None:
+        from app.core import audit_catalog
+        _actions = frozenset(audit_catalog.stored_names(["compliance"]))
+    return action in _actions and status == TAKEN and action not in OWN_STEPS
+
+
+def counted_rows(model, now: datetime):
+    """The rows of ``model`` (audit_logs) that keep the marker now: those counts() takes, younger than
+    COMPLIANCE_RECORD_MIN_DAYS (compliance_retention.compliance_rows_kept, which keeps every row of the category)."""
+    from sqlalchemy import and_
+    from app.core import compliance_retention as cr
+    return and_(cr.compliance_rows_kept(model, now), model.status == TAKEN, model.action.notin_(sorted(OWN_STEPS)))
+
+
 def kept_now(db, now: Optional[datetime] = None) -> bool:
     """Whether the records of compliance access must be kept now: a case is open, a case's audit rows are kept
-    (compliance_retention.case_rows_released_since says when they stop being kept), or a row of the compliance
-    category is younger than COMPLIANCE_RECORD_MIN_DAYS (compliance_retention.compliance_rows_kept)."""
+    (compliance_retention.case_rows_released_since says when they stop being kept), or a row that counts is younger
+    than COMPLIANCE_RECORD_MIN_DAYS (counted_rows)."""
     from app.core import compliance_retention as cr
     from app.core.models import AuditLog, ComplianceCase
     now = now or _utcnow()
@@ -87,7 +128,7 @@ def kept_now(db, now: Optional[datetime] = None) -> bool:
     for case in db.query(ComplianceCase).filter(ComplianceCase.closed_at.isnot(None)).all():
         if cr.case_rows_released_since(db, case, now) is None:
             return True
-    return db.query(AuditLog.id).filter(cr.compliance_rows_kept(AuditLog, now)).first() is not None
+    return db.query(AuditLog.id).filter(counted_rows(AuditLog, now)).first() is not None
 
 
 def required_version() -> str:
@@ -110,7 +151,7 @@ _INSERT = (f"INSERT INTO {TABLE} (key, requires_at_least, reason, undo, since) "
 
 
 def ensure(db, *, now: Optional[datetime] = None) -> None:
-    """In the caller's transaction, which writes a row of the compliance category: the marker, unless it is there,
+    """In the caller's transaction, which writes a row that counts: the marker, unless it is there,
     under the lock taken shared until the transaction ends, so sync() cannot remove it meanwhile. Never raises: on
     Postgres it runs in a savepoint of the connection, so a failure leaves the caller's transaction as it was; it is
     said, and the next sync() writes the marker. The session's savepoint is not used: it would flush what the caller
