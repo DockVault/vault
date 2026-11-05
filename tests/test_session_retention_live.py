@@ -26,8 +26,10 @@ def _run(container, argv):
     try:
         r = subprocess.run(["docker", "exec", "-i", container, *argv],
                            capture_output=True, text=True, timeout=60)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, container)
     assert r.returncode == 0, (r.stderr or r.stdout)[-600:]
     return r.stdout.strip()

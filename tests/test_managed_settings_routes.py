@@ -415,6 +415,34 @@ def test_a_cancel_whose_audit_row_cannot_be_written_leaves_the_change_waiting(en
     assert len(quiet["announced"]) == 1
 
 
+def test_a_busy_chain_answers_409_and_writes_no_setting_and_no_audit_row(env, db, monkeypatch, quiet):
+    """Another writer holds the audit log's chain: a change and a cancel answer 409 and are rolled back, with no
+    setting, no change and no audit row written, and the waiting change still waiting."""
+    from app.core import audit_integrity
+    alice = _admin(db)
+    change_id = _put(db, alice, "keep_days", 10)["change"]["id"]
+    rows = (db.query(ManagedSetting).count(), db.query(ManagedSettingChange).count(), db.query(AuditLog).count())
+
+    @contextmanager
+    def busy(_bind):
+        raise audit_integrity.ChainBusy()
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(routes.chain_seals, "change_transaction", busy)
+    for value in (400, 9):
+        with refused(409) as caught:
+            _put(db, alice, "keep_days", value)
+        assert caught.value.detail == "Busy, retry: the audit log is being sealed."
+    with refused(409) as caught:
+        routes.cancel_managed_setting_change(uuid.UUID(change_id), current_user=alice, db=db)
+    assert caught.value.detail == "Busy, retry: the audit log is being sealed."
+    db.expire_all()
+    assert (db.query(ManagedSetting).count(), db.query(ManagedSettingChange).count(),
+            db.query(AuditLog).count()) == rows
+    assert db.get(ManagedSettingChange, uuid.UUID(change_id)).status == sc.PENDING
+    assert reg.resolve("keep_days") == 30 and len(quiet["announced"]) == 1
+
+
 def _waiting(db, user):
     return routes.get_managed_settings(current_user=user, db=db)["pending"]
 

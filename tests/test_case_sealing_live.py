@@ -45,8 +45,10 @@ def test_a_sealed_case_opens_back_and_a_dump_of_the_database_holds_none_of_its_t
             dump = subprocess.run(["docker", "exec", DB, "pg_dump", "-U", "sftp_user", "-d", "sftp_db",
                                    "--data-only"], capture_output=True, text=True, encoding="utf-8",
                                   errors="replace", timeout=300)
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        except FileNotFoundError as exc:
             pytest.skip(f"docker unavailable: {exc}")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail(f"the command did not finish within {exc.timeout} s")
         skip_if_container_absent(dump, DB)
         assert dump.returncode == 0, dump.stderr[-400:]
         assert str(case_id) in dump.stdout          # the dump does hold the case's row

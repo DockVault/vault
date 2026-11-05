@@ -629,8 +629,13 @@ def test_a_row_of_the_name_dated_before_the_first_hour_during_a_run_holds_it_unt
     assert failures(env.verify()) == []
 
 
-@pytest.mark.parametrize("who", ["account", "credential", "invitation"])
-def test_a_name_someone_took_meanwhile_waits(env, who):
+@pytest.mark.parametrize("who, says", [
+    ("account", "It waits: an account has this name: delete the account first."),
+    ("credential", "It waits: a temporary credential has this name: delete it first."),
+    ("invitation", "It waits: an invitation for this name is waiting: revoke it first."),
+])
+def test_a_name_someone_took_meanwhile_waits(env, who, says):
+    """The request says which holder of the name it waits for, in those words: an administrator acts on them."""
     rid = _put(env, T0 - timedelta(hours=30))
     env.run_until_sealed()
     asked = env.ask("eve")
@@ -647,7 +652,7 @@ def test_a_name_someone_took_meanwhile_waits(env, who):
         db.commit()
     env.passes(24 * 8)
     assert _rows(env, id=rid)[0].username == "eve" and env.erase_seals() == []
-    assert "has this name" in env.request_row(asked["id"]).waiting or "waiting" in env.request_row(asked["id"]).waiting
+    assert env.request_row(asked["id"]).waiting == says
 
 
 @pytest.mark.parametrize("action, bound", [("settings_updated", "AUDIT_PROTECTED_MIN_DAYS"),
