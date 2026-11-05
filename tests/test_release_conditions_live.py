@@ -9,7 +9,8 @@ expired, beside ones that ended 29 days ago and live ones; an archived day and a
 with an encryption key whose sign-in details were changed 1 to 13 days ago, the first change an email change (from
 an address, or of an account that had none) or another kind, beside accounts without a key (which the hold covers
 once they set one up, and which no query can count), a change 15 days ago and changes never applied, counted as
-the hold's own code counts them. test_release_conditions.py checks the queries offline.
+the hold's own code counts them; recording levels whose newest version records addresses shortened; the old name a
+hold kept; and the record an earlier release refuses to start on. test_release_conditions.py checks the queries offline.
 """
 import json
 
@@ -22,9 +23,15 @@ pytestmark = pytest.mark.integration
 
 SCRIPT = PREAMBLE + r'''
 from datetime import date
-from app.core.models import (AccountInvitation, AuditArchiveBlock, AuditLog, CredentialChange, EmailChangeCode,
-                             ManagedSetting, OtpCode, PasswordResetToken, RoleEnum, SecurityAlert, User, UserKeyPair)
+from app.core.models import (AccountInvitation, AuditArchiveBlock, AuditLog, AuditPrivacyPolicy, CredentialChange,
+                             EmailChangeCode, HeldNameHistory, ManagedSetting, OtpCode, PasswordResetToken, RoleEnum,
+                             SecurityAlert, User, UserKeyPair)
+from app.core import kept_tables
 QUERIES = json.loads(__QUERIES__)
+# The kept tables the legal holds' query reads, as the start builds them.
+with SessionLocal() as k:
+    kept_tables.install(k)
+    k.commit()
 
 def run_all():
     out = {}
@@ -77,6 +84,17 @@ db.add(AuditArchiveBlock(day=date(2026, 1, 3), part=0, first_hour=datetime(2026,
                          raw_bytes=1, aggregates={}, created_at=now))
 db.add(ManagedSetting(key="audit_hot_days", value=120, version=1, updated_at=now))
 db.add(ManagedSetting(key="logs_hold", value=None, version=2, updated_at=now))
+# Recording levels: an older version recorded no email addresses; the newest records addresses shortened.
+LEVELS = dict(names="none", signin_names="full", emails="full", ip="full", user_agent="full")
+db.add(AuditPrivacyPolicy(version=1, reason="initial", created_at=ago(3), **LEVELS))
+db.add(AuditPrivacyPolicy(version=2, reason="admin", created_at=ago(2), **dict(LEVELS, emails="none")))
+db.add(AuditPrivacyPolicy(version=3, reason="admin", created_at=ago(1), **dict(LEVELS, ip="shortened")))
+# The old name of a renamed file a hold kept.
+db.add(HeldNameHistory(object_id=uuid.uuid4(), vault_id=uuid.uuid4(), kind="file", enc_name="zk2:old",
+                       name_key_version=1, renamed_at=now))
+db.flush()
+db.execute(text("INSERT INTO data_requirements (key, requires_at_least, reason, undo, since) "
+                "VALUES ('recording-levels', '0.34.0', 'Recorded less.', 'Set them back.', :since)"), {"since": now})
 # Accounts and the changes of their sign-in details: (has a key, [(kind, status, days ago)]).
 ACCOUNTS = {
     "password-3-days": (True, [("password", "made", 3)]),                         # held, host only
@@ -175,3 +193,11 @@ def test_each_detect_query_finds_what_was_seeded_and_only_that(throwaway):
     # The account without a key changed 2 days ago is held as soon as it sets one up; the query does not count it,
     # and the condition's text says so. The one changed 15 days ago is not held.
     assert out["held_once_a_key_is_set_up"] == ["cond-no-key"]
+    # The newest levels record addresses shortened: one row, of that version alone.
+    q = "recording-levels-changed"
+    assert before[q] == [] and len(after[q]) == 1
+    q = "legal-holds-block-rollback"
+    assert before[q] == [] and len(after[q]) == 1
+    q = "older-images-refuse-newer-data"
+    assert before[q] == []
+    assert [(r["key"], r["requires_at_least"]) for r in after[q]] == [("recording-levels", "0.34.0")]

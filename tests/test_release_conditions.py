@@ -1,9 +1,13 @@
-"""The detect queries kept for the release commit's upgrade-matrix conditions (tests/_release_conditions.py),
-offline: each is one statement that only reads, names the tables it is listed with, which exist; the queries run
-on the database being upgraded read only what 0.33.2 has; the condition that blocks a rollback has a query; and
-the ids are ones the matrix accepts. tests/test_release_conditions_live.py runs each against a database.
+"""The upgrade-matrix conditions of 0.34.0 kept for the release commit (tests/_release_conditions.py), offline:
+each query is one statement that only reads, names the tables it is listed with, which exist; the queries run on
+the database being upgraded read only what 0.33.2 has; the conditions that block a rollback have a query; the ids
+are ones the matrix accepts; each text kept there says what the code does; and the matrix, once it declares 0.34.0,
+carries every condition on every edge into it, none of which leaves from below 0.33.6.
+tests/test_release_conditions_live.py runs each query against a database.
 """
+import copy
 import importlib.util
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -15,7 +19,7 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 import _release_conditions as rc  # noqa: E402
-from app.core.models import Base  # noqa: E402
+from app.core.models import Base, KeptBase  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -50,7 +54,7 @@ def test_each_query_finds_rows_only_where_its_condition_applies():
 
 
 def test_each_query_reads_the_tables_it_is_listed_with_and_they_exist():
-    tables = set(Base.metadata.tables)
+    tables = set(Base.metadata.tables) | set(KeptBase.metadata.tables)
     assert set(rc.TABLES) == set(rc.DETECT)
     for cid, sql in rc.DETECT.items():
         assert _named_tables(sql) - {"t"} == rc.TABLES[cid], cid
@@ -182,3 +186,190 @@ def test_the_condition_ids_are_ones_the_matrix_accepts_and_the_rollback_one_has_
                   for cid, sql in rc.DETECT.items()] + [{"id": cid, "summary": "s"} for cid in rc.WITHOUT_DETECT]
     for condition in conditions:
         assert set(condition) <= um._CONDITION_KEYS
+
+
+def test_every_condition_is_listed_once_and_each_set_is_drawn_from_them():
+    assert len(rc.CONDITIONS) == len(set(rc.CONDITIONS))
+    assert set(rc.CONDITIONS) == set(rc.DETECT) | set(rc.WITHOUT_DETECT)
+    assert set(rc.SUMMARY) <= set(rc.CONDITIONS)
+    assert rc.BLOCKS_ROLLBACK <= rc.ON_UPGRADED <= set(rc.DETECT)
+
+
+# --------------------------------------------------------------------------- the release commit's matrix
+
+def _key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def _matrix():
+    return json.loads((ROOT / "docs" / "upgrade-matrix.json").read_text(encoding="utf-8"))
+
+
+def test_the_matrix_carries_every_condition_on_every_edge_into_0_34_0_from_0_33_6_or_later():
+    """The check the release commit's matrix must pass. Until that commit declares 0.34.0 its VERSION is below it;
+    from that commit on, the matrix declares it and every edge into it is checked."""
+    matrix = _matrix()
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    if rc.INTO not in matrix["versions"]:
+        assert _key(version) < _key(rc.INTO), f"VERSION is {version}: the matrix must declare {rc.INTO}"
+        return
+    assert rc.edge_problems(matrix) == []
+
+
+def _condition(cid):
+    out = {"id": cid, "summary": rc.SUMMARY.get(cid, "What the release commit writes.")}
+    if cid in rc.DETECT:
+        out["detect"] = rc.DETECT[cid]
+    if cid in rc.BLOCKS_ROLLBACK:
+        out["blocks_rollback"] = True
+    return out
+
+
+def _with_the_release():
+    """The matrix as the release commit would make it from this file: 0.34.0 declared, its line listed, and one
+    edge into it, from 0.33.6, with every condition."""
+    data = copy.deepcopy(_matrix())
+    newest = max(data["versions"], key=_key)
+    assert newest == rc.SOURCE_FLOOR, "a later release of the line before needs its own edge into 0.34.0 here"
+    entry = copy.deepcopy(data["versions"][newest])
+    entry.update(released="2026-11-15", notes="The release.")
+    entry["support"] = {"eol": False, "secure": True}
+    entry.pop("vulnerabilities", None)
+    data["versions"][rc.INTO] = entry
+    data["lines"] = {"0.33": {"security_fixes_until": "2027-05-15"}, "0.34": {"security_fixes_until": None}}
+    data["edges"].append({"from": rc.SOURCE_FLOOR, "to": rc.INTO, "kind": "direct", "reversible": True,
+                          "requires_backup": True, "conditions": [_condition(cid) for cid in rc.CONDITIONS]})
+    return data
+
+
+def _edge(data, source):
+    (edge,) = [e for e in data["edges"] if e["from"] == source and e["to"] == rc.INTO]
+    return edge
+
+
+def test_a_release_entry_made_from_this_file_passes_the_matrix_check_and_this_one():
+    data = _with_the_release()
+    _matrix_script().validate_matrix(data, released_ceiling=rc.INTO)
+    assert rc.edge_problems(data) == []
+
+
+def _drop(cid):
+    def change(data):
+        edge = _edge(data, rc.SOURCE_FLOOR)
+        edge["conditions"] = [c for c in edge["conditions"] if c["id"] != cid]
+    return change
+
+
+def _alter(cid, key, value):
+    def change(data):
+        (condition,) = [c for c in _edge(data, rc.SOURCE_FLOOR)["conditions"] if c["id"] == cid]
+        if value is None:
+            condition.pop(key, None)
+        else:
+            condition[key] = value
+    return change
+
+
+def _edge_from(source, kind="direct", conditions=True):
+    def change(data):
+        edge = {"from": source, "to": rc.INTO, "kind": kind, "reversible": False, "requires_backup": True}
+        if kind == "blocked":
+            edge["reason"] = "Upgrade to 0.33.6 first."
+        if conditions:
+            edge["conditions"] = [_condition(cid) for cid in rc.CONDITIONS]
+        data["edges"].append(edge)
+    return change
+
+
+@pytest.mark.parametrize("change, found", [
+    (_drop("legal-holds-block-rollback"), "the edge 0.33.6 -> 0.34.0 lacks the condition legal-holds-block-rollback"),
+    (_drop("container-output-rotates"), "the edge 0.33.6 -> 0.34.0 lacks the condition container-output-rotates"),
+    (_alter("recording-levels-changed", "blocks_rollback", None),
+     "the edge 0.33.6 -> 0.34.0 leaves blocks_rollback off recording-levels-changed, which blocks a rollback"),
+    (_alter("panel-retention-not-read", "blocks_rollback", True),
+     "the edge 0.33.6 -> 0.34.0 marks panel-retention-not-read with blocks_rollback, which blocks none"),
+    (_alter("audit-retention-runs-on-a-timer", "detect", "SELECT 1"),
+     "the edge 0.33.6 -> 0.34.0 gives audit-retention-runs-on-a-timer another detect query than the one kept here"),
+    (_alter("older-images-refuse-newer-data", "summary", "Another text."),
+     "the edge 0.33.6 -> 0.34.0 gives older-images-refuse-newer-data another text than the one kept here"),
+    (_edge_from("0.33.2"), "the edge 0.33.2 -> 0.34.0 skips 0.33.6: an edge into 0.34.0 leaves from 0.33.6 or later"),
+    (_edge_from("0.33.5", conditions=False),
+     "the edge 0.33.5 -> 0.34.0 lacks the condition audit-history-compressed-after-90-days"),
+])
+def test_the_check_finds_an_edge_into_0_34_0_that_lacks_a_condition_or_skips_0_33_6(change, found):
+    data = _with_the_release()
+    change(data)
+    assert found in rc.edge_problems(data)
+
+
+def test_the_matrix_check_takes_an_edge_that_skips_0_33_6_so_only_this_one_refuses_it():
+    """An edge into the first release of the next line is a step from any release of the line before it
+    (.github/scripts/upgrade_matrix.py), so the matrix's own check takes 0.33.2 -> 0.34.0 with no condition."""
+    data = _with_the_release()
+    _edge_from("0.33.2", conditions=False)(data)
+    _matrix_script().validate_matrix(data, released_ceiling=rc.INTO)
+    assert "the edge 0.33.2 -> 0.34.0 skips 0.33.6: an edge into 0.34.0 leaves from 0.33.6 or later" in (
+        rc.edge_problems(data))
+
+
+def test_an_edge_marked_blocked_from_below_0_33_6_is_left_alone():
+    data = _with_the_release()
+    _edge_from("0.33.2", kind="blocked", conditions=False)(data)
+    assert rc.edge_problems(data) == []
+
+
+def test_a_declared_0_34_0_with_no_edge_that_can_be_taken_into_it_is_found():
+    data = _with_the_release()
+    data["edges"] = [e for e in data["edges"] if e["to"] != rc.INTO]
+    assert rc.edge_problems(data) == ["no edge that can be taken leads into 0.34.0"]
+
+
+# --------------------------------------------------------------------------- the texts and queries kept here
+
+def test_the_rollback_conditions_of_the_data_markers_are_the_markers_own():
+    """The queries are the ones each marker keeps its row by, so the matrix finds what stops the older image."""
+    from app.core import legal_hold_marker, recording_marker
+    assert rc.DETECT["recording-levels-changed"] == recording_marker.STRICTER_SQL
+    hold = legal_hold_marker.CONDITION
+    assert rc.DETECT[hold["id"]] == hold["detect"] == legal_hold_marker.DETECT_SQL
+    assert rc.SUMMARY[hold["id"]] == hold["summary"] and hold["blocks_rollback"] is True
+    for cid in ("recording-levels-changed", "legal-holds-block-rollback", "older-images-refuse-newer-data"):
+        assert cid in rc.BLOCKS_ROLLBACK and cid in rc.ON_UPGRADED, cid
+
+
+def test_the_recording_levels_text_names_the_kinds_the_marker_counts():
+    """Lowering any of the four kinds below Full writes the marker; lowering vault and file names, which earlier
+    releases recorded no more of, does not."""
+    from app.core import audit_privacy as ap
+    from app.core import recording_marker
+    text = rc.SUMMARY["recording-levels-changed"]
+    assert text.count("names typed at sign-in, email addresses, IP addresses and browser descriptions") == 1
+    kinds = (ap.SIGNIN_NAMES, ap.EMAILS, ap.IP, ap.USER_AGENT)
+    assert all(ap.POLICY_ONE[kind] == ap.FULL for kind in kinds)
+    for kind in kinds:
+        assert recording_marker.records_less(dict(ap.POLICY_ONE, **{kind: ap.NONE})), kind
+    assert not recording_marker.records_less(dict(ap.POLICY_ONE, **{ap.NAMES: ap.NONE}))
+    assert "0.33.1 and later refuse to start" in text and "unless --force-downgrade is given" in text
+    tool = (ROOT / "dockvault.py").read_text(encoding="utf-8")
+    assert '"--force-downgrade", dest="force_downgrade"' in tool
+
+
+def test_the_text_on_older_images_names_the_reader_and_the_escape():
+    from app.core import data_requirements as dr
+    text = rc.SUMMARY["older-images-refuse-newer-data"]
+    assert f"{dr.ESCAPE_VARIABLE}=true in .env" in text and f"the table {dr.TABLE}" in text
+    assert "0.33.1 and later refuse to start" in text and "0.33.0 and earlier do not read the table" in text
+    assert rc.DETECT["older-images-refuse-newer-data"] == (f"SELECT key, requires_at_least, reason, since "
+                                                           f"FROM {dr.TABLE} ORDER BY key")
+
+
+def test_the_promotion_text_says_what_a_rollback_leaves_unrecorded():
+    """The origin of a password is read from the audit log once, when 0.34.0 adds its columns; nothing reads what an
+    earlier release did after a rollback (app/core/password_origin.py, add_columns_once)."""
+    from app.core import password_origin
+    text = rc.SUMMARY["promotion-resets-passwords-set-by-others"]
+    assert text.count("a password an administrator set while it ran counts as the person's own") == 1
+    assert text.count("At the upgrade this is read once from the audit log") == 1
+    assert "A password set while an older release ran afterwards is not recorded" in (
+        " ".join(password_origin.add_columns_once.__doc__.split()))
+    assert "promotion-resets-passwords-set-by-others" in rc.WITHOUT_DETECT
