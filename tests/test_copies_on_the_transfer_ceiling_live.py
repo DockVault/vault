@@ -51,6 +51,7 @@ BURST = 40              # more requests than the pool had connections (30)
 LOOP_ALONE_WITHIN = 1.0     # seconds: a path the server answers on the event loop alone
 ANSWERED_WITHIN = 3.0       # seconds: every request
 ANSWERS_A_SECOND = 3
+HELD_SIZE = 64 * MB
 
 
 def _setting(name, default):
@@ -76,9 +77,9 @@ def _session(client):
     return s
 
 
-def _payload(seed):
+def _payload(seed, size=SIZE):
     block = hashlib.sha256(seed).digest() * (CHUNK // 32)
-    return [block] * (SIZE // CHUNK), hashlib.sha256(block * (SIZE // CHUNK)).hexdigest()
+    return [block] * (size // CHUNK), hashlib.sha256(block * (size // CHUNK)).hexdigest()
 
 
 def _upload(client, vault_id, name, pieces, folder_id=None):
@@ -330,8 +331,10 @@ def test_requests_waiting_for_a_slot_hold_no_database_connection(admin, vaults):
     if limit > 32 or queue < waiting:
         pytest.skip(f"needs a ceiling of at most 32 and room for {waiting} to wait (ceiling {limit}, queue {queue})")
     vid = vaults("waiting")
-    held_pieces, _ = _payload(b"held")
-    held = _upload(admin, vid, "held.bin", held_pieces)          # larger than the socket buffers
+    # Larger than everything between the server and a client that does not read can take in: the client's
+    # small window, the server's send buffer and those of the port's proxy, which can grow to 32 MiB.
+    held_pieces, _ = _payload(b"held", HELD_SIZE)
+    held = _upload(admin, vid, "held.bin", held_pieces)
     small = _upload(admin, vid, "small.bin", [b"s" * 1024])
     other_vault = vaults("waiting-to")
     targets = [_folder(admin, other_vault, f"t{i}") for i in range(4)]
