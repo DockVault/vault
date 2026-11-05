@@ -19,9 +19,16 @@ waits for it:
 - a cancellation that was already asked for when the call is made does not stop it either; it is passed
   on at the request's next pause after the call.
 
-Two rules for what is run here, which every caller keeps:
+Three rules for what is run here, which every caller keeps:
 
 - ``fn`` must not need the event loop (no awaiting, no loop-bound objects);
+- work on the request's database session (``run_to_end_on_session``) runs only under a transfer slot (an
+  upload's completion, a copy, a move, a folder copy: app/core/transfer_admission.py), taken while the request
+  holds no connection. Each such call holds its request's connection until it ends, and calls past this
+  pool's threads wait here still holding theirs; the slots bound how many there are, and the database pool is
+  sized beyond them (app/core/database.py), so they never take the connections the event loop's own requests
+  need. Unbounded, a burst of copies held every connection, and the next request's first query waited for
+  one on the loop;
 - no database row lock is held across a call, nor after one that failed. A lock taken on the loop and held
   while the request waits here would let another request on the loop wait for that lock synchronously,
   stopping the loop; and a lock released only after the call would then never be released. Work that takes
@@ -42,9 +49,9 @@ import functools
 
 import anyio
 
-# Uploads that are finishing at once are bounded by the transfer ceiling (MAX_CONCURRENT_TRANSFERS, 16 by
-# default, and a quarter of it for public upload links); a chunk's sync is short. Room for both, and for
-# copies and moves between vaults, which are not admitted on that ceiling.
+# What uses the request's session here (uploads finishing, copies and moves) is bounded by the transfer
+# ceilings (MAX_CONCURRENT_TRANSFERS, 16 by default, and a quarter of it for public upload links); a chunk's sync
+# is short. Room for both at the default ceilings.
 WORKERS = 32
 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="stored-bytes")
 

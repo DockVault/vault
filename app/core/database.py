@@ -31,6 +31,27 @@ _LOCK_TIMEOUT_MS = 5000
 # time zone, which is otherwise the database's: on a database set to another zone such values were off
 # by its offset. Pinned here, they are UTC whatever the database is set to.
 _CONNECT_OPTIONS = f"-c lock_timeout={_LOCK_TIMEOUT_MS} -c timezone=UTC"
+# The pool keeps POOL_SIZE connections open and opens more when needed, up to pool_capacity().
+POOL_SIZE = 10
+# What the pool keeps for the requests the event loop is answering, beyond all the work handed to threads that
+# holds a connection while it runs: every transfer the two ceilings admit (a download, an upload's completion, a
+# copy or a move, each finished in a thread of app/core/off_loop.py on its request's connection) and every
+# sign-in handed to app/core/auth_offload.py. When those could take every connection (a burst of copies, before
+# copies were admitted), the next request's first query waited for one ON the event loop, which answers every
+# request, for up to the pool's 30 s timeout.
+LOOP_RESERVE = 10
+# The least the pool holds, as it always held: 10 kept open and 20 more.
+MIN_CAPACITY = 30
+
+
+def pool_capacity(max_concurrent_transfers) -> int:
+    """The most connections the pool opens, with the transfer ceiling configured as ``max_concurrent_transfers``:
+    one for each transfer and sign-in that can run in a thread at once, and LOOP_RESERVE more."""
+    from app.core.auth_offload import AUTH_OFFLOAD_LIMIT
+    from app.core.transfer_admission import admitted_at_most
+    return max(MIN_CAPACITY, admitted_at_most(max_concurrent_transfers) + AUTH_OFFLOAD_LIMIT + LOOP_RESERVE)
+
+
 _engine = None
 _session_factory = None
 _redis_client = None
@@ -58,8 +79,8 @@ def initialize_consumers() -> None:
             engine = create_engine(
                 settings.database_url,
                 pool_pre_ping=True,
-                pool_size=10,
-                max_overflow=20,
+                pool_size=POOL_SIZE,
+                max_overflow=pool_capacity(settings.max_concurrent_transfers) - POOL_SIZE,
                 echo=settings.log_level == "DEBUG",
                 # A database error's text, and the DEBUG echo, leave out the statement's bound values:
                 # they are names typed at sign-in, addresses, file names, and an error is printed to

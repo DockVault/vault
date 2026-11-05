@@ -35,9 +35,9 @@ STEPS = [
     (API, "upload_file", "ctx.write_chunk", PLAIN),
     (API, "upload_file", "ctx.sync_written", PLAIN),
     (API, "upload_file", "vault_service.finalize_streaming_upload", ON_SESSION),
-    (API, "copy_file_endpoint", "vault_service.copy_file", ON_SESSION),
-    (API, "move_file_endpoint", "vault_service.move_file", ON_SESSION),
-    (API, "copy_folder_endpoint", "vault_service.copy_folder", ON_SESSION),
+    (API, "copy_file_endpoint", "_copy_and_record", ON_SESSION),
+    (API, "move_file_endpoint", "_move_and_record", ON_SESSION),
+    (API, "copy_folder_endpoint", "_copy_folder_and_record", ON_SESSION),
     (CHUNKS, "seal_stream_to_file", "durable_write.sync_file", PLAIN),
 ]
 

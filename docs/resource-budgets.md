@@ -256,11 +256,22 @@ suits 1 GB and above.
 host reaches 11%.
 
 **Concurrency is now enforced, not merely described.** `MAX_CONCURRENT_TRANSFERS` (16 by default)
-caps how many transfers are carried at once, counting downloads and upload assembly together.
-Arrivals beyond it wait — a burst is normal traffic — and are only turned away once the queue
-(`MAX_QUEUED_TRANSFERS`, 32) is also full or the wait (`TRANSFER_QUEUE_WAIT_SECONDS`, 20) expires.
-A refusal is a `503` with `Retry-After`, deliberately distinct from a failure, so a client can tell
-"come back shortly" from "this file is broken".
+caps how many transfers are carried at once, counting downloads, upload assembly, and copies and
+moves of files and folders together. Arrivals beyond it wait — a burst is normal traffic — and are
+only turned away once the queue (`MAX_QUEUED_TRANSFERS`, 32) is also full or the wait
+(`TRANSFER_QUEUE_WAIT_SECONDS`, 20) expires. A refusal is a `503` with `Retry-After`, deliberately
+distinct from a failure, so a client can tell "come back shortly" from "this file is broken".
+
+**A transfer also holds a database connection while it runs.** Upload assembly, a copy and a move
+run in threads of their own, each on its request's connection, and a download holds one while it
+streams; an upload, a copy or a move waiting for a slot holds none. The API's connection pool is
+therefore sized from the ceiling: one connection for each transfer the two ceilings admit (this one
+and the upload links' quarter of it), 8 for sign-ins, and 10 more for everything else the server
+answers meanwhile: 38 at the default ceiling, never fewer than 30. Before copies and moves were
+admitted, a burst of them could hold every connection, and every other request then waited for one,
+up to 30 seconds. PostgreSQL accepts 100 connections unless it is told otherwise, and the SFTP
+server keeps a pool of its own, so a ceiling much above 40 needs PostgreSQL's `max_connections`
+raised as well.
 
 At the default ceiling the transfer memory is about 16 × 40 MB = 640 MB on top of the ~260 MB
 resting, which is why a deployment with less memory than that should lower it. **Open SFTP handles

@@ -80,6 +80,7 @@ from app.core.upload_chunk_crypto import (
 from app.core.upload_attempt_header import HeadPeek, header_token_mismatch
 from app.core import durable_write
 from app.core import off_loop
+from app.core import vault_access
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -128,9 +129,10 @@ def get_active_operations_count() -> int:
 
 
 # The count above reports; this one decides. They are deliberately separate: the registry tracks
-# every operation for the activity feed and cancellation, while admission governs only the two
-# things that hold memory for a duration -- serving a download, and assembling an upload.
-from app.core.transfer_admission import TransferAdmission, TransferBusy  # noqa: E402
+# every operation for the activity feed and cancellation, while admission governs the things that
+# hold memory, and a database connection, for a duration -- serving a download, assembling an
+# upload, and copying or moving a file or a folder.
+from app.core.transfer_admission import TransferAdmission, TransferBusy, link_ceiling  # noqa: E402
 
 transfer_admission = TransferAdmission(
     limit=settings.max_concurrent_transfers,
@@ -142,7 +144,7 @@ transfer_admission = TransferAdmission(
 # a flood of anonymous uploads can never starve authenticated transfers of the main pool. Sized as a
 # fraction of the main ceiling (at least 1), with a short, shallow queue.
 receiver_transfer_admission = TransferAdmission(
-    limit=max(1, settings.max_concurrent_transfers // 4),
+    limit=link_ceiling(settings.max_concurrent_transfers),
     max_waiting=max(1, settings.max_queued_transfers // 4),
     wait_seconds=settings.transfer_queue_wait_seconds,
 )
@@ -17558,7 +17560,7 @@ async def create_vault(
         'file_count': vault.file_count,
         'created_at': vault.created_at,
         'updated_at': vault.updated_at,
-        'last_accessed': vault.last_accessed,
+        'last_accessed': vault_access.last_access(vault.id, vault.last_accessed),
         'is_active': vault.is_active,
         'type': vault.type,
         'my_permission': 'owner',  # creator owns it
@@ -17693,7 +17695,7 @@ async def list_vaults(
             'department_count': _access_counts.get(vault.id, (None, None))[1],
             'created_at': vault.created_at,
             'updated_at': vault.updated_at,
-            'last_accessed': vault.last_accessed,
+            'last_accessed': vault_access.last_access(vault.id, vault.last_accessed),
             'is_active': vault.is_active,
             'type': vault.type,
             # Zero-knowledge: the browser-sealed name/description, so the client can decrypt them
@@ -17808,7 +17810,7 @@ async def get_vault(
             'file_count': None if _id_scoped else vault.file_count,
             'created_at': vault.created_at,
             'updated_at': vault.updated_at,
-            'last_accessed': vault.last_accessed,
+            'last_accessed': vault_access.last_access(vault.id, vault.last_accessed),
             'is_active': vault.is_active,
             'type': vault.type,
             'my_permission': _effective_vault_permission(vault, base_perms, current_user),
@@ -20141,12 +20143,10 @@ async def upload_file(
         # request commit its first file and then be refused partway through. Taken before the
         # operation is registered, so a refusal leaves nothing in the registry, and returned by the
         # request-level finally on every path out -- which also returns the space reservation taken
-        # above, the one thing that does precede admission.
+        # above, the one thing that does precede admission. The read transaction ends first, so a
+        # request waiting for a slot holds no database connection meanwhile.
         if files:
-            try:
-                transfer_slot = await transfer_admission.acquire()
-            except TransferBusy as busy:
-                raise _busy_response(busy)
+            transfer_slot = await _admitted_holding_no_connection(db)
 
         for upload_file in files:
             # Validate filename
@@ -20689,9 +20689,10 @@ def _release_db_before_streaming(db: Session) -> None:
     request the same instance), and its first query checked a pool connection out for the
     transaction that began. Then it streams the body, at the CLIENT'S pace, and that pace is
     unbounded by design: the per-chunk cap bounds bytes, not time. A connection held across that is
-    a pool slot held for as long as the client cares to dawdle -- and the pool is small (10 + 20
-    overflow) and shared with every login and every other request. Enough slow uploads and the
-    whole API waits on a client.
+    a pool slot held for as long as the client cares to dawdle -- and the pool is small (sized for
+    the transfers and sign-ins that run in threads, and ten more: app/core/database.py) and shared
+    with every login and every other request. Enough slow uploads and the whole API waits on a
+    client.
 
     So the read transaction ENDS HERE, before the first byte of body is read, and its connection
     goes back to the pool. After the body has arrived a new, short transaction re-validates and
@@ -23395,6 +23396,27 @@ def _gate_move_copy_destination(db, vault_service, current_user, dest_vault_id, 
     return dest_vault
 
 
+async def _admitted_holding_no_connection(db):
+    """A transfer slot for a direct upload, a copy, a move or a folder copy, with the same answer as every
+    transfer's when the deployment is full (503 with Retry-After).
+
+    Each of them runs to its end in a thread (app/core/off_loop.py) on the request's database connection: a copy
+    reads, decrypts, encrypts and syncs a whole file, a folder copy every file in the tree. Copies were not
+    admitted, and a burst of them held every connection of the pool: the next request's first query waited for
+    one on the event loop, which answers every request. Admitted, they hold at most as many connections as the
+    ceilings admit transfers, and the pool is sized beyond that (app/core/database.py).
+
+    Called after the checks that cost nothing to answer, so a caller told 403 or 404 is not first made to queue.
+    The request's read transaction ends first (nothing is pending: the checks only read, and get_vault commits),
+    so a request waiting for a slot holds no connection meanwhile: waiting requests are not bounded by the
+    ceiling, only by its queue."""
+    db.rollback()
+    try:
+        return await transfer_admission.acquire()
+    except TransferBusy as busy:
+        raise _busy_response(busy)
+
+
 @app.post("/vaults/{vault_id}/files/{file_id}/copy")
 @require_endpoint_permission("FILE_DOWNLOAD")
 @require_vault_cap("file.download")
@@ -23415,6 +23437,7 @@ async def copy_file_endpoint(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
+    transfer_slot = None
     try:
         # Source: access + password on the path vault, the file belongs to it, item in scope.
         vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
@@ -23429,18 +23452,26 @@ async def copy_file_endpoint(
         # the DESTINATION vault — the client flag alone must not let an upload-only principal destroy
         # another user's file (same rule as every other replace path, _principal_can_replace_file).
         replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
-        # Off the event loop, to its end: the copy reads, re-encrypts and syncs the whole file.
-        new_file = await off_loop.run_to_end_on_session(
-            db, vault_service.copy_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
-            source_file_password=x_file_password, replace_same_name=replace)
-        audit_logger.log_action(
-            action='file_copy', status='success', user=current_user, resource_type='file',
-            resource_id=str(file_id),
-            details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
-                     'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
-                     'new_file_id': str(new_file.id)},
-            ip_address=get_client_ip(request))
-        return {'message': 'File copied', 'id': str(new_file.id)}
+        client_ip = get_client_ip(request)
+
+        def _copy_and_record():
+            new_id = str(vault_service.copy_file(
+                file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+                source_file_password=x_file_password, replace_same_name=replace).id)
+            audit_logger.log_action(
+                action='file_copy', status='success', user=current_user, resource_type='file',
+                resource_id=str(file_id),
+                details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
+                         'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
+                         'new_file_id': new_id},
+                ip_address=client_ip)
+            return new_id
+
+        transfer_slot = await _admitted_holding_no_connection(db)
+        # Off the event loop, to its end: the copy reads, re-encrypts and syncs the whole file, and its audit
+        # row commits there too (a commit on the loop waits for a disk the copies keep busy).
+        new_id = await off_loop.run_to_end_on_session(db, _copy_and_record)
+        return {'message': 'File copied', 'id': new_id}
     except DuplicateNameError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except HTTPException:
@@ -23449,6 +23480,9 @@ async def copy_file_endpoint(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail="A file with that name already exists in the destination")
+    finally:
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
 
 
 @app.post("/vaults/{vault_id}/files/{file_id}/move")
@@ -23471,6 +23505,7 @@ async def move_file_endpoint(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
+    transfer_slot = None
     try:
         vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
         if not db.query(File.id).filter(File.id == file_id, File.vault_id == vault_id,
@@ -23482,19 +23517,26 @@ async def move_file_endpoint(
         # Same rule as copy: overwriting a same-name file in the destination needs delete authority
         # there, not just the client flag.
         replace = body.replace_same_name and _principal_can_replace_file(db, current_user, body.dest_vault_id)
+        client_ip = get_client_ip(request)
+
+        def _move_and_record():
+            new_id = str(vault_service.move_file(
+                file_id, current_user, body.dest_vault_id, body.dest_folder_id,
+                source_file_password=x_file_password, replace_same_name=replace).id)
+            audit_logger.log_action(
+                action='file_move', status='success', user=current_user, resource_type='file',
+                resource_id=str(file_id),
+                details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
+                         'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
+                         'new_file_id': new_id},
+                ip_address=client_ip)
+            return new_id
+
+        transfer_slot = await _admitted_holding_no_connection(db)
         # Off the event loop, to its end: a move to another vault reads, re-encrypts and syncs the whole
-        # file, then removes the source.
-        new_file = await off_loop.run_to_end_on_session(
-            db, vault_service.move_file, file_id, current_user, body.dest_vault_id, body.dest_folder_id,
-            source_file_password=x_file_password, replace_same_name=replace)
-        audit_logger.log_action(
-            action='file_move', status='success', user=current_user, resource_type='file',
-            resource_id=str(file_id),
-            details={'source_vault_id': str(vault_id), 'dest_vault_id': str(body.dest_vault_id),
-                     'dest_folder_id': str(body.dest_folder_id) if body.dest_folder_id else None,
-                     'new_file_id': str(new_file.id)},
-            ip_address=get_client_ip(request))
-        return {'message': 'File moved', 'id': str(new_file.id)}
+        # file, then removes the source; its audit row commits there too.
+        new_id = await off_loop.run_to_end_on_session(db, _move_and_record)
+        return {'message': 'File moved', 'id': new_id}
     except DuplicateNameError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except HTTPException:
@@ -23503,6 +23545,9 @@ async def move_file_endpoint(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail="A file with that name already exists in the destination")
+    finally:
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
 
 
 @app.post("/vaults/{vault_id}/folders/{folder_id}/move")
@@ -23564,6 +23609,7 @@ async def copy_folder_endpoint(
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
+    transfer_slot = None
     try:
         from app.core.temp_scope import require_cap
         vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
@@ -23576,17 +23622,25 @@ async def copy_folder_endpoint(
         # the read + write caps too (all within the one vault).
         require_cap(current_user, vault_id, "file.download")
         require_cap(current_user, vault_id, "file.upload")
-        # Off the event loop, to its end: every file in the tree is read, re-encrypted and synced.
-        folder = await off_loop.run_to_end_on_session(
-            db, vault_service.copy_folder, folder_id, current_user, body.dest_vault_id,
-            body.dest_parent_folder_id)
-        audit_logger.log_action(
-            action='folder_copy', status='success', user=current_user, resource_type='folder',
-            resource_id=str(folder_id),
-            details={'vault_id': str(vault_id), 'new_folder_id': str(folder.id),
-                     'dest_parent_folder_id': str(body.dest_parent_folder_id) if body.dest_parent_folder_id else None},
-            ip_address=get_client_ip(request))
-        return {'message': 'Folder copied', 'id': str(folder.id)}
+        client_ip = get_client_ip(request)
+
+        def _copy_folder_and_record():
+            new_id = str(vault_service.copy_folder(folder_id, current_user, body.dest_vault_id,
+                                                   body.dest_parent_folder_id).id)
+            audit_logger.log_action(
+                action='folder_copy', status='success', user=current_user, resource_type='folder',
+                resource_id=str(folder_id),
+                details={'vault_id': str(vault_id), 'new_folder_id': new_id,
+                         'dest_parent_folder_id': (str(body.dest_parent_folder_id)
+                                                   if body.dest_parent_folder_id else None)},
+                ip_address=client_ip)
+            return new_id
+
+        transfer_slot = await _admitted_holding_no_connection(db)
+        # Off the event loop, to its end: every file in the tree is read, re-encrypted and synced, and the
+        # audit row commits there too.
+        new_id = await off_loop.run_to_end_on_session(db, _copy_folder_and_record)
+        return {'message': 'Folder copied', 'id': new_id}
     except DuplicateNameError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except HTTPException:
@@ -23595,6 +23649,9 @@ async def copy_folder_endpoint(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail="A folder with that name already exists in the destination")
+    finally:
+        if transfer_slot is not None:
+            transfer_admission.release(transfer_slot)
 
 
 @app.post("/vaults/{vault_id}/folders")
