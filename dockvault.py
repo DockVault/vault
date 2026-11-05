@@ -5907,11 +5907,15 @@ class DockVault:
         created but could not finish is removed."""
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         for dest in env_copy_names(self.root, label):
+            # A name already there, of any kind, is passed over before anything opens it: on Windows, creating a
+            # file with O_EXCL at a link to nothing is not refused, it creates the name the link points to.
+            if os.path.lexists(dest):
+                continue
             try:
                 fd = os.open(dest, flags, 0o600) if os.name != "nt" else os.open(dest, flags)
                 break
             except OSError as exc:
-                # A name already there, of any kind, is passed over, whatever the refusal said: Windows refuses
+                # A name made there since that check is passed over too, whatever the refusal said: Windows refuses
                 # to create a file over a folder with PermissionError, not FileExistsError. Only a refusal for a
                 # name that is free (a folder that cannot be written to, a full disk) stops the copy.
                 if os.path.lexists(dest):

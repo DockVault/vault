@@ -8,14 +8,14 @@ never over a file already there, says where it is and how to go back to that set
 copy cannot be made or when .env is sealed by `lock`.
 
 Every path through it: another set's backup (in a root whose path holds a space too); the same set's, with its own
-.env and with one changed since the backup; no .env at all; a kept file (and a folder) already there, also where
-creating a file over a name already there is refused as Windows refuses it, and a link to nothing (for a kept and
-an archived .env); a copy that cannot be made, or that reads back otherwise, and the name the refusal gives; a
-current .env or a backup's that cannot be read; a restore that stops before it installs the backup's .env, and one
-that fails while installing it; a sealed .env; a current prefix that is no set's name; a set named like the sealed
-file or the template, in any case or with a trailing dot (whose names a kept or archived .env never takes); the note
-on a running set. With real Docker, the volumes of the set the host was on open again from the kept file, through
-the command the restore prints.
+.env and with one changed since the backup; no .env at all; a kept file (and a folder) already there, and one made
+there as the copy is created, refused as Windows refuses it; a link to nothing, also where creating a file at it
+creates the name it points to, as Windows does (for a kept and an archived .env); a copy that cannot be made, or
+that reads back otherwise, and the name the refusal gives; a current .env or a backup's that cannot be read; a
+restore that stops before it installs the backup's .env, and one that fails while installing it; a sealed .env; a
+current prefix that is no set's name; a set named like the sealed file or the template, in any case or with a
+trailing dot (whose names a kept or archived .env never takes); the note on a running set. With real Docker, the
+volumes of the set the host was on open again from the kept file, through the command the restore prints.
 """
 import argparse
 import importlib.util
@@ -195,15 +195,24 @@ def test_a_kept_file_already_there_is_never_written_over(tmp_path, monkeypatch, 
     assert _go_back_command(kept) in said
 
 
-class _OsRefusingAsWindowsDoes:
-    """dockvault's os, but for os.open, which refuses to create a .env copy over a name already there with
+class _OsWhereTheNameIsTakenAsItIsCreated:
+    """dockvault's os, but for os.open, where the file `name` is taken by something else (`taken_by`: a folder or a
+    file) at the moment the copy creates it, after the copy found the name free, and the create is refused with
     PermissionError, as Windows refuses to create a file over a folder (POSIX says FileExistsError)."""
+
+    def __init__(self, name, taken_by):
+        self._name, self._taken_by = name, taken_by
 
     def __getattr__(self, attr):
         return getattr(os, attr)
 
     def open(self, path, flags, *a, **k):
-        if os.path.basename(path).startswith(".env.") and flags & os.O_EXCL and os.path.lexists(path):
+        if os.path.basename(path) == self._name and flags & os.O_EXCL and not os.path.lexists(path):
+            if self._taken_by == "a-folder":
+                os.mkdir(path)
+                Path(path, "inside").write_bytes(b"left alone\n")
+            else:
+                Path(path).write_bytes(b"an older one\n")
             raise PermissionError(13, "Permission denied", path)
         return os.open(path, flags, *a, **k)
 
@@ -211,23 +220,20 @@ class _OsRefusingAsWindowsDoes:
 @pytest.mark.parametrize("first_taken_by", ["a-folder", "a-file"])
 def test_a_name_already_there_is_passed_over_whatever_the_refusal_to_create_it_says(
         tmp_path, monkeypatch, capsys, first_taken_by):
-    """On Windows, creating the copy over a folder already there is refused with PermissionError: the copy goes on
-    to the next name, as it does where the refusal is FileExistsError. os.open answers as on Windows here, so this
-    holds on every system the tests run on. (A refusal for a name that is free stops the restore: below.)"""
+    """A name taken between the copy's look at it and the create (.env.<prefix> here) is passed over, as one taken
+    before (.env.<prefix>.1, a folder): on Windows, creating the copy over a folder is refused with PermissionError,
+    and the copy goes on to the next name as it does where the refusal is FileExistsError. os.open answers as on
+    Windows here, so this holds on every system the tests run on. (A refusal for a name that is free stops the
+    restore: below.)"""
     current = _env_bytes(HERE)
     (tmp_path / ".env").write_bytes(current)
     first = tmp_path / (".env." + HERE)
-    if first_taken_by == "a-folder":
-        first.mkdir()
-        (first / "inside").write_bytes(b"left alone\n")
-    else:
-        first.write_bytes(b"an older one\n")
     (tmp_path / (".env." + HERE + ".1")).mkdir()               # a folder holds the next name
     theirs = _env_bytes(THERE)
     bundle = _bundle(tmp_path, theirs)
     steps = []
     tool = _tool(tmp_path, monkeypatch, steps)
-    monkeypatch.setattr(dv, "os", _OsRefusingAsWindowsDoes())
+    monkeypatch.setattr(dv, "os", _OsWhereTheNameIsTakenAsItIsCreated(first.name, first_taken_by))
     _restore(tool, bundle)
 
     kept = tmp_path / (".env." + HERE + ".2")
@@ -254,18 +260,53 @@ def _link_to_nothing(path):
     assert os.path.lexists(path) and not os.path.exists(path)
 
 
-def test_a_link_to_nothing_holds_its_name_against_the_kept_env(tmp_path, monkeypatch, capsys):
-    """Not followed (the copy would be written where the link points) and not replaced: the next name is taken."""
+def _points_to(link):
+    """The name the link at `link` points to, as the link was made: Windows' os.readlink gives it behind the prefix
+    of its long paths (and a share's name behind the prefix and UNC)."""
+    target = os.readlink(str(link))
+    for prefix, put_back in (("\\\\?\\UNC\\", "\\\\"), ("\\\\?\\", "")):
+        if target.startswith(prefix):
+            return put_back + target[len(prefix):]
+    return target
+
+
+class _OsCreatingAtALinkToNothingAsWindowsDoes:
+    """dockvault's os, but for os.open, which, asked to create a file (O_CREAT and O_EXCL) at a symbolic link to a
+    name that is not there, creates that name and opens it, as Windows does (POSIX refuses: FileExistsError)."""
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+    def open(self, path, flags, *a, **k):
+        if flags & os.O_CREAT and flags & os.O_EXCL and os.path.islink(path) and not os.path.exists(path):
+            path = os.path.join(os.path.dirname(path), os.readlink(path))
+        return os.open(path, flags, *a, **k)
+
+
+@pytest.mark.parametrize("create_at_a_link", ["as-here", "as-on-windows"])
+def test_a_link_to_nothing_holds_its_name_against_the_kept_env(tmp_path, monkeypatch, capsys, create_at_a_link):
+    """Not followed (the copy would be written where the link points) and not replaced: the next name is taken.
+    Also where creating a file at the link creates the name it points to, as Windows does: the link is passed over
+    before anything opens it."""
     current = _env_bytes(HERE)
     (tmp_path / ".env").write_bytes(current)
     link = tmp_path / (".env." + HERE)
     _link_to_nothing(link)
     bundle = _bundle(tmp_path, _env_bytes(THERE))
-    _restore(_tool(tmp_path, monkeypatch, []), bundle)
+    tool = _tool(tmp_path, monkeypatch, [])
+    if create_at_a_link == "as-on-windows":
+        windows_like = _OsCreatingAtALinkToNothingAsWindowsDoes()
+        other = tmp_path / "other" / "link"                   # the stand-in does as it says, on a link of its own
+        other.parent.mkdir()
+        _link_to_nothing(other)
+        os.close(windows_like.open(str(other), os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+        assert os.path.isfile(str(other) + "-gone")
+        monkeypatch.setattr(dv, "os", windows_like)
+    _restore(tool, bundle)
 
     kept = tmp_path / (".env." + HERE + ".1")
     assert kept.read_bytes() == current
-    assert os.path.islink(link) and os.readlink(link) == str(link) + "-gone"
+    assert os.path.islink(link) and _points_to(link) == str(link) + "-gone"
     assert not os.path.lexists(str(link) + "-gone"), "the copy was written through the link"
     assert "Kept the current .env (set '%s') as %s" % (HERE, kept) in _said(capsys)
 
@@ -280,7 +321,7 @@ def test_a_link_to_nothing_holds_its_name_against_an_archived_env(tmp_path):
 
     assert archived == str(tmp_path / (".env." + HERE + ".1"))
     assert Path(archived).read_bytes() == b"VAULT_VOLUME_PREFIX=%s\n" % HERE.encode()
-    assert os.path.islink(link) and os.readlink(link) == str(link) + "-gone"
+    assert os.path.islink(link) and _points_to(link) == str(link) + "-gone"
     assert not os.path.lexists(str(link) + "-gone")
 
 
