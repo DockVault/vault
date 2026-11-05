@@ -9,6 +9,7 @@ waiting change. The routes are plain functions (the thread pool runs them), moun
 only by an interactive administrator. These run on a throwaway SQLite database, with a throwaway setting.
 """
 import inspect
+import re
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -337,18 +338,32 @@ def test_a_check_across_settings_refuses_before_anything_is_asked(env, db, monke
     assert _put(db, user, "keep_days", 9)["status"] == "pending"
 
 
-def test_a_change_whose_audit_row_cannot_be_built_is_not_made(env, db, monkeypatch, quiet):
+FAILURE_TEXT = "the failure's own text, which stays out of the log"
+
+
+def _logged_error_id(capsys, what):
+    """The error id the log gives the failure ``what``, which names the class and never the failure's text."""
+    out = capsys.readouterr()
+    logged = out.out + out.err
+    (line,) = [ln for ln in logged.splitlines() if what in ln]
+    assert line.endswith(": RuntimeError") and FAILURE_TEXT not in logged, logged
+    return re.search(r"\(ID: ([0-9a-f-]{36})\)", line).group(1)
+
+
+def test_a_change_whose_audit_row_cannot_be_built_is_not_made(env, db, monkeypatch, quiet, capsys):
     from app.services.audit_logger import AuditLogger
 
     def broken(*_a, **_k):
-        raise RuntimeError("no row")
+        raise RuntimeError(FAILURE_TEXT)
 
     monkeypatch.setattr(AuditLogger, "build_row", broken)
     user = _admin(db)
     for value in (400, 10):
+        capsys.readouterr()
         with refused(503) as caught:
             _put(db, user, "keep_days", value)
         assert "Nothing was changed" in caught.value.detail
+        assert _logged_error_id(capsys, "a change of keep_days was not saved") in caught.value.detail
     assert db.query(ManagedSetting).count() == 0 and db.query(ManagedSettingChange).count() == 0
     assert quiet["announced"] == []
 
@@ -382,18 +397,20 @@ def test_any_administrator_cancels_a_waiting_change(env, db, quiet):
         routes.cancel_managed_setting_change(uuid.uuid4(), current_user=bob, db=db)
 
 
-def test_a_cancel_whose_audit_row_cannot_be_written_leaves_the_change_waiting(env, db, monkeypatch, quiet):
+def test_a_cancel_whose_audit_row_cannot_be_written_leaves_the_change_waiting(env, db, monkeypatch, quiet, capsys):
     alice = _admin(db)
     change_id = _put(db, alice, "keep_days", 10)["change"]["id"]
     from app.services.audit_logger import AuditLogger
 
     def broken(*_a, **_k):
-        raise RuntimeError("no row")
+        raise RuntimeError(FAILURE_TEXT)
 
     monkeypatch.setattr(AuditLogger, "build_row", broken)
+    capsys.readouterr()
     with refused(503) as caught:
         routes.cancel_managed_setting_change(uuid.UUID(change_id), current_user=alice, db=db)
     assert "still waiting" in caught.value.detail
+    assert _logged_error_id(capsys, "a cancel of a waiting change was not saved") in caught.value.detail
     assert db.get(ManagedSettingChange, uuid.UUID(change_id)).status == sc.PENDING
     assert len(quiet["announced"]) == 1
 
