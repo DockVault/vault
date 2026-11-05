@@ -464,13 +464,15 @@ def run_compliance_cases(p: Pass) -> JobResult:
 
 def run_legal_holds(p: Pass) -> JobResult:
     """The legal holds' clock (app/core/legal_holds.py): holds nobody confirmed in time lapse, those due a review
-    ask for one, and what released holds kept is purged once their delay is over (a batch per transaction, each
+    ask for one, while anything is held an SFTP server of another version is looked for again (the administrators
+    are told of one), and what released holds kept is purged once their delay is over (a batch per transaction, each
     file's held_file_purged row in it, the blobs secure-deleted after its commit). Not stopped by the hold switch:
     a hold's purge is the end of what a case kept, not a log."""
     from app.core import legal_holds
     with p.transaction() as db:
         legal_holds.lapse_due(db, p.now)
         legal_holds.prompt_reviews(db, p.now)
+        legal_holds.sftp_while_held(db, p.now)
     done = JobResult()
 
     def record(db, count, table):

@@ -8,9 +8,13 @@ the web app asks before it makes one.
 Each SFTP process records itself in ``sftp_processes`` (an id of its own, its host and its version) when
 it starts and every RECORD_SECONDS after, on a thread of its own, so a database that does not answer never
 holds up the server or its heartbeat (app/sftp/heartbeat.py). A process counts as live while it has
-recorded itself within LIVE_WITHIN_SECONDS. It removes its own row when it stops cleanly, waiting at most
-FORGET_SECONDS for the database (a row it could not remove goes stale on its own), and rows no process has
-refreshed for PRUNE_AFTER_DAYS are removed when a process starts.
+recorded itself within LIVE_WITHIN_SECONDS, two record intervals and a little more: one that missed a single
+record still counts. It removes its own row when it stops cleanly, waiting at most FORGET_SECONDS for the database
+(a row it could not remove goes stale on its own); a process killed before it could (an out-of-memory kill, a stop
+that timed out) leaves a row that still counts that long, so the window is kept short: an SFTP server of an older
+release, which never records itself, could otherwise start unseen beside the dead one's row. Rows no process has
+refreshed for PRUNE_AFTER_DAYS are removed when a process starts. Legal holds ask again at every pass of the
+pruner while they stand (app/core/legal_holds.py, sftp_while_held), not only when one is placed.
 
 sftp_same_version() answers whether SFTP is off, or every live SFTP process runs this version:
 
@@ -40,7 +44,7 @@ RECORD_SECONDS = 30.0
 # How long a stop waits for its row's removal. A database that does not answer then (stopped, or frozen)
 # never holds up the stop: the process ends, and its row is no longer live after LIVE_WITHIN_SECONDS.
 FORGET_SECONDS = 2.0
-LIVE_WITHIN_SECONDS = 120
+LIVE_WITHIN_SECONDS = int(2 * RECORD_SECONDS) + 5
 PRUNE_AFTER_DAYS = 7
 
 SAME = "same"
