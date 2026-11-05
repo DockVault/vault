@@ -318,8 +318,12 @@ def test_the_two_ceilings_are_the_ones_the_pool_counts():
     assert S.receiver_transfer_admission.limit == link_ceiling(S.settings.max_concurrent_transfers)
 
 
+@pytest.mark.parametrize("carries_transfers", [True, False])
 @pytest.mark.parametrize("limit", [1, 16, 40])
-def test_the_engine_is_made_with_that_capacity(monkeypatch, limit):
+def test_the_engine_is_made_with_that_capacity(monkeypatch, limit, carries_transfers):
+    """The web server's pool from the ceiling; any other process's (the SFTP server's, a command's) 30, whatever the
+    ceiling: SFTP transfers are not on it, and the two pools sized from it together passed PostgreSQL's 100
+    connections from a ceiling of about 25."""
     seen = {}
 
     def fake_create_engine(url, **kwargs):
@@ -332,6 +336,26 @@ def test_the_engine_is_made_with_that_capacity(monkeypatch, limit):
     monkeypatch.setattr(database.settings, "max_concurrent_transfers", limit)
     monkeypatch.setattr(database, "runtime_is_initialized", lambda: True)
     with pytest.raises(Exception):
-        database.initialize_consumers()
+        database.initialize_consumers(carries_transfers=carries_transfers)
     assert seen["pool_size"] == database.POOL_SIZE == 10
-    assert seen["pool_size"] + seen["max_overflow"] == database.pool_capacity(limit)
+    expected = database.pool_capacity(limit) if carries_transfers else database.MIN_CAPACITY
+    assert seen["pool_size"] + seen["max_overflow"] == expected
+
+
+@pytest.mark.parametrize("component, carries", [("API", True), ("SFTP", False)])
+def test_only_the_web_server_sizes_its_pool_from_the_ceiling(monkeypatch, component, carries):
+    from app.core import config
+    asked = []
+    monkeypatch.setattr(config, "initialize_runtime",
+                        lambda **k: SimpleNamespace(plan_log_pull=False, log_token_pepper=""))
+    monkeypatch.setattr(database, "initialize_consumers", lambda **k: asked.append(k))
+    config.bootstrap_entrypoint(component)
+    assert asked == [{"carries_transfers": carries}]
+
+
+def test_the_two_pools_fit_in_what_postgresql_accepts_up_to_a_ceiling_of_40():
+    """PostgreSQL accepts 100 connections unless it is told otherwise: the web server's pool and the SFTP server's
+    hold 68 of them at the default ceiling and 98 at 40, as the documentation says."""
+    both = {limit: database.pool_capacity(limit) + database.MIN_CAPACITY for limit in (16, 40, 41)}
+    assert both == {16: 68, 40: 98, 41: 99}
+    assert all(database.pool_capacity(limit) + database.MIN_CAPACITY <= 100 for limit in range(-1, 41))

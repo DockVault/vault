@@ -33,20 +33,36 @@ _LOCK_TIMEOUT_MS = 5000
 _CONNECT_OPTIONS = f"-c lock_timeout={_LOCK_TIMEOUT_MS} -c timezone=UTC"
 # The pool keeps POOL_SIZE connections open and opens more when needed, up to pool_capacity().
 POOL_SIZE = 10
-# What the pool keeps for the requests the event loop is answering, beyond all the work handed to threads that
-# holds a connection while it runs: every transfer the two ceilings admit (a download, an upload's completion, a
-# copy or a move, each finished in a thread of app/core/off_loop.py on its request's connection) and every
-# sign-in handed to app/core/auth_offload.py. When those could take every connection (a burst of copies, before
-# copies were admitted), the next request's first query waited for one ON the event loop, which answers every
-# request, for up to the pool's 30 s timeout.
+# The web server's pool (pool_capacity) holds one connection for each piece of work that is bounded and holds a
+# connection while it runs: every transfer the two ceilings admit (a download, an upload's completion, a copy or a
+# move, each holding its request's connection; a transfer waiting for its slot holds none) and every sign-in
+# handed to app/core/auth_offload.py. When those could take every connection (a burst of copies before copies were
+# admitted; downloads waiting for a slot holding their read transaction), the next request's first query waited
+# for one ON the event loop, which answers every request, for up to the pool's 30 s timeout.
+#
+# LOOP_RESERVE connections more are left for everything else together, which this does not count and nothing
+# bounds below the pool:
+# - the requests the event loop answers, each holding one while it queries;
+# - the synchronous routes (82), which the framework runs in its own thread pool, up to 40 at once, each holding
+#   its session's connection while it runs (the activity search and export, the compliance cases' reads, file
+#   contents and exports);
+# - the mail sent without the request waiting for it (a password reset, an email action), one thread per mail,
+#   holding a session while the mail is sent; nothing bounds how many;
+# - the background threads that use the database: maintenance, the owner notices, the recording levels and the
+#   managed settings refreshers, and the last-opened writer (app/core/vault_access.py).
+# So the ten are kept only while those need no more than ten at once. When they need more, the next query waits
+# for one, on the loop if the loop asked: a burst of those is not prevented here.
 LOOP_RESERVE = 10
-# The least the pool holds, as it always held: 10 kept open and 20 more.
+# The least the pool holds, as it always held: 10 kept open and 20 more. A process that carries no transfers (the
+# SFTP server, a command run in the container) keeps this: SFTP transfers are not on the ceiling.
 MIN_CAPACITY = 30
 
 
 def pool_capacity(max_concurrent_transfers) -> int:
-    """The most connections the pool opens, with the transfer ceiling configured as ``max_concurrent_transfers``:
-    one for each transfer and sign-in that can run in a thread at once, and LOOP_RESERVE more."""
+    """The most connections the web server's pool opens, with the transfer ceiling configured as
+    ``max_concurrent_transfers``: one for each transfer and sign-in that can run at once, and LOOP_RESERVE more for
+    everything else (see the comment above: not a reserve for the event loop alone). 38 at the default ceiling of
+    16; with the SFTP server's 30 that is 68 of PostgreSQL's 100, and 98 at a ceiling of 40."""
     from app.core.auth_offload import AUTH_OFFLOAD_LIMIT
     from app.core.transfer_admission import admitted_at_most
     return max(MIN_CAPACITY, admitted_at_most(max_concurrent_transfers) + AUTH_OFFLOAD_LIMIT + LOOP_RESERVE)
@@ -57,12 +73,17 @@ _session_factory = None
 _redis_client = None
 
 
-def initialize_consumers() -> None:
+def initialize_consumers(*, carries_transfers=False) -> None:
     """Construct process-local SQLAlchemy and Redis clients exactly once.
 
     Client construction does not open a network connection; schema creation and health
     checks remain explicit operations. Locals are assigned only after every constructor
     succeeds, so a partial failure cannot publish a half-initialized consumer set.
+
+    ``carries_transfers``: the process carries the web transfers the ceiling admits (the web server), so its
+    pool is sized from the ceiling (pool_capacity); any other process (the SFTP server, a command) keeps
+    MIN_CAPACITY. Sized from the ceiling too, the SFTP server's pool and the web server's together passed
+    PostgreSQL's 100 connections from a ceiling of about 25.
     """
     global _engine, _session_factory, _redis_client
     with _consumer_lock:
@@ -80,7 +101,8 @@ def initialize_consumers() -> None:
                 settings.database_url,
                 pool_pre_ping=True,
                 pool_size=POOL_SIZE,
-                max_overflow=pool_capacity(settings.max_concurrent_transfers) - POOL_SIZE,
+                max_overflow=(pool_capacity(settings.max_concurrent_transfers) if carries_transfers
+                              else MIN_CAPACITY) - POOL_SIZE,
                 echo=settings.log_level == "DEBUG",
                 # A database error's text, and the DEBUG echo, leave out the statement's bound values:
                 # they are names typed at sign-in, addresses, file names, and an error is printed to

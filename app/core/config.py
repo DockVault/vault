@@ -791,9 +791,10 @@ def bootstrap_entrypoint(component: str, *, dotenv_path=None, master_password=No
             interactive=True,
         )
         # Import only after credentials/settings are installed; database.py is import-safe
-        # and this explicit call constructs the SQLAlchemy/Redis consumers once.
+        # and this explicit call constructs the SQLAlchemy/Redis consumers once. Only the web server
+        # carries the transfers the ceiling admits, so only its pool is sized from the ceiling.
         from app.core.database import initialize_consumers
-        initialize_consumers()
+        initialize_consumers(carries_transfers=component == "API")
     except RuntimeBootstrapError as exc:
         print(
             f"DockVault {component} startup failed [{exc.code}]: {exc.safe_message}",

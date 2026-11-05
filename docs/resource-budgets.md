@@ -274,12 +274,24 @@ row and, for a copy or a move, whether a same-name file may be replaced, so a si
 made during the wait applies to it; a public link's download asks its link's gates again. A move
 within one vault copies no bytes and takes no slot. The API's connection pool is
 therefore sized from the ceiling: one connection for each transfer the two ceilings admit (this one
-and the upload links' quarter of it), 8 for sign-ins, and 10 more for everything else the server
-answers meanwhile: 38 at the default ceiling, never fewer than 30. Before copies and moves were
-admitted, a burst of them could hold every connection, and every other request then waited for one,
-up to 30 seconds. PostgreSQL accepts 100 connections unless it is told otherwise, and the SFTP
-server keeps a pool of its own, so a ceiling much above 40 needs PostgreSQL's `max_connections`
-raised as well.
+and the upload links' quarter of it), 8 for sign-ins, and 10 more: 38 at the default ceiling, never
+fewer than 30. Before copies and moves were admitted, a burst of them could hold every connection,
+and every other request then waited for one, up to 30 seconds.
+
+Those 10 are for everything else together, which the pool does not count: the requests the server
+answers meanwhile, its 82 synchronous routes (run up to 40 at once, each holding a connection while
+it runs: the activity search and export, the compliance cases' reads, file contents and exports),
+the mail it sends
+without the request waiting for it (one thread per mail, each holding a connection while it sends;
+nothing bounds how many) and its background work (maintenance, owner notices, two settings
+refreshers, the record of when each vault was last opened). Ten is enough while those need no more
+than ten at once; a burst of them makes the next request wait for a connection, as before.
+
+The SFTP server keeps a pool of its own, of 30 connections whatever the ceiling (SFTP transfers are
+not on it). PostgreSQL accepts 100 connections unless it is told otherwise; the two pools hold at
+most 68 of them at the default ceiling, and 98 at a ceiling of 40 (each step of the ceiling adds one
+connection, each fourth step one more). So a ceiling above 40 needs PostgreSQL's `max_connections`
+raised as well, leaving room for a backup or an administrator's `psql` beside the pools.
 
 At the default ceiling the transfer memory is about 16 × 40 MB = 640 MB on top of the ~260 MB
 resting, which is why a deployment with less memory than that should lower it. **Open SFTP handles
