@@ -1673,8 +1673,13 @@ async def get_current_user(
     Dependency to get current authenticated user from JWT token.
     For temporary credentials, validates that the session is still active.
     """
-    token = credentials.credentials
-    
+    return _user_for_token(credentials.credentials, db)
+
+
+def _user_for_token(token, db) -> User:
+    """get_current_user's whole decision, synchronous: a request that waited for a transfer slot asks it again,
+    in a thread of app/core/off_loop.py when its work runs there (_admitted_again). One implementation, so the
+    second ask cannot drift from the first."""
     payload = verify_access_token(token)
     if not payload:
         raise HTTPException(
@@ -14274,9 +14279,11 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
     link present and not revoked, vault Standard+not-pw, owner active + still holds READ, target present
     + not password-protected), requires the grant to have been minted before the link expired, and
     confines the requested file_id to the link's target subtree (id_scope). Any failure is the uniform
-    404. No principal is synthesised: the blob is opened directly once every gate passes. When the
-    server fails after the grant is used and before the first byte of the file goes out, the redeem's
-    use is given back (_publiclink_refund_use)."""
+    404. No principal is synthesised: the blob is opened directly once every gate passes. It waits for
+    its transfer slot holding no database connection, and the gates are asked again once it has one.
+    When the server fails after the grant is used and before the first byte of the file goes out, or a
+    gate no longer lets it through after the wait, the redeem's use is given back
+    (_publiclink_refund_use)."""
     import time as _t
     from app.core.id_scope import id_in_scope
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
@@ -14305,43 +14312,55 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
     def _deny():
         raise HTTPException(status_code=404, detail="This file is not available.")
 
-    if not note_link_policy.public_file_links_enabled(_global_settings_blob(db)):
-        _deny()
-
     token_hash = _publiclink_token_hash(token)
-    link = db.query(PublicLink).filter(PublicLink.token_hash == token_hash).first()
-    # Not _notelink_status: a link whose last use this grant's redeem spent reads "exhausted", and one
-    # that expired after the grant was minted reads "expired", yet both still owe this download. The
-    # expiry is checked against the grant's mint time when the grant is consumed, below.
-    if not link or link.revoked:
-        _deny()
 
-    live = _publiclink_resolve_live(db, link)
-    if live is None:
-        _deny()
-    vault, owner = live
+    def _gates():
+        """(link, vault, file) when every gate lets the download through, None otherwise. Asked at the door, and
+        again once the download has its transfer slot."""
+        if not note_link_policy.public_file_links_enabled(_global_settings_blob(db)):
+            return None
+        link = db.query(PublicLink).filter(PublicLink.token_hash == token_hash).first()
+        # Not _notelink_status: a link whose last use this grant's redeem spent reads "exhausted", and one
+        # that expired after the grant was minted reads "expired", yet both still owe this download. The
+        # expiry is checked against the grant's mint time when the grant is consumed, below.
+        if not link or link.revoked:
+            return None
 
-    # The requested file must exist in the vault, not have expired, and carry no file password
-    # (added-since-mint → 404).
-    file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault.id,
-                                        file_expiry.live_clause()).first()
-    if not file_record or file_record.password_hash:
-        _deny()
+        live = _publiclink_resolve_live(db, link)
+        if live is None:
+            return None
+        vault, _owner = live
 
-    # The file must lie inside the link's target subtree, and no ancestor folder up to the target may
-    # have acquired a password since minting (a password added later must bite here).
-    ancestors = folder_ancestry(db, vault.id, file_record.folder_id)
-    if not id_in_scope(_publiclink_target_scope(link), str(file_id), ancestors):
+        # The requested file must exist in the vault, not have expired, and carry no file password
+        # (added-since-mint → 404).
+        file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault.id,
+                                            file_expiry.live_clause()).first()
+        if not file_record or file_record.password_hash:
+            return None
+
+        # The file must lie inside the link's target subtree, and no ancestor folder up to the target may
+        # have acquired a password since minting (a password added later must bite here).
+        ancestors = folder_ancestry(db, vault.id, file_record.folder_id)
+        if not id_in_scope(_publiclink_target_scope(link), str(file_id), ancestors):
+            return None
+        protected = db.query(Folder.id).filter(Folder.vault_id == vault.id,
+                                              Folder.id.in_([a for a in ancestors] or [None]),
+                                              Folder.password_hash.isnot(None)).first()
+        if protected is not None:
+            return None
+        return link, vault, file_record
+
+    gated = _gates()
+    if gated is None:
         _deny()
-    protected = db.query(Folder.id).filter(Folder.vault_id == vault.id,
-                                          Folder.id.in_([a for a in ancestors] or [None]),
-                                          Folder.password_hash.isnot(None)).first()
-    if protected is not None:
-        _deny()
+    link, vault, file_record = gated
+    # Copied out: the wait for a slot below ends the read transaction, which expires the rows (and a link
+    # deleted meanwhile could not be read again).
+    link_id, vault_id = link.id, vault.id
 
     # Consume the single-use grant (bound to this link + client IP, minted before the link expired).
     # A miss = uniform 404.
-    if not _publiclink_consume_grant(presented_grant, link.id, client_ip, expires_at=link.expires_at):
+    if not _publiclink_consume_grant(presented_grant, link_id, client_ip, expires_at=link.expires_at):
         _deny()
 
     # Everything authorized: open the blob for streaming (no principal — the equivalent of the authed
@@ -14363,11 +14382,26 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
     transfer_slot = None
     download = None
     try:
+        # Waits holding no connection (nothing is pending: the gates only read, and the grant is spent in
+        # Redis). A download that waited holding its read transaction kept a connection each, and enough of
+        # them, beside the transfers streaming, held the whole pool: nobody was answered.
+        db.rollback()
         try:
             transfer_slot = await transfer_admission.acquire()
         except TransferBusy as busy:
-            await _publiclink_settle_failure(request, db, link.id, vault.id, file_id, "busy", client_ip)
+            await _publiclink_settle_failure(request, db, link_id, vault_id, file_id, "busy", client_ip)
             raise _busy_response(busy)
+        # Asked again with the slot held: the link may have been revoked, its owner removed, its vault given a
+        # password, or the file deleted, replaced or moved out of the link's subtree while it waited. Nothing
+        # was delivered, so the use goes back, as for a server failure (unless the client has gone).
+        gated = _gates()
+        if gated is None:
+            transfer_admission.release(transfer_slot)
+            transfer_slot = None
+            await _publiclink_settle_failure(request, db, link_id, vault_id, file_id, "no_longer_available",
+                                             client_ip)
+            _deny()
+        link, vault, file_record = gated
         download = vault_service._open_stored_file(file_record, vault, file_id, whole=False)
         pieces = download.chunks()
         first = next(pieces, None)
@@ -14399,7 +14433,7 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
         if transfer_slot is not None:
             transfer_admission.release(transfer_slot)
         reason = _publiclink_failure_reason(exc)
-        await _publiclink_settle_failure(request, db, link.id, vault.id, file_id, reason, client_ip)
+        await _publiclink_settle_failure(request, db, link_id, vault_id, file_id, reason, client_ip)
         if reason == "internal_error":
             # Not a stored file that could not be served: say where, for the operator (the class and
             # the place, never the message, which can carry values), and answer as for any other.
@@ -14412,7 +14446,7 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
         audit_logger.log_action(
             action="public_link_download", status="authorized", user=None,
             resource_type="file", resource_id=str(file_id),
-            details={"vault_id": str(vault.id), "public_link_id": str(link.id),
+            details={"vault_id": str(vault_id), "public_link_id": str(link_id),
                      "file_name": file_name}, ip_address=client_ip)
     except Exception:
         pass
@@ -14436,7 +14470,7 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
             # Count only a completed transfer against the owner's card + oversight counters.
             try:
                 from sqlalchemy import update as _sa_update2
-                db.execute(_sa_update2(PublicLink).where(PublicLink.id == link.id).values(
+                db.execute(_sa_update2(PublicLink).where(PublicLink.id == link_id).values(
                     download_count=PublicLink.download_count + 1,
                     bytes_served=PublicLink.bytes_served + state["served"]))
                 db.commit()
@@ -14451,7 +14485,7 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
                 action="public_link_download_completed",
                 status="success" if state["terminal_success"] else "failed", user=None,
                 resource_type="file", resource_id=str(file_id),
-                details={"vault_id": str(vault.id), "public_link_id": str(link.id),
+                details={"vault_id": str(vault_id), "public_link_id": str(link_id),
                          "bytes_sent": state["served"], "total_bytes": total_size,
                          "outcome": ("completed" if state["terminal_success"]
                                      else "disconnected" if state["disconnected"]
@@ -22355,20 +22389,31 @@ async def download_file(
         # transfer slot is taken: naming a file that is not there costs nothing to answer, and a
         # caller who is going to be told 404 should not first be made to queue behind real
         # transfers -- nor should the attempt show up as load the deployment shed.
-        file_record = db.query(File).filter(
-            File.id == file_id, File.vault_id == vault_id, file_expiry.live_clause()
-        ).first()
-        if not file_record:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="File not found",
-            )
+        def _the_file():
+            record = db.query(File).filter(
+                File.id == file_id, File.vault_id == vault_id, file_expiry.live_clause()
+            ).first()
+            if not record:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="File not found",
+                )
+            return record
+
+        _the_file()
+        token = _bearer_credentials(request).credentials
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
 
         operation_id = f"download_{uuid.uuid4()}"
-        try:
-            transfer_slot = await transfer_admission.acquire()
-        except TransferBusy as busy:
-            raise _busy_response(busy)
+        # Waits holding no connection, then asks again what let it in, and reads the file's row again: the file
+        # may have been deleted or replaced, and the session, the scope or the vault's password changed, while it
+        # waited.
+        transfer_slot = await _admitted_holding_no_connection(db)
+        current_user, vault = _admitted_again(db, token, vault_id, password_hash_before, "FILE_DOWNLOAD",
+                                              "file.download", allow_share=True)
+        require_file_scope(db, current_user, vault_id, file_id)
+        require_download_scope(db, current_user, vault_id, file_id)
+        file_record = _the_file()
         start_operation(operation_id)
 
         # Atomically consume a capped share download before serving bytes. This one stays AFTER
@@ -23171,20 +23216,30 @@ async def preview_render_file(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail="Rendered preview is not available for zero-knowledge vaults.")
 
-        file_record = db.query(File).filter(File.id == file_id, File.vault_id == vault_id,
-                                            file_expiry.live_clause()).first()
-        if file_record is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-        if (file_record.size_bytes or 0) > _MAX_PREVIEW_RENDER_BYTES:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                                detail="File is too large to render inline; download it to view it.")
+        def _the_file():
+            record = db.query(File).filter(File.id == file_id, File.vault_id == vault_id,
+                                           file_expiry.live_clause()).first()
+            if record is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+            if (record.size_bytes or 0) > _MAX_PREVIEW_RENDER_BYTES:
+                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                    detail="File is too large to render inline; download it to view it.")
+            return record
+
+        _the_file()
+        token = _bearer_credentials(request).credentials
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
 
         # Load-shed like /download: refuse under pressure rather than queue a CPU-bound render onto
-        # the event loop. Taken AFTER the cheap 404/413 answers so a rejected caller never queues.
-        try:
-            transfer_slot = await transfer_admission.acquire()
-        except TransferBusy as busy:
-            raise _busy_response(busy)
+        # the event loop. Taken AFTER the cheap 404/413 answers so a rejected caller never queues, and
+        # waited for holding no connection; what let it in is asked again once it has its slot, and the
+        # file's row read again (a file replaced meanwhile may now be too large).
+        transfer_slot = await _admitted_holding_no_connection(db)
+        current_user, _ = _admitted_again(db, token, vault_id, password_hash_before, "FILE_DOWNLOAD",
+                                          "file.download")
+        require_file_scope(db, current_user, vault_id, file_id)
+        require_download_scope(db, current_user, vault_id, file_id)
+        file_record = _the_file()
 
         # Bounded by the size gate above. download_file re-checks the same access/scope internally.
         content, name, _mime = vault_service.download_file(
@@ -23397,24 +23452,66 @@ def _gate_move_copy_destination(db, vault_service, current_user, dest_vault_id, 
 
 
 async def _admitted_holding_no_connection(db):
-    """A transfer slot for a direct upload, a copy, a move or a folder copy, with the same answer as every
-    transfer's when the deployment is full (503 with Retry-After).
+    """A transfer slot for a download, a preview, a direct upload, a copy, a move or a folder copy, with the same
+    answer as every transfer's when the deployment is full (503 with Retry-After).
 
-    Each of them runs to its end in a thread (app/core/off_loop.py) on the request's database connection: a copy
-    reads, decrypts, encrypts and syncs a whole file, a folder copy every file in the tree. Copies were not
-    admitted, and a burst of them held every connection of the pool: the next request's first query waited for
-    one on the event loop, which answers every request. Admitted, they hold at most as many connections as the
-    ceilings admit transfers, and the pool is sized beyond that (app/core/database.py).
+    Each of them holds the request's database connection while it runs: a download while it streams, a copy in a
+    thread (app/core/off_loop.py) that reads, decrypts, encrypts and syncs a whole file, a folder copy every file in
+    the tree. The ceilings bound how many run, and the pool is sized beyond that (app/core/database.py). A request
+    waiting for its slot must hold none: waiting requests are bounded by the queue (32 by default), not by the
+    ceiling, and when downloads waited holding their read transaction, 16 streaming and 32 waiting held the whole
+    pool, and the server stopped answering anyone.
 
     Called after the checks that cost nothing to answer, so a caller told 403 or 404 is not first made to queue.
     The request's read transaction ends first (nothing is pending: the checks only read, and get_vault commits),
-    so a request waiting for a slot holds no connection meanwhile: waiting requests are not bounded by the
-    ceiling, only by its queue."""
+    so a request waiting for a slot holds no connection meanwhile. Ending it expires what the session loaded: a
+    caller copies out what it needs before (its ids, the vault's password hash), and asks what let it in again
+    once it has its slot (_admitted_again), reading its rows again."""
     db.rollback()
     try:
         return await transfer_admission.acquire()
     except TransferBusy as busy:
         raise _busy_response(busy)
+
+
+def _vault_again(db, user, vault_id, password_hash_before, *, allow_share=False):
+    """A vault's access check asked again after a wait, with its password compared, not verified: see
+    _admitted_again. Returns the vault."""
+    vault = VaultService(db, PermissionService(db)).get_vault(
+        vault_id, user, None, require_password=False, allow_share=allow_share)
+    if _vault_credential_fingerprint(db, vault_id) != password_hash_before:
+        raise PasswordRequiredError(
+            "This vault's password changed while the transfer waited for its turn. Enter the password again.")
+    return vault
+
+
+def _admitted_again(db, token, vault_id, password_hash_before, group_name, cap, *, allow_share=False):
+    """What let a transfer in, asked again once it has its slot; returns the principal and the vault the rest of the
+    request must use.
+
+    A transfer waits for its slot holding no connection (_admitted_holding_no_connection), for up to the queue's
+    wait (TRANSFER_QUEUE_WAIT_SECONDS: 20 s by default, up to an hour). Every decision that let it in is about a
+    world that may have moved meanwhile: the session signed out or ended by an administrator, the account
+    deactivated or locked, a temporary credential switched off or its scope narrowed, a membership or a share
+    removed, the vault's password changed. Each exists to stop what this principal does, so it stops a transfer
+    that has not started yet too. Asked in the order the door asks it: the principal (get_current_user's decision,
+    _user_for_token, from the request's bearer token; a temporary credential's scope is read again with it), the
+    endpoint permission and the vault capability (the route's decorators), then the vault's access check
+    (membership, group access, a share when `allow_share`, a temporary credential's vault scope). The caller then
+    asks its own item checks again and reads its rows again.
+
+    Synchronous, so a copy asks it in the thread its work runs in, with nothing between the answer and the work.
+
+    The vault's password is compared, not verified again, as after a chunk's body (_reauthorize_after_body): the
+    request's password was checked against `password_hash_before` (the vault's password hash then, None for none),
+    and a vault whose password was set, cleared or changed meanwhile is refused. Verifying it again would count
+    against the vault's password throttle, and redeem a temporary credential's passcode a second time."""
+    from app.core.endpoint_permissions import check_endpoint_permission
+    from app.core.temp_scope import require_cap
+    user = _user_for_token(token, db)
+    check_endpoint_permission(db, user, group_name, {"vault_id": vault_id, "db": db})
+    require_cap(user, vault_id, cap)
+    return user, _vault_again(db, user, vault_id, password_hash_before, allow_share=allow_share)
 
 
 @app.post("/vaults/{vault_id}/files/{file_id}/copy")

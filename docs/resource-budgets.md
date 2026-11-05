@@ -264,7 +264,12 @@ distinct from a failure, so a client can tell "come back shortly" from "this fil
 
 **A transfer also holds a database connection while it runs.** Upload assembly, a copy and a move
 run in threads of their own, each on its request's connection, and a download holds one while it
-streams; an upload, a copy or a move waiting for a slot holds none. The API's connection pool is
+streams; a transfer waiting for a slot holds none (a download, a preview or a public link's download
+waited holding one, and 16 streaming with 32 waiting held the whole pool: nobody was answered). Once a
+download or a preview that waited has its slot, what let it in is asked again: the session, the
+account, a temporary credential's scope, the vault's access and its password (a changed password
+refuses it), and the file's row, so a sign-out or a change made during the wait applies to it; a
+public link's download asks its link's gates again. The API's connection pool is
 therefore sized from the ceiling: one connection for each transfer the two ceilings admit (this one
 and the upload links' quarter of it), 8 for sign-ins, and 10 more for everything else the server
 answers meanwhile: 38 at the default ceiling, never fewer than 30. Before copies and moves were
