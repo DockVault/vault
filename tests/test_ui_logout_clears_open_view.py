@@ -128,7 +128,7 @@ def test_logout_resets_the_active_section_and_clears_the_vault_header():
     `pytest -m unit` run nothing else would notice this being removed.
     """
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
-    start = app.index("function logout()")
+    start = app.index("function logout(")
     body = app[start:app.index("\nfunction ", start + 1)]
 
     assert "content-section" in body, (

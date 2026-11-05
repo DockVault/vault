@@ -60,7 +60,8 @@ RATE_LIMIT_EXCLUDE_PATHS = ("/docs", "/openapi.json", "/redoc", "/health")
 def classify_api_rate_limit(method: str, path: str) -> str:
     """Return one general-API class with auth > upload(_chunk) > download > poll > default precedence.
 
-    Auth covers every /auth route plus logout. A resumable upload's per-CHUNK PUTs go to their own
+    Auth covers every /auth route plus logout (the web app's sign-out at the auth budget in a bucket
+    of its own: SIGN_OUT_BUCKET, below). A resumable upload's per-CHUNK PUTs go to their own
     high-limit `upload_chunk` bucket (one upload is dozens–thousands of requests, so they must NOT
     share the small operation-level `upload` bucket used for init/complete — that throttled large
     files mid-transfer). Download covers the file-content GET. Poll covers the timer-polled read
@@ -99,6 +100,42 @@ def classify_api_rate_limit(method: str, path: str) -> str:
     if method == "GET" and path in POLL_GET_PATHS:
         return "poll"
     return "default"
+
+
+# The web app's sign-out, POST /auth/sign-out. It is in the auth class, at that class's limit and window, but it
+# is counted in a bucket of its own (SIGN_OUT_BUCKET), by the session its token names whether or not the token has
+# expired (RateLimitMiddleware._get_client_identifier: SIGN_OUT_SESSION_PREFIX and the session's hash); a token
+# that names no session (one this server did not sign, a second-factor pending token, none) is counted by address,
+# in that bucket too. Sign-outs come in bursts that are nobody's abuse: every tab of a session signs out at the
+# same moment, a session that has run out is signed out with its expired token, and the person signs in again from
+# the same address a moment later. Counted with the sign-ins, by address (an expired token names no one to the
+# other readers), those sign-outs used up that sign-in. Counted by the account, the sign-outs sent with any token
+# the server ever signed for it (one that has run out, one already signed out, a temporary credential's, whose
+# account is its owner's) used up the sign-out of the account's other sessions, which then stayed valid. By the
+# session, they use up only that session's own.
+SIGN_OUT_PATH = "/auth/sign-out"
+SIGN_OUT_BUCKET = "auth_sign_out"
+SIGN_OUT_SESSION_PREFIX = "session:"
+
+
+def is_sign_out_request(method: str, path: str) -> bool:
+    """Whether a request is the web app's sign-out (method and path as classify_api_rate_limit reads them)."""
+    return (method or "").upper() == "POST" and ((path or "/").rstrip("/") or "/") == SIGN_OUT_PATH
+
+
+def sign_out_session_of(token: str) -> Optional[str]:
+    """Who a sign-out sent with `token` is counted against: SIGN_OUT_SESSION_PREFIX and the hash of the session the
+    token names (the hash the server keeps of it, as in active_sessions and denylist:session:*), for a token this
+    server signed that names one, expired or not (verify_access_token_for_sign_out, as the route reads it). None for
+    any other token: one this server did not sign, one over the length limit, a second-factor pending token (it
+    names no session), garbage."""
+    from app.core.security import verify_access_token_for_sign_out
+    from app.core.session_hash_utils import hash_session_token
+    payload = verify_access_token_for_sign_out(token)
+    session_token = payload.get("session_token") if isinstance(payload, dict) else None
+    if not isinstance(session_token, str) or not session_token:
+        return None
+    return SIGN_OUT_SESSION_PREFIX + hash_session_token(session_token)
 
 
 def resolve_api_rate_limit_policy(
@@ -801,7 +838,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         })
         self.exclude_paths = exclude_paths or list(RATE_LIMIT_EXCLUDE_PATHS)
     
-    def _get_client_identifier(self, request: Request) -> str:
+    def _get_client_identifier(self, request: Request, sign_out: bool = False) -> str:
         """
         Extract client identifier from request.
 
@@ -815,22 +852,40 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         still buckets by trusted-proxy-aware IP. The token decode is best-effort — a missing or
         invalid token silently falls through to the IP bucket (the request will be rejected by the
         real auth dependency downstream anyway).
-        """
-        # 1. Explicit request.state (kept for forward-compat with an auth middleware).
-        if hasattr(request.state, "user_id") and request.state.user_id:
-            return f"user:{request.state.user_id}"
 
-        # 2. Best-effort identity from the bearer token (HS256 decode is cheap; no DB lookup).
+        `sign_out` (the web app's sign-out, is_sign_out_request): counted by the session its token
+        names, never by the account (sign_out_session_of: the token read as that route reads it,
+        expired or not, its signature checked all the same), so the sign-out of a session that has run
+        out is counted as the sign-out of a live one is, and no other token of the account, expired,
+        signed out or a temporary credential's, can use up that session's sign-out. A token that names
+        no session is counted by address.
+        """
         auth = request.headers.get("Authorization") or request.headers.get("authorization")
-        if auth and auth.lower().startswith("bearer "):
-            try:
-                from app.core.security import verify_access_token
-                payload = verify_access_token(auth.split(" ", 1)[1].strip())
-                sub = payload.get("sub") if payload else None
-                if sub:
-                    return f"user:{sub}"
-            except Exception:
-                pass  # fall through to IP
+        bearer = auth.split(" ", 1)[1].strip() if auth and auth.lower().startswith("bearer ") else None
+
+        if sign_out:
+            if bearer:
+                try:
+                    session = sign_out_session_of(bearer)
+                    if session:
+                        return session
+                except Exception:
+                    pass  # by address
+        else:
+            # 1. Explicit request.state (kept for forward-compat with an auth middleware).
+            if hasattr(request.state, "user_id") and request.state.user_id:
+                return f"user:{request.state.user_id}"
+
+            # 2. Best-effort identity from the bearer token (HS256 decode is cheap; no DB lookup).
+            if bearer is not None:
+                try:
+                    from app.core.security import verify_access_token
+                    payload = verify_access_token(bearer)
+                    sub = payload.get("sub") if payload else None
+                    if sub:
+                        return f"user:{sub}"
+                except Exception:
+                    pass  # fall through to IP
 
         # 3. Fall back to IP — trusted-proxy aware (a direct client can't spoof X-Forwarded-For), kept
         # under the address's throttle subject (an IPv6 address grouped to its /64).
@@ -866,14 +921,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             except Exception:  # noqa: BLE001 - retain deployment defaults on provider failure
                 logger.warning("Could not resolve the live API rate-limit policy; using deployment defaults")
         rule = policy.get(category, self._static_policy["default"])
-        identifier = self._get_client_identifier(request)
+        # The web app's sign-out: the auth class's rule, in a bucket of its own (SIGN_OUT_BUCKET), by the session
+        # its token names (_get_client_identifier).
+        sign_out = category == "auth" and is_sign_out_request(request.method, path)
+        identifier = self._get_client_identifier(request, sign_out=sign_out)
+        bucket = SIGN_OUT_BUCKET if sign_out else category
 
         # Class prefixes isolate budgets: traffic in one class cannot consume another.
         allowed, remaining, reset_time = self.rate_limiter.check_rate_limit(
             identifier,
             rule.limit,
             rule.window,
-            prefix=f"rate_limit:api:{category}",
+            prefix=f"rate_limit:api:{bucket}",
         )
         headers = self.rate_limiter.get_rate_limit_headers(
             rule.limit,

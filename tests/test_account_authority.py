@@ -284,6 +284,7 @@ OWN_ACCOUNT = {
     ("POST", "/users/me/second-factor/totp/enroll"): "the caller's own second factor",
     ("POST", "/auth/temp-credentials"): "a temporary credential for the caller's own account",
     ("POST", "/api/logout"): "the caller's own session",
+    ("POST", "/auth/sign-out"): "the session of the token sent, which is the caller's own",
     ("POST", "/auth/second-factor/step-up"): "the caller's own second factor, used for a step-up",
     ("POST", "/auth/second-factor/verify"): "the second factor of the account signing in, after its password",
 }

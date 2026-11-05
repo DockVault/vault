@@ -72,10 +72,10 @@ jobs:
   # disposable stack built from this commit. Both need only preflight, so they run side by side.
   #
   # - integration: the whole suite, once, against the shipped configuration.
-  # - scenarios: six steps that each reconfigure the stack (a transfer ceiling that refuses, log
-  #   pull switched on, a vault-type allowlist, a Redis outage, a login limit of five, a small
-  #   device-sync limit), recreate the API, run the few files that need that configuration, and
-  #   put the shipped value back.
+  # - scenarios: seven steps that each reconfigure the stack (a transfer ceiling that refuses, log
+  #   pull switched on, a vault-type allowlist, no storage ceiling, a Redis outage, a login limit
+  #   of five, a small device-sync limit), recreate the API, run the few files that need that
+  #   configuration, and put the shipped value back.
   #
   # The scenarios used to follow the suite in this job and took about 7.4 of its minutes. With
   # them in, the 0.32.6 job measured 49.5 minutes against a 60-minute cap, and the tests 0.33.0
@@ -346,7 +346,9 @@ jobs:
     runs-on: ubuntu-latest
     # In the suite's job, setup took about two minutes and the six steps 7.4. 30 minutes is about
     # three times that: room for a slow day, and a hang is still reported in half an hour rather
-    # than consuming the suite's cap.
+    # than consuming the suite's cap. The seventh, the size accounting with no storage ceiling,
+    # adds about a minute and a half (its file took 39 seconds when measured, plus two recreates
+    # of the API).
     timeout-minutes: 30
 
     steps:
@@ -659,6 +661,85 @@ jobs:
             if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
             if [ "$attempt" -eq 40 ]; then
               echo "::error::vault-api did not return after restoring the permissive allowlist"
+              exit 1
+            fi
+            sleep 3
+          done
+
+      # Both stack jobs set MAX_STORAGE_GB=64, so there every upload, copy and move that finishes
+      # takes the deployment's storage turn as well as the vault's row lock. The shipped default
+      # sets no ceiling, and then the vault's row lock alone keeps a vault inside its size limit
+      # when files finish at the same moment: that was checked by the offline lane only. So the
+      # size-accounting file runs once more with the ceiling removed and no live limit saved, which
+      # is asserted before the tests run, and its report must show every test in it ran. Before
+      # the throttle steps below, which leave a login limit of five that these tests' sign-ins
+      # would exceed.
+      - name: Exercise the size accounting with no storage ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '/^MAX_STORAGE_GB=/d' .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not come back without the storage ceiling"
+              exit 1
+            fi
+            sleep 3
+          done
+          python - <<'PY'
+          import os
+          import sys
+
+          import requests
+
+          BASE = "http://127.0.0.1:8200"
+          login = requests.post(
+              f"{BASE}/auth/login",
+              json={"username": os.environ["VAULT_ADMIN_USER"],
+                    "password": os.environ["VAULT_ADMIN_PASS"]},
+              timeout=15,
+          )
+          login.raise_for_status()
+          settings = requests.get(
+              f"{BASE}/settings",
+              headers={"Authorization": f"Bearer {login.json()['access_token']}"},
+              timeout=15,
+          )
+          settings.raise_for_status()
+          body = settings.json()
+          if body.get("deployment_storage_max_gb") is not None or body.get("deployment_storage_limit_bytes") is not None:
+              sys.exit(
+                  "::error::the deployment still has a storage limit "
+                  f"(maximum {body.get('deployment_storage_max_gb')!r} GB, limit "
+                  f"{body.get('deployment_storage_limit_bytes')!r} bytes), so the tests below would "
+                  "not check the vault's row lock on its own"
+              )
+          print("no storage ceiling and no live limit")
+          PY
+          python -m pytest tests/test_vault_size_accounting.py --maxfail=1 --junitxml=size-junit.xml
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("size-junit.xml").getroot()
+          cases = [c for c in root.iter("testcase")
+                   if c.get("classname", "").endswith("test_vault_size_accounting")]
+          ran = [c.get("name") for c in cases
+                 if c.find("skipped") is None and c.find("failure") is None and c.find("error") is None]
+          print(f"size accounting without a ceiling: {len(ran)} of {len(cases)} ran and passed")
+          for name in ran:
+              print(f"  ran: {name}")
+          if len(cases) < 7 or len(ran) != len(cases):
+              sys.exit("::error::the size-accounting tests did not all run without the ceiling")
+          PY
+          echo 'MAX_STORAGE_GB=64' >> .env
+          docker compose up -d --force-recreate vault-api
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::vault-api did not return after restoring the storage ceiling"
               exit 1
             fi
             sleep 3

@@ -1560,13 +1560,15 @@ function _sfError(node, msg) {
     node.style.display = 'block';
 }
 
-function _sfRestoreLoginForm() {
+// policyWhenShown: ask for the screen's policy when the tab is next shown, not now (a tab told of a sign-out).
+function _sfRestoreLoginForm(policyWhenShown) {
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
     const form = document.getElementById('login-form');
     if (form) { form.reset(); form.style.display = ''; }
     const forgot = document.getElementById('forgot-toggle');
-    if (forgot && typeof applyLoginPolicyLabel === 'function') { try { applyLoginPolicyLabel(); } catch (_) {} }
+    if (forgot && policyWhenShown === true) _refreshLoginPolicyWhenShown();
+    else if (forgot && typeof applyLoginPolicyLabel === 'function') { try { applyLoginPolicyLabel(); } catch (_) {} }
     const uf = document.getElementById('username');
     if (uf) uf.focus();
 }
@@ -1932,12 +1934,116 @@ function _buildStepUpBody(action, methods) {
     if (!codeInput && pwInput) pwInput.focus();
 }
 
-// Logout
-function logout() {
+// ----------------------------------------------------------------------------------------------------------------
+// Ending the session on the server at a sign-out.
+//
+// Every sign-out goes through logout(): the sign-out button, a refusal of the session (it ran out, it was ended
+// elsewhere, the account was locked) answered with a 401 or an account's 403, a refusal of the sign-in check at
+// load, a sign-out after a two-factor sign-in, and a sign-out in another tab of this browser (below). logout()
+// signs the page out at once, asks the server to end the session it held (POST /auth/sign-out), so that its token
+// is refused everywhere from then on rather than until it expires, and tells this browser's other tabs. The page
+// never waits for that answer: offline, refused or slow, it is signed out all the same.
+//
+// Two sign-outs are this tab's alone, and neither ends the session nor tells another tab:
+// - SIGN_OUT_THIS_TAB: the sign-in check at load could not be answered (no answer at all, a server error such as a
+//   proxy's 502 or 503 while the vault restarts, a rate limit). That says nothing about the session, which other
+//   tabs may still be using: this tab goes to the sign-in screen, as it always did, and nothing else changes.
+// - SIGN_OUT_TOLD: another tab has just ended this session and said so. That tab has sent the call; this one sends
+//   nothing, tells nobody, and does not ask for the sign-in screen's policy again until it is next shown. Every tab
+//   of a session is told at once: a call from each would only meet the sign-out's own limit, and each tab's request
+//   for that policy (sent without a token) draws on the budget of the address the person signs in from again a
+//   moment later.
+//
+// Not POST /api/logout: its answer carries Clear-Site-Data, which clears this origin's storage in every tab (the
+// skin and theme read before the page paints, saved zero-knowledge uploads, the download worker).
+//
+// A preference saved at the sign-out (the Activity page's page size, saved as the page is left) is sent before
+// the session ends, or the server would refuse it: the call waits for saves still on their way, at most
+// SIGN_OUT_WAIT_MS. Once sent, the request is kept alive, so it completes even when the page goes away; a page
+// closed while it still waits for such a save sends nothing, and that session then ends when it expires.
+const SIGN_OUT_THIS_TAB = 'this-tab';
+const SIGN_OUT_TOLD = 'told';
+const SIGN_OUT_WAIT_MS = 3000;
+const _preferenceSaves = new Set();
+
+function _endServerSession(token) {
+    if (!token) return;
+    _tellOtherTabsSignedOut(token);
+    let sent = false;
+    const send = () => {
+        if (sent) return;
+        sent = true;
+        try {
+            fetch(`${API_BASE}/auth/sign-out`, {
+                method: 'POST', keepalive: true, cache: 'no-store',
+                headers: { 'Authorization': `Bearer ${token}` },
+            }).catch(() => {});
+        } catch (_) { /* signed out all the same */ }
+    };
+    const saving = Array.from(_preferenceSaves);
+    if (!saving.length) { send(); return; }
+    Promise.allSettled(saving).then(send);
+    setTimeout(send, SIGN_OUT_WAIT_MS);
+}
+
+// A sign-out in another tab of this browser. The tabs share one stored session, so the session another tab has
+// just ended is this tab's too when it holds the same token: told so, this tab signs out at once, instead of at its
+// next request (which the server now refuses), and without a request of its own (SIGN_OUT_TOLD). Only the token's
+// last characters (its signature's) are sent, to tell the token apart; a tab of another account, signed in since,
+// is left alone.
+let _signOutChannel = null;
+try { if (typeof BroadcastChannel === 'function') _signOutChannel = new BroadcastChannel('dockvault-sign-out'); } catch (_) {}
+
+function _tokenTail(token) { return String(token || '').slice(-24); }
+
+function _tellOtherTabsSignedOut(token) {
+    try { if (_signOutChannel) _signOutChannel.postMessage({ type: 'signed-out', token: _tokenTail(token) }); } catch (_) {}
+}
+
+if (_signOutChannel) {
+    _signOutChannel.addEventListener('message', (event) => {
+        const told = event && event.data;
+        if (!told || told.type !== 'signed-out' || !authToken || told.token !== _tokenTail(authToken)) return;
+        logout(SIGN_OUT_TOLD);
+        try { showInfo('Signed out in another tab.'); } catch (_) {}
+    });
+}
+
+// The sign-in screen's policy (which identifier it asks for, the sign-up and reset links), asked for again when a
+// tab told of a sign-out is next shown or focused rather than at once (SIGN_OUT_TOLD): once, and only while the tab
+// is still signed out.
+let _loginPolicyWhenShown = null;
+
+function _refreshLoginPolicyWhenShown() {
+    if (_loginPolicyWhenShown) return;
+    const refresh = (event) => {
+        if (event && event.type === 'visibilitychange' && document.visibilityState !== 'visible') return;
+        document.removeEventListener('visibilitychange', refresh);
+        window.removeEventListener('focus', refresh);
+        _loginPolicyWhenShown = null;
+        if (!authToken && typeof applyLoginPolicyLabel === 'function') { try { applyLoginPolicyLabel(); } catch (_) {} }
+    };
+    _loginPolicyWhenShown = refresh;
+    document.addEventListener('visibilitychange', refresh);
+    window.addEventListener('focus', refresh);
+}
+
+// Sign the page out. `how` is SIGN_OUT_THIS_TAB or SIGN_OUT_TOLD (see above); anything else, the click event the
+// sign-out buttons pass among them, is a full sign-out.
+function logout(how) {
+    const mode = (how === SIGN_OUT_THIS_TAB || how === SIGN_OUT_TOLD) ? how : 'end';
+    const endingToken = authToken;
+    // A tab told late (one the browser had frozen in the background gets the message when it wakes) may find that
+    // the person has signed in again since in another tab: the session stored for this browser is then that new
+    // one, and is not this tab's to clear.
+    const storedToken = storage.getItem('authToken');
+    const anotherSessionStored = mode === SIGN_OUT_TOLD && !!storedToken && storedToken !== endingToken;
     // The Activity page first, while the session still holds its token: a page size or range chosen in
     // the last second, which the page saves to the account a second after the last change, is saved now.
     // It also forgets everything it held, so none of it carries over to the next person on this tab.
     if (typeof window.resetActivity === 'function') { try { window.resetActivity(); } catch (_) {} }
+    // Then the session is ended on the server (see above), after that save.
+    if (mode === 'end') _endServerSession(endingToken);
     authToken = null;
     currentUser = null;
     userPermissions = [];
@@ -1947,8 +2053,9 @@ function logout() {
     isScopedTemp = false;
     zkResetKeys();  // drop the in-memory ECC private key + per-vault DEKs
     // Wipe any saved zero-knowledge upload ciphertext too — on a shared machine it must
-    // not outlive the session (it's opaque without the DEK, but matches the scrub above).
-    try { zkUploadStore.clear(); } catch (_) {}
+    // not outlive the session (it's opaque without the DEK, but matches the scrub above). Not when another
+    // session is stored for this browser since (above): what is saved now is that session's.
+    if (!anotherSessionStored) { try { zkUploadStore.clear(); } catch (_) {} }
     // Re-arm the once-per-session pending-invite prompt so a DIFFERENT keyless user who
     // logs in on this same tab (no page refresh) is still prompted to set up a key.
     _zkInvitePrompted = false;
@@ -2037,11 +2144,14 @@ function logout() {
     try { sessionStorage.removeItem('dv_remembered'); } catch (_) {}
     try { sessionStorage.removeItem('dv_nav'); } catch (_) {}
 
-    // Clear storage with helper (handles both localStorage and sessionStorage)
-    storage.removeItem('authToken');
-    storage.removeItem('currentUser');
-    storage.removeItem('userPermissions');
-    storage.removeItem('isScopedTemp');
+    // Clear storage with helper (handles both localStorage and sessionStorage), but for a session stored since by
+    // another tab (above).
+    if (!anotherSessionStored) {
+        storage.removeItem('authToken');
+        storage.removeItem('currentUser');
+        storage.removeItem('userPermissions');
+        storage.removeItem('isScopedTemp');
+    }
 
     // Clear the pre-paint boot state so the splash-override CSS releases and the
     // login screen shows (matters when logout runs from the boot verify path).
@@ -2049,7 +2159,8 @@ function logout() {
     // The sign-in form as the login screen's own "Back to sign in" leaves it: emptied and shown, with the second
     // step's card empty and hidden. A two-factor sign-in hides the form for its second step and nothing else
     // shows it again, so after such a sign-in the next person found a login screen with no fields to sign in with.
-    _sfRestoreLoginForm();
+    // A tab told of the sign-out asks for the screen's policy when it is next shown (_refreshLoginPolicyWhenShown).
+    _sfRestoreLoginForm(mode === SIGN_OUT_TOLD);
     // Dismiss any dialog still standing, and empty what it was holding.
     //
     // showScreen only swaps `.screen` elements; a modal is not one, so a dialog open at logout is
@@ -21969,6 +22080,18 @@ function cleanupPreviousView(newSection) {
 // SESSION BOOT + PREFERENCE SYNC
 // ============================================================================
 
+// Whether the server refused the session itself at the sign-in check: a 401, or a 403 of the account (inactive,
+// locked, its session terminated), the two answers apiRequest signs out on. Anything else (a server error, a
+// proxy's 502 or 503 while the vault restarts, a rate limit's 429) says nothing about the session.
+async function _refusesTheSession(resp) {
+    if (resp.status === 401) return true;
+    if (resp.status !== 403) return false;
+    let detail = '';
+    try { const body = await resp.json(); detail = body && body.detail; } catch (_) { return false; }
+    return typeof detail === 'string'
+        && (detail.includes('inactive') || detail.includes('terminated') || detail.includes('locked'));
+}
+
 // Verify a cached session token with the server, then reveal the dashboard. Runs
 // while the pre-paint boot splash (auth-boot.js) is showing, so an EXPIRED token
 // bounces straight to login without ever flashing the app shell.
@@ -21977,15 +22100,21 @@ async function enterAuthedSession() {
         const resp = await fetch(`${API_BASE}/users/me`, {
             headers: { 'Authorization': `Bearer ${authToken}` }
         });
-        if (!resp.ok) { logout(); return; }   // 401/403/etc -> login, no dashboard flash
+        if (!resp.ok) {
+            // -> login, no dashboard flash. Only a refusal of the session ends it on the server and signs out the
+            // other tabs; a check that could not be answered signs out this tab alone, as it always did, and leaves
+            // the session to the tabs still using it.
+            logout(await _refusesTheSession(resp) ? undefined : SIGN_OUT_THIS_TAB);
+            return;
+        }
         const user = await resp.json();
         currentUser = user;
         try { storage.setItem('currentUser', JSON.stringify(user)); } catch (_) {}
     } catch (e) {
         // Couldn't reach the server to verify — fail safe to login rather than a
-        // half-loaded app on a dead/expired session.
+        // half-loaded app on a dead/expired session. That is no refusal of the session: this tab only.
         console.error('Session verification failed:', e);
-        logout();
+        logout(SIGN_OUT_THIS_TAB);
         return;
     }
 
@@ -22128,14 +22257,18 @@ function applyNotesHidePref(prefs) {
 
 // Persist a UI preference change to the server (fire-and-forget) so it follows the
 // account. No-op when logged out — the pre-login theme is a local-only default.
-// Exposed on window so theme.js's pickers can call it without importing app.js.
+// Exposed on window so theme.js's pickers can call it without importing app.js. A save still on its way is
+// kept in _preferenceSaves until it is answered: a sign-out ends the session only after it (_endServerSession).
 function saveUserPreference(patch) {
     if (!authToken) return Promise.resolve();
-    return fetch(`${API_BASE}/users/me/preferences`, {
+    const saving = fetch(`${API_BASE}/users/me/preferences`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
         body: JSON.stringify(patch)
     }).catch(() => {});   // best-effort; localStorage already holds the local copy
+    _preferenceSaves.add(saving);
+    saving.then(() => _preferenceSaves.delete(saving));
+    return saving;
 }
 window.saveUserPreference = saveUserPreference;
 
