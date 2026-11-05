@@ -85,6 +85,25 @@ DETECT = {
 
 # The texts of the conditions whose text is written already, for the release commit to copy with the query.
 SUMMARY = {
+    "audit-history-compressed-after-90-days": (
+        "From 0.34.0 the audit log is still kept for ever by default, but each UTC day older than 90 days "
+        "(AUDIT_HOT_DAYS, 31 to 3650, or Settings, Activity and records) is moved from audit_logs into compressed "
+        "daily blocks (audit_archive_blocks), each checked against the log's integrity chain before its rows are "
+        "removed; nothing is deleted. Archiving starts 14 days after 0.34.0 first starts "
+        "(AUDIT_ARCHIVE_START_AFTER_DAYS, 0 to 90), and again 14 days after it starts once more following more than "
+        "12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or stopped, so going "
+        "back to an earlier release within that time needs nothing. The Activity page and its exports read archived days; a tool that reads audit_logs directly sees "
+        "only the newer days. python dockvault.py audit unarchive puts days back as rows once they fit. The check "
+        "counts the rows archiving will move when it starts, with the default windows: those of the days before the "
+        "day 76 days ago."),
+    "archived-audit-history-hidden": (
+        "An earlier release cannot read the audit log's compressed daily blocks. While any block exists, 0.33.1 and "
+        "later refuse to start on this database, and 0.33.0 and earlier start without seeing those days. Before "
+        "going back, put the days back as rows with this release: python dockvault.py audit unarchive (it checks "
+        "the database volume's free space first: restored days take 7 to 12 times their compressed size), then go "
+        "back. Within 14 days of the first 0.34.0 start (AUDIT_ARCHIVE_START_AFTER_DAYS), or of a start of 0.34.0 "
+        "after more than 12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or "
+        "stopped, there is nothing to undo. The check finds the archived days."),
     "zk-envelope-held-after-admin-reset": (
         "From 0.34.0, for ZK_ENVELOPE_HOLD_DAYS days (14 by default) after an administrator or the server's "
         "operator changed an account's sign-in details, the account's zero-knowledge encryption key is given to a "

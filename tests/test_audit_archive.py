@@ -333,6 +333,20 @@ def test_the_row_window_is_a_setting(env):
     assert _hot(env, young) == 0 and arc.summary(env.st)["hot_days"] == 31
 
 
+def _running(env, **kw):
+    """The clock moves on by ``kw`` while the server runs: a sealing pass at least every 6 hours, as the pruner's
+    longest interval gives."""
+    end = env.clock() + timedelta(**kw)
+    while env.clock() < end:
+        env.clock.at = min(end, env.clock() + timedelta(hours=6))
+        env.seal()
+
+
+def _away(env, **kw):
+    """The server is stopped, or an earlier release runs, for ``kw``: nothing is sealed meanwhile."""
+    env.clock.advance(**kw)
+
+
 def test_nothing_is_archived_inside_the_grace_period_after_the_chains_genesis(env):
     env.settings.audit_archive_start_after_days = 14
     _sealed_day(env)
@@ -340,17 +354,93 @@ def test_nothing_is_archived_inside_the_grace_period_after_the_chains_genesis(en
     assert genesis == T0
     _archive(env)
     assert _hot(env) == 6 and _blocks(env) == []
-    env.clock.advance(days=13, hours=23)
-    env.seal()
+    _running(env, days=13, hours=23)
     _archive(env)
     assert _hot(env) == 6 and _blocks(env) == []
     s = arc.summary(env.st)
     assert s["first_start"] == fmt.time_text(genesis) and s["starts_on"] == fmt.time_text(genesis + timedelta(days=14))
     assert s["start_after_days"] == 14
-    env.clock.advance(hours=1)
-    env.seal()
+    _running(env, hours=1)
     _archive(env)
     assert _hot(env) == 0
+
+
+def _after_a_gap(env, *, before_days, away, written=False):
+    """0.34.0 runs ``before_days`` from its genesis, then is away for ``away`` (an earlier release wrote to the audit
+    log meanwhile when ``written``: rows with no privacy version), and starts again. Returns when it started again."""
+    env.settings.audit_archive_start_after_days = 14
+    _sealed_day(env)
+    _running(env, days=before_days)
+    left = env.clock()
+    _away(env, **away)
+    if written:
+        env.row(left + timedelta(hours=1), action="login_success")
+    env.fresh_process()
+    env.seal()
+    return env.clock()
+
+
+def test_a_return_after_a_long_rollback_waits_the_grace_again(env):
+    """Back after 37 days, the grace of genesis long run out: nothing is archived for 14 days from the first seal of
+    the return, so going back again meanwhile needs no unarchive; then the day is archived."""
+    back = _after_a_gap(env, before_days=3, away=dict(days=37))
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    assert arc.summary(env.st)["starts_on"] == fmt.time_text(back + timedelta(days=14))
+    _running(env, days=13, hours=23)
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    _running(env, hours=1)
+    _archive(env)
+    assert _hot(env) == 0 and [b.day for b in _blocks(env)] == [DAY]
+
+
+def test_a_return_after_a_short_rollback_an_earlier_release_wrote_in_waits_the_grace_again(env):
+    """Back after 2 days on an earlier release that recorded a sign-in: the grace runs again from the return, though
+    that of genesis ended meanwhile."""
+    back = _after_a_gap(env, before_days=13, away=dict(days=2), written=True)
+    assert back > T0 + timedelta(days=14)
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    _running(env, days=13, hours=23)
+    _archive(env)
+    assert _hot(env) == 6
+    _running(env, hours=1)
+    _archive(env)
+    assert _hot(env) == 0
+
+
+@pytest.mark.parametrize("away", [dict(hours=11), dict(hours=13), dict(days=2, hours=23)])
+def test_a_stop_with_nothing_written_leaves_the_grace_as_it_was(env, away):
+    """A stop of less than 12 hours is no gap; a longer one up to 3 days in which nothing was written, a server
+    switched off for the night or a weekend, does not start the grace again: such a deployment still archives."""
+    _after_a_gap(env, before_days=14, away=away)
+    _archive(env)
+    assert _hot(env) == 0
+
+
+def test_nothing_is_archived_while_a_gap_is_open(env):
+    """Past the grace, archiving waits while the newest seal is more than 12 hours old: the first pass of a process
+    back from an earlier release that runs before any seal of its own."""
+    env.settings.audit_archive_start_after_days = 14
+    _sealed_day(env)
+    _running(env, days=15)
+    _away(env, hours=13)
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    env.seal()
+    _archive(env)
+    assert _hot(env) == 0, "a gap of 13 hours with nothing written does not start the grace again"
+
+
+def test_a_gap_older_than_the_grace_is_not_read_again(env, monkeypatch):
+    back = _after_a_gap(env, before_days=3, away=dict(days=37))
+    _running(env, days=15)
+    asked = []
+    monkeypatch.setattr(arc, "written_by_an_earlier_release", lambda *a: asked.append(a) or True)
+    with env.session() as db:
+        assert arc.grace_from(env.st.view, env.clock(), db) == T0 and asked == []
+    assert arc.grace_from(env.st.view, back + timedelta(days=1)) == back
 
 
 def test_a_day_the_host_put_back_stays_rows_for_the_grace(env):

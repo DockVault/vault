@@ -373,3 +373,21 @@ def test_the_promotion_text_says_what_a_rollback_leaves_unrecorded():
     assert "A password set while an older release ran afterwards is not recorded" in (
         " ".join(password_origin.add_columns_once.__doc__.split()))
     assert "promotion-resets-passwords-set-by-others" in rc.WITHOUT_DETECT
+
+
+def test_the_archive_texts_say_when_archiving_starts_again():
+    """Archiving starts AUDIT_ARCHIVE_START_AFTER_DAYS after the first start, and again after a gap in sealing of
+    more than 12 hours in which an earlier release wrote to the audit log, or of more than RESTART_AFTER whatever it
+    held (app/core/audit_archive.py, grace_from); restored days take RESTORE_LOW to RESTORE_HIGH times their size."""
+    from datetime import timedelta
+    from app.core import audit_archive as arc
+    from app.core import audit_chain_times as times
+    from app.core import settings_registry as reg
+    assert reg.spec_for(arc.START_AFTER_KEY).default == 14 and arc.RESTART_AFTER == timedelta(days=3)
+    assert times.GAP_US == 12 * 3600 * 1000000
+    said = ("more than 12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or "
+            "stopped")
+    for cid in ("audit-history-compressed-after-90-days", "archived-audit-history-hidden"):
+        assert rc.SUMMARY[cid].count(said) == 1, cid
+    assert f"{arc.RESTORE_LOW} to {arc.RESTORE_HIGH} times their compressed size" in (
+        rc.SUMMARY["archived-audit-history-hidden"])
