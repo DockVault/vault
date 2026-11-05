@@ -658,3 +658,88 @@ def test_a_ranged_download_gives_its_slot_back(admin, temp_vault):
     assert whole.status_code == 200, (
         f"the ceiling was exhausted by the ranged requests: {whole.status_code}")
     assert whole.content == body
+
+
+@pytest.mark.skipif(
+    os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
+    reason=SKIP_REASON)
+def test_a_copy_a_move_and_a_folder_copy_are_admitted_on_the_same_ceiling(admin, temp_vault):
+    """A copy, a move and a folder copy read, decrypt, encrypt and sync whole files in a thread, on their
+    request's database connection, as an upload's completion does. While a download holds the single slot,
+    each is refused as an upload is: 503 with Retry-After, and nothing changes. Once the slot is free each is
+    done, and gives the slot back."""
+    vid = temp_vault["id"]
+    body = b"C" * (24 * MB)
+    held = _upload(admin, vid, unique("held") + ".bin", body)
+    small = b"copy me" * 1000
+    file_id = _upload(admin, vid, unique("small") + ".bin", small)
+    other = admin.create_vault(name=unique("other"))
+    try:
+        def folder(vault_id, name):
+            r = admin.post(f"/vaults/{vault_id}/folders", json={"name": name})
+            assert r.status_code in (200, 201), r.text
+            return r.json()["folder"]["id"]
+
+        here, tree, into = folder(vid, unique("here")), folder(vid, unique("tree")), folder(vid, unique("into"))
+        there = folder(other["id"], unique("there"))
+        attempts = {
+            "copy": (f"/vaults/{vid}/files/{file_id}/copy", {"dest_vault_id": other["id"], "dest_folder_id": there}),
+            "move to another vault": (f"/vaults/{vid}/files/{file_id}/move", {"dest_vault_id": other["id"]}),
+            "move within the vault": (f"/vaults/{vid}/files/{file_id}/move",
+                                      {"dest_vault_id": vid, "dest_folder_id": here}),
+            "folder copy": (f"/vaults/{vid}/folders/{tree}/copy",
+                            {"dest_vault_id": vid, "dest_parent_folder_id": into}),
+        }
+
+        def listing(vault_id, folder_id=None):
+            r = admin.get(f"/vaults/{vault_id}/files", params={"folder_id": folder_id} if folder_id else None)
+            assert r.status_code == 200, r.text
+            return sorted((it["type"], it["name"]) for it in r.json()["items"])
+
+        def state():
+            return (listing(vid), listing(vid, here), listing(vid, into), listing(other["id"]),
+                    listing(other["id"], there))
+
+        before = state()
+        release = threading.Event()
+
+        def _hold():
+            client = admin.clone_anonymous()
+            client.session.headers.update({"Authorization": f"Bearer {admin.token}"})
+            response = client.get(f"/vaults/{vid}/files/{held}/download", stream=True)
+            pieces = response.iter_content(MB)
+            next(pieces)
+            release.wait(60)
+            for _ in pieces:            # read to the end, so the slot comes back at once
+                pass
+            response.close()
+
+        holder = threading.Thread(target=_hold)
+        holder.start()
+        try:
+            deadline = time.monotonic() + 30
+            while _transfer_stats(admin)["transfersInFlight"] < 1 and time.monotonic() < deadline:
+                time.sleep(0.2)
+            refused = {name: admin.post(path, json=payload) for name, (path, payload) in attempts.items()}
+        finally:
+            release.set()
+            holder.join(timeout=60)
+
+        for name, answer in refused.items():
+            assert answer.status_code == 503, f"a {name} was admitted while the single slot was held: {answer.text}"
+            assert int(answer.headers.get("Retry-After", "0")) >= 1, name
+            assert "transfers" in answer.text, f"the {name}'s refusal does not say what happened: {answer.text}"
+        assert state() == before, "a refused copy, move or folder copy changed something"
+
+        done = {}
+        for name in ("copy", "folder copy", "move within the vault", "move to another vault"):
+            path, payload = attempts[name]
+            done[name] = admin.post(path, json=payload)
+        assert {k: v.status_code for k, v in done.items()} == {k: 200 for k in done}, \
+            {k: v.text for k, v in done.items()}
+        # Each gave its slot back: on a ceiling of one, the next transfer of any kind is still served.
+        got = admin.get(f"/vaults/{vid}/files/{held}/download")
+        assert got.status_code == 200 and got.content == body
+        assert _transfer_stats(admin)["transfersInFlight"] == 0
+    finally:
+        admin.delete_vault(other["id"])

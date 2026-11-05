@@ -24,6 +24,24 @@ import math
 import threading
 
 
+def ceiling(limit) -> int:
+    """The slots a ceiling configured as ``limit`` has: at least one."""
+    return max(1, int(limit))
+
+
+def link_ceiling(limit) -> int:
+    """The slots of the anonymous upload links' completions beside a ceiling configured as ``limit``: a
+    quarter of it, at least one (receiver_transfer_admission in app/api/api_server.py)."""
+    return max(1, int(limit) // 4)
+
+
+def admitted_at_most(limit) -> int:
+    """The most transfers the two ceilings admit at once, for a ceiling configured as ``limit``. Each may hold
+    a database connection while it runs (a download, an upload's completion, a copy or a move, finished in a
+    thread of app/core/off_loop.py), so app/core/database.py sizes its pool by this."""
+    return ceiling(limit) + link_ceiling(limit)
+
+
 class TransferBusy(Exception):
     """The deployment is carrying as many transfers as it will, and this one waited long enough.
 
@@ -55,7 +73,7 @@ class TransferAdmission:
     MAX_WAIT_SECONDS = 3600.0
 
     def __init__(self, limit: int, max_waiting: int, wait_seconds: float):
-        self._limit = max(1, int(limit))
+        self._limit = ceiling(limit)
         self._max_waiting = max(0, int(max_waiting))
         self._wait_seconds = self._usable_wait(wait_seconds)
         self._semaphore = asyncio.Semaphore(self._limit)
