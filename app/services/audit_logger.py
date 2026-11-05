@@ -262,6 +262,7 @@ class AuditLogger:
         audit_row_hooks.case(audit_log)
         audit_row_hooks.privacy(audit_log, raw_details)
         audit_row_hooks.seal_nonce(audit_log)
+        audit_row_hooks.kept_records(audit_log, self.db)
         return audit_log
 
     def log_custom_action(

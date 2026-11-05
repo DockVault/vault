@@ -449,12 +449,16 @@ def run_compliance_cases(p: Pass) -> JobResult:
     """The compliance cases' clock (app/core/cases.py): a case nobody approved within 7 days expires, and a case
     whose access reached its end closes or keeps only its legal hold, its owners told in the same transaction; a case
     closed 30 days ago keeps the counts of its audit rows (files opened, exports) on itself, before those rows may
-    leave the table. Deletes nothing: a case's rows are its record. Not stopped by the hold switch."""
-    from app.core import cases
+    leave the table. Then the data marker that stops an earlier release from starting while the records of compliance
+    access must be kept (app/core/compliance_marker.py), in a transaction of its own. Deletes nothing: a case's rows
+    are its record. Not stopped by the hold switch."""
+    from app.core import cases, compliance_marker
     with p.transaction() as db:
         cases.expire_pending(db, p.now)
         cases.end_due(db, p.now)
         cases.keep_counts(db, p.now)
+    with p.transaction() as db:
+        compliance_marker.sync(db, now=p.now)
     return JobResult()
 
 

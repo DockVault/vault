@@ -73,6 +73,10 @@ DETECT = {
         "SELECT 1 FROM legal_hold_vaults WHERE released_at IS NULL "
         "UNION ALL SELECT 1 FROM held_files UNION ALL SELECT 1 FROM held_folders "
         "UNION ALL SELECT 1 FROM held_name_history LIMIT 1"),
+    # While a compliance case is open or the records of compliance access must be kept: the marker itself, which
+    # alone knows COMPLIANCE_RECORD_MIN_DAYS (app/core/compliance_marker.py, CONDITION).
+    "compliance-records-block-rollback": (
+        "SELECT key, requires_at_least, since FROM data_requirements WHERE key = 'compliance-records'"),
     # The records of what an earlier release cannot read or would destroy, each of which it refuses to start on
     # (app/core/data_requirements.py).
     "older-images-refuse-newer-data": (
@@ -110,10 +114,24 @@ SUMMARY = {
         "While a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones) waits for its "
         "purge, going back to a release before 0.34.0 would destroy it: release the holds and let the purge run "
         "first."),
+    # The compliance records' own condition (app/core/compliance_marker.py, CONDITION), word for word.
+    "compliance-records-block-rollback": (
+        "From 0.34.0, while a compliance case is open, a case's records must still be kept, or a row of the audit "
+        "log's compliance category (an auditor right given or taken, a case's steps, a name revealed, a refused "
+        "request) is younger than COMPLIANCE_RECORD_MIN_DAYS (2190 by default, at least 365), an earlier release "
+        "would not keep them: it knows no cases, and with a positive AUDIT_LOG_RETENTION_DAYS, which 0.34.0 leaves in "
+        ".env as a waiting change, it deletes every older audit row the first time an administrator opens the "
+        "dashboard's activity feed. So 0.33.1 and later refuse to start on this database, and python dockvault.py "
+        "update refuses to go back unless --force-downgrade is given. Close the cases and wait until their records "
+        "and the compliance rows are older than COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the "
+        "record that stops the earlier release. An earlier release started sooner with "
+        "ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env sets no AUDIT_LOG_RETENTION_DAYS. The "
+        "check finds that record."),
     "older-images-refuse-newer-data": (
         "From 0.34.0 the release records in the table data_requirements each state of the data that an earlier "
         "release cannot read or would destroy, for as long as it lasts: archived audit days, legal holds and what "
-        "they kept, and recording levels below Full. 0.33.1 and later refuse to start on a database that holds such "
+        "they kept, recording levels below Full, and open compliance cases and the records of compliance access "
+        "while they must be kept. 0.33.1 and later refuse to start on a database that holds such "
         "a record, and print what to undo with 0.34.0 before going back; python dockvault.py update refuses to go "
         "back while one exists unless --force-downgrade is given. ALLOW_START_ON_NEWER_DATA=true in .env starts an "
         "earlier release anyway, on data it cannot fully read: it may show an incomplete audit log and delete what "
@@ -133,10 +151,10 @@ SUMMARY = {
 
 # The conditions whose rows stop the upgraded deployment going back across the edge.
 BLOCKS_ROLLBACK = {"archived-audit-history-hidden", "recording-levels-changed", "legal-holds-block-rollback",
-                   "older-images-refuse-newer-data"}
+                   "compliance-records-block-rollback", "older-images-refuse-newer-data"}
 # Checked on the upgraded database: a rollback's conditions.
 ON_UPGRADED = {"archived-audit-history-hidden", "panel-retention-not-read", "recording-levels-changed",
-               "legal-holds-block-rollback", "older-images-refuse-newer-data"}
+               "legal-holds-block-rollback", "compliance-records-block-rollback", "older-images-refuse-newer-data"}
 # Conditions that have no query: what they say cannot be read from the database.
 WITHOUT_DETECT = ("audit-protected-minimum-365-days", "container-output-rotates",
                   "promotion-resets-passwords-set-by-others")
@@ -152,6 +170,7 @@ CONDITIONS = (
     "panel-retention-not-read",
     "recording-levels-changed",
     "legal-holds-block-rollback",
+    "compliance-records-block-rollback",
     "older-images-refuse-newer-data",
     "promotion-resets-passwords-set-by-others",
     "zk-envelope-held-after-admin-reset",
@@ -168,6 +187,7 @@ TABLES = {
     "zk-envelope-held-after-admin-reset": {"credential_changes", "user_keypairs"},
     "recording-levels-changed": {"audit_privacy_policies"},
     "legal-holds-block-rollback": {"legal_hold_vaults", "held_files", "held_folders", "held_name_history"},
+    "compliance-records-block-rollback": {"data_requirements"},
     "older-images-refuse-newer-data": {"data_requirements"},
 }
 # The tables and columns 0.33.2 has that the queries on the database being upgraded read (from its models).

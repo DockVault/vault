@@ -3,7 +3,7 @@
 Five columns on audit_logs (seal_nonce, privacy_version, recorded, ip_via, case_id) and ip_via on
 security_alerts are nullable with no default, added at start by one statement per table, so Postgres
 adds them without rewriting a row and a release that does not know them ignores them. build_row sets
-the row's id itself, then calls four hooks in a fixed order (app/services/audit_row_hooks.py); privacy
+the row's id itself, then calls five hooks in a fixed order (app/services/audit_row_hooks.py); privacy
 applies the recording levels (tests/test_audit_privacy.py), and the others leave the row alone. test_audit_row_columns_live.py checks the columns on a
 running stack's database.
 """
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.unit
 
 AUDIT_COLUMNS = {"seal_nonce": "BYTEA", "privacy_version": "INTEGER", "recorded": "JSONB",
                  "ip_via": "VARCHAR(24)", "case_id": "UUID"}
-HOOKS = ("provenance", "case", "privacy", "seal_nonce")
+HOOKS = ("provenance", "case", "privacy", "seal_nonce", "kept_records")
 
 
 def _pg_type(column):

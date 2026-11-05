@@ -10,7 +10,8 @@ with an encryption key whose sign-in details were changed 1 to 13 days ago, the 
 an address, or of an account that had none) or another kind, beside accounts without a key (which the hold covers
 once they set one up, and which no query can count), a change 15 days ago and changes never applied, counted as
 the hold's own code counts them; recording levels whose newest version records addresses shortened; the old name a
-hold kept; and the record an earlier release refuses to start on. test_release_conditions.py checks the queries offline.
+hold kept; and the records an earlier release refuses to start on. test_release_conditions.py checks the queries
+offline.
 """
 import json
 
@@ -93,8 +94,9 @@ db.add(AuditPrivacyPolicy(version=3, reason="admin", created_at=ago(1), **dict(L
 db.add(HeldNameHistory(object_id=uuid.uuid4(), vault_id=uuid.uuid4(), kind="file", enc_name="zk2:old",
                        name_key_version=1, renamed_at=now))
 db.flush()
-db.execute(text("INSERT INTO data_requirements (key, requires_at_least, reason, undo, since) "
-                "VALUES ('recording-levels', '0.34.0', 'Recorded less.', 'Set them back.', :since)"), {"since": now})
+for key in ("recording-levels", "compliance-records"):
+    db.execute(text("INSERT INTO data_requirements (key, requires_at_least, reason, undo, since) "
+                    "VALUES (:key, '0.34.0', 'Changed.', 'Undo it.', :since)"), {"key": key, "since": now})
 # Accounts and the changes of their sign-in details: (has a key, [(kind, status, days ago)]).
 ACCOUNTS = {
     "password-3-days": (True, [("password", "made", 3)]),                         # held, host only
@@ -198,6 +200,10 @@ def test_each_detect_query_finds_what_was_seeded_and_only_that(throwaway):
     assert before[q] == [] and len(after[q]) == 1
     q = "legal-holds-block-rollback"
     assert before[q] == [] and len(after[q]) == 1
+    q = "compliance-records-block-rollback"
+    assert before[q] == [] and [(r["key"], r["requires_at_least"]) for r in after[q]] == [("compliance-records",
+                                                                                           "0.34.0")]
     q = "older-images-refuse-newer-data"
     assert before[q] == []
-    assert [(r["key"], r["requires_at_least"]) for r in after[q]] == [("recording-levels", "0.34.0")]
+    assert [(r["key"], r["requires_at_least"]) for r in after[q]] == [("compliance-records", "0.34.0"),
+                                                                      ("recording-levels", "0.34.0")]
