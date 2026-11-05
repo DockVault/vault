@@ -1453,8 +1453,10 @@ def verify_access_token(token: str) -> Optional[dict]:
     """
     Verify and decode a JWT access token.
 
-    Every bearer token the web API reads goes through here: the request dependencies, sign-out, the
-    live monitor, the rate limiter's per-user bucket and the upload size check.
+    Every bearer token the web API reads goes through here: the request dependencies, POST
+    /api/logout, the live monitor, the rate limiter's per-user count and the upload size check. The
+    web app's sign-out (POST /auth/sign-out), and the rate limiter's count of it by session, read
+    with verify_access_token_for_sign_out instead.
 
     Args:
         token: JWT token string
@@ -1481,11 +1483,12 @@ def verify_access_token(token: str) -> Optional[dict]:
 def verify_access_token_for_sign_out(token: str) -> Optional[dict]:
     """The claims of a token this server signed, whether or not it has expired; None otherwise.
 
-    For one use only: ending the session a token names when the web app signs out (POST
-    /auth/sign-out). A sign-out also follows a session that has run out, and ending the session
-    then still matters: its row stays listed as signed in until it is ended. The signature, the
-    algorithm and the length limit are checked exactly as verify_access_token checks them; only the
-    expiry is not. Never use it to let a request in."""
+    For the web app's sign-out only (POST /auth/sign-out): the route reads with it to end the session
+    a token names, and the rate limiter to count the sign-out by that session
+    (app/core/rate_limiter.py: sign_out_session_of). A sign-out also follows a session that has run
+    out, and ending the session then still matters: its row stays listed as signed in until it is
+    ended. The signature, the algorithm and the length limit are checked exactly as
+    verify_access_token checks them; only the expiry is not. Never use it to let a request in."""
     if isinstance(token, (str, bytes)) and len(token) > MAX_ACCESS_TOKEN_LENGTH:
         return None
     try:

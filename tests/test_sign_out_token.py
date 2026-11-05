@@ -8,11 +8,14 @@ not read, and one longer than any this server signs is refused on its length wit
 other bearer token is (tests/test_access_token_length.py). It reads tokens for that one route only; every other
 reader still refuses an expired token. tests/test_api_sign_out.py holds the route on a running stack.
 
-The rate limiter reads the sign-out's token the same way (app/core/rate_limiter.py: SIGN_OUT_BUCKET): the sign-out
-is in the auth class, at its limit and window, but counted in a bucket of its own, by the account its token names,
-expired or not, and by address for any other token. The sign-ins (by address) and the account's other auth requests
-are counted apart from it, as before.
+The rate limiter reads the sign-out's token the same way (app/core/rate_limiter.py: SIGN_OUT_BUCKET,
+sign_out_session_of): the sign-out is in the auth class, at its limit and window, but counted in a bucket of its own,
+by the session its token names, expired or not, and by address for a token that names no session. Never by the
+account: every other token the server signed for it (another session's, one that has run out, a temporary
+credential's, whose account is its owner's) is counted apart, so none of them can use up a session's sign-out. The
+sign-ins (by address) and the account's other auth requests are counted apart from it, as before.
 """
+import hashlib
 import time
 from datetime import timedelta
 
@@ -110,16 +113,19 @@ class _CountingLimiter:
         return {}
 
 
-def _counted(monkeypatch, method, path, authorization=None):
-    """Where the middleware counts one request: (bucket prefix, who, limit, window)."""
+def _counted(monkeypatch, method, path, authorization=None, state=None):
+    """Where the middleware counts one request: (bucket prefix, who, limit, window). `state`: what an earlier layer
+    put on the request (request.state)."""
     monkeypatch.setattr("app.core.net_utils.client_ip", lambda _request: ADDRESS)
     limiter = _CountingLimiter()
     middleware = RateLimitMiddleware(None, limiter, default_limit=100, default_window=60, auth_limit=10,
                                      auth_window=60)
     headers = [(b"authorization", authorization.encode())] if authorization is not None else []
-    request = Request({"type": "http", "method": method, "path": path, "headers": headers,
-                       "client": (ADDRESS, 1234), "scheme": "https", "server": ("vault.example", 443),
-                       "query_string": b""})
+    scope = {"type": "http", "method": method, "path": path, "headers": headers, "client": (ADDRESS, 1234),
+             "scheme": "https", "server": ("vault.example", 443), "query_string": b""}
+    if state is not None:
+        scope["state"] = dict(state)
+    request = Request(scope)
 
     async def call_next(_request):
         return Response("ok")
@@ -132,19 +138,55 @@ def _counted(monkeypatch, method, path, authorization=None):
 SIGN_OUTS = f"rate_limit:api:{SIGN_OUT_BUCKET}"
 
 
-def test_a_sign_out_is_counted_by_the_account_its_token_names_expired_or_not_in_a_bucket_of_its_own(monkeypatch):
+def _session(session_token):
+    """Who a sign-out of the session `session_token` is counted against: the hash the server keeps of it."""
+    return "session:" + hashlib.sha256(session_token.encode()).hexdigest()
+
+
+def test_a_sign_out_is_counted_by_the_session_its_token_names_expired_or_not_in_a_bucket_of_its_own(monkeypatch):
     assert SIGN_OUTS != "rate_limit:api:auth"
     expired = create_access_token(dict(CLAIMS), timedelta(minutes=-5))
     live = create_access_token(dict(CLAIMS), timedelta(minutes=5))
     for token in (expired, live):
-        assert _counted(monkeypatch, "POST", "/auth/sign-out", f"Bearer {token}") == (SIGN_OUTS, "user:u1", 10, 60)
+        assert _counted(monkeypatch, "POST", "/auth/sign-out", f"Bearer {token}") == \
+            (SIGN_OUTS, _session(CLAIMS["session_token"]), 10, 60)
 
 
-def test_a_sign_out_with_any_other_token_is_counted_by_address_in_its_own_bucket(monkeypatch):
+def test_no_other_token_of_the_account_is_counted_against_a_sessions_sign_out(monkeypatch):
+    """Another session of the account, one that has run out, and a temporary credential's (its account is its
+    owner's, its session its own): each is counted against its own session, none against the account."""
+    mine = create_access_token(dict(CLAIMS), timedelta(minutes=5))
+    old = create_access_token(dict(CLAIMS, session_token="o" * 43), timedelta(minutes=-60))
+    lent = create_access_token(dict(CLAIMS, session_token="t" * 43, is_temporary=True), timedelta(minutes=5))
+    counted = [_counted(monkeypatch, "POST", "/auth/sign-out", f"Bearer {token}")[1] for token in (mine, old, lent)]
+    assert counted == [_session("s" * 43), _session("o" * 43), _session("t" * 43)], counted
+
+
+def test_a_sign_out_is_counted_by_session_whatever_an_earlier_layer_says_of_the_account(monkeypatch):
+    """An earlier layer naming the account on the request (request.state.user_id, by which the other requests are
+    counted) does not make a sign-out the account's; with a token that names no session, it is counted by address."""
+    live = create_access_token(dict(CLAIMS), timedelta(minutes=5))
+    by_layer = {"user_id": "u1"}
+    assert _counted(monkeypatch, "POST", "/auth/sign-out", f"Bearer {live}", state=by_layer) == \
+        (SIGN_OUTS, _session(CLAIMS["session_token"]), 10, 60)
+    assert _counted(monkeypatch, "POST", "/auth/sign-out", None, state=by_layer) == (SIGN_OUTS, f"ip:{ADDRESS}", 10, 60)
+    # Every other request is counted by the account that layer names, as before.
+    assert _counted(monkeypatch, "GET", "/auth/session", None, state=by_layer) == \
+        ("rate_limit:api:auth", "user:u1", 10, 60)
+
+
+def test_a_sign_out_with_a_token_that_names_no_session_is_counted_by_address_in_its_own_bucket(monkeypatch):
     other_key = jwt.encode(dict(CLAIMS), "another-key-" + "x" * 32, algorithm=_alg())
     over = create_access_token(dict(CLAIMS, pad="x" * MAX_ACCESS_TOKEN_LENGTH), timedelta(minutes=-5))
-    for authorization in (None, "Bearer", "Bearer not-a-token", f"Bearer {other_key}", f"Bearer {over}",
-                          f"Basic {create_access_token(dict(CLAIMS), timedelta(minutes=5))}"):
+    # Signed by the server, for the account, but naming no session: a second-factor pending token, and tokens whose
+    # session claim is missing, empty or not a string.
+    pending = create_access_token({"sub": "u1", "username": "ana", "stage": "second_factor", "pre_auth": "p1"},
+                                  timedelta(minutes=5))
+    no_session = [create_access_token(dict(CLAIMS, session_token=value), timedelta(minutes=5))
+                  for value in (None, "", 7, ["s" * 43])]
+    for authorization in (None, "Bearer", "Bearer ", "Bearer not-a-token", f"Bearer {other_key}", f"Bearer {over}",
+                          f"Basic {create_access_token(dict(CLAIMS), timedelta(minutes=5))}", f"Bearer {pending}",
+                          *(f"Bearer {token}" for token in no_session)):
         assert _counted(monkeypatch, "POST", "/auth/sign-out", authorization) == (SIGN_OUTS, f"ip:{ADDRESS}", 10, 60), \
             authorization
 

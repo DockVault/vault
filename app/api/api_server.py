@@ -24124,9 +24124,10 @@ async def sign_out(
       attributed to the temporary credential when it is one, and the live event).
     - A token that is not one this server signed for a session (a second-factor pending token, a forged or
       malformed one, none at all) is refused with 401, also without Clear-Site-Data.
-    - Rate limit: the auth class's, in a bucket of its own and by the account the token names, expired or not
-      (app/core/rate_limiter.py: SIGN_OUT_BUCKET), so the sign-outs of every tab of a session never use up the
-      sign-in that follows from the same address.
+    - Rate limit: the auth class's, in a bucket of its own and by the session the token names, expired or not
+      (app/core/rate_limiter.py: SIGN_OUT_BUCKET, sign_out_session_of), so the sign-outs of every tab of a
+      session never use up the sign-in that follows from the same address, and no other token of the account
+      (one that has run out, one signed out, a temporary credential's) uses up this session's sign-out.
     """
     import time as _time
     from app.core.security import verify_access_token_for_sign_out

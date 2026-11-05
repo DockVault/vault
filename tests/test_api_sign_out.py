@@ -19,9 +19,11 @@ route ends the session as logout does and answers without that header. What is h
 - a temporary credential's web session ends and frees the credential's slot, as logout does;
 - the token is held in the cache's denylist for the rest of its life (none for a token that has run out, none for
   a token naming another account);
-- at the auth requests' limit a vault ships with, sign-outs are counted in a budget of their own, by the account
-  the token names (expired or not) and by address for any other token: they never use up the sign-in that follows
-  from the same address, nor the account's other auth requests;
+- at the auth requests' limit a vault ships with, sign-outs are counted in a budget of their own, by the session
+  the token names (expired or not) and by address for a token that names none: they never use up the sign-in that
+  follows from the same address, nor the account's other auth requests, and the sign-outs sent with any other
+  token of the account (one that has run out, one signed out, a second-factor pending token, a temporary
+  credential's) never use up the sign-out of the account's live session;
 - POST /api/logout keeps its answer for its callers.
 
 tests/test_ui_sign_out_ends_session.py holds the web app's side: every sign-out path calls this route.
@@ -197,12 +199,12 @@ def _sign_in_status(account):
                          timeout=30).status_code
 
 
-def test_the_sign_outs_of_a_session_that_ran_out_are_counted_by_its_account_in_a_budget_of_their_own(
+def test_the_sign_outs_of_a_session_that_ran_out_are_counted_by_that_session_in_a_budget_of_their_own(
         admin, person):
     """Every tab of a session signs out at the same moment, and a session that has run out is signed out with its
     expired token. Counted with the sign-ins by address (an expired token names no one to the other readers), ten of
-    them used up the sign-in that follows; they are counted by the account the token names, in the sign-out's own
-    budget: past the limit only the account's further sign-outs wait, not another account's, not the sign-in, not
+    them used up the sign-in that follows; they are counted by the session the token names, in the sign-out's own
+    budget: past the limit only that session's further sign-outs wait, not another account's, not the sign-in, not
     the account's other auth requests."""
     expired = _expired_copy(signed_in(person).token)
     other = admin.create_user()
@@ -217,6 +219,56 @@ def test_the_sign_outs_of_a_session_that_ran_out_are_counted_by_its_account_in_a
             assert again.get("/auth/session").status_code == 200, "the account's other auth requests were refused"
     finally:
         admin.delete_user(other["id"])
+
+
+def _another_token_of_the_account(kind, admin, admin_creds, person):
+    """(a token the server signed for an account, of a session other than the live one, or of none; a client of
+    that account's live session) for `kind`."""
+    if kind == "a-temporary-credentials":
+        # Its account is its owner's (here the administrator's); its session is its own.
+        made = admin.post("/auth/temp-credentials", json={"note": unique("sign-out budget")})
+        assert made.status_code == 200, made.text
+        cred = made.json()
+        holder = requests.post(f"{BASE_URL}/auth/login",
+                               json={"username": cred["temp_username"], "password": cred["credential"]}, timeout=30)
+        assert holder.status_code == 200, holder.text
+        live = signed_in({"_username": admin_creds["username"], "_password": admin_creds["password"]})
+        return holder.json()["access_token"], live
+    live = signed_in(person)
+    if kind == "a-second-factor-pending-token":
+        enroll_totp(person, live)
+        step = requests.post(f"{BASE_URL}/auth/login",
+                             json={"username": person["_username"], "password": person["_password"]}, timeout=30)
+        assert step.status_code == 200 and step.json().get("second_factor_required"), step.text
+        return step.json()["pre_auth_token"], live
+    old = signed_in(person).token
+    if kind == "one-signed-out":
+        assert _sign_out(old).json()["session_ended"] is True
+        return old, live
+    return _expired_copy(old), live                                     # one that has run out
+
+
+@pytest.mark.parametrize("kind", ["one-that-has-run-out", "one-signed-out", "a-second-factor-pending-token",
+                                  "a-temporary-credentials"])
+def test_no_other_token_of_the_account_uses_up_the_sign_out_of_its_live_session(admin, admin_creds, person, kind):
+    """Any token the server signed for an account can be sent to the sign-out: an old session's that has run out,
+    one already signed out, a second-factor pending token, a temporary credential's (whose account is its owner's).
+    Counted by the account, the shipped limit of them used up the sign-out of the account's live session: it was
+    refused, and that session stayed valid. Counted by the session each names (or by address, for a token that names
+    none), they use up only their own, and the live session's sign-out ends it."""
+    spent, live = _another_token_of_the_account(kind, admin, admin_creds, person)
+    assert _claims(spent)["sub"] == _claims(live.token)["sub"], "not a token of the same account"
+    assert _claims(spent).get("session_token") != _claims(live.token)["session_token"]
+    assert live.get("/users/me").status_code == 200
+    with shipped_auth_limit(admin) as limit:
+        answers = [_sign_out(spent) for _ in range(limit)]
+        expected = 401 if kind == "a-second-factor-pending-token" else 200
+        assert [r.status_code for r in answers] == [expected] * limit, [(r.status_code, r.text) for r in answers]
+        assert answers[0].headers.get("x-ratelimit-limit") == str(limit), dict(answers[0].headers)
+        r = _sign_out(live.token)
+        assert r.status_code == 200 and r.json() == {"signed_out": True, "session_ended": True}, r.text
+    assert live.get("/users/me").status_code == 401, "the live session was not ended"
+    assert _row(live.token) == "f|t"
 
 
 def test_sign_outs_with_a_token_this_server_did_not_sign_do_not_use_up_the_sign_in(admin, person):
