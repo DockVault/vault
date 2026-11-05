@@ -7,10 +7,13 @@ set's data was kept. The restore now keeps the current .env first, as .env.<pref
 never over a file already there, says where it is and how to go back to that set, and refuses to go on when the
 copy cannot be made or when .env is sealed by `lock`.
 
-Every path through it: another set's backup; the same set's, with its own .env and with one changed since the
-backup; no .env at all; a kept file (and a folder) already there; a copy that cannot be made; a restore that stops
-before it installs the backup's .env, and one that fails while installing it; a sealed .env. With real Docker, the
-volumes of the set the host was on open again from the kept file, through the command the restore prints.
+Every path through it: another set's backup (in a root whose path holds a space too); the same set's, with its own
+.env and with one changed since the backup; no .env at all; a kept file (and a folder) already there; a copy that
+cannot be made, or that reads back otherwise, and the name the refusal gives; a current .env or a backup's that
+cannot be read; a restore that stops before it installs the backup's .env, and one that fails while installing it;
+a sealed .env; a current prefix that is no set's name; a set named like the sealed file or the template (whose names
+a kept or archived .env never takes); the note on a running set. With real Docker, the volumes of the set the host
+was on open again from the kept file, through the command the restore prints.
 """
 import argparse
 import importlib.util
@@ -106,18 +109,23 @@ def _go_back_command(kept):
             % (HERE, arg))
 
 
+@pytest.mark.parametrize("folder", ["", "a root with a space"], ids=["plain-root", "root-with-a-space"])
 def test_a_restore_of_another_sets_backup_keeps_the_current_env_first_and_says_how_to_go_back(
-        tmp_path, monkeypatch, capsys):
+        tmp_path, monkeypatch, capsys, folder):
+    """In a root whose path holds a space as well (a Windows profile's, say): the printed command then quotes it,
+    and still parses as the tool's own command naming the kept file."""
+    root = tmp_path / folder if folder else tmp_path
+    root.mkdir(exist_ok=True)
     current, theirs = _env_bytes(HERE), _env_bytes(THERE)
-    (tmp_path / ".env").write_bytes(current)
+    (root / ".env").write_bytes(current)
     bundle = _bundle(tmp_path, theirs)
     steps = []
-    _restore(_tool(tmp_path, monkeypatch, steps), bundle)
+    _restore(_tool(root, monkeypatch, steps), bundle)
 
-    kept = tmp_path / (".env." + HERE)
+    kept = root / (".env." + HERE)
     assert kept.read_bytes() == current                       # the set the host was on, byte for byte
-    assert (tmp_path / ".env").read_bytes() == theirs         # the backup's .env is installed
-    assert _kept_files(tmp_path) == [".env." + HERE]
+    assert (root / ".env").read_bytes() == theirs             # the backup's .env is installed
+    assert _kept_files(root) == [".env." + HERE]
     if os.name != "nt":
         assert (os.stat(kept).st_mode & 0o077) == 0, "the kept .env holds secrets: owner-only"
     # Kept before anything was stopped or replaced.
@@ -261,6 +269,185 @@ def test_a_restore_while_env_is_sealed_is_refused_before_anything(tmp_path, monk
     said = _said(capsys)
     assert ".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock)" in said
     assert "Nothing changed." in said
+
+
+@pytest.mark.parametrize("which", ["the-current-env", "the-backups-env"])
+def test_an_env_that_cannot_be_read_refuses_the_restore_with_nothing_changed(tmp_path, monkeypatch, capsys, which):
+    """The current .env cannot be kept without reading it, nor told from the backup's without reading that: the
+    restore stops there, rather than go on with nothing kept."""
+    current = _env_bytes(HERE)
+    (tmp_path / ".env").write_bytes(current)
+    bundle = _bundle(tmp_path, _env_bytes(THERE))
+    unreadable = (tmp_path / ".env") if which == "the-current-env" else (bundle / "env")
+    steps = []
+    tool = _tool(tmp_path, monkeypatch, steps)
+    real_open = open
+
+    def refusing_open(path, mode="r", *a, **k):
+        if Path(path) == unreadable and "b" in mode:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, mode, *a, **k)
+
+    monkeypatch.setattr(dv, "open", refusing_open, raising=False)
+    with pytest.raises(SystemExit):
+        _restore(tool, bundle)
+
+    assert steps == [], "nothing was stopped, cleared or extracted"
+    assert (tmp_path / ".env").read_bytes() == current
+    assert _kept_files(tmp_path) == []
+    said = _said(capsys)
+    assert "could not read the current .env or the backup's to keep the current one before the restore" in said
+    assert "Nothing changed." in said
+
+
+def test_a_copy_that_does_not_read_back_as_written_is_refused_and_removed(tmp_path, monkeypatch, capsys):
+    """A disk that does not hold what was written: the copy reads back otherwise, so it is no copy of the .env."""
+    current = _env_bytes(HERE)
+    (tmp_path / ".env").write_bytes(current)
+    bundle = _bundle(tmp_path, _env_bytes(THERE))
+    steps = []
+    tool = _tool(tmp_path, monkeypatch, steps)
+
+    def altered_on_the_way(path):
+        if Path(path).name.startswith(".env."):
+            with open(path, "ab") as f:
+                f.write(b"\0")
+        return True
+
+    monkeypatch.setattr(dv, "tighten_secret_file", altered_on_the_way)
+    with pytest.raises(SystemExit):
+        _restore(tool, bundle)
+
+    assert steps == []
+    assert (tmp_path / ".env").read_bytes() == current
+    assert _kept_files(tmp_path) == [], "the copy that read back otherwise is removed"
+    said = _said(capsys)
+    assert "could not keep the current .env as %s" % (tmp_path / (".env." + HERE)) in said
+    assert "does not read back as it was written" in said and "Nothing changed." in said
+
+
+class _OsRefusingToCreate:
+    """dockvault's os, but for os.open, which refuses to create the file named `name`."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+    def open(self, path, *a, **k):
+        if os.path.basename(path) == self._name:
+            raise PermissionError(13, "Permission denied", path)
+        return os.open(path, *a, **k)
+
+
+@pytest.mark.parametrize("failure", ["not-created", "written-then-not-synced"])
+def test_the_refusal_names_the_name_the_copy_was_made_under(tmp_path, monkeypatch, capsys, failure):
+    """.env.<prefix> taken by an older copy: the copy is made as .env.<prefix>.1, and a refusal names that file."""
+    current = _env_bytes(HERE)
+    (tmp_path / ".env").write_bytes(current)
+    (tmp_path / (".env." + HERE)).write_bytes(b"an older one\n")
+    bundle = _bundle(tmp_path, _env_bytes(THERE))
+    steps = []
+    tool = _tool(tmp_path, monkeypatch, steps)
+    if failure == "not-created":
+        monkeypatch.setattr(dv, "os", _OsRefusingToCreate(".env.%s.1" % HERE))
+    else:
+        monkeypatch.setattr(dv, "sync_directory", _no_sync)
+    with pytest.raises(SystemExit):
+        _restore(tool, bundle)
+
+    assert steps == []
+    assert _kept_files(tmp_path) == [".env." + HERE]
+    assert (tmp_path / (".env." + HERE)).read_bytes() == b"an older one\n"
+    said = _said(capsys)
+    assert "could not keep the current .env as %s (" % (tmp_path / (".env.%s.1" % HERE)) in said
+    assert "Nothing changed." in said
+
+
+def _with_prefix(env, prefix):
+    """`env` with its VAULT_VOLUME_PREFIX line set to `prefix` as written (no check of the name)."""
+    lines = [("VAULT_VOLUME_PREFIX=%s" % prefix) if line.startswith("VAULT_VOLUME_PREFIX=") else line
+             for line in env.decode("utf-8").split("\n")]
+    assert any(line == "VAULT_VOLUME_PREFIX=%s" % prefix for line in lines)
+    return "\n".join(lines).encode("utf-8")
+
+
+@pytest.mark.parametrize("written", ["sets/one", "-one"], ids=["a-path", "not-a-volume-name"])
+def test_a_current_env_whose_prefix_is_no_sets_name_is_kept_as_before_restore(tmp_path, monkeypatch, capsys, written):
+    """A VAULT_VOLUME_PREFIX no volume can be named after (a path; a name docker refuses) names no file beside .env
+    and no set to go back to: the copy is .env.before-restore, and no repoint command is printed for it."""
+    current = _with_prefix(_env_bytes(HERE), written)
+    (tmp_path / ".env").write_bytes(current)
+    bundle = _bundle(tmp_path, _env_bytes(THERE))
+    _restore(_tool(tmp_path, monkeypatch, []), bundle)
+
+    kept = tmp_path / ".env.before-restore"
+    assert _kept_files(tmp_path) == [".env.before-restore"] and kept.read_bytes() == current
+    said = _said(capsys)
+    assert "Kept the current .env (set '%s') as %s" % (written, kept) in said
+    assert "The .env this host had before the restore is kept in %s" % kept in said
+    assert "is not a volume set's name" in said
+    assert "repoint" not in said
+
+
+@pytest.mark.parametrize("prefix", ["enc", "example", "ENC", "Example"])
+def test_a_set_named_like_the_sealed_file_or_the_template_never_has_its_env_kept_under_their_names(
+        tmp_path, monkeypatch, capsys, prefix):
+    """.env.enc is the sealed .env: a plain .env kept under that name would be taken for it (lock would refuse to
+    seal, status would call it sealed, and deleting it as a stale sealed file would delete the set's only key), and
+    left out of the plain-text archives lock warns about. .env.example is the template. Where file names ignore
+    case, .env.ENC is .env.enc. The copy goes on to .env.<prefix>.1, and the printed command names it."""
+    current = _env_bytes(prefix)
+    (tmp_path / ".env").write_bytes(current)
+    bundle = _bundle(tmp_path, _env_bytes(THERE))
+    tool = _tool(tmp_path, monkeypatch, [])
+    _restore(tool, bundle)
+
+    kept = tmp_path / (".env.%s.1" % prefix)
+    assert _kept_files(tmp_path) == [kept.name] and kept.read_bytes() == current
+    assert not tool._is_locked()
+    os.remove(tmp_path / ".env")                  # even with .env gone, nothing reads as sealed
+    assert not tool._is_locked()
+    assert str(kept) in tool._env_archives(), "lock would not warn about this plain-text copy"
+    said = _said(capsys)
+    assert ("--target-prefix %s --env-source %s" % (prefix, kept)) in said
+
+
+@pytest.mark.parametrize("prefix", ["enc", "example", "ENC"])
+def test_an_env_archived_aside_never_takes_the_sealed_files_or_the_templates_name(tmp_path, prefix):
+    """The same rule where repoint, a new set and Reset move .env aside (_archive_env)."""
+    (tmp_path / ".env").write_bytes(b"VAULT_VOLUME_PREFIX=%s\n" % prefix.encode())
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    archived = tool._archive_env(prefix)
+
+    assert archived == str(tmp_path / (".env.%s.1" % prefix))
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env.%s.1" % prefix]
+    assert archived in tool._env_archives(), "lock would not warn about this plain-text archive"
+    assert not tool._is_locked(), "the archive reads as a sealed .env"
+
+
+def test_the_note_on_a_running_set_mentions_its_env_only_when_one_was_kept(tmp_path, monkeypatch, capsys):
+    """A different set running when the restore starts: with no .env there was nothing to keep, and the note says
+    only that its data is kept."""
+    bundle = _bundle(tmp_path, _env_bytes(THERE))
+    steps = []
+    tool = _tool(tmp_path, monkeypatch, steps)
+    running = {"db": True}
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: running["db"])
+    monkeypatch.setattr(tool, "_stop_stack", lambda: running.update(db=False) or steps.append(("stop", False)))
+    _restore(tool, bundle)
+    said = _said(capsys)
+    assert "is running and will be stopped to restore set '%s' (its data is kept)." % THERE in said
+    assert "its data and its .env are kept" not in said
+
+    # With a .env, kept: the note says so.
+    (tmp_path / ".env").write_bytes(_env_bytes(HERE))
+    running["db"] = True
+    _restore(tool, bundle)
+    said = _said(capsys)
+    assert "(set '%s') is running and will be stopped to restore set '%s' (its data and its .env are kept)." \
+        % (HERE, THERE) in said
 
 
 # --------------------------------------------------------------------------- with real Docker

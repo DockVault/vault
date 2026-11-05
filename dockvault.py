@@ -1617,6 +1617,27 @@ def volume_set_prefix(name):
     return None
 
 
+# The names beside .env that are never a set's kept or archived .env, whatever the set is called: the sealed .env
+# (lock's .env.enc) and the template (.env.example). A plain .env under the first would be taken for the sealed one
+# (lock would refuse to seal, status would call it sealed, and deleting it as a stale sealed file would delete the
+# set's only key) and kept out of the list of plain-text archives; under the second, for the template. A set named
+# 'enc' or 'example' has its .env kept as .env.enc.1, .env.example.1 instead. Compared without case: where file
+# names ignore case, .env.ENC is the sealed file.
+RESERVED_ENV_NAMES = (".env.enc", ".env.example")
+
+
+def env_copy_names(root, label):
+    """The names a kept or archived .env of `label` may take in `root`, in order: .env.<label>, then .env.<label>.1,
+    .2, ..., never one of RESERVED_ENV_NAMES."""
+    base = os.path.join(root, ".env." + label)
+    n = 0
+    while True:
+        name = base if n == 0 else "%s.%d" % (base, n)
+        n += 1
+        if os.path.basename(name).lower() not in RESERVED_ENV_NAMES:
+            yield name
+
+
 def group_volumes_by_prefix(records):
     """Group parsed volume records into physical SETS by their name prefix, first-seen order:
     [(prefix, [records...]), ...]. Records whose name doesn't parse are grouped under their raw
@@ -5728,7 +5749,9 @@ class DockVault:
             # which we then overwrite in place.
             if current_prefix != prefix and container_running(DB_CONTAINER):
                 print(pal.paint("  Note: a different deployment (set '%s') is running and will be stopped "
-                                "to restore set '%s' (its data and its .env are kept)." % (current_prefix, prefix),
+                                "to restore set '%s' (%s)." % (current_prefix, prefix,
+                                                               "its data and its .env are kept" if kept_env
+                                                               else "its data is kept"),
                                 "yellow"))
             print(pal.paint("  Stopping the deployment before restore (data volumes are kept) ...", "cyan"))
             self._stop_stack()
@@ -5843,8 +5866,9 @@ class DockVault:
         when it is the backup's own .env byte for byte (nothing would be lost).
 
         The copy is .env.<prefix of the set the host is on>, the name Volumes' repoint finds a set's .env by, or
-        .env.<prefix>.1, .2, ... when that name is taken: never written over a file already there. A copy that
-        cannot be made refuses the restore here, before anything is stopped or replaced, with nothing changed."""
+        .env.<prefix>.1, .2, ... when that name is taken or is one of RESERVED_ENV_NAMES: never written over a file
+        already there. A current .env, or a backup's, that cannot be read, and a copy that cannot be made, refuse
+        the restore here, before anything is stopped or replaced, with nothing changed."""
         current_prefix = volume_prefix(self._load_env())
         env_now = self._env_path()
         if not os.path.exists(env_now):
@@ -5866,28 +5890,30 @@ class DockVault:
         try:
             kept = self._keep_env_copy(label, current)
         except OSError as exc:
+            # The name the copy was being made under (.env.<prefix>.N when the first was taken).
+            tried = getattr(exc, "kept_as", None) or next(env_copy_names(self.root, label))
             self._fail("could not keep the current .env as %s (%s): without it the volumes of set '%s' could not be "
-                       "read again after the restore. Nothing changed."
-                       % (os.path.join(self.root, ".env." + label), exc, current_prefix))
+                       "read again after the restore. Nothing changed." % (tried, exc, current_prefix))
         print(self.pal.paint("  Kept the current .env (set '%s') as %s before the restore." % (current_prefix, kept),
                              "cyan"))
         return current_prefix, kept
 
     def _keep_env_copy(self, label, data):
         """Write `data` (the current .env's bytes) to .env.<label>, or to .env.<label>.1, .2, ... when that name is
-        taken (a file, a folder or a link: never followed, never written over). Created mode 600, written through
-        to the disk with its name, tightened like .env and read back to the same bytes before its path is returned.
-        Raises OSError; a file this call created but could not finish is removed."""
-        base = os.path.join(self.root, ".env." + label)
+        taken (a file, a folder or a link: never followed, never written over) or reserved (env_copy_names). Created
+        mode 600, written through to the disk with its name, tightened like .env and read back to the same bytes
+        before its path is returned. Raises OSError, with the name it was making as `kept_as`; a file this call
+        created but could not finish is removed."""
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        dest, n = base, 1
-        while True:
+        for dest in env_copy_names(self.root, label):
             try:
                 fd = os.open(dest, flags, 0o600) if os.name != "nt" else os.open(dest, flags)
                 break
             except FileExistsError:
-                dest = "%s.%d" % (base, n)
-                n += 1
+                continue
+            except OSError as exc:
+                exc.kept_as = dest
+                raise
         try:
             with os.fdopen(fd, "wb") as out:
                 out.write(data)
@@ -5898,11 +5924,13 @@ class DockVault:
             with open(dest, "rb") as f:
                 if f.read() != data:
                     raise OSError("%s does not read back as it was written" % dest)
-        except BaseException:
+        except BaseException as exc:
             try:
                 os.remove(dest)
             except OSError:
                 pass
+            if isinstance(exc, OSError):
+                exc.kept_as = dest
             raise
         return dest
 
@@ -5931,7 +5959,13 @@ class DockVault:
             return
         pal = self.pal
         arg = '"%s"' % kept if any(c.isspace() for c in kept) else kept
-        if current_prefix != prefix:
+        if not valid_volume_prefix(current_prefix):
+            # Its VAULT_VOLUME_PREFIX names no volume set (no volumes could have that name): no set to go back to.
+            print(pal.paint("  The .env this host had before the restore is kept in %s. Its VAULT_VOLUME_PREFIX, %r, "
+                            "is not a volume set's name, so it does not open any set's volumes. It is plain text and "
+                            "holds secrets, and 'lock' does not seal it: copy from it what you need, then delete it."
+                            % (kept, current_prefix), "yellow"))
+        elif current_prefix != prefix:
             print(pal.paint("  The set this host was on, '%s', is as it was: its volumes are untouched, and its .env "
                             "is kept in %s." % (current_prefix, kept), "yellow"))
             print(pal.paint("  To go back to it: python dockvault.py volumes --non-interactive --action repoint "
@@ -5994,15 +6028,14 @@ class DockVault:
 
     def _archive_env(self, label):
         """Move the current .env aside as .env.<label> so it isn't lost / left live. Collision-safe
-        (never clobbers an existing archive). Returns the archive path, or None if there was no .env."""
+        (never clobbers an existing archive) and never under a reserved name (env_copy_names: .env.<label>.1, .2,
+        ... instead). Returns the archive path, or None if there was no .env."""
         env_path = self._env_path()
         if not os.path.exists(env_path):
             return None
-        base = os.path.join(self.root, ".env." + label)
-        dest, n = base, 1
-        while os.path.exists(dest):
-            dest = "%s.%d" % (base, n)
-            n += 1
+        for dest in env_copy_names(self.root, label):
+            if not os.path.lexists(dest):
+                break
         os.replace(env_path, dest)
         return dest
 
