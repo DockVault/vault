@@ -4,7 +4,8 @@ A release before 0.34.0 knows no cases and deletes every audit row older than a 
 while a case is open, a case's records must stay, or the record of a step of compliance access taken is younger
 than COMPLIANCE_RECORD_MIN_DAYS, a row in data_requirements stops such a release from starting (0.33.1 and later),
 and dockvault.py update refuses to go back unless forced. Every audit row of such a step writes the marker in its own
-transaction; a refusal, which any account can cause, and a vault owner's own steps on Access to my vaults do not.
+transaction; a refusal, which any account can cause, a vault owner's own steps on Access to my vaults, and the
+records of telling a vault's owner (also of access someone else gave to their vault) do not.
 sync() removes it once nothing needs it, at the start and at each pass of the pruner's compliance_cases job.
 test_compliance_marker_live.py checks on Postgres that sync() never removes it while a transaction that wrote such a
 row is still open.
@@ -141,7 +142,8 @@ def test_no_marker_when_nothing_must_be_kept(db, state):
     assert marker.sync(db, now=NOW) is False and _rows(db) == []
 
 
-# A refused step, which any signed-in account can cause, and a vault owner's own steps on Access to my vaults.
+# A refused step, which any signed-in account can cause, a vault owner's own steps on Access to my vaults, and the
+# records of telling a vault's owner.
 NOT_COUNTED = [
     ("case_access_refused", "failure"),     # a read of a case that does not exist
     ("hold_placed", "failure"),             # a hold its account may not place
@@ -151,12 +153,14 @@ NOT_COUNTED = [
     ("owner_access_unlocked", "success"),   # an owner shows their own vault's names on their page
     ("owner_access_unlocked", "failure"),   # with a wrong vault password
     ("owner_notice_seen", "success"),       # an owner reads their notices
+    ("owner_notice_written", "success"),    # an owner is told (of access a manager of their vault gave, too)
+    ("owner_notice_email_sent", "success"),  # and by email
 ]
 
 
 @pytest.mark.parametrize("action, status", NOT_COUNTED)
-def test_a_refused_step_or_a_vault_owners_own_writes_and_keeps_no_marker(db, action, status):
-    """Neither may stop every rollback for COMPLIANCE_RECORD_MIN_DAYS on a deployment that never used compliance
+def test_a_refused_step_a_vault_owners_own_or_a_notice_to_one_writes_and_keeps_no_marker(db, action, status):
+    """None may stop every rollback for COMPLIANCE_RECORD_MIN_DAYS on a deployment that never used compliance
     access. The row is written all the same, and the pruner keeps it as long as any row of the category."""
     from app.core import compliance_retention as cr
     row = AuditLogger(db).build_row(action=action, status=status, username="someone")
@@ -184,15 +188,19 @@ def test_an_ordinary_accounts_refused_case_read_and_hold_record_their_refusals_a
     assert _rows(db) == [] and marker.sync(db, now=NOW) is False
 
 
-def test_every_step_of_the_category_taken_counts_but_a_vault_owners_own(db):
+def test_every_step_of_the_category_taken_counts_but_a_vault_owners_own_and_the_notices_to_owners(db):
     """counts() (the row's own transaction) and counted_rows() (sync) take the same rows: every action of the
-    compliance category taken (status success) but OWN_STEPS; no refusal, no row of another category."""
+    compliance category taken (status success) but OWN_STEPS and OWNER_NOTICES; no refusal, no row of another
+    category."""
     from app.core import audit_catalog
     actions = list(audit_catalog.stored_names(["compliance"]))
+    left_out = marker.OWN_STEPS | marker.OWNER_NOTICES
     assert marker.OWN_STEPS == {"owner_access_unlocked", "owner_notice_seen"} and marker.OWN_STEPS < set(actions)
+    assert marker.OWNER_NOTICES == {"owner_notice_written", "owner_notice_email_sent", "owner_notice_email_failed"}
+    assert marker.OWNER_NOTICES < set(actions) and not marker.OWN_STEPS & marker.OWNER_NOTICES
     statuses = ("success", "failure", "error")
     for action in actions:
-        assert marker.counts(action, "success") is (action not in marker.OWN_STEPS), action
+        assert marker.counts(action, "success") is (action not in left_out), action
         assert not marker.counts(action, "failure") and not marker.counts(action, "error"), action
     assert not marker.counts("file_uploaded", "success") and not marker.counts(None, "success")
     for action in actions + ["file_uploaded"]:
@@ -203,7 +211,82 @@ def test_every_step_of_the_category_taken_counts_but_a_vault_owners_own(db):
     db.commit()
     found = set(db.query(AuditLog.action, AuditLog.status).filter(marker.counted_rows(AuditLog, NOW)).all())
     assert found == {(a, st) for a in actions + ["file_uploaded"] for st in statuses if marker.counts(a, st)}
-    assert len(found) == len(actions) - len(marker.OWN_STEPS)
+    assert len(found) == len(actions) - len(left_out)
+
+
+def test_the_notices_left_out_are_every_row_the_owners_notices_write_and_the_rest_are_an_owners_own_steps():
+    """OWNER_NOTICES is what the code that tells a vault's owner records (a case's notices, a reveal's, those of
+    access someone else gave, and their emails), so a new record of it is not counted unseen; with OWN_STEPS it is
+    every action of the category about a vault's owner."""
+    import re
+    from app.core import audit_catalog
+    written = set()
+    for name in ("owner_notices.py", "access_notices.py"):
+        source = (ROOT / "app" / "core" / name).read_text(encoding="utf-8")
+        found = re.findall(r'\b_audit\(db, "(\w+)"', source)
+        calls = re.findall(r"(?<!def )\b_audit\(db,", source)      # every call, each naming its action
+        assert found and len(found) == len(calls), name
+        written |= set(found)
+    assert written == marker.OWNER_NOTICES
+    owners = {a for a in audit_catalog.stored_names(["compliance"]) if a.startswith("owner_")}
+    assert owners == marker.OWN_STEPS | marker.OWNER_NOTICES
+
+
+def test_a_grant_by_someone_other_than_the_owner_and_its_email_write_the_notices_and_no_marker(db, monkeypatch):
+    """Through the code that tells a vault's owner of access someone else gave (app/core/access_notices.py): a
+    manager of the vault and an administrator each give a person access to it, and the email of the administrator's
+    grant is sent. Each records the owner's notice, the administrator's grant its email too, and none writes the
+    marker: an ordinary grant is no compliance access, so it may not stop every rollback for
+    COMPLIANCE_RECORD_MIN_DAYS."""
+    from app.core import access_notices as an
+    from app.core import after_commit
+    from app.core import owner_notices as on
+    from app.core.models import ComplianceNoticeOutbox, RoleEnum, User, Vault, vault_members
+    for kind in (on._NUDGES, on._WAKE):
+        monkeypatch.setitem(after_commit._HANDLERS, kind, lambda items: None)
+    monkeypatch.setattr(on, "contact", lambda db_: None)
+
+    def person(name, role=RoleEnum.USER):
+        u = User(id=uuid.uuid4(), username=name, email=f"{name}@example.com", password_hash="x", role=role,
+                 is_active=True, is_locked=False)
+        db.add(u)
+        return u
+
+    ada, olga, mona = person("ada", RoleEnum.ADMIN), person("olga"), person("mona")
+    xavier, yuri = person("xavier"), person("yuri")
+    vault = Vault(id=uuid.uuid4(), name="Plans", owner_id=olga.id, type="standard", file_count=0, total_size_bytes=0)
+    db.add(vault)
+    db.commit()
+
+    def member(who, manage=False):
+        db.execute(vault_members.insert().values(vault_id=vault.id, user_id=who.id, read_permission=True,
+                                                 write_permission=manage, delete_permission=manage,
+                                                 manage_permission=manage))
+
+    member(mona, manage=True)
+    db.commit()
+
+    def grant(granter, who):
+        """What POST /vaults/{id}/permissions does, around its write: watch, write, tell, commit."""
+        reach = an.Reach(db, granter)
+        reach.watch(vault, [who.id], via=an.GRANT)
+        member(who)
+        told = reach.tell()
+        db.commit()
+        return told
+
+    assert grant(mona, xavier) == 1, "a manager of the vault tells its owner, in the app"
+    assert _rows(db) == [], "the manager's grant wrote the marker"
+    assert grant(ada, yuri) == 1, "an administrator who is not a member tells the owner by email too"
+    assert _rows(db) == [], "the administrator's grant wrote the marker"
+    [row] = db.query(ComplianceNoticeOutbox).filter(ComplianceNoticeOutbox.kind == an.KIND).all()
+    assert on._attempt(db, row, NOW, lambda *a: None) == on.SENT
+    db.commit()
+    rows = sorted(db.query(AuditLog.action, AuditLog.status).filter(AuditLog.action.like("owner_notice%")).all())
+    assert rows == [("owner_notice_email_sent", "success"), ("owner_notice_written", "success"),
+                    ("owner_notice_written", "success")]
+    assert _rows(db) == [], "the email's record wrote the marker"
+    assert marker.kept_now(db) is False and marker.sync(db) is False and _rows(db) == []
 
 
 def test_the_undo_holds_with_no_case_and_names_only_what_the_host_tool_can_do():

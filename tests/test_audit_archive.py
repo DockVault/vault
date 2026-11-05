@@ -1336,6 +1336,8 @@ def test_an_unarchive_brings_back_the_compliance_records_marker_with_the_rows_th
 @pytest.mark.parametrize("rows, floor", [
     (dict(action="case_access_refused", status="failure"), None),   # a refusal keeps no marker
     (dict(action="owner_notice_seen"), None),                       # nor an owner's own step
+    (dict(action="owner_notice_written"), None),                    # nor the record of telling an owner
+    (dict(action="owner_notice_email_sent"), None),                 # by email
     (dict(action="file_uploaded"), None),                           # nor a row of another category
     (dict(action="auditor_granted"), 99),                           # nor a step past the floor (DAY is 100 days ago)
 ])

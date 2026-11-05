@@ -146,11 +146,12 @@ SUMMARY = {
         "no cases, and with a positive AUDIT_LOG_RETENTION_DAYS, which 0.34.0 leaves in .env as a waiting change, it "
         "deletes every older audit row the first time an administrator opens the dashboard's activity feed. So 0.33.1 "
         "and later refuse to start on this database, and python dockvault.py update refuses to go back unless "
-        "--force-downgrade is given. A refused request, which any account can make, and a vault owner's own steps on "
-        "Access to my vaults do not count. Wait until no case is open and those records are older than "
-        "COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the record that stops the earlier release. "
-        "An earlier release started sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env "
-        "sets no AUDIT_LOG_RETENTION_DAYS. The check finds that record."),
+        "--force-downgrade is given. A refused request, which any account can make, a vault owner's own steps on "
+        "Access to my vaults, and a notice to a vault's owner (also of access someone else gave to their vault) do "
+        "not count. Wait until no case is open and those records are older than COMPLIANCE_RECORD_MIN_DAYS, then "
+        "start 0.34.0 once so it removes the record that stops the earlier release. An earlier release started "
+        "sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env sets no "
+        "AUDIT_LOG_RETENTION_DAYS. The check finds that record."),
     "older-images-refuse-newer-data": (
         "From 0.34.0 the release records in the table data_requirements each state of the data that an earlier "
         "release cannot read or would destroy, for as long as it lasts: archived audit days, legal holds and what "

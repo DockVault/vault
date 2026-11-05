@@ -65,9 +65,9 @@ _compliance_actions = None
 def kept_records(row, db=None) -> None:
     """A row of the compliance category (app/core/audit_catalog.py) is kept COMPLIANCE_RECORD_MIN_DAYS, which an
     earlier release would not do. When the row records a step of compliance access taken (compliance_marker.counts:
-    not a refusal, not a vault owner's own step), the marker that stops one from starting is written in ``db``'s
-    transaction, the one that writes the row (app/core/compliance_marker.py, ensure). Any other row: nothing. Never
-    raises."""
+    not a refusal, not a vault owner's own step, not the record of telling an owner), the marker that stops one from
+    starting is written in ``db``'s transaction, the one that writes the row (app/core/compliance_marker.py, ensure).
+    Any other row: nothing. Never raises."""
     global _compliance_actions
     try:
         if _compliance_actions is None:

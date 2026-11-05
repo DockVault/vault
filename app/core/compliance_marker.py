@@ -15,12 +15,16 @@ start when a row names a version above its own (the operator's undo, or the esca
 ``dockvault.py update`` refuses the rollback unless forced, naming the row (app/core/host_operator.py,
 downgrade-blockers).
 
-Not every row of the category is such a step (counts): a refused one is not, since any signed-in account can cause
-one (a read of a case that does not exist, a hold it may not place), and neither are a vault owner's own steps on
-Access to my vaults (OWN_STEPS). Were they counted, one request from anyone would stop every rollback for
-COMPLIANCE_RECORD_MIN_DAYS on a deployment that never used compliance access. This release keeps those rows all the
-same; an earlier release started anyway may delete them. A refusal under a case stays with the case's records,
-which keep the marker while they must stay.
+Not every row of the category is such a step (counts): a refused one is not, since any signed-in account can cause one
+(a read of a case that does not exist, a hold it may not place); neither are a vault owner's own steps on Access to my
+vaults (OWN_STEPS), nor the records of telling a vault's owner, in the app or by email (OWNER_NOTICES). A notice of
+access someone else gave to an owner's vault (app/core/access_notices.py) follows an ordinary change of access (a
+grant, a department's members, a member row removed) by an administrator or a manager of the vault; a notice of a
+case's step or of a name revealed follows a step that counts in a row of its own, written in the same transaction.
+Were they counted, one request from anyone, or one vault shared by someone other than its owner, would stop every
+rollback for COMPLIANCE_RECORD_MIN_DAYS on a deployment that never used compliance access. This release keeps those
+rows all the same; an earlier release, which they do not stop, may delete them. A refusal or a notice under a case
+stays with the case's records, which keep the marker while they must stay.
 
 The row is written in the transaction of the change that makes it needed: every audit row that counts is built with
 it (ensure(), from app/services/audit_row_hooks.py), and a case opens with such a row. ``audit unarchive`` puts
@@ -59,11 +63,13 @@ UNDO = ("Wait until no compliance case is open and the records of compliance acc
         "{version} or later once so it removes this marker.")
 
 # The rows of the compliance category that do not keep the marker though they are kept as long (see the module's
-# docstring): a step not taken (any status but TAKEN), and a vault owner's own steps on Access to my vaults, showing
-# their own vault's names there and reading their notices (a case or a reveal wrote those notices, with rows of
-# their own that count).
+# docstring): a step not taken (any status but TAKEN); a vault owner's own steps on Access to my vaults, showing
+# their own vault's names there and reading their notices (OWN_STEPS); and the records of telling a vault's owner,
+# the notice written and its email sent or given up (OWNER_NOTICES, every row app/core/owner_notices.py and
+# app/core/access_notices.py write).
 TAKEN = "success"
 OWN_STEPS = frozenset({"owner_access_unlocked", "owner_notice_seen"})
+OWNER_NOTICES = frozenset({"owner_notice_written", "owner_notice_email_sent", "owner_notice_email_failed"})
 
 # The lock sync() takes alone to remove the marker, and every write of it (ensure(), restored()) shared (distinct
 # from the other lock classes).
@@ -82,11 +88,12 @@ CONDITION = {
                 "0.34.0 leaves in .env as a waiting change, it deletes every older audit row the first time an "
                 "administrator opens the dashboard's activity feed. So 0.33.1 and later refuse to start on this "
                 "database, and python dockvault.py update refuses to go back unless --force-downgrade is given. A "
-                "refused request, which any account can make, and a vault owner's own steps on Access to my vaults "
-                "do not count. Wait until no case is open and those records are older than "
-                "COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the record that stops the earlier "
-                "release. An earlier release started sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows "
-                "only while .env sets no AUDIT_LOG_RETENTION_DAYS. The check finds that record."),
+                "refused request, which any account can make, a vault owner's own steps on Access to my vaults, and "
+                "a notice to a vault's owner (also of access someone else gave to their vault) do not count. Wait "
+                "until no case is open and those records are older than COMPLIANCE_RECORD_MIN_DAYS, then start "
+                "0.34.0 once so it removes the record that stops the earlier release. An earlier release started "
+                "sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env sets no "
+                "AUDIT_LOG_RETENTION_DAYS. The check finds that record."),
     "detect": f"SELECT key, requires_at_least, since FROM {TABLE} WHERE key = '{KEY}'",
     "blocks_rollback": True,
 }
@@ -101,18 +108,18 @@ def _postgres(db) -> bool:
     return bind is not None and bind.dialect.name == "postgresql"
 
 
-_actions = None
+_counted = None
 
 
 def counts(action: Optional[str], status: Optional[str]) -> bool:
     """Whether an audit row of ``action`` with ``status`` keeps the marker while it is younger than
     COMPLIANCE_RECORD_MIN_DAYS: a step of the compliance category (app/core/audit_catalog.py) that was taken
-    (TAKEN), other than a vault owner's own (OWN_STEPS)."""
-    global _actions
-    if _actions is None:
+    (TAKEN), other than a vault owner's own (OWN_STEPS) and the records of telling an owner (OWNER_NOTICES)."""
+    global _counted
+    if _counted is None:
         from app.core import audit_catalog
-        _actions = frozenset(audit_catalog.stored_names(["compliance"]))
-    return action in _actions and status == TAKEN and action not in OWN_STEPS
+        _counted = frozenset(audit_catalog.stored_names(["compliance"])) - OWN_STEPS - OWNER_NOTICES
+    return action in _counted and status == TAKEN
 
 
 def counted_rows(model, now: datetime):
@@ -120,7 +127,8 @@ def counted_rows(model, now: datetime):
     COMPLIANCE_RECORD_MIN_DAYS (compliance_retention.compliance_rows_kept, which keeps every row of the category)."""
     from sqlalchemy import and_
     from app.core import compliance_retention as cr
-    return and_(cr.compliance_rows_kept(model, now), model.status == TAKEN, model.action.notin_(sorted(OWN_STEPS)))
+    return and_(cr.compliance_rows_kept(model, now), model.status == TAKEN,
+                model.action.notin_(sorted(OWN_STEPS | OWNER_NOTICES)))
 
 
 def kept_now(db, now: Optional[datetime] = None) -> bool:

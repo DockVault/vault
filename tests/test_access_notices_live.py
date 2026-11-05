@@ -7,13 +7,20 @@ On a running stack, with a real SMTP server inside the web container (_owner_not
     administrator who made X's account and that the administrator set X's password;
   * the department paths: a grant to a department X is in, adding someone to that department, and removing X's own
     member row while the department may write each tell O in that change's transaction;
-  * the owner's own grant tells nobody; a manager of the vault tells the owner in the app only, with no email.
+  * the owner's own grant tells nobody; a manager of the vault tells the owner in the app only, with no email;
+  * neither a manager's grant nor an administrator's, nor the email of its notice, writes the compliance records'
+    rollback marker (app/core/compliance_marker.py): an ordinary grant is no compliance access.
 
 test_access_notices.py covers the rules offline.
 """
+import json
+import subprocess
+import time
+from contextlib import contextmanager
+
 import pytest
 
-from _account_change_helpers import notifications, psql, signed_in
+from _account_change_helpers import DB, in_api_container, notifications, psql, signed_in
 from _owner_notice_helpers import mail_to, owner_with_vault, sender_held, sending_to_sink, wait_for
 from conftest import ADMIN_USER, unique
 
@@ -139,3 +146,80 @@ def test_the_owners_own_grant_tells_nobody_and_a_managers_only_in_the_app(admin,
     assert _outbox_rows(owner["id"]) == [], "a manager of the vault is a member: no email"
     assert psql("SELECT details->>'email_status' FROM audit_logs WHERE action = 'owner_notice_written' "
                 f"AND resource_id = '{owner['id']}' ORDER BY timestamp DESC LIMIT 1") == "in_app_only"
+
+
+# The lock of the compliance records' rollback marker (app/core/compliance_marker.py, LOCK). Every write of the marker
+# takes it shared first, for the rest of its transaction.
+MARKER_LOCK = (0x6372, 1)
+
+
+def _marker_lock_held_alone() -> bool:
+    return psql("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND mode = 'ExclusiveLock' "
+                f"AND classid = {MARKER_LOCK[0]} AND objid = {MARKER_LOCK[1]}") != "0"
+
+
+@contextmanager
+def marker_lock_held():
+    """Another database session holds the marker's lock alone: a transaction that goes to write the marker waits."""
+    holder = subprocess.Popen(["docker", "exec", "-i", DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-Atc",
+                               f"SELECT pg_advisory_lock({MARKER_LOCK[0]}, {MARKER_LOCK[1]}); "
+                               "SELECT pg_sleep(900)"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(120):
+            if _marker_lock_held_alone():
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError("the marker's lock was not taken")
+        yield
+    finally:
+        psql("SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND granted "
+             f"AND classid = {MARKER_LOCK[0]} AND objid = {MARKER_LOCK[1]} AND pid <> pg_backend_pid()")
+        holder.kill()
+        holder.wait(timeout=30)
+
+
+_COUNTED = """
+import json
+from datetime import datetime, timezone
+from app.core import compliance_marker as m
+from app.core.database import get_db_context
+from app.core.models import AuditLog
+ids = %(ids)r
+now = datetime.now(timezone.utc).replace(tzinfo=None)
+with get_db_context() as db:
+    rows = db.query(AuditLog.action, AuditLog.status).filter(AuditLog.id.in_(ids)).all()
+    taken = db.query(AuditLog.id).filter(AuditLog.id.in_(ids), m.counted_rows(AuditLog, now)).count()
+print(json.dumps({"lock": list(m.LOCK), "rows": sorted([a, s] for a, s in rows),
+                  "counts": [m.counts(a, s) for a, s in rows], "taken": taken}))
+"""
+
+
+def test_a_grant_by_someone_other_than_the_owner_never_writes_the_compliance_records_marker(admin, made):
+    """The owner's notice of an ordinary grant, and the email of it, are kept with the records of compliance access
+    but are none: they may not stop every rollback below 0.34.0 for COMPLIANCE_RECORD_MIN_DAYS. While another
+    session holds the marker's lock alone, a manager's grant and an administrator's complete and the administrator's
+    notice is emailed, so none of their transactions went to write the marker (whether or not an earlier step wrote
+    it), and the running image counts none of the rows they wrote."""
+    owner, owner_c, vid = _owner(admin, made)
+    mona, x, y = _person(admin, made), _person(admin, made), _person(admin, made)
+    r = owner_c.post(f"/vaults/{vid}/permissions", json={"user_id": mona["id"], "level": "manage"})
+    assert r.status_code == 200, r.text
+    mona_c = signed_in(mona)
+    with sending_to_sink(admin):
+        with marker_lock_held():
+            r = mona_c.post(f"/vaults/{vid}/permissions", json={"user_id": x["id"], "level": "read"})
+            assert r.status_code == 200, r.text
+            r = admin.post(f"/vaults/{vid}/permissions", json={"user_id": y["id"], "level": "read"})
+            assert r.status_code == 200, r.text
+            sent = wait_for(lambda: psql("SELECT count(*) FROM audit_logs WHERE action = 'owner_notice_email_sent' "
+                                         f"AND resource_id = '{owner['id']}'") == "1")
+            assert sent, "the notice's email was not recorded as sent while the marker's lock was held"
+    ids = psql("SELECT string_agg(id::text, ',') FROM audit_logs WHERE action LIKE 'owner_notice%' "
+               f"AND resource_id = '{owner['id']}'").split(",")
+    out = json.loads(in_api_container(_COUNTED % {"ids": ids}).stdout.strip().splitlines()[-1])
+    assert tuple(out["lock"]) == MARKER_LOCK
+    assert out["rows"] == [["owner_notice_email_sent", "success"], ["owner_notice_written", "success"],
+                           ["owner_notice_written", "success"]]
+    assert out["counts"] == [False, False, False] and out["taken"] == 0
