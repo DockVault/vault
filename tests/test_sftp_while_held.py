@@ -144,3 +144,25 @@ def test_the_pruners_legal_holds_job_asks_at_every_pass(db, told, monkeypatch):
     _sftp(db, "0.33.5", 5)
     retention.run_legal_holds(retention.Pass(db.factory, now=NOW))
     assert [d for _t, _b, d in told] == ["sftp-version-other_version-0.33.5-2026-11-05"]
+
+
+def test_a_check_that_fails_leaves_the_rest_of_the_pass(db, told, monkeypatch, capsys):
+    """The check reads the kept tables, which a start can skip: when it fails, the lapses and the review prompts of
+    the pass still commit, the purge still runs, and the next pass asks again."""
+    from sqlalchemy import text
+    purged = []
+    monkeypatch.setattr(legal_holds, "purge", lambda *a, **k: purged.append(True))
+
+    def lapse_due(session, now):
+        session.add(LegalHoldVault(case_id=uuid.uuid4(), vault_id=uuid.uuid4(), placed_by_username="lapsed",
+                                   lapsed_at=now, released_at=now))
+    monkeypatch.setattr(legal_holds, "lapse_due", lapse_due)
+    monkeypatch.setattr(legal_holds, "prompt_reviews", lambda session, now: None)
+    _sftp(db, "0.33.5", 5)
+    db.execute(text("DROP TABLE held_files"))
+    db.commit()
+    retention.run_legal_holds(retention.Pass(db.factory, now=NOW))
+    lapsed = db.factory().query(LegalHoldVault).filter(LegalHoldVault.placed_by_username == "lapsed").count()
+    assert lapsed == 1 and purged == [True] and told == []
+    assert ("the SFTP servers' versions were not checked while legal holds keep files (OperationalError)"
+            in capsys.readouterr().out)

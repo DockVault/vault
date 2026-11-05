@@ -467,12 +467,19 @@ def run_legal_holds(p: Pass) -> JobResult:
     ask for one, while anything is held an SFTP server of another version is looked for again (the administrators
     are told of one), and what released holds kept is purged once their delay is over (a batch per transaction, each
     file's held_file_purged row in it, the blobs secure-deleted after its commit). Not stopped by the hold switch:
-    a hold's purge is the end of what a case kept, not a log."""
+    a hold's purge is the end of what a case kept, not a log. The SFTP check runs in a transaction of its own, and
+    its failure is said and goes no further: the lapses and the review prompts commit without it, and the purge
+    runs."""
     from app.core import legal_holds
     with p.transaction() as db:
         legal_holds.lapse_due(db, p.now)
         legal_holds.prompt_reviews(db, p.now)
-        legal_holds.sftp_while_held(db, p.now)
+    try:
+        with p.transaction() as db:
+            legal_holds.sftp_while_held(db, p.now)
+    except Exception as exc:  # noqa: BLE001 -- the check asks again at the next pass
+        print(f"Warning: the SFTP servers' versions were not checked while legal holds keep files "
+              f"({type(exc).__name__}); the next pass asks again")
     done = JobResult()
 
     def record(db, count, table):
