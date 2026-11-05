@@ -79,11 +79,12 @@ def _session(client):
     return s
 
 
-def _upload(client, vault_id, name, content):
+def _upload(client, vault_id, name, content, folder_id=None):
     """Through the resumable path, in 4 MiB chunks."""
     pieces = [content[i:i + CHUNK] for i in range(0, len(content), CHUNK)] or [b""]
     r = client.post(f"/vaults/{vault_id}/uploads", json={
-        "file_name": name, "total_size": len(content), "total_chunks": len(pieces), "chunk_size": CHUNK})
+        "file_name": name, "total_size": len(content), "total_chunks": len(pieces), "chunk_size": CHUNK,
+        **({"folder_id": folder_id} if folder_id else {})})
     assert r.status_code in (200, 201), r.text
     sid = r.json()["session_id"]
     s = _session(client)
@@ -502,3 +503,56 @@ def test_a_transfer_waiting_for_its_slot_is_refused_when_what_let_it_in_changes(
             client.delete_vault(vid, vault_password=password)
         for user in users:
             admin.delete_user(user["id"])
+
+
+def test_one_account_holds_at_most_a_quarter_of_the_slots_with_copies(admin, other, vault):
+    """One account sends twice its share of folder copies of a large tree at once. At most its share (a quarter of
+    the ceiling) run at a time, the others wait their turn and are all done, and another account's download meanwhile
+    is admitted at once. Before, one account's long folder copies held every slot while everyone else waited."""
+    limit = _setting("MAX_CONCURRENT_TRANSFERS", 16)
+    queue = _setting("MAX_QUEUED_TRANSFERS", 32)
+    share = max(1, limit // 4)
+    if limit > 64 or limit < 4 or queue < share:
+        pytest.skip(f"needs a ceiling of 4 to 64 and room for {share} to wait (ceiling {limit}, queue {queue})")
+    asker_client, asker_vault = other
+    theirs = _upload(asker_client, asker_vault, "theirs.bin", os.urandom(1024))
+    tree = _folder(admin, vault, "tree")
+    for i in range(3):
+        _upload(admin, vault, f"part{i}.bin", os.urandom(32 * MB), folder_id=tree)
+    into = [_folder(admin, vault, f"into{i}") for i in range(2 * share)]
+    seen, stop, answers = [], threading.Event(), {}
+
+    def watch():
+        while not stop.is_set():
+            seen.append((time.monotonic(), *_metrics(admin)))
+            time.sleep(0.05)
+
+    def copy(i):
+        answers[i] = _session(admin).post(f"{BASE}/vaults/{vault}/folders/{tree}/copy",
+                                          json={"dest_vault_id": vault, "dest_parent_folder_id": into[i]},
+                                          timeout=120)
+
+    _until(admin, lambda flying, waiting: flying == 0 and waiting == 0, "idle", 120)
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    threads = [threading.Thread(target=copy, args=(i,), daemon=True) for i in range(2 * share)]
+    try:
+        for t in threads:
+            t.start()
+        _until(admin, lambda flying, waiting: waiting > 0, "a copy waiting for its turn", 30)
+        sent = time.monotonic()
+        r = _session(asker_client).get(f"{BASE}/vaults/{asker_vault}/files/{theirs}/download", timeout=60)
+        took = time.monotonic() - sent
+        assert r.status_code == 200 and took < 3, (r.status_code, f"{took:.1f} s")
+        for t in threads:
+            t.join(130)
+    finally:
+        stop.set()
+        watcher.join(10)
+    assert {i: a.status_code for i, a in answers.items()} == {i: 200 for i in range(2 * share)}, (
+        {i: a.text[:200] for i, a in answers.items() if a.status_code != 200})
+    # Not counting the other account's download, which held a slot of its own for as long as it took.
+    copies_only = [(flying, waiting) for at, flying, waiting in seen if not sent - 0.2 <= at <= sent + took + 0.2]
+    most = max(flying for flying, _waiting in copies_only)
+    assert most <= share, f"one account's copies held {most} slots at once, past its share of {share}"
+    assert max(waiting for _flying, waiting in copies_only) > 0, "no copy waited: the instrument saw nothing"

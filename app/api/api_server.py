@@ -132,7 +132,7 @@ def get_active_operations_count() -> int:
 # every operation for the activity feed and cancellation, while admission governs the things that
 # hold memory, and a database connection, for a duration -- serving a download, assembling an
 # upload, and copying or moving a file or a folder.
-from app.core.transfer_admission import TransferAdmission, TransferBusy, link_ceiling  # noqa: E402
+from app.core.transfer_admission import TransferAdmission, TransferBusy, copy_share, link_ceiling  # noqa: E402
 
 transfer_admission = TransferAdmission(
     limit=settings.max_concurrent_transfers,
@@ -23457,9 +23457,14 @@ def _gate_move_copy_destination(db, vault_service, current_user, dest_vault_id, 
     return dest_vault
 
 
-async def _admitted_holding_no_connection(db):
+async def _admitted_holding_no_connection(db, *, account=None):
     """A transfer slot for a download, a preview, a direct upload, a copy, a move or a folder copy, with the same
     answer as every transfer's when the deployment is full (503 with Retry-After).
+
+    With an ``account`` (a copy, a move to another vault, a folder copy), that account holds at most its share of
+    the slots with them (copy_share: a quarter of the ceiling, at least one); one past it waits for one of its own
+    to end. A copy needs no slow client to last, and one account's folder copies of a large tree held every slot
+    while everyone else waited.
 
     Each of them holds the request's database connection while it runs: a download while it streams, a copy in a
     thread (app/core/off_loop.py) that reads, decrypts, encrypts and syncs a whole file, a folder copy every file in
@@ -23475,7 +23480,9 @@ async def _admitted_holding_no_connection(db):
     once it has its slot (_admitted_again), reading its rows again."""
     db.rollback()
     try:
-        return await transfer_admission.acquire()
+        if account is None:
+            return await transfer_admission.acquire()
+        return await transfer_admission.acquire(holder=account, share=copy_share(transfer_admission.limit))
     except TransferBusy as busy:
         raise _busy_response(busy)
 
@@ -23568,6 +23575,7 @@ async def copy_file_endpoint(
         token = _bearer_credentials(request).credentials
         source_password = _vault_credential_fingerprint(db, vault_id)
         dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
+        account = current_user.id
         client_ip = get_client_ip(request)
 
         def _copy_and_record():
@@ -23586,7 +23594,7 @@ async def copy_file_endpoint(
                 ip_address=client_ip)
             return new_id
 
-        transfer_slot = await _admitted_holding_no_connection(db)
+        transfer_slot = await _admitted_holding_no_connection(db, account=account)
         # Off the event loop, to its end: the copy reads, re-encrypts and syncs the whole file, and its audit
         # row commits there too (a commit on the loop waits for a disk the copies keep busy).
         new_id = await off_loop.run_to_end_on_session(db, _copy_and_record)
@@ -23649,6 +23657,7 @@ async def move_file_endpoint(
         token = _bearer_credentials(request).credentials
         source_password = _vault_credential_fingerprint(db, vault_id)
         dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
+        account = current_user.id
         client_ip = get_client_ip(request)
 
         def _move_and_record(waited):
@@ -23673,7 +23682,7 @@ async def move_file_endpoint(
             # it; and it runs here, as a folder move and a rename do (work on the request's session runs off
             # the event loop only under a slot: app/core/off_loop.py).
             return {'message': 'File moved', 'id': _move_and_record(False)}
-        transfer_slot = await _admitted_holding_no_connection(db)
+        transfer_slot = await _admitted_holding_no_connection(db, account=account)
         # Off the event loop, to its end: a move to another vault reads, re-encrypts and syncs the whole
         # file, then removes the source; its audit row commits there too.
         new_id = await off_loop.run_to_end_on_session(db, _move_and_record, True)
@@ -23775,6 +23784,7 @@ async def copy_folder_endpoint(
         _admitted(current_user)
         token = _bearer_credentials(request).credentials
         password = _vault_credential_fingerprint(db, vault_id)
+        account = current_user.id
         client_ip = get_client_ip(request)
 
         def _copy_folder_and_record():
@@ -23792,7 +23802,7 @@ async def copy_folder_endpoint(
                 ip_address=client_ip)
             return new_id
 
-        transfer_slot = await _admitted_holding_no_connection(db)
+        transfer_slot = await _admitted_holding_no_connection(db, account=account)
         # Off the event loop, to its end: every file in the tree is read, re-encrypted and synced, and the
         # audit row commits there too.
         new_id = await off_loop.run_to_end_on_session(db, _copy_folder_and_record)

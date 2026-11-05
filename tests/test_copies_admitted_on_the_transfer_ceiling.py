@@ -66,7 +66,7 @@ class _Session:
 
 
 class _World:
-    def __init__(self, monkeypatch, gate, *, fail_with=None, refuse_access=False):
+    def __init__(self, monkeypatch, gate, *, fail_with=None, refuse_access=False, hold=None):
         self.db = _Session()
         self.gate = gate
         self.ran = []
@@ -87,6 +87,8 @@ class _World:
                 # Runs in a thread of the off-loop pool, holding the request's slot and its connection.
                 world.db._query_ran()
                 world.ran.append((name, dict(world.gate.stats()), world.db.held))
+                if hold is not None:
+                    assert hold.wait(10)
                 if fail_with is not None:
                     raise fail_with
                 return SimpleNamespace(id=uuid.uuid4())
@@ -127,9 +129,9 @@ def _raw(endpoint):
 REQUEST = SimpleNamespace(headers={"authorization": "Bearer t"})
 
 
-def _call(kind, world):
+def _call(kind, world, user=None):
     """The endpoint's coroutine for `kind`, as FastAPI would call it."""
-    user = SimpleNamespace(id=uuid.uuid4())
+    user = user or SimpleNamespace(id=uuid.uuid4())
     vid, item = uuid.uuid4(), uuid.uuid4()
     if kind == "copy":
         return _raw(S.copy_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), REQUEST,
@@ -260,6 +262,42 @@ def test_a_move_within_one_vault_takes_no_slot_and_a_full_ceiling_never_refuses_
     assert stats["admitted"] == 1 and stats["refused"] == 0 and stats["waiting"] == 0, stats
     ((action, thread),) = world.audited
     assert action == "file_move" and not thread.startswith("stored-bytes"), thread
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_one_account_holds_at_most_its_share_of_the_slots_with_copies(monkeypatch, kind):
+    """A quarter of the ceiling, at least one: at a ceiling of 4, one account's second copy waits for its first to
+    end, while another account's copy is admitted at once. Without it one account's long folder copies held every
+    slot."""
+    async def scenario():
+        gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=30)
+        hold = threading.Event()
+        world = _World(monkeypatch, gate, hold=hold)
+        one, another = SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4())
+
+        async def until(done):
+            for _ in range(500):
+                if done():
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+
+        try:
+            first = asyncio.ensure_future(_call(kind, world, user=one))
+            assert await until(lambda: len(world.ran) == 1)
+            second = asyncio.ensure_future(_call(kind, world, user=one))
+            third = asyncio.ensure_future(_call(kind, world, user=another))
+            await until(lambda: len(world.ran) == 2 and gate.stats()["waiting"] == 1)
+            seen = (gate.stats()["in_flight"], gate.stats()["waiting"], len(world.ran))
+        finally:
+            hold.set()
+        answers = await asyncio.gather(first, second, third)
+        return seen, answers, gate.stats()
+
+    seen, answers, after = run_coroutine(scenario())
+    assert seen == (2, 1, 2), f"(in flight, waiting, run) while the first copy ran: {seen}"
+    assert all(a["id"] for a in answers)
+    assert (after["in_flight"], after["waiting"], after["admitted"]) == (0, 0, 3), after
 
 
 # ---- the pool ----------------------------------------------------------------------------------------------------
