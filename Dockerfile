@@ -7,6 +7,24 @@ FROM python:3.14-alpine@sha256:eb2c62658b8d51bff0acc408504b76521d02030de56a8a3c1
 # layer. The base digest stays pinned, so the starting point is still reproducible.
 RUN apk --no-cache upgrade
 
+# No SQLite in the image. The vault keeps its data in PostgreSQL, and nothing that runs here (the
+# application, its locked dependencies, the commands the host tool runs in the container) imports
+# Python's sqlite3. The base installs Alpine's sqlite-libs only for that module: .python-rundeps, the
+# virtual package that holds Python's own run-time libraries, lists libsqlite3.so.0. Dropping that one
+# entry lets apk remove the library (nothing is fetched: --no-network), and the module that needs it
+# goes too, so `import sqlite3` fails as on a Python built without SQLite instead of finding a module
+# whose library is gone. Every other library the virtual package lists stays, and the modules that
+# load them are imported below. A base that no longer lists the library there stops the build, so
+# that a changed base is looked at again rather than guessed at.
+RUN rundeps="$(apk info -R .python-rundeps | grep '^so:')" \
+    && { printf '%s\n' "$rundeps" | grep -qx 'so:libsqlite3\.so\.0' \
+         || { echo "the base's .python-rundeps no longer lists libsqlite3.so.0: see the SQLite removal step" >&2; exit 1; }; } \
+    && apk add --no-cache --no-network --virtual .python-rundeps $(printf '%s\n' "$rundeps" | grep -vx 'so:libsqlite3\.so\.0') \
+    && ! apk info -e sqlite-libs \
+    && rm /usr/local/lib/python3.14/lib-dynload/_sqlite3.cpython-314-*.so \
+    && python -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("_sqlite3") is not None)' \
+    && python -c 'import _bz2, _ctypes, _curses, _curses_panel, _dbm, _gdbm, _hashlib, _lzma, _ssl, _uuid, _zstd, readline, zlib'
+
 WORKDIR /app
 
 # Bound DNS resolution so a Redis (or DB) outage fails FAST. socket_connect_timeout does NOT

@@ -93,14 +93,29 @@ def test_apk_upgrade_is_the_only_unpinned_install():
     base-OS security patches the release scan requires, at the cost of byte-for-byte reproducibility
     (documented in docs/supply-chain-controls.md). Keep it the only one, so the exception stays a
     single reviewed line and a second unpinned install cannot be added quietly under this file's
-    "reproducible images" contract."""
+    "reproducible images" contract.
+
+    The step after it, which takes SQLite out of the image, also runs apk, and fetches nothing: it reads
+    the installed database (`apk info`) and declares the base's own .python-rundeps again without one
+    library (`apk add --no-network`). Its lines are held here word for word, so that a change to them is
+    as visible as a change to the upgrade."""
     apk_lines = [
         ln.strip() for ln in _DOCKERFILE.splitlines()
         if re.search(r"\bapk\b", ln) and not ln.lstrip().startswith("#")
     ]
-    assert apk_lines == ["RUN apk --no-cache upgrade"], (
-        "the only apk line must be the documented `RUN apk --no-cache upgrade`; found: %r" % apk_lines
+    assert apk_lines == [
+        "RUN apk --no-cache upgrade",
+        "RUN rundeps=\"$(apk info -R .python-rundeps | grep '^so:')\" \\",
+        "&& apk add --no-cache --no-network --virtual .python-rundeps "
+        "$(printf '%s\\n' \"$rundeps\" | grep -vx 'so:libsqlite3\\.so\\.0') \\",
+        "&& ! apk info -e sqlite-libs \\",
+    ], (
+        "the only network apk line must be the documented `RUN apk --no-cache upgrade`, and the SQLite "
+        "removal's apk lines must fetch nothing; found: %r" % apk_lines
     )
+    for line in apk_lines[1:]:
+        calls = re.findall(r"\bapk\s+([^|&;]*)", line)
+        assert calls and all(c.startswith("info ") or "--no-network" in c.split() for c in calls), line
     doc = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
     assert "apk --no-cache upgrade" in doc and "reproducib" in doc.lower(), (
         "the apk reproducibility exception must be documented in docs/supply-chain-controls.md"
@@ -126,10 +141,14 @@ def test_the_image_keeps_the_base_images_own_standard_library():
     two files over it from a reviewed CPython snapshot, and the base later carried newer fixes in one
     of them, so the copy would have taken that file back to an older version with no scanner
     noticing. Nothing in the build may write into the standard library again without first checking
-    the base's own file, which this pin makes a reviewed change rather than a quiet one."""
+    the base's own file, which this pin makes a reviewed change rather than a quiet one.
+
+    The one instruction that touches it only removes: the _sqlite3 module, whose library the build
+    takes out of the image (tests/test_image_without_sqlite.py holds the built image)."""
     instructions = [line.strip() for line in _DOCKERFILE.splitlines()
                     if line.strip() and not line.lstrip().startswith("#")]
-    assert not [line for line in instructions if "/usr/local/lib/python" in line]
+    assert [line for line in instructions if "/usr/local/lib/python" in line] == [
+        "&& rm /usr/local/lib/python3.14/lib-dynload/_sqlite3.cpython-314-*.so \\"]
     assert not [line for line in instructions if re.match(r"COPY\s+security/", line)]
     assert not (_ROOT / "security" / "cpython-backports").exists()
     # The one COPY of the whole tree comes after the dependency install, and copies into /app only.
@@ -138,8 +157,9 @@ def test_the_image_keeps_the_base_images_own_standard_library():
     assert re.search(r"^WORKDIR /app$", _DOCKERFILE, re.MULTILINE)
 
     evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
-    assert "The image runs the base image's standard library unmodified." in evidence
+    assert "The image runs the base image's standard library unmodified, but for one module it removes" in evidence
     assert "must check the base image's own file hash" in evidence
+    assert "No SQLite in the image" in evidence
 
 
 def test_production_lock_is_fully_pinned_and_hashed():
