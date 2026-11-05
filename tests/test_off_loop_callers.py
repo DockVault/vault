@@ -42,6 +42,12 @@ STEPS = [
 ]
 
 
+# Steps that also run on the event loop on purpose, how often, and why. A move within one vault is a reparent (one row
+# changes, no bytes are copied): it takes no transfer slot and runs on the loop, as a folder move and a rename do.
+# test_a_move_runs_on_the_loop_only_within_one_vault holds where.
+ON_THE_LOOP = {("move_file_endpoint", "_move_and_record"): 1}
+
+
 def _async_function(source, name):
     found = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.AsyncFunctionDef) and n.name == name]
     assert len(found) == 1, f"expected one async function {name}, found {len(found)}"
@@ -92,7 +98,20 @@ def test_each_step_is_handed_off_the_loop_and_never_run_on_it(path, function, st
     other = PLAIN if helper == ON_SESSION else ON_SESSION
     assert not [c for c in _off_loop_calls(node, other) if step in map(ast.unparse, c.args[:2])], (
         f"{function}: {step} is handed to off_loop.{other}, not off_loop.{helper}")
-    assert not called_on_the_loop(node, step), f"{function}: {step} is called on the event loop"
+    assert len(called_on_the_loop(node, step)) == ON_THE_LOOP.get((function, step), 0), (
+        f"{function}: {step} is called on the event loop")
+
+
+def test_a_move_runs_on_the_loop_only_within_one_vault():
+    node = _async_function((ROOT / API).read_text(encoding="utf-8"), "move_file_endpoint")
+    within = [n for n in ast.walk(node) if isinstance(n, ast.If)
+              and ast.unparse(n.test) == "str(body.dest_vault_id) == str(vault_id)"]
+    assert len(within) == 1, "the within-vault branch of the move is gone"
+    inside = set(map(id, ast.walk(within[0])))
+    on_the_loop = called_on_the_loop(node, "_move_and_record")
+    assert on_the_loop and all(id(c) in inside for c in on_the_loop), "a move to another vault runs on the loop"
+    assert not [c for c in handed(node, "_move_and_record", ON_SESSION) if id(c) in inside], (
+        "a move within one vault is handed off the loop")
 
 
 def test_the_reading_finds_a_step_run_on_the_loop_or_handed_to_the_wrong_helper():

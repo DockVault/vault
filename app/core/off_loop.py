@@ -23,7 +23,8 @@ Three rules for what is run here, which every caller keeps:
 
 - ``fn`` must not need the event loop (no awaiting, no loop-bound objects);
 - work on the request's database session (``run_to_end_on_session``) runs only under a transfer slot (an
-  upload's completion, a copy, a move, a folder copy: app/core/transfer_admission.py), taken while the request
+  upload's completion, a copy, a move to another vault, a folder copy: app/core/transfer_admission.py; a move
+  within one vault is a reparent, which copies no bytes, takes no slot and runs on the loop), taken while the request
   holds no connection. Each such call holds its request's connection until it ends, and calls past this
   pool's threads wait here still holding theirs; the slots bound how many there are, and the database pool is
   sized beyond them (app/core/database.py), so they never take the connections the event loop's own requests

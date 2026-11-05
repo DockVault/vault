@@ -23596,9 +23596,10 @@ async def move_file_endpoint(
     x_dest_vault_password: Optional[str] = Header(None),
     x_file_password: Optional[str] = Header(None),
 ):
-    """Move a file. Within one vault this is a reparent (no re-encryption); across vaults it
-    re-encrypts into the destination (Standard↔Standard) and deletes the source. Requires the delete
-    capability on the source and the upload capability on the destination."""
+    """Move a file. Within one vault this is a reparent (no re-encryption, no transfer slot); across
+    vaults it re-encrypts into the destination (Standard↔Standard) and deletes the source, admitted on
+    the transfer ceiling. Requires the delete capability on the source and the upload capability on the
+    destination."""
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
@@ -23629,6 +23630,12 @@ async def move_file_endpoint(
                 ip_address=client_ip)
             return new_id
 
+        if str(body.dest_vault_id) == str(vault_id):
+            # Within one vault a move is a reparent (VaultService.move_file): one row changes and no bytes are
+            # copied. It takes no transfer slot, as a folder move takes none, so a full ceiling never refuses
+            # it; and it runs here, as a folder move and a rename do (work on the request's session runs off
+            # the event loop only under a slot: app/core/off_loop.py).
+            return {'message': 'File moved', 'id': _move_and_record()}
         transfer_slot = await _admitted_holding_no_connection(db)
         # Off the event loop, to its end: a move to another vault reads, re-encrypts and syncs the whole
         # file, then removes the source; its audit row commits there too.

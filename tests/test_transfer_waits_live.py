@@ -95,6 +95,19 @@ def _upload(client, vault_id, name, content):
     return r.json()["id"]
 
 
+def _folder(client, vault_id, name, parent=None):
+    r = client.post(f"/vaults/{vault_id}/folders",
+                    json={"name": name, **({"parent_folder_id": parent} if parent else {})})
+    assert r.status_code in (200, 201), r.text
+    return r.json()["folder"]["id"]
+
+
+def _files_in(client, vault_id, folder_id=None):
+    r = client.get(f"/vaults/{vault_id}/files", params={"folder_id": folder_id} if folder_id else None)
+    assert r.status_code == 200, r.text
+    return {it["id"] for it in r.json()["items"]}
+
+
 def _metrics(admin):
     r = admin.get("/api/monitoring/metrics")
     assert r.status_code == 200, r.text
@@ -328,3 +341,44 @@ def test_downloads_previews_and_link_downloads_wait_holding_no_connection_and_ev
         else:
             assert hashlib.sha256(r.content).hexdigest() == hashlib.sha256(small_content).hexdigest(), name
     _until(admin, lambda flying, waiting: flying == 0 and waiting == 0, "idle again", 120)
+
+
+def test_a_move_within_one_vault_is_answered_while_every_slot_is_held(admin, vault):
+    """A move within one vault is a reparent (one row, no bytes copied): like a folder move it takes no transfer
+    slot, so it is answered while every slot is held, where it waited for one, and was refused once the wait ran
+    out. A move to another vault copies the file, and waits for a slot."""
+    limit = _setting("MAX_CONCURRENT_TRANSFERS", 16)
+    queue = _setting("MAX_QUEUED_TRANSFERS", 32)
+    if limit > 64 or queue < 1:
+        pytest.skip(f"needs a ceiling of at most 64 and room for one to wait (ceiling {limit}, queue {queue})")
+    held = _upload(admin, vault, "held.bin", os.urandom(HELD_SIZE))
+    within, across = (_upload(admin, vault, f"{n}.bin", os.urandom(1024)) for n in ("within", "across"))
+    into = _folder(admin, vault, "into")
+    moved_folder = _folder(admin, vault, "moved")
+    elsewhere = admin.create_vault(name=unique("waits-to"))["id"]
+    answers = {}
+    try:
+        with _EverySlotHeld(admin, vault, held, limit):
+            s = _session(admin)
+            sent = time.monotonic()
+            r = s.post(f"{BASE}/vaults/{vault}/files/{within}/move",
+                       json={"dest_vault_id": vault, "dest_folder_id": into}, timeout=60)
+            took = time.monotonic() - sent
+            assert r.status_code == 200 and took < 5, (r.status_code, r.text[:200], f"{took:.1f} s")
+            r = s.post(f"{BASE}/vaults/{vault}/folders/{moved_folder}/move",
+                       json={"dest_vault_id": vault, "dest_parent_folder_id": into}, timeout=60)
+            assert r.status_code == 200, r.text
+            assert _metrics(admin) == (limit, 0)
+
+            def send():
+                answers["across"] = _session(admin).post(
+                    f"{BASE}/vaults/{vault}/files/{across}/move", json={"dest_vault_id": elsewhere}, timeout=120)
+            t = threading.Thread(target=send, daemon=True)
+            t.start()
+            _until(admin, lambda flying, waiting: waiting == 1, "the move to another vault waiting", 15)
+        t.join(130)
+        assert answers["across"].status_code == 200, answers["across"].text
+        assert {within, moved_folder} <= _files_in(admin, vault, into)
+        assert _files_in(admin, elsewhere) == {answers["across"].json()["id"]}
+    finally:
+        admin.delete_vault(elsewhere)

@@ -228,6 +228,32 @@ def test_a_request_its_checks_refuse_takes_no_slot(monkeypatch, kind):
     assert world.ran == [] and stats["admitted"] == 0 and stats["refused"] == 0
 
 
+def test_a_move_within_one_vault_takes_no_slot_and_a_full_ceiling_never_refuses_it(monkeypatch):
+    """A move within one vault is a reparent: one row changes, no bytes are copied. Like a folder move it takes no
+    transfer slot, so it is answered while the ceiling and its queue are full, and it runs on the event loop as a
+    folder move and a rename do. A move to another vault is refused then (the test above)."""
+    async def scenario():
+        gate = TransferAdmission(limit=1, max_waiting=0, wait_seconds=20)
+        world = _World(monkeypatch, gate)
+        other = await gate.acquire()
+        vid = uuid.uuid4()
+        answer = await _raw(S.move_file_endpoint)(vid, uuid.uuid4(), S.ItemMoveCopy(dest_vault_id=vid), None,
+                                                  current_user=SimpleNamespace(id=uuid.uuid4()), db=world.db,
+                                                  x_vault_password=None, x_dest_vault_password=None,
+                                                  x_file_password=None)
+        stats = gate.stats()
+        gate.release(other)
+        return world, answer, stats
+
+    world, answer, stats = run_coroutine(scenario())
+    assert answer["message"] == "File moved" and answer["id"]
+    ((name, seen, _held),) = world.ran
+    assert name == "move" and seen["in_flight"] == 1, "it took a slot"
+    assert stats["admitted"] == 1 and stats["refused"] == 0 and stats["waiting"] == 0, stats
+    ((action, thread),) = world.audited
+    assert action == "file_move" and not thread.startswith("stored-bytes"), thread
+
+
 # ---- the pool ----------------------------------------------------------------------------------------------------
 
 def test_the_pool_keeps_ten_connections_beyond_every_transfer_and_sign_in_handed_to_a_thread():
