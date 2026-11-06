@@ -1927,6 +1927,32 @@ def test_backup_root_explicit_list_picks_first_writable(tmp_path):
     assert tool._backup_root(args) == str(good) and good.is_dir()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+def test_a_backup_folder_that_was_already_there_keeps_its_mode(tmp_path, monkeypatch):
+    """Probing a --backup-dir made every one of them 0700, an existing folder too: under sudo, a shared folder
+    (/srv/backups, a mount point) was taken away from everyone else. Only a folder the tool makes is made 0700;
+    each backup inside is 0700 anyway."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o755)
+    made = tmp_path / "made" / "backups"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    assert tool._backup_root(argparse.Namespace(backup_dir=str(shared))) == str(shared)
+    assert dv._writable_dir(str(shared)) is True
+    assert (os.stat(shared).st_mode & 0o777) == 0o755, "an existing folder keeps its mode"
+    assert tool._backup_root(argparse.Namespace(backup_dir=str(made))) == str(made)
+    assert (os.stat(made).st_mode & 0o777) == 0o700, "a folder the tool makes is 0700"
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(dict(_reusable_env_cfg(), volume_prefix="dvmode",
+                                                                     deployment_id="m"))) + "\n", encoding="utf-8")
+    tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=str(shared)))
+    assert (os.stat(shared).st_mode & 0o777) == 0o755
+    bundle = next(shared.iterdir())
+    assert (os.stat(bundle).st_mode & 0o777) == 0o700, "the backup itself is 0700"
+
+
 def test_backup_search_roots_includes_legacy(tmp_path, monkeypatch):
     monkeypatch.delenv("DOCKVAULT_BACKUP_DIR", raising=False)
     legacy = tmp_path / "backups"; legacy.mkdir()                     # the historical <root>/backups

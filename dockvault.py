@@ -2158,14 +2158,23 @@ def write_volume_file(volume, rel, text, run=subprocess.run):
 # every secret-bearing bundle under Downloads. They now default to a per-OS application-data directory
 # and the location is overridable + can name SEVERAL directories.
 def _writable_dir(path):
-    """True if `path` exists-or-can-be-created AND a probe file can be written there (creating it 0700
-    on POSIX as a side effect, then removing the probe). Picking the first WRITABLE candidate stops a
-    full / read-only / disconnected-network location from silently swallowing a backup."""
+    """True if `path` exists-or-can-be-created AND a probe file can be written there (then removing the probe).
+    Picking the first WRITABLE candidate stops a full / read-only / disconnected-network location from silently
+    swallowing a backup. A folder this call makes is made 0700 on POSIX; a folder that was already there keeps its
+    mode (it is the operator's, often shared, as with a --backup-dir under sudo): each backup inside is made 0700
+    itself."""
     try:
-        os.makedirs(path, exist_ok=True)
-        if os.name != "nt":
+        made = False
+        if not os.path.isdir(path):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             try:
-                os.chmod(path, 0o700)
+                os.mkdir(path, 0o700)
+                made = True
+            except FileExistsError:
+                pass                           # made meanwhile by someone else: theirs, left as it is
+        if made and os.name != "nt":
+            try:
+                os.chmod(path, 0o700)          # mkdir's mode is masked by the umask
             except OSError:
                 pass
         probe = os.path.join(path, ".dockvault_write_probe")

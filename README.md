@@ -632,6 +632,9 @@ bundle really is the one those volumes were created with. **Restore** verifies t
 recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
+Each backup is a folder of its own that only you can open (mode `0700`). The backup folder you name
+with `--backup-dir` keeps its own permissions when it already exists; one the tool creates is `0700`.
+
 A running deployment is paused (not stopped) while its volumes are archived, so the database, the
 stored files and the keys are copies of one moment: the vault does not answer until the last archive
 is written, then carries on (with the app running, a file deleted between the database's archive and
