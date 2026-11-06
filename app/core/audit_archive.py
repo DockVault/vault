@@ -502,23 +502,34 @@ class PartReader:
         return self
 
 
+# Whether any block exists: the data marker's question, asked again by its removal itself.
+BLOCKS_SQL = "SELECT 1 FROM audit_archive_blocks"
+
+
 def sync_marker(db, now: datetime, present: Optional[bool] = None) -> bool:
-    """Keep the data marker while any block exists, in the caller's transaction. Returns whether it is there."""
+    """Keep the data marker while any block exists, in the caller's transaction. Returns whether it is there.
+
+    Safe beside another transaction doing the same, as the legal holds' marker is (app/core/legal_hold_marker.py,
+    sync): the once-a-day check (_daily_marker) runs outside the audit chain's lock, beside an archiving pass that may
+    be writing the first block. At READ COMMITTED each statement reads what was committed when it starts, so the row
+    is locked first (on Postgres) and the blocks are looked for after it: a pass that wrote the marker has committed by
+    then, and its block is seen. The row is written with one upsert (two first writers would collide on its key), and
+    removed only while the blocks, looked for again by the removal itself, are none: a block committed after the look
+    above keeps it."""
     from app.core import recording_marker as rm
-    from app.core.models import AuditArchiveBlock as B
-    if present is None:
-        present = db.query(B.day).first() is not None
+    db.flush()      # the caller's own blocks, not yet written (the sessions do not autoflush)
     rm._ensure_table(db)
+    if rm._on_postgres(db):
+        db.execute(text(f"SELECT key FROM {rm.TABLE} WHERE key = :key FOR UPDATE"), {"key": MARKER_KEY})
+    if present is None:
+        present = db.execute(text(BLOCKS_SQL + " LIMIT 1")).first() is not None
     if not present:
-        db.execute(text(f"DELETE FROM {rm.TABLE} WHERE key = :key"), {"key": MARKER_KEY})
-        return False
-    params = {"key": MARKER_KEY, "version": rm.required_version(),
-              "reason": MARKER_REASON.format(introduced=rm.INTRODUCED), "undo": MARKER_UNDO, "since": now}
-    updated = db.execute(text(f"UPDATE {rm.TABLE} SET requires_at_least = :version, reason = :reason, "
-                              "undo = :undo WHERE key = :key"), params).rowcount
-    if not updated:
-        db.execute(text(f"INSERT INTO {rm.TABLE} (key, requires_at_least, reason, undo, since) "
-                        "VALUES (:key, :version, :reason, :undo, :since)"), params)
+        db.execute(text(f"DELETE FROM {rm.TABLE} WHERE key = :key AND NOT EXISTS ({BLOCKS_SQL})"),
+                   {"key": MARKER_KEY})
+        # Kept when a block committed before the removal started: say so.
+        return db.execute(text(f"SELECT 1 FROM {rm.TABLE} WHERE key = :key"), {"key": MARKER_KEY}).first() is not None
+    rm.write_row(db, MARKER_KEY, rm.required_version(), MARKER_REASON.format(introduced=rm.INTRODUCED),
+                 MARKER_UNDO, now)
     return True
 
 
