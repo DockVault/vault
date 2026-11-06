@@ -2009,27 +2009,76 @@
         const go = button('Export', 'btn-primary cmp-export-go', async () => {
             go.disabled = true;
             const body = all.box.checked ? { all: true } : { file_ids: WS.items.map((f) => f.id) };
+            // The size of the files listed, when they are the ones chosen (every file of the case is counted by the
+            // server only).
+            const listed = all.box.checked ? null : WS.items.reduce((n, f) => n + (Number(f.size) || 0), 0);
+            let closed = false;
             try {
+                // Too large to read whole, and no download to write it into: refused before it is prepared, so no
+                // code is asked for.
+                if (listed !== null && listed > readWholeMost() && !(await canStreamDownloads())) {
+                    throw problem(0, 'no_download_service', tooLargeToSave(listed));
+                }
                 const prepared = await cmp('/compliance/cases/' + WS.c.id + '/exports', { json: body, headers: caseUnlockHeader(WS.c.id) });
                 s.close();
+                closed = true;
                 await fetchExport(prepared);
-            } catch (e) { fail(e, msg); go.disabled = false; }
+            } catch (e) {
+                if (closed) fail(e);
+                else { fail(e, msg); go.disabled = false; }
+            }
         });
         s.foot.append(button('Cancel', 'btn-secondary', s.close), go);
     }
 
+    // The most an export may be when it is read whole before it is saved (no download service in this browser): the
+    // app's own limit for a download read whole.
+    function readWholeMost() {
+        return typeof MAX_BUFFERED_DOWNLOAD_BYTES === 'number' ? MAX_BUFFERED_DOWNLOAD_BYTES : 256 * 1024 * 1024;
+    }
+
+    async function canStreamDownloads() {
+        return typeof dvSinkWorker === 'function' && !!(await dvSinkWorker());
+    }
+
+    function tooLargeToSave(bytes) {
+        const size = typeof formatBytes === 'function' ? formatBytes(bytes) : bytes + ' bytes';
+        return 'This export is ' + size + ', too large to save without the download service of this browser (a '
+            + 'private window, or a page not served over https, has none). It was not fetched: nothing was exported '
+            + 'and no owner was told. Export it from a browser window that has the service.';
+    }
+
     // The archive, once: through the app's download sink when it has one (the bytes go to the browser's download as
-    // they arrive), otherwise read whole and handed over.
+    // they arrive), otherwise read whole and handed over. The server spends the export and tells each owner as soon
+    // as it is asked for, so an export too large to read whole is asked for only once a download to write it into
+    // is open: one this browser could not save is never asked for.
     async function fetchExport(prepared) {
         const name = 'case-' + (WS.c.number || 'export') + '-' + String(prepared.export_id).slice(0, 8) + '.zip';
         const ctl = new AbortController();
-        const resp = await cmp('/compliance/cases/' + WS.c.id + '/exports/' + prepared.export_id, { raw: true, headers: caseUnlockHeader(WS.c.id), signal: ctl.signal });
+        let sink = null;
+        const large = !(Number(prepared.bytes) <= readWholeMost());
+        if (large) {
+            sink = typeof dvOpenDownloadSink === 'function'
+                ? await dvOpenDownloadSink({ filename: name, size: null, mime: 'application/zip' }) : null;
+            if (!sink) throw problem(0, 'no_download_service', tooLargeToSave(prepared.bytes));
+        }
+        let resp;
+        try {
+            resp = await cmp('/compliance/cases/' + WS.c.id + '/exports/' + prepared.export_id, { raw: true, headers: caseUnlockHeader(WS.c.id), signal: ctl.signal });
+        } catch (e) {
+            if (sink) sink.abort('refused');
+            throw e;
+        }
         if (typeof dvTryStandardStreamedDownload === 'function') {
-            const streamed = await dvTryStandardStreamedDownload(resp, name, 0, 'application/zip', ctl);
+            const streamed = await dvTryStandardStreamedDownload(resp, name, null, 'application/zip', ctl, sink);
             if (streamed === true) { ok('Exporting ' + plural(prepared.files, 'file') + ' into ' + name + '.'); return; }
             if (streamed === 'failed') throw problem(0, null, 'The export stopped before it was complete; it was recorded as stopped.');
         }
-        if (prepared.bytes > 256 * 1024 * 1024) { ctl.abort(); throw problem(0, null, 'This export is too large to save without the download service of this browser.'); }
+        if (large) {
+            if (sink) sink.abort('failed');
+            ctl.abort();
+            throw problem(0, null, 'The export could not be written into the download; it was recorded as stopped.');
+        }
         const blob = await resp.blob();
         const url = URL.createObjectURL(blob);
         const a = el('a');

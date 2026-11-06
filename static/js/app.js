@@ -14055,10 +14055,13 @@ const MAX_BUFFERED_DOWNLOAD_BYTES = 256 * 1024 * 1024;   // 256 MiB fallback cei
  * zkTryStreamedDownload: `true` (under way), `'failed'` (a sink was opened and the transfer broke
  * part-way -- do NOT fall back, bytes are already in the download), `false` (streaming was never
  * entered: no sink, nothing written -- the caller re-fetches for the buffered path).
+ *
+ * `openedSink`, when given, is a sink the caller opened before it asked for the response (a case export, which the
+ * server spends as it is asked for): it is written into instead of a new one. On `false` the caller still holds it.
  */
-async function dvTryStandardStreamedDownload(response, fileName, size, mime, abortCtl) {
+async function dvTryStandardStreamedDownload(response, fileName, size, mime, abortCtl, openedSink) {
     if (!response.body || !response.body.getReader) return false;
-    const sink = await dvOpenDownloadSink({ filename: fileName, size, mime });
+    const sink = openedSink || await dvOpenDownloadSink({ filename: fileName, size, mime });
     if (!sink) return false;                       // no service worker / not a secure context
     const reader = response.body.getReader();
     const dlId = downloadProgress.start(fileName, () => { try { abortCtl.abort(); } catch (_) {} });
