@@ -3436,6 +3436,83 @@ def test_icacls_and_whoami_run_from_system32_never_by_their_bare_names(monkeypat
     assert [c[0] for c in calls] == [os.path.join(system32, "whoami.exe"), os.path.join(system32, "icacls.exe")] * 2
 
 
+# --- on a real Windows host (the Windows lane runs these; elsewhere they are skipped) --------------------------
+_ON_WINDOWS = pytest.mark.skipif(os.name != "nt", reason="needs a real Windows host")
+
+
+def _acl_entries(path):
+    """The access entries icacls lists for `path` (by its System32 path), one per line, as icacls prints them."""
+    r = subprocess.run([dv.windows_system_tool("icacls.exe"), str(path)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    lines = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    first = lines[0][len(str(path)):].strip() if lines and lines[0].startswith(str(path)) else None
+    return [e for e in ([first] if first else []) + lines[1:-1] if e]
+
+
+@_ON_WINDOWS
+def test_on_windows_icacls_and_whoami_are_the_ones_in_system32():
+    for name in ("icacls.exe", "whoami.exe"):
+        assert os.path.isfile(dv.windows_system_tool(name)), name
+    assert dv.windows_user_grantee().startswith("*S-1-"), "the grant names the account by its SID"
+
+
+@_ON_WINDOWS
+def test_on_windows_a_restricted_folder_and_a_tightened_file_leave_only_the_user_system_and_administrators(tmp_path):
+    folder = tmp_path / "bundle"
+    folder.mkdir()
+    assert dv.restrict_folder_to_owner(str(folder)) is True
+    (folder / "inside.txt").write_text("x", encoding="utf-8")
+    secret = tmp_path / "secret.env"
+    secret.write_text("A=1\n", encoding="utf-8")
+    assert _TIGHTEN_SECRET_FILE(str(secret)) is True
+    for path, count in ((folder, 3), (folder / "inside.txt", 3), (secret, 3)):
+        entries = _acl_entries(path)
+        assert len(entries) == count, entries
+        text = " ".join(entries).lower()
+        assert "everyone" not in text and "\\users:" not in text and "authenticated users" not in text, entries
+
+
+@_ON_WINDOWS
+def test_on_windows_secret_files_are_written_byte_for_byte(tmp_path):
+    """The secret files are written through file descriptors opened with os.open: a text-mode write would turn each
+    line end into CR LF, and a .env copied or restored would grow a CR on every line. Each comes back as written."""
+    data = b"ENCRYPTION_KEY=k\nVAULT_DB_PASSWORD=p\n"
+    (tmp_path / ".env").write_bytes(data)
+    dv._copy_secret(str(tmp_path / ".env"), str(tmp_path / "env"))
+    assert (tmp_path / "env").read_bytes() == data
+    dv.write_kept_key(str(tmp_path / "kept"), "a-key")
+    assert (tmp_path / "kept").read_bytes() == b"a-key\n"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    kept = tool._keep_env_copy("dvwinbytes", data)
+    assert Path(kept).read_bytes() == data
+    tool._atomic_write_secret(str(tmp_path / "atomic"), "A=1\nB=2\n")
+    assert (tmp_path / "atomic").read_bytes() == b"A=1\nB=2\n"
+
+
+def test_on_windows_a_file_is_synced_through_a_handle_that_may_write(tmp_path, monkeypatch):
+    """Windows' fsync refuses a handle opened read-only (EBADF): the old AUDIT_CHAIN_KEY that a key change, or a
+    restore of a backup taken during one, keeps beside .env could not be written there at all (write_kept_key removed
+    it again and failed). It is synced through a handle opened for writing; nothing is written through it."""
+    path = str(tmp_path / "kept")
+    with open(path, "wb") as f:
+        f.write(b"a-key\n")
+    want = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    real_open, opened = os.open, []
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setattr(dv.os, "open", lambda p, flags, *a: opened.append((p, flags)) or real_open(p, flags, *a))
+    dv.sync_to_disk(path)
+    assert opened == [(path, want)]
+    with open(path, "rb") as f:
+        assert f.read() == b"a-key\n"
+
+
+@_ON_WINDOWS
+def test_on_windows_a_docker_child_starts_in_a_group_of_its_own_with_no_console():
+    r = subprocess.run([sys.executable, "-c", "print('ran')"], capture_output=True, text=True, timeout=60,
+                       stdin=subprocess.DEVNULL, **dv.own_session_kwargs())
+    assert (r.returncode, r.stdout.strip()) == (0, "ran")
+
+
 # --- the Let's Encrypt renewal hook is Linux's --------------------------------------------------------------
 
 @pytest.mark.parametrize("platform", ["darwin", "freebsd14", "win32"])

@@ -860,8 +860,10 @@ def write_env(path, lines):
 def sync_to_disk(path):
     """Force a file just written, and its name in its directory, to the disk (the standard library's fsync, as the
     app's durable writes do), so a power cut right after cannot lose it. Windows, and a filesystem that cannot sync
-    a directory (EINVAL, EBADF), skip the directory; any other error (EIO) raises OSError."""
-    fd = os.open(path, os.O_RDONLY)
+    a directory (EINVAL, EBADF), skip the directory; any other error (EIO) raises OSError. On Windows the file is
+    opened for writing (nothing is written): fsync there flushes through a handle that may write, and refuses one
+    opened read-only (EBADF)."""
+    fd = os.open(path, (os.O_RDWR | getattr(os, "O_BINARY", 0)) if os.name == "nt" else os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
