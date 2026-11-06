@@ -62,15 +62,25 @@ def _psql(sql):
     return out.stdout.strip()
 
 
-def _clear_open_throttle():
-    """The opens of one link from one address are limited to ten a minute."""
-    keys = subprocess.run(["docker", "exec", REDIS, "redis-cli", "--scan", "--pattern", "publiclink_redeem*"],
+def _delete_keys(pattern):
+    keys = subprocess.run(["docker", "exec", REDIS, "redis-cli", "--scan", "--pattern", pattern],
                           capture_output=True, text=True, timeout=30)
     skip_if_container_absent(keys, REDIS)
     assert keys.returncode == 0, keys.stderr
     for key in [k for k in keys.stdout.split("\n") if k]:
         subprocess.run(["docker", "exec", REDIS, "redis-cli", "DEL", key], capture_output=True, text=True,
                        timeout=30, check=True)
+
+
+def _clear_open_throttle():
+    """The opens of one link from one address are limited to ten a minute."""
+    _delete_keys("publiclink_redeem*")
+
+
+def _clear_poll_budget():
+    """The monitor's metrics are read in the polled-reads class, 600 a minute per account by default: a test that
+    watches them for long starts with that minute's budget unspent, not spent by the tests before it."""
+    _delete_keys("rate_limit:api:poll*")
 
 
 def _session(client):
@@ -520,18 +530,26 @@ def test_one_account_holds_at_most_a_quarter_of_the_slots_with_copies(admin, oth
     for i in range(3):
         _upload(admin, vault, f"part{i}.bin", os.urandom(32 * MB), folder_id=tree)
     into = [_folder(admin, vault, f"into{i}") for i in range(2 * share)]
-    seen, stop, answers = [], threading.Event(), {}
+    seen, stop, answers, unwatched = [], threading.Event(), {}, []
 
     def watch():
+        # Five reads a second: a copy of the tree lasts many times longer, and with the reads of the waits below
+        # they stay well inside the account's budget for polled reads (600 a minute by default), however long the
+        # copies take.
         while not stop.is_set():
-            seen.append((time.monotonic(), *_metrics(admin)))
-            time.sleep(0.05)
+            try:
+                seen.append((time.monotonic(), *_metrics(admin)))
+            except AssertionError as exc:
+                unwatched.append(str(exc)[:300])
+                return
+            time.sleep(0.2)
 
     def copy(i):
         answers[i] = _session(admin).post(f"{BASE}/vaults/{vault}/folders/{tree}/copy",
                                           json={"dest_vault_id": vault, "dest_parent_folder_id": into[i]},
                                           timeout=120)
 
+    _clear_poll_budget()
     _until(admin, lambda flying, waiting: flying == 0 and waiting == 0, "idle", 120)
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
@@ -549,6 +567,7 @@ def test_one_account_holds_at_most_a_quarter_of_the_slots_with_copies(admin, oth
     finally:
         stop.set()
         watcher.join(10)
+    assert not unwatched, f"the metrics stopped being read while the copies ran: {unwatched}"
     assert {i: a.status_code for i, a in answers.items()} == {i: 200 for i in range(2 * share)}, (
         {i: a.text[:200] for i, a in answers.items() if a.status_code != 200})
     # Not counting the other account's download, which held a slot of its own for as long as it took.
