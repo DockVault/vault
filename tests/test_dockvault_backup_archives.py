@@ -316,21 +316,33 @@ def test_an_old_backup_whose_archive_does_not_read_whole_is_still_refused(tmp_pa
     assert "the archive for volume dvarcholdbad_vault_storage cannot be restored" in _said(capsys)
 
 
-@pytest.mark.parametrize("manifest", ["some-only", "not-a-checksum", "not-a-size"])
+@pytest.mark.parametrize("manifest", ["some-only", "not-a-checksum", "not-a-size", "a-size-as-a-float"])
 def test_a_manifest_whose_checksums_no_backup_writes_is_refused(tmp_path, monkeypatch, capsys, manifest):
+    """Each by the check of what a backup writes, before any archive is compared with it: a size of the right value
+    as a float compares equal to the archive's own, and True to 1."""
     bundle = _backed_up(tmp_path, monkeypatch, "dvarchodd")
     man = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert man["volumes"][0]["role"] == "keys"
     if manifest == "some-only":
         del man["volumes"][2]["sha256"], man["volumes"][2]["size"]
     elif manifest == "not-a-checksum":
         man["volumes"][0]["sha256"] = "not-hex"
-    else:
+    elif manifest == "not-a-size":
         man["volumes"][0]["size"] = True
+    else:
+        man["volumes"][0]["size"] = float(man["volumes"][0]["size"])
     (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
     steps = []
+    capsys.readouterr()
     with pytest.raises(SystemExit):
         _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(_restore_args(bundle))
     assert steps == []
+    said = _said(capsys)
+    if manifest == "some-only":
+        assert "records the checksum of some of its archives only" in said
+    else:
+        assert "records a checksum or size for volume role 'keys' that is not one" in said
+    assert "is not the archive this backup made" not in said
 
 
 @pytest.mark.parametrize("docker", ["sees-nothing", "sees-another-file"])
