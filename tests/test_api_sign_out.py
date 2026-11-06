@@ -7,7 +7,9 @@ route ends the session as logout does and answers without that header. What is h
 - the session ends at once: its token is refused, the row is inactive and revoked, another session of the same
   account goes on; the answer clears nothing (no Clear-Site-Data, no cookie);
 - it is idempotent: a second call answers 200 again, says it ended nothing, and records nothing; of two calls at
-  once, one ends the session and one sign-out is recorded;
+  once, one ends the session and one sign-out is recorded; a call for a session already ended writes nothing to its
+  row (a row revoked elsewhere and still listed as active is marked inactive);
+- it does its work off the server's event loop: a sign-out waiting on its session's row holds up no other request;
 - an expired token still ends its session (whose row stayed listed as signed in), and that session's other,
   unexpired token is then refused too;
 - only a token this server signed for a session ends one: no token, a malformed one, one signed with another key
@@ -29,14 +31,16 @@ route ends the session as logout does and answers without that header. What is h
 tests/test_ui_sign_out_ends_session.py holds the web app's side: every sign-out path calls this route.
 """
 import json
+import subprocess
 import threading
 import time
+from contextlib import contextmanager
 
 import jwt
 import pytest
 import requests
 
-from _account_change_helpers import psql, signed_in
+from _account_change_helpers import DB, psql, signed_in
 from _sign_out_helpers import claims as _claims, expired_copy as _expired_copy, signed_by_the_server as _signed
 from _sign_out_helpers import redis_cli, session_digest, shipped_auth_limit
 from _sign_out_helpers import session_row as _row, sign_outs_recorded as _sign_outs_recorded
@@ -117,6 +121,89 @@ def test_two_sign_outs_at_once_end_the_session_once(person):
         t.join(timeout=60)
     assert sorted((a.status_code, a.json()["session_ended"]) for a in answers) == [(200, False), (200, True)]
     assert _sign_outs_recorded(person["id"]) == before + 1
+
+
+def _row_version(token):
+    """The version of the session row the database keeps (its xmin): every UPDATE of the row writes a new one, even
+    one that sets the values the row already holds."""
+    return psql(f"SELECT xmin FROM active_sessions WHERE session_token = '{session_digest(token)}'")
+
+
+def test_a_sign_out_of_a_session_already_ended_writes_nothing_to_its_row(person):
+    one = signed_in(person)
+    assert _sign_out(one.token).json()["session_ended"] is True
+    assert _row(one.token) == "f|t"
+    version = _row_version(one.token)
+    for _ in range(2):
+        again = _sign_out(one.token)
+        assert again.status_code == 200 and again.json() == {"signed_out": True, "session_ended": False}, again.text
+    assert _row_version(one.token) == version, "a sign-out of a session already ended wrote its row again"
+
+
+def test_a_session_revoked_elsewhere_and_still_listed_as_active_is_marked_inactive(person):
+    """The control of the test above: the row is written when there is still something to write."""
+    one = signed_in(person)
+    psql(f"UPDATE active_sessions SET revoked = true WHERE session_token = '{session_digest(one.token)}'")
+    assert _row(one.token) == "t|t"
+    r = _sign_out(one.token)
+    assert r.status_code == 200 and r.json() == {"signed_out": True, "session_ended": False}, r.text
+    assert _row(one.token) == "f|t"
+
+
+ROW_HOLDER = "sign-out-row-holder"
+
+
+@contextmanager
+def _row_held(token):
+    """Another database session holds the lock of the session row ``token`` names until this ends."""
+    holder = subprocess.Popen(
+        ["docker", "exec", "-i", DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-Atc",
+         f"BEGIN; SELECT 1 FROM active_sessions WHERE session_token = '{session_digest(token)}' FOR UPDATE; "
+         f"SELECT pg_sleep(900); -- {ROW_HOLDER}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _until(lambda: psql("SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'PgSleep' "
+                            f"AND query LIKE '%{ROW_HOLDER}%' AND pid <> pg_backend_pid()") == "1",
+               30, "the row's lock to be taken")
+        yield
+    finally:
+        # Ending the docker client does not end psql inside the container: end its session.
+        psql("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+             f"WHERE query LIKE '%{ROW_HOLDER}%' AND pid <> pg_backend_pid()")
+        holder.kill()
+        holder.wait(timeout=30)
+
+
+def _until(condition, seconds, what):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"waited {seconds}s for {what}")
+
+
+def test_a_sign_out_waiting_on_its_row_holds_up_no_other_request(person):
+    """The sign-out's work runs off the server's event loop. Its session's row is held by another database session,
+    so the sign-out waits on it; while it waits, another request (the health check) is answered at once. On the
+    loop, every other request waited until the row was let go or the wait timed out (five seconds), and the
+    sign-out then failed."""
+    one = signed_in(person)
+    answers = []
+    with _row_held(one.token):
+        sending = threading.Thread(target=lambda: answers.append(_sign_out(one.token)))
+        sending.start()
+        _until(lambda: psql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                            "AND query LIKE 'UPDATE active_sessions%'") != "0", 20, "the sign-out to wait on its row")
+        started = time.monotonic()
+        health = requests.get(f"{BASE_URL}/health", timeout=30)
+        took = time.monotonic() - started
+    sending.join(60)
+    assert health.status_code == 200, health.text
+    assert took < 2, f"another request waited {took:.1f}s behind a sign-out waiting on its row"
+    assert answers and answers[0].status_code == 200, answers and (answers[0].status_code, answers[0].text[:200])
+    assert answers[0].json() == {"signed_out": True, "session_ended": True}
+    assert _row(one.token) == "f|t"
 
 
 def test_an_expired_token_still_ends_its_session(person):

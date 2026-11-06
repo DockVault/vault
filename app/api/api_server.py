@@ -24237,7 +24237,8 @@ def _end_web_session(db, session_token: str, user_id=None):
     live-monitor socket all read the flag), and a temporary credential spent at the web door frees its cap slot
     when this was its last session, the web twin of the SFTP close release (it never touches the credential's
     is_used or is_active). Idempotent: the row is ended by one conditional UPDATE, so of two calls at once only
-    one ends it, and only that one says so (and records the sign-out)."""
+    one ends it, and only that one says so (and records the sign-out). A call for a session already ended writes
+    nothing to its row: a row that is revoked is marked inactive only while it is still listed as active."""
     from app.core.models import ActiveSession
     session = db.query(ActiveSession).filter(
         ActiveSession.session_token == hash_session_token(session_token)
@@ -24248,7 +24249,8 @@ def _end_web_session(db, session_token: str, user_id=None):
     ended = row.filter(ActiveSession.revoked == False).update(  # noqa: E712
         {ActiveSession.is_active: False, ActiveSession.revoked: True}, synchronize_session=False) == 1
     if not ended:
-        row.update({ActiveSession.is_active: False}, synchronize_session=False)
+        row.filter(ActiveSession.is_active == True).update(  # noqa: E712
+            {ActiveSession.is_active: False}, synchronize_session=False)
     if session.temp_credential_id is not None:
         from app.core.temp_cred_slot import release_ended_session_slots
         from app.core.models import TemporaryCredential as _TC_ended
@@ -24327,12 +24329,17 @@ _sign_out_bearer = HTTPBearer(auto_error=False)
 
 
 @app.post("/auth/sign-out")
-async def sign_out(
+def sign_out(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_sign_out_bearer),
     db: Session = Depends(get_db),
 ):
     """End the session of the token sent, on the server, at once: the web app calls it on every sign-out.
+
+    A plain function, so the web server runs it in a worker thread, not on its event loop: its queries, its writes,
+    the cache's denylist and its commit all block, and every tab of a session may send one at once. On the loop
+    they held every other request while they ran, and a sign-out that waited on its session's row held them for
+    the whole wait.
 
     POST /api/logout does the same for its callers, but its answer carries Clear-Site-Data, which a browser
     applies to the whole origin, in every tab: the stored skin and theme, the saved zero-knowledge uploads, the
