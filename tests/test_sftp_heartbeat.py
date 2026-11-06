@@ -392,6 +392,13 @@ def test_the_heartbeat_goes_stale_while_the_accept_loop_is_blocked_and_returns_w
     monkeypatch.setattr(mod.settings, "sftp_port", port)
     monkeypatch.setattr(mod.settings, "sftp_host_key_path", str(tmp_path / "host_key"))
     monkeypatch.setattr(mod.settings, "sftp_write_progress_timeout_seconds", 0)
+    # The database work the server keeps up on threads of its own, which nothing stops when the server
+    # stops: left running, each would go on for the rest of the test process, printing into the output
+    # another test reads.
+    from app.core import audit_privacy, settings_registry, sftp_versions
+    monkeypatch.setattr(settings_registry, "start", lambda *a, **k: None)
+    monkeypatch.setattr(audit_privacy, "start", lambda *a, **k: None)
+    monkeypatch.setattr(sftp_versions.Recorder, "start", lambda self, *a, **k: None)
 
     threads_before = set(threading.enumerate())
     server = threading.Thread(target=mod.start_sftp_server, daemon=True)
@@ -449,6 +456,8 @@ def test_the_heartbeat_goes_stale_while_the_accept_loop_is_blocked_and_returns_w
     final = len(beats)
     time.sleep(0.3)
     assert len(beats) == final
+    # 5. Nothing it started outlives it here.
+    assert [t.name for t in threading.enumerate() if t not in threads_before and t.is_alive()] == []
 
 
 def _handler_names(handler):
