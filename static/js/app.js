@@ -2129,6 +2129,10 @@ function logout(how) {
     sessionAccess = null;
     isScopedTemp = false;
     zkResetKeys();  // drop the in-memory ECC private key + per-vault DEKs
+    // An unlock of the account key (or its setup, change or restore) still running belongs to this person: it stops
+    // at its next step without keeping the key, and the next person's first unlock is their own, not this one.
+    _zkSignOuts += 1;
+    _zkUnlockInFlight = null;
     // Wipe any saved zero-knowledge upload ciphertext too — on a shared machine it must
     // not outlive the session (it's opaque without the DEK, but matches the scrub above). Not when another
     // session is stored for this browser since (above): what is saved now is that session's.
@@ -12465,7 +12469,37 @@ async function zkWrapPrivateKey(pem, passphrase) {
 // One unlock for every caller: requests started while locked (a share to several people runs in
 // parallel, and each change to a vault's keys proves the identity key) wait for the same prompt
 // instead of fighting over the one dialog, and cancelling it rejects them all.
+//
+// An unlock belongs to the person who started it. A sign-out forgets the one running (logout), so the next person on
+// the tab starts their own rather than joining it, and an unlock that goes on after the sign-out (the key's
+// derivation takes from a fraction of a second to several seconds) stops at its next step, without installing the
+// key it was unlocking: _zkSignOuts counts the sign-outs, and the unlock checks it after each step. Its callers are
+// the person's who signed out, so its promise then never settles: nothing of it is shown to the next person.
 let _zkUnlockInFlight = null;
+let _zkSignOuts = 0;
+
+// What a key operation begun before a sign-out ends with: a promise that never settles, so nothing of it is shown
+// to the next person on the tab, nothing more is sent with their session, and no key is kept.
+function _zkLeftBehind() {
+    return new Promise(() => {});
+}
+
+// The steps of a key operation begun now: `await step(() => work())` is the work's outcome while the person who began
+// it is still signed in. Once they have signed out it never settles, and work not yet begun is not begun (a request
+// is not sent with the next person's session).
+function _zkSteps() {
+    const signOuts = _zkSignOuts;
+    return async (work) => {
+        if (signOuts !== _zkSignOuts) return _zkLeftBehind();
+        let value;
+        let error;
+        let failed = false;
+        try { value = await work(); } catch (e) { error = e; failed = true; }
+        if (signOuts !== _zkSignOuts) return _zkLeftBehind();
+        if (failed) throw error;
+        return value;
+    };
+}
 // The account key as it is held now, for a step that must never ask for the passphrase (the checks of a
 // vault's key as it is opened): a key locked meanwhile, by the idle lock or the lock control, ends that step.
 function zkHeldPrivateKey() {
@@ -12543,7 +12577,8 @@ function zkNudgeWeakPassphrase(pass) {
 }
 
 async function _zkUnlockOnce() {
-    const priv = await zkFetchPrivateEnvelope();
+    const step = _zkSteps();   // every await below: a sign-out meanwhile ends the unlock (see _zkSignOuts)
+    const priv = await step(() => zkFetchPrivateEnvelope());
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
@@ -12559,15 +12594,15 @@ async function _zkUnlockOnce() {
     }
     // The registered public key, for the consistency check below. Fetched before the prompt so a
     // server that cannot supply it fails the unlock early rather than after the passphrase.
-    const pub = await apiRequest('/ecc/keys/public', { silent: true });
-    const pass = await showPrompt(
+    const pub = await step(() => apiRequest('/ecc/keys/public', { silent: true }));
+    const pass = await step(() => showPrompt(
         'Enter your encryption passphrase to unlock zero-knowledge vaults.',
         'Unlock encryption key', { password: true }
-    );
+    ));
     if (pass === null) throw new Error('Unlock cancelled.');
     let pem;
     try {
-        pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, pass);
+        pem = await step(() => eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, pass));
     } catch (e) {
         // A wrong passphrase and tampered ciphertext are one outcome to AES-GCM. Everything
         // else -- an unsupported envelope, an unusable key, no WebCrypto at all -- is NOT, and
@@ -12578,16 +12613,16 @@ async function _zkUnlockOnce() {
     // recovered key with the registered public key as canonical raw points, and FAIL CLOSED when
     // the comparison cannot be made — treating "cannot check" as "passed" would make this
     // optional in exactly the circumstances an attacker controls. Nothing is cached until it does.
-    const consistent = await eccLib().privateKeyMatchesRegisteredPublicKey(
+    const consistent = await step(() => eccLib().privateKeyMatchesRegisteredPublicKey(
         pem, pub && pub.public_key
-    );
+    ));
     if (!consistent) {
         throw new Error(
             'The stored encryption key does not match this account’s registered public key. ' +
             'This is not a passphrase problem — nothing has been unlocked.'
         );
     }
-    zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);  // non-extractable runtime key
+    zkState.privateKey = await step(() => eccLib().importPrivateKeyPEM(pem, false));  // non-extractable runtime key
     zkArmIdleLock();  // start the inactivity auto-lock countdown now a key is in memory
     try { zkAfterUnlock(); } catch (_) { /* background work only (static/js/zk-background.js) */ }
     zkNudgeWeakPassphrase(pass);
@@ -12600,6 +12635,9 @@ async function _zkUnlockOnce() {
 // by ZK vault creation (first time) and the standalone "set up key" action.
 // Throws Error('Setup cancelled.') if the user backs out of either prompt.
 async function zkRegisterNewKeypair() {
+    // A sign-out meanwhile ends the setup: the key is never registered with the next person's session, nor kept
+    // (see _zkSignOuts). Its derivation takes from a fraction of a second to several seconds.
+    const step = _zkSteps();
     // Prominent, acknowledged warning: the ZK passphrase is the ONLY key to the
     // user's zero-knowledge vaults, is never sent to the server, and cannot be reset or
     // recovered by anyone. Make the user ACTIVELY acknowledge irrecoverability (a dedicated
@@ -12633,11 +12671,11 @@ async function zkRegisterNewKeypair() {
     // server won't accept a substituted/unheld public key. A challenge the server cannot open is
     // refused once (see zkIsPossessionChallengeRefusal); the fresh one asked for then goes through.
     for (let attempt = 0; ; attempt++) {
-        const challenge = await apiRequest('/ecc/keys/register/challenge', { method: 'POST' });
+        const challenge = await step(() => apiRequest('/ecc/keys/register/challenge', { method: 'POST' }));
         const mac = await lib.computeRegistrationPoP(
             challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey);
         try {
-            await apiRequest('/ecc/keys/register', {
+            await step(() => apiRequest('/ecc/keys/register', {
                 method: 'POST',
                 body: JSON.stringify({
                     public_key: publicPem,
@@ -12646,7 +12684,7 @@ async function zkRegisterNewKeypair() {
                     encrypted_private_key: JSON.stringify(enc),
                     pop: { challenge_id: challenge.challenge_id, mac },
                 }),
-            });
+            }));
             break;
         } catch (e) {
             if (attempt === 0 && zkIsPossessionChallengeRefusal(e)) continue;
@@ -12655,7 +12693,7 @@ async function zkRegisterNewKeypair() {
     }
     // Hold a NON-extractable runtime copy (the generated key was extractable only
     // so we could export + password-encrypt it above).
-    zkState.privateKey = await lib.importPrivateKeyPEM(privatePem, false);
+    zkState.privateKey = await step(() => lib.importPrivateKeyPEM(privatePem, false));
     zkArmIdleLock();
 }
 
@@ -12665,6 +12703,9 @@ async function zkRegisterNewKeypair() {
 // from now on (this is a passphrase change, not a key rotation). Throws Error('Cancelled.')
 // if the user backs out of any prompt.
 async function zkChangePassphrase() {
+    // A sign-out meanwhile ends the change: nothing is stored with the next person's session, and no key is kept
+    // (see _zkSignOuts).
+    const step = _zkSteps();
     const priv = await zkFetchPrivateEnvelope();
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
@@ -12700,10 +12741,10 @@ async function zkChangePassphrase() {
     // Re-wrapping replaces the account's only copy, so prove possession of the registered key.
     // `pem` was already checked against that key above, so it can answer the challenge.
     const provingKey = await eccLib().importPrivateKeyPEM(pem, false);
-    await zkPutPrivateEnvelope(enc, provingKey, pubForChange.public_key,
-                               pubForChange.user_id, next, pem);
+    await step(() => zkPutPrivateEnvelope(enc, provingKey, pubForChange.public_key,
+                                          pubForChange.user_id, next, pem));
     // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
-    zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+    zkState.privateKey = await step(() => eccLib().importPrivateKeyPEM(pem, false));
     zkArmIdleLock();
 }
 
@@ -12773,6 +12814,9 @@ async function zkExportRecoveryKey() {
 // re-wrap it under a NEW main passphrase, and store it (PUT /ecc/keys/private). Used when the main
 // passphrase was lost. Throws Error('Cancelled.') on back-out.
 async function zkRestoreFromRecoveryKey(kitText) {
+    // A sign-out meanwhile ends the restore: nothing is stored with the next person's session, and no key is kept
+    // (see _zkSignOuts).
+    const step = _zkSteps();
     // This file is the only fully attacker-supplied envelope the app reads, so the wrapper AND
     // the envelope inside it are bounded here — before the passphrase prompt and before any key
     // derivation. See docs/design/vault-private-key-envelope-v1.md §1.1.
@@ -12823,9 +12867,9 @@ async function zkRestoreFromRecoveryKey(kitText) {
     // Recovery works precisely because a valid kit reconstructs the SAME key: the key recovered
     // above is the registered one (verified against it), so it can answer the challenge.
     const recoveredKey = await eccLib().importPrivateKeyPEM(pem, false);
-    await zkPutPrivateEnvelope(enc, recoveredKey, pub.public_key,
-                               pub.user_id, next, pem);
-    zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);
+    await step(() => zkPutPrivateEnvelope(enc, recoveredKey, pub.public_key,
+                                          pub.user_id, next, pem));
+    zkState.privateKey = await step(() => eccLib().importPrivateKeyPEM(pem, false));
     zkArmIdleLock();
 }
 
@@ -13134,6 +13178,9 @@ async function zkGetVaultDek(vaultId, keyVersion = null, opts = null) {
 // matching same-name rows on the legacy per-epoch indices, so a failure here must not fail the
 // create -- it is swallowed and the vault works.
 async function zkMintOwnIndexKey(vaultId) {
+    // The cache as it is now: a lock or a sign-out while this runs replaces it, and what this mints is then kept in
+    // the one it replaced, never in the next person's.
+    const cache = zkState.vaultIndexKeys;
     try {
         // Minting proves the identity key and the vault's current key (the key is one every member
         // then uses for every name). Both are in hand right after a create, so this asks for nothing.
@@ -13152,7 +13199,7 @@ async function zkMintOwnIndexKey(vaultId) {
             }] },
             expect: current.expect, current: current.material,
         });
-        zkState.vaultIndexKeys[vaultId] = K;   // cache so a later write need not round-trip
+        cache[vaultId] = K;   // cache so a later write need not round-trip
         return K;
     } catch (_) {
         // Non-fatal by contract. A 409 (another client minted first) or any other hiccup just
@@ -13166,7 +13213,10 @@ async function zkMintOwnIndexKey(vaultId) {
 // that same response (the account the server selected the row for), never from local state -- the
 // unwrap transcript binds it, and localStorage identity tolerates corrupt data.
 async function zkGetVaultIndexKey(vaultId) {
-    const cached = zkState.vaultIndexKeys[vaultId];
+    // The cache as it is now: a lock or a sign-out while this waits replaces it, and what this reads is then kept
+    // in the one it replaced, never in the next person's (as zkGetVaultDek keeps its own).
+    const cache = zkState.vaultIndexKeys;
+    const cached = cache[vaultId];
     if (cached) return cached;
     // "No key" is remembered too (as `false`): this is asked once per picked NAME, and a vault
     // without one used to cost a request every time. Minting one overwrites the entry, and the
@@ -13176,14 +13226,14 @@ async function zkGetVaultIndexKey(vaultId) {
     if (cached === false) return null;
     const resp = await apiRequest(`/ecc/vaults/${vaultId}/index-key`, { silent: true });
     if (!resp || !resp.index_key) {              // no key minted for this vault yet
-        zkState.vaultIndexKeys[vaultId] = false;
+        cache[vaultId] = false;
         return null;
     }
     const priv = await zkEnsureUnlocked();
     const K = await eccLib().unwrapNameIndexKeyV2(
         resp.index_key, resp.ephemeral_public_key, priv,
         { vaultId, recipientUserId: resp.recipient_user_id });
-    zkState.vaultIndexKeys[vaultId] = K;
+    cache[vaultId] = K;
     return K;
 }
 
