@@ -402,7 +402,81 @@ def test_only_the_web_server_sizes_its_pool_from_the_ceiling(monkeypatch, compon
 
 def test_the_two_pools_fit_in_what_postgresql_accepts_up_to_a_ceiling_of_40():
     """PostgreSQL accepts 100 connections unless it is told otherwise: the web server's pool and the SFTP server's
-    hold 68 of them at the default ceiling and 98 at 40, as the documentation says."""
-    both = {limit: database.pool_capacity(limit) + database.MIN_CAPACITY for limit in (16, 40, 41)}
-    assert both == {16: 68, 40: 98, 41: 99}
-    assert all(database.pool_capacity(limit) + database.MIN_CAPACITY <= 100 for limit in range(-1, 41))
+    hold 68 of them at the default ceiling, 96 at 39 and 98 at 40, as the documentation says."""
+    both = {limit: database.pool_capacity(limit) + database.MIN_CAPACITY for limit in (16, 39, 40, 41, 42, 43)}
+    assert both == {16: 68, 39: 96, 40: 98, 41: 99, 42: 100, 43: 101}
+    assert all(database.pool_capacity(limit) + database.MIN_CAPACITY <= 100 for limit in range(-1, 43))
+
+
+# max_connections, superuser_reserved_connections, a superuser, the role's own limit (-1: none)
+SHIPPED, OWN_ROLE = (100, 3, True, -1), (100, 3, False, -1)
+
+
+@pytest.mark.parametrize("row, ceiling_, sftp, needed, usable, highest", [
+    (SHIPPED, 16, True, 68, 100, 42),
+    (SHIPPED, 43, True, 101, 100, 42),
+    (OWN_ROLE, 39, True, 96, 97, 39),
+    (OWN_ROLE, 40, True, 98, 97, 39),         # the 98 of a ceiling of 40 is past what a role that is not one opens
+    (OWN_ROLE, 40, False, 68, 97, 63),        # no SFTP server beside it
+    ((100, 3, False, 50), 16, True, 68, 50, 0),
+    ((200, 5, False, -1), 64, True, 128, 195, 118),
+])
+def test_what_the_pools_may_open_is_set_against_what_the_role_may(row, ceiling_, sftp, needed, usable, highest):
+    room = database.connection_room(row, ceiling_, sftp)
+    assert (room["needed"], room["usable"], room["highest_ceiling"]) == (needed, usable, highest)
+    if highest:
+        assert database.pool_capacity(highest) + (database.MIN_CAPACITY if sftp else 0) <= usable
+    assert database.pool_capacity(highest + 1) + (database.MIN_CAPACITY if sftp else 0) > usable
+
+
+class _RoomEngine:
+    """An engine on PostgreSQL whose server answers ``row`` to the question of connection_room."""
+
+    def __init__(self, row):
+        self.row = row
+        self.dialect = SimpleNamespace(name="postgresql")
+
+    def connect(self):
+        engine = self
+
+        class _Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, statement):
+                assert "superuser_reserved_connections" in str(statement)
+                return SimpleNamespace(first=lambda: engine.row)
+        return _Connection()
+
+
+@pytest.mark.parametrize("row, ceiling_, said", [
+    (OWN_ROLE, 40, "Set MAX_CONCURRENT_TRANSFERS to 39 or less"),
+    (SHIPPED, 43, "Set MAX_CONCURRENT_TRANSFERS to 42 or less"),
+    (OWN_ROLE, 16, None),
+    (SHIPPED, 42, None),
+])
+def test_the_start_says_when_the_pools_may_open_more_than_the_role_may(monkeypatch, capsys, row, ceiling_, said):
+    from app.core import sftp_versions
+    monkeypatch.setattr(database, "_require_engine", lambda: _RoomEngine(row))
+    monkeypatch.setattr(database.settings, "max_concurrent_transfers", ceiling_)
+    monkeypatch.delenv(sftp_versions.COMBINED_SFTP_ENV, raising=False)
+    capsys.readouterr()
+    database.report_connection_room()
+    out = capsys.readouterr().out
+    if said is None:
+        assert out == ""
+    else:
+        assert out.startswith(f"Warning: at MAX_CONCURRENT_TRANSFERS={ceiling_} the database pools") and said in out
+        assert ("3 of them kept for superusers" in out) == (row is OWN_ROLE)
+
+
+def test_a_database_that_cannot_be_asked_is_said_and_the_start_goes_on(monkeypatch, capsys):
+    def unreachable():
+        raise ConnectionError("db:5432 refused")
+    monkeypatch.setattr(database, "_require_engine", unreachable)
+    database.report_connection_room()
+    out = capsys.readouterr().out
+    assert out == "Warning: the database's connection limit was not checked (ConnectionError)\n"

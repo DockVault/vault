@@ -288,10 +288,15 @@ refreshers, the record of when each vault was last opened). Ten is enough while 
 than ten at once; a burst of them makes the next request wait for a connection, as before.
 
 The SFTP server keeps a pool of its own, of 30 connections whatever the ceiling (SFTP transfers are
-not on it). PostgreSQL accepts 100 connections unless it is told otherwise; the two pools hold at
-most 68 of them at the default ceiling, and 98 at a ceiling of 40 (each step of the ceiling adds one
-connection, each fourth step one more). So a ceiling above 40 needs PostgreSQL's `max_connections`
-raised as well, leaving room for a backup or an administrator's `psql` beside the pools.
+not on it). PostgreSQL accepts 100 connections unless it is told otherwise, and keeps 3 of them
+(`superuser_reserved_connections`) for superusers: the role the shipped compose files create is a
+superuser and may open all 100, while a role that is not one, as on a database of your own, opens 97
+(fewer if the role has a connection limit of its own). The two pools hold at most 68 connections at
+the default ceiling, 96 at a ceiling of 39 and 98 at 40 (each step of the ceiling adds one
+connection, each fourth step one more). So a ceiling above 39, or above 42 for a superuser, needs
+PostgreSQL's `max_connections` raised as well, leaving room for a backup or an administrator's
+`psql` beside the pools. The web server checks this at start and says so in its log, with the
+highest ceiling that fits, when the pools may open more than the role may.
 
 At the default ceiling the transfer memory is about 16 × 40 MB = 640 MB on top of the ~260 MB
 resting, which is why a deployment with less memory than that should lower it. **Open SFTP handles

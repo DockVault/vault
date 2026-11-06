@@ -26489,6 +26489,9 @@ async def lifespan(app: FastAPI):
     _check_data_requirements("web")
     init_db()
     print("Database initialized")
+    # Whether the database lets this role open what the pools may open at the transfer ceiling (said, never refused).
+    from app.core.database import report_connection_room
+    report_connection_room()
     recorded = _run_lightweight_migrations()
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state

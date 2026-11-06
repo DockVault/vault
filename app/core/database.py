@@ -62,10 +62,70 @@ def pool_capacity(max_concurrent_transfers) -> int:
     """The most connections the web server's pool opens, with the transfer ceiling configured as
     ``max_concurrent_transfers``: one for each transfer and sign-in that can run at once, and LOOP_RESERVE more for
     everything else (see the comment above: not a reserve for the event loop alone). 38 at the default ceiling of
-    16; with the SFTP server's 30 that is 68 of PostgreSQL's 100, and 98 at a ceiling of 40."""
+    16; with the SFTP server's 30 that is 68, and 98 at a ceiling of 40 (connection_room says what the database
+    lets the vault's role open)."""
     from app.core.auth_offload import AUTH_OFFLOAD_LIMIT
     from app.core.transfer_admission import admitted_at_most
     return max(MIN_CAPACITY, admitted_at_most(max_concurrent_transfers) + AUTH_OFFLOAD_LIMIT + LOOP_RESERVE)
+
+
+# PostgreSQL accepts max_connections (100 unless it is told otherwise), and keeps superuser_reserved_connections of
+# them (3 by default) for superusers: a role that is not one opens at most the rest, 97 by default (the role the
+# shipped composes create is a superuser; one on a database of your own may not be), and fewer when the role has a
+# connection limit of its own. Past what the role may open, the next connection is refused: a request fails, or the
+# SFTP server cannot read a session. The web server's pool and the SFTP server's (pool_capacity and MIN_CAPACITY)
+# fit in 97 up to a ceiling of 39 and in 100 up to 42; the management tool's commands run in the container open one
+# or two more while they run.
+_ROOM_SQL = ("SELECT current_setting('max_connections')::int, current_setting('superuser_reserved_connections')::int, "
+             "r.rolsuper, r.rolconnlimit FROM pg_roles r WHERE r.rolname = current_user")
+
+
+def connection_room(row, max_concurrent_transfers, runs_sftp: bool) -> dict:
+    """What the pools may open at the transfer ceiling ``max_concurrent_transfers`` (the web server's, and the SFTP
+    server's when ``runs_sftp``) against what the database lets the vault's role open, from ``row`` (_ROOM_SQL's
+    answer: max_connections, superuser_reserved_connections, whether the role is a superuser, its own limit, -1 for
+    none). ``highest_ceiling`` is the highest ceiling whose pools fit, 0 when none does."""
+    max_connections, reserved, superuser, role_limit = (int(row[0]), int(row[1]), bool(row[2]), int(row[3]))
+    usable = max_connections - (0 if superuser else reserved)
+    if role_limit >= 0:
+        usable = min(usable, role_limit)
+    others = MIN_CAPACITY if runs_sftp else 0
+    highest = 0
+    for ceiling in range(1, 1001):
+        if pool_capacity(ceiling) + others > usable:
+            break
+        highest = ceiling
+    return {"needed": pool_capacity(max_concurrent_transfers) + others, "usable": usable,
+            "max_connections": max_connections, "reserved": 0 if superuser else reserved, "superuser": superuser,
+            "role_limit": role_limit, "highest_ceiling": highest}
+
+
+def report_connection_room() -> None:
+    """At the web server's start: say when the pools may open more connections than the database lets the vault's
+    role open (connection_room), and what to change. Never raises: a database that cannot be asked is said, and the
+    start goes on."""
+    from sqlalchemy import text
+    try:
+        engine = _require_engine()
+        if engine.dialect.name != "postgresql":
+            return
+        from app.core.sftp_versions import deployment_runs_sftp
+        with engine.connect() as connection:
+            row = connection.execute(text(_ROOM_SQL)).first()
+        if row is None:
+            return
+        room = connection_room(row, settings.max_concurrent_transfers, deployment_runs_sftp())
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: the database's connection limit was not checked ({type(exc).__name__})")
+        return
+    if room["needed"] <= room["usable"]:
+        return
+    kept = (f", {room['reserved']} of them kept for superusers" if room["reserved"] else "")
+    print(f"Warning: at MAX_CONCURRENT_TRANSFERS={settings.max_concurrent_transfers} the database pools of the web "
+          f"server and the SFTP server may open {room['needed']} connections, more than the database lets this "
+          f"role open ({room['usable']}: max_connections {room['max_connections']}{kept}). When they are all in "
+          f"use, the next request fails. Set MAX_CONCURRENT_TRANSFERS to {room['highest_ceiling']} or less, or raise "
+          f"the database's max_connections.", flush=True)
 
 
 _engine = None
