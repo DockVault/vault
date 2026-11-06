@@ -112,17 +112,55 @@ def test_a_session_the_cleanup_ends_meanwhile_is_revoked_and_counted_once(db, mo
     the statement that revokes the idle ones. It must still end up revoked, and be counted once."""
     user = uuid.uuid4()
     live = _row(db, user, active=True)
+    ran = []
 
-    def cleanup_runs_meanwhile(channel, message):
+    def cleanup_runs_meanwhile(state):
+        # Just before the statement that revokes the idle rows: the live row was loaded as live already.
+        if state.is_update and not ran:
+            ran.append(True)
+            other = sessionmaker(bind=db.get_bind())()
+            other.query(ActiveSession).filter(ActiveSession.id == live).update({"is_active": False})
+            other.commit()
+            other.close()
+
+    monkeypatch.setattr(S, "_guarded_publish_force", lambda channel, message: True)
+    sa.event.listen(db, "do_orm_execute", cleanup_runs_meanwhile)
+    try:
+        assert _revoke(db, user_id=user) == 1
+    finally:
+        sa.event.remove(db, "do_orm_execute", cleanup_runs_meanwhile)
+    assert ran, "the cleanup did not run between the load and the statement"
+    assert _state(db, live) == (False, True)
+
+
+def test_the_force_close_signal_is_sent_once_the_revocation_commits_and_never_when_it_rolls_back(db, monkeypatch):
+    """The signal tears down a live SFTP transport at once. Sent before the commit, a change that then rolled back
+    had already cut the person's live transfers; so it goes once the revocation is committed, and a revocation rolled
+    back sends nothing."""
+    user = uuid.uuid4()
+    live = _row(db, user, active=True)
+    seen = []
+
+    def publish(channel, message):
         other = sessionmaker(bind=db.get_bind())()
-        other.query(ActiveSession).filter(ActiveSession.id == live).update({"is_active": False})
-        other.commit()
+        row = other.query(ActiveSession).filter(ActiveSession.id == live).one()
+        seen.append((S.json.loads(message)["session_token"], row.is_active, row.revoked))
         other.close()
         return True
 
-    monkeypatch.setattr(S, "_guarded_publish_force", cleanup_runs_meanwhile)
-    assert _revoke(db, user_id=user) == 1
-    assert _state(db, live) == (False, True)
+    monkeypatch.setattr(S, "_guarded_publish_force", publish)
+    assert S._revoke_sessions(db, user_id=user, actor_username="tester") == 1
+    assert seen == [], "the signal went before the commit"
+    db.rollback()
+    assert seen == [] and _state(db, live) == (True, False)
+    db.commit()                       # a later commit of the same session sends nothing the rollback dropped
+    assert seen == []
+
+    assert S._revoke_sessions(db, user_id=user, actor_username="tester") == 1
+    db.commit()
+    assert seen == [(_token(db, live), False, True)], "the signal went before the row was ended"
+    db.commit()
+    assert len(seen) == 1, "a signal was sent twice"
 
 
 def test_the_revoked_rows_are_left_out_of_the_count(db, published):

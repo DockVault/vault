@@ -8754,6 +8754,46 @@ def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
         )
 
 
+# The force-close signals a session's transaction will send once it commits (_force_close_after_commit).
+_FORCE_CLOSE_PENDING = "force_close_after_commit"
+_FORCE_CLOSE_LISTENING = "force_close_listening"
+
+
+def _force_close_after_commit(db, message: dict, actor_username: str) -> None:
+    """Send the SFTP server the force-close signal ``message`` (one session's) once ``db``'s transaction commits,
+    and none when it rolls back. The signal tears down a live transport at once; sent before the commit, a change
+    that then rolled back (a reset whose transaction failed, answered "nothing changed") had already cut the
+    person's live SFTP transfers. Sent after it, the session's row is ended by the time a client that reconnects
+    is checked again."""
+    pending = db.info.setdefault(_FORCE_CLOSE_PENDING, [])
+    pending.append((message, actor_username))
+    if not db.info.get(_FORCE_CLOSE_LISTENING):
+        from sqlalchemy import event as _sa_event
+        _sa_event.listen(db, "after_commit", _send_force_closes)
+        _sa_event.listen(db, "after_rollback", _drop_force_closes)
+        db.info[_FORCE_CLOSE_LISTENING] = True
+
+
+def _drop_force_closes(session) -> None:
+    session.info.pop(_FORCE_CLOSE_PENDING, None)
+
+
+def _send_force_closes(session) -> None:
+    """After a commit: the force-close signals its transaction gathered. Never raises (the change is committed)."""
+    for message, actor_username in session.info.pop(_FORCE_CLOSE_PENDING, None) or ():
+        try:
+            sent = _guarded_publish_force('session_terminations', json.dumps(message))
+            if sent:
+                print(f"📢 Force-closed session {message['session_token'][:8]}... ({actor_username})")
+            else:
+                # Durable revocation is committed; only the live teardown signal was skipped while a
+                # cache failure sits inside its cooldown.
+                print(f"↩ Revoked session {message['session_token'][:8]}... ({actor_username}); live signal "
+                      f"skipped (cache guard), teardown falls to the session's own recheck")
+        except Exception as e:  # noqa: BLE001
+            print(f"❌ Failed to publish termination signal ({type(e).__name__})")
+
+
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
                      durable=True, except_session_token=None):
     """Deactivate the matching active sessions AND publish a force-close signal to
@@ -8761,6 +8801,8 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
     transport immediately — not just at the connection's next operation. This is
     the active counterpart to the per-request is_active/is_locked/cred-active
     re-checks on the web and SFTP paths. Returns the number of sessions revoked.
+    The signals are sent once the caller's transaction commits (_force_close_after_commit), and not at all when
+    it rolls back.
 
     durable=True (logout / lock / deactivate) ALSO sets ActiveSession.revoked so a regular-user
     web JWT is rejected per request even during a Redis outage. durable=False (e.g. disabling
@@ -8813,21 +8855,11 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
         count += 1
         handled_ids.append(s.id)
-        try:
-            sent = _guarded_publish_force('session_terminations', json.dumps({
-                'session_token': s.session_token,
-                'session_id': str(s.id),
-                'terminated_by': actor_username,
-            }))
-            if sent:
-                print(f"📢 Force-closed session {s.session_token[:8]}... ({actor_username})")
-            else:
-                # Durable revocation is committed; only the live teardown signal was skipped while a
-                # cache failure sits inside its cooldown.
-                print(f"↩ Revoked session {s.session_token[:8]}... ({actor_username}); live signal "
-                      f"skipped (cache guard), teardown falls to the session's own recheck")
-        except Exception as e:  # noqa: BLE001
-            print(f"❌ Failed to publish termination signal: {e}")
+        _force_close_after_commit(db, {
+            'session_token': s.session_token,
+            'session_id': str(s.id),
+            'terminated_by': actor_username,
+        }, actor_username)
     if durable and temp_credential_id is None:
         # The regular sessions already inactive but never revoked (see the docstring), in one
         # statement: an account can hold a month of them. A temporary credential's token is refused

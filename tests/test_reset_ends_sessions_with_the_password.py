@@ -71,3 +71,58 @@ def test_a_reset_whose_sessions_cannot_be_ended_changes_nothing_and_says_so(db, 
     monkeypatch.setattr(api, "_revoke_sessions", lambda db_, **kw: 0)
     assert _use(db, token) == {"ok": True}
     assert not verify_password(OLD, _password_elsewhere(db, bob))
+
+
+# The real revocation, kept before the fixtures stand one in.
+REVOKE = api._revoke_sessions
+
+
+def _live_session(db, user):
+    import uuid
+    from app.core.models import ActiveSession
+    ActiveSession.__table__.create(db.get_bind(), checkfirst=True)
+    row = ActiveSession(session_token="h" * 64, user_id=user.id, ip_address="198.51.100.7", is_active=True,
+                        revoked=False)
+    db.add(row)
+    db.commit()
+    return row.id
+
+
+def _signals(db, user, monkeypatch):
+    """What the SFTP server is told, each with whether the new password was committed by then."""
+    seen = []
+    monkeypatch.setattr(api, "_revoke_sessions", REVOKE)
+    monkeypatch.setattr(api, "_guarded_publish_force", lambda channel, message: seen.append(
+        (channel, not verify_password(OLD, _password_elsewhere(db, user)))) or True)
+    return seen
+
+
+def test_the_sftp_servers_signal_goes_once_the_reset_has_committed(db, world, monkeypatch):
+    bob = _user(db, "bob")
+    _live_session(db, bob)
+    token = _link(db, bob, created_by=None, made_by_other=False)
+    seen = _signals(db, bob, monkeypatch)
+    assert _use(db, token) == {"ok": True}
+    assert seen == [("session_terminations", True)], "the live transports were cut before the reset committed"
+
+
+def test_a_reset_that_does_not_commit_cuts_no_live_transport(db, world, monkeypatch):
+    """The reset answers "the password was not changed": the person's live SFTP transfers go on."""
+    bob = _user(db, "bob")
+    _live_session(db, bob)
+    token = _link(db, bob, created_by=None, made_by_other=False)
+    seen = _signals(db, bob, monkeypatch)
+    real_commit = db.commit
+    calls = []
+
+    def commit():
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("the database went away")
+        return real_commit()
+    monkeypatch.setattr(db, "commit", commit)
+    with pytest.raises(HTTPException) as refused:
+        _use(db, token)
+    assert refused.value.status_code == 503 and calls
+    assert seen == [], "a reset that changed nothing cut the live transports"
+    assert verify_password(OLD, _password_elsewhere(db, bob))
