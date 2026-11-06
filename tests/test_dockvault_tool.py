@@ -812,6 +812,28 @@ def test_container_running_reads_docker_inspect():
         "vault-db", run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) is False
 
 
+def _raises(exc):
+    def run(*a, **k):
+        raise exc
+    return run
+
+
+@pytest.mark.parametrize("run, paused", [
+    (lambda *a, **k: _Proc(0, "true\n"), True),
+    (lambda *a, **k: _Proc(0, "false\n"), False),
+    # Docker cannot tell: never "running", which would count a resume it could not confirm as done.
+    (lambda *a, **k: _Proc(1, "", "Error: No such object: vault-db"), None),
+    (lambda *a, **k: _Proc(1, "false\n"), None),
+    (lambda *a, **k: _Proc(0, "running\n"), None),
+    (lambda *a, **k: _Proc(0, ""), None),
+    (_raises(OSError("no docker")), None),
+    (_raises(subprocess.TimeoutExpired(["docker"], 20)), None),
+], ids=["paused", "running", "no-such-container", "did-not-answer-0", "another-answer", "no-answer",
+        "could-not-run", "timed-out"])
+def test_container_paused_says_none_whenever_docker_cannot_tell(run, paused):
+    assert dv.container_paused("vault-db", run=run) is paused
+
+
 def test_container_mounts_lists_named_volumes_and_fails_soft():
     assert dv.container_mounts(
         "vault-db", run=lambda *a, **k: _Proc(0, "dockvault-vault_vault_pg_data \n")
