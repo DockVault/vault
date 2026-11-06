@@ -657,8 +657,11 @@ secrets). Don't edit the prefix by hand; the management tool's **Volumes** menu 
 The secret check opens the set's database with the `.env`'s `VAULT_DB_PASSWORD`, then checks its
 `ENCRYPTION_KEY` against the key check the vault keeps in that database: a `.env` with the right
 password and another key is refused. A database with no key check yet (its vault never started) lets
-the `.env` through, and the next check of it reads the key check again. When setup's existing-volume
-menu installs a `.env` you point it at, it first keeps the current one as `.env.<set>`, as a restore
+the `.env` through, and the next check of it reads the key check again. A check that read both
+leaves a stamp in the volume, so the next check of that exact `.env` takes a second instead of
+starting the database; a stamp an earlier version left after checking the password alone is not
+taken, and the next check starts the database and reads both. When setup's existing-volume menu
+installs a `.env` you point it at, it first keeps the current one as `.env.<set>`, as a restore
 does. If that `.env` is another set's, the menu's choices are then about that set's volume: its
 "destroy" option deletes the volumes of the set `.env` names, and says which.
 

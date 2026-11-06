@@ -3087,14 +3087,46 @@ def test_coupling_marker_verdict_confirms_only():
     env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
     salt = dv.gen_salt()
     good = {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}
-    assert dv.coupling_marker_verdict({"coupling": good}, env) == "ok"
+    stamp = {"dockvault_coupling": dv.COUPLING_STAMP_VERSION}
+    assert dv.coupling_marker_verdict(dict(stamp, coupling=good), env) == "ok"
     # a stale/absent/garbled stamp is "unknown" (None) - never a refusal, because a rotated DB
     # password would otherwise lock the operator out of their own data.
     assert dv.coupling_marker_verdict(None, env) is None
     assert dv.coupling_marker_verdict({}, env) is None
-    assert dv.coupling_marker_verdict({"coupling": {"salt": salt, "sha256": "0" * 64}}, env) is None
+    assert dv.coupling_marker_verdict(dict(stamp, coupling={"salt": salt, "sha256": "0" * 64}), env) is None
     other = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
-    assert dv.coupling_marker_verdict({"coupling": good}, other) is None
+    assert dv.coupling_marker_verdict(dict(stamp, coupling=good), other) is None
+
+
+@pytest.mark.parametrize("version", [None, 1, True, "2", 2.0], ids=["none", "one", "a-bool", "a-text", "a-float"])
+def test_a_stamp_written_before_the_key_was_checked_vouches_for_nothing(version):
+    """A stamp vouches for the exact .env it was written for. Earlier versions wrote it after the database password
+    alone had opened the database (version 1, or none), so it can vouch for a .env that shares the password and
+    has another ENCRYPTION_KEY: such a stamp is not taken, only one written once the key check was read too."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    marker = dv.build_coupling_marker(env)
+    assert marker["dockvault_coupling"] == dv.COUPLING_STAMP_VERSION == 2
+    assert dv.coupling_marker_verdict(marker, env) == "ok"
+    if version is None:
+        del marker["dockvault_coupling"]
+    else:
+        marker["dockvault_coupling"] = version
+    assert dv.coupling_marker_verdict(marker, env) is None
+
+
+def test_an_earlier_versions_stamp_sends_the_guard_to_the_database_and_its_key_check(tmp_path):
+    """The stamp an earlier version wrote for a .env whose password opens the database and whose ENCRYPTION_KEY is
+    not the data's (never checked then) answered every later check: the .env went through. Now the guard starts the
+    database, reads the key check, refuses that .env, and stamps nothing."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    old = dict(dv.build_coupling_marker(env), dockvault_coupling=1)
+    starts, stamped = [], []
+    ok = tool._guard_db_secret(env, exists_fn=lambda v: True, start_fn=lambda: starts.append(1) or True,
+                               wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None,
+                               marker_fn=lambda vol: old, stamp_fn=lambda vol, e: stamped.append(vol),
+                               canary_fn=lambda e: "mismatch")
+    assert ok is False and starts == [1] and stamped == []
 
 
 def test_coupling_marker_carries_no_secret():
@@ -3134,7 +3166,8 @@ def test_stamped_volume_verifies_without_starting_the_database(tmp_path, capsys)
     env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     salt = dv.gen_salt()
-    marker = {"coupling": {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}}
+    marker = {"dockvault_coupling": dv.COUPLING_STAMP_VERSION,
+              "coupling": {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}}
     started = []
     ok = tool._guard_db_secret(
         env, exists_fn=lambda v: True,

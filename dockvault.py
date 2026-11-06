@@ -2137,6 +2137,11 @@ def compute_coupling_fingerprint(env, salt):
 # of booting postgres for a ~20-40s auth probe. Postgres ignores unrecognised files in its data
 # directory (it only requires an EMPTY directory at initdb time, long before this is written).
 COUPLING_MARKER = "dockvault_coupling.json"
+# The stamp's version. A stamp is written once both halves of the pairing were checked: the database password opened
+# the database, and ENCRYPTION_KEY opened the key check the vault keeps there. Earlier versions of this tool stamped
+# after the password alone (version 1), so their stamp can vouch for a .env whose ENCRYPTION_KEY was never checked
+# (one that shares the password): it is not taken, the live check runs and stamps this version.
+COUPLING_STAMP_VERSION = 2
 
 
 def read_volume_coupling(volume, run=subprocess.run):
@@ -2165,7 +2170,7 @@ def build_coupling_marker(env, salt=None):
     """The marker document, in the SAME shape verify_backup_coupling() reads (the digest nested
     under "coupling") so the writer and the reader can never drift apart. Salt + digest only."""
     salt = salt or gen_salt()
-    return {"dockvault_coupling": 1,
+    return {"dockvault_coupling": COUPLING_STAMP_VERSION,
             "coupling": {"salt": salt, "sha256": compute_coupling_fingerprint(env, salt)}}
 
 
@@ -2190,8 +2195,13 @@ def coupling_marker_verdict(marker, env):
     """Pure: 'ok' when `marker` proves `env` is the .env this volume was stamped with, else None.
     NEVER returns a negative verdict - a stamp can go stale (the DB password was rotated in
     postgres and in .env), and only the live auth probe may refuse a start. Shares ONE digest
-    comparison with the backup manifests (verify_backup_coupling)."""
-    return "ok" if verify_backup_coupling(env, marker or {}) else None
+    comparison with the backup manifests (verify_backup_coupling). A stamp vouches for the exact
+    .env it was written for, and only one written once both halves were checked
+    (COUPLING_STAMP_VERSION) is taken; an older one (the password checked alone) is not."""
+    version = marker.get("dockvault_coupling") if isinstance(marker, dict) else None
+    if not (isinstance(version, int) and not isinstance(version, bool) and version >= COUPLING_STAMP_VERSION):
+        return None
+    return "ok" if verify_backup_coupling(env, marker) else None
 
 
 # The manifest's format ("dockvault_backup"). 1: the backups made before archives had checksums (an entry records no
