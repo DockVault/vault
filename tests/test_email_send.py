@@ -312,3 +312,56 @@ def test_build_message_html_with_inline_image():
     assert msg.is_multipart()
     # the PNG rides along as a related part
     assert any(part.get_content_type() == "image/png" for part in msg.walk())
+
+
+# --------------------------------------------------------------------------- what the log says of a failure
+
+REFUSED_TEXT = b"5.1.1 <carol@example.com>: Recipient address rejected: User unknown"
+
+
+@pytest.mark.parametrize("failure, said", [
+    (smtplib.SMTPDataError(550, REFUSED_TEXT), "[email] send failed: SMTPDataError (reply 550)"),
+    (smtplib.SMTPRecipientsRefused({"carol@example.com": (550, REFUSED_TEXT)}),
+     "[email] send failed: SMTPRecipientsRefused"),
+    (ConnectionRefusedError(111, "Connection refused to carol@example.com"),
+     "[email] send failed: ConnectionRefusedError (errno 111)"),
+])
+def test_a_failed_send_logs_the_errors_class_and_code_never_its_text(fake_smtp, capsys, failure, said):
+    """A mail server's reply names what it refused, a recipient's address among them: the log has the error's class
+    and the reply code (or the system's error number), never the text."""
+    def _mk(host, port, timeout=None, context=None):
+        inst = _FakeSMTP(host, port, timeout)
+        inst.send_exc = failure
+        return inst
+    smtplib.SMTP_SSL = _mk
+    cfg = _cfg(smtp_port=465)
+    with pytest.raises(es.EmailSendError):
+        es.smtp_send(cfg, _msg(cfg))
+    logged = capsys.readouterr().out
+    assert logged.strip().splitlines() == [said]
+    assert "carol" not in logged and "rejected" not in logged
+
+
+def test_a_failed_send_in_a_batch_logs_no_recipient(fake_smtp, capsys):
+    def _mk(host, port, timeout=None, context=None):
+        inst = _FakeSMTP(host, port, timeout)
+        inst.send_exc = smtplib.SMTPDataError(550, REFUSED_TEXT)
+        return inst
+    smtplib.SMTP_SSL = _mk
+    cfg = _cfg(smtp_port=465)
+    out = es.smtp_send_batch(cfg, [_msg(cfg, to="carol@example.com")])
+    assert out == [{"ok": False, "error": "delivery failed"}]
+    logged = capsys.readouterr().out
+    assert logged.strip().splitlines() == ["[email] per-recipient send failed: SMTPDataError (reply 550)"]
+    assert "carol" not in logged
+
+
+def test_a_connection_that_fails_for_a_batch_logs_no_text(fake_smtp, capsys):
+    def _mk(host, port, timeout=None, context=None):
+        raise ConnectionRefusedError(111, "Connection refused by smtp.internal.example")
+    smtplib.SMTP_SSL = _mk
+    cfg = _cfg(smtp_port=465)
+    with pytest.raises(es.EmailSendError):
+        es.smtp_send_batch(cfg, [_msg(cfg)])
+    logged = capsys.readouterr().out
+    assert logged.strip().splitlines() == ["[email] batch connect failed: ConnectionRefusedError (errno 111)"]

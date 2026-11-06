@@ -451,11 +451,11 @@ async def decompress_point(
             detail="Invalid compressed point"
         )
     except Exception as e:
-        # 500 detail is scrubbed + server-logged by the global handler, so keeping str(e) here is safe.
+        # The 500 handler answers with an error id and logs it with the class and place of this error (its cause).
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Point decompression failed: {str(e)}"
-        )
+            detail="Point decompression failed"
+        ) from e
 
 
 # =============================================================================
@@ -696,8 +696,8 @@ async def register_public_key(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Public key registration failed: {str(e)}"
-        )
+            detail="Public key registration failed"
+        ) from e
 
 
 

@@ -4728,14 +4728,14 @@ async def send_test_email(
     except (ValueError, UnicodeError) as e:
         # Malformed From name/address (control chars) or SMTP host (bad IDNA) — a configuration
         # problem, returned cleanly instead of propagating as an unhandled 500.
-        print(f"test-email config invalid: {type(e).__name__}: {e}")
+        _email_send.log_send_failure("test-email config invalid", e)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The SMTP configuration is invalid — check the server address and the From name/address.",
         )
     except (smtplib.SMTPException, OSError) as e:
-        # Log the detail server-side; never surface it (or the password) to the client.
-        print(f"test-email send failed: {type(e).__name__}: {e}")
+        # Log the class server-side; never surface the detail (or the password) to the client.
+        _email_send.log_send_failure("test-email send failed", e)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Could not send the test email — check the SMTP server, port, and TLS settings.",
@@ -18127,8 +18127,8 @@ async def delete_vault(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=hold_refusals.vault_text(keeping))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete vault: {str(e)}"
-        )
+            detail="Failed to delete vault"
+        ) from e
 
 
 @app.patch("/vaults/{vault_id}")
@@ -18332,8 +18332,8 @@ async def update_vault_info(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update vault information: {str(e)}"
-        )
+            detail="Failed to update vault information"
+        ) from e
 
 
 @app.put("/vaults/{vault_id}/password")
@@ -18418,8 +18418,8 @@ async def change_vault_password(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to change password: {str(e)}"
-        )
+            detail="Failed to change password"
+        ) from e
 
 
 @app.patch("/vaults/{vault_id}/settings")
@@ -18559,8 +18559,8 @@ async def update_vault_settings(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update settings: {str(e)}"
-        )
+            detail="Failed to update settings"
+        ) from e
 
 
 class VaultStorageUpdate(BaseModel):
@@ -18971,8 +18971,8 @@ async def list_vault_permissions(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list permissions: {str(e)}"
-        )
+            detail="Failed to list permissions"
+        ) from e
 
 
 @app.post("/vaults/{vault_id}/permissions")
@@ -19134,8 +19134,8 @@ async def grant_vault_permission(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to grant permission: {str(e)}"
-        )
+            detail="Failed to grant permission"
+        ) from e
 
 
 @app.delete("/vaults/{vault_id}/permissions/{user_id}")
@@ -19272,8 +19272,8 @@ async def revoke_vault_permission(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to revoke permission: {str(e)}"
-        )
+            detail="Failed to revoke permission"
+        ) from e
 
 
 # ----------------------------------------------------------------------------
@@ -19852,8 +19852,8 @@ async def list_vault_files(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list files: {str(e)}"
-        )
+            detail="Failed to list files"
+        ) from e
 
 
 def _member_grade_principal(user, vault_id) -> bool:
@@ -20609,7 +20609,7 @@ async def upload_file(
                 "event": {
                     "type": "error",
                     "title": "Upload failed",
-                    "description": f"Upload error: {str(e)[:100]}",
+                    "description": f"Upload error ({type(e).__name__})",
                     "user": current_user.username if current_user else "unknown",
                     "ip": get_client_ip(request),
                     "timestamp": datetime.now(timezone.utc).isoformat()
@@ -20619,8 +20619,8 @@ async def upload_file(
             pass  # Don't fail the error handler
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to upload file: {str(e)}"
-        )
+            detail="Failed to upload file"
+        ) from e
     finally:
         # Every path out of the request returns the slot, including the ones that raise before a
         # single file is read (where there is nothing to return and this is a no-op). A slot lost
@@ -22983,7 +22983,7 @@ async def download_file(
                 "event": {
                     "type": "error",
                     "title": "Download failed",
-                    "description": f"Download error: {str(e)[:100]}",
+                    "description": f"Download error ({type(e).__name__})",
                     "user": current_user.username if current_user else "unknown",
                     "ip": get_client_ip(request),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -23100,8 +23100,8 @@ async def delete_file(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete file: {str(e)}"
-        )
+            detail="Failed to delete file"
+        ) from e
 
 
 @app.get("/vaults/{vault_id}/files/{file_id}/info")
@@ -23452,8 +23452,8 @@ async def rename_file(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to rename file: {str(e)}"
-        )
+            detail="Failed to rename file"
+        ) from e
 
 
 class ItemMoveCopy(BaseModel):
@@ -24037,8 +24037,8 @@ async def create_folder(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create folder: {str(e)}"
-        )
+            detail="Failed to create folder"
+        ) from e
 
 
 @app.post("/vaults/{vault_id}/folders/{folder_id}/delete")
