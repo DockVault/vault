@@ -399,19 +399,39 @@
         return box;
     }
 
+    // An answer, or a failure, that comes back after a sign-out belongs to the person who asked, not to whoever has
+    // signed in on the tab since: a sign-out gives the page a new state (resetActivity), and a read made for the
+    // state before is dropped. Its promise never settles, so nothing that waits on it draws it, counts it or reports
+    // it (the list, the summary, who is signed in now, the details). The list's, the summary's and the now panel's
+    // own counters start again from 0 with each new state, so they could not tell such an answer from the next
+    // person's.
+    function dropped() {
+        return new Promise(() => {});
+    }
+
     // A GET under /activity (or the session probe). A 401 is handed to the app's own sign-in handling;
     // a refusal for a temporary credential stops the page (see blockAsTemporary).
     async function get(path) {
+        const asked = S;
         const [base, query] = path.split('?');
         const params = new URLSearchParams(query || '');
-        const resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
-            : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader(), caseHeader()) });
+        let resp;
+        try {
+            resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
+                : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader(), caseHeader()) });
+        } catch (err) {
+            if (asked !== S) return dropped();
+            throw err;
+        }
+        if (asked !== S) return dropped();
         if (resp.status === 401) {
             await apiRequest(path, { silent: true });          // the app signs out
+            if (asked !== S) return dropped();
             throw new RequestError('Your session has ended.', 401, null);
         }
         let data = null;
         try { data = await resp.json(); } catch (_) { data = null; }
+        if (asked !== S) return dropped();
         if (!resp.ok) {
             const detail = data && data.detail;
             const text = typeof detail === 'string' ? detail : `the server answered ${resp.status}`;
