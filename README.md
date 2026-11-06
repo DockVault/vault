@@ -709,10 +709,13 @@ the manifest under the key its `env.enc` is sealed with. Before restore stops or
 reads every archive through, checks it against the recorded checksum, and checks that Docker sees the
 same file through the mount it extracts from; for a sealed backup it first checks the manifest's
 MAC. A changed or damaged archive, a changed sealed manifest, or an archive Docker cannot see is
-refused with nothing changed. Each extraction then reads its archive once more and hashes the bytes
-it extracts in that same read: a bundle on a share or a removable disk, or one someone else can write
-while the restore waits for its confirmation, can change in between, and other bytes than the ones
-checked stop the restore there. The checksums of an unsealed backup show damage only: whoever can write
+refused with nothing changed. Each extraction then copies its archive into the container that
+extracts it, hashes the copy, and extracts the copy only when it is the archive checked: a bundle on a
+share or a removable disk, or one someone else can write while the restore waits for its
+confirmation, can change in between, and an archive changed since is not extracted at all (the
+restore stops there). The copy needs room in Docker's storage for one archive at a time; the check
+before anything is stopped makes the same copy, so a host without that room is refused with nothing
+changed. The checksums of an unsealed backup show damage only: whoever can write
 the bundle can rewrite them too. A backup made before backups recorded checksums (its manifest is of
 format 1) is still restored, with a notice that its archives could only be read through, not matched;
 a manifest of the format that records them and lacks one is refused. A sealed backup also says, inside

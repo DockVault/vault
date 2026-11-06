@@ -2296,42 +2296,47 @@ def check_archive_file(path):
     return digest.hexdigest(), reader.size
 
 
-def _read_archive_once(archive_name, tar_command):
-    """A busybox shell script that reads /src/<archive_name> once and hands the same bytes to `tar_command` (a tar
-    that reads its archive from standard input) and, through a FIFO, to sha256sum, whose line (`<hex>  -`) it prints
-    last. What tar leaves unread is drained, so the checksum is of the whole file. It fails when the file is not
-    there or is empty, when tar fails, or when the FIFO cannot be made. The restore's look at each archive before it
-    stops anything (archive_digest_in_docker) and its extraction (untar_volume) both read this way: the look proves
-    that the extraction can check what it reads."""
+def _copy_archive_in(archive_name, then):
+    """A busybox shell script that copies /src/<archive_name> (the bundle's file, which can change while the restore
+    runs) into the container's own file /tmp/dv-archive, prints the copy's SHA-256 as `dv-sha256 <hex>`, then runs
+    `then`, which reads that copy only ($1 holds its SHA-256): what it reads is the very file hashed, whatever happens
+    to the bundle meanwhile. It fails when the file is not there or is empty (exit 3), or when the copy cannot be
+    made whole or hashed (exit 4: no room for it in Docker's storage, say). The restore's look at each archive before
+    it stops anything (archive_digest_in_docker) and its extraction (untar_volume) both read this way: the look
+    proves the extraction can (Docker sees the file, and has room for the copy)."""
     return ('f=/src/%s; [ -f "$f" ] && [ -s "$f" ] || { echo "no such archive, or an empty one" >&2; exit 3; }; '
-            'mkfifo /tmp/dv-sum && { sha256sum < /tmp/dv-sum > /tmp/dv-sum.txt & } && '
-            'tee /tmp/dv-sum < "$f" | { %s && cat > /dev/null; } && wait && cat /tmp/dv-sum.txt'
-            % (archive_name, tar_command))
+            'cp "$f" /tmp/dv-archive || { echo "the archive could not be copied into the container (is there room '
+            'for it in the Docker storage?)" >&2; exit 4; }; '
+            's="$(sha256sum < /tmp/dv-archive)" || exit 4; set -- $s; echo "dv-sha256 $1"; %s'
+            % (archive_name, then))
 
 
-def _sum_from(stdout):
-    """The SHA-256 hex on the last line _read_archive_once prints, or None."""
-    lines = (stdout or "").strip().splitlines()
-    words = lines[-1].split() if lines else []
-    return words[0] if words and ARCHIVE_DIGEST_RE.match(words[0]) else None
+def _copied_sum(stdout):
+    """The SHA-256 hex _copy_archive_in printed for its copy, or None."""
+    for line in (stdout or "").splitlines():
+        if line.startswith("dv-sha256 "):
+            word = line[len("dv-sha256 "):].strip()
+            return word if ARCHIVE_DIGEST_RE.match(word) else None
+    return None
 
 
 def archive_digest_in_docker(src_dir, archive_name, run=subprocess.run):
     """The SHA-256 hex of <src_dir>/<archive_name> as Docker sees it, through the same read-only bind mount the
-    restore's untar_volume uses and read the same way (_read_archive_once), once busybox tar has listed it to its
-    end (gunzip checks the stream's own checksum on the way). Returns (digest or None, why not). A Docker that does
-    not see the host's folder (another host's daemon, a confined one), or sees another file there, answers with no
-    digest or another one."""
-    script = _read_archive_once(archive_name, "tar tzf - > /dev/null")
+    restore's untar_volume uses and read the same way (_copy_archive_in: copied into the container, then the copy
+    hashed), once busybox tar has listed the copy to its end (gunzip checks the stream's own checksum on the way).
+    Returns (digest or None, why not). A Docker that does not see the host's folder (another host's daemon, a
+    confined one), or sees another file there, answers with no digest or another one; one with no room for the copy
+    answers with none."""
+    script = _copy_archive_in(archive_name, "tar tzf /tmp/dv-archive > /dev/null")
     try:
         r = run(["docker", "run", "--rm", "--network", "none", "-v", "%s:/src:ro" % src_dir, "busybox", "sh", "-c",
-                 script], capture_output=True, text=True, timeout=1200)
+                 script], capture_output=True, text=True, timeout=3600)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return None, "Docker could not be run (%s)" % type(exc).__name__
     if getattr(r, "returncode", 1) != 0:
         why = " ".join((getattr(r, "stderr", "") or "").split())[-200:]
         return None, why or "exit %s" % getattr(r, "returncode", "?")
-    seen = _sum_from(getattr(r, "stdout", ""))
+    seen = _copied_sum(getattr(r, "stdout", ""))
     if seen is None:
         return None, "no checksum came back"
     return seen, ""
@@ -2406,8 +2411,8 @@ def tar_volume(volume, dest_dir, archive_name, run=subprocess.run):
 
 
 class ArchiveChanged(Exception):
-    """untar_volume extracted an archive whose bytes, as the extraction read them, are not the ones the restore
-    checked. `seen` is their SHA-256 hex, or None when the extraction gave none back."""
+    """untar_volume found its archive, as copied for the extraction, to be other bytes than the ones the restore
+    checked, and extracted nothing of it. `seen` is the copy's SHA-256 hex."""
 
     def __init__(self, seen):
         Exception.__init__(self, seen)
@@ -2418,28 +2423,33 @@ def untar_volume(volume, src_dir, archive_name, run=subprocess.run, sha256=None)
     """Restore <src_dir>/<archive_name> into a docker volume via a throwaway busybox container (the -v
     mount creates the volume if absent). Returns True on success.
 
-    With `sha256` (the archive's SHA-256 hex as the restore checked it, before it stopped anything), the extraction
-    hashes the very bytes it extracts (_read_archive_once), because the bundle can change between that check and
-    this read (a bundle on a share or a removable disk, or one anyone else can write while the restore waits for its
-    confirmation). Bytes other than the ones checked raise ArchiveChanged once the extraction ends, and the caller
-    stops there."""
+    With `sha256` (the archive's SHA-256 hex as the restore checked it, before it stopped anything), the archive is
+    copied into the extracting container first, the copy hashed, and the copy extracted only when it is those bytes
+    (_copy_archive_in): the bundle can change between that check and this read (a bundle on a share or a removable
+    disk, or one anyone else can write while the restore waits for its confirmation), and other bytes never reach
+    tar, let alone the volume. They raise ArchiveChanged, with nothing extracted, and the caller stops there. A copy
+    that could not be made or hashed extracts nothing either: False."""
     if sha256 is None:
         script = "cd /dest && tar xzf /src/%s" % archive_name
+    elif not ARCHIVE_DIGEST_RE.match(str(sha256)):
+        return False
     else:
-        script = "cd /dest || exit 5; " + _read_archive_once(archive_name, "tar xzf -")
+        script = "cd /dest || exit 5; " + _copy_archive_in(
+            archive_name, '[ "$1" = %s ] || { echo "not the archive checked" >&2; exit 6; }; tar xzf /tmp/dv-archive'
+            % sha256)
     try:
         r = run(["docker", "run", "--rm", "-v", "%s:/dest" % volume, "-v", "%s:/src:ro" % src_dir,
                  "busybox", "sh", "-c", script],
-                capture_output=True, text=True, timeout=600)
+                capture_output=True, text=True, timeout=3600)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
-    if getattr(r, "returncode", 1) != 0:
-        return False
     if sha256 is not None:
-        seen = _sum_from(getattr(r, "stdout", ""))
+        seen = _copied_sum(getattr(r, "stdout", ""))
+        if seen is None:
+            return False                     # nothing was copied or hashed: nothing was extracted
         if seen != sha256:
-            raise ArchiveChanged(seen)
-    return True
+            raise ArchiveChanged(seen)       # stopped before tar: nothing was extracted
+    return getattr(r, "returncode", 1) == 0
 
 
 def clear_volume(volume, run=subprocess.run):
@@ -7038,18 +7048,16 @@ class DockVault:
                 if not clear_volume(vol):
                     stopped_part_way("could not clear volume %s before restoring it (the backup is never merged over "
                                      "data left in it)" % vol, vol, True)
-                # The extraction reads the archive again: it must read the bytes checked above, or the volume now
-                # holds what someone put in the bundle since (it stops there, and says not to start).
+                # The extraction reads the archive again: it copies it first and extracts the copy only when it is the
+                # archive checked above. Other bytes (someone changed the bundle since) are not extracted at all: the
+                # restore stops there, with this volume emptied, and says not to start.
                 try:
                     extracted = untar_volume(vol, bundle, archive, sha256=digests.get(archive))
                 except ArchiveChanged as exc:
-                    path = os.path.join(bundle, archive)
-                    if exc.seen is None:
-                        stopped_part_way("the extraction of %s into volume %s gave back no checksum, so nothing shows "
-                                         "that what it extracted is the archive checked" % (path, vol), vol, True)
-                    stopped_part_way("%s changed after the restore checked it: what was extracted into volume %s is "
-                                     "not the archive checked (its checksum as extracted is %s)"
-                                     % (path, vol, exc.seen), vol, True, backup_changed=True)
+                    stopped_part_way("%s changed after the restore checked it (its copy taken for the extraction has "
+                                     "the checksum %s): nothing of it was extracted, and volume %s, emptied for it, "
+                                     "is empty" % (os.path.join(bundle, archive), exc.seen, vol), vol, True,
+                                     backup_changed=True)
                 if not extracted:
                     stopped_part_way("could not extract %s into volume %s" % (archive, vol), vol, True)
                 replaced.append(vol)
@@ -7151,8 +7159,9 @@ class DockVault:
                 lines.append("The set the host was on, '%s', is untouched: python dockvault.py start brings it back. "
                              "To restore set '%s', %s." % (current_prefix, prefix, from_copy))
             else:
-                lines.append("Do not start the deployment now: volume %s holds data nobody checked. Do not restore "
-                             "from %s again: it changed while it was read. Instead, %s." % (vol, bundle, from_copy))
+                lines.append("Do not start the deployment now: volume %s is empty and the volumes before it hold the "
+                             "backup's data. Do not restore from %s again: it changed while it was read. Instead, %s."
+                             % (vol, bundle, from_copy))
             return " ".join(lines)
         if had_env and prefix != current_prefix:
             lines.append("The set the host was on, '%s', is untouched: python dockvault.py start brings it back. To "
