@@ -7,8 +7,10 @@ key's derivation, the check against the registered key, the key's import) ends i
 later step is begun (no request with the next person's session), and its promise never settles (nothing of it is
 shown to the next person); without a sign-out it unlocks as before. The next person's first unlock is their own,
 and the finish of the earlier one does not end it. A name-index key read or minted across a sign-out is kept in
-the cache it was read for, not in the next person's. tests/test_ui_zk_unlock_sign_out.py holds the same in a real
-browser.
+the cache it was read for, not in the next person's. The same holds for the four operations of the encryption key
+dialog (zkRegisterNewKeypair, zkChangePassphrase, zkExportRecoveryKey, zkRestoreFromRecoveryKey): a sign-out at any
+of their steps ends them there, with no later prompt, request, key or recovery kit download.
+tests/test_ui_zk_unlock_sign_out.py holds the same in a real browser.
 """
 import json
 import re
@@ -199,3 +201,155 @@ def test_a_name_index_key_read_across_a_sign_out_is_kept_in_the_cache_it_was_rea
     out = json.loads(done.stdout)
     assert out["next"] == {}, "kept in the next person's cache"
     assert out["before"] == {"V": out["got"] if out["got"] is not None else False}
+
+
+# The four operations of the encryption key dialog, lifted out verbatim with the steps they run on. Every prompt,
+# request, derivation and import is held until the test answers it, in the order the operation asks.
+KEYOPS_SHIPPED = "".join(_function(n) for n in (
+    "_zkLeftBehind", "_zkSteps", "zkRegisterNewKeypair", "zkChangePassphrase", "zkExportRecoveryKey",
+    "zkRestoreFromRecoveryKey"))
+
+KEYOPS_HARNESS = """
+let _zkUnlockInFlight = null;
+let _zkSignOuts = 0;
+const zkState = { privateKey: null };
+const begun = [];
+const queue = [];
+const held = (name) => (...args) => { begun.push(name); return new Promise((resolve, reject) => { queue.push({ name, resolve, reject }); }); };
+const showConfirm = held('confirm');
+const showPrompt = held('prompt');
+const zkFetchPrivateEnvelope = held('envelope');
+const zkPutPrivateEnvelope = held('put');
+const zkWrapPrivateKey = held('wrap');
+const apiRequest = (path) => held('api ' + path)();
+const lib = {
+  parsePrivateEnvelope: () => ({}),
+  parseRecoveryKitFile: () => ({ kit: { public_key: 'PUB', recovery: 'sealed for recovery' } }),
+  decryptPrivateEnvelope: held('derive'),
+  derivePublicKeyPEMFromPrivatePEM: held('public from private'),
+  privateKeyMatchesRegisteredPublicKey: held('match'),
+  importPrivateKeyPEM: held('import'),
+  generateKeypair: held('generate'),
+  exportPublicKeyPEM: held('export public'),
+  exportPrivateKeyPEM: held('export private'),
+  computeRegistrationPoP: held('proof'),
+};
+const eccLib = () => lib;
+const safeMessageForCode = () => 'could not';
+const zkPassphraseProblem = () => null;
+const zkIsPossessionChallengeRefusal = () => false;
+let armed = 0;
+const zkArmIdleLock = () => { armed++; };
+const downloads = [];
+const document = {
+  createElement: () => ({ click() { downloads.push(this.download); }, remove() {} }),
+  body: { appendChild() {} },
+};
+const ANSWER = {
+  confirm: true,
+  prompt: 'a long enough passphrase',
+  envelope: { has_keypair: true, encrypted_private_key: 'sealed' },
+  put: {},
+  wrap: { sealed: 'anew' },
+  'api /ecc/keys/public': { has_keypair: true, public_key: 'PUB', user_id: 'u', fingerprint: 'fp' },
+  'api /ecc/keys/register/challenge': { server_ephemeral_public_key: 'E', nonce: 'N', challenge_id: 'C' },
+  'api /ecc/keys/register': {},
+  derive: 'PEM',
+  'public from private': 'PUB',
+  match: true,
+  import: 'THE-KEY',
+  generate: { publicKey: 'pk', privateKey: 'sk' },
+  'export public': 'PUB',
+  'export private': 'PEM',
+  proof: 'MAC',
+};
+const OPS = {
+  setup: () => zkRegisterNewKeypair(),
+  change: () => zkChangePassphrase(),
+  export: () => zkExportRecoveryKey(),
+  restore: () => zkRestoreFromRecoveryKey('{}'),
+};
+const signOut = () => { _zkSignOuts += 1; _zkUnlockInFlight = null; };
+const tick = () => new Promise((r) => setTimeout(r, 0));
+const outcome = (p) => Promise.race([
+  p.then(() => 'done', (e) => 'failed: ' + e.message),
+  new Promise((r) => setTimeout(() => r('pending'), 50)),
+]);
+"""
+
+# What each operation asks for, in order, when nobody signs out.
+KEYOPS = {
+    "setup": ["confirm", "prompt", "prompt", "generate", "export public", "export private", "wrap",
+              "api /ecc/keys/register/challenge", "proof", "api /ecc/keys/register", "import"],
+    "change": ["envelope", "prompt", "derive", "api /ecc/keys/public", "match", "prompt", "prompt", "wrap", "import",
+               "put", "import"],
+    "export": ["envelope", "prompt", "derive", "api /ecc/keys/public", "match", "prompt", "prompt", "wrap"],
+    "restore": ["api /ecc/keys/public", "prompt", "derive", "public from private", "match", "prompt", "prompt", "wrap",
+                "import", "put", "import"],
+}
+
+
+def _keyop(op: str, at, fail: bool = False) -> dict:
+    """Run one operation, answering each step in turn; at step `at` (an index, or None) the person signs out while
+    it is on its way, and it then succeeds, or fails when `fail`."""
+    node = shutil.which("node")
+    assert node, "Node is required: the page's own code must not be skipped"
+    script = KEYOPS_HARNESS + KEYOPS_SHIPPED + f"""
+(async () => {{
+  const p = OPS[{json.dumps(op)}]();
+  p.catch(() => {{}});                         // read below; not a rejection nobody handles
+  for (let i = 0; ; i++) {{
+    await tick();
+    const w = queue.shift();
+    if (!w) break;
+    if (i === {json.dumps(at)}) {{
+      signOut();
+      if ({json.dumps(fail)}) {{ w.reject(new Error('refused')); continue; }}
+    }} else if ({json.dumps(fail)} && {json.dumps(at)} === null && i === 0) {{
+      w.reject(new Error('refused'));
+      continue;
+    }}
+    w.resolve(ANSWER[w.name]);
+  }}
+  await tick();
+  console.log(JSON.stringify({{ got: await outcome(p), key: zkState.privateKey, armed, begun, downloads: downloads.length }}));
+}})();
+"""
+    done = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60,
+                          cwd=str(ROOT))
+    assert done.returncode == 0, done.stdout + done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("op", sorted(KEYOPS))
+def test_a_key_operation_nobody_signs_out_of_runs_to_its_end(op):
+    """The control: every step is asked for in turn, and the key is kept (or, for the export, the kit downloaded)."""
+    out = _keyop(op, None)
+    assert out["begun"] == KEYOPS[op] and out["got"] == "done", out
+    if op == "export":
+        assert out["downloads"] == 1 and out["key"] is None and out["armed"] == 0, out
+    else:
+        assert out["key"] == "THE-KEY" and out["armed"] == 1 and out["downloads"] == 0, out
+
+
+@pytest.mark.parametrize("op,at", [(op, at) for op in sorted(KEYOPS) for at in range(len(KEYOPS[op]))])
+def test_a_key_operation_signed_out_of_at_any_step_ends_there(op, at):
+    """A sign-out while a step is on its way ends the operation when that step comes back: no later step (no
+    prompt, no request with the next person's session), no key kept, no recovery kit downloaded, nothing said."""
+    out = _keyop(op, at)
+    assert out == {"got": "pending", "key": None, "armed": 0, "begun": KEYOPS[op][:at + 1], "downloads": 0}
+
+
+@pytest.mark.parametrize("op,at", [(op, at) for op in sorted(KEYOPS) for at in range(len(KEYOPS[op]))])
+def test_a_key_operation_step_failing_after_a_sign_out_says_nothing(op, at):
+    """A step that fails once the person has signed out (a read refused for want of a session, a prompt answered as
+    cancelled by the sign-out) is not reported to the next person."""
+    out = _keyop(op, at, fail=True)
+    assert out == {"got": "pending", "key": None, "armed": 0, "begun": KEYOPS[op][:at + 1], "downloads": 0}
+
+
+@pytest.mark.parametrize("op", sorted(KEYOPS))
+def test_a_key_operation_step_failing_while_signed_in_is_reported(op):
+    """The control: the same failure without a sign-out ends the operation with an error its caller shows."""
+    out = _keyop(op, None, fail=True)
+    assert out["got"].startswith("failed: ") and out["begun"] == KEYOPS[op][:1] and out["key"] is None, out

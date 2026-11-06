@@ -2133,10 +2133,15 @@ function logout(how) {
     sessionAccess = null;
     isScopedTemp = false;
     zkResetKeys();  // drop the in-memory ECC private key + per-vault DEKs
-    // An unlock of the account key (or its setup, change or restore) still running belongs to this person: it stops
-    // at its next step without keeping the key, and the next person's first unlock is their own, not this one.
+    // An unlock of the account key (or its setup, change, recovery export or restore) still running belongs to this
+    // person: it stops at its next step without keeping the key, and the next person's first unlock is their own, not
+    // this one.
     _zkSignOuts += 1;
     _zkUnlockInFlight = null;
+    // Such an operation started from the encryption key dialog never comes back to turn on the button it turned off
+    // (Set up, Change passphrase, Export recovery key): it is turned on here, so the next person can use it.
+    ['encryption-key-setup-btn', 'encryption-key-change-passphrase-btn', 'encryption-key-export-recovery-btn']
+        .forEach((id) => { const btn = document.getElementById(id); if (btn) btn.disabled = false; });
     // Wipe any saved zero-knowledge upload ciphertext too — on a shared machine it must
     // not outlive the session (it's opaque without the DEK, but matches the scrub above). Not when another
     // session is stored for this browser since (above): what is saved now is that session's.
@@ -12639,45 +12644,46 @@ async function _zkUnlockOnce() {
 // by ZK vault creation (first time) and the standalone "set up key" action.
 // Throws Error('Setup cancelled.') if the user backs out of either prompt.
 async function zkRegisterNewKeypair() {
-    // A sign-out meanwhile ends the setup: the key is never registered with the next person's session, nor kept
-    // (see _zkSignOuts). Its derivation takes from a fraction of a second to several seconds.
+    // A sign-out meanwhile ends the setup at its next step: no prompt of it is shown to the next person, the key is
+    // never registered with their session, nor kept (see _zkSignOuts). Its derivation takes from a fraction of a
+    // second to several seconds.
     const step = _zkSteps();
     // Prominent, acknowledged warning: the ZK passphrase is the ONLY key to the
     // user's zero-knowledge vaults, is never sent to the server, and cannot be reset or
     // recovered by anyone. Make the user ACTIVELY acknowledge irrecoverability (a dedicated
     // confirm dialog, not just a line in the passphrase prompt) BEFORE they set a passphrase.
     // Covers both setup paths (ZK vault creation + the standalone "set up my key" modal).
-    const acknowledged = await showConfirm(
+    const acknowledged = await step(() => showConfirm(
         'Your encryption passphrase is the ONLY key to your zero-knowledge vaults. '
         + 'It is never sent to the server and CANNOT be reset or recovered by anyone — not even an administrator. '
         + 'If you lose it, everything in your zero-knowledge vaults becomes permanently unrecoverable. '
         + 'Store it somewhere safe, such as a password manager. Do you understand and want to continue?',
         'Zero-knowledge: your passphrase cannot be recovered'
-    );
+    ));
     if (!acknowledged) throw new Error('Setup cancelled.');
-    const pass = await showPrompt(
+    const pass = await step(() => showPrompt(
         'Create a passphrase to protect your encryption key: at least 12 characters, and not a common one. You will need it to open zero-knowledge vaults — it CANNOT be recovered if lost.',
         'Set up encryption key', { password: true }
-    );
+    ));
     if (pass === null) throw new Error('Setup cancelled.');
     const passProblem = zkPassphraseProblem(pass);
     if (passProblem) throw new Error(passProblem);
-    const confirm = await showPrompt('Re-enter your passphrase to confirm.', 'Confirm passphrase', { password: true });
+    const confirm = await step(() => showPrompt('Re-enter your passphrase to confirm.', 'Confirm passphrase', { password: true }));
     if (confirm === null) throw new Error('Setup cancelled.');
     if (confirm !== pass) throw new Error('Passphrases do not match.');
 
     const lib = eccLib();
-    const kp = await lib.generateKeypair();
-    const publicPem = await lib.exportPublicKeyPEM(kp.publicKey);
-    const privatePem = await lib.exportPrivateKeyPEM(kp.privateKey);
-    const enc = await zkWrapPrivateKey(privatePem, pass);  // legacy shape, or v1 when enabled
+    const kp = await step(() => lib.generateKeypair());
+    const publicPem = await step(() => lib.exportPublicKeyPEM(kp.publicKey));
+    const privatePem = await step(() => lib.exportPrivateKeyPEM(kp.privateKey));
+    const enc = await step(() => zkWrapPrivateKey(privatePem, pass));  // legacy shape, or v1 when enabled
     // Proof-of-possession: prove we hold this key's private half (ECDH key-confirmation) so the
     // server won't accept a substituted/unheld public key. A challenge the server cannot open is
     // refused once (see zkIsPossessionChallengeRefusal); the fresh one asked for then goes through.
     for (let attempt = 0; ; attempt++) {
         const challenge = await step(() => apiRequest('/ecc/keys/register/challenge', { method: 'POST' }));
-        const mac = await lib.computeRegistrationPoP(
-            challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey);
+        const mac = await step(() => lib.computeRegistrationPoP(
+            challenge.server_ephemeral_public_key, challenge.nonce, publicPem, kp.privateKey));
         try {
             await step(() => apiRequest('/ecc/keys/register', {
                 method: 'POST',
@@ -12707,10 +12713,10 @@ async function zkRegisterNewKeypair() {
 // from now on (this is a passphrase change, not a key rotation). Throws Error('Cancelled.')
 // if the user backs out of any prompt.
 async function zkChangePassphrase() {
-    // A sign-out meanwhile ends the change: nothing is stored with the next person's session, and no key is kept
-    // (see _zkSignOuts).
+    // A sign-out meanwhile ends the change at its next step: no prompt of it is shown to the next person, nothing is
+    // sent or stored with their session, and no key is kept (see _zkSignOuts).
     const step = _zkSteps();
-    const priv = await zkFetchPrivateEnvelope();
+    const priv = await step(() => zkFetchPrivateEnvelope());
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) {
         throw new Error('No encryption key is set up for your account.');
     }
@@ -12719,32 +12725,32 @@ async function zkChangePassphrase() {
     } catch (e) {
         throw new Error(safeMessageForCode(e && e.code, 'change'));
     }
-    const current = await showPrompt('Enter your CURRENT encryption passphrase.', 'Change passphrase', { password: true });
+    const current = await step(() => showPrompt('Enter your CURRENT encryption passphrase.', 'Change passphrase', { password: true }));
     if (current === null) throw new Error('Cancelled.');
     let pem;
     try {
-        pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current);
+        pem = await step(() => eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current));
     } catch (e) {
         throw new Error(safeMessageForCode(e && e.code, 'change'));
     }
     // Re-wrapping replaces the account's only copy, so confirm this really is the account's key
     // before writing over it. Fails closed.
-    const pubForChange = await apiRequest('/ecc/keys/public', { silent: true });
-    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForChange && pubForChange.public_key)) {
+    const pubForChange = await step(() => apiRequest('/ecc/keys/public', { silent: true }));
+    if (!await step(() => eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForChange && pubForChange.public_key))) {
         throw new Error(safeMessageForCode('KEY_MISMATCH', 'change'));
     }
-    const next = await showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true });
+    const next = await step(() => showPrompt('Enter a NEW passphrase. It protects your key and CANNOT be recovered if lost.', 'New passphrase', { password: true }));
     if (next === null) throw new Error('Cancelled.');
     const nextProblem = zkPassphraseProblem(next);
     if (nextProblem) throw new Error(nextProblem);
-    const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
+    const confirm = await step(() => showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true }));
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
-    const enc = await zkWrapPrivateKey(pem, next);  // legacy shape, or v1 when enabled
+    const enc = await step(() => zkWrapPrivateKey(pem, next));  // legacy shape, or v1 when enabled
     // Re-wrapping replaces the account's only copy, so prove possession of the registered key.
     // `pem` was already checked against that key above, so it can answer the challenge.
-    const provingKey = await eccLib().importPrivateKeyPEM(pem, false);
+    const provingKey = await step(() => eccLib().importPrivateKeyPEM(pem, false));
     await step(() => zkPutPrivateEnvelope(enc, provingKey, pubForChange.public_key,
                                           pubForChange.user_id, next, pem));
     // Keep a NON-extractable runtime copy so the session stays unlocked with the same key.
@@ -12758,35 +12764,38 @@ async function zkChangePassphrase() {
 // browser — the kit holds only ciphertext the server never sees. Throws Error('Cancelled.') on
 // back-out.
 async function zkExportRecoveryKey() {
-    const priv = await zkFetchPrivateEnvelope();
+    // A sign-out meanwhile ends the export: no kit is downloaded after the person has gone, and nothing is sent
+    // with the next person's session (see _zkSignOuts). Each of its two derivations takes up to several seconds.
+    const step = _zkSteps();
+    const priv = await step(() => zkFetchPrivateEnvelope());
     if (!priv || !priv.has_keypair || !priv.encrypted_private_key) throw new Error('No encryption key is set up for your account.');
     try {
         eccLib().parsePrivateEnvelope(priv.encrypted_private_key);
     } catch (e) {
         throw new Error(safeMessageForCode(e && e.code, 'export'));
     }
-    const current = await showPrompt('Enter your CURRENT encryption passphrase to export a recovery key.', 'Export recovery key', { password: true });
+    const current = await step(() => showPrompt('Enter your CURRENT encryption passphrase to export a recovery key.', 'Export recovery key', { password: true }));
     if (current === null) throw new Error('Cancelled.');
     let pem;
-    try { pem = await eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current); }
+    try { pem = await step(() => eccLib().decryptPrivateEnvelope(priv.encrypted_private_key, current)); }
     catch (e) { throw new Error(safeMessageForCode(e && e.code, 'export')); }
     // Not required by the consistency rule, which scopes the check to paths that CACHE a key or
     // replace the stored one. Done anyway because a kit minted from a key that does not match the
     // account is useless, and catching it here turns an unrecoverable surprise at restore into a
     // recoverable error at export.
-    const pubForExport = await apiRequest('/ecc/keys/public', { silent: true });
-    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForExport && pubForExport.public_key)) {
+    const pubForExport = await step(() => apiRequest('/ecc/keys/public', { silent: true }));
+    if (!await step(() => eccLib().privateKeyMatchesRegisteredPublicKey(pem, pubForExport && pubForExport.public_key))) {
         throw new Error(safeMessageForCode('KEY_MISMATCH', 'export'));
     }
-    const rec = await showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true });
+    const rec = await step(() => showPrompt('Choose a RECOVERY passphrase. Store it somewhere safe and SEPARATE from your normal passphrase — it protects the recovery key you are about to download.', 'Recovery passphrase', { password: true }));
     if (rec === null) throw new Error('Cancelled.');
     const recProblem = zkPassphraseProblem(rec);
     if (recProblem) throw new Error(recProblem.replace('The passphrase', 'The recovery passphrase'));
-    const confirm = await showPrompt('Re-enter your RECOVERY passphrase to confirm.', 'Confirm recovery passphrase', { password: true });
+    const confirm = await step(() => showPrompt('Re-enter your RECOVERY passphrase to confirm.', 'Confirm recovery passphrase', { password: true }));
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== rec) throw new Error('Passphrases do not match.');
 
-    const enc = await zkWrapPrivateKey(pem, rec);  // legacy shape, or v1 when enabled
+    const enc = await step(() => zkWrapPrivateKey(pem, rec));  // legacy shape, or v1 when enabled
     // Reuse the response fetched above rather than asking again. The read is not free (it stamps
     // last_used and commits), and reusing it guarantees the kit records the very public key the
     // private key was just checked against, rather than a second read that could disagree with
@@ -12818,8 +12827,8 @@ async function zkExportRecoveryKey() {
 // re-wrap it under a NEW main passphrase, and store it (PUT /ecc/keys/private). Used when the main
 // passphrase was lost. Throws Error('Cancelled.') on back-out.
 async function zkRestoreFromRecoveryKey(kitText) {
-    // A sign-out meanwhile ends the restore: nothing is stored with the next person's session, and no key is kept
-    // (see _zkSignOuts).
+    // A sign-out meanwhile ends the restore at its next step: no prompt of it is shown to the next person, nothing is
+    // sent or stored with their session, and no key is kept (see _zkSignOuts).
     const step = _zkSteps();
     // This file is the only fully attacker-supplied envelope the app reads, so the wrapper AND
     // the envelope inside it are bounded here — before the passphrase prompt and before any key
@@ -12832,17 +12841,17 @@ async function zkRestoreFromRecoveryKey(kitText) {
         // it invalid invites the user to discard the only copy of their key.
         throw new Error(safeMessageForCode(e && e.code, 'restore'));
     }
-    const pub = await apiRequest('/ecc/keys/public', { silent: true });
+    const pub = await step(() => apiRequest('/ecc/keys/public', { silent: true }));
     if (!pub || !pub.has_keypair || !pub.public_key) throw new Error('This account has no encryption key to restore.');
     // Fast pre-check on the kit's ASSERTED public key (untrusted metadata — a nicety so an
     // obviously-wrong kit is rejected before asking for the recovery passphrase).
     if (kit.public_key && kit.public_key.trim() !== pub.public_key.trim()) {
         throw new Error('This recovery key is for a different account or keypair.');
     }
-    const rec = await showPrompt('Enter the RECOVERY passphrase for this recovery key.', 'Restore access', { password: true });
+    const rec = await step(() => showPrompt('Enter the RECOVERY passphrase for this recovery key.', 'Restore access', { password: true }));
     if (rec === null) throw new Error('Cancelled.');
     let pem;
-    try { pem = await eccLib().decryptPrivateEnvelope(kit.recovery, rec); }
+    try { pem = await step(() => eccLib().decryptPrivateEnvelope(kit.recovery, rec)); }
     catch (e) { throw new Error(safeMessageForCode(e && e.code, 'restore')); }
     // SECURITY: verify the DECRYPTED private key actually matches this account's registered public
     // key. The kit's asserted public_key is untrusted metadata (a corrupt/forged/null-public_key
@@ -12850,27 +12859,27 @@ async function zkRestoreFromRecoveryKey(kitText) {
     // compare — adopting a mismatched key would silently orphan every wrapped DEK (permanent lockout).
     // Corruptness first, so a structurally invalid key reports as corrupt rather than as a
     // mismatch — they send the user to different remedies.
-    try { await eccLib().derivePublicKeyPEMFromPrivatePEM(pem); }
+    try { await step(() => eccLib().derivePublicKeyPEMFromPrivatePEM(pem)); }
     catch (_) { throw new Error('The recovery key is corrupt or not a valid key.'); }
     // Compare as canonical raw points, not as PEM text. A string comparison reports a mismatch
     // between two encodings of the SAME key — line endings, wrap width, a trailing newline — and
     // this is the one path reached only after the main passphrase is already lost, so a false
     // mismatch here has no way back.
-    if (!await eccLib().privateKeyMatchesRegisteredPublicKey(pem, pub.public_key)) {
+    if (!await step(() => eccLib().privateKeyMatchesRegisteredPublicKey(pem, pub.public_key))) {
         throw new Error("This recovery key does not match your account's encryption key and cannot be restored.");
     }
-    const next = await showPrompt('Set a NEW encryption passphrase. It replaces your forgotten one and CANNOT be recovered if lost.', 'New passphrase', { password: true });
+    const next = await step(() => showPrompt('Set a NEW encryption passphrase. It replaces your forgotten one and CANNOT be recovered if lost.', 'New passphrase', { password: true }));
     if (next === null) throw new Error('Cancelled.');
     const nextProblem = zkPassphraseProblem(next);
     if (nextProblem) throw new Error(nextProblem);
-    const confirm = await showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true });
+    const confirm = await step(() => showPrompt('Re-enter your NEW passphrase to confirm.', 'Confirm new passphrase', { password: true }));
     if (confirm === null) throw new Error('Cancelled.');
     if (confirm !== next) throw new Error('Passphrases do not match.');
 
-    const enc = await zkWrapPrivateKey(pem, next);
+    const enc = await step(() => zkWrapPrivateKey(pem, next));
     // Recovery works precisely because a valid kit reconstructs the SAME key: the key recovered
     // above is the registered one (verified against it), so it can answer the challenge.
-    const recoveredKey = await eccLib().importPrivateKeyPEM(pem, false);
+    const recoveredKey = await step(() => eccLib().importPrivateKeyPEM(pem, false));
     await step(() => zkPutPrivateEnvelope(enc, recoveredKey, pub.public_key,
                                           pub.user_id, next, pem));
     zkState.privateKey = await step(() => eccLib().importPrivateKeyPEM(pem, false));
