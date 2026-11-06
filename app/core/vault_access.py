@@ -16,10 +16,13 @@ Now ``get_vault`` calls ``opened(db, vault)``, which writes nothing itself:
   a minute behind the time being written (or more than a minute ahead of the writer's clock: a time stored by a
   clock that was later set back). So the web server and the SFTP server, each with its writer, write at most
   once a minute between them, and a write that is late never puts back a later time another wrote meanwhile;
-- a write that fails (the database away, the row locked past the connection's lock_timeout) is tried again,
-  ``RETRY_SECONDS`` later, until it is written. There is one pending write per vault, which a later opening only
-  moves forward (also while it is being retried), so retrying costs nothing that grows. It used to be given up
-  after four attempts, about 35 s against a held row: the opening was then lost;
+- a write that fails (the database away, the row locked past the connection's lock_timeout) is tried again until
+  it is written: ``RETRY_SECONDS`` later, then twice as long after each failure, up to ``MAX_RETRY_SECONDS``.
+  There is one pending write per vault, which a later opening only moves forward (also while it is being
+  retried), so retrying costs nothing that grows. It used to be given up after four attempts, about 35 s against
+  a held row: the opening was then lost. A failure that trying again cannot cure (the database refuses the
+  statement itself: a column it does not have, a value it will not take) is logged as an error, and tried again
+  only every ``MAX_RETRY_SECONDS`` (a newer start may put it right);
 - what is still waiting when the process stops is written then, for up to ``EXIT_SECONDS``.
 
 So the stored time is at most about a minute behind the vault's most recent opening, with these limits:
@@ -49,10 +52,11 @@ from datetime import datetime, timedelta, timezone
 
 EVERY_SECONDS = 60
 RETRY_SECONDS = 5
-# A write that keeps failing is logged at its first failure and then once in so many attempts. Attempts are
-# RETRY_SECONDS apart after each failure, so that is about once a minute while the database refuses connections at
-# once, and about every two minutes while each attempt first waits 5 s (the connection's lock_timeout against a held
-# row, or its connect timeout against a database that does not answer).
+# The longest wait between two attempts of a write that keeps failing: RETRY_SECONDS doubles after each failure up to
+# this, and a failure that trying again cannot cure waits this long from the first.
+MAX_RETRY_SECONDS = 300
+# A write that keeps failing is logged at its first failure and then once in so many attempts: about once an hour
+# once the wait between them is at its longest.
 LOG_EVERY = 12
 EXIT_SECONDS = 5.0
 # The vaults whose last opening this process remembers for the readers; past it, the older half is forgotten
@@ -162,6 +166,23 @@ def _next():
             _cond.wait()
 
 
+def _cured_by_waiting(error_class) -> bool:
+    """Whether a write that failed with ``error_class`` may go through if it is tried again: the database could not
+    be reached or did not answer in time, or the row was held past the connection's lock_timeout. Any other error
+    (the database refuses the statement itself: a column or a table it does not have, a value it will not take, an
+    error of this code) is the same at every attempt."""
+    from sqlalchemy import exc as sa_exc
+    return issubclass(error_class, (sa_exc.OperationalError, sa_exc.InterfaceError, sa_exc.DisconnectionError,
+                                    sa_exc.TimeoutError))
+
+
+def _retry_after(item, cured_by_waiting: bool) -> float:
+    """Seconds before ``item``'s next attempt, after its ``item.attempts``-th failure."""
+    if not cured_by_waiting:
+        return MAX_RETRY_SECONDS
+    return min(MAX_RETRY_SECONDS, RETRY_SECONDS * 2 ** min(item.attempts - 1, 30))
+
+
 def _write(vault_id, item):
     """Write ``item.when`` as the vault's last access, if the stored one is more than a minute away from it (or
     more than a minute ahead of now). None when the statement committed (whether or not it changed the row);
@@ -183,7 +204,7 @@ def _write(vault_id, item):
             session.commit()
         return None
     except Exception as exc:  # noqa: BLE001 -- tried again, below; the class only (a message can carry values)
-        return type(exc).__name__
+        return type(exc)
 
 
 def _run():
@@ -198,13 +219,21 @@ def _run():
                 # Tried again until it is written, as the one pending write of its vault: an opening that came
                 # meanwhile (a new pending write, made while this one was out of _waiting) is taken into it.
                 item.attempts += 1
+                curable = _cured_by_waiting(failed)
+                wait = _retry_after(item, curable)
                 if item.attempts == 1 or item.attempts % LOG_EVERY == 0:
-                    _log.warning("A vault's last access could not be recorded (%s, %d attempts); trying again.",
-                                 failed, item.attempts)
+                    if curable:
+                        _log.warning("A vault's last access could not be recorded (%s, attempt %d); trying again in "
+                                     "%d s.", failed.__name__, item.attempts, wait)
+                    else:
+                        _log.error("A vault's last access cannot be recorded: the database refuses the write itself "
+                                   "(%s, attempt %d), and trying again soon will not change that. Trying again "
+                                   "every %d s; until it is put right, the time of each vault's last opening falls "
+                                   "behind.", failed.__name__, item.attempts, wait)
                 later = _waiting.get(vault_id)
                 if later is not None and later.when > item.when:
                     item.when, item.bind = later.when, later.bind
-                item.not_before = time.monotonic() + RETRY_SECONDS
+                item.not_before = time.monotonic() + wait
                 _waiting[vault_id] = item
             _cond.notify_all()
 

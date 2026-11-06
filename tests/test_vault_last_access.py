@@ -188,12 +188,63 @@ def _refuse_writes(world, times, also=None):
 def test_a_write_the_database_refuses_is_tried_until_it_is_written(world, monkeypatch):
     """It was given up after four attempts (about 35 s against a held row), and the opening was lost."""
     monkeypatch.setattr(vault_access, "RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(vault_access, "MAX_RETRY_SECONDS", 0.04)
     refused = _refuse_writes(world, times=9)
     when = _past(5)
     _open(world, when)
     assert len(refused) == 9, "the writes were not refused"
     assert _stored(world) == when
     assert vault_access.flush(5) and not vault_access._waiting
+
+
+def _attempt_times(world, times, error):
+    """Make the database refuse the next `times` updates of a vault's last access with `error`; returns the list of
+    when each was refused (time.monotonic)."""
+    import time
+    at = []
+
+    def refuse(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE VAULTS") and len(at) < times:
+            at.append(time.monotonic())
+            raise error(statement, parameters, Exception("refused"))
+    sa.event.listen(world.engine, "before_cursor_execute", refuse)
+    return at
+
+
+def test_the_wait_between_attempts_doubles_up_to_its_longest(world, monkeypatch, caplog):
+    """A write that keeps failing (the database away, the row held) was tried every 5 s for as long as the process
+    ran. The wait now doubles after each failure, up to MAX_RETRY_SECONDS, and each failure is a warning."""
+    import logging
+    monkeypatch.setattr(vault_access, "RETRY_SECONDS", 0.05)
+    monkeypatch.setattr(vault_access, "MAX_RETRY_SECONDS", 0.4)
+    caplog.set_level(logging.WARNING, logger=vault_access.__name__)
+    at = _attempt_times(world, 6, sa.exc.OperationalError)
+    when = _past(3)
+    _open(world, when)
+    assert len(at) == 6 and _stored(world) == when
+    gaps = [b - a for a, b in zip(at, at[1:])]
+    for gap, least in zip(gaps, [0.05, 0.1, 0.2, 0.4, 0.4]):
+        assert least * 0.9 <= gap < least + 0.35, (gaps, least)
+    assert {r.levelno for r in caplog.records if r.name == vault_access.__name__} == {logging.WARNING}
+
+
+@pytest.mark.parametrize("error", [sa.exc.ProgrammingError, sa.exc.DataError, sa.exc.IntegrityError])
+def test_a_write_the_database_refuses_as_it_is_is_an_error_and_waits_the_longest(world, monkeypatch, caplog, error):
+    """Trying again soon cannot cure a statement the database refuses itself (a column it does not have, after a
+    rollback of the schema, say): said as an error, and tried again only at the longest wait."""
+    import logging
+    monkeypatch.setattr(vault_access, "RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(vault_access, "MAX_RETRY_SECONDS", 0.3)
+    caplog.set_level(logging.WARNING, logger=vault_access.__name__)
+    at = _attempt_times(world, 2, error)
+    when = _past(3)
+    _open(world, when)
+    assert len(at) == 2 and _stored(world) == when
+    assert at[1] - at[0] >= 0.27, "tried again before the longest wait"
+    said = [r for r in caplog.records if r.name == vault_access.__name__]
+    assert said and all(r.levelno == logging.ERROR for r in said)
+    assert said[0].getMessage().startswith(f"A vault's last access cannot be recorded: the database refuses the "
+                                           f"write itself ({error.__name__}, attempt 1)")
 
 
 def test_a_time_within_a_minute_of_the_stored_one_is_not_written(world):
