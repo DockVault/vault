@@ -3817,7 +3817,9 @@ def volume_exists(name, run=subprocess.run):
 
 def container_running(name, run=subprocess.run):
     """True if a container named `name` exists AND is running. Best-effort: any docker error
-    answers False, which callers must treat as 'not known to be running'."""
+    answers False, which callers must treat as 'not known to be running'. A paused container is
+    running here (Docker's .State.Running): it still holds its volumes. container_paused tells the
+    two apart where that matters (a backup pauses only what is not paused already)."""
     try:
         r = run(["docker", "inspect", "-f", "{{.State.Running}}", name],
                 capture_output=True, text=True, timeout=20)
@@ -6539,6 +6541,16 @@ class DockVault:
         in a list. Its docker child runs out of reach of the signals that end the run (own_session_kwargs), which
         are sent to the run's whole process group."""
         running = [s for s in BACKUP_PAUSED_SERVICES if container_running(s)]
+        # Docker says a paused container runs. One already paused (by the operator, or left so by a backup that was
+        # killed) writes nothing: it is archived as it is, neither paused again (Docker refuses that, which would
+        # stop the backup) nor resumed afterwards (this backup did not pause it).
+        already = [s for s in running if container_paused(s) is True]
+        if already:
+            one = len(already) == 1
+            print(self.pal.paint("  %s %s paused already: archived as %s, and left paused (docker unpause %s resumes "
+                                 "%s)." % (", ".join(already), "is" if one else "are", "it is" if one else "they are",
+                                           " ".join(already), "it" if one else "them"), "yellow"))
+        running = [s for s in running if s not in already]
         if not running:
             return None
         print(self.pal.paint("  pausing the deployment while its volumes are copied (%s; it does not answer meanwhile)"

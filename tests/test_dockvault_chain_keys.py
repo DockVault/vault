@@ -123,6 +123,33 @@ def test_a_deployment_that_cannot_be_paused_is_not_archived_and_what_paused_is_r
     assert "could not be resumed" not in said
 
 
+@pytest.mark.parametrize("left_paused", [("vault-db",), ("vault", "vault-db")], ids=["the-database", "both"])
+def test_a_container_paused_before_the_backup_is_archived_as_it_is_and_left_paused(tmp_path, monkeypatch, capsys,
+                                                                                   left_paused):
+    """Docker says a paused container runs. The backup took one the operator had paused (or a killed backup had left
+    so) for a running one: its pause was refused ("already paused"), the backup stopped with nothing archived, and
+    the resume then unpaused the operator's container. It writes nothing while paused: it is archived as it is, and
+    neither paused nor resumed by the backup."""
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-k5", deployment_id="k5")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls, archived = [], []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(dv, "container_paused", lambda name, **k: name in left_paused)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: archived.append(vol)
+                        or _tgz(Path(bundle) / archive) and True)
+    # As Docker answers: a container that is paused already cannot be paused again.
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(" ".join(a)) or _Result(
+        1 if a[0] == "pause" and a[1] in left_paused else 0))
+    tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    assert len(archived) == 3, "every volume was archived"
+    assert not [c for c in calls if set(c.split()[1:]) & set(left_paused)], "a container paused before is left so"
+    assert calls == ([] if "vault" in left_paused else ["pause vault", "unpause vault"])
+    said = " ".join(capsys.readouterr().out.split())
+    assert ("%s %s paused already: archived as" % (", ".join(left_paused), "is" if len(left_paused) == 1 else "are")
+            in said) and "and left paused (docker unpause %s resumes" % " ".join(left_paused) in said
+
+
 def _docker_refuses(a):
     result = _Result(1)
     result.stderr = "Error response from daemon:\n  cannot pause container: the engine cannot freeze it\n"

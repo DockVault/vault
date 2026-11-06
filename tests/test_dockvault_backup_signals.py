@@ -668,7 +668,9 @@ def test_a_pause_that_timed_out_is_resumed_on_its_own_and_named_when_it_stays_pa
             return _Result(1)
         return _Result()
 
-    tool, args = _backing_up(tmp_path, monkeypatch, run_dc, paused_now=lambda name: name == "vault-db")
+    # As Docker answers: the database is paused once its pause, cut short, has reached it (not before).
+    tool, args = _backing_up(tmp_path, monkeypatch, run_dc,
+                             paused_now=lambda name: name == "vault-db" and "pause vault-db" in calls)
     with pytest.raises(SystemExit) as failed:
         tool._do_backup(tool._load_env(), args)
     assert not isinstance(failed.value, dv.StoppedBySignal) and failed.value.code == 1
@@ -780,7 +782,8 @@ def test_a_docker_that_does_not_answer_in_time_is_not_asked_again_and_again(tmp_
             raise subprocess.TimeoutExpired(a, 60)
         return _Result()
 
-    tool, args = _backing_up(tmp_path, monkeypatch, run_dc, paused_now=lambda name: True)
+    # As Docker answers: each service is paused once its pause has reached it, and stays so (no unpause answers).
+    tool, args = _backing_up(tmp_path, monkeypatch, run_dc, paused_now=lambda name: ("pause " + name) in calls)
     monkeypatch.setattr(dv, "RESUME_RETRY_SECONDS", -1)
     tool._do_backup(tool._load_env(), args)            # the archives are of one moment: the backup stands
     assert calls == ["pause vault", "pause vault-db", "unpause vault vault-db"]
