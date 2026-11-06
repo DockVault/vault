@@ -337,3 +337,44 @@ def test_scoped_temp_cannot_copy_to_the_vault_root(admin):
     finally:
         admin.post(f"/temp-creds/{tname}/delete")
         admin.delete_vault(vid)
+
+
+# ---- files: copy and move into and out of a vault with a password ------------------------------------------------
+
+def _with_password(password):
+    return {"X-Vault-Password": password} if password else {}
+
+
+@pytest.mark.parametrize("verb", ["copy", "move"])
+@pytest.mark.parametrize("source_pw, dest_pw", [(None, "Dest-Vault-Pw-1!"), ("Source-Vault-Pw-1!", None),
+                                                ("Source-Vault-Pw-1!", "Dest-Vault-Pw-2!")],
+                         ids=["into-a-password-vault", "out-of-a-password-vault", "between-two-passwords"])
+def test_a_copy_or_a_move_into_and_out_of_a_vault_with_a_password(admin, verb, source_pw, dest_pw):
+    """A copy and a move to another vault ask each vault's password at the door (X-Vault-Password for the source,
+    X-Dest-Vault-Password for the destination), and once they have their transfer slot compare each vault's password
+    hash with its own, read before the door. With the two vaults' hashes swapped in that comparison, every one of
+    these is refused 401 although no password changed; and the wrong destination password is refused at the door."""
+    a = admin.create_vault(name=unique("pwA"), password=source_pw)
+    b = admin.create_vault(name=unique("pwB"), password=dest_pw)
+    content = b"between vaults with passwords\n" * 64
+    r = admin.post(f"/vaults/{a['id']}/files", files=[("files", (unique("f") + ".txt", content, "text/plain"))],
+                   headers=_with_password(source_pw))
+    assert r.status_code == 200, r.text
+    src = r.json()["files"][0]["id"]
+    headers = dict(_with_password(source_pw))
+    try:
+        if dest_pw:
+            wrong = admin.post(f"/vaults/{a['id']}/files/{src}/{verb}", json={"dest_vault_id": b["id"]},
+                               headers=dict(headers, **{"X-Dest-Vault-Password": "not-the-password"}))
+            assert wrong.status_code == 401, wrong.text
+            headers["X-Dest-Vault-Password"] = dest_pw
+        r = admin.post(f"/vaults/{a['id']}/files/{src}/{verb}", json={"dest_vault_id": b["id"]}, headers=headers)
+        assert r.status_code == 200, r.text
+        new_id = r.json()["id"]
+        got = admin.get(f"/vaults/{b['id']}/files/{new_id}/download", headers=_with_password(dest_pw))
+        assert got.status_code == 200 and got.content == content, got.status_code
+        left = admin.get(f"/vaults/{a['id']}/files/{src}/download", headers=_with_password(source_pw))
+        assert left.status_code == (200 if verb == "copy" else 404), left.status_code
+    finally:
+        admin.delete_vault(a["id"], vault_password=source_pw)
+        admin.delete_vault(b["id"], vault_password=dest_pw)

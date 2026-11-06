@@ -21540,6 +21540,10 @@ async def upload_chunk(
     """Store a single chunk. Idempotent: re-sending a chunk overwrites it."""
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
+    # The vault's password CREDENTIAL, to compare with after the body -- see _reauthorize_after_body for what that
+    # comparison proves and what it does not. Read before the door checks the password: a change committed between
+    # the two then fails the comparison, rather than becoming the value the request is compared with.
+    _vault_password_hash = _vault_credential_fingerprint(db, vault_id)
     vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
 
     session = db.query(ChunkedUploadSession).filter(
@@ -21553,9 +21557,6 @@ async def upload_chunk(
     # A scoped credential may only write to a session whose target folder is in scope
     # (the session was created by the same shared user id, so re-check per surface).
     require_folder_scope(db, current_user, vault_id, session.folder_id)
-    # The vault's password CREDENTIAL as it stands now, to compare with after the body -- see
-    # _reauthorize_after_body for what that comparison proves and what it does not.
-    _vault_password_hash = _vault_credential_fingerprint(db, vault_id)
     if session.status != 'active':
         raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
     if session.expires_at and session.expires_at <= datetime.utcnow():
@@ -22421,6 +22422,10 @@ async def download_file(
     burned_share_claim_ids = []
 
     try:
+        # The vault's password hash, to compare with once the transfer has its slot (_admitted_again). Read before
+        # the door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
         # Verify vault access and password. allow_share=True: a recipient with an active
         # whole-vault share claim may open + download from the vault (read-only). SFTP
         # downloads never pass this flag.
@@ -22451,7 +22456,6 @@ async def download_file(
 
         _the_file()
         token = _bearer_credentials(request).credentials
-        password_hash_before = _vault_credential_fingerprint(db, vault_id)
 
         operation_id = f"download_{uuid.uuid4()}"
         # Waits holding no connection, then asks again what let it in, and reads the file's row again: the file
@@ -23252,6 +23256,10 @@ async def preview_render_file(
     audit_logger = AuditLogger(db)
     transfer_slot = None
     try:
+        # The vault's password hash, to compare with once the transfer has its slot (_admitted_again). Read before
+        # the door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
                                         require_password=True, allow_share=False)
         # Rendering exposes the content: gate it with the download scopes, not merely see_files.
@@ -23274,7 +23282,6 @@ async def preview_render_file(
 
         _the_file()
         token = _bearer_credentials(request).credentials
-        password_hash_before = _vault_credential_fingerprint(db, vault_id)
 
         # Load-shed like /download: refuse under pressure rather than queue a CPU-bound render onto
         # the event loop. Taken AFTER the cheap 404/413 answers so a rejected caller never queues, and
@@ -23618,10 +23625,13 @@ async def copy_file_endpoint(
             # another user's file (same rule as every other replace path, _principal_can_replace_file).
             return user, body.replace_same_name and _principal_can_replace_file(db, user, body.dest_vault_id)
 
-        _admitted(current_user)
-        token = _bearer_credentials(request).credentials
+        # Each vault's password hash, to compare with once the copy has its slot (_admitted_again). Read before the
+        # door checks the passwords: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
         source_password = _vault_credential_fingerprint(db, vault_id)
         dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
+        _admitted(current_user)
+        token = _bearer_credentials(request).credentials
         account = current_user.id
         client_ip = get_client_ip(request)
 
@@ -23700,10 +23710,13 @@ async def move_file_endpoint(
             # there, not just the client flag.
             return user, body.replace_same_name and _principal_can_replace_file(db, user, body.dest_vault_id)
 
-        at_the_door = _admitted(current_user)
-        token = _bearer_credentials(request).credentials
+        # Each vault's password hash, to compare with once the move has its slot (_admitted_again). Read before the
+        # door checks the passwords: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
         source_password = _vault_credential_fingerprint(db, vault_id)
         dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
+        at_the_door = _admitted(current_user)
+        token = _bearer_credentials(request).credentials
         account = current_user.id
         client_ip = get_client_ip(request)
 
@@ -23828,9 +23841,12 @@ async def copy_folder_endpoint(
             require_cap(user, vault_id, "file.upload")
             return user
 
+        # The vault's password hash, to compare with once the copy has its slot (_admitted_again). Read before the
+        # door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password = _vault_credential_fingerprint(db, vault_id)
         _admitted(current_user)
         token = _bearer_credentials(request).credentials
-        password = _vault_credential_fingerprint(db, vault_id)
         account = current_user.id
         client_ip = get_client_ip(request)
 
