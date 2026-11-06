@@ -141,6 +141,9 @@ docker compose -f docker-compose.secure.yml up -d
 > the checkout: it restarts the web container by name (`docker restart`), and it writes the renewed
 > pair only into the certificate folder setup made, refusing (and renewing nothing) when that folder
 > has been replaced by a link, is writable by others, or is owned by anyone but root or the app user.
+> A hook an earlier version installed ran `docker compose` with the checkout's files instead: a setup
+> re-run as root (`sudo python3 dockvault.py setup`), which keeps the certificate it finds, rewrites
+> this deployment's hook to the current one; run as another user, it says so and leaves it.
 
 > **`.env` is found automatically — never move it.** The root `docker-compose.secure.yml` (and the
 > `docker-compose.yml` below) are thin `include:` shims over the real files in `deploy/`. Running

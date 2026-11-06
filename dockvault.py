@@ -1141,7 +1141,8 @@ def render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=None, 
     ])
 
 
-def install_renewal_hook(app_dir, cert_dir, server_name, service, owners=(0, APP_UID), hook=RENEWAL_HOOK):
+def install_renewal_hook(app_dir, cert_dir, server_name, service, owners=(0, APP_UID), hook=RENEWAL_HOOK,
+                         live_dir=None):
     """Write the certbot deploy hook (POSIX), root's, 755: written whole beside its name and moved over it, so the
     name is never written through (a link there is replaced, not followed). Returns True on success."""
     tmp = None
@@ -1149,7 +1150,7 @@ def install_renewal_hook(app_dir, cert_dir, server_name, service, owners=(0, APP
         os.makedirs(os.path.dirname(hook), exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".dockvault-hook-", dir=os.path.dirname(hook))
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(render_renewal_hook(app_dir, cert_dir, server_name, service, owners=owners))
+            f.write(render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=live_dir, owners=owners))
         os.chmod(tmp, 0o755)
         os.replace(tmp, hook)
         tmp = None
@@ -1162,6 +1163,75 @@ def install_renewal_hook(app_dir, cert_dir, server_name, service, owners=(0, APP
                 os.remove(tmp)
             except OSError:
                 pass
+
+
+def renewal_hook_targets(text):
+    """(the certificate folder, the Let's Encrypt live folder) that a renewal hook this tool wrote names, in any of
+    its versions (`CD=` and `LIVE=` lines, or the live folder in the install lines of the first one), or None when
+    the text names either not, or not once."""
+    found = {}
+    for line in text.splitlines():
+        line = line.strip()
+        for name in ("CD", "LIVE"):
+            if line.startswith(name + "="):
+                try:
+                    words = shlex.split(line[len(name) + 1:])
+                except ValueError:
+                    return None
+                if len(words) != 1 or name in found:
+                    return None
+                found[name] = words[0]
+    if "LIVE" not in found:
+        lives = set(re.findall(r'/etc/letsencrypt/live/([^/"\'\s]+)/(?:fullchain|privkey)\.pem', text))
+        if len(lives) == 1:
+            found["LIVE"] = "/etc/letsencrypt/live/" + lives.pop()
+    if not found.get("CD") or not found.get("LIVE"):
+        return None
+    return found["CD"], found["LIVE"]
+
+
+def refresh_renewal_hook(app_dir, cert_dir, service, owners=None, hook=RENEWAL_HOOK, is_root=None):
+    """A setup re-run keeps the certificate it finds, so it never writes the Let's Encrypt renewal hook: an upgraded
+    deployment kept the hook an earlier version wrote, which runs docker compose as root with the checkout's files.
+    This brings this deployment's hook (the one that names its certificate folder) to the text install_renewal_hook
+    writes now, keeping the live folder it renews from. Returns (outcome, a message or None), the outcome one of:
+    "none" (no hook, another deployment's, or not POSIX: nothing to do), "current", "rewritten", "not-root" (only
+    root may write it: left as it is), "unreadable" (it could not be read, or names no certificate folder and live
+    folder: left as it is) and "failed" (it could not be written). `owners`: the owners the hook accepts for the
+    certificate folder, as obtain_letsencrypt_cert gives them (root, the app's uid, the uid a remapping engine maps
+    it to) when None."""
+    if os.name == "nt" or not os.path.lexists(hook):
+        return "none", None
+    try:
+        with open(hook, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, ValueError) as exc:
+        return "unreadable", ("could not read the Let's Encrypt renewal hook %s (%s), so it was left as it is"
+                              % (hook, exc))
+    targets = renewal_hook_targets(text)
+    if targets is None:
+        return "unreadable", ("the Let's Encrypt renewal hook %s names no certificate folder and live folder this "
+                              "tool can read, so it was left as it is" % hook)
+    named, live = targets
+    if os.path.realpath(named) != os.path.realpath(cert_dir):
+        return "none", None
+    if owners is None:
+        mapped = _remapped_cert_owner()
+        owners = (0, APP_UID) + ((mapped,) if mapped is not None else ())
+    if text == render_renewal_hook(app_dir, cert_dir, os.path.basename(live), service, live_dir=live, owners=owners):
+        return "current", None
+    if is_root is None:
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if not is_root:
+        why = ("it was written by an earlier version, and at each renewal it runs, as root, what this checkout's "
+               "compose file and .env say" if "docker compose" in text else "it was written for other settings")
+        return "not-root", ("the Let's Encrypt renewal hook %s is not the one this version writes: %s. Run setup "
+                            "again as root (sudo python3 dockvault.py setup) to replace it" % (hook, why))
+    if not install_renewal_hook(app_dir, cert_dir, os.path.basename(live), service, owners=owners, hook=hook,
+                                live_dir=live):
+        return "failed", "could not rewrite the Let's Encrypt renewal hook %s; it was left as it was" % hook
+    return "rewritten", ("rewrote the Let's Encrypt renewal hook %s: it reads nothing of the checkout and restarts "
+                         "the %s container by name" % (hook, service))
 
 
 def obtain_letsencrypt_cert(cert_dir, server_name, email, app_dir, service, run=subprocess.run):
@@ -4727,6 +4797,12 @@ class DockVault:
         cert_dir = self._certs_dir()
         if _cert_pair_present(cert_dir):
             print(pal.paint("  Certificates already present - keeping them (repairing ownership).", "green"))
+            # A kept Let's Encrypt certificate keeps the renewal hook an earlier version wrote for it: brought to the
+            # one this version writes (as root), or the operator is told how.
+            outcome, said = refresh_renewal_hook(self.root, cert_dir,
+                                                 self._web_service(summary.get("compose_profiles")))
+            if said:
+                print(pal.paint("  " + said + ".", "green" if outcome == "rewritten" else "yellow"))
         else:
             server = summary.get("server_name") or "localhost"
             if not validate_server_name(server):   # re-validate a reused .env's SERVER_NAME before it hits openssl
