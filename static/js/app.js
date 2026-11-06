@@ -2709,7 +2709,11 @@ async function loadVaults() {
         updateZkLockControl();
         renderVaults();
     } catch (error) {
-        container.innerHTML = `<div class="alert alert-error">Failed to load vaults: ${error.message}</div>`;
+        // The message is text (a server's detail, an error of the page), never markup.
+        const alert = document.createElement('div');
+        alert.className = 'alert alert-error';
+        alert.textContent = `Failed to load vaults: ${(error && error.message) || error}`;
+        container.replaceChildren(alert);
     }
 }
 
