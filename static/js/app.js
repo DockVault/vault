@@ -9705,7 +9705,8 @@ async function loadStorageStats() {
             // promise more than the disk holds because most of that promise is never filled.
             allocated.textContent =
                 `${formatBytes(stats.allocated_bytes || 0)} allocated across ${stats.vault_count || 0} vault(s)`
-                + (stats.limit_bytes ? ` · limit ${formatBytes(stats.limit_bytes)}` : '');
+                + (stats.limit_bytes ? ` · limit ${formatBytes(stats.limit_bytes)}, `
+                    + `${formatBytes(stats.limit_counts_bytes || 0)} counted toward it` : '');
         }
         // What legal holds keep after deletion (static/js/compliance.js).
         if (typeof window.renderKeptForCases === 'function') window.renderKeptForCases(stats);

@@ -9649,11 +9649,15 @@ async def storage_stats(
     kept = kept_tables.totals(db)
     return {
         "total": total,
+        # The vaults' stored bytes. The deployment's storage limit (limit_bytes) counts these and the kept ones
+        # together: compare it with limit_counts_bytes, not with this.
         "used": used,
         "kept_for_cases": kept,
         # What the vaults' files take on the disk: their counted bytes and the kept ones. The
         # deployment's storage limit counts both (vault_service.deployment_storage_used).
         "on_disk_bytes": used + kept["bytes"],
+        # What limit_bytes is measured against: the same sum, by name.
+        "limit_counts_bytes": used + kept["bytes"],
         "available": available,
         "allocated_bytes": allocated,
         "limit_bytes": limit,

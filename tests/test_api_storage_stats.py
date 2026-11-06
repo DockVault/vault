@@ -15,14 +15,16 @@ def test_storage_stats_shape(admin):
     # enforced against that limit), the live limit, and the deployment's own ceiling.
     # What legal holds keep after a deletion is on the disk too, in no vault's counters: shown beside it, with
     # what the vaults' files take on the disk altogether.
-    assert set(body) == {"total", "used", "available", "kept_for_cases", "on_disk_bytes",
+    assert set(body) == {"total", "used", "available", "kept_for_cases", "on_disk_bytes", "limit_counts_bytes",
                          "allocated_bytes", "limit_bytes", "max_bytes", "vault_count"}
-    for key in ("total", "used", "available", "on_disk_bytes", "allocated_bytes", "vault_count"):
+    for key in ("total", "used", "available", "on_disk_bytes", "limit_counts_bytes", "allocated_bytes",
+                "vault_count"):
         assert isinstance(body[key], int) and body[key] >= 0
     kept = body["kept_for_cases"]
     assert set(kept) == {"files", "folders", "bytes"}
     assert all(isinstance(kept[k], int) and kept[k] >= 0 for k in kept)
-    assert body["on_disk_bytes"] == body["used"] + kept["bytes"]
+    # `used` is the vaults' bytes alone; the deployment's limit counts the kept ones too, and says so by name.
+    assert body["on_disk_bytes"] == body["limit_counts_bytes"] == body["used"] + kept["bytes"]
     # A null limit/ceiling means "unlimited", which is the shipped default.
     for key in ("limit_bytes", "max_bytes"):
         assert body[key] is None or (isinstance(body[key], int) and body[key] >= 0)
