@@ -709,11 +709,17 @@ jobs:
           )
           settings.raise_for_status()
           body = settings.json()
-          if body.get("deployment_storage_max_gb") is not None or body.get("deployment_storage_limit_bytes") is not None:
+          # Both keys answered first: a key missing would read as no limit, and the step would pass unchecked.
+          missing = [key for key in ("deployment_storage_max_gb", "deployment_storage_limit_bytes")
+                     if key not in body]
+          if missing:
+              sys.exit("::error::/settings does not answer " + ", ".join(missing)
+                       + ", so whether the deployment has a storage limit cannot be told")
+          if body["deployment_storage_max_gb"] is not None or body["deployment_storage_limit_bytes"] is not None:
               sys.exit(
                   "::error::the deployment still has a storage limit "
-                  f"(maximum {body.get('deployment_storage_max_gb')!r} GB, limit "
-                  f"{body.get('deployment_storage_limit_bytes')!r} bytes), so the tests below would "
+                  f"(maximum {body['deployment_storage_max_gb']!r} GB, limit "
+                  f"{body['deployment_storage_limit_bytes']!r} bytes), so the tests below would "
                   "not check the vault's row lock on its own"
               )
           print("no storage ceiling and no live limit")
