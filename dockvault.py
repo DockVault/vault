@@ -5884,15 +5884,24 @@ class DockVault:
                         print(pal.paint("  Kept the current .env as %s before installing that one." % kept, "cyan"))
                 _copy_secret(src, self._env_path())
                 tighten_secret_file(self._env_path())
+                # The installed .env may name another volume set: from here on the menu is about that set's volume,
+                # the one every option now acts on (verify, and down -v, which deletes the volumes of the set .env
+                # names), whatever happens next.
+                env = self._load_env()
+                env_is_fresh = False     # a real, operator-supplied .env now - never discard it
+                chosen = "%s_vault_pg_data" % volume_prefix(env)
+                if chosen != vol:
+                    vol = chosen
+                    print(pal.paint("  That .env is for another volume set: the choices below are now about %s."
+                                    % vol, "yellow"))
                 try:
                     self._normalize_compose_profile()
                 except (OSError, ValueError) as exc:
                     print(pal.paint("  That .env is not deployable: %s." % exc, "red"))
                     continue
-                env = self._load_env()   # the installed .env may name a different volume set
-                env_is_fresh = False     # a real, operator-supplied .env now - never discard it
+                env = self._load_env()
                 print(pal.paint("  Installed that .env; verifying it...", "cyan"))
-                if self._try_verify(env, "%s_vault_pg_data" % volume_prefix(env), hooks):
+                if self._try_verify(env, vol, hooks):
                     return True
             elif choice == "3":
                 self._new_set_from(env, current_env_is_fresh=env_is_fresh)
@@ -5975,8 +5984,15 @@ class DockVault:
                                         % cfg["admin_password"], "bold", "yellow"), label="admin-password")
 
     def _destroy_data(self, vol):
-        """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined."""
+        """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined. `down -v` deletes the
+        volumes of the set the installed .env names, so it runs only when that is the set of `vol`, the volume the
+        operator is asked about: never against another set's."""
         pal = self.pal
+        named = "%s_vault_pg_data" % volume_prefix(self._load_env())
+        if named != vol:
+            print(pal.paint("  Refusing to delete: .env now names the set of %s, not %s, and down -v deletes the "
+                            "volumes of the set .env names. Nothing was deleted." % (named, vol), "red"))
+            return False
         flush_stdin()
         if not confirm("This PERMANENTLY deletes the data in %s. Continue?" % vol, pal, default=False):
             print(pal.paint("  Nothing was deleted.", "yellow"))

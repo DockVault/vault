@@ -656,7 +656,8 @@ The secret check opens the set's database with the `.env`'s `VAULT_DB_PASSWORD`,
 password and another key is refused. A database with no key check yet (its vault never started) lets
 the `.env` through, and the next check of it reads the key check again. When setup's existing-volume
 menu installs a `.env` you point it at, it first keeps the current one as `.env.<set>`, as a restore
-does.
+does. If that `.env` is another set's, the menu's choices are then about that set's volume: its
+"destroy" option deletes the volumes of the set `.env` names, and says which.
 
 The **Reset** menu tears the current set down with `docker compose down -v` (a strong, typed
 confirmation — this destroys the data) and moves the `.env` aside so a later setup starts fresh.

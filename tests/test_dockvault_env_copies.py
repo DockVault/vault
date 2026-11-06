@@ -303,6 +303,73 @@ def test_a_current_env_that_cannot_be_kept_is_not_replaced(tmp_path, monkeypatch
     assert "Could not keep the current .env" in " ".join(capsys.readouterr().out.split())
 
 
+class _Ran:
+    returncode = 0
+    stdout = stderr = ""
+
+
+def _menu_after_pointing(tmp_path, monkeypatch, answers, normalize_fails=False):
+    """Setup's existing-volume menu, found volume dvcurrent's, driven by `answers`: option 2 installs set
+    dvprovided's .env, which does not verify, and the menu comes back. Returns (the tool's answer, what each `confirm`
+    asked, every docker command run, the set the .env named as each docker command ran)."""
+    current = _env_text("dvcurrent")
+    (tmp_path / ".env").write_text(current, encoding="utf-8")
+    src = tmp_path / "provided.env"
+    src.write_text(_env_text("dvprovided"), encoding="utf-8")
+    replies = iter([a if a != "<src>" else str(src) for a in answers])
+    asked, ran, env_then = [], [], []
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: next(replies))
+    monkeypatch.setattr(dv, "flush_stdin", lambda: None)
+    monkeypatch.setattr(dv, "confirm", lambda prompt, *a, **k: asked.append(prompt) or True)
+
+    def run(cmd, **k):
+        ran.append(list(cmd))
+        env_then.append(dv.volume_prefix(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))))
+        return _Ran()
+
+    monkeypatch.setattr(dv.subprocess, "run", run)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+
+    def normalize():
+        if normalize_fails:
+            raise ValueError("not a profile this tool knows")
+        return "combined"
+
+    monkeypatch.setattr(tool, "_normalize_compose_profile", normalize)
+    monkeypatch.setattr(tool, "_try_verify", lambda env, vol, hooks: False)
+    answer = tool._resolve_existing_volume(dv.parse_env(current), "dvcurrent_vault_pg_data", (None,) * 6)
+    return answer, asked, ran, env_then
+
+
+@pytest.mark.parametrize("normalize_fails", [False, True], ids=["verify-fails", "not-deployable"])
+def test_after_pointing_setup_at_another_sets_env_its_destroy_names_that_set(tmp_path, monkeypatch, capsys,
+                                                                            normalize_fails):
+    """Option 2 installed set dvprovided's .env; it did not verify (or was not deployable) and the menu came back.
+    Option 4's down -v deletes the volumes of the set .env names (dvprovided's), while the menu still named the
+    volume it found (dvcurrent's): the confirmation now names dvprovided's volume, the one down -v deletes."""
+    answer, asked, ran, env_then = _menu_after_pointing(tmp_path, monkeypatch, ["2", "<src>", "4"],
+                                                        normalize_fails=normalize_fails)
+    assert answer is True
+    assert asked == ["This PERMANENTLY deletes the data in dvprovided_vault_pg_data. Continue?"]
+    downs = [i for i, cmd in enumerate(ran) if "down" in cmd and "-v" in cmd]
+    assert len(downs) == 1 and env_then[downs[0]] == "dvprovided", "down -v ran with the .env whose set it names"
+    said = " ".join(capsys.readouterr().out.split())
+    assert "That .env is for another volume set: the choices below are now about dvprovided_vault_pg_data." in said
+
+
+def test_a_destroy_of_a_volume_the_installed_env_does_not_name_deletes_nothing(tmp_path, monkeypatch, capsys):
+    """down -v deletes the volumes of the set .env names: asked to destroy another set's volume, nothing runs."""
+    (tmp_path / ".env").write_text(_env_text("dvcurrent"), encoding="utf-8")
+    monkeypatch.setattr(dv, "flush_stdin", lambda: None)
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: pytest.fail("a destroy of another set's volume was asked"))
+    monkeypatch.setattr(dv.subprocess, "run", lambda *a, **k: pytest.fail("docker ran"))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    assert tool._destroy_data("dvother_vault_pg_data") is False
+    said = " ".join(capsys.readouterr().out.split())
+    assert ("Refusing to delete: .env now names the set of dvcurrent_vault_pg_data, not dvother_vault_pg_data"
+            in said) and "Nothing was deleted." in said
+
+
 # --------------------------------------------------------------------------- with a running stack
 
 @pytest.mark.docker
