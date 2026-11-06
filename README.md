@@ -645,7 +645,8 @@ secrets). Don't edit the prefix by hand; the management tool's **Volumes** menu 
 - **Repoint** — point the deployment at another set; you must supply that set's matching `.env`, and
   the tool verifies it against the set's data (the same secret check as on start) before switching.
   Without `--env-source` it takes the newest kept copy (`.env.<set>`, `.env.<set>.1`, `.2`, ... by
-  number), and lists them when run interactively.
+  number: each new copy takes the number after the highest one there, even when a lower name is free),
+  and lists them when run interactively.
 
 The secret check opens the set's database with the `.env`'s `VAULT_DB_PASSWORD`, then checks its
 `ENCRYPTION_KEY` against the key check the vault keeps in that database: a `.env` with the right
@@ -704,8 +705,9 @@ the backup's `.env` or start the stack, names the volumes it replaced so far, an
 of a backup you trust in a folder only you can write).
 
 Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
-the set the host was on; `.env.<prefix>.1`, `.2`, ... when that name is taken, never over a file already
-there, and never as `.env.enc` or `.env.example`, the sealed file's and the template's names) and says
+the set the host was on; `.env.<prefix>.1`, `.2`, ... after the highest copy there when one is, never
+over a file already there, and never as `.env.enc` or `.env.example`, the sealed file's and the
+template's names) and says
 where. Restoring **another set's** backup leaves the current set's volumes as they were,
 and that kept file is the only way to read them again: restore prints the `volumes --action repoint`
 command that goes back to them. It refuses to start if the current `.env` cannot be read or the copy

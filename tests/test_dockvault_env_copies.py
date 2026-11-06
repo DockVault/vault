@@ -71,6 +71,39 @@ def test_kept_env_copies_are_ordered_by_their_number_not_as_text(tmp_path):
     assert names == [".env.%s.%d" % (TARGET, n) for n in (11, 10, 9, 2, 1)] + [".env.%s" % TARGET]
 
 
+@pytest.mark.parametrize("there", [[1, 2], [0, 2], [0, 1, 2]])
+def test_a_new_copy_takes_the_number_after_the_highest_one_there(tmp_path, there):
+    """A name below the highest is free when a copy was deleted. A new copy made there (.env.<set> first) sorted as
+    the oldest, so a repoint took an older copy for the newest."""
+    _copies(tmp_path, there)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    kept = tool._keep_env_copy(TARGET, (_env_text(TARGET) + "COPY_NUMBER=new\n").encode("utf-8"))
+    assert Path(kept).name == ".env.%s.3" % TARGET
+    assert dv.kept_env_copies(str(tmp_path), TARGET)[0] == kept
+
+
+def test_none_there_the_first_copy_is_the_sets_own_name(tmp_path):
+    (tmp_path / (".env.%s.x" % TARGET)).write_text(_env_text(TARGET + ".x"), encoding="utf-8")
+    assert Path(next(dv.env_copy_names(str(tmp_path), TARGET))).name == ".env.%s" % TARGET
+
+
+def test_a_repoint_after_a_copy_was_deleted_installs_the_copy_kept_last(tmp_path, monkeypatch):
+    _copies(tmp_path, [0, 1, 2])
+    (tmp_path / (".env.%s" % TARGET)).unlink()
+    tool = _repointing(tmp_path, monkeypatch)
+    tool._keep_env_copy(TARGET, (_env_text(TARGET) + "COPY_NUMBER=last\n").encode("utf-8"))
+    _repoint(tool)
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["COPY_NUMBER"] == "last"
+
+
+def test_a_sets_copies_never_include_the_sealed_env(tmp_path):
+    """For a set named 'enc', .env.enc is the sealed .env, never a copy of the set's .env."""
+    (tmp_path / ".env.enc").write_text('{"sealed": true}\n', encoding="utf-8")
+    (tmp_path / ".env.enc.1").write_text(_env_text("enc"), encoding="utf-8")
+    assert [Path(p).name for p in dv.kept_env_copies(str(tmp_path), "enc")] == [".env.enc.1"]
+    assert Path(next(dv.env_copy_names(str(tmp_path), "enc"))).name == ".env.enc.2"
+
+
 def test_a_repoint_installs_the_newest_kept_copy_by_its_number(tmp_path, monkeypatch):
     """With ten or more copies, the text sort took .9 over .10 and .11."""
     _copies(tmp_path, [0, 1, 9, 10, 11])

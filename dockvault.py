@@ -1804,11 +1804,36 @@ def volume_set_prefix(name):
 RESERVED_ENV_NAMES = (".env.enc", ".env.example")
 
 
+def _env_copy_number(label, name):
+    """The number of the name `name` among the names of set `label`'s kept or archived .env copies (0 for
+    .env.<label>, n for .env.<label>.<n>), or None when it is not one of them (.env.<label>.x is another set's, whose
+    prefix is <label>.x)."""
+    base = ".env." + label
+    if name == base:
+        return 0
+    if name.startswith(base + ".") and re.match(r"^[0-9]+$", name[len(base) + 1:]):
+        return int(name[len(base) + 1:])
+    return None
+
+
+def _env_copies_there(root, label):
+    """[(number, path)] of every name in `root` that is one of set `label`'s copy names, of any kind."""
+    found = []
+    for path in glob.glob(os.path.join(glob.escape(root), glob.escape(".env." + label) + "*")):
+        number = _env_copy_number(label, os.path.basename(path))
+        if number is not None:
+            found.append((number, path))
+    return found
+
+
 def env_copy_names(root, label):
-    """The names a kept or archived .env of `label` may take in `root`, in order: .env.<label>, then .env.<label>.1,
-    .2, ..., never one of RESERVED_ENV_NAMES."""
+    """The names a kept or archived .env of `label` may take in `root`, in order: .env.<label> when no copy of it is
+    there, else .env.<label>.<n> from the number after the highest one there, so that the newest copy always has
+    the highest number (kept_env_copies takes the newest by it), never one of RESERVED_ENV_NAMES. A free name below
+    the highest (a copy deleted since) is not taken again: a copy made there would sort as an old one."""
     base = os.path.join(root, ".env." + label)
-    n = 0
+    taken = [number for number, _path in _env_copies_there(root, label)]
+    n = max(taken) + 1 if taken else 0
     while True:
         name = base if n == 0 else "%s.%d" % (base, n)
         n += 1
@@ -1820,19 +1845,11 @@ def kept_env_copies(root, label):
     """The kept or archived copies of set `label`'s .env in `root` (the names env_copy_names gives: .env.<label>, then
     .env.<label>.1, .2, ...), the newest first: by the number, as a number (.10 after .9, which a sort by text puts
     first), and .env.<label> itself last. A name with any other ending (.env.<label>.x is another set's, whose
-    prefix is <label>.x) is not one of them. Plain files only."""
-    base = ".env." + label
-    found = []
-    for path in glob.glob(os.path.join(glob.escape(root), glob.escape(base) + "*")):
-        name = os.path.basename(path)
-        if name == base:
-            number = 0
-        elif name.startswith(base + ".") and re.match(r"^[0-9]+$", name[len(base) + 1:]):
-            number = int(name[len(base) + 1:])
-        else:
-            continue
-        if os.path.isfile(path) and not os.path.islink(path):
-            found.append((number, path))
+    prefix is <label>.x) is not one of them, nor is one of RESERVED_ENV_NAMES (for a set named 'enc', .env.enc is
+    the sealed .env). Plain files only."""
+    found = [(number, path) for number, path in _env_copies_there(root, label)
+             if os.path.basename(path).rstrip(". ").lower() not in RESERVED_ENV_NAMES
+             and os.path.isfile(path) and not os.path.islink(path)]
     return [path for _n, path in sorted(found, reverse=True)]
 
 
@@ -5834,7 +5851,8 @@ class DockVault:
 
     def _keep_env_before_replacing(self, src):
         """Keep the current .env, before setup installs the .env at `src` over it, as .env.<the set it names> (or
-        .env.<prefix>.1, .2, ...; never over a file already there: _keep_env_copy). Returns the copy's path, or None
+        .env.<prefix>.<n>, numbered after the copies there; never over a file already there: _keep_env_copy).
+        Returns the copy's path, or None
         when there is no .env or it already reads as `src` (nothing would be lost). Raises OSError when it cannot be
         kept: the caller then does not replace it."""
         env_now = self._env_path()
@@ -6899,7 +6917,8 @@ class DockVault:
         when it is the backup's own .env byte for byte (nothing would be lost).
 
         The copy is .env.<prefix of the set the host is on>, the name Volumes' repoint finds a set's .env by, or
-        .env.<prefix>.1, .2, ... when that name is taken or is one of RESERVED_ENV_NAMES: never written over a file
+        .env.<prefix>.<n> when copies of it are there already (n after the highest, so that the newest copy has the
+        highest number) or that name is one of RESERVED_ENV_NAMES: never written over a file
         already there. A current .env, or a backup's, that cannot be read, and a copy that cannot be made, refuse
         the restore here, before anything is stopped or replaced, with nothing changed."""
         current_prefix = volume_prefix(self._load_env())
@@ -6932,8 +6951,9 @@ class DockVault:
         return current_prefix, kept
 
     def _keep_env_copy(self, label, data):
-        """Write `data` (the current .env's bytes) to .env.<label>, or to .env.<label>.1, .2, ... when that name is
-        taken (a file, a folder or a link: never followed, never written over) or reserved (env_copy_names). Created
+        """Write `data` (the current .env's bytes) to .env.<label>, or to .env.<label>.<n> after the highest copy
+        there, when a name of that set is taken (a file, a folder or a link: never followed, never written over) or
+        reserved (env_copy_names). Created
         mode 600, written through to the disk with its name, tightened like .env and read back to the same bytes
         before its path is returned. Raises OSError, with the name it was making as `kept_as`; a file this call
         created but could not finish is removed."""
@@ -7068,7 +7088,8 @@ class DockVault:
 
     def _archive_env(self, label):
         """Move the current .env aside as .env.<label> so it isn't lost / left live. Collision-safe
-        (never clobbers an existing archive) and never under a reserved name (env_copy_names: .env.<label>.1, .2,
+        (never clobbers an existing archive; numbered after the copies there) and never under a reserved name
+        (env_copy_names: .env.<label>.1, .2,
         ... instead). Returns the archive path, or None if there was no .env."""
         env_path = self._env_path()
         if not os.path.exists(env_path):

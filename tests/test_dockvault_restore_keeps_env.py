@@ -230,15 +230,15 @@ class _OsWhereTheNameIsTakenAsItIsCreated:
 @pytest.mark.parametrize("first_taken_by", ["a-folder", "a-file"])
 def test_a_name_already_there_is_passed_over_whatever_the_refusal_to_create_it_says(
         tmp_path, monkeypatch, capsys, first_taken_by):
-    """A name taken between the copy's look at it and the create (.env.<prefix> here) is passed over, as one taken
-    before (.env.<prefix>.1, a folder): on Windows, creating the copy over a folder is refused with PermissionError,
-    and the copy goes on to the next name as it does where the refusal is FileExistsError. os.open answers as on
-    Windows here, so this holds on every system the tests run on. (A refusal for a name that is free stops the
-    restore: below.)"""
+    """A name taken between the copy's look at it and the create (.env.<prefix>.2 here, the first one the copy tries,
+    after the highest one there) is passed over, as one taken before (.env.<prefix>.1, a folder): on Windows,
+    creating the copy over a folder is refused with PermissionError, and the copy goes on to the next name as it
+    does where the refusal is FileExistsError. os.open answers as on Windows here, so this holds on every system the
+    tests run on. (A refusal for a name that is free stops the restore: below.)"""
     current = _env_bytes(HERE)
     (tmp_path / ".env").write_bytes(current)
-    first = tmp_path / (".env." + HERE)
-    (tmp_path / (".env." + HERE + ".1")).mkdir()               # a folder holds the next name
+    first = tmp_path / (".env." + HERE + ".2")
+    (tmp_path / (".env." + HERE + ".1")).mkdir()               # a folder holds a name
     theirs = _env_bytes(THERE)
     bundle = _bundle(tmp_path, theirs)
     steps = []
@@ -246,7 +246,7 @@ def test_a_name_already_there_is_passed_over_whatever_the_refusal_to_create_it_s
     monkeypatch.setattr(dv, "os", _OsWhereTheNameIsTakenAsItIsCreated(first.name, first_taken_by))
     _restore(tool, bundle)
 
-    kept = tmp_path / (".env." + HERE + ".2")
+    kept = tmp_path / (".env." + HERE + ".3")
     assert kept.read_bytes() == current
     assert (tmp_path / ".env").read_bytes() == theirs
     if first_taken_by == "a-folder":
