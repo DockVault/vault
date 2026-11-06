@@ -6,7 +6,8 @@
  * The name is typed exactly as the records hold it (a deleted account's username, or a name typed at a failed
  * sign-in), previewed first (what it would change in each place, the near misses, what it does not reach), and only
  * then asked for: asking needs the password (apiRequest runs the step-up) and typing "erase". The name travels in
- * request bodies only, is never kept in the browser, and the field is cleared once it is asked for. The list shows
+ * request bodies only, is never kept in the browser, and the field is cleared once it is asked for, and with its
+ * preview at a sign-out (reset), so the next person on the tab finds neither. The list shows
  * each erase by its placeholder, never by the name: waiting (with the date it runs and why it may wait longer),
  * running, completed (with what it changed) or cancelled; a waiting one can be cancelled by any administrator.
  *
@@ -16,6 +17,9 @@
     'use strict';
 
     const S = { preview: null, previewed: null, busy: false, data: null };
+    // A sign-out begins the next person's time on this tab (reset, called by the app's logout): what the page held
+    // for the person who signed out is cleared, and the answer to a request they made is dropped when it comes.
+    let resets = 0;
     const STATUS = { pending: 'Waiting', running: 'Running', completed: 'Completed', cancelled: 'Cancelled',
         'not recorded': 'Not in the audit log' };
 
@@ -139,20 +143,28 @@
             showToast('Type the name to erase', 'error');
             return;
         }
+        const asked = resets;
         S.busy = true;
         renderPreview();
+        let answer = null;
+        let failure = null;
         try {
-            S.preview = await apiRequest('/settings/erase-requests/preview', {
+            answer = await apiRequest('/settings/erase-requests/preview', {
                 method: 'POST', body: JSON.stringify({ name }), silent: true,
             });
-            S.previewed = name;
         } catch (e) {
-            S.preview = null;
-            showToast(e.message || 'The preview could not be made', 'error');
-        } finally {
-            S.busy = false;
-            renderPreview();
+            failure = e;
         }
+        if (asked !== resets) return;
+        S.busy = false;
+        if (failure) {
+            S.preview = null;
+            showToast(failure.message || 'The preview could not be made', 'error');
+        } else {
+            S.preview = answer;
+            S.previewed = name;
+        }
+        renderPreview();
     }
 
     async function ask() {
@@ -163,54 +175,69 @@
         const message = `Erase this name from ${where} and the other ` +
             `records? It runs in ${plural(p.delay_days, 'day', 'days')} unless an administrator cancels it, and ` +
             'cannot be undone once it has run.';
+        const asked = resets;
         const ok = await showConfirm(message, "Erase a person's records?", 'erase', 'Ask for this erase');
-        if (!ok) return;
+        if (!ok || asked !== resets) return;
         S.busy = true;
         renderPreview();
+        let out = null;
+        let failure = null;
         try {
-            const out = await apiRequest('/settings/erase-requests', {
+            out = await apiRequest('/settings/erase-requests', {
                 method: 'POST', body: JSON.stringify({ name }), silent: true,
             });
+        } catch (e) {
+            failure = e;
+        }
+        if (asked !== resets) return;
+        if (failure) {
+            showToast(failure.message || 'The erase was not asked for', 'error');
+        } else {
             const input = nameInput();
             if (input) input.value = '';
             S.preview = null;
             S.previewed = null;
             showToast(`The erase ${out.request.placeholder} runs on ${when(out.request.effective_at)} unless it is ` +
                 'cancelled', 'success');
-        } catch (e) {
-            showToast(e.message || 'The erase was not asked for', 'error');
-        } finally {
-            S.busy = false;
-            renderPreview();
-            await load();
         }
+        S.busy = false;
+        renderPreview();
+        await load();
     }
 
     async function cancelErase(e) {
         if (S.busy) return;
+        const asked = resets;
         S.busy = true;
         renderList();
+        let failure = null;
         try {
             await apiRequest(`/settings/erase-requests/${encodeURIComponent(e.id)}/cancel`, { method: 'POST', silent: true });
-            showToast(`The erase ${e.placeholder} is cancelled`, 'success');
         } catch (err) {
-            showToast(err.message || 'The erase was not cancelled', 'error');
-        } finally {
-            S.busy = false;
-            await load();
+            failure = err;
         }
+        if (asked !== resets) return;
+        if (failure) showToast(failure.message || 'The erase was not cancelled', 'error');
+        else showToast(`The erase ${e.placeholder} is cancelled`, 'success');
+        S.busy = false;
+        await load();
     }
 
     async function load() {
         if (!byId('erase-list')) return;
+        const asked = resets;
+        let data;
         try {
-            S.data = await apiRequest('/settings/erase-requests', { silent: true });
+            data = await apiRequest('/settings/erase-requests', { silent: true });
         } catch (e) {
+            if (asked !== resets) return;
             S.data = null;
             const box = byId('erase-list');
             if (box) box.replaceChildren(el('p', 'text-secondary', `The erases could not be read: ${e.message}`));
             return;
         }
+        if (asked !== resets) return;
+        S.data = data;
         const note = byId('erase-protected');
         if (note) note.hidden = !S.data.protected_minimum;
         renderList();
@@ -249,5 +276,24 @@
     });
     document.addEventListener('DOMContentLoaded', wire);
 
-    window.EraseSettings = { load, preview, ask };
+    // At a sign-out: the name typed, its preview (with the near-miss names the records hold) and the Ask button it
+    // turned on, and the list of erases, so the next person on the tab finds none of them; an answer still on its
+    // way is dropped.
+    function reset() {
+        resets += 1;
+        S.preview = null;
+        S.previewed = null;
+        S.busy = false;
+        S.data = null;
+        const input = nameInput();
+        if (input) input.value = '';
+        const box = byId('erase-preview');
+        if (box) box.replaceChildren();
+        const askBtn = byId('erase-ask');
+        if (askBtn) askBtn.disabled = true;
+        const list = byId('erase-list');
+        if (list) list.replaceChildren();
+    }
+
+    window.EraseSettings = { load, preview, ask, reset };
 })();

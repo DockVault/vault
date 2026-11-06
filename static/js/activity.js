@@ -281,16 +281,18 @@
         return out;
     }
 
-    function post(path, params) {
+    function post(path, params, signal) {
         return fetch(API_BASE + path, {
             method: 'POST',
             headers: Object.assign({ Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, unlockHeader(), caseHeader()),
             body: JSON.stringify(bodyOf(params)),
+            signal,
         });
     }
 
     // Vaults whose names were unlocked with the vault password: a receipt each, good for 15 minutes, sent with
-    // every read (POST /activity/vaults/{id}/unlock). Kept in memory only.
+    // every read (POST /activity/vaults/{id}/unlock). Kept in memory only, and forgotten at a sign-out
+    // (resetActivity): the next person on the tab is asked for the password again.
     const UNLOCKS = new Map();
 
     function unlockHeader() {
@@ -307,8 +309,10 @@
     }
 
     async function unlockVault(vid, password) {
+        const asked = S;
         const out = await apiRequest(`/activity/vaults/${encodeURIComponent(vid)}/unlock`,
             { method: 'POST', body: JSON.stringify({ password }), silent: true });
+        if (asked !== S) return dropped();    // a receipt for the person who signed out meanwhile
         UNLOCKS.set(vid, { receipt: out.receipt, expires: Date.parse(out.expires_at) || (Date.now() + 15 * 60000) });
         await reloadAfterUnlock();
     }
@@ -857,6 +861,10 @@
         }
     }
 
+    // An export on its way: a sign-out stops it (resetActivity), so a file of the person who signed out never lands
+    // in the browser's downloads after they have gone.
+    let exporting = null;
+
     // Every event that matches the filters, as a file. The server streams it, stops at its row limit and
     // says so in the last line; the headers carry both counts.
     async function exportEvents(fmt) {
@@ -864,11 +872,16 @@
         const p = listParams();
         p.set('format', fmt);
         btn.setAttribute('aria-busy', 'true');
+        const asked = S;
+        const ctl = new AbortController();
+        exporting = ctl;
         try {
-            const resp = await post('/activity/export', p);
+            const resp = await post('/activity/export', p, ctl.signal);
+            if (asked !== S) return;
             if (resp.status === 403) {
                 let data = null;
                 try { data = await resp.json(); } catch (_) { /* no body */ }
+                if (asked !== S) return;
                 refused(new RequestError((data && data.detail) || 'Refused', 403, null));
                 return;
             }
@@ -883,6 +896,7 @@
             const rows = Number(resp.headers.get('X-Export-Rows') || 0);
             const match = (resp.headers.get('Content-Disposition') || '').match(/filename=([^;]+)/);
             const blob = await resp.blob();
+            if (asked !== S) return;
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -896,8 +910,9 @@
                 showWarning(`Exported ${rows.toLocaleString()} of ${total.toLocaleString()} events, the most one export holds. Narrow the filters to export the rest.`);
             } else showSuccess(`Exported ${rows.toLocaleString()} ${rows === 1 ? 'event' : 'events'}`);
         } catch (err) {
-            showError(`Export failed: ${err.message}`);
+            if (asked === S) showError(`Export failed: ${err.message}`);
         } finally {
+            if (exporting === ctl) exporting = null;
             btn.removeAttribute('aria-busy');
         }
     }
@@ -5132,6 +5147,9 @@
         const m = $('activity-event-modal');
         if (m) { delete m.dataset.actOpen; m.classList.remove('active'); }
         phonePushed = false;
+        // The vault receipts of the person who signed out, and their export on its way.
+        UNLOCKS.clear();
+        if (exporting) { try { exporting.abort(); } catch (_) { /* done */ } exporting = null; }
         S = freshState();
         P.open = false;
         P.draft = null;

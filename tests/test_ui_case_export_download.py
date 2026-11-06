@@ -9,7 +9,9 @@ not have. Held here:
   export is not marked fetched, and no owner is told;
 - with it, the download is opened first and the same export streams into it (the control);
 - when the files listed are the ones chosen and their sizes already say the export is larger, it is refused before
-  it is prepared, so no code is asked for either.
+  it is prepared, so no code is asked for either;
+- an export on its way when the auditor signs out stops: one whose answer has not come yet is cancelled, and one
+  whose answer is being read never lands in the browser's downloads.
 
 The export's real files are small; its size is the server's answer (the prepare's ``bytes``, a listing's ``size``)
 made larger on its way to the page. Waits are on state, never on time.
@@ -22,7 +24,7 @@ import pytest
 from playwright.sync_api import Browser, Page, expect
 
 from _account_change_helpers import psql
-from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
+from _auditor_helpers import compliance_receipt, forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, outbox, owner_with_vault
 from conftest import BASE_URL
 
@@ -43,11 +45,23 @@ def world(admin):
         assert r.status_code in (200, 201), r.text
         case = approved_case(admins, (uma, uma_c, codes), [vid], can_export=True)
         try:
-            yield {"uma": uma, "codes": codes, "olga": olga, "vid": vid, "case": case}
+            yield {"uma": uma, "uma_c": uma_c, "codes": codes, "olga": olga, "vid": vid, "case": case}
         finally:
             forget_cases([case["id"]], [vid])
             forget_grants(uma["id"])
             olga_c.delete_vault(vid)
+
+
+@pytest.fixture
+def codes(world):
+    """At least four of uma's recovery codes left for the test (a sign-in and a step-up take one each): when fewer
+    are left, ten new ones, asked for with one of them."""
+    if len(world["codes"]) < 4:
+        r = world["uma_c"].post("/users/me/second-factor/recovery/regenerate", headers=compliance_receipt(
+            world["uma_c"], "account.second_factor", world["uma"]["_password"], world["codes"]))
+        assert r.status_code == 200, r.text
+        world["codes"][:] = r.json()["recovery_codes"]
+    return world["codes"]
 
 
 # What the browser's own blocking of service workers reports as the page loads (its script reads the property it
@@ -140,7 +154,7 @@ def _export_notices(case_id):
     return [row for row in outbox(case_id) if row[0] == "export"]
 
 
-def test_an_export_too_large_to_read_whole_is_never_asked_for_without_a_download_service(browser: Browser, world):
+def test_an_export_too_large_to_read_whole_is_never_asked_for_without_a_download_service(browser: Browser, world, codes):
     page = _page(browser, "block")
     try:
         _login(page, world)
@@ -165,7 +179,7 @@ def test_an_export_too_large_to_read_whole_is_never_asked_for_without_a_download
         page.context.close()
 
 
-def test_an_export_too_large_to_read_whole_streams_into_a_download_opened_first(browser: Browser, world):
+def test_an_export_too_large_to_read_whole_streams_into_a_download_opened_first(browser: Browser, world, codes):
     page = _page(browser, "allow")
     try:
         _login(page, world)
@@ -193,7 +207,7 @@ def test_an_export_too_large_to_read_whole_streams_into_a_download_opened_first(
         page.context.close()
 
 
-def test_listed_files_too_large_to_read_whole_are_refused_before_the_export_is_prepared(browser: Browser, world):
+def test_listed_files_too_large_to_read_whole_are_refused_before_the_export_is_prepared(browser: Browser, world, codes):
     page = _page(browser, "block")
     try:
         _login(page, world)
@@ -222,6 +236,92 @@ def test_listed_files_too_large_to_read_whole_are_refused_before_the_export_is_p
         expect(page.locator("#stepup-modal.active")).to_have_count(0)
         assert prepares == [], "the export was prepared"
         assert _exports(case_id) == before
+        assert ERRORS[id(page)] == []
+    finally:
+        page.context.close()
+
+
+# Marks, in the page, each export's request (an address under /exports/) that is cancelled.
+WATCH_CANCELS = """() => {
+    window.__cancelled = [];
+    const fetchOf = window.fetch;
+    window.fetch = function (url, init) {
+        const sent = fetchOf.apply(this, arguments);
+        sent.catch((e) => { if (e && e.name === 'AbortError' && String(url).includes('/exports/')) window.__cancelled.push(String(url)); });
+        return sent;
+    };
+}"""
+
+# Holds the page's read of an export's answer (an address under /exports/) until window.__letRead() is called.
+HOLD_READ = """() => {
+    const read = Response.prototype.blob;
+    Response.prototype.blob = function () {
+        if (!String(this.url).includes('/exports/')) return read.call(this);
+        return new Promise((resolve, reject) => {
+            window.__letRead = () => read.call(this).then(resolve, reject);
+        });
+    };
+}"""
+
+
+def _export_with_the_step_up(page: Page, world):
+    page.locator(".cmp-ws-export").click()
+    sheet = page.locator("#cmp-export-sheet.active")
+    sheet.get_by_label("Every file of the case", exact=False).check()
+    sheet.locator(".cmp-export-go").click()
+    _step_up(page, world)
+
+
+def test_an_export_whose_answer_has_not_come_at_a_sign_out_is_cancelled(browser: Browser, world, codes):
+    page = _page(browser, "block")
+    held = []
+    try:
+        _login(page, world)
+        case_id = world["case"]["id"]
+        downloads = []
+        page.on("download", lambda d: downloads.append(d))
+        page.route(lambda url: "/compliance/cases/" in url and "/exports/" in url, lambda route: held.append(route))
+        _workspace(page, world)
+        page.evaluate(WATCH_CANCELS)
+        _export_with_the_step_up(page, world)
+        for _ in range(300):
+            if held:
+                break
+            page.wait_for_timeout(50)
+        assert len(held) == 1, "the export was not asked for"
+        page.evaluate("() => logout()")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.wait_for_function("() => window.__cancelled.length === 1", timeout=10000)
+        page.wait_for_timeout(1000)
+        assert downloads == []
+        expect(page.locator("#toast-container .toast-error")).to_have_count(0)
+        assert _exports(case_id)[-1] == "ready|false", "the export reached the server"
+        assert ERRORS[id(page)] == []
+    finally:
+        for route in held:
+            try:
+                route.abort()
+            except Exception:  # noqa: BLE001 -- already cancelled by the page
+                pass
+        page.context.close()
+
+
+def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(browser: Browser, world, codes):
+    page = _page(browser, "block")
+    try:
+        _login(page, world)
+        downloads = []
+        page.on("download", lambda d: downloads.append(d))
+        _workspace(page, world)
+        page.evaluate(HOLD_READ)
+        _export_with_the_step_up(page, world)
+        page.wait_for_function("() => typeof window.__letRead === 'function'", timeout=30000)
+        page.evaluate("() => logout()")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.evaluate("() => window.__letRead()")
+        page.wait_for_timeout(1500)                     # the moment in which the file would be handed over
+        assert downloads == [], "the archive landed in the downloads after the sign-out"
+        expect(page.locator("#toast-container .toast-error")).to_have_count(0)
         assert ERRORS[id(page)] == []
     finally:
         page.context.close()

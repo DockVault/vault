@@ -752,6 +752,7 @@
         renderAuditorBadge();
         setCount(0);
         stopWorkspace();
+        stopExport();
     }
 
     // The auditor's badge: beside the account menu, and, where the top bar is too narrow for it (a phone), in the
@@ -2008,6 +2009,7 @@
         s.body.appendChild(msg);
         const go = button('Export', 'btn-primary cmp-export-go', async () => {
             go.disabled = true;
+            const asked = signIns;
             const body = all.box.checked ? { all: true } : { file_ids: WS.items.map((f) => f.id) };
             // The size of the files listed, when they are the ones chosen (every file of the case is counted by the
             // server only).
@@ -2024,6 +2026,7 @@
                 closed = true;
                 await fetchExport(prepared);
             } catch (e) {
+                if (asked !== signIns) return;      // signed out meanwhile: nothing of it for the next person
                 if (closed) fail(e);
                 else { fail(e, msg); go.disabled = false; }
             }
@@ -2048,23 +2051,51 @@
             + 'and no owner was told. Export it from a browser window that has the service.';
     }
 
+    // The export on its way: a sign-out stops it (forgetStanding), its request and the download it writes into, so
+    // the archive of the person who signed out never lands in the browser's downloads after they have gone. The
+    // server records an export stopped part-way as stopped.
+    let EXPORTING = null;     // { ctl, sink }
+
+    function stopExport() {
+        const x = EXPORTING;
+        EXPORTING = null;
+        if (!x) return;
+        try { x.ctl.abort(); } catch (_) { /* done */ }
+        if (x.sink) { try { x.sink.abort('signed-out'); } catch (_) { /* done */ } }
+    }
+
     // The archive, once: through the app's download sink when it has one (the bytes go to the browser's download as
     // they arrive), otherwise read whole and handed over. The server spends the export and tells each owner as soon
     // as it is asked for, so an export too large to read whole is asked for only once a download to write it into
     // is open: one this browser could not save is never asked for.
     async function fetchExport(prepared) {
+        const asked = signIns;
+        const caseId = WS.c.id;
         const name = 'case-' + (WS.c.number || 'export') + '-' + String(prepared.export_id).slice(0, 8) + '.zip';
         const ctl = new AbortController();
-        let sink = null;
+        const mine = { ctl, sink: null };
+        stopExport();
+        EXPORTING = mine;
+        try {
+            await fetchInto(prepared, caseId, name, mine, asked);
+        } finally {
+            if (EXPORTING === mine) EXPORTING = null;
+        }
+    }
+
+    async function fetchInto(prepared, caseId, name, mine, asked) {
+        const ctl = mine.ctl;
         const large = !(Number(prepared.bytes) <= readWholeMost());
         if (large) {
-            sink = typeof dvOpenDownloadSink === 'function'
+            mine.sink = typeof dvOpenDownloadSink === 'function'
                 ? await dvOpenDownloadSink({ filename: name, size: null, mime: 'application/zip' }) : null;
-            if (!sink) throw problem(0, 'no_download_service', tooLargeToSave(prepared.bytes));
+            if (asked !== signIns) { if (mine.sink) mine.sink.abort('signed-out'); return; }
+            if (!mine.sink) throw problem(0, 'no_download_service', tooLargeToSave(prepared.bytes));
         }
+        const sink = mine.sink;
         let resp;
         try {
-            resp = await cmp('/compliance/cases/' + WS.c.id + '/exports/' + prepared.export_id, { raw: true, headers: caseUnlockHeader(WS.c.id), signal: ctl.signal });
+            resp = await cmp('/compliance/cases/' + caseId + '/exports/' + prepared.export_id, { raw: true, headers: caseUnlockHeader(caseId), signal: ctl.signal });
         } catch (e) {
             if (sink) sink.abort('refused');
             throw e;
@@ -2080,6 +2111,7 @@
             throw problem(0, null, 'The export could not be written into the download; it was recorded as stopped.');
         }
         const blob = await resp.blob();
+        if (asked !== signIns) return;
         const url = URL.createObjectURL(blob);
         const a = el('a');
         a.href = url;

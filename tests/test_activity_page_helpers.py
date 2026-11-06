@@ -407,6 +407,32 @@ const signOut = () => { S = { name: 'next' }; };
     assert out == want
 
 
+def test_a_vault_receipt_that_comes_back_after_a_sign_out_is_not_kept():
+    """A vault's names unlocked with its password: the receipt is kept for the reads that follow, but not when the
+    person signed out while it was on its way (the next person's reads would carry it)."""
+    out = _node(_fn("dropped") + _fn("unlockVault") + """
+const UNLOCKS = new Map();
+let answer;
+let reloads = 0;
+const apiRequest = () => new Promise((resolve) => { answer = resolve; });
+const reloadAfterUnlock = async () => { reloads++; };
+let S = { name: 'first' };
+const outcome = (p) => Promise.race([p.then(() => 'done', () => 'threw'), new Promise((r) => setTimeout(() => r('pending'), 50))]);
+(async () => {
+  const late = unlockVault('v1', 'pw');
+  S = { name: 'next' };                          // signed out while the receipt was on its way
+  answer({ receipt: 'r1', expires_at: new Date(Date.now() + 60000).toISOString() });
+  const lateOut = await outcome(late);
+  const kept = Array.from(UNLOCKS.keys());
+  const own = unlockVault('v2', 'pw');
+  answer({ receipt: 'r2', expires_at: new Date(Date.now() + 60000).toISOString() });
+  const ownOut = await outcome(own);
+  console.log(JSON.stringify({ lateOut, kept, ownOut, after: Array.from(UNLOCKS.keys()), reloads }));
+})();
+""")
+    assert out == {"lateOut": "pending", "kept": [], "ownOut": "done", "after": ["v2"], "reloads": 1}
+
+
 # ---- the band's total and the list's -------------------------------------------------------------
 
 RECONCILE = _line("let reconcileTimer") + _fn("reconcileTotals") + """

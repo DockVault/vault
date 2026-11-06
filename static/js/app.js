@@ -2119,6 +2119,10 @@ function logout(how) {
     // the last second, which the page saves to the account a second after the last change, is saved now.
     // It also forgets everything it held, so none of it carries over to the next person on this tab.
     if (typeof window.resetActivity === 'function') { try { window.resetActivity(); } catch (_) {} }
+    // The erase form (Settings): the name typed and its preview, with the near-miss names the records hold.
+    if (window.EraseSettings && typeof window.EraseSettings.reset === 'function') {
+        try { window.EraseSettings.reset(); } catch (_) {}
+    }
     // Then the session is ended on the server (see above), after that save.
     if (mode === 'end') _endServerSession(endingToken);
     authToken = null;
