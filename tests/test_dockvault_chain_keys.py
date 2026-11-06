@@ -20,6 +20,7 @@
 Docker is stubbed throughout."""
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,45 @@ def test_a_deployment_that_cannot_be_paused_is_not_archived_and_what_paused_is_r
     said = " ".join(capsys.readouterr().out.split())
     assert "could not pause vault-db for the backup" in said
     assert "could not be resumed" not in said
+
+
+def _docker_refuses(a):
+    result = _Result(1)
+    result.stderr = "Error response from daemon:\n  cannot pause container: the engine cannot freeze it\n"
+    return result
+
+
+def _docker_does_not_answer(a):
+    raise subprocess.TimeoutExpired(["docker", "compose"] + list(a), 60)
+
+
+def _docker_cannot_run(a):
+    raise FileNotFoundError(2, "No such file or directory", "docker")
+
+
+@pytest.mark.parametrize("pause_db, docker_said", [
+    (_docker_refuses, "(docker: Error response from daemon: cannot pause container: the engine cannot freeze it)"),
+    (_docker_does_not_answer, "(docker: it did not answer within 60 seconds)"),
+    (_docker_cannot_run, "(docker: it could not be run: [Errno 2] No such file or directory: 'docker')"),
+], ids=["refused", "no-answer", "could-not-run"])
+def test_a_pause_docker_would_not_take_says_why_and_how_to_back_up_without_one(tmp_path, monkeypatch, capsys,
+                                                                                pause_db, docker_said):
+    """Docker's own reason, and the way through that needs no pause: a deployment that is not running is archived as
+    it is (test_a_stopped_database_is_copied_without_a_pause)."""
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-k5", deployment_id="k5")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(dv, "container_paused", lambda name, **k: False)
+    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: pytest.fail("a volume was archived while the app ran"))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: pause_db(a) if " ".join(a) == "pause vault-db" else _Result())
+    with pytest.raises(SystemExit):
+        tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    said = " ".join(capsys.readouterr().out.split())
+    assert "could not pause vault-db for the backup %s" % docker_said in said
+    assert ("A deployment that is not running is archived as it is: stop it (python dockvault.py stop), back it up "
+            "(python dockvault.py backup --action backup) and start it again (python dockvault.py start). An update "
+            "then goes on with --backup-verified") in said
 
 
 def test_a_stopped_database_is_copied_without_a_pause(tmp_path, monkeypatch):

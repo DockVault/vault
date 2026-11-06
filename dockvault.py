@@ -6337,9 +6337,9 @@ class DockVault:
                     r = self._run_dc("pause", service, timeout=60, **own_session_kwargs())
                 except subprocess.TimeoutExpired:
                     maybe_paused.append(service)
-                    r = None
-                except (OSError, subprocess.SubprocessError):
-                    r = None
+                    r, said = None, "it did not answer within 60 seconds"
+                except (OSError, subprocess.SubprocessError) as exc:
+                    r, said = None, "it could not be run: %s" % " ".join(str(exc).split())[-200:]
                 except BaseException:
                     maybe_paused.append(service)
                     raise
@@ -6347,10 +6347,19 @@ class DockVault:
                     # A docker that ran and did not answer 0 may have paused it all the same: one a signal ended after
                     # its request reached Docker (systemd's stop signals every process of the service, whatever its
                     # session) answers as one Docker refused. Resumed on its own, as a pause cut short is.
-                    if r is not None and service not in maybe_paused:
-                        maybe_paused.append(service)
-                    return ("could not pause %s for the backup, and the volumes are only copies of one moment while "
-                            "nothing writes to them; nothing was archived" % service)
+                    if r is not None:
+                        if service not in maybe_paused:
+                            maybe_paused.append(service)
+                        said = (" ".join((getattr(r, "stderr", "") or "").split())[-300:]
+                                or "it answered %s" % getattr(r, "returncode", "?"))
+                    # Docker's own reason, and the way through that needs no pause: a deployment that is not running
+                    # is archived as it is.
+                    return ("could not pause %s for the backup (docker: %s), and the volumes are only copies of one "
+                            "moment while nothing writes to them; nothing was archived. A deployment that is not "
+                            "running is archived as it is: stop it (python dockvault.py stop), back it up (python "
+                            "dockvault.py backup --action backup) and start it again (python dockvault.py start). An "
+                            "update then goes on with --backup-verified; what changes after that backup is not in it"
+                            % (service, said))
                 paused.append(service)
             finally:
                 if signals is not None:

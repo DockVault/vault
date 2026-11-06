@@ -677,7 +677,11 @@ name with `--backup-dir` keeps its own permissions when it already exists; one t
 A running deployment is paused (not stopped) while its volumes are archived, so the database, the
 stored files and the keys are copies of one moment: the vault does not answer until the last archive
 is written, then carries on (with the app running, a file deleted between the database's archive and
-the storage volume's would come back as a row without its file). A backup stopped meanwhile (Ctrl-C,
+the storage volume's would come back as a row without its file). When Docker will not pause it, the
+backup stops with nothing archived and shows Docker's reason. A deployment that is not running is
+archived as it is, so `python dockvault.py stop`, then the backup, then `python dockvault.py start`
+backs it up without a pause (an update then goes on with `--backup-verified`; what changes after that
+backup is not in it). A backup stopped meanwhile (Ctrl-C,
 a closed SSH session, `kill`, a timeout or a service stop; Ctrl-Break on Windows) resumes the
 deployment before it ends and removes the incomplete backup; one run under `nohup` goes on when its
 terminal closes. A closed terminal and `timeout` signal the tool's whole process group, and a service
