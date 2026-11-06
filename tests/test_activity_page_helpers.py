@@ -355,13 +355,13 @@ const caseHeader = () => ({});
 const calls = { app: 0, json: 0, refused: 0 };
 const refused = () => { calls.refused++; };
 let S = { name: 'first' };
-let answer, appAnswer;
+let answer, appAnswer, appRefusal;
 const fetch = () => new Promise((resolve, reject) => { answer = { resolve, reject }; });
-const apiRequest = () => { calls.app++; return new Promise((resolve) => { appAnswer = resolve; }); };
+const apiRequest = () => { calls.app++; return new Promise((resolve, reject) => { appAnswer = resolve; appRefusal = reject; }); };
 const reply = (status, body, onRead) => ({ status, ok: status >= 200 && status < 300,
   json: () => { calls.json++; if (onRead) onRead(); return Promise.resolve(body); } });
 const outcome = (p) => Promise.race([
-  p.then(() => 'data', (e) => 'threw: ' + e.status),
+  p.then(() => 'data', (e) => 'threw: ' + (e.status || e.message)),
   new Promise((r) => setTimeout(() => r('pending'), 50)),
 ]);
 """
@@ -372,7 +372,7 @@ const outcome = (p) => Promise.race([
     ("refused after a sign-out", {"got": "pending", "app": 0, "json": 0}),
     ("failed after a sign-out", {"got": "pending", "app": 0, "json": 0}),
     ("signed out while it was read", {"got": "pending", "app": 0, "json": 1}),
-    ("its refusal signs the page out", {"got": "pending", "app": 1, "json": 0}),
+    ("its refusal signs the page out", {"got": "threw: Session expired. Please log in again.", "app": 1, "json": 0}),
     ("answered", {"got": "data", "app": 0, "json": 1}),
     ("refused", {"got": "threw: 401", "app": 1, "json": 0}),
     ("forbidden", {"got": "threw: 403", "app": 0, "json": 1}),
@@ -381,7 +381,9 @@ def test_a_read_answered_after_a_sign_out_is_dropped(case, want):
     """An answer to a read made before a sign-out, or its failure, is drawn for nobody: the read never settles, and
     a refusal is not handed to the app's sign-in handling with the next person's session. The counters the list,
     the summary and the Now panel compare their answers with start again at each sign-out, so only this tells the
-    first person's answer from the next person's. The controls: a read of the same person settles as before."""
+    first person's answer from the next person's. The controls: a read of the same person settles as before (an
+    answer, a 401, a 403), and so does a read whose refusal itself ends the session: the app's own request
+    (apiRequest) signs the page out and then throws, and the read passes that failure on, as it did before."""
     out = _node(READ + """
 const signOut = () => { S = { name: 'next' }; };
 (async () => {
@@ -392,10 +394,11 @@ const signOut = () => { S = { name: 'next' }; };
   if (CASE === 'failed after a sign-out') { signOut(); answer.reject(new TypeError('Failed to fetch')); }
   if (CASE === 'signed out while it was read') answer.resolve(reply(200, { events: [] }, signOut));
   if (CASE === 'its refusal signs the page out') {
+    // As apiRequest does with a refusal of the session the tab still holds: it signs the page out, then throws.
     answer.resolve(reply(401, {}));
     await new Promise((r) => setTimeout(r, 0));
     signOut();
-    appAnswer();
+    appRefusal(new Error('Session expired. Please log in again.'));
   }
   if (CASE === 'answered') answer.resolve(reply(200, { events: [] }));
   if (CASE === 'refused') { answer.resolve(reply(401, {})); await new Promise((r) => setTimeout(r, 0)); appAnswer(); }
