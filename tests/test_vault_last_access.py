@@ -170,19 +170,176 @@ def test_a_write_that_fails_is_tried_again(world, monkeypatch):
     assert _stored(world) == when
 
 
-def test_a_write_given_up_on_does_not_stop_the_next(world, monkeypatch):
-    monkeypatch.setattr(vault_access, "RETRY_SECONDS", 0.01)
+def _refuse_writes(world, times, also=None):
+    """Make the database refuse the next `times` updates of a vault's last access (running `also`, in the writer's
+    thread, before each refusal); returns the list each refusal is recorded in."""
+    refused = []
 
     def refuse(conn, cursor, statement, parameters, context, executemany):
-        if statement.lstrip().upper().startswith("UPDATE VAULTS"):
-            raise sa.exc.OperationalError(statement, parameters, Exception("the database is away"))
+        if statement.lstrip().upper().startswith("UPDATE VAULTS") and len(refused) < times:
+            refused.append(threading.get_ident())
+            if also is not None:
+                also(len(refused))
+            raise sa.exc.OperationalError(statement, parameters, Exception("the row is locked"))
     sa.event.listen(world.engine, "before_cursor_execute", refuse)
-    _open(world, _past(5))
-    assert _stored(world) is None
-    sa.event.remove(world.engine, "before_cursor_execute", refuse)
-    when = _past(4)
+    return refused
+
+
+def test_a_write_the_database_refuses_is_tried_until_it_is_written(world, monkeypatch):
+    """It was given up after four attempts (about 35 s against a held row), and the opening was lost."""
+    monkeypatch.setattr(vault_access, "RETRY_SECONDS", 0.01)
+    refused = _refuse_writes(world, times=9)
+    when = _past(5)
     _open(world, when)
+    assert len(refused) == 9, "the writes were not refused"
     assert _stored(world) == when
+    assert vault_access.flush(5) and not vault_access._waiting
+
+
+def test_a_time_within_a_minute_of_the_stored_one_is_not_written(world):
+    """The write itself moves the stored time only when it is more than a minute behind: another process (the SFTP
+    server's writer beside the web server's) stored a time, and a request that read the vault before that hands
+    its own opening, 30 s later, to this writer. Written, the two servers would each write once a minute, and so
+    more often than that between them."""
+    stored = _past(10)
+    with world.make() as s:
+        stale = s.get(m.Vault, world.vault_id)
+        _ = stale.last_accessed                 # read as None, before the other process writes
+        with world.make() as other:
+            other.execute(sa.update(m.Vault).where(m.Vault.id == world.vault_id).values(last_accessed=stored))
+            other.commit()
+        vault_access.opened(s, stale, when=stored + timedelta(seconds=30))
+    assert vault_access.flush(30)
+    assert _stored(world) == stored, "written again within the minute"
+    # More than a minute after it, it is written.
+    later = stored + MINUTE + timedelta(seconds=1)
+    _open(world, later)
+    assert _stored(world) == later
+
+
+def test_an_opening_that_comes_while_a_write_fails_is_the_one_written_next(world, monkeypatch):
+    """The write in progress is out of the queue; an opening meanwhile queues a write of its own, and the failed
+    write, tried again, takes it in rather than putting its own, earlier, time back over it."""
+    monkeypatch.setattr(vault_access, "RETRY_SECONDS", 0.05)
+    first, meanwhile = _past(9), _past(7)
+
+    def open_again(_n):
+        with world.make() as s:
+            vault_access.opened(s, SimpleNamespace(id=world.vault_id, last_accessed=None), when=meanwhile)
+    _refuse_writes(world, times=1, also=open_again)
+    _open(world, first)
+    assert _stored(world) == meanwhile
+
+
+def test_a_later_opening_moves_a_write_that_is_still_waiting(world):
+    """While the writer is busy, two openings of one vault queue one write, which takes the later time."""
+    busy, go = threading.Event(), threading.Event()
+
+    def hold(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE VAULTS") and not busy.is_set():
+            busy.set()
+            assert go.wait(30)
+    sa.event.listen(world.engine, "before_cursor_execute", hold)
+    first, second, third = _past(10), _past(8), _past(6)
+    with world.make() as s:
+        vault_access.opened(s, SimpleNamespace(id=world.vault_id, last_accessed=None), when=first)
+    assert busy.wait(30), "the writer did not start"
+    with world.make() as s:
+        for when in (second, third):
+            vault_access.opened(s, SimpleNamespace(id=world.vault_id, last_accessed=None), when=when)
+    assert len(vault_access._waiting) == 1 and vault_access._waiting[world.vault_id].when == third
+    go.set()
+    assert vault_access.flush(30)
+    assert _stored(world) == third
+
+
+def test_the_readers_forget_the_oldest_openings_first(monkeypatch):
+    """Past KEEP vaults the readers forget half of what they remember: the oldest openings, which the stored times
+    have caught up with, never the newest."""
+    monkeypatch.setattr(vault_access, "KEEP", 4)
+    monkeypatch.setattr(vault_access, "_seen", {})
+    stand_in = SimpleNamespace(get_bind=lambda: None)       # bound to no engine: nothing is written
+    vaults = [uuid.uuid4() for _ in range(5)]
+    times = [_past(50 - i) for i in range(5)]
+    for vault_id, when in zip(vaults, times):
+        vault_access.opened(stand_in, SimpleNamespace(id=vault_id, last_accessed=None), when=when)
+    assert [vault_access.last_access(v, None) for v in vaults] == [None, None] + times[2:]
+
+
+# Run in a process of its own, against a database file the test reads afterwards: what the writer does when the
+# process stops, and when its thread is gone.
+_CHILD = """
+import sys, threading, time, uuid
+from datetime import datetime, timedelta, timezone
+sys.path.insert(0, sys.argv[2])
+import sqlalchemy as sa
+from sqlalchemy.orm import sessionmaker
+from app.core import models as m
+from app.core import vault_access
+
+engine = sa.create_engine("sqlite:///" + sys.argv[1])
+m.Vault.__table__.create(engine)
+make = sessionmaker(bind=engine)
+vault_id = uuid.uuid4()
+with make() as s:
+    s.add(m.Vault(id=vault_id, owner_id=uuid.uuid4(), type="standard"))
+    s.commit()
+when = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) - timedelta(minutes=5)
+print(vault_id.hex, when.isoformat(), flush=True)
+case = sys.argv[3]
+if case == "stopped while waiting":
+    vault_access.RETRY_SECONDS = 1.0
+    refused = []
+
+    def refuse(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE VAULTS") and not refused:
+            refused.append(1)
+            raise sa.exc.OperationalError(statement, parameters, Exception("the row is locked"))
+    sa.event.listen(engine, "before_cursor_execute", refuse)
+    with make() as s:
+        vault_access.opened(s, s.get(m.Vault, vault_id), when=when)
+    while not refused:
+        time.sleep(0.01)
+    # The write waits for its retry, a second from now: the process stops.
+elif case == "writer gone":
+    gone = threading.Thread(target=lambda: None)
+    gone.start()
+    gone.join()
+    vault_access._thread = gone                 # a writer that stopped (one a fork left behind, say)
+    with make() as s:
+        vault_access.opened(s, s.get(m.Vault, vault_id), when=when)
+    print("flushed" if vault_access.flush(10) else "not-flushed", flush=True)
+"""
+
+
+def _in_a_process_of_its_own(case):
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "vaults.db"
+        out = subprocess.run([sys.executable, "-c", _CHILD, str(path), str(root), case], capture_output=True,
+                             text=True, timeout=60, cwd=str(root))
+        assert out.returncode == 0, out.stderr[-2000:]
+        words = out.stdout.split()
+        vault_id, when = uuid.UUID(words[0]), datetime.fromisoformat(words[1])
+        engine = sa.create_engine(f"sqlite:///{path}")
+        try:
+            with engine.connect() as c:
+                stored = c.execute(sa.select(m.Vault.last_accessed).where(m.Vault.id == vault_id)).scalar()
+        finally:
+            engine.dispose()
+    return when, stored, words[2:]
+
+
+def test_a_write_still_waiting_when_the_process_stops_is_written_then():
+    when, stored, _ = _in_a_process_of_its_own("stopped while waiting")
+    assert stored == when, "the opening was lost at the stop"
+
+
+def test_a_writer_that_stopped_is_started_again():
+    when, stored, said = _in_a_process_of_its_own("writer gone")
+    assert said == ["flushed"] and stored == when
 
 
 def test_the_readers_report_the_latest_opening_this_process_saw(world):

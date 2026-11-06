@@ -415,6 +415,18 @@ def _audit_vault_cap_denial(db, user, vault_id, cap: str) -> None:
         pass
 
 
+def require_cap_recorded(db, user, vault_id, cap: str) -> None:
+    """require_cap, with a refusal recorded (_audit_vault_cap_denial). The route's decorator
+    (require_vault_cap) asks it at the door; a transfer asks it again once it has its slot
+    (app/api/api_server.py, _admitted_again), so a capability withdrawn while the transfer waited
+    is refused and recorded as it is at the door."""
+    try:
+        require_cap(user, vault_id, cap)
+    except HTTPException:
+        _audit_vault_cap_denial(db, user, vault_id, cap)
+        raise
+
+
 def require_vault_cap(cap: str):
     """Decorator (stacks UNDER @require_endpoint_permission) enforcing a per-vault
     capability for scoped temp sessions. Reads current_user + vault_id from kwargs.
@@ -426,11 +438,7 @@ def require_vault_cap(cap: str):
         async def wrapper(*args, **kwargs):
             user = kwargs.get("current_user")
             if user is not None:
-                try:
-                    require_cap(user, kwargs.get("vault_id"), cap)
-                except HTTPException:
-                    _audit_vault_cap_denial(kwargs.get("db"), user, kwargs.get("vault_id"), cap)
-                    raise
+                require_cap_recorded(kwargs.get("db"), user, kwargs.get("vault_id"), cap)
             return await func(*args, **kwargs)
         return wrapper
     return decorator

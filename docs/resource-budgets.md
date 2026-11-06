@@ -256,22 +256,42 @@ suits 1 GB and above.
 host reaches 11%.
 
 **Concurrency is now enforced, not merely described.** `MAX_CONCURRENT_TRANSFERS` (16 by default)
-caps how many transfers are carried at once, counting downloads, upload assembly, and copies and
-moves of files and folders together. Arrivals beyond it wait — a burst is normal traffic — and are
+caps how many transfers are carried at once, counting downloads, upload assembly, copies of files
+and folders and moves of files to another vault together (a move within one vault copies no bytes
+and is not counted). Arrivals beyond it wait — a burst is normal traffic — and are
 only turned away once the queue (`MAX_QUEUED_TRANSFERS`, 32) is also full or the wait
 (`TRANSFER_QUEUE_WAIT_SECONDS`, 20) expires. A refusal is a `503` with `Retry-After`, deliberately
 distinct from a failure, so a client can tell "come back shortly" from "this file is broken".
 
 **A transfer also holds a database connection while it runs.** Upload assembly, a copy and a move
 run in threads of their own, each on its request's connection, and a download holds one while it
-streams; an upload, a copy or a move waiting for a slot holds none. The API's connection pool is
+streams; a transfer waiting for a slot holds none (a download, a preview or a public link's download
+waited holding one, and 16 streaming with 32 waiting held the whole pool: nobody was answered). Once a
+download, a preview, a copy, a move to another vault or a folder copy that waited has its slot, what
+let it in is asked again (by a copy, in the thread it runs in): the session, the account, a temporary
+credential's scope, each vault's access and its password (a changed password refuses it), the item's
+row and, for a copy or a move, whether a same-name file may be replaced, so a sign-out or a change
+made during the wait applies to it; a public link's download asks its link's gates again. A move
+within one vault copies no bytes and takes no slot. The API's connection pool is
 therefore sized from the ceiling: one connection for each transfer the two ceilings admit (this one
-and the upload links' quarter of it), 8 for sign-ins, and 10 more for everything else the server
-answers meanwhile: 38 at the default ceiling, never fewer than 30. Before copies and moves were
-admitted, a burst of them could hold every connection, and every other request then waited for one,
-up to 30 seconds. PostgreSQL accepts 100 connections unless it is told otherwise, and the SFTP
-server keeps a pool of its own, so a ceiling much above 40 needs PostgreSQL's `max_connections`
-raised as well.
+and the upload links' quarter of it), 8 for sign-ins, and 10 more: 38 at the default ceiling, never
+fewer than 30. Before copies and moves were admitted, a burst of them could hold every connection,
+and every other request then waited for one, up to 30 seconds.
+
+Those 10 are for everything else together, which the pool does not count: the requests the server
+answers meanwhile, its 82 synchronous routes (run up to 40 at once, each holding a connection while
+it runs: the activity search and export, the compliance cases' reads, file contents and exports),
+the mail it sends
+without the request waiting for it (one thread per mail, each holding a connection while it sends;
+nothing bounds how many) and its background work (maintenance, owner notices, two settings
+refreshers, the record of when each vault was last opened). Ten is enough while those need no more
+than ten at once; a burst of them makes the next request wait for a connection, as before.
+
+The SFTP server keeps a pool of its own, of 30 connections whatever the ceiling (SFTP transfers are
+not on it). PostgreSQL accepts 100 connections unless it is told otherwise; the two pools hold at
+most 68 of them at the default ceiling, and 98 at a ceiling of 40 (each step of the ceiling adds one
+connection, each fourth step one more). So a ceiling above 40 needs PostgreSQL's `max_connections`
+raised as well, leaving room for a backup or an administrator's `psql` beside the pools.
 
 At the default ceiling the transfer memory is about 16 × 40 MB = 640 MB on top of the ~260 MB
 resting, which is why a deployment with less memory than that should lower it. **Open SFTP handles

@@ -664,15 +664,18 @@ def test_a_ranged_download_gives_its_slot_back(admin, temp_vault):
     os.environ.get("VAULT_TRANSFER_LIMIT_IS_ONE") != "1",
     reason=SKIP_REASON)
 def test_a_copy_a_move_and_a_folder_copy_are_admitted_on_the_same_ceiling(admin, temp_vault):
-    """A copy, a move and a folder copy read, decrypt, encrypt and sync whole files in a thread, on their
-    request's database connection, as an upload's completion does. While a download holds the single slot,
-    each is refused as an upload is: 503 with Retry-After, and nothing changes. Once the slot is free each is
-    done, and gives the slot back."""
+    """A copy, a move to another vault and a folder copy read, decrypt, encrypt and sync whole files in a thread,
+    on their request's database connection, as an upload's completion does. While a download holds the single
+    slot, each is refused as an upload is: 503 with Retry-After, and nothing changes. A move within the vault is
+    a reparent (one row changes, no bytes are copied) and takes no slot, as a folder move takes none: it is
+    answered then, and is the one change made. Once the slot is free each of the others is done, and gives the
+    slot back."""
     vid = temp_vault["id"]
     body = b"C" * (24 * MB)
     held = _upload(admin, vid, unique("held") + ".bin", body)
     small = b"copy me" * 1000
-    file_id = _upload(admin, vid, unique("small") + ".bin", small)
+    small_name = unique("small") + ".bin"
+    file_id = _upload(admin, vid, small_name, small)
     other = admin.create_vault(name=unique("other"))
     try:
         def folder(vault_id, name):
@@ -720,19 +723,28 @@ def test_a_copy_a_move_and_a_folder_copy_are_admitted_on_the_same_ceiling(admin,
             deadline = time.monotonic() + 30
             while _transfer_stats(admin)["transfersInFlight"] < 1 and time.monotonic() < deadline:
                 time.sleep(0.2)
-            refused = {name: admin.post(path, json=payload) for name, (path, payload) in attempts.items()}
+            answered = {name: admin.post(path, json=payload) for name, (path, payload) in attempts.items()}
         finally:
             release.set()
             holder.join(timeout=60)
 
-        for name, answer in refused.items():
+        moved = answered.pop("move within the vault")
+        assert moved.status_code == 200, (
+            f"a move within the vault, which takes no slot, was answered {moved.status_code} while the single slot "
+            f"was held: {moved.text}")
+        for name, answer in answered.items():
             assert answer.status_code == 503, f"a {name} was admitted while the single slot was held: {answer.text}"
             assert int(answer.headers.get("Retry-After", "0")) >= 1, name
             assert "transfers" in answer.text, f"the {name}'s refusal does not say what happened: {answer.text}"
-        assert state() == before, "a refused copy, move or folder copy changed something"
+        # The one change is that move: the file left the vault's root for the folder it was moved into.
+        (entry,) = [item for item in before[0] if item[1] == small_name]
+        root = list(before[0])
+        root.remove(entry)
+        assert state() == (root, sorted(before[1] + [entry]), *before[2:]), (
+            "a refused copy, move or folder copy changed something, or the move within the vault did not move")
 
         done = {}
-        for name in ("copy", "folder copy", "move within the vault", "move to another vault"):
+        for name in ("copy", "folder copy", "move to another vault"):
             path, payload = attempts[name]
             done[name] = admin.post(path, json=payload)
         assert {k: v.status_code for k, v in done.items()} == {k: 200 for k in done}, \

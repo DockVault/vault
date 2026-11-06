@@ -73,6 +73,7 @@ class _DB:
 
     def __init__(self, link, file_row):
         self.link, self.file_row, self.statements = link, file_row, []
+        self.events = []
 
     def query(self, model, *more):
         return _Rows({S.PublicLink: self.link, S.File: self.file_row}.get(model))
@@ -98,7 +99,7 @@ class _DB:
         pass
 
     def rollback(self):
-        pass
+        self.events.append("rollback")
 
 
 class _Stored:
@@ -169,7 +170,8 @@ def harness(monkeypatch):
     monkeypatch.setattr(S, "transfer_admission", admission)
     opened = {}
 
-    def run(stored=None, open_error=None, busy=False, request=None, use_count=1):
+    def run(stored=None, open_error=None, busy=False, request=None, use_count=1, during_wait=None):
+        """during_wait(link, db): called while the download waits for its transfer slot."""
         file_id = uuid.uuid4()
         token = "tok-" + uuid.uuid4().hex
         link = types.SimpleNamespace(
@@ -195,6 +197,14 @@ def harness(monkeypatch):
             async def refuse():
                 raise TransferBusy(retry_after=5, waiting=0, limit=2)
             monkeypatch.setattr(admission, "acquire", refuse)
+        elif during_wait is not None:
+            take = TransferAdmission.acquire.__get__(admission)
+
+            async def wait():
+                db.events.append("waits")
+                during_wait(link, db)
+                return await take()
+            monkeypatch.setattr(admission, "acquire", wait)
         grant = S._publiclink_issue_grant(link.id, ADDRESS)
         request = request or _Request()
         out = types.SimpleNamespace(link=link, db=db, store=store, audit=audit, admission=admission,
@@ -350,6 +360,58 @@ def test_the_disconnect_question_starlette_offers_cannot_tell_behind_that_middle
         return await request.is_disconnected()
 
     assert _through_the_header_middleware(asked, left=True) is False
+
+
+def test_it_waits_for_its_slot_holding_no_read_transaction(harness):
+    # A download waiting for a slot held its read transaction, so a connection: enough of them beside the
+    # transfers streaming held the whole pool. Nothing is pending at that point (the gates only read).
+    stored = _Stored(PIECES)
+    out = harness(stored=stored, during_wait=lambda link, db: None)
+    assert out.status == 200 and out.body == b"".join(PIECES)
+    assert out.db.events == ["rollback", "waits"], out.db.events
+
+
+def _revoke(link, db):
+    link.revoked = True
+
+
+def _delete_the_file(link, db):
+    db.file_row = None
+
+
+def _protect_the_file(link, db):
+    db.file_row.password_hash = "a file password"
+
+
+def _close_the_vault(monkeypatch):
+    def closed(link, db):
+        monkeypatch.setattr(S, "_publiclink_resolve_live", lambda db_, link_: None)
+    return closed
+
+
+# What changed while the download waited for its slot
+CHANGED_WHILE_IT_WAITED = {
+    "the link was revoked": lambda monkeypatch: _revoke,
+    "the file was deleted": lambda monkeypatch: _delete_the_file,
+    "the file was given a password": lambda monkeypatch: _protect_the_file,
+    "the vault or its owner no longer lets it through": _close_the_vault,
+}
+
+
+@pytest.mark.parametrize("case", list(CHANGED_WHILE_IT_WAITED))
+def test_a_gate_that_closed_while_it_waited_refuses_it_and_gives_the_use_back(harness, monkeypatch, case):
+    # The gates are asked again once the download has its slot. Nothing was delivered, so the use goes back
+    # (the grant stays used), and the slot is given back.
+    stored = _Stored(PIECES)
+    out = harness(stored=stored, during_wait=CHANGED_WHILE_IT_WAITED[case](monkeypatch))
+    assert out.status == 404 and out.error.detail == "This file is not available.", case
+    assert out.body == b""
+    assert stored.closed is False, "the file was opened"
+    assert out.link.use_count == 0, "the use was not given back"
+    assert [(r["status"], r["details"]["reason"]) for r in out.refunds] == [("success", "no_longer_available")]
+    assert out.store.data == {}, "the grant must stay used"
+    assert not out.admission._live, "the transfer slot was not given back"
+    assert out.completed == []
 
 
 def test_a_completed_download_keeps_its_use_and_counts_the_download(harness):

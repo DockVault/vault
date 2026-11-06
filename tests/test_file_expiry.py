@@ -644,10 +644,11 @@ def test_each_read_path_consults_the_rule(src, head, times):
 
 def test_the_download_lookups_answer_404_before_any_bytes_or_budget():
     """The web download refuses an expired file where it refuses a missing one: before a transfer
-    slot is taken and before a share download is burned."""
+    slot is taken (and again once it has one) and before a share download is burned."""
     body = _function(API, "async def download_file(")
     lookup = body.index("File.id == file_id, File.vault_id == vault_id, file_expiry.live_clause()")
-    assert lookup < body.index("transfer_admission.acquire()")
+    at_the_door = body.index("\n        _the_file()\n")
+    assert lookup < at_the_door < body.index("transfer_slot = await _admitted_holding_no_connection(db)")
     assert lookup < body.index("burn_share_download(")
 
 

@@ -17,10 +17,21 @@ Now ``get_vault`` calls ``opened(db, vault)``, which writes nothing itself:
   clock that was later set back). So the web server and the SFTP server, each with its writer, write at most
   once a minute between them, and a write that is late never puts back a later time another wrote meanwhile;
 - a write that fails (the database away, the row locked past the connection's lock_timeout) is tried again,
-  ``RETRY_SECONDS`` later, up to ``ATTEMPTS`` times in all; and what is still waiting when the process stops is
-  written then, for up to ``EXIT_SECONDS``.
+  ``RETRY_SECONDS`` later, until it is written. There is one pending write per vault, which a later opening only
+  moves forward (also while it is being retried), so retrying costs nothing that grows. It used to be given up
+  after four attempts, about 35 s against a held row: the opening was then lost;
+- what is still waiting when the process stops is written then, for up to ``EXIT_SECONDS``.
 
-So the stored time is never more than about a minute behind the vault's most recent opening.
+So the stored time is at most about a minute behind the vault's most recent opening, with these limits:
+
+- at a stop (the process ends normally: the container stopped or restarted), a write the database does not take
+  within ``EXIT_SECONDS`` (its row held, the database away) is lost;
+- a crash (the process killed without its exit handlers: SIGKILL, out of memory, a power cut) loses every write
+  still waiting: at most one opening per vault, the latest that was not written yet;
+- while writes fail (the database away), the stored time falls behind for as long as it lasts, and catches up
+  once the database takes them.
+
+A write that was lost leaves the stored time more than a minute behind until the vault is opened again.
 
 ``last_access(vault_id, stored)`` is what a reader reports: the later of the stored time and the last time this
 process opened the vault. A vault just opened shows that time, as it did when every opening was written.
@@ -38,7 +49,11 @@ from datetime import datetime, timedelta, timezone
 
 EVERY_SECONDS = 60
 RETRY_SECONDS = 5
-ATTEMPTS = 4
+# A write that keeps failing is logged at its first failure and then once in so many attempts. Attempts are
+# RETRY_SECONDS apart after each failure, so that is about once a minute while the database refuses connections at
+# once, and about every two minutes while each attempt first waits 5 s (the connection's lock_timeout against a held
+# row, or its connect timeout against a database that does not answer).
+LOG_EVERY = 12
 EXIT_SECONDS = 5.0
 # The vaults whose last opening this process remembers for the readers; past it, the older half is forgotten
 # (by then the stored time has caught up with them).
@@ -149,7 +164,8 @@ def _next():
 
 def _write(vault_id, item):
     """Write ``item.when`` as the vault's last access, if the stored one is more than a minute away from it (or
-    more than a minute ahead of now). True when the statement committed (whether or not it changed the row)."""
+    more than a minute ahead of now). None when the statement committed (whether or not it changed the row);
+    otherwise the class of the error that stopped it."""
     from sqlalchemy import or_, update
     from sqlalchemy.orm import Session
     from app.core.models import Vault
@@ -165,10 +181,9 @@ def _write(vault_id, item):
                 .values(last_accessed=item.when, updated_at=now)
                 .execution_options(synchronize_session=False))
             session.commit()
-        return True
+        return None
     except Exception as exc:  # noqa: BLE001 -- tried again, below; the class only (a message can carry values)
-        _log.warning("A vault's last access could not be recorded (%s); trying again.", type(exc).__name__)
-        return False
+        return type(exc).__name__
 
 
 def _run():
@@ -176,25 +191,27 @@ def _run():
     while True:
         with _cond:
             vault_id, item = _next()
-        done = _write(vault_id, item)
+        failed = _write(vault_id, item)
         with _cond:
             _writing -= 1
-            if not done:
+            if failed is not None:
+                # Tried again until it is written, as the one pending write of its vault: an opening that came
+                # meanwhile (a new pending write, made while this one was out of _waiting) is taken into it.
                 item.attempts += 1
-                if item.attempts < ATTEMPTS:
-                    later = _waiting.get(vault_id)
-                    if later is not None and later.when > item.when:
-                        item.when, item.bind = later.when, later.bind
-                    item.not_before = time.monotonic() + RETRY_SECONDS
-                    _waiting[vault_id] = item
-                else:
-                    _log.warning("A vault's last access was not recorded after %d attempts.", ATTEMPTS)
+                if item.attempts == 1 or item.attempts % LOG_EVERY == 0:
+                    _log.warning("A vault's last access could not be recorded (%s, %d attempts); trying again.",
+                                 failed, item.attempts)
+                later = _waiting.get(vault_id)
+                if later is not None and later.when > item.when:
+                    item.when, item.bind = later.when, later.bind
+                item.not_before = time.monotonic() + RETRY_SECONDS
+                _waiting[vault_id] = item
             _cond.notify_all()
 
 
 def flush(timeout):
-    """Wait until every time handed to the writer is written (or given up on), for up to ``timeout`` seconds.
-    True when nothing is left."""
+    """Wait until every time handed to the writer is written, for up to ``timeout`` seconds. True when nothing is
+    left."""
     deadline = time.monotonic() + timeout
     with _cond:
         while _waiting or _writing:

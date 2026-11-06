@@ -272,9 +272,11 @@ def test_every_case_takes_its_times_when_it_runs(db, monkeypatch):
 
 
 def test_the_cases_cover_every_refusal_get_current_user_makes():
-    """Each 401 and 403 get_current_user raises has a case above (a new refusal there needs one here)."""
+    """Each 401 and 403 get_current_user raises has a case above (a new refusal there needs one here). Its decision
+    is _user_for_token, which a transfer that waited for its slot asks again."""
     import inspect
-    source = inspect.getsource(S.get_current_user)
+    assert "return _user_for_token(credentials.credentials, db)" in inspect.getsource(S.get_current_user)
+    source = inspect.getsource(S._user_for_token)
     raised = source.count("raise HTTPException(")
     # Refusals: invalid token, no sub, no session_token (session_claims), denylisted, regular row
     # revoked or gone, temp row gone, temp idle, temp cred gone, temp cred off, temp cred finished,

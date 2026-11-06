@@ -271,3 +271,160 @@ def test_an_unusable_wait_still_produces_an_answer_a_client_can_act_on(configure
 def test_the_wait_ceiling_is_an_hour():
     """Pinned because the management tool mirrors this number rather than importing it."""
     assert TransferAdmission.MAX_WAIT_SECONDS == 3600.0
+
+
+# ---- one holder's share ------------------------------------------------------------------------------------------
+#
+# A copy needs no slow client to last, and one account's folder copies of a large tree held every slot for minutes
+# while everyone else waited, then was refused. With a holder (an account), at most `share` of the slots are held
+# by that holder's acquires at once (copy_share: a quarter of the ceiling, at least one).
+
+def test_a_copy_share_is_a_quarter_of_the_ceiling_and_at_least_one():
+    from app.core.transfer_admission import copy_share
+    assert [copy_share(n) for n in (-3, 0, 1, 3, 4, 7, 8, 16, 40)] == [1, 1, 1, 1, 1, 1, 2, 4, 10]
+
+
+def test_one_holder_past_its_share_waits_while_another_is_admitted_at_once():
+    async def _go():
+        gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=5)
+        mine = [await gate.acquire(holder="a", share=2) for _ in range(2)]
+        third = asyncio.create_task(gate.acquire(holder="a", share=2))
+        await asyncio.sleep(0.05)
+        assert not third.done(), "a holder took more than its share"
+        assert gate.stats()["waiting"] == 1 and gate.stats()["in_flight"] == 2
+        theirs = await asyncio.wait_for(gate.acquire(holder="b", share=2), timeout=1)
+        anyone = await asyncio.wait_for(gate.acquire(), timeout=1)
+        assert gate.stats()["in_flight"] == 4 and not third.done()
+        gate.release(theirs)
+        await asyncio.sleep(0.05)
+        assert not third.done(), "another holder's slot let it past its share"
+        gate.release(mine[0])
+        token = await asyncio.wait_for(third, timeout=1)
+        assert gate.stats()["in_flight"] == 3 and gate.stats()["waiting"] == 0
+        for t in (mine[1], token, anyone):
+            gate.release(t)
+        assert gate.stats()["in_flight"] == 0 and gate._holders == {} and gate._holder_of == {}
+    run_coroutine(_go())
+
+
+def test_its_share_still_holds_once_one_of_its_transfers_ends_while_another_runs():
+    """The holder's entry counts every acquire using it, so it outlives the end of any one of them while another
+    still runs. Were it forgotten at the first release, the holder's next acquire would start a share of its own,
+    and the holder would run past its share."""
+    async def _go():
+        gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=5)
+        first = await gate.acquire(holder="a", share=2)
+        second = await gate.acquire(holder="a", share=2)
+        third = asyncio.create_task(gate.acquire(holder="a", share=2))
+        await asyncio.sleep(0.05)
+        assert not third.done(), "a holder took more than its share"
+        gate.release(first)
+        third_token = await asyncio.wait_for(third, timeout=1)
+        # Two of its transfers run (the second and the third): one more waits for one of them to end.
+        fourth = asyncio.create_task(gate.acquire(holder="a", share=2))
+        await asyncio.sleep(0.05)
+        assert not fourth.done(), "once one of its transfers ended, the holder ran past its share"
+        assert gate.stats()["in_flight"] == 2 and gate.stats()["waiting"] == 1
+        gate.release(second)
+        fourth_token = await asyncio.wait_for(fourth, timeout=1)
+        for t in (third_token, fourth_token):
+            gate.release(t)
+        assert gate.stats()["in_flight"] == 0 and gate._holders == {} and gate._holder_of == {}
+    run_coroutine(_go())
+
+
+def test_a_holder_past_its_share_for_the_whole_wait_is_told_to_come_back():
+    async def _go():
+        gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=0.2)
+        held = await gate.acquire(holder="a", share=1)
+        with pytest.raises(TransferBusy) as refusal:
+            await gate.acquire(holder="a", share=1)
+        assert refusal.value.limit == 4 and refusal.value.retry_after >= 1
+        stats = gate.stats()
+        assert (stats["in_flight"], stats["waiting"], stats["refused"]) == (1, 0, 1)
+        gate.release(held)
+        assert gate._holders == {}, "the refused acquire left its share taken"
+        gate.release(await asyncio.wait_for(gate.acquire(holder="a", share=1), timeout=1))
+    run_coroutine(_go())
+
+
+def test_waiting_for_its_share_is_waiting_in_the_same_room():
+    """Bounded like any wait: with no room to wait, one past its share is refused at once."""
+    async def _go():
+        gate = TransferAdmission(limit=4, max_waiting=0, wait_seconds=5)
+        held = await gate.acquire(holder="a", share=1)
+        with pytest.raises(TransferBusy):
+            await gate.acquire(holder="a", share=1)
+        assert gate.stats()["refused"] == 1 and gate.stats()["in_flight"] == 1
+        gate.release(held)
+    run_coroutine(_go())
+
+
+def test_the_wait_for_its_share_and_for_a_slot_is_one_wait():
+    """Its share frees after most of the wait, and the slot that freed is taken by someone else first: the rest of
+    the one wait runs out, rather than a second whole wait for a slot."""
+    async def _go():
+        gate = TransferAdmission(limit=2, max_waiting=8, wait_seconds=1.0)
+        loop = asyncio.get_running_loop()
+        blocker = await gate.acquire()
+        mine = await gate.acquire(holder="a", share=1)
+        started = loop.time()
+        late = asyncio.create_task(gate.acquire(holder="a", share=1))
+        await asyncio.sleep(0.6)
+        gate.release(mine)
+        second_blocker = await gate.acquire()     # takes the slot `mine` freed before `late` runs again
+        with pytest.raises(TransferBusy):
+            await late
+        took = loop.time() - started
+        assert 0.9 < took < 1.3, f"{took:.2f} s: it waited for its share and then a whole wait again for a slot"
+        gate.release(blocker)
+        gate.release(second_blocker)
+        assert gate._holders == {} and gate.stats()["in_flight"] == 0
+    run_coroutine(_go())
+
+
+@pytest.mark.parametrize("while_waiting_for", ["its share", "a slot"])
+def test_a_holder_that_stops_waiting_gives_everything_back(while_waiting_for):
+    async def _go():
+        gate = TransferAdmission(limit=2, max_waiting=8, wait_seconds=5)
+        if while_waiting_for == "its share":
+            held = [await gate.acquire(holder="a", share=1)]
+        else:
+            held = [await gate.acquire(), await gate.acquire()]
+        task = asyncio.create_task(gate.acquire(holder="a", share=1))
+        await asyncio.sleep(0.05)
+        assert gate.stats()["waiting"] == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert gate.stats()["waiting"] == 0
+        for t in held:
+            gate.release(t)
+        assert gate._holders == {} and gate.stats()["in_flight"] == 0
+        # Nothing of the one that stopped waiting is still taken: the whole ceiling, and each share, is usable.
+        tokens = [await asyncio.wait_for(gate.acquire(holder=h, share=1), timeout=1) for h in ("a", "b")]
+        for t in tokens:
+            gate.release(t)
+    run_coroutine(_go())
+
+
+def test_a_holder_that_stops_waiting_for_a_slot_gives_its_share_back_while_its_other_transfers_run():
+    """It had its share and was waiting for a slot. Its account's share is still in use by its other transfer, so
+    what it took of the share must be back: the account's next copy is admitted at once once a slot is free."""
+    async def _go():
+        gate = TransferAdmission(limit=2, max_waiting=8, wait_seconds=5)
+        first = await gate.acquire(holder="a", share=2)
+        other = await gate.acquire()
+        task = asyncio.create_task(gate.acquire(holder="a", share=2))
+        await asyncio.sleep(0.05)
+        assert gate.stats()["waiting"] == 1, "it is not waiting for a slot"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        gate.release(other)
+        second = await asyncio.wait_for(gate.acquire(holder="a", share=2), timeout=1)
+        assert gate.stats()["in_flight"] == 2
+        for t in (first, second):
+            gate.release(t)
+        assert gate._holders == {}
+    run_coroutine(_go())

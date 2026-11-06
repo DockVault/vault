@@ -66,7 +66,7 @@ class _Session:
 
 
 class _World:
-    def __init__(self, monkeypatch, gate, *, fail_with=None, refuse_access=False):
+    def __init__(self, monkeypatch, gate, *, fail_with=None, refuse_access=False, hold=None):
         self.db = _Session()
         self.gate = gate
         self.ran = []
@@ -87,6 +87,8 @@ class _World:
                 # Runs in a thread of the off-loop pool, holding the request's slot and its connection.
                 world.db._query_ran()
                 world.ran.append((name, dict(world.gate.stats()), world.db.held))
+                if hold is not None:
+                    assert hold.wait(10)
                 if fail_with is not None:
                     raise fail_with
                 return SimpleNamespace(id=uuid.uuid4())
@@ -109,8 +111,13 @@ class _World:
         monkeypatch.setattr(S, "require_folder_scope", lambda *a, **k: world.db._query_ran())
         monkeypatch.setattr(S, "_principal_can_replace_file", lambda *a, **k: False)
         monkeypatch.setattr(S, "get_client_ip", lambda request: "192.0.2.1")
+        # What is asked again once it has its slot (tests/test_transfers_asked_again_after_the_wait.py).
+        monkeypatch.setattr(S, "_user_for_token", lambda token, db: SimpleNamespace(id=uuid.uuid4()))
+        monkeypatch.setattr(S, "_vault_credential_fingerprint", lambda db, vault_id: None)
+        import app.core.endpoint_permissions as endpoint_permissions
         import app.core.temp_scope as temp_scope
         monkeypatch.setattr(temp_scope, "require_cap", lambda *a, **k: None)
+        monkeypatch.setattr(endpoint_permissions, "check_endpoint_permission", lambda *a, **k: None)
 
 
 def _raw(endpoint):
@@ -119,19 +126,22 @@ def _raw(endpoint):
     return endpoint
 
 
-def _call(kind, world):
+REQUEST = SimpleNamespace(headers={"authorization": "Bearer t"})
+
+
+def _call(kind, world, user=None):
     """The endpoint's coroutine for `kind`, as FastAPI would call it."""
-    user = SimpleNamespace(id=uuid.uuid4())
+    user = user or SimpleNamespace(id=uuid.uuid4())
     vid, item = uuid.uuid4(), uuid.uuid4()
     if kind == "copy":
-        return _raw(S.copy_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), None,
+        return _raw(S.copy_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), REQUEST,
                                           current_user=user, db=world.db, x_vault_password=None,
                                           x_dest_vault_password=None, x_file_password=None)
     if kind == "move":
-        return _raw(S.move_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), None,
+        return _raw(S.move_file_endpoint)(vid, item, S.ItemMoveCopy(dest_vault_id=uuid.uuid4()), REQUEST,
                                           current_user=user, db=world.db, x_vault_password=None,
                                           x_dest_vault_password=None, x_file_password=None)
-    return _raw(S.copy_folder_endpoint)(vid, item, S.FolderMoveCopy(dest_vault_id=vid), None,
+    return _raw(S.copy_folder_endpoint)(vid, item, S.FolderMoveCopy(dest_vault_id=vid), REQUEST,
                                         current_user=user, db=world.db, x_vault_password=None)
 
 
@@ -228,6 +238,68 @@ def test_a_request_its_checks_refuse_takes_no_slot(monkeypatch, kind):
     assert world.ran == [] and stats["admitted"] == 0 and stats["refused"] == 0
 
 
+def test_a_move_within_one_vault_takes_no_slot_and_a_full_ceiling_never_refuses_it(monkeypatch):
+    """A move within one vault is a reparent: one row changes, no bytes are copied. Like a folder move it takes no
+    transfer slot, so it is answered while the ceiling and its queue are full, and it runs on the event loop as a
+    folder move and a rename do. A move to another vault is refused then (the test above)."""
+    async def scenario():
+        gate = TransferAdmission(limit=1, max_waiting=0, wait_seconds=20)
+        world = _World(monkeypatch, gate)
+        other = await gate.acquire()
+        vid = uuid.uuid4()
+        answer = await _raw(S.move_file_endpoint)(vid, uuid.uuid4(), S.ItemMoveCopy(dest_vault_id=vid), REQUEST,
+                                                  current_user=SimpleNamespace(id=uuid.uuid4()), db=world.db,
+                                                  x_vault_password=None, x_dest_vault_password=None,
+                                                  x_file_password=None)
+        stats = gate.stats()
+        gate.release(other)
+        return world, answer, stats
+
+    world, answer, stats = run_coroutine(scenario())
+    assert answer["message"] == "File moved" and answer["id"]
+    ((name, seen, _held),) = world.ran
+    assert name == "move" and seen["in_flight"] == 1, "it took a slot"
+    assert stats["admitted"] == 1 and stats["refused"] == 0 and stats["waiting"] == 0, stats
+    ((action, thread),) = world.audited
+    assert action == "file_move" and not thread.startswith("stored-bytes"), thread
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_one_account_holds_at_most_its_share_of_the_slots_with_copies(monkeypatch, kind):
+    """A quarter of the ceiling, at least one: at a ceiling of 4, one account's second copy waits for its first to
+    end, while another account's copy is admitted at once. Without it one account's long folder copies held every
+    slot."""
+    async def scenario():
+        gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=30)
+        hold = threading.Event()
+        world = _World(monkeypatch, gate, hold=hold)
+        one, another = SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4())
+
+        async def until(done):
+            for _ in range(500):
+                if done():
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+
+        try:
+            first = asyncio.ensure_future(_call(kind, world, user=one))
+            assert await until(lambda: len(world.ran) == 1)
+            second = asyncio.ensure_future(_call(kind, world, user=one))
+            third = asyncio.ensure_future(_call(kind, world, user=another))
+            await until(lambda: len(world.ran) == 2 and gate.stats()["waiting"] == 1)
+            seen = (gate.stats()["in_flight"], gate.stats()["waiting"], len(world.ran))
+        finally:
+            hold.set()
+        answers = await asyncio.gather(first, second, third)
+        return seen, answers, gate.stats()
+
+    seen, answers, after = run_coroutine(scenario())
+    assert seen == (2, 1, 2), f"(in flight, waiting, run) while the first copy ran: {seen}"
+    assert all(a["id"] for a in answers)
+    assert (after["in_flight"], after["waiting"], after["admitted"]) == (0, 0, 3), after
+
+
 # ---- the pool ----------------------------------------------------------------------------------------------------
 
 def test_the_pool_keeps_ten_connections_beyond_every_transfer_and_sign_in_handed_to_a_thread():
@@ -246,8 +318,12 @@ def test_the_two_ceilings_are_the_ones_the_pool_counts():
     assert S.receiver_transfer_admission.limit == link_ceiling(S.settings.max_concurrent_transfers)
 
 
+@pytest.mark.parametrize("carries_transfers", [True, False])
 @pytest.mark.parametrize("limit", [1, 16, 40])
-def test_the_engine_is_made_with_that_capacity(monkeypatch, limit):
+def test_the_engine_is_made_with_that_capacity(monkeypatch, limit, carries_transfers):
+    """The web server's pool from the ceiling; any other process's (the SFTP server's, a command's) 30, whatever the
+    ceiling: SFTP transfers are not on it, and the two pools sized from it together passed PostgreSQL's 100
+    connections from a ceiling of about 25."""
     seen = {}
 
     def fake_create_engine(url, **kwargs):
@@ -260,6 +336,26 @@ def test_the_engine_is_made_with_that_capacity(monkeypatch, limit):
     monkeypatch.setattr(database.settings, "max_concurrent_transfers", limit)
     monkeypatch.setattr(database, "runtime_is_initialized", lambda: True)
     with pytest.raises(Exception):
-        database.initialize_consumers()
+        database.initialize_consumers(carries_transfers=carries_transfers)
     assert seen["pool_size"] == database.POOL_SIZE == 10
-    assert seen["pool_size"] + seen["max_overflow"] == database.pool_capacity(limit)
+    expected = database.pool_capacity(limit) if carries_transfers else database.MIN_CAPACITY
+    assert seen["pool_size"] + seen["max_overflow"] == expected
+
+
+@pytest.mark.parametrize("component, carries", [("API", True), ("SFTP", False)])
+def test_only_the_web_server_sizes_its_pool_from_the_ceiling(monkeypatch, component, carries):
+    from app.core import config
+    asked = []
+    monkeypatch.setattr(config, "initialize_runtime",
+                        lambda **k: SimpleNamespace(plan_log_pull=False, log_token_pepper=""))
+    monkeypatch.setattr(database, "initialize_consumers", lambda **k: asked.append(k))
+    config.bootstrap_entrypoint(component)
+    assert asked == [{"carries_transfers": carries}]
+
+
+def test_the_two_pools_fit_in_what_postgresql_accepts_up_to_a_ceiling_of_40():
+    """PostgreSQL accepts 100 connections unless it is told otherwise: the web server's pool and the SFTP server's
+    hold 68 of them at the default ceiling and 98 at 40, as the documentation says."""
+    both = {limit: database.pool_capacity(limit) + database.MIN_CAPACITY for limit in (16, 40, 41)}
+    assert both == {16: 68, 40: 98, 41: 99}
+    assert all(database.pool_capacity(limit) + database.MIN_CAPACITY <= 100 for limit in range(-1, 41))

@@ -35,6 +35,14 @@ def link_ceiling(limit) -> int:
     return max(1, int(limit) // 4)
 
 
+def copy_share(limit) -> int:
+    """The slots one account's copies, moves to another vault and folder copies may hold at once, beside a ceiling
+    configured as ``limit``: a quarter of it, at least one. A copy needs no slow client to last: one account's
+    folder copies of a large tree held every slot for minutes, and everyone else's downloads and uploads waited,
+    then were refused."""
+    return max(1, int(limit) // 4)
+
+
 def admitted_at_most(limit) -> int:
     """The most transfers the two ceilings admit at once, for a ceiling configured as ``limit``. Each may hold
     a database connection while it runs (a download, an upload's completion, a copy or a move, finished in a
@@ -74,6 +82,10 @@ class TransferAdmission:
 
     def __init__(self, limit: int, max_waiting: int, wait_seconds: float):
         self._limit = ceiling(limit)
+        # holder -> [a semaphore of its share, the acquires using it]: see acquire(). Touched on the loop only,
+        # as the semaphores are.
+        self._holders = {}
+        self._holder_of = {}
         self._max_waiting = max(0, int(max_waiting))
         self._wait_seconds = self._usable_wait(wait_seconds)
         self._semaphore = asyncio.Semaphore(self._limit)
@@ -111,43 +123,79 @@ class TransferAdmission:
             return 0.0
         return min(cls.MAX_WAIT_SECONDS, max(0.0, value))
 
-    async def acquire(self):
+    async def acquire(self, holder=None, share=None):
         """Take a slot, waiting if the deployment is full. Raises :class:`TransferBusy` if not.
 
         Returns a token, which is what gives the slot back. The waiting room is checked before
         joining it, so a burst that is never going to be served is refused now rather than after a
         timeout each.
+
+        With a ``holder`` (an account), at most ``share`` of the slots are held by that holder's
+        acquires at once: one past its share waits for one of its own to end, in the same waiting room
+        and within the same wait as for a slot, and is refused as a caller waiting for a slot is. So one
+        account's copies cannot hold every slot while everyone else waits.
         """
-        if self._semaphore.locked():
-            with self._counter_lock:
-                if self._waiting >= self._max_waiting:
-                    waiting = self._waiting
-                    self._refused += 1
-                    raise TransferBusy(
-                        retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
-                self._waiting += 1
-            try:
-                await asyncio.wait_for(self._semaphore.acquire(), timeout=self._wait_seconds)
-            except asyncio.TimeoutError:
-                with self._counter_lock:
-                    # Minus this caller: it is being refused, not left waiting, and reporting
-                    # itself as one of the queue makes a deployment look busier than it is.
-                    waiting = max(0, self._waiting - 1)
-                    self._refused += 1
-                raise TransferBusy(
-                    retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
-            finally:
-                with self._counter_lock:
-                    self._waiting -= 1
+        if holder is None:
+            await self._take(self._semaphore, self._wait_seconds)
         else:
-            await self._semaphore.acquire()
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            entry = self._holders.get(holder)
+            if entry is None:
+                entry = self._holders[holder] = [asyncio.Semaphore(ceiling(share)), 0]
+            entry[1] += 1
+            try:
+                await self._take(entry[0], self._wait_seconds)
+                try:
+                    await self._take(self._semaphore, self._wait_seconds - (loop.time() - started))
+                except BaseException:
+                    entry[0].release()
+                    raise
+            except BaseException:
+                self._let_go(holder, entry)
+                raise
 
         token = object()
         with self._counter_lock:
             self._live.add(token)
+            if holder is not None:
+                self._holder_of[token] = holder
             self._admitted += 1
             self._peak_in_flight = max(self._peak_in_flight, len(self._live))
         return token
+
+    async def _take(self, semaphore, wait):
+        """Take ``semaphore``: at once when it is free, otherwise through the waiting room, for up to ``wait``
+        seconds. Raises :class:`TransferBusy` when the waiting room is full or the wait runs out."""
+        if not semaphore.locked():
+            await semaphore.acquire()
+            return
+        with self._counter_lock:
+            if self._waiting >= self._max_waiting:
+                waiting = self._waiting
+                self._refused += 1
+                raise TransferBusy(
+                    retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
+            self._waiting += 1
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=max(0.0, wait))
+        except asyncio.TimeoutError:
+            with self._counter_lock:
+                # Minus this caller: it is being refused, not left waiting, and reporting
+                # itself as one of the queue makes a deployment look busier than it is.
+                waiting = max(0, self._waiting - 1)
+                self._refused += 1
+            raise TransferBusy(
+                retry_after=self._retry_after(), waiting=waiting, limit=self._limit)
+        finally:
+            with self._counter_lock:
+                self._waiting -= 1
+
+    def _let_go(self, holder, entry):
+        """One acquire of ``holder`` no longer uses its share; the entry goes once none does."""
+        entry[1] -= 1
+        if entry[1] <= 0 and self._holders.get(holder) is entry:
+            del self._holders[holder]
 
     def release(self, token) -> None:
         """Give a slot back. Anything other than a token from a live acquire does nothing."""
@@ -155,7 +203,13 @@ class TransferAdmission:
             if token not in self._live:
                 return
             self._live.discard(token)
+            holder = self._holder_of.pop(token, None)
         self._semaphore.release()
+        if holder is not None:
+            entry = self._holders.get(holder)
+            if entry is not None:
+                entry[0].release()
+                self._let_go(holder, entry)
 
     def _retry_after(self) -> int:
         """Seconds to suggest. Long enough to be worth honouring, short enough to be useful."""
