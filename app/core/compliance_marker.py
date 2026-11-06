@@ -31,10 +31,11 @@ it (ensure(), from app/services/audit_row_hooks.py), and a case opens with such 
 archived rows back without building them, so it writes the marker itself, in the transaction of each day it restores
 (restored(), from app/core/audit_archive.py, restore_day): a row that counts may be archived, since only a case's
 rows stay rows, and while it is archived only the archive's own marker stands, which the last unarchived day
-removes. Only sync() removes the marker, once nothing needs it, at each start and by every pass of the pruner's
-compliance_cases job, and only while it holds a lock that every write of it takes shared for the rest of its
-transaction: a row that counts not yet committed keeps the marker. When the lock is taken, sync() leaves the marker
-as it is until a later pass.
+removes. Only sync() removes the marker, once nothing needs it, at each start, by every pass of the pruner's
+compliance_cases job and before downgrade-blockers answers (app/core/host_compliance.py, which so also writes a
+marker an ensure() that gave up left unwritten), and only while it holds a lock that every write of it takes shared
+for the rest of its transaction: a row that counts not yet committed keeps the marker. When the lock is taken, sync()
+leaves the marker as it is until a later pass.
 
 A release older than the reader of that table (before 0.33.1) is not protected by the row. CONDITION is the upgrade
 matrix's condition for the edge back to an earlier release, written into the matrix in the release commit.

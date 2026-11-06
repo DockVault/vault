@@ -130,10 +130,45 @@ def _case_summary(db, case):
 
 def downgrade_blockers(db, target) -> list:
     """What stops this deployment going back to ``target``: each record of data a release older than it cannot
-    read (app/core/data_requirements.py), as {key, requires_at_least, reason, undo}. Empty: nothing does."""
+    read (app/core/data_requirements.py), as {key, requires_at_least, reason, undo}. Empty: nothing does.
+
+    The compliance records' marker is brought in line first, in a transaction of its own (compliance_marker.sync):
+    a step of compliance access writes it in its own transaction, and a write that gave up (its lock held past the
+    connection's lock_timeout) left a counted row with no marker until the pruner's next pass, up to hours later,
+    while this answer, which dockvault.py update reads before a rollback, said nothing stopped it. When the marker
+    cannot be written now either, what it would say is named all the same while the records must be kept."""
+    from app.core import compliance_marker
     from app.core import data_requirements as dr
+    kept = _compliance_marker_in_line(db)
+    rows = dr.unmet(dr.read_requirements(db.connection()), target)
+    if kept and not any(r.key == compliance_marker.KEY for r in rows):
+        params = compliance_marker._params(compliance_marker._utcnow())
+        rows += dr.unmet([dr.Requirement(key=params["key"], requires_at_least=params["version"],
+                                         reason=params["reason"], undo=params["undo"], since=params["since"])],
+                         target)
     return [{"key": r.key, "requires_at_least": r.requires_at_least, "reason": r.reason, "undo": r.undo}
-            for r in dr.unmet(dr.read_requirements(db.connection()), target)]
+            for r in rows]
+
+
+def _compliance_marker_in_line(db):
+    """compliance_marker.sync() in a transaction of its own; when it cannot run, whether the records must be kept
+    (compliance_marker.kept_now). True when they must, False or None otherwise. Never raises."""
+    from app.core import compliance_marker
+    try:
+        there = compliance_marker.sync(db)
+        db.commit()
+        return there
+    except Exception as exc:  # noqa: BLE001 -- answered from what must be kept, below
+        db.rollback()
+        print(f"Warning: the compliance records' rollback marker was not brought in line ({type(exc).__name__}); "
+              "naming it from what must be kept", file=sys.stderr)
+    try:
+        return compliance_marker.kept_now(db)
+    except Exception as exc:  # noqa: BLE001 -- the records read below are the answer
+        db.rollback()
+        print(f"Warning: whether the compliance records must be kept was not read ({type(exc).__name__})",
+              file=sys.stderr)
+        return None
 
 
 def _version(target):

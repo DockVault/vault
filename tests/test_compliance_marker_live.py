@@ -6,6 +6,7 @@ marker as it is rather than remove it, so the new row, once committed, is still 
 marker for it, and removes it once that row is past the floor too. Writing the marker flushes nothing the caller has
 not written yet. A change whose marker cannot be written still commits, and the next sync() writes the marker. An
 ordinary account's refused case read and refused hold, and a vault owner's own step, write their rows and no marker.
+A counted row left without its marker (its write gave up) is named by downgrade-blockers, which writes the marker.
 A day ``audit unarchive`` restores, which reads in one snapshot (repeatable read), writes the marker for the rows it
 puts back, also when another transaction committed one after its snapshot, and holds the lock so that a sync() which
 cannot see those rows leaves the marker; any other error of that write is raised, so the day stays archived.
@@ -244,3 +245,40 @@ def test_a_restored_day_writes_the_marker_under_its_snapshot_and_the_lock(throwa
     assert out["refused"] == ["P0001", True], "another error of the write was taken for the marker being there"
     assert out["after_the_refusal"] == []
     assert out["written_once_it_can_be"] is True and out["at_last"] == ["compliance-records"]
+
+
+UNWRITTEN = PREAMBLE + r'''
+from app.core import compliance_marker as marker
+from app.core import host_compliance
+
+def marked():
+    with engine.connect() as c:
+        return [r[0] for r in c.execute(text("SELECT key FROM data_requirements ORDER BY key"))]
+
+out = {}
+# A step of compliance access whose own write of the marker gave up: its row committed, no marker.
+with engine.begin() as c:
+    c.execute(text("INSERT INTO audit_logs (id, action, status, timestamp) VALUES (:id, 'auditor_granted', 'success', "
+                   ":t)"), {"id": uuid.uuid4(), "t": now - timedelta(days=1)})
+out["before"] = marked()
+# Another transaction holds the marker's lock alone meanwhile, as a sync() does.
+holder = engine.connect()
+tx = holder.begin()
+holder.execute(text("SELECT pg_advisory_xact_lock(:c, :k)"), {"c": marker.LOCK[0], "k": marker.LOCK[1]})
+with SessionLocal() as s:
+    out["blockers"] = [b["key"] for b in host_compliance.downgrade_blockers(s, "0.33.5")]
+    out["none_for_this_release"] = host_compliance.downgrade_blockers(s, "0.34.0")
+tx.rollback()
+holder.close()
+out["after"] = marked()
+print(json.dumps(out))
+'''
+
+
+def test_downgrade_blockers_write_and_name_the_marker_a_counted_row_was_left_without(throwaway):
+    """A counted row committed without its marker (the step's own write gave up), and the marker's lock held alone
+    by another transaction: downgrade-blockers still names the records and writes the marker."""
+    out = run_in(throwaway, UNWRITTEN)
+    assert out["before"] == [], out
+    assert out["blockers"] == ["compliance-records"] and out["none_for_this_release"] == [], out
+    assert out["after"] == ["compliance-records"], out
