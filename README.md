@@ -679,14 +679,18 @@ the manifest under the key its `env.enc` is sealed with. Before restore stops or
 reads every archive through, checks it against the recorded checksum, and checks that Docker sees the
 same file through the mount it extracts from; for a sealed backup it first checks the manifest's
 MAC. A changed or damaged archive, a changed sealed manifest, or an archive Docker cannot see is
-refused with nothing changed. The checksums of an unsealed backup show damage only: whoever can write
+refused with nothing changed. Each extraction then reads its archive once more and hashes the bytes
+it extracts in that same read: a bundle on a share or a removable disk, or one someone else can write
+while the restore waits for its confirmation, can change in between, and other bytes than the ones
+checked stop the restore there. The checksums of an unsealed backup show damage only: whoever can write
 the bundle can rewrite them too. A backup made before backups recorded checksums is still restored,
 with a notice that its archives could only be read through, not matched. `--bundle-dir` and
 `--backup-dir` may be relative paths. A restore that stops part way, once it has stopped the
-deployment (a volume that cannot be cleared, an archive that does not extract, the audit log's
-restore mark that cannot be written), changes nothing more: it does not install the backup's `.env`
-or start the stack, names the volumes it replaced so far, and prints the way back (start the set the
-host was on, or run the same restore again).
+deployment (a volume that cannot be cleared, an archive that does not extract or changed after the
+check, the audit log's restore mark that cannot be written), changes nothing more: it does not install
+the backup's `.env` or start the stack, names the volumes it replaced so far, and prints the way back
+(start the set the host was on, or run the same restore again; after an archive changed, from a copy
+of a backup you trust in a folder only you can write).
 
 Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
 the set the host was on; `.env.<prefix>.1`, `.2`, ... when that name is taken, never over a file already

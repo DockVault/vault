@@ -6,8 +6,10 @@ under the key its env.enc is sealed with. A restore takes the bundle's path as a
 clears anything it reads every archive through, checks it against what the backup recorded and checks that Docker
 sees the same file through the mount the extraction uses. A changed archive, a changed sealed manifest, a manifest
 recording some checksums only, and an archive Docker does not see are refused with nothing changed. A backup made
-before backups recorded checksums is restored with a notice. With real Docker: a backup and a restore through a
-relative folder, and an archive changed after the backup, which leaves the keys volume as it was.
+before backups recorded checksums is restored with a notice. Each extraction hashes the bytes it extracts and stops
+the restore there when they are not the ones checked (the bundle can change in between). With real Docker: a backup
+and a restore through a relative folder, an archive changed after the backup, which leaves the keys volume as it
+was, and an archive changed after the check, which its extraction catches.
 """
 import argparse
 import gzip
@@ -495,6 +497,14 @@ def _stopping(tmp_path, monkeypatch, capsys, fail, host="same-set"):
     elif fail == "untar":
         monkeypatch.setattr(dv, "untar_volume", lambda vol, src, archive, **k: steps.append(("untar", vol, src))
                             or vol != names["pg"])
+    elif fail == "changed":
+        def untar(vol, src, archive, **k):
+            steps.append(("untar", vol, src))
+            if vol == names["pg"]:
+                raise dv.ArchiveChanged("c" * 64)
+            return True
+
+        monkeypatch.setattr(dv, "untar_volume", untar)
     capsys.readouterr()
     with pytest.raises(SystemExit):
         tool._do_restore(_restore_args(bundle))
@@ -545,3 +555,150 @@ def test_a_restore_whose_mark_cannot_be_written_stops_before_any_other_volume(tm
     assert "could not write the restore mark into volume %s" % names["keys"] in said
     assert "the volumes it replaced from the backup, or emptied in part, so far are: %s." % names["keys"] in said
     assert "the deployment is stopped" in said and _again(tmp_path) in said
+
+
+# --------------------------------------------------------------------------- the extraction reads what was checked
+
+def test_an_extraction_given_the_checked_checksum_hashes_the_bytes_it_extracts(tmp_path):
+    """The archives are checked before anything is stopped, and each extraction reads its archive again: the
+    extraction hashes what it reads, in the same read, and raises when that is not what was checked."""
+    calls = []
+    good, other = "a" * 64, "b" * 64
+
+    class _R:
+        returncode, stdout, stderr = 0, "%s  -\n" % good, ""
+
+    def run(cmd, **k):
+        calls.append(cmd)
+        return _R()
+
+    assert dv.untar_volume("v_keys", "/b", "vault_keys.tar.gz", run=run, sha256=good) is True
+    script = calls[0][-1]
+    assert "/b:/src:ro" in calls[0] and "v_keys:/dest" in calls[0]
+    assert "tee /tmp/dv-sum" in script and "sha256sum < /tmp/dv-sum" in script and "tar xzf -" in script
+    assert "tar xzf /src" not in script, "tar reads only the stream the checksum is taken of"
+    _R.stdout = "%s  -\n" % other
+    with pytest.raises(dv.ArchiveChanged) as changed:
+        dv.untar_volume("v_keys", "/b", "vault_keys.tar.gz", run=run, sha256=good)
+    assert changed.value.seen == other
+    _R.stdout = ""
+    with pytest.raises(dv.ArchiveChanged) as changed:
+        dv.untar_volume("v_keys", "/b", "vault_keys.tar.gz", run=run, sha256=good)
+    assert changed.value.seen is None
+    _R.returncode = 1
+    assert dv.untar_volume("v_keys", "/b", "vault_keys.tar.gz", run=run, sha256=good) is False
+    # The look before anything is stopped reads the archive the same way, so it proves the extraction can.
+    calls.clear()
+    _R.returncode, _R.stdout = 0, "%s  -\n" % good
+    assert _DIGEST_IN_DOCKER("/b", "vault_keys.tar.gz", run=run) == (good, "")
+    assert calls[0][-1].replace("tar tzf - > /dev/null", "tar xzf -") == script.split("; ", 1)[1]
+
+
+@pytest.mark.parametrize("made", ["with-checksums", "before-checksums"])
+def test_each_extraction_is_handed_the_checksum_of_its_archive_as_checked(tmp_path, monkeypatch, made):
+    bundle = (_backed_up(tmp_path, monkeypatch, "dvarchhand") if made == "with-checksums"
+              else _old_backup(tmp_path, "dvarchhand"))
+    handed = {}
+    tool = _restoring_tool(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(dv, "untar_volume",
+                        lambda vol, src, archive, **k: handed.update({archive: k.get("sha256")}) or True)
+    tool._do_restore(_restore_args(bundle))
+    assert handed == {a: _sha(bundle / a) for a in ("vault_keys.tar.gz", "vault_pg_data.tar.gz",
+                                                     "vault_storage.tar.gz")}
+
+
+@pytest.mark.parametrize("host", ["same-set", "another-set"])
+def test_a_restore_whose_archive_changed_after_the_check_stops_there_and_not_back_to_that_backup(
+        tmp_path, monkeypatch, capsys, host):
+    """A bundle restored from a share or a removable disk, or one someone else can write while the restore waits
+    for its confirmation, can change between the check and the extraction."""
+    steps, names, host_env, said = _stopping(tmp_path, monkeypatch, capsys, "changed", host)
+    assert steps[-1][:2] == ("untar", names["pg"])
+    assert ("clear", names["storage"]) not in steps and ("start",) not in steps
+    assert (tmp_path / ".env").read_bytes() == host_env
+    bundle = next((tmp_path / "backups").iterdir())
+    assert ("%s changed after the restore checked it: what was extracted into volume %s is not the archive checked "
+            "(its checksum as extracted is %s)" % (bundle / "vault_pg_data.tar.gz", names["pg"], "c" * 64)) in said
+    assert _again(tmp_path) not in said, "never sent back to the backup that changed"
+    assert "copy a backup of set 'dvarchstop' you trust into a folder only you can write, then restore from" in said
+    if host == "another-set":
+        assert "The set the host was on, 'dvarchhost', is untouched: python dockvault.py start brings it back" in said
+    else:
+        assert "Do not start the deployment now: volume %s holds data nobody checked" % names["pg"] in said
+
+
+@pytest.mark.docker
+def test_an_extraction_of_real_bytes_is_checked_in_the_same_read_live(tmp_path):
+    """Real busybox: the FIFO, the tee and the drain give the checksum of the whole file as Docker read it."""
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    vol = "dvarchread" + uuid.uuid4().hex[:6] + "_vault_storage"
+    archive = _tgz(tmp_path / "vault_storage.tar.gz", {"a.txt": b"A" * 70000, "d/b.txt": b"B"})
+    try:
+        try:
+            made = _docker("docker", "volume", "create", vol)
+        except (subprocess.SubprocessError, OSError) as exc:
+            pytest.skip("docker unavailable: %s" % exc)
+        if made.returncode != 0:
+            pytest.skip("docker volume create unavailable: %s" % made.stderr[:120])
+        assert dv.untar_volume(vol, str(tmp_path), archive.name, sha256=_sha(archive)) is True
+        got = _docker("docker", "run", "--rm", "-v", vol + ":/d:ro", "busybox", "sh", "-c",
+                      "cat /d/d/b.txt; wc -c /d/a.txt")
+        assert got.stdout.startswith("B") and "70000" in got.stdout
+        with pytest.raises(dv.ArchiveChanged) as changed:
+            dv.untar_volume(vol, str(tmp_path), archive.name, sha256="0" * 64)
+        assert changed.value.seen == _sha(archive)
+    finally:
+        _docker("docker", "volume", "rm", "-f", vol)
+
+
+@pytest.mark.docker
+def test_an_archive_swapped_after_the_restore_checked_it_is_caught_by_its_extraction_live(tmp_path, monkeypatch,
+                                                                                            capsys):
+    """Real volumes: the storage archive is replaced after the check (as on a share, during the confirmation): the
+    extraction reads other bytes than the ones checked, and the restore stops there."""
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+    prefix = "dvarchswap" + uuid.uuid4().hex[:6]
+    names = dv.set_volume_names(prefix)
+    vols = [names["pg"], names["storage"], names["keys"]]
+    env = _env(tmp_path, prefix)
+    host_env = (tmp_path / ".env").read_bytes()
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    started = []
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    monkeypatch.setattr(tool, "_stop_stack", lambda: None)
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    try:
+        try:
+            for v in vols:
+                _docker("docker", "volume", "create", v)
+            seed = _docker("docker", "run", "--rm", "-v", names["storage"] + ":/d", "busybox", "sh", "-c",
+                           "echo STORED > /d/marker.txt")
+        except (subprocess.SubprocessError, OSError) as exc:
+            pytest.skip("docker unavailable: %s" % exc)
+        if seed.returncode != 0:
+            pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+        bundle = next((tmp_path / "backups").iterdir())
+        checked = tool._check_bundle_archives
+
+        def check_then_swap(bundle_dir, plan, recorded):
+            digests = checked(bundle_dir, plan, recorded)
+            storage = Path(bundle_dir) / "vault_storage.tar.gz"
+            storage.unlink()                      # written by the container's root: replaced, not rewritten
+            _tgz(storage, {"marker.txt": b"PLANTED"})
+            return digests
+
+        monkeypatch.setattr(tool, "_check_bundle_archives", check_then_swap)
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            tool._do_restore(_restore_args(bundle))
+        said = _said(capsys)
+        assert "%s changed after the restore checked it" % (bundle / "vault_storage.tar.gz") in said
+        assert "Do not start the deployment now: volume %s holds data nobody checked" % names["storage"] in said
+        assert started == [] and (tmp_path / ".env").read_bytes() == host_env
+    finally:
+        for v in vols:
+            _docker("docker", "volume", "rm", "-f", v)
