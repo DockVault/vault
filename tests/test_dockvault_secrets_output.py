@@ -123,6 +123,47 @@ def test_a_recovery_key_with_no_terminal_goes_only_to_recovery_out_when_given(tm
     assert "it is written to %s only" % out_file in " ".join(out.split())
 
 
+def _locking(tmp_path, recovery_out):
+    (tmp_path / ".env").write_text("ENCRYPTION_KEY=x\nVAULT_DB_PASSWORD=y\n", encoding="utf-8")
+    pf = tmp_path / "pass.txt"
+    pf.write_text("a long enough passphrase\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    args = argparse.Namespace(passphrase_file=str(pf), passphrase_stdin=False, hint=None,
+                              recovery_out=str(recovery_out))
+    return tool, args
+
+
+def test_recovery_out_is_written_before_anything_says_the_key_is_there(tmp_path, monkeypatch):
+    pytest.importorskip("cryptography")
+    _no_terminal(monkeypatch)
+    out_file = tmp_path / "recovery.txt"
+    tool, args = _locking(tmp_path, out_file)
+    shown = []
+    emit = tool._emit_secret
+    monkeypatch.setattr(tool, "_emit_secret", lambda text, label="secret", kept_in=None: shown.append(
+        (kept_in, out_file.exists())) or emit(text, label=label, kept_in=kept_in))
+    tool.lock(args)
+    assert shown == [(str(out_file), True)]
+
+
+def test_a_recovery_out_that_cannot_be_written_is_said_and_the_key_goes_to_a_file_of_its_own(tmp_path, monkeypatch,
+                                                                                            capsys):
+    """It said the key was written to --recovery-out only, then failed to write it."""
+    pytest.importorskip("cryptography")
+    _no_terminal(monkeypatch)
+    out_file = tmp_path / "no-such-folder" / "recovery.txt"
+    tool, args = _locking(tmp_path, out_file)
+    tool.lock(args)
+    said = " ".join(capsys.readouterr().out.split())
+    assert "could not write the recovery key to %s" % out_file in said
+    assert "it is written to %s only" % out_file not in said
+    assert not out_file.exists()
+    (path,) = _secret_files(tmp_path)
+    key = path.read_text(encoding="utf-8").split("=====")[2].split()[0]
+    assert key and key not in said
+    assert (tmp_path / ".env.enc").exists() and not (tmp_path / ".env").exists()
+
+
 def test_a_recovery_key_with_no_terminal_and_no_recovery_out_goes_to_a_file(tmp_path, monkeypatch, capsys):
     pytest.importorskip("cryptography")
     _no_terminal(monkeypatch)

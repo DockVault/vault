@@ -4414,17 +4414,26 @@ class DockVault:
         key = dek.decode("ascii") if isinstance(dek, (bytes, bytearray)) else str(dek)
         pal = self.pal
         out = getattr(args, "recovery_out", None)
+        # --recovery-out is written first, so that nothing says the key is there before it is. A file that cannot
+        # be written is said so, and the key goes where it would go without one.
+        written = False
+        if out:
+            try:
+                self._atomic_write_secret(out, key + "\n")
+                written = True
+            except OSError as exc:
+                print(pal.paint("  WARNING: could not write the recovery key to %s (%s): it is shown as without "
+                                "--recovery-out instead." % (out, exc), "red"))
         # Show the key + its guidance on the controlling terminal only (see _emit_secret); with no terminal, in
-        # --recovery-out when given, else in a file of its own.
+        # --recovery-out when it was written, else in a file of its own.
         self._emit_secret("\n".join([
             pal.paint("\n  ===== CREDENTIAL RECOVERY KEY (shown once) =====", "bold", "yellow"),
             "    " + pal.paint(key, "bold"),
             pal.paint("  Save this in a password manager. It unlocks .env if you forget the passphrase.\n"
                       "  It does NOT recover vault files or deployments. If you lose BOTH this key and the\n"
                       "  passphrase, every stored file becomes permanently unrecoverable.", "yellow"),
-        ]), label="recovery-key", kept_in=out)
-        if out:
-            self._atomic_write_secret(out, key + "\n")
+        ]), label="recovery-key", kept_in=out if written else None)
+        if written:
             print(pal.paint("  Also written to %s - move it OFF this host, then delete it here." % out,
                             "yellow"))
 
