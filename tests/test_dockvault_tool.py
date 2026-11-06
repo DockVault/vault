@@ -2654,6 +2654,63 @@ def test_restart_with_the_release_image_here_needs_no_registry(tmp_path, monkeyp
     assert not _compose_verb(calls, "pull") and downs and ups and downs[0] < ups[0]
 
 
+def _restarting_a_build(tmp_path, monkeypatch, build_ok=True, checkout="0.34.0", running="0.34.0"):
+    """restart of a deployment that builds from source (DOCKVAULT_IMAGE the local build), this checkout's VERSION
+    `checkout`, the deployment running `running`; `docker compose build` succeeds when `build_ok`."""
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False, image=dv.LOCAL_IMAGE)
+    (tmp_path / "VERSION").write_text(checkout + "\n", encoding="utf-8")
+    answer = dv.subprocess.run
+
+    def run(cmd, **k):
+        r = answer(cmd, **k)
+        if cmd[:2] == ["docker", "compose"] and "build" in cmd and not build_ok:
+            return _Proc(1, "")
+        return r
+
+    monkeypatch.setattr(dv.subprocess, "run", run)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: (running, "the running container"))
+    return tool, calls
+
+
+def test_restart_of_a_deployment_that_builds_from_source_builds_before_it_takes_anything_down(tmp_path,
+                                                                                            monkeypatch):
+    """restart took the stack down and only then built it (start's up --build): a build that failed left nothing
+    running. It now builds first."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch)
+    tool.restart()
+    builds, downs, ups = (_compose_verb(calls, v) for v in ("build", "down", "up"))
+    assert builds and downs and ups and builds[0] < downs[0] < ups[0]
+
+
+def test_restart_of_a_deployment_that_builds_from_source_takes_nothing_down_when_its_build_fails(
+        tmp_path, monkeypatch, capsys):
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, build_ok=False)
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert _compose_verb(calls, "build") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert "The build failed" in said and "Nothing was taken down: the deployment keeps running as it is." in said
+
+
+def test_restart_never_builds_a_checkout_older_than_the_version_the_deployment_runs(tmp_path, monkeypatch, capsys):
+    """A checkout moved back (an older tag checked out) would be built and started over data a newer version wrote:
+    the image refuses to start on it, and nothing would run. Refused before anything is built or taken down."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout="0.33.6", running="0.34.0")
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert not _compose_verb(calls, "build") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert ("restart would build and start this checkout at 0.33.6, which is older than 0.34.0, the version this "
+            "deployment has run (from the running container)") in said
+    assert "python dockvault.py update --tag v0.33.6 does" in said and "Nothing was built or taken down." in said
+
+
+def test_restart_builds_a_checkout_newer_than_the_version_the_deployment_runs(tmp_path, monkeypatch):
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout="0.34.1", running="0.34.0")
+    tool.restart()
+    assert _compose_verb(calls, "build") and _compose_verb(calls, "up")
+
+
 def test_start_builds_when_no_release_image_is_pinned(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))

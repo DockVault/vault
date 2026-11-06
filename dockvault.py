@@ -4801,15 +4801,56 @@ class DockVault:
         standalone `down`. A container-log rotation Docker would refuse stops it before anything is
         taken down, and so does a published release image that is neither here nor can be pulled: it is
         made present BEFORE the containers are removed, so a host without the registry (offline, an
-        outage, a rate limit) keeps the deployment it has rather than being left with nothing running."""
+        outage, a rate limit) keeps the deployment it has rather than being left with nothing running. A deployment
+        that builds from source is built from the checkout as it is, BEFORE anything is taken down, for the same
+        reason: a build that fails (no network for the base image or the packages, a broken checkout) leaves the
+        deployment running as it is. A checkout older than the version the deployment has run is refused before
+        that (_refuse_older_build): its image would not start on the newer data."""
         if not self._container_logs_readable():
             raise SystemExit(1)
-        if os.path.exists(self._env_path()) and uses_release_image(self._load_env()):
-            if not self._ensure_release_image():
-                print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.", "yellow"))
-                raise SystemExit(1)
+        if os.path.exists(self._env_path()):
+            if uses_release_image(self._load_env()):
+                if not self._ensure_release_image():
+                    print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.",
+                                         "yellow"))
+                    raise SystemExit(1)
+            else:
+                self._refuse_older_build("restart")
+                if not self._build_checkout():
+                    print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.",
+                                         "yellow"))
+                    raise SystemExit(1)
         self._tear_down_containers()
         self.start(args)
+
+    def _build_checkout(self):
+        """`docker compose build`: the images of a deployment that builds from source, built from the checkout as it
+        is (start's `up --build` then finds them built). True when the build succeeded."""
+        print(self.pal.paint("  Building this checkout before anything is taken down ...", "cyan"))
+        try:
+            r = self._run_dc("build", capture=False, timeout=1800)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(self.pal.paint("  docker compose build failed: %s" % exc, "red"))
+            return False
+        if getattr(r, "returncode", 1) != 0:
+            print(self.pal.paint("  The build failed (Docker's output is above).", "red"))
+            return False
+        return True
+
+    def _refuse_older_build(self, command):
+        """Stop `command`, which builds this checkout and starts it, when this checkout's VERSION is older than the
+        version the deployment has run (_running_version): the older code would go back over data a newer version
+        wrote (an image from 0.33.1 on refuses to start on it, and the deployment would be left with nothing
+        running). Going back is update's to do, with its checks. Nothing was built or taken down."""
+        version = read_version_file(self.root)
+        if not parse_semver(version):
+            return
+        running, source = self._running_version()
+        if parse_semver(running) and parse_semver(version) < parse_semver(running):
+            self._fail("%s would build and start this checkout at %s, which is older than %s, the version this "
+                       "deployment has run (from %s). It does not go back to an older version: python dockvault.py "
+                       "update --tag v%s does, after it checks what the data holds that %s cannot read. Nothing was "
+                       "built or taken down." % (command, version, running, source, version.lstrip("vV"), version))
 
     def status(self, args=None):
         """Show credential lock state + container/health/port status (read-only)."""
