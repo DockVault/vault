@@ -17,7 +17,8 @@ route ends the session as logout does and answers without that header. What is h
   token signed by the server that names another account than the session's;
 - a token used after it is refused everywhere one is accepted: the web API, an upload (a new one, the chunks of one
   begun before, its completion, the direct upload), a download, the live-monitor socket (a new one and one already
-  open), and the minting of SFTP temporary credentials;
+  open), and the minting of SFTP temporary credentials; refused without Clear-Site-Data (by the denylist, by the
+  session's row, for a temporary credential's session), which a token that has run out still gets;
 - a temporary credential's web session ends and frees the credential's slot, as logout does;
 - the token is held in the cache's denylist for the rest of its life (none for a token that has run out, none for
   a token naming another account);
@@ -485,6 +486,44 @@ def test_a_temporary_credentials_web_session_ends_and_frees_its_slot(admin):
     recorded = psql("SELECT temp_credential_name FROM audit_logs WHERE action = 'logout' "
                     f"AND temp_credential_name = '{cred['temp_username']}'")
     assert recorded == cred["temp_username"], "the sign-out was not recorded as the temporary credential's"
+
+
+def _clears_site_data(r):
+    return "clear-site-data" in {k.lower() for k in r.headers}
+
+
+def test_a_session_that_has_ended_is_refused_without_clear_site_data(admin, person):
+    """A request a tab sends with the token of a session ended by a sign-out (a poll on its way, a tab told late) is
+    refused without Clear-Site-Data, which a browser applies to the whole origin in every tab: by the denylist, by
+    the session's row when the denylist does not hold it, and for a temporary credential's session. A token that
+    has run out is still refused with it (the control)."""
+    one = signed_in(person)
+    assert _sign_out(one.token).json()["session_ended"] is True
+    refused = _as(one.token, "GET", "/users/me")
+    assert refused.status_code == 401 and "terminated" in refused.text, refused.text
+    assert not _clears_site_data(refused), dict(refused.headers)
+    redis_cli("DEL", _denylisted(one.token))                 # the session's row refuses it now
+    assert redis_cli("EXISTS", _denylisted(one.token)) == "0"
+    refused = _as(one.token, "GET", "/users/me")
+    assert refused.status_code == 401 and "terminated" in refused.text, refused.text
+    assert not _clears_site_data(refused), dict(refused.headers)
+
+    made = admin.post("/auth/temp-credentials", json={"note": unique("ended-session")})
+    assert made.status_code == 200, made.text
+    cred = made.json()
+    holder = requests.post(f"{BASE_URL}/auth/login",
+                           json={"username": cred["temp_username"], "password": cred["credential"]}, timeout=30)
+    assert holder.status_code == 200, holder.text
+    temp = holder.json()["access_token"]
+    assert _sign_out(temp).json()["session_ended"] is True
+    redis_cli("DEL", _denylisted(temp))
+    refused = _as(temp, "GET", "/users/me")
+    assert refused.status_code == 401 and "terminated" in refused.text, refused.text
+    assert not _clears_site_data(refused), dict(refused.headers)
+
+    other = signed_in(person)
+    run_out = _as(_expired_copy(other.token), "GET", "/users/me")
+    assert run_out.status_code == 401 and _clears_site_data(run_out), dict(run_out.headers)
 
 
 def test_api_logout_keeps_its_answer_for_its_callers(person):

@@ -1720,12 +1720,18 @@ def _user_for_token(token, db) -> User:
     # Revocation: a logged-out token is denylisted until it expires. This revokes the token
     # for ALL users WITHOUT enforcing single-session (re-login denylists nothing), so
     # concurrent sessions still work. See auth_service.denylist_token.
+    #
+    # A session that has ended (signed out, ended by an administrator, its account locked) is refused without
+    # Clear-Site-Data, here and in the two refusals below. Every sign-out of the web app ends its session at once
+    # (POST /auth/sign-out), so a request a tab sends with that token afterwards (a poll on its way, a tab told of
+    # the sign-out late) meets one of these refusals; a browser applies that header to the whole origin, in every
+    # tab, which would clear the storage of a session signed in since in another tab, its saved uploads and the
+    # look kept for the browser. The web app signs the tab out on this 401 and clears what is its own.
     from app.services.auth_service import is_token_denylisted
     if session_token and is_token_denylisted(session_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session has been terminated. Please login again.",
-            headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
         )
 
     # Durable revocation for REGULAR-user tokens: a logged-out / locked / deactivated session
@@ -1746,7 +1752,6 @@ def _user_for_token(token, db) -> User:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session has been terminated. Please login again.",
-                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
             )
 
     if is_temporary and session_token:
@@ -1763,9 +1768,8 @@ def _user_for_token(token, db) -> User:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session has been terminated. Please login again.",
-                headers={"Clear-Site-Data": '"cache", "cookies", "storage"'}
             )
-        
+
         # Also check if session has expired based on grace period
         grace_minutes = int(os.getenv('TEMP_CRED_SESSION_GRACE_MINUTES', '65'))
         grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=grace_minutes)

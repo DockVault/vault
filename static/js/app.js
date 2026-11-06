@@ -2028,16 +2028,28 @@ function _refreshLoginPolicyWhenShown() {
     window.addEventListener('focus', refresh);
 }
 
+// The session a token names (the session_token claim of its payload), so that two tokens of one session are told
+// apart from the tokens of two sessions; the token itself when the page cannot read it.
+function _sessionOf(token) {
+    if (!token) return null;
+    try {
+        const claims = JSON.parse(atob(String(token).split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+        if (claims && typeof claims.session_token === 'string' && claims.session_token) return claims.session_token;
+    } catch (_) { /* not a token the page can read */ }
+    return String(token);
+}
+
 // Sign the page out. `how` is SIGN_OUT_THIS_TAB or SIGN_OUT_TOLD (see above); anything else, the click event the
 // sign-out buttons pass among them, is a full sign-out.
 function logout(how) {
     const mode = (how === SIGN_OUT_THIS_TAB || how === SIGN_OUT_TOLD) ? how : 'end';
     const endingToken = authToken;
-    // A tab told late (one the browser had frozen in the background gets the message when it wakes) may find that
-    // the person has signed in again since in another tab: the session stored for this browser is then that new
-    // one, and is not this tab's to clear.
+    // The person may have signed in again since in another tab: the session stored for this browser is then that new
+    // one, and is not this tab's to clear. A tab told late (one the browser had frozen in the background gets the
+    // message when it wakes) finds it so, and so does a tab whose own request with the ended token was refused (a
+    // poll on its way at the sign-out, a tab never told), which signs out in full.
     const storedToken = storage.getItem('authToken');
-    const anotherSessionStored = mode === SIGN_OUT_TOLD && !!storedToken && storedToken !== endingToken;
+    const anotherSessionStored = !!storedToken && _sessionOf(storedToken) !== _sessionOf(endingToken);
     // The Activity page first, while the session still holds its token: a page size or range chosen in
     // the last second, which the page saves to the account a second after the last change, is saved now.
     // It also forgets everything it held, so none of it carries over to the next person on this tab.

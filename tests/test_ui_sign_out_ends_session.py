@@ -15,7 +15,9 @@ the token back from the server afterwards:
 - a sign-out in another tab: a tab holding the same token signs out at once (told by the other tab, not by a
   refusal), sends nothing of its own, asks for the sign-in screen's policy only when it is next shown (once), and
   leaves a session stored since by another tab (and the uploads saved since), while a tab of another account stays
-  signed in; the tab the person signs out in asks for that policy at once;
+  signed in; the tab the person signs out in asks for that policy at once; a tab never told, whose request with
+  the ended token is refused (without Clear-Site-Data), signs out and leaves the session stored since, its uploads
+  and the look kept for the browser;
 - the sign-in check of a tab being loaded: a refusal of the session (a 401, an account's 403) ends the session and
   signs out the other tabs; a check that could not be answered (a server error, a proxy's 502 or 503 while the
   vault restarts, a proxy's own 403 page, a rate limit, no answer at all) signs out that tab alone, as it always
@@ -191,7 +193,7 @@ def test_a_tab_told_late_leaves_the_session_stored_since_by_another_tab(page: Pa
     signed in again in another tab since: the session then stored for this browser is that new one. The told tab
     signs out (it held the ended session) and leaves the stored one where it is, so the other tab's next load still
     finds it, and the zero-knowledge uploads saved in this browser (which every tab shares), now that session's, so
-    they can be resumed. A full sign-out still empties that store (the control)."""
+    they can be resumed. A full sign-out of the session stored still empties that store (the control)."""
     sign_in_on_the_tab(page, ana)
     token = page.evaluate("() => authToken")
     sent = []
@@ -213,9 +215,52 @@ def test_a_tab_told_late_leaves_the_session_stored_since_by_another_tab(page: Pa
     page.wait_for_timeout(1000)
     assert sent == [], "a tab told of the sign-out sent one of its own"
     assert page.evaluate(SAVED_SINCE) is True, "the uploads saved by the session stored since were wiped"
-    # The control: a full sign-out on this tab empties the store, as it always did.
-    page.evaluate("() => logout()")
+    # The control: a full sign-out of the session stored (here this tab holds it) empties the store, as it always did.
+    page.evaluate("() => { authToken = localStorage.getItem('authToken'); logout(); }")
     _until(page, lambda: page.evaluate(SAVED_SINCE) is False, "a full sign-out left the saved uploads")
+
+
+def test_a_tab_never_told_leaves_the_session_signed_in_since_its_uploads_and_the_look(page: Page, ana):
+    """A tab of a session that another tab signed out, and that was not told (its message lost), sends a request
+    with the ended token once the person has signed in again in the first tab. The server refuses it without
+    Clear-Site-Data (which a browser applies to the whole origin, in every tab), and the tab signs out without
+    touching what is stored for the browser: the session signed in since, the uploads it saved, the look."""
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    late = page.context.new_page()
+    late.goto("/")
+    expect(late.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert late.evaluate("() => authToken") == token
+    # Never told: its channel is closed, and it sends nothing until the test asks (its own timers stopped, and the
+    # reads of its loading answered: one still on its way at the sign-out would meet the ended session at once).
+    late.evaluate("() => { clearInterval(notifPollTimer); _signOutChannel.close(); _signOutChannel = null; }")
+    late.wait_for_load_state("networkidle")
+    sign_out(page)
+    _ended(token)
+    expect(late.locator("#dashboard-screen")).to_be_visible()
+    # The person signs in again in the first tab, which stores its session and saves an upload, and picks a look.
+    sign_in_on_the_tab(page, ana)
+    newer = page.evaluate("() => authToken")
+    assert newer != token
+    page.evaluate("() => { localStorage.setItem('theme', 'dark'); localStorage.setItem('accent', 'teal'); }")
+    saved = page.evaluate("() => zkUploadStore.put({ sessionId: 'saved-since', vaultId: 'v', createdAt: Date.now(), "
+                          "schema: zkUploadStore.schemaVersion(), blob: zkUploadStore.neutralBlob(new Blob(['x'])) })")
+    assert saved == {"ok": True}, saved
+
+    with late.expect_response(lambda r: r.request.method == "GET" and r.url.endswith("/users/me"),
+                              timeout=15000) as answered:
+        late.evaluate("() => { apiRequest('/users/me').catch(() => {}); }")
+    assert answered.value.status == 401
+    assert "clear-site-data" not in answered.value.all_headers(), answered.value.all_headers()
+    expect(late.locator("#login-screen")).to_be_visible(timeout=15000)
+    assert late.evaluate("() => authToken") is None
+    assert page.evaluate("() => [localStorage.getItem('authToken'), localStorage.getItem('theme'), "
+                         "localStorage.getItem('accent')]") == [newer, "dark", "teal"]
+    assert page.evaluate(SAVED_SINCE) is True, "the uploads saved by the session signed in since were wiped"
+    # The first tab's next load finds its session.
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => authToken") == newer and _refused(newer) == 200
 
 
 def _is_policy(request):
