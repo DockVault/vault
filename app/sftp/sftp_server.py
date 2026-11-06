@@ -70,6 +70,7 @@ from app.services.vault_service import (
     require_item_scope,
     filter_listing_for_scope,
     folder_is_navigable,
+    StorageLimitExceeded,
 )
 from app.services.vault_service import FileNotFoundError as VaultFileNotFoundError
 from app.services.audit_logger import AuditLogger
@@ -934,6 +935,13 @@ class _StreamingUpload:
         try:
             self._assembler.feed(offset, data)
             return paramiko.SFTP_OK
+        except StorageLimitExceeded as e:
+            # The storage volume is down to the free space it keeps (app/core/free_space.py): the upload stops,
+            # and its file is removed at the close.
+            self._failed = True
+            self._set_status("upload rejected: %s" % str(e))
+            safe_event('upload.rejected.disk-floor', bytes=e.used, limit=e.cap)
+            return paramiko.SFTP_FAILURE
         except AssemblerError as e:
             # A rewrite of an already-sealed region, or out-of-order data past the reorder window: the
             # streaming path cannot honour it (records are sealed in order). Fail the upload.
@@ -1675,6 +1683,16 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 ).first()
                 if clash is not None:
                     return paramiko.SFTP_PERMISSION_DENIED
+
+            # The free space the storage volume keeps (MIN_FREE_SPACE_GB, app/core/free_space.py): a write is refused
+            # at its open while the volume has no more than that, before anything is staged or stored. One that runs
+            # it down while its bytes arrive is stopped then (the streaming writer's guard), and at its finish.
+            from app.core import free_space
+            _short = free_space.short_of(0)
+            if _short is not None:
+                safe_event('upload.rejected.disk-floor', bytes=_short.free, limit=_short.floor)
+                self._set_pending_status("upload rejected: " + free_space.refusal_text(_short))
+                return paramiko.SFTP_FAILURE
 
             # Same-name lock + in-flight marker, for EVERYONE (the no-clobber check above runs only
             # for a principal lacking DELETE; a concurrent upload of the SAME final name must be

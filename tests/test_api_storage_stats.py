@@ -16,9 +16,9 @@ def test_storage_stats_shape(admin):
     # What legal holds keep after a deletion is on the disk too, in no vault's counters: shown beside it, with
     # what the vaults' files take on the disk altogether.
     assert set(body) == {"total", "used", "available", "kept_for_cases", "on_disk_bytes", "limit_counts_bytes",
-                         "allocated_bytes", "limit_bytes", "max_bytes", "vault_count"}
-    for key in ("total", "used", "available", "on_disk_bytes", "limit_counts_bytes", "allocated_bytes",
-                "vault_count"):
+                         "free_space_floor_bytes", "allocated_bytes", "limit_bytes", "max_bytes", "vault_count"}
+    for key in ("total", "used", "available", "on_disk_bytes", "limit_counts_bytes", "free_space_floor_bytes",
+                "allocated_bytes", "vault_count"):
         assert isinstance(body[key], int) and body[key] >= 0
     kept = body["kept_for_cases"]
     assert set(kept) == {"files", "folders", "bytes"}
@@ -49,3 +49,23 @@ def test_the_routes_of_the_removed_pages_are_gone(admin):
     # What replaced them answers.
     assert admin.get("/activity/summary").status_code == 200
     assert admin.get("/activity/export", params={"q": "no-such-event-text"}).status_code == 200
+
+
+def test_the_storage_panel_reports_the_free_space_the_volume_keeps(admin):
+    """MIN_FREE_SPACE_GB unset (the shipped .env leaves it commented): the larger of 2 GB and 5% of the volume."""
+    import subprocess
+    import os
+    api = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+    try:
+        set_to = subprocess.run(["docker", "exec", api, "printenv", "MIN_FREE_SPACE_GB"], capture_output=True,
+                                text=True, timeout=30)
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("docker is not available to read the deployment's setting")
+    body = admin.get("/storage/stats").json()
+    if set_to.returncode != 0 and body["total"]:
+        assert body["free_space_floor_bytes"] == max(2 * 1024 ** 3, int(body["total"] * 0.05)), body
+    elif set_to.returncode == 0:
+        configured = float(set_to.stdout.strip())
+        expected = max(2 * 1024 ** 3, int(body["total"] * 0.05)) if configured < 0 else int(configured * 1024 ** 3)
+        assert body["free_space_floor_bytes"] == expected, body

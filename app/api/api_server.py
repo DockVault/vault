@@ -203,6 +203,9 @@ async def _file_service_error_handler(request: StarletteRequest, exc: FileServic
         status_code = status.HTTP_404_NOT_FOUND
     elif isinstance(exc, RateLimitExceededError):
         status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    elif isinstance(exc, StorageLimitExceeded) and exc.kind == 'disk':
+        # The storage volume keeps a floor of free space (app/core/free_space.py).
+        status_code = status.HTTP_507_INSUFFICIENT_STORAGE
     elif isinstance(exc, FileTooLargeError):
         status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
     elif isinstance(exc, DestinationGoneError):
@@ -9630,7 +9633,11 @@ async def storage_stats(
     the deployment's hard ceiling from MAX_STORAGE_GB, which the panel shows as the top of the
     range an admin may choose from. `allocated_bytes` is the sum of every active vault's declared
     limit — reported so an operator can see how much has been promised, NOT enforced against this
-    limit: an empty vault costs nothing until files land in it."""
+    limit: an empty vault costs nothing until files land in it.
+
+    `used` is the vaults' stored bytes; `limit_bytes` limits those and what legal holds keep after a deletion
+    together, `limit_counts_bytes` (the same as `on_disk_bytes`). `free_space_floor_bytes` is the free space the
+    volume keeps (MIN_FREE_SPACE_GB): an upload, an SFTP write or a copy that would leave less is refused."""
     from sqlalchemy import func as _f
     from app.services.vault_service import vaults_stored_bytes, deployment_storage_limit_bytes
     used = vaults_stored_bytes(db)
@@ -9647,6 +9654,9 @@ async def storage_stats(
     # Files a legal hold keeps after their deletion: on this disk, in no vault's counters.
     from app.core import kept_tables
     kept = kept_tables.totals(db)
+    # The free space the storage volume keeps (app/core/free_space.py): 0 when it is off or cannot be judged.
+    from app.core import free_space
+    room = free_space.room()
     return {
         "total": total,
         # The vaults' stored bytes. The deployment's storage limit (limit_bytes) counts these and the kept ones
@@ -9659,6 +9669,8 @@ async def storage_stats(
         # What limit_bytes is measured against: the same sum, by name.
         "limit_counts_bytes": used + kept["bytes"],
         "available": available,
+        # Uploads, SFTP writes and copies are refused once they would leave less than this free (MIN_FREE_SPACE_GB).
+        "free_space_floor_bytes": room.floor if room is not None else 0,
         "allocated_bytes": allocated,
         "limit_bytes": limit,
         "max_bytes": storage_quota.env_ceiling_bytes(settings.max_storage_gb),
@@ -15427,6 +15439,7 @@ async def open_receiver_upload_session(
         raise HTTPException(status_code=413,
                             detail=f"File exceeds the maximum size of {per_file_cap // (1024 * 1024)} MB.")
     _enforce_deployment_storage_quota(db, size)
+    _enforce_free_space(size)
 
     # Bound concurrent open anon sessions per receiver (transient-buffer DoS bound).
     now = datetime.utcnow()
@@ -15568,6 +15581,8 @@ async def receiver_upload_chunk(
             clen = None
         if clen is not None and clen > remaining:
             raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+    # A chunk is staged on the storage volume: refused while it would leave less than the free space the volume keeps.
+    _enforce_free_space(remaining)
 
     tmp_path = sdir / f".chunk_{chunk_index:06d}.{uuid.uuid4().hex}.part"
     # ---- THE BOUNDARY: no connection is held while the client sends. ----
@@ -15717,12 +15732,16 @@ async def receiver_complete_upload(
             file_info, stream_ctx = vault_service.upload_file_streaming(
                 vault_id=vault.id, file_name=fname, user=owner, folder_id=None,
                 mime_type=session.mime_type, file_id=None)
-            with stream_ctx as ctx:
-                for i in range(session.total_chunks):
-                    for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
-                        if buf:
-                            ctx.write_chunk(buf)
-                return ctx.get_checksum(), ctx.get_total_size()
+            try:
+                with stream_ctx as ctx:
+                    for i in range(session.total_chunks):
+                        for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                            if buf:
+                                ctx.write_chunk(buf)
+                    return ctx.get_checksum(), ctx.get_total_size()
+            except StorageLimitExceeded as refused:
+                # The storage volume reached the free space it keeps as the file was written.
+                raise _no_room(refused, "This upload would exceed the link's space.") from None
 
         def _record(final_checksum, final_size):
             if final_size != session.total_size:
@@ -17216,6 +17235,21 @@ def _enforce_deployment_storage_quota(db, additional_bytes: int) -> None:
         raise _deployment_storage_refusal(used, cap_bytes)
 
 
+def _enforce_free_space(additional_bytes: int) -> None:
+    """Refuse, before it starts, a transfer whose ``additional_bytes`` would leave the storage volume less than the
+    free space it keeps (MIN_FREE_SPACE_GB, app/core/free_space.py): 507, with the free space and the floor. Asked
+    before a byte is written: once they are on the disk, the volume's own free space counts them (the guard as they
+    are written, and the check as the row is written)."""
+    from app.core import free_space
+    short = free_space.short_of(additional_bytes)
+    if short is not None:
+        raise _disk_full_refusal(free_space.refusal_text(short))
+
+
+def _disk_full_refusal(text: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=text)
+
+
 def _deployment_storage_refusal(used: int, cap_bytes: int) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -17227,7 +17261,10 @@ def _deployment_storage_refusal(used: int, cap_bytes: int) -> HTTPException:
 
 def _no_room(refused: StorageLimitExceeded, vault_detail: str) -> HTTPException:
     """The 413 for a file finalize_streaming_upload found no room for: the deployment's answer, or
-    `vault_detail` for the vault's size limit (each upload path words its own)."""
+    `vault_detail` for the vault's size limit (each upload path words its own); a 507 for a storage volume left
+    with less than the free space it keeps (refused as the file was written or stored)."""
+    if refused.kind == 'disk':
+        return _disk_full_refusal(str(refused))
     if refused.kind == 'deployment':
         return _deployment_storage_refusal(refused.used, refused.cap)
     return HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=vault_detail)
@@ -20115,6 +20152,7 @@ async def upload_file(
         # before the per-vault reservation so a customer can't exceed their plan by
         # spreading data across many vaults.
         _enforce_deployment_storage_quota(db, estimated_upload_size)
+        _enforce_free_space(estimated_upload_size)
 
         # the per-file ceiling is enforced IN-STREAM inside the per-file loop below (see the
         # bytes_uploaded check) — matching chunked-init — so an oversized single file is aborted
@@ -21261,6 +21299,7 @@ async def init_chunked_upload(
     if vault.size_limit and (vault.total_size_bytes or 0) + body.total_size > vault.size_limit:
         raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
     _enforce_deployment_storage_quota(db, body.total_size)   # deployment-wide stored-bytes limit
+    _enforce_free_space(body.total_size)                     # the free space the storage volume keeps
 
     folder_uuid = None
     if body.folder_id:
@@ -21634,6 +21673,9 @@ async def upload_chunk(
             clen = None
         if clen is not None and clen > remaining:
             raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+    # A chunk is staged on the storage volume: refused while it would leave less than the free space the volume keeps
+    # (MIN_FREE_SPACE_GB), before anything of it is read.
+    _enforce_free_space(remaining)
 
     # Staged under a name unique to this REQUEST, not to the chunk index. The body is streamed
     # into this file across the whole transfer rather than written to it in one call at the end,
@@ -22010,15 +22052,20 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
             mime_type=session.mime_type,
             file_id=client_file_id,
         )
-        with stream_ctx as ctx:
-            for i in range(session.total_chunks):
-                # Each staged chunk was sealed on arrival; unseal it in order (memory-bounded,
-                # one record at a time) and hand the plaintext to the at-rest codec. A chunk
-                # staged as plaintext by a pre-upgrade release streams through verbatim.
-                for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
-                    if buf:
-                        ctx.write_chunk(buf)
-            return ctx.get_checksum(), ctx.get_total_size()
+        try:
+            with stream_ctx as ctx:
+                for i in range(session.total_chunks):
+                    # Each staged chunk was sealed on arrival; unseal it in order (memory-bounded,
+                    # one record at a time) and hand the plaintext to the at-rest codec. A chunk
+                    # staged as plaintext by a pre-upgrade release streams through verbatim.
+                    for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                        if buf:
+                            ctx.write_chunk(buf)
+                return ctx.get_checksum(), ctx.get_total_size()
+        except StorageLimitExceeded as refused:
+            # The storage volume reached the free space it keeps as the file was written (the context has
+            # removed it): answered as a refusal at the finish is. The staged chunks stay, for a retry.
+            raise _no_room(refused, "File would exceed the vault size limit") from None
 
     def _record(final_checksum, final_size):
         # A short delivery must not commit. Every other size check in this path is a one-sided

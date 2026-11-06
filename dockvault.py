@@ -768,6 +768,10 @@ def build_env_lines(cfg):
     # .env it always did.
     if cfg.get("max_storage_gb") not in (None, ""):
         bare("MAX_STORAGE_GB", format_gb_value(cfg["max_storage_gb"]))
+    # The free space the storage volume keeps. Same rule: written only when the operator chose one, so the app's
+    # default (-1: the larger of 2 GB and 5% of the volume) applies otherwise.
+    if cfg.get("min_free_space_gb") not in (None, ""):
+        bare("MIN_FREE_SPACE_GB", format_gb_value(cfg["min_free_space_gb"]))
     # Transfer ceiling. The one that costs memory is MAX_CONCURRENT_TRANSFERS; the other two only
     # shape what happens to callers who arrive at a full deployment. Same rule as storage: written
     # only when this deployment has a value, so an install that never mentions them authors the
@@ -1739,6 +1743,8 @@ def new_set_config(current_env, new_prefix, new_id):
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
             current_env.get("MAX_STORAGE_GB") or current_env.get("PLAN_MAX_STORAGE_GB")),
+        # And the free space the storage volume keeps.
+        "min_free_space_gb": parse_max_storage_gb(current_env.get("MIN_FREE_SPACE_GB")),
         # Likewise for the transfer ceiling: an operator who lowered it to fit the machine's
         # memory should not find it back at the default because they took a fresh volume set.
         "max_concurrent_transfers": parse_transfer_limit(
@@ -4488,6 +4494,7 @@ class DockVault:
             "audit_fingerprint_key": gen_hex(32),
             "audit_chain_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
+            "min_free_space_gb": (getattr(args, "min_free_space_gb", None) if args else None),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.
             "max_concurrent_transfers": parse_transfer_limit(
@@ -7980,6 +7987,9 @@ def build_parser():
                          "a fresh install; interactive setup asks)")
     sp.add_argument("--max-storage-gb", dest="max_storage_gb", type=float,
                     help="deployment storage ceiling in GB (-1 = unlimited, the default)")
+    sp.add_argument("--min-free-space-gb", dest="min_free_space_gb", type=float,
+                    help="the free space in GB the storage volume keeps: uploads that would leave less are "
+                         "refused (-1, the default: the larger of 2 GB and 5%% of the volume; 0 = off)")
     sp.add_argument("--max-concurrent-transfers", dest="max_concurrent_transfers", type=int,
                     help="how many uploads and downloads may run at once (16 by default). Each "
                          "costs a fixed amount of memory whatever the file weighs, so lower this "

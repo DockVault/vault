@@ -129,6 +129,7 @@ class _World:
         monkeypatch.setattr(S, "_vault_credential_fingerprint", fingerprint)
         monkeypatch.setattr(S, "require_folder_scope", folder_scope)
         monkeypatch.setattr(S, "_enforce_deployment_storage_quota", lambda db, size: None)
+        monkeypatch.setattr(S, "_enforce_free_space", lambda size: None)
         monkeypatch.setattr(S, "_upload_policy", lambda db: (None, 10 ** 12))
         monkeypatch.setattr(S, "_enforce_file_type", lambda name, allowed: None)
         monkeypatch.setattr(S, "start_operation", started)

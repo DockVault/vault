@@ -76,10 +76,13 @@ class StreamingUploadContext:
     ``security.IdentityChunkCodec`` (zero-knowledge passthrough).
     """
 
-    def __init__(self, file_id, storage_path: Path, codec):
+    def __init__(self, file_id, storage_path: Path, codec, guard=None):
         self.file_id = file_id
         self.storage_path = storage_path
         self.codec = codec
+        # Asked before each chunk is written (app/core/free_space.py, WriteGuard): raises to stop the transfer
+        # when the storage volume is down to the free space it keeps. The error removes the file (__exit__).
+        self.guard = guard
         self.file_handle = None
         self.total_bytes = 0
         self.hasher = hashlib.sha256()
@@ -164,6 +167,9 @@ class StreamingUploadContext:
         """
         if not chunk:
             return 0
+
+        if self.guard is not None:
+            self.guard.wrote(len(chunk))
 
         # Update checksum with raw data
         self.hasher.update(chunk)

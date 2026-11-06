@@ -48,6 +48,7 @@ def _job_text(name: str, next_name: str | None) -> str:
 _SIZE_WITHOUT_A_CEILING = "Exercise the size accounting with no storage ceiling"
 _SCENARIO_STEPS = (
     "Exercise the transfer ceiling on a deployment that refuses",
+    "Exercise the free-space floor set above the disk's size",
     "Exercise the log-pull endpoint with its ceiling on",
     "Exercise the vault-type allowlist against a forbidden type",
     _SIZE_WITHOUT_A_CEILING,

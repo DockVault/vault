@@ -130,7 +130,10 @@ retire is told only that a legal hold keeps it. A per-person erase waits while a
 case is open, and says which case it waits for. A hold nobody has confirmed yet keeps what is deleted from its
 vaults, which counts toward the deployment's storage limit (`MAX_STORAGE_GB`, or the lower limit set on the
 Settings page), but holds no erase back: one person places it alone. One person can have at most five hold-only
-cases waiting for confirmation at once.
+cases waiting for confirmation at once. Without a storage limit (the default), what holds keep is bounded by the
+free space the storage volume keeps (`MIN_FREE_SPACE_GB`: by default the larger of 2 GB and 5% of the volume):
+uploads, SFTP writes and copies that would leave less are refused, so deleting and uploading in turn in a held
+vault cannot fill the disk.
 
 ### Upgrading with SFTP in its own container
 

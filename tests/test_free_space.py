@@ -1,0 +1,259 @@
+"""The free space the storage volume keeps (MIN_FREE_SPACE_GB, app/core/free_space.py), offline.
+
+On the shipped defaults nothing else bounds the disk: no deployment storage limit, and what legal holds keep after a
+deletion is in no vault's size, so a member of a held vault could upload and delete in turn until the disk was full,
+and the database, which usually shares it, with it. Every write of a file's bytes now keeps at least the floor free:
+by default the larger of 2 GB and 5% of the volume, 0 turns it off, any other value is that many GB.
+
+- before a transfer starts, when its size is known: an upload's declared length, a chunked upload's declared size, a
+  chunk's, a copy's (507 with the free space and the floor);
+- while its bytes are written (StreamingUploadContext's guard): at the first write and every CHECK_EVERY_BYTES, so one
+  transfer of unknown size cannot run the disk to its end; the file is removed;
+- as its row is written (VaultService._claim_room), with its bytes on the disk: refused, rolled back and removed;
+- an SFTP write stops with the reason as its status;
+- a volume that reports no size, or whose free space cannot be read, is not checked.
+
+These stub the volume's figures (shutil.disk_usage). test_free_space_floor_live.py runs a stack whose floor is above
+its disk; test_api_storage_stats.py checks the floor the storage panel reports.
+"""
+import uuid
+from collections import namedtuple
+from types import SimpleNamespace
+
+import pytest
+
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
+
+from app.core import free_space  # noqa: E402
+from app.core.models import Vault  # noqa: E402
+from test_storage_room_at_finish import MB, _DB, _copy_service, _vault, finish, limits  # noqa: E402,F401
+
+pytestmark = pytest.mark.unit
+
+GIB = 1024 ** 3
+Usage = namedtuple("Usage", "total used free")
+
+
+@pytest.fixture
+def volume(monkeypatch):
+    """The storage volume's figures, as shutil.disk_usage gives them, and the floor setting (-1: automatic)."""
+    state = {"total": 100 * GIB, "free": 50 * GIB, "configured": -1, "asked": 0}
+
+    def usage(path):
+        state["asked"] += 1
+        if isinstance(state["total"], Exception):
+            raise state["total"]
+        return Usage(state["total"], state["total"] - state["free"], state["free"])
+    monkeypatch.setattr(free_space.shutil, "disk_usage", usage)
+    monkeypatch.setattr(free_space, "configured_gb", lambda: state["configured"])
+    monkeypatch.setattr(free_space, "_said", type(free_space._said)())
+    return state
+
+
+@pytest.mark.parametrize("total, configured, floor", [
+    (10 * GIB, -1, 2 * GIB),                 # 5% of a small volume is less than 2 GB
+    (100 * GIB, -1, 5 * GIB),                # 5% of a large one
+    (100 * GIB, None, 5 * GIB),              # unset reads as automatic
+    (100 * GIB, float("nan"), 5 * GIB),
+    (100 * GIB, -7, 5 * GIB),
+    (100 * GIB, "not a number", 5 * GIB),
+    (100 * GIB, 0, 0),                       # off
+    (100 * GIB, 25, 25 * GIB),
+    (100 * GIB, 2.5, int(2.5 * GIB)),
+])
+def test_the_floor_is_the_larger_of_2_gb_and_5_percent_unless_set(total, configured, floor):
+    assert free_space.floor_bytes(total, configured=configured if configured is not None else -1) == floor
+
+
+def test_a_write_that_would_leave_less_than_the_floor_is_short(volume):
+    volume["free"] = 6 * GIB                                  # floor 5 GB
+    assert free_space.short_of(0) is None
+    assert free_space.short_of(GIB) is None                   # leaves exactly the floor
+    short = free_space.short_of(GIB + 1)
+    assert short == free_space.Room(free=6 * GIB, floor=5 * GIB, total=100 * GIB)
+    volume["free"] = 5 * GIB - 1
+    assert free_space.short_of(0) is not None
+
+
+def test_the_floor_off_never_refuses(volume):
+    volume["configured"], volume["free"] = 0, 0
+    assert free_space.room() is None and free_space.short_of(10 * GIB) is None
+
+
+def test_a_volume_that_reports_no_size_is_not_judged(volume):
+    volume["total"], volume["free"] = 0, 0
+    assert free_space.short_of(GIB) is None
+
+
+def test_a_volume_whose_free_space_cannot_be_read_is_not_judged_and_said_once(volume, capsys):
+    volume["total"] = PermissionError("statvfs refused")
+    assert free_space.short_of(GIB) is None and free_space.short_of(GIB) is None
+    said = capsys.readouterr().out.strip().splitlines()
+    assert said == ["Warning: the free space of the storage volume could not be read (PermissionError); uploads "
+                    "are not held to MIN_FREE_SPACE_GB while it cannot"]
+
+
+def test_the_refusal_says_the_free_space_and_the_floor():
+    text = free_space.refusal_text(free_space.Room(free=3 * GIB, floor=5 * GIB, total=100 * GIB))
+    assert text.startswith("The server's storage is nearly full: 3.00 GB is free, and it keeps at least 5.00 GB "
+                           "free")
+    assert "MIN_FREE_SPACE_GB" in text
+
+
+def test_the_guard_looks_at_the_first_write_and_then_every_check_every_bytes(volume):
+    refused = []
+    guard = free_space.WriteGuard(None, refused.append)
+    guard.wrote(10)
+    assert volume["asked"] == 1
+    for _ in range(free_space.CHECK_EVERY_BYTES // MB - 1):
+        guard.wrote(MB)
+    assert volume["asked"] == 1, "looked again before CHECK_EVERY_BYTES were written"
+    volume["free"] = 4 * GIB
+    guard.wrote(MB)
+    assert volume["asked"] == 2 and len(refused) == 1
+
+
+# --------------------------------------------------------------------------- as the bytes are written
+
+def _context(tmp_path, refuse_after_bytes):
+    """A StreamingUploadContext whose guard refuses once `refuse_after_bytes` have been handed to it."""
+    from app.core.security import IdentityChunkCodec
+    from app.services.streaming_upload import StreamingUploadContext
+    seen = {"n": 0}
+
+    class Guard:
+        def wrote(self, n):
+            seen["n"] += n
+            if seen["n"] > refuse_after_bytes:
+                raise RuntimeError("the volume is down to its floor")
+    return StreamingUploadContext(uuid.uuid4(), tmp_path / "blob", IdentityChunkCodec(), guard=Guard())
+
+
+def test_a_transfer_that_runs_the_volume_down_to_its_floor_stops_and_its_file_goes(tmp_path):
+    ctx = _context(tmp_path, refuse_after_bytes=3 * MB)
+    with pytest.raises(RuntimeError, match="down to its floor"):
+        with ctx:
+            for _ in range(10):
+                ctx.write_chunk(b"x" * MB)
+    assert not (tmp_path / "blob").exists(), "the refused file was left on the disk"
+    assert ctx.total_bytes == 3 * MB, "a chunk was written after the guard refused it"
+
+
+def test_an_upload_streams_through_the_guard_of_the_storage_volume(volume, tmp_path, monkeypatch):
+    """upload_file_streaming hands its context the volume's guard: a refusal is StorageLimitExceeded, kind 'disk',
+    with the free space and the floor, and the file goes."""
+    import app.services.vault_service as vs
+    svc = vs.VaultService.__new__(vs.VaultService)
+    svc.storage_path = tmp_path
+    svc.permission_service = SimpleNamespace(require_vault_permission=lambda *a, **k: None)
+    vault = _vault(0, None)
+    svc.db = _DB({Vault: [vault]})
+    monkeypatch.setattr(svc, "_id_is_spent", lambda file_id: False)
+    file_info, ctx = svc.upload_file_streaming(vault.id, "a.bin", SimpleNamespace(id=uuid.uuid4()))
+    volume["free"] = 6 * GIB
+    with pytest.raises(vs.StorageLimitExceeded) as refused:
+        with ctx:
+            ctx.write_chunk(b"x" * MB)
+            volume["free"] = 5 * GIB - 1
+            for _ in range(free_space.CHECK_EVERY_BYTES // MB + 1):
+                ctx.write_chunk(b"x" * MB)
+    assert (refused.value.kind, refused.value.used, refused.value.cap) == ("disk", 5 * GIB - 1, 5 * GIB)
+    assert str(refused.value).startswith("The server's storage is nearly full")
+    assert not (tmp_path / file_info["storage_path"]).exists()
+
+
+# --------------------------------------------------------------------------- as the row is written
+
+def test_a_file_that_left_less_than_the_floor_is_refused_as_its_row_is_written(finish, volume):
+    import app.services.vault_service as vs
+    call, removed = finish
+    vault = _vault(0, None)
+    db = _DB({Vault: [vault]})
+    volume["free"] = 5 * GIB - 1
+    with pytest.raises(vs.StorageLimitExceeded) as refused:
+        call(db, vault, MB)
+    assert refused.value.kind == "disk" and len(removed) == 1
+    assert [e[0] for e in db.log if e[0] in ("add", "commit", "rollback")] == ["rollback"]
+    volume["free"] = 5 * GIB
+    assert call(_DB({Vault: [vault]}), vault, MB) is not None, "a file leaving exactly the floor is stored"
+
+
+def test_a_copy_that_would_leave_less_than_the_floor_is_refused_before_it_is_written(monkeypatch, volume):
+    import app.services.vault_service as vs
+    svc, source, dest = _copy_service(monkeypatch, "vault")
+    dest.size_limit = None                    # no vault limit to refuse it first
+    written = []
+    svc.upload_file_streaming = lambda *a, **k: written.append(True)
+    source.size_bytes = GIB + 1
+    volume["free"] = 6 * GIB
+    with pytest.raises(vs.StorageLimitExceeded) as refused:
+        svc._stream_copy_file_record(source, SimpleNamespace(id="u"), dest.id, None)
+    assert refused.value.kind == "disk" and written == []
+
+
+def test_a_copy_refused_as_its_row_is_written_keeps_the_volumes_words(monkeypatch):
+    import app.services.vault_service as vs
+    svc, source, dest = _copy_service(monkeypatch, "disk")
+    with pytest.raises(vs.StorageLimitExceeded) as refused:
+        svc._stream_copy_file_record(source, SimpleNamespace(id="u"), dest.id, None)
+    assert refused.value.kind == "disk" and str(refused.value) == "found under the lock"
+
+
+# --------------------------------------------------------------------------- what the routes answer
+
+def test_a_route_answers_507_with_the_free_space_and_the_floor(volume):
+    from fastapi import HTTPException
+    from app.api import api_server as api
+    from app.services.vault_service import StorageLimitExceeded
+    volume["free"] = 6 * GIB
+    api._enforce_free_space(GIB)
+    with pytest.raises(HTTPException) as refused:
+        api._enforce_free_space(GIB + 1)
+    assert refused.value.status_code == 507
+    assert refused.value.detail.startswith("The server's storage is nearly full: 6.00 GB is free")
+    answered = api._no_room(StorageLimitExceeded("the volume's words", kind="disk", used=1, cap=2), "unused")
+    assert (answered.status_code, answered.detail) == (507, "the volume's words")
+
+
+def test_a_refusal_that_reaches_the_applications_handler_is_507(volume):
+    import json
+    from _async_run import run_coroutine
+    from app.api import api_server as api
+    from app.services.vault_service import StorageLimitExceeded
+    answer = run_coroutine(api._file_service_error_handler(
+        SimpleNamespace(), StorageLimitExceeded("the volume's words", kind="disk", used=1, cap=2)))
+    assert answer.status_code == 507 and json.loads(answer.body) == {"detail": "the volume's words"}
+    vault = run_coroutine(api._file_service_error_handler(
+        SimpleNamespace(), StorageLimitExceeded("no room", kind="vault", used=1, cap=2)))
+    assert vault.status_code == 413
+
+
+def test_the_deployments_early_check_is_still_its_own_and_asked_after_the_bytes_land(volume, monkeypatch):
+    """The direct upload asks the deployment's limit again with the file's real size once its bytes are written:
+    the volume's floor is not asked there with that size, which the volume's free space counts already."""
+    from app.api import api_server as api
+    import app.services.vault_service as vs
+    monkeypatch.setattr(vs, "would_exceed_deployment_storage", lambda db, n: (False, 0, 0))
+    volume["free"] = 6 * GIB
+    api._enforce_deployment_storage_quota(None, 2 * GIB)
+
+
+def test_an_sftp_write_the_volume_has_no_room_for_stops_with_its_reason():
+    import paramiko
+    from app.services.vault_service import StorageLimitExceeded
+    from app.sftp import sftp_server as S
+    said = []
+    upload = S._StreamingUpload.__new__(S._StreamingUpload)
+    upload._failed, upload._max_bytes = False, 0
+    upload._handle = SimpleNamespace(_set_status_desc=said.append)
+
+    class Assembler:
+        def feed(self, offset, data):
+            raise StorageLimitExceeded("The server's storage is nearly full: 1.0 GB is free", kind="disk",
+                                       used=GIB, cap=5 * GIB)
+    upload._assembler = Assembler()
+    assert upload.write(0, b"x" * 10) == paramiko.SFTP_FAILURE
+    assert upload._failed is True
+    assert said == ["upload rejected: The server's storage is nearly full: 1.0 GB is free"]

@@ -3070,6 +3070,25 @@ def test_a_fresh_volume_set_keeps_the_configured_ceiling():
     assert "MAX_STORAGE_GB=64" in dv.build_env_lines({**cfg, "server_name": "localhost"})
 
 
+def test_setup_writes_the_free_space_floor_only_when_asked_and_a_fresh_set_keeps_it():
+    """MIN_FREE_SPACE_GB: the app's own default (the larger of 2 GB and 5% of the volume) unless the operator chose
+    a value at setup (--min-free-space-gb), and kept across a fresh volume set of the same deployment."""
+    from app.core.config import Settings
+    cfg = _reusable_env_cfg()
+    assert not [ln for ln in dv.build_env_lines(cfg) if ln.startswith("MIN_FREE_SPACE_GB")]
+    for given, written in ((0, "MIN_FREE_SPACE_GB=0"), (25, "MIN_FREE_SPACE_GB=25"), (2.5, "MIN_FREE_SPACE_GB=2.5")):
+        assert written in dv.build_env_lines(dict(cfg, min_free_space_gb=given))
+        assert Settings(min_free_space_gb=written.split("=", 1)[1]).min_free_space_gb == float(given)
+    args = dv.build_parser().parse_args(["setup", "--non-interactive", "--min-free-space-gb", "10"])
+    assert args.min_free_space_gb == 10.0
+    assert dv.build_parser().parse_args(["setup", "--non-interactive"]).min_free_space_gb is None
+    kept = dv.new_set_config({"MIN_FREE_SPACE_GB": "0"}, "prefix-1", "dep-1")
+    assert kept["min_free_space_gb"] == 0.0
+    assert "MIN_FREE_SPACE_GB=0" in dv.build_env_lines({**kept, "server_name": "localhost"})
+    assert dv.new_set_config({}, "prefix-1", "dep-1")["min_free_space_gb"] is None
+    assert Settings.model_fields["min_free_space_gb"].default == -1
+
+
 # The transfer ceiling (MAX_CONCURRENT_TRANSFERS and the two queue settings beside it). It is a
 # memory ceiling in the same sense MAX_STORAGE_GB is a disk one, so it is handled on the same
 # terms: written only when the deployment has a value, and carried across a fresh volume set.

@@ -112,8 +112,11 @@ def _service(db, removed):
 def limits(monkeypatch):
     """Set the deployment's storage limit (None: none) and what it holds, as finalize reads them."""
     import app.services.vault_service as vs
+    from app.core import free_space
     state = {"cap": None, "used": 0, "db": None}
     monkeypatch.setattr(vs, "deployment_storage_limit_bytes", lambda _db: state["cap"])
+    # The storage volume's free space is not this file's question (tests/test_free_space.py): no volume to read.
+    monkeypatch.setattr(free_space, "storage_path", lambda: "/nonexistent/storage/volume")
 
     def stored(_db):
         _db.log.append(("deployment total",))
@@ -378,8 +381,11 @@ def test_an_sftp_write_takes_the_turn_before_it_locks_the_vaults_row_when_it_per
 def _copy_service(monkeypatch, refusal_kind):
     import app.services.vault_service as vs
     monkeypatch.setattr(vs, "would_exceed_deployment_storage", lambda db, n: (False, 0, 0))
+    from app.core import free_space
+    monkeypatch.setattr(free_space, "storage_path", lambda: "/nonexistent/storage/volume")
     dest = _vault(0, 64 * MB)
     svc = vs.VaultService.__new__(vs.VaultService)
+    svc.storage_path = None
     svc.db = _DB({Vault: [dest]})
     svc.open_download_stream = lambda *a, **k: SimpleNamespace(chunks=lambda: iter([b"x" * 10]),
                                                                close=lambda: None)

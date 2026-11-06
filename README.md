@@ -25,7 +25,9 @@ Licensed under **AGPL-3.0** — self-host it freely.
 - **Storage limits at three levels** — a deployment ceiling (`MAX_STORAGE_GB`, which an
   administrator can lower from the panel but never raise), a per-account quota users spend by
   allocating storage to vaults, and a per-vault size that the owner *and* vault managers can each
-  top up from their own quota and reclaim again.
+  top up from their own quota and reclaim again. Below them all, the storage volume always keeps some free space
+  (`MIN_FREE_SPACE_GB`, by default the larger of 2 GB and 5% of the disk): an upload that would leave less is
+  refused rather than fill the disk the database shares.
 - **Login rate-limiting** and durable session revocation.
 - **Single standalone image** — needs only its bundled PostgreSQL + Redis; no external
   services required.
