@@ -115,6 +115,16 @@ out = {}
 now = datetime.now(timezone.utc).replace(tzinfo=None)
 base = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=6)
 
+def rows(sql):
+    """A query's rows, read in a session closed at once. A session left open keeps its transaction, and the lock
+    its read took on the table, until the garbage collector frees it, whenever that is: the DROP TRIGGER below
+    then waits for that lock past the connection's lock_timeout."""
+    db = SessionLocal()
+    try:
+        return db.execute(text(sql)).all()
+    finally:
+        db.close()
+
 with engine.begin() as c:
     c.execute(text("INSERT INTO system_settings (key, value) VALUES ('audit_name_redaction_purged', '{}')"))
     for i in range(12):
@@ -135,8 +145,8 @@ for _ in range(50):
     if r.stopped or not r.sealed:
         break
 out["stopped"] = r.stopped
-out["kinds"] = [k for (k,) in SessionLocal().execute(text("SELECT kind FROM audit_seals ORDER BY seq"))]
-out["salted"] = SessionLocal().execute(text("SELECT count(*) FROM audit_seals WHERE legacy_salt IS NOT NULL")).scalar()
+out["kinds"] = [k for (k,) in rows("SELECT kind FROM audit_seals ORDER BY seq")]
+out["salted"] = rows("SELECT count(*) FROM audit_seals WHERE legacy_salt IS NOT NULL")[0][0]
 
 def report():
     db = SessionLocal()
@@ -159,8 +169,8 @@ def tamper(sql, restore):
         c.execute(text(restore))
     return kinds
 
-one = SessionLocal().execute(text("SELECT id::text, details::text, recorded::text, username FROM audit_logs "
-                                  "WHERE action = 'file_uploaded' ORDER BY timestamp LIMIT 1 OFFSET 1")).first()
+one = rows("SELECT id::text, details::text, recorded::text, username FROM audit_logs "
+           "WHERE action = 'file_uploaded' ORDER BY timestamp LIMIT 1 OFFSET 1")[0]
 rid, details, recorded, username = one
 q = lambda s: s.replace("'", "''")
 out["respelled"] = tamper(
@@ -213,7 +223,7 @@ done = audit_chain_prune.prune(p, [AuditLog.timestamp < base + timedelta(hours=1
                                    AuditLog.action == "file_uploaded"], reason="retention")
 out["pruned"] = done.deleted
 out["after_prune"], rep = report()
-out["prune_seals"] = SessionLocal().execute(text("SELECT count(*) FROM audit_seals WHERE kind = 'prune'")).scalar()
+out["prune_seals"] = rows("SELECT count(*) FROM audit_seals WHERE kind = 'prune'")[0][0]
 print(json.dumps(out, default=str))
 '''
 
