@@ -431,11 +431,14 @@ def test_key_is_encrypted():
 def test_render_renewal_hook():
     hook = dv.render_renewal_hook("/opt/vault", "/opt/vault/certs", "vault.example.com", "vault-api")
     assert hook.startswith("#!/bin/bash")
-    assert "/etc/letsencrypt/live/vault.example.com/fullchain.pem" in hook
+    assert "LIVE=/etc/letsencrypt/live/vault.example.com" in hook and '"$LIVE/fullchain.pem"' in hook
     assert "openssl x509" in hook and "openssl pkey" in hook            # validates the renewed pair
     assert '[ -n "$_c" ]' in hook                                       # non-empty guard (missing openssl -> fail)
-    assert 'mv "$CD/.new-key.pem"  "$CD/key.pem"' in hook               # atomic swap
-    assert "docker compose" in hook and "restart vault-api" in hook     # restarts so uvicorn reloads
+    assert 'mv -fT "$T/key.pem" key.pem' in hook                        # atomic swap, replacing the name
+    assert "docker restart vault-api" in hook                           # restarts so uvicorn reloads
+    # Run as root by certbot: nothing of the checkout (its compose file, its .env) is read. The hook's behaviour
+    # is run in tests/test_dockvault_renewal_hook.py.
+    assert "/opt/vault/.env" not in hook and "docker-compose" not in hook and "docker compose" not in hook
 
 
 def test_engine_is_remapped_detects_rootless_and_userns():

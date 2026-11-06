@@ -245,6 +245,7 @@ import hashlib  # noqa: E402
 import json     # noqa: E402
 import math     # noqa: E402
 import re       # noqa: E402
+import shlex    # noqa: E402
 import tempfile # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
@@ -1086,45 +1087,80 @@ def install_byo_cert(cert_dir, cert_path, key_path, run=subprocess.run):
     return True, "installed the bring-your-own certificate" + caveat
 
 
-def render_renewal_hook(app_dir, cert_dir, server_name, service):
-    """The certbot deploy-hook script text: on renewal, stage the new fullchain/privkey, preserve
-    the live key's owner+mode, VALIDATE the new pair, atomically swap them into cert_dir, then
-    restart the app service so uvicorn reloads. Pure text (POSIX-only; mirrors setup-secure.sh)."""
+RENEWAL_HOOK = "/etc/letsencrypt/renewal-hooks/deploy/dockvault-vault.sh"
+
+
+def render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=None, owners=(0, APP_UID)):
+    """The certbot deploy-hook script text, which certbot runs as root, unattended, at each renewal: stage the new
+    fullchain/privkey, VALIDATE the pair, swap it into cert_dir keeping the live key's owner and mode, then restart
+    the web container so uvicorn reloads.
+
+    It trusts nothing a less trusted account could change. It reads no file of the checkout (`app_dir`, which may
+    belong to another account): no compose file, no .env, and it restarts the container by its fixed name. It works
+    in the certificate folder only once it has entered it and found it to be the very folder setup made (its
+    physical path, so not a link put in its place), owned by root or by the container's app user (`owners`), and
+    writable by nobody else; then nobody else can put a name in it. It stages in a fresh folder of its own there,
+    and its changes of owner and mode follow no link (chown -h, files it just made), its moves replace names
+    (mv -T). Anything else stops it before it changes anything. Pure text (POSIX-only, GNU coreutils)."""
+    q = shlex.quote
+    real = os.path.realpath(cert_dir)
+    live = live_dir or "/etc/letsencrypt/live/%s" % server_name
+    allowed = " ".join(str(int(o)) for o in sorted(set(owners)))
+    stop = 'echo "dockvault renewal: %s; nothing was renewed" >&2; exit 1'
     return "\n".join([
         "#!/bin/bash",
         "# Written by dockvault.py - deploys a renewed Let's Encrypt cert into the vault stack and",
-        "# restarts the API so uvicorn picks it up.",
-        "set -e",
-        'CD="%s"' % cert_dir,
-        'install -m 644 "/etc/letsencrypt/live/%s/fullchain.pem" "$CD/.new-cert.pem"' % server_name,
-        'install -m 600 "/etc/letsencrypt/live/%s/privkey.pem"   "$CD/.new-key.pem"' % server_name,
-        '_own="$(stat -c \'%u:%g\' "$CD/key.pem" 2>/dev/null || echo 0:0)"',
-        '_mode="$(stat -c \'%a\' "$CD/key.pem" 2>/dev/null || echo 644)"',
-        'chown "$_own" "$CD/.new-key.pem" "$CD/.new-cert.pem" 2>/dev/null || true',
-        'chmod "$_mode" "$CD/.new-key.pem" 2>/dev/null || chmod 644 "$CD/.new-key.pem"',
-        'chmod 644 "$CD/.new-cert.pem"',
-        '_c="$(openssl x509 -in "$CD/.new-cert.pem" -pubkey -noout)"',
-        '_k="$(openssl pkey -in "$CD/.new-key.pem" -pubout)"',
+        "# restarts the web container so uvicorn picks it up. It reads nothing from the checkout.",
+        "set -eu",
+        "LIVE=%s" % q(live),
+        "CD=%s" % q(real),
+        'cd -P -- "$CD" || { %s; }' % (stop % "cannot enter the certificate folder"),
+        '[ "$(pwd -P)" = "$CD" ] || { %s; }' % (stop % "the certificate folder is not the one setup made"),
+        "_o=\"$(stat -c '%u' .)\"",
+        "_m=\"$(stat -c '%a' .)\"",
+        'case " %s " in *" $_o "*) ;; *) %s;; esac' % (allowed, stop % "the certificate folder is not owned by "
+                                                                       "root or the app user"),
+        '[ $(( 0$_m & 022 )) -eq 0 ] || { %s; }' % (stop % "the certificate folder is writable by others"),
+        'T="$(mktemp -d .renew.XXXXXX)"',
+        "trap 'rm -rf -- \"$T\"' EXIT",
+        'install -m 600 "$LIVE/fullchain.pem" "$T/cert.pem"',
+        'install -m 600 "$LIVE/privkey.pem" "$T/key.pem"',
+        "_own=\"$(stat -c '%u:%g' key.pem 2>/dev/null || echo 0:0)\"",
+        "_mode=\"$(stat -c '%a' key.pem 2>/dev/null || echo 600)\"",
+        'chown -h "$_own" "$T/key.pem" "$T/cert.pem"',
+        'chmod "$_mode" "$T/key.pem"',
+        'chmod 644 "$T/cert.pem"',
+        '_c="$(openssl x509 -in "$T/cert.pem" -pubkey -noout)"',
+        '_k="$(openssl pkey -in "$T/key.pem" -pubout)"',
         '[ -n "$_c" ] && [ "$_c" = "$_k" ]  # non-empty so a missing openssl fails (never swaps unvalidated)',
-        'mv "$CD/.new-key.pem"  "$CD/key.pem"',
-        'mv "$CD/.new-cert.pem" "$CD/cert.pem"',
-        'cd "%s" && docker compose --env-file "%s/.env" -f "%s/docker-compose.secure.yml" restart %s'
-        % (app_dir, app_dir, app_dir, service),
+        'mv -fT "$T/key.pem" key.pem',
+        'mv -fT "$T/cert.pem" cert.pem',
+        "docker restart %s" % q(service),
         "",
     ])
 
 
-def install_renewal_hook(app_dir, cert_dir, server_name, service):
-    """Write the certbot deploy hook (POSIX). Returns True on success."""
-    hook = "/etc/letsencrypt/renewal-hooks/deploy/dockvault-vault.sh"
+def install_renewal_hook(app_dir, cert_dir, server_name, service, owners=(0, APP_UID), hook=RENEWAL_HOOK):
+    """Write the certbot deploy hook (POSIX), root's, 755: written whole beside its name and moved over it, so the
+    name is never written through (a link there is replaced, not followed). Returns True on success."""
+    tmp = None
     try:
         os.makedirs(os.path.dirname(hook), exist_ok=True)
-        with open(hook, "w", encoding="utf-8", newline="\n") as f:
-            f.write(render_renewal_hook(app_dir, cert_dir, server_name, service))
-        os.chmod(hook, 0o755)
+        fd, tmp = tempfile.mkstemp(prefix=".dockvault-hook-", dir=os.path.dirname(hook))
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(render_renewal_hook(app_dir, cert_dir, server_name, service, owners=owners))
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, hook)
+        tmp = None
         return True
     except Exception:  # noqa: BLE001
         return False
+    finally:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def obtain_letsencrypt_cert(cert_dir, server_name, email, app_dir, service, run=subprocess.run):
@@ -1148,7 +1184,11 @@ def obtain_letsencrypt_cert(cert_dir, server_name, email, app_dir, service, run=
     ok, msg = install_byo_cert(cert_dir, live + "/fullchain.pem", live + "/privkey.pem", run=run)
     if not ok:
         return False, msg
-    install_renewal_hook(app_dir, cert_dir, server_name, service)
+    # The owners the hook accepts for the certificate folder: root, and whom apply_cert_owner hands it to (the app's
+    # uid, or the host uid it maps to on a userns-remap engine).
+    mapped = _remapped_cert_owner(run)
+    install_renewal_hook(app_dir, cert_dir, server_name, service,
+                         owners=(0, APP_UID) + ((mapped,) if mapped is not None else ()))
     return True, "obtained a Let's Encrypt certificate + installed the auto-renewal hook"
 
 

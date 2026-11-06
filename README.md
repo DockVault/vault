@@ -136,6 +136,11 @@ docker compose -f docker-compose.secure.yml up -d
 > root it hands the pair to uid `10001` itself; run as another user (in the `docker` group, or with a
 > rootless engine) it does it from a container as above, keeping the key `600`, and makes the key
 > world-readable (`644`) only when that fails too. Your own user then no longer reads `key.pem`.
+>
+> The Let's Encrypt renewal hook setup installs runs as root at each renewal. It reads nothing from
+> the checkout: it restarts the web container by name (`docker restart`), and it writes the renewed
+> pair only into the certificate folder setup made, refusing (and renewing nothing) when that folder
+> has been replaced by a link, is writable by others, or is owned by anyone but root or the app user.
 
 > **`.env` is found automatically — never move it.** The root `docker-compose.secure.yml` (and the
 > `docker-compose.yml` below) are thin `include:` shims over the real files in `deploy/`. Running
