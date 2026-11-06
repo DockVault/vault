@@ -2009,6 +2009,27 @@ BACKUP_REQUIRED_ROLES = ("pg", "storage", "keys")
 # While a backup holds the deployment paused, SignalsEndTheRun turns them into an exit that resumes it first. Ctrl-C
 # is a KeyboardInterrupt already, which runs them. Each is used where this platform has it.
 RUN_ENDING_SIGNALS = ("SIGHUP", "SIGTERM", "SIGBREAK")
+# A resume of the deployment that Docker did not confirm is asked about and tried again: up to RESUME_RETRIES more
+# rounds, RESUME_RETRY_GAP seconds apart, none begun once RESUME_RETRY_SECONDS have passed since the first try (a
+# Docker that does not answer is not waited for again and again). The first try's docker child can be ended by the
+# signal that ends the run: one started in the very moment the signal reaches the run's process group is still in
+# that group, and systemd's stop signals every process of the service, whatever its group.
+RESUME_RETRIES = 3
+RESUME_RETRY_GAP = 0.5
+RESUME_RETRY_SECONDS = 30
+
+
+def own_session_kwargs():
+    """The subprocess keyword arguments that start a docker child out of reach of the signals that end this run. A
+    terminal's hangup (twice: the shell passes its SIGHUP on to its jobs, then the terminal sends its own), systemd's
+    stop and GNU timeout signal the run's whole process group, and a `docker compose pause` they end can have taken
+    effect with no answer, an `unpause` they end leaves the deployment paused. On POSIX a session of its own; on
+    Windows a process group of its own (Ctrl-Break sent to the run's group) with no console (Ctrl-Break typed at the
+    console reaches every process attached to it, whatever its group)."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {"start_new_session": True}
 
 
 class StoppedBySignal(SystemExit):
@@ -3711,9 +3732,11 @@ def container_running(name, run=subprocess.run):
 
 def container_paused(name, run=subprocess.run):
     """True if a container named `name` is paused, False if it is there and not paused, None when Docker cannot
-    tell (no such container, or Docker did not answer)."""
+    tell (no such container, or Docker did not answer). Asked while a backup resumes the deployment, so its docker
+    child runs out of reach of the signals that end the run (own_session_kwargs)."""
     try:
-        r = run(["docker", "inspect", "-f", "{{.State.Paused}}", name], capture_output=True, text=True, timeout=20)
+        r = run(["docker", "inspect", "-f", "{{.State.Paused}}", name], capture_output=True, text=True, timeout=20,
+                stdin=subprocess.DEVNULL, **own_session_kwargs())
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if getattr(r, "returncode", 1) != 0:
@@ -6295,10 +6318,12 @@ class DockVault:
         app deletes or adds files after the database was archived. Returns None, or why not when a running one could
         not be paused.
 
-        Each service paused goes into `paused`, and one whose pause was cut short (a timeout, Ctrl-C) and may have
-        taken effect into `maybe_paused`: both are the caller's lists, which it resumes (_resume_after_backup) however
-        this ends. Each pause runs held (`signals`, SignalsEndTheRun.hold): a signal that comes meanwhile is raised once
-        the pause has answered and its service is in the list."""
+        Each service paused goes into `paused`, and one whose pause may have taken effect without saying so into
+        `maybe_paused`: a pause cut short (a timeout, Ctrl-C), or one whose docker ran and did not answer 0. Both are
+        the caller's lists, which it resumes (_resume_after_backup) however this ends. Each pause runs held (`signals`,
+        SignalsEndTheRun.hold): a signal that comes meanwhile is raised once the pause has answered and its service is
+        in a list. Its docker child runs out of reach of the signals that end the run (own_session_kwargs), which
+        are sent to the run's whole process group."""
         running = [s for s in BACKUP_PAUSED_SERVICES if container_running(s)]
         if not running:
             return None
@@ -6309,7 +6334,7 @@ class DockVault:
                 signals.hold()
             try:
                 try:
-                    r = self._run_dc("pause", service, timeout=60)
+                    r = self._run_dc("pause", service, timeout=60, **own_session_kwargs())
                 except subprocess.TimeoutExpired:
                     maybe_paused.append(service)
                     r = None
@@ -6319,6 +6344,11 @@ class DockVault:
                     maybe_paused.append(service)
                     raise
                 if getattr(r, "returncode", 1) != 0:
+                    # A docker that ran and did not answer 0 may have paused it all the same: one a signal ended after
+                    # its request reached Docker (systemd's stop signals every process of the service, whatever its
+                    # session) answers as one Docker refused. Resumed on its own, as a pause cut short is.
+                    if r is not None and service not in maybe_paused:
+                        maybe_paused.append(service)
                     return ("could not pause %s for the backup, and the volumes are only copies of one moment while "
                             "nothing writes to them; nothing was archived" % service)
                 paused.append(service)
@@ -6328,24 +6358,46 @@ class DockVault:
         return None
 
     def _resume_after_backup(self, paused, maybe_paused=()):
-        """Resume what _pause_for_backup paused, and each service whose pause was cut short on its own (it may never
-        have paused, and Docker then refuses to resume it). Says how to do it by hand when Docker would not. Returns
-        True when everything paused is running again (or nothing was), False otherwise."""
+        """Resume what _pause_for_backup paused, and each service that may have paused without saying so on its own
+        (it may never have paused, and Docker then refuses to resume it). A resume Docker did not confirm (an unpause
+        that did not answer 0, or a service Docker does not say is running) is asked about again and, while still
+        paused, tried again (RESUME_RETRIES): the signal that ends the run can end the docker child of the first try,
+        one started in the very moment it comes, or any one under systemd's stop, which signals every process of the
+        service. Says how to do it by hand when Docker would not. Returns True when everything paused is running
+        again (or nothing was), False otherwise. Each docker child runs out of reach of the signals that end the run
+        (own_session_kwargs)."""
+        import time
+        started = time.monotonic()
         failed = []
         if paused:
             try:
-                r = self._run_dc("unpause", *paused, timeout=60)
+                r = self._run_dc("unpause", *paused, timeout=60, **own_session_kwargs())
                 if getattr(r, "returncode", 1) != 0:
                     failed.extend(paused)
             except (OSError, subprocess.SubprocessError):
                 failed.extend(paused)
         for service in maybe_paused:
             try:
-                self._run_dc("unpause", service, timeout=60)
+                self._run_dc("unpause", service, timeout=60, **own_session_kwargs())
             except (OSError, subprocess.SubprocessError):
                 pass
             if container_paused(service) is not False:
                 failed.append(service)
+        for _again in range(RESUME_RETRIES):
+            if not failed or time.monotonic() - started > RESUME_RETRY_SECONDS:
+                break
+            time.sleep(RESUME_RETRY_GAP)
+            still = []
+            for service in failed:
+                if container_paused(service) is False:
+                    continue                    # running: the try before did resume it
+                try:
+                    self._run_dc("unpause", service, timeout=20, **own_session_kwargs())
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                if container_paused(service) is not False:
+                    still.append(service)
+            failed = still
         if failed:
             try:
                 print(self.pal.paint("  WARNING: the deployment could not be resumed after the backup: run docker "

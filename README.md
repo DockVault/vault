@@ -680,7 +680,11 @@ is written, then carries on (with the app running, a file deleted between the da
 the storage volume's would come back as a row without its file). A backup stopped meanwhile (Ctrl-C,
 a closed SSH session, `kill`, a timeout or a service stop; Ctrl-Break on Windows) resumes the
 deployment before it ends and removes the incomplete backup; one run under `nohup` goes on when its
-terminal closes. An end the tool cannot see leaves the deployment paused: `kill -9`, the
+terminal closes. A closed terminal and `timeout` signal the tool's whole process group, and a service
+stop every process of the service, so the `docker compose pause` and `unpause` it runs are started
+apart from its group, a pause that did not answer is resumed all the same, and a resume Docker does
+not confirm is asked about and tried again; what is still paused after that is named, with the
+command that resumes it. An end the tool cannot see leaves the deployment paused: `kill -9`, the
 out-of-memory killer, and on Windows closing the console window or ending the task.
 `docker ps --filter status=paused` then lists what it left, and `docker unpause <name> ...` resumes it.
 

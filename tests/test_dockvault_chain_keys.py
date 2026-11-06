@@ -110,11 +110,16 @@ def test_a_deployment_that_cannot_be_paused_is_not_archived_and_what_paused_is_r
     monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: pytest.fail("a volume was archived while the app ran"))
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(" ".join(a)) or _Result(
         1 if " ".join(a) == "pause vault-db" else 0))
+    monkeypatch.setattr(dv, "container_paused", lambda name, **k: False)    # Docker refused it: it runs
     with pytest.raises(SystemExit):
         tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
-    assert calls == ["pause vault", "pause vault-db", "unpause vault"]
+    # A pause that did not answer 0 may have been taken all the same (its docker ended by a signal): it is resumed on
+    # its own, which Docker refuses for a container that never paused.
+    assert calls == ["pause vault", "pause vault-db", "unpause vault", "unpause vault-db"]
     assert not list((tmp_path / "backups").iterdir())
-    assert "could not pause vault-db for the backup" in " ".join(capsys.readouterr().out.split())
+    said = " ".join(capsys.readouterr().out.split())
+    assert "could not pause vault-db for the backup" in said
+    assert "could not be resumed" not in said
 
 
 def test_a_stopped_database_is_copied_without_a_pause(tmp_path, monkeypatch):
