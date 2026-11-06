@@ -650,8 +650,10 @@ secrets). Don't edit the prefix by hand; the management tool's **Volumes** menu 
 
 The secret check opens the set's database with the `.env`'s `VAULT_DB_PASSWORD`, then checks its
 `ENCRYPTION_KEY` against the key check the vault keeps in that database: a `.env` with the right
-password and another key is refused. When setup's existing-volume menu installs a `.env` you point it
-at, it first keeps the current one as `.env.<set>`, as a restore does.
+password and another key is refused. A database with no key check yet (its vault never started) lets
+the `.env` through, and the next check of it reads the key check again. When setup's existing-volume
+menu installs a `.env` you point it at, it first keeps the current one as `.env.<set>`, as a restore
+does.
 
 The **Reset** menu tears the current set down with `docker compose down -v` (a strong, typed
 confirmation — this destroys the data) and moves the `.env` aside so a later setup starts fresh.

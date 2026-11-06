@@ -169,8 +169,10 @@ def test_read_key_canary_asks_the_database_over_its_network_address():
     assert dv.read_key_canary("vault-db", "u", "d", "pw", run=lambda *a, **k: _R(1, "")) is None
 
 
-@pytest.mark.parametrize("canary, passes", [("ok", True), ("unknown", True), ("mismatch", False)])
-def test_the_guard_refuses_a_env_whose_password_opens_the_volume_with_another_encryption_key(capsys, canary, passes):
+@pytest.mark.parametrize("canary, passes, stamps", [("ok", True, True), ("unknown", True, False),
+                                                    ("mismatch", False, False)])
+def test_the_guard_refuses_a_env_whose_password_opens_the_volume_with_another_encryption_key(capsys, canary, passes,
+                                                                                            stamps):
     tool = dv.DockVault(dv.Palette(False), root="/nonexistent-dockvault-root")
     stamped = []
     ok = tool._guard_db_secret(
@@ -179,9 +181,25 @@ def test_the_guard_refuses_a_env_whose_password_opens_the_volume_with_another_en
         stop_fn=lambda: None, marker_fn=lambda vol: None, stamp_fn=lambda vol, env: stamped.append(vol),
         canary_fn=lambda env: canary)
     assert ok is passes
-    assert bool(stamped) is passes, "a pairing is stamped only once both halves were checked"
+    assert bool(stamped) is stamps, "a pairing is stamped only once both halves were checked"
     if not passes:
         assert "ENCRYPTION_KEY is not the key its" in " ".join(capsys.readouterr().out.split())
+
+
+def test_a_key_check_that_could_not_be_read_is_read_again_by_the_next_check():
+    """No key check in the database yet (or none readable) lets the .env through without a stamp, so the next check
+    of the same .env starts the database again and reads the key check then, where a stamp would have answered it."""
+    tool = dv.DockVault(dv.Palette(False), root="/nonexistent-dockvault-root")
+    env = {"ENCRYPTION_KEY": dv.gen_fernet_key(), "VAULT_DB_PASSWORD": "x"}
+    stamps, starts, verdicts = {}, [], iter(["unknown", "mismatch"])
+    hooks = dict(exists_fn=lambda v: True, start_fn=lambda: starts.append(1) or True, wait_fn=lambda: True,
+                 probe_fn=lambda *a: "ok", stop_fn=lambda: None, marker_fn=lambda vol: stamps.get(vol),
+                 stamp_fn=lambda vol, e: stamps.__setitem__(vol, dv.build_coupling_marker(e)) or True,
+                 canary_fn=lambda e: next(verdicts))
+    assert tool._guard_db_secret(env, **hooks) is True
+    assert stamps == {}
+    assert tool._guard_db_secret(env, **hooks) is False, "the second check read the key check, now there"
+    assert starts == [1, 1]
 
 
 def test_a_repoint_to_a_copy_with_the_right_password_and_another_key_puts_the_previous_env_back(

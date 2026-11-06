@@ -5765,13 +5765,20 @@ class DockVault:
         # The password opens the database; ENCRYPTION_KEY is the other half of the pairing, and the one whose loss
         # is final. With the database up, its key check is read too: one sealed under another key refuses the .env.
         # No check there yet (an app never started on this set) or none readable is not a refusal: the app's own
-        # check refuses to start under a wrong key.
+        # check refuses to start under a wrong key. It is not a check either, so the pairing is not stamped: a stamp
+        # would answer every later check of this .env, and its key would never be checked here again.
+        key_unchecked = False
         if result == "ok" and self._canary_check is not None:
             print(pal.paint("  Checking ENCRYPTION_KEY against the key check in the database...", "cyan"), flush=True)
-            if self._canary_check(env) == "mismatch":
+            verdict = self._canary_check(env)
+            if verdict == "mismatch":
                 result = "encryption_key_mismatch"
+            elif verdict != "ok":
+                key_unchecked = True
+                print(pal.paint("  The database holds no key check yet, or none could be read: the next check of "
+                                "this .env reads it again.", "cyan"), flush=True)
         stop_fn()
-        if result == "ok":
+        if result == "ok" and not key_unchecked:
             stamp_fn(vol, env)   # best-effort: make the next check instant
         return result if result in ("ok", "mismatch", "encryption_key_mismatch") else "ambiguous"
 

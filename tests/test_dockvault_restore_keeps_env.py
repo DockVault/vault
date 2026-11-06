@@ -699,13 +699,16 @@ def test_the_volumes_of_the_set_the_host_was_on_open_again_from_the_kept_env(tmp
         monkeypatch.setattr(tool, "_start_db_only", lambda: (_start_pg(pg, names_a["pg"]), True)[1])
         monkeypatch.setattr(tool, "_wait_db_ready", lambda *a, **k: True)
         monkeypatch.setattr(tool, "_stop_db_only", lambda: _stop_pg(pg))
-        real_probe = dv.probe_pg_password
+        real_probe, real_key_check = dv.probe_pg_password, dv.read_key_canary
 
         def probe(_container, user, db, password, **k):
             checked.append(password)
             return real_probe(pg, user, db, password)
 
         monkeypatch.setattr(dv, "probe_pg_password", probe)
+        # The key check is read from the same database: this test's own, never a vault-db the host may run.
+        monkeypatch.setattr(dv, "read_key_canary",
+                            lambda _container, user, db, password, **k: real_key_check(pg, user, db, password))
         tool.volumes(args)
         assert checked == [pw_a], "the tool's own check opened A's database with the kept .env's password"
         assert (tmp_path / ".env").read_bytes() == env_a
