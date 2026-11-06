@@ -238,8 +238,8 @@ def test_while_compliance_access_is_off_no_hold_is_placed(db, people, settings):
 def test_one_person_keeps_at_most_five_hold_only_cases_waiting_for_confirmation(db, people):
     """Placing a hold needs no second person, and each keeps what is deleted from its vaults until it is confirmed
     or lapses: one person may have MAX_UNCONFIRMED_CASES of them waiting at once. Another person may still place
-    one, and the placer may again once one of theirs is confirmed, or past its confirm deadline (it lapses then,
-    whether or not the job has run yet)."""
+    one, and the placer may again once one of theirs is confirmed, released (the placer may release their own), or
+    past its confirm deadline (it lapses then, whether or not the job has run yet)."""
     assert holds.MAX_UNCONFIRMED_CASES == 5
     cases = [_place(db, people.ada, [people.v1, people.v2]) for _ in range(5)]
     refused = _refused(holds.place_hold_only, db, people.ada, [people.v2.id], now=NOW, **TEXT)
@@ -249,6 +249,14 @@ def test_one_person_keeps_at_most_five_hold_only_cases_waiting_for_confirmation(
     assert db.query(m.ComplianceCase).count() == 5
     _place(db, people.bob, [people.v2])
     holds.confirm(db, cases[0], by=people.bob, now=NOW)
+    db.commit()
+    _place(db, people.ada, [people.v2])
+    assert _refused(holds.place_hold_only, db, people.ada, [people.v2.id], now=NOW,
+                    **TEXT).reason == holds.TOO_MANY_UNCONFIRMED
+    db.rollback()
+    # A hold the placer releases frees its place, as the refusal says.
+    assert holds.release_refusal(db, cases[1], people.ada, now=NOW) is None
+    assert holds.release(db, cases[1], by=people.ada, reason="no longer needed", now=NOW) == 2
     db.commit()
     _place(db, people.ada, [people.v2])
     assert _refused(holds.place_hold_only, db, people.ada, [people.v2.id], now=NOW,
