@@ -704,7 +704,7 @@ def test_a_backup_whose_kept_file_holds_no_key_is_refused_and_removed(tmp_path, 
     assert "holds none" in capsys.readouterr().out
 
 
-def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, interactive=False):
+def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, interactive=False, on_env=None):
     """A restore of a bundle carrying the old key `carried` (or none), its env sealed or not, onto a host whose own
     kept file holds `here` (or none). Returns (the steps, in order, and whether the kept file was there when .env
     was installed)."""
@@ -734,8 +734,14 @@ def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, 
     monkeypatch.setattr(dv, "clear_volume", lambda vol, **k: True)
     monkeypatch.setattr(dv, "untar_volume", lambda vol, *a, **k: steps.append("untar") or True)
     monkeypatch.setattr(dv, "write_volume_file", lambda *a, **k: steps.append("mark") or True)
-    monkeypatch.setattr(dv, "_copy_secret", lambda *a, **k: steps.append(("env", kept.exists())))
-    monkeypatch.setattr(tool, "_atomic_write_secret", lambda *a, **k: steps.append(("env", kept.exists())))
+    def install_env(*_a, **_k):
+        # The backup's .env being installed: whether the kept old key was there then, and (`on_env`) what else was.
+        steps.append(("env", kept.exists()))
+        if on_env is not None:
+            steps.append(("host set's .env kept", on_env()))
+
+    monkeypatch.setattr(dv, "_copy_secret", install_env)
+    monkeypatch.setattr(tool, "_atomic_write_secret", install_env)
     monkeypatch.setattr(dv, "tighten_secret_file", lambda *a, **k: True)
     monkeypatch.setattr(dv, "ask", lambda *a, **k: "dockvault-vault-rc")
     monkeypatch.setattr(tool, "_stop_stack", lambda: steps.append("stop"))
@@ -889,12 +895,17 @@ def test_a_restore_of_another_sets_backup_puts_its_key_in_that_sets_file_and_lea
         tmp_path, monkeypatch):
     """The host's own set has an unfinished key change; a backup of another set carries the key of its own: the
     restore is not refused for a key that is not its set's, writes the carried key into its set's file, and leaves the
-    host set's file as it was."""
+    host set's file as it was. The host set's .env (the only key to its volumes, and to the chain its kept key belongs
+    to) is kept, byte for byte, before the backup's .env is installed."""
     mine = dv.gen_hex(32)
     _kept(tmp_path).write_text(mine + "\n", encoding="utf-8")
     carried = dv.gen_hex(32)
-    steps = _restoring(tmp_path, monkeypatch, carried=carried)
+    host_env = tmp_path / (".env." + dv.DEFAULT_PROJECT)
+    steps = _restoring(tmp_path, monkeypatch, carried=carried,
+                       on_env=lambda: host_env.exists() and host_env.read_text(encoding="utf-8") == "x=1\n")
     assert ("env", True) in steps
+    assert ("host set's .env kept", True) in steps, "the host set's .env was kept before the backup's was installed"
+    assert host_env.read_text(encoding="utf-8") == "x=1\n"
     assert _kept(tmp_path, "dockvault-vault-rc").read_text(encoding="utf-8") == carried + "\n"
     assert _kept(tmp_path).read_text(encoding="utf-8") == mine + "\n"
 

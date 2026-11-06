@@ -636,7 +636,11 @@ MAC. A changed or damaged archive, a changed sealed manifest, or an archive Dock
 refused with nothing changed. The checksums of an unsealed backup show damage only: whoever can write
 the bundle can rewrite them too. A backup made before backups recorded checksums is still restored,
 with a notice that its archives could only be read through, not matched. `--bundle-dir` and
-`--backup-dir` may be relative paths.
+`--backup-dir` may be relative paths. A restore that stops part way, once it has stopped the
+deployment (a volume that cannot be cleared, an archive that does not extract, the audit log's
+restore mark that cannot be written), changes nothing more: it does not install the backup's `.env`
+or start the stack, names the volumes it replaced so far, and prints the way back (start the set the
+host was on, or run the same restore again).
 
 Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
 the set the host was on; `.env.<prefix>.1`, `.2`, ... when that name is taken, never over a file already

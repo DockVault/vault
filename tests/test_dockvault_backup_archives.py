@@ -471,3 +471,77 @@ def test_an_archive_changed_after_the_backup_leaves_every_volume_as_it_was_live(
     finally:
         for v in vols:
             _docker("docker", "volume", "rm", "-f", v)
+
+
+# --------------------------------------------------------------------------- a restore that stops part way
+
+def _stopping(tmp_path, monkeypatch, capsys, fail, host="same-set"):
+    """A restore of a backup of set dvarchstop that stops at `fail` (the second volume cannot be cleared, or does not
+    extract; or the restore mark cannot be written after the keys volume). The host is on the same set, or on
+    another set's .env. Returns (the steps, the names of the set's volumes, the host's .env bytes, what was said)."""
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchstop")
+    if host == "another-set":
+        _env(tmp_path, "dvarchhost")
+    host_env = (tmp_path / ".env").read_bytes()
+    names = dv.set_volume_names("dvarchstop")
+    steps = []
+    tool = _restoring_tool(tmp_path, monkeypatch, steps)
+    monkeypatch.setattr(dv, "read_volume_json", lambda *a, **k: {"seq": 3, "link": "aa"})
+    monkeypatch.setattr(dv, "write_volume_file", lambda vol, rel, text, **k: steps.append(("mark", vol))
+                        or fail != "mark")
+    if fail == "clear":
+        monkeypatch.setattr(dv, "clear_volume", lambda vol, **k: steps.append(("clear", vol))
+                            or vol != names["pg"])
+    elif fail == "untar":
+        monkeypatch.setattr(dv, "untar_volume", lambda vol, src, archive, **k: steps.append(("untar", vol, src))
+                            or vol != names["pg"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        tool._do_restore(_restore_args(bundle))
+    return steps, names, host_env, _said(capsys)
+
+
+def _again(tmp_path):
+    bundle = next((tmp_path / "backups").iterdir())
+    arg = '"%s"' % bundle if any(c.isspace() for c in str(bundle)) else str(bundle)
+    return "python dockvault.py backup --action restore --bundle-dir %s --force" % arg
+
+
+@pytest.mark.parametrize("host", ["same-set", "another-set"])
+def test_a_restore_whose_volume_cannot_be_cleared_stops_there_with_the_way_back(tmp_path, monkeypatch, capsys, host):
+    steps, names, host_env, said = _stopping(tmp_path, monkeypatch, capsys, "clear", host)
+    assert steps[-1] == ("clear", names["pg"]), "nothing is extracted into a volume that was not cleared"
+    assert not [s for s in steps if s[0] == "untar" and s[1] == names["pg"]]
+    assert ("clear", names["storage"]) not in steps and ("start",) not in steps
+    assert (tmp_path / ".env").read_bytes() == host_env, ".env is as it was"
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".env.")], "no second copy of .env is left"
+    assert "could not clear volume %s before restoring it" % names["pg"] in said
+    assert "the deployment is stopped, .env is as it was" in said
+    assert "replaced from the backup, or emptied in part, so far are: %s, %s" % (names["keys"], names["pg"]) in said
+    assert _again(tmp_path) in said
+    if host == "another-set":
+        assert "The set the host was on, 'dvarchhost', is untouched: python dockvault.py start brings it back" in said
+    else:
+        assert "Do not start the deployment now" in said
+
+
+def test_a_restore_whose_archive_does_not_extract_stops_there_with_the_way_back(tmp_path, monkeypatch, capsys):
+    steps, names, host_env, said = _stopping(tmp_path, monkeypatch, capsys, "untar")
+    assert steps[-1][:2] == ("untar", names["pg"])
+    assert ("clear", names["storage"]) not in steps and ("start",) not in steps
+    assert (tmp_path / ".env").read_bytes() == host_env
+    assert "could not extract vault_pg_data.tar.gz into volume %s" % names["pg"] in said
+    assert "the deployment is stopped" in said and "Do not start the deployment now" in said
+    assert _again(tmp_path) in said
+
+
+def test_a_restore_whose_mark_cannot_be_written_stops_before_any_other_volume(tmp_path, monkeypatch, capsys):
+    """The mark keeps the audit log's pruner from deleting until the restore is accepted: without it, nothing else
+    of the backup is restored."""
+    steps, names, host_env, said = _stopping(tmp_path, monkeypatch, capsys, "mark")
+    assert steps[-1] == ("mark", names["keys"])
+    assert ("clear", names["pg"]) not in steps and ("start",) not in steps
+    assert (tmp_path / ".env").read_bytes() == host_env
+    assert "could not write the restore mark into volume %s" % names["keys"] in said
+    assert "the volumes it replaced from the backup, or emptied in part, so far are: %s." % names["keys"] in said
+    assert "the deployment is stopped" in said and _again(tmp_path) in said

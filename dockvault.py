@@ -6056,17 +6056,24 @@ class DockVault:
             # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
             # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
             marked = False
+            replaced = []
+
+            def stopped_part_way(why, vol, touched):
+                # Every stop from here on: nothing more is cleared or extracted, .env is not installed and the stack
+                # is not started, and the message says what was replaced and the way back.
+                self._fail(self._restore_stopped_part_way(why, vol, replaced, touched, prefix, current_prefix, bundle))
+
             for vol, archive in plan:
                 print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
                 # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
                 # silently degrade to the old MERGE (the exact "restored, saw the same files" trap). The
                 # stack is already stopped, so aborting loudly is the safe state.
                 if not clear_volume(vol):
-                    self._fail("could not clear volume %s before restore - the deployment is stopped; free "
-                               "the volume and retry (refusing to merge the backup over stale data)." % vol)
+                    stopped_part_way("could not clear volume %s before restoring it (the backup is never merged over "
+                                     "data left in it)" % vol, vol, True)
                 if not untar_volume(vol, bundle, archive):
-                    self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
-                               "bundle and retry." % (vol, archive))
+                    stopped_part_way("could not extract %s into volume %s" % (archive, vol), vol, True)
+                replaced.append(vol)
                 if vol == names["keys"] and head_rel:
                     # Right after the keys volume, before any other volume or .env: the restore mark. While it is
                     # there the audit pruner deletes nothing, until `audit accept-restore` (run below once the
@@ -6078,8 +6085,9 @@ class DockVault:
                                 "bundle": os.path.basename(os.path.normpath(bundle)), "record": replaced_record,
                                 "restored_record": restored_record}
                         if not write_volume_file(vol, head_rel + ".restore-pending", json.dumps(mark)):
-                            self._fail("could not write the restore mark into %s - the deployment is stopped; "
-                                       "retry the restore" % vol)
+                            stopped_part_way("could not write the restore mark into volume %s (it keeps the audit "
+                                             "log's pruner from deleting until the restore is accepted)" % vol,
+                                             vol, False)
                         marked = True
             # The old AUDIT_CHAIN_KEY the bundle carries, beside .env and on the disk before the .env that does not
             # hold it: the restored chain may be under it.
@@ -6087,8 +6095,8 @@ class DockVault:
                 try:
                     write_kept_key(kept_here, carried)
                 except OSError as exc:
-                    self._fail("could not put the old AUDIT_CHAIN_KEY this backup carries into %s (%s) - the "
-                               "deployment is stopped; retry the restore" % (kept_here, exc))
+                    stopped_part_way("could not put the old AUDIT_CHAIN_KEY this backup carries into %s (%s)"
+                                     % (kept_here, exc), None, False)
             # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
             # the plaintext was decrypted into memory above; write those exact bytes.
             if sealed_env_bytes is not None:
@@ -6139,6 +6147,32 @@ class DockVault:
                                                         old_key_file=None), "accept-restore")
         else:
             self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
+
+    def _restore_stopped_part_way(self, why, vol, replaced, touched, prefix, current_prefix, bundle):
+        """The message of a restore that stops after it stopped the deployment (a volume that cannot be cleared, an
+        archive that does not extract, a restore mark or a kept key that cannot be written): what happened, which
+        volumes it changed (`replaced`, and `vol` when `touched`: a clear or an extraction that failed part way), that
+        .env and the stack were left as they were, and the way back: the set the host was on, or the same restore run
+        again from the same (checked, unchanged) backup."""
+        arg = '"%s"' % bundle if any(c.isspace() for c in bundle) else bundle
+        again = "python dockvault.py backup --action restore --bundle-dir %s --force" % arg
+        changed = list(replaced) + ([vol] if touched and vol and vol not in replaced else [])
+        state = ("the volumes it replaced from the backup, or emptied in part, so far are: %s" % ", ".join(changed)
+                 if changed else "no volume was changed")
+        had_env = os.path.exists(self._env_path())
+        lines = ["%s. The restore stopped there: the deployment is stopped, .env is as it was%s, and %s."
+                 % (why, " (set '%s')" % current_prefix if had_env else " (there was none)", state)]
+        if had_env and prefix != current_prefix:
+            lines.append("The set the host was on, '%s', is untouched: python dockvault.py start brings it back. To "
+                         "restore set '%s', fix the cause, then run the restore again: %s"
+                         % (current_prefix, prefix, again))
+        elif had_env and not changed:
+            lines.append("Nothing of the set was changed: python dockvault.py start brings it back as it was. Or fix "
+                         "the cause, then run the restore again: %s" % again)
+        else:
+            lines.append("Do not start the deployment now: its volumes hold the backup's data in part. Fix the cause, "
+                         "then run the restore again (it starts over from the backup, which is unchanged): %s" % again)
+        return " ".join(lines)
 
     def _keep_env_before_restore(self, prefix, sealed_env_bytes, env_path):
         """Keep the current .env before a restore installs the backup's .env over it. `prefix` is the set the
