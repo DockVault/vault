@@ -26,8 +26,10 @@ def psql(sql: str) -> str:
         r = subprocess.run(["docker", "exec", DB, "psql", "-U", "sftp_user", "-d", "sftp_db",
                             "-v", "ON_ERROR_STOP=1", "-Atc", sql],
                            capture_output=True, text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, DB)
     assert r.returncode == 0, r.stderr[:300]
     return r.stdout.strip()
@@ -40,8 +42,10 @@ def in_api_container(source: str, *, check=True) -> subprocess.CompletedProcess:
     try:
         r = subprocess.run(["docker", "exec", "-i", API, "python", "-c", script],
                            capture_output=True, text=True, timeout=90)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, API)
     if check:
         assert r.returncode == 0, (r.stderr or r.stdout)[-800:]
@@ -188,8 +192,10 @@ def sign_in_from_inside(username, password, *, container=None, url="http://127.0
     try:
         r = subprocess.run(["docker", "exec", "-i", container, "python", "-c", script],
                            capture_output=True, text=True, timeout=90)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, container)
     assert r.returncode == 0, (r.stderr or r.stdout)[-600:]
     import json

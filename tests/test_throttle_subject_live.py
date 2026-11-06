@@ -105,8 +105,10 @@ def test_the_sftp_server_counts_a_64_as_one_client():
     try:
         r = subprocess.run(["docker", "exec", "-i", SFTP, "python", "-c", SFTP_SCRIPT],
                            capture_output=True, text=True, timeout=90)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, SFTP)
     assert r.returncode == 0, (r.stderr or r.stdout)[-800:]
     got = json.loads(r.stdout.strip().splitlines()[-1])

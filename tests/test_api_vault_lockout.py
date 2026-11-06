@@ -26,8 +26,10 @@ def _redis(*args):
     try:
         return subprocess.run(["docker", "exec", _REDIS, "redis-cli", *args],
                               capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/redis unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
 
 
 def _require_redis():

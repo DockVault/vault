@@ -35,8 +35,10 @@ def _in_container(env_overrides=None, args=None, stdin=None, timeout=90):
             cmd, input=stdin, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
 
 
 def test_general_api_rate_limiter_is_attached(admin):
@@ -659,8 +661,8 @@ def _render_secure_compose(**overrides):
     try:
         r = subprocess.run(["docker", "compose", "-f", "docker-compose.secure.yml", "config"],
                            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90)
-    except subprocess.TimeoutExpired:
-        pytest.skip("docker compose config timed out")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"docker compose config did not finish within {exc.timeout} s")
     if "failed to read" in r.stderr and ".env" in r.stderr:
         # Compose could not parse the developer's own .env, which says nothing about the file
         # under test. Worth skipping specifically: on Windows `echo x > file` writes UTF-16,

@@ -539,8 +539,8 @@ def test_one_account_holds_at_most_a_quarter_of_the_slots_with_copies(admin, oth
         while not stop.is_set():
             try:
                 seen.append((time.monotonic(), *_metrics(admin)))
-            except AssertionError as exc:
-                unwatched.append(str(exc)[:300])
+            except Exception as exc:  # noqa: BLE001 -- a refused read and a read that timed out alike
+                unwatched.append(f"{type(exc).__name__}: {str(exc)[:300]}")
                 return
             time.sleep(0.2)
 

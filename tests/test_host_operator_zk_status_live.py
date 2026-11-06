@@ -36,8 +36,10 @@ def zk_status(env=()):
     cmd += [API, "python", "-m", "app.core.host_operator", "zk-status"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, API)
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     assert len(lines) == 1, (r.stdout[-800:], (r.stderr or "")[-800:])
@@ -148,8 +150,10 @@ def _create_check(env=()):
     cmd += [API, "python", "-c", CREATE_CHECK]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, API)
     assert r.returncode == 0, (r.stdout[-800:], (r.stderr or "")[-800:])
     return json.loads(r.stdout.strip().splitlines()[-1])
@@ -201,8 +205,10 @@ def test_when_something_stops_it_it_still_prints_one_answer(setting, said):
            API, "python", "-m", "app.core.host_operator", "zk-status"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, API)
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     assert [json.loads(ln) for ln in lines] == [

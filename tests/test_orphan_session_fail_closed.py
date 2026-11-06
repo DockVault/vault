@@ -56,8 +56,10 @@ def _mint_orphan_session_token():
             input=_FORGE_ORPHAN_SESSION, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=60,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable to mint the token in-container: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     if proc.returncode != 0 and "No such container" in (proc.stderr or ""):
         pytest.skip(f"no {container} container on this host to mint the token in")
     assert proc.returncode == 0, f"minting failed (rc={proc.returncode})\n{proc.stdout}\n{proc.stderr}"

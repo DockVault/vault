@@ -28,8 +28,10 @@ def tool(*args):
     try:
         r = subprocess.run(["docker", "exec", "-i", API, "python", "-m", "app.core.host_operator", *args],
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, API)
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     assert lines, (r.stderr or "")[-800:]

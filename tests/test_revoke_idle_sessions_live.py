@@ -27,8 +27,10 @@ def _psql(sql):
             ["docker", "exec", _DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db",
              "-v", "ON_ERROR_STOP=1", "-Atc", sql],
             capture_output=True, text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, _DB_CONTAINER)
     assert r.returncode == 0, r.stderr[:300]
     return r.stdout.strip()

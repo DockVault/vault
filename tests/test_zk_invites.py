@@ -29,8 +29,10 @@ def _psql(sql: str) -> str:
              "-v", "ON_ERROR_STOP=1", "-tAc", sql],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     assert proc.returncode == 0, f"psql failed: {proc.stderr}"
     return proc.stdout.strip()
 

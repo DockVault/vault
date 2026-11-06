@@ -35,8 +35,10 @@ def _psql(sql):
             ["docker", "exec", _DB, "psql", "-U", "sftp_user", "-d", "sftp_db",
              "-v", "ON_ERROR_STOP=1", "-tAc", sql],
             capture_output=True, text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, _DB)
     assert r.returncode == 0, r.stderr[:300]
     return (r.stdout or "").strip()
@@ -50,8 +52,10 @@ def _in_web_container(source):
     try:
         r = subprocess.run(["docker", "exec", "-i", _API, "python", "-c", script],
                            capture_output=True, text=True, timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, _API)
     assert r.returncode == 0, (r.stderr or r.stdout)[-600:]
     out = r.stdout.strip()

@@ -62,8 +62,10 @@ def test_timed_lockout_reports_minutes_and_retry_after(admin):
                 f"UPDATE users SET is_locked=true, locked_until=now()+interval '10 minutes' "
                 f"WHERE username='{u['_username']}';"
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        except FileNotFoundError as exc:
             pytest.skip(f"docker/psql unavailable: {exc}")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail(f"the command did not finish within {exc.timeout} s")
         skip_if_container_absent(r, _DB_CONTAINER)
         assert r.returncode == 0 and "UPDATE 1" in (r.stdout + r.stderr), (
             "did not apply a timed lock to exactly one user, so the login below is an ordinary "

@@ -55,8 +55,10 @@ def redis_cli(*args):
     """One redis-cli command in the stack's cache, its output stripped."""
     try:
         r = subprocess.run(["docker", "exec", REDIS, "redis-cli", *args], capture_output=True, text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, REDIS)
     assert r.returncode == 0, r.stderr[:300]
     return r.stdout.strip()

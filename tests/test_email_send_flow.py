@@ -50,8 +50,10 @@ def _psql(sql):
         return subprocess.run(
             ["docker", "exec", DB_CONTAINER, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
             capture_output=True, text=True, timeout=20)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None   # no docker / slow exec -> the caller skips
+    except FileNotFoundError:
+        return None   # no docker -> the caller skips
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
 
 
 @pytest.fixture
