@@ -1781,8 +1781,11 @@ def plan_volume_action(choice):
 # The order archived in, and restored in; brand is optional. The keys volume comes first: it holds the audit
 # chain's head record, and a database archived after it can only be ahead of its record (by the seals written
 # meanwhile, which the server lists and the host acknowledges), never behind it, which would stop sealing as a
-# cut tail does. The database is paused while its volume is archived, so the copy is one moment's.
+# cut tail does. The running deployment is paused while the volumes are archived, so every archive is of one moment.
 BACKUP_ROLES = ("keys", "pg", "storage", "brand")
+# The containers paused while a backup archives the volumes (each a compose service of the same name): the app's in
+# either layout, which write the stored files, the keys and the database rows, and the database itself.
+BACKUP_PAUSED_SERVICES = ("vault", "vault-api", "vault-sftp", "vault-db")
 # The three that carry data. A bundle without them is not a backup, whatever else it contains,
 # and saying so is load-bearing now that an upgrade takes one on the operator's behalf and
 # proceeds with an irreversible change on the strength of it.
@@ -5473,8 +5476,8 @@ class DockVault:
     def _do_backup(self, env, args=None):
         """Dump the current set into ONE bundle dir: the paired .env (mode-600), a tar.gz per data
         volume, and a manifest with a NON-secret coupling fingerprint. Skips a volume that doesn't
-        exist (e.g. brand). Does NOT stop the stack (a running Postgres is crash-consistent for a
-        restore-then-start; note it)."""
+        exist (e.g. brand). The running deployment is paused (not stopped) for as long as its volumes are
+        archived (_pause_for_backup), so the database and the stored files are copies of one moment."""
         pal = self.pal
         prefix = volume_prefix(env)
         if not env:
@@ -5531,21 +5534,24 @@ class DockVault:
                 write_kept_key(os.path.join(bundle, KEPT_CHAIN_KEY_BUNDLE), key)
             except OSError as exc:
                 self._fail_backup(bundle, "could not copy %s into the backup (%s)" % (kept, exc))
+        planned = [(role, names[role], "%s.tar.gz" % VOLUME_BASENAMES[role]) for role in BACKUP_ROLES
+                   if volume_exists(names[role])]           # e.g. brand isn't always present
+        # One moment for every volume: the database and the stored files are archived one after the other, and a
+        # file deleted (or uploaded) by the running app between the two would leave a restored row without its file.
+        # So the running deployment is paused (not stopped: its connections wait) until the last archive is
+        # written, and resumed whatever happens. A deployment that is not running is archived as it is.
+        paused, why = self._pause_for_backup()
+        if why:
+            self._fail_backup(bundle, why)
+        try:
+            for role, vol, archive in planned:
+                print(pal.paint("  archiving %s ..." % vol, "cyan"))
+                if not tar_volume(vol, bundle, archive):
+                    self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
+        finally:
+            self._resume_after_backup(paused)
         entries = []
-        for role in BACKUP_ROLES:
-            vol = names[role]
-            if not volume_exists(vol):
-                continue                                     # e.g. brand isn't always present
-            archive = "%s.tar.gz" % VOLUME_BASENAMES[role]
-            print(pal.paint("  archiving %s ..." % vol, "cyan"))
-            paused = self._pause_database() if role == "pg" else False
-            try:
-                archived = tar_volume(vol, bundle, archive)
-            finally:
-                if paused:
-                    self._unpause_database()
-            if not archived:
-                self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
+        for role, vol, archive in planned:
             # The archive was written by a container through a bind mount, and its exit code says only that the
             # container's tar finished. Docker can see another folder than this host's under the same path (a daemon
             # on another host, a confined one), and then nothing reaches the bundle. So the archive must be here, on
@@ -5612,24 +5618,42 @@ class DockVault:
                             "back beside .env. Finish the change: python dockvault.py audit rekey --old-key-file %s\n"
                             % (kept, " (sealed with its env)" if seal else "", kept), "yellow"))
 
-    def _pause_database(self):
-        """Pause the running database container while its volume is archived, so the copy is one moment's (a
-        tar of a running data directory is not: Postgres keeps writing pages behind it). True when paused."""
-        if not container_running(DB_CONTAINER):
-            return False
-        print(self.pal.paint("  pausing the database while its volume is copied ...", "cyan"))
-        try:
-            r = self._run_dc("pause", "vault-db", timeout=60)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return getattr(r, "returncode", 1) == 0
+    def _pause_for_backup(self):
+        """Pause every running container of the deployment that writes to the volumes a backup archives (the app's,
+        in either layout, and the database), so that every archive is of one moment: a tar of a running data
+        directory is not (Postgres keeps writing pages behind it), and neither is a storage volume archived while the
+        app deletes or adds files after the database was archived. Returns (the services paused, None), or (None, why
+        not) when a running one could not be paused (whatever did pause is resumed)."""
+        running = [s for s in BACKUP_PAUSED_SERVICES if container_running(s)]
+        if not running:
+            return [], None
+        print(self.pal.paint("  pausing the deployment while its volumes are copied (%s; it does not answer meanwhile)"
+                             " ..." % ", ".join(running), "cyan"))
+        paused = []
+        for service in running:
+            try:
+                r = self._run_dc("pause", service, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                r = None
+            if getattr(r, "returncode", 1) != 0:
+                self._resume_after_backup(paused)
+                return None, ("could not pause %s for the backup, and the volumes are only copies of one moment "
+                              "while nothing writes to them; nothing was archived" % service)
+            paused.append(service)
+        return paused, None
 
-    def _unpause_database(self):
+    def _resume_after_backup(self, paused):
+        """Resume what _pause_for_backup paused; says how to do it by hand when Docker would not."""
+        if not paused:
+            return
         try:
-            self._run_dc("unpause", "vault-db", timeout=60)
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(self.pal.paint("  WARNING: the database could not be resumed (%s): run docker compose unpause "
-                                 "vault-db" % type(exc).__name__, "red"))
+            r = self._run_dc("unpause", *paused, timeout=60)
+            failed = getattr(r, "returncode", 1) != 0
+        except (OSError, subprocess.SubprocessError):
+            failed = True
+        if failed:
+            print(self.pal.paint("  WARNING: the deployment could not be resumed after the backup: run docker compose "
+                                 "-f docker-compose.secure.yml unpause %s" % " ".join(paused), "red"))
 
     def _seal_bundle_env(self, bundle, args):
         """Seal bundle/env -> bundle/env.enc (envelope encryption; passphrase + one-time recovery key),

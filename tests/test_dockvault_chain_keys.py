@@ -1,7 +1,7 @@
 """The audit chain's keys and head record on the host (dockvault.py, the shipped compose files), offline:
 
-- a backup archives the keys volume (the head record) before the database, and pauses the database while its
-  volume is copied, resuming it whatever happens;
+- a backup archives the keys volume (the head record) before the database, and pauses the running deployment
+  (the app and the database) while the volumes are copied, resuming it whatever happens;
 - a restore puts the keys volume back first, whatever order the bundle lists, and writes the restore mark
   right after it, before any other volume, holding the head record it replaced and the one it restored;
 - an update to a release with the chain offers AUDIT_CHAIN_KEY (yes by default; --no-chain-key declines);
@@ -55,22 +55,30 @@ class _Result:
         self.stderr = ""
 
 
-def test_a_backup_archives_the_keys_volume_first_and_pauses_the_database_around_its_copy(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout", ["combined", "split"])
+def test_a_backup_archives_the_keys_volume_first_with_the_deployment_paused_around_every_copy(tmp_path, monkeypatch,
+                                                                                              layout):
+    """The storage volume is archived after the database: with the app running between the two, a file it deleted
+    meanwhile would be a restored row without its file. So the app (in either layout) and the database are paused
+    before the first archive and resumed after the last, and only those that run."""
     env = _env_file(tmp_path, volume_prefix="dockvault-vault-k1", deployment_id="k1")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     order = []
+    running = {"vault", "vault-db", "vault-redis"} if layout == "combined" else {"vault-api", "vault-sftp", "vault-db"}
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
-    monkeypatch.setattr(dv, "container_running", lambda name, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in running)
     monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: order.append(vol.rsplit("_vault_", 1)[1])
                         or _tgz(Path(bundle) / archive) and True)
-    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: order.append(" ".join(a[:2])) or _Result())
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: order.append(" ".join(a)) or _Result())
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
-    assert order == ["keys", "pause vault-db", "pg_data", "unpause vault-db", "storage"]
+    app = ["vault"] if layout == "combined" else ["vault-api", "vault-sftp"]
+    paused = app + ["vault-db"]
+    assert order == ["pause %s" % s for s in paused] + ["keys", "pg_data", "storage", "unpause " + " ".join(paused)]
     man = json.loads(next((tmp_path / "backups").glob("dockvault-*/manifest.json")).read_text(encoding="utf-8"))
     assert [e["role"] for e in man["volumes"]] == ["keys", "pg", "storage"]
 
 
-def test_the_database_is_resumed_when_its_copy_fails(tmp_path, monkeypatch):
+def test_the_deployment_is_resumed_when_a_copy_fails(tmp_path, monkeypatch):
     env = _env_file(tmp_path, volume_prefix="dockvault-vault-k2", deployment_id="k2")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     calls = []
@@ -78,10 +86,27 @@ def test_the_database_is_resumed_when_its_copy_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(dv, "container_running", lambda name, **k: True)
     monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: not vol.endswith("_vault_pg_data")
                         and _tgz(Path(bundle) / archive) and True)
-    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a[0]) or _Result())
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(" ".join(a)) or _Result())
     with pytest.raises(SystemExit):
         tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
-    assert calls == ["pause", "unpause"]
+    assert calls == ["pause vault", "pause vault-db", "unpause vault vault-db"]
+
+
+def test_a_deployment_that_cannot_be_paused_is_not_archived_and_what_paused_is_resumed(tmp_path, monkeypatch, capsys):
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-k4", deployment_id="k4")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: pytest.fail("a volume was archived while the app ran"))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(" ".join(a)) or _Result(
+        1 if " ".join(a) == "pause vault-db" else 0))
+    with pytest.raises(SystemExit):
+        tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    assert calls == ["pause vault", "pause vault-db", "unpause vault"]
+    assert not list((tmp_path / "backups").iterdir())
+    assert "could not pause vault-db for the backup" in " ".join(capsys.readouterr().out.split())
 
 
 def test_a_stopped_database_is_copied_without_a_pause(tmp_path, monkeypatch):

@@ -620,6 +620,11 @@ bundle really is the one those volumes were created with. **Restore** verifies t
 recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
+A running deployment is paused (not stopped) while its volumes are archived, so the database, the
+stored files and the keys are copies of one moment: the vault does not answer until the last archive
+is written, then carries on (with the app running, a file deleted between the database's archive and
+the storage volume's would come back as a row without its file).
+
 Backup counts an archive only once it is in the backup folder on this host, not empty, and read
 through whole as a `tar.gz` (a Docker daemon that writes to a folder of its own, such as one on
 another host, fails the backup instead of leaving a bundle without data). The manifest records each
