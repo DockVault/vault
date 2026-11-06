@@ -78,7 +78,10 @@ Unattended runs (`--non-interactive`) **build** unless you pass `--image-source 
 scripted install always deploys the code it checked out rather than a different published artifact.
 If the checkout's `VERSION` has no matching release yet — which is normal on `main` — setup says so
 and builds instead. The choice is recorded as `DOCKVAULT_IMAGE` in `.env`, and re-running setup
-honours it: a release-image deployment is re-pulled, never rebuilt over.
+honours it: a release-image deployment is never rebuilt over. Setup, start, restart and the end of a
+restore use the release image already on the host as it is, without the registry, and pull it only
+when it is missing; `restart` does that before it takes anything down, so a host that cannot reach
+the registry keeps its running deployment. Only `update` moves a deployment to another image.
 
 Setup creates the first admin account from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` it writes to
 `.env` (a blank password auto-generates a strong one, printed once). Then open

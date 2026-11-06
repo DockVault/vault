@@ -2303,6 +2303,19 @@ def uses_release_image(env):
     return image.startswith(GHCR_IMAGE + ":") or image.startswith(GHCR_IMAGE + "@")
 
 
+def image_present(image, run=None):
+    """True when `image` is already in this host's Docker image store (`docker image inspect` finds it), so the
+    stack can be recreated from it without the registry. False when it is not, and when Docker cannot be asked."""
+    if not image:
+        return False
+    try:
+        r = (run or subprocess.run)(["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                capture_output=True, text=True, timeout=30)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
 def describe_image_mode(env):
     """One-line, operator-facing description of which image THIS .env runs: a pinned published
     release, or a local build of the checkout. Used so a setup re-run is never silent about the
@@ -4230,9 +4243,15 @@ class DockVault:
         """Recreate the deployment (compose down + start, health-checked) so a changed .env takes
         effect. Data volumes are untouched. No prompt: this is an explicit in-place action, not the
         standalone `down`. A container-log rotation Docker would refuse stops it before anything is
-        taken down."""
+        taken down, and so does a published release image that is neither here nor can be pulled: it is
+        made present BEFORE the containers are removed, so a host without the registry (offline, an
+        outage, a rate limit) keeps the deployment it has rather than being left with nothing running."""
         if not self._container_logs_readable():
             raise SystemExit(1)
+        if os.path.exists(self._env_path()) and uses_release_image(self._load_env()):
+            if not self._ensure_release_image():
+                print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.", "yellow"))
+                raise SystemExit(1)
         self._tear_down_containers()
         self.start(args)
 
@@ -4896,15 +4915,26 @@ class DockVault:
         """Start/recreate the deployment the current .env describes.
 
         Builds the local Dockerfile UNLESS .env pins a published release image, in which case the
-        image is PULLED and the stack recreated without --build. Setup re-runs go through here, so
-        without the check the documented "re-run setup to upgrade" path would rebuild over a
-        release image an operator deliberately chose — the same clobber the Update menu's pull path
-        already avoids."""
+        image is used as it is when already here (pulled only when not: _ensure_release_image) and the
+        stack recreated without --build. Setup re-runs go through here, so without the check the
+        documented "re-run setup to upgrade" path would rebuild over a release image an operator
+        deliberately chose — the same clobber the Update menu's pull path already avoids."""
         if not self._container_logs_readable():
             return False
         if uses_release_image(self._load_env()):
-            return self._pull_release_image() and self._recreate_stack(build=False)
+            return self._ensure_release_image() and self._recreate_stack(build=False)
         return self._recreate_stack(build=True)
+
+    def _ensure_release_image(self):
+        """The release image .env pins, made present: used as it is when Docker already has it, pulled otherwise.
+        A start or a restart then needs no registry when the image is here (offline, a registry outage or rate limit),
+        and does not fetch the tag again each time it starts: only `update` moves the deployment to another image,
+        with its gates. True when the image is here."""
+        image = (self._load_env().get("DOCKVAULT_IMAGE") or "").strip()
+        if image_present(image):
+            print(self.pal.paint("  Using %s, already on this host (no pull)." % image, "cyan"))
+            return True
+        return self._pull_release_image()
 
     def _container_logs_readable(self):
         """False, having said why, when .env sets a container-log rotation Docker would refuse: the stack is

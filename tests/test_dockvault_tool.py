@@ -2354,6 +2354,19 @@ def test_authored_env_pins_the_image_only_when_a_release_was_chosen():
     assert pinned["DOCKVAULT_IMAGE"] == "ghcr.io/dockvault/vault:v0.9.0"
 
 
+def _docker(calls, image_here, pull_ok=True):
+    """subprocess.run as Docker answers it: `docker image inspect` finds the image only when `image_here`; a pull
+    succeeds when `pull_ok`; everything else succeeds. Every command is recorded in `calls`."""
+    def run(cmd, **k):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return _Proc(0 if image_here else 1, "sha256:abc\n" if image_here else "")
+        if "pull" in cmd:
+            return _Proc(0 if pull_ok else 1, "")
+        return _Proc(0, "")
+    return run
+
+
 def test_start_pulls_and_never_builds_over_a_release_image(tmp_path, monkeypatch):
     # The gap this closes: `setup` is the documented idempotent upgrade path, so a re-run over a
     # release-image deployment used to rebuild — replacing the published image with a local build
@@ -2363,11 +2376,70 @@ def test_start_pulls_and_never_builds_over_a_release_image(tmp_path, monkeypatch
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     calls = []
-    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=False))
     assert tool._start_secure_stack() is True
-    assert any("pull" in c for c in calls), "a release-image deployment must pull"
+    assert any("pull" in c for c in calls), "a release-image deployment pulls an image it does not have"
     ups = [c for c in calls if "up" in c]
     assert ups and all("--build" not in c for c in ups), "and must never rebuild over the release"
+    assert calls.index([c for c in calls if "pull" in c][0]) < calls.index(ups[0])
+
+
+def test_start_uses_a_release_image_already_here_without_the_registry(tmp_path, monkeypatch, capsys):
+    """Each start pulled the pinned tag again: offline (or with the registry down) the vault could not start from the
+    image it already had, and a tag moved on the registry reached the deployment with none of update's gates."""
+    cfg = _reusable_env_cfg()
+    cfg["dockvault_image"] = "ghcr.io/dockvault/vault:v0.9.0"
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=True, pull_ok=False))
+    assert tool._start_secure_stack() is True
+    assert not [c for c in calls if "pull" in c], "an image already here is not pulled again"
+    assert ["docker", "image", "inspect", "--format", "{{.Id}}", "ghcr.io/dockvault/vault:v0.9.0"] in calls
+    ups = [c for c in calls if "up" in c]
+    assert ups and all("--build" not in c for c in ups)
+    assert "Using ghcr.io/dockvault/vault:v0.9.0, already on this host (no pull)" in capsys.readouterr().out
+
+
+def _restarting(tmp_path, monkeypatch, image_here, pull_ok, image="ghcr.io/dockvault/vault:v0.9.0"):
+    cfg = _reusable_env_cfg()
+    cfg["dockvault_image"] = image
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=image_here, pull_ok=pull_ok))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_print_status", lambda *a, **k: None)
+    return tool, calls
+
+
+def _compose_verb(calls, verb):
+    return [i for i, c in enumerate(calls) if c[:2] == ["docker", "compose"] and verb in c]
+
+
+def test_restart_takes_nothing_down_when_the_release_image_is_neither_here_nor_pullable(tmp_path, monkeypatch,
+                                                                                       capsys):
+    """restart used to take the containers down and only then need the registry: offline, the vault stayed down."""
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=False, pull_ok=False)
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert _compose_verb(calls, "pull") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    assert "Nothing was taken down" in capsys.readouterr().out
+
+
+def test_restart_pulls_a_missing_release_image_before_it_takes_anything_down(tmp_path, monkeypatch):
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=False, pull_ok=True)
+    tool.restart()
+    pulls, downs, ups = (_compose_verb(calls, v) for v in ("pull", "down", "up"))
+    assert pulls and downs and ups and pulls[0] < downs[0] < ups[0]
+
+
+def test_restart_with_the_release_image_here_needs_no_registry(tmp_path, monkeypatch):
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False)
+    tool.restart()
+    downs, ups = _compose_verb(calls, "down"), _compose_verb(calls, "up")
+    assert not _compose_verb(calls, "pull") and downs and ups and downs[0] < ups[0]
 
 
 def test_start_builds_when_no_release_image_is_pinned(tmp_path, monkeypatch):
@@ -2387,8 +2459,7 @@ def test_start_reports_the_remedy_when_the_release_cannot_be_pulled(tmp_path, mo
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     calls = []
-    monkeypatch.setattr(dv.subprocess, "run",
-                        lambda cmd, **k: calls.append(cmd) or _Proc(0 if "pull" not in cmd else 1, ""))
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=False, pull_ok=False))
     assert tool._start_secure_stack() is False
     assert not [c for c in calls if "up" in c], "a failed pull must not go on to start anything"
     assert "--image-source build" in capsys.readouterr().out
