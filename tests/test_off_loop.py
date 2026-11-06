@@ -292,7 +292,9 @@ def test_at_a_raised_ceiling_a_chunk_sync_is_not_kept_waiting_behind_every_admit
     from app.core.config import settings
     from app.core.transfer_admission import admitted_at_most
     monkeypatch.setattr(settings, "max_concurrent_transfers", 40)
+    # A pool of its own, made at the first use below; the pool and its size are put back together afterwards.
     monkeypatch.setattr(off_loop, "_pool", None)
+    monkeypatch.setattr(off_loop, "_pool_size", None)
     admitted = admitted_at_most(40)
     release = threading.Event()
 
@@ -322,3 +324,9 @@ def test_at_a_raised_ceiling_a_chunk_sync_is_not_kept_waiting_behind_every_admit
     assert off_loop.workers(40) == 62
     assert synced == "synced" and took < 1, f"the sync waited {took:.1f} s behind {admitted} transfers"
     assert copied == ["copied"] * admitted
+
+
+def test_the_pool_size_reported_is_that_of_the_pool_in_use():
+    """pool_size() says how many threads the pool run_to_end uses has: a test that sends more calls than that reads
+    it. It stays true after the test above made a pool of its own for a raised ceiling and put the first one back."""
+    assert off_loop.pool_size() == off_loop._executor()._max_workers
