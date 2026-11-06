@@ -191,6 +191,34 @@ _connection_admission = _ConnectionAdmission(
 _SFTP_TMP_DIR = Path(settings.file_storage_path) / ".sftp_tmp"
 
 
+class _StagingShort(Exception):
+    """A buffered upload staged on the storage volume reached the free space the volume keeps."""
+
+    def __init__(self, room):
+        from app.core import free_space
+        super().__init__("the storage volume is down to the free space it keeps")
+        self.room = room
+        self.text = free_space.refusal_text(room)
+
+
+def _staging_floor_guard(staged_at):
+    """The free-space guard (app/core/free_space.py, WriteGuard) of a buffered upload staged at ``staged_at``, when
+    the buffer is on the storage volume itself; False when it is on another filesystem (the tmpfs the composes mount
+    over .sftp_tmp: RAM, bounded by its own size) or when that cannot be told."""
+    from app.core import free_space
+    try:
+        here = os.stat(os.path.dirname(str(staged_at))).st_dev
+        volume = os.stat(str(free_space.storage_path())).st_dev
+    except (OSError, TypeError, ValueError):
+        return False
+    if here != volume:
+        return False
+
+    def _refuse(room):
+        raise _StagingShort(room)
+    return free_space.WriteGuard(free_space.storage_path(), _refuse)
+
+
 def _staging_capped_max(eff_max_bytes: int, tmpfs_mb: int) -> int:
     """The per-upload byte cap, clamped to the SFTP staging tmpfs budget.
 
@@ -382,6 +410,10 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
         # marks the upload for discard at close (an SFTP close can't signal failure).
         self.max_bytes = 0
         self.overlimit = False
+        # The free space the storage volume keeps, for a buffer staged on that volume itself (no tmpfs mounted over
+        # .sftp_tmp): a free_space.WriteGuard, False when the buffer is elsewhere (the tmpfs the composes mount),
+        # None until the first write asks (_staging_floor_guard).
+        self._floor_guard = None
         # A write raised (e.g. the staging tmpfs ran out of space under concurrent uploads). Like
         # overlimit, this marks the upload for discard at close so a truncated buffer is never
         # finalized -- an SFTP close cannot report failure, so the discard is the only signal.
@@ -470,6 +502,19 @@ class VaultSFTPHandle(paramiko.SFTPHandle):
                 "which uses that much RAM, or lower MAX_FILE_SIZE_MB to match)"
                 % (self.max_bytes // (1024 * 1024)))
             return paramiko.SFTP_FAILURE
+        # A buffer staged on the storage volume itself is held to the free space the volume keeps as its bytes
+        # arrive, as a streaming upload is (app/core/free_space.py). Staged on the tmpfs the composes mount, it is RAM
+        # and bounded by that tmpfs instead.
+        if self._floor_guard is None:
+            self._floor_guard = _staging_floor_guard(self.writepath)
+        if self._floor_guard:
+            try:
+                self._floor_guard.wrote(len(data))
+            except _StagingShort as short:
+                self.write_failed = True
+                self._set_status_desc("upload rejected: " + short.text)
+                safe_event('upload.rejected.disk-floor', bytes=short.room.free, limit=short.room.floor)
+                return paramiko.SFTP_FAILURE
         try:
             self.writefile.seek(offset)
             self.writefile.write(data)

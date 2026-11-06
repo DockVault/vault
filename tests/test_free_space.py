@@ -257,3 +257,70 @@ def test_an_sftp_write_the_volume_has_no_room_for_stops_with_its_reason():
     assert upload.write(0, b"x" * 10) == paramiko.SFTP_FAILURE
     assert upload._failed is True
     assert said == ["upload rejected: The server's storage is nearly full: 1.0 GB is free"]
+
+
+def _buffered_handle(staged_at):
+    """An SFTP upload handle buffering to ``staged_at`` (the path a buffered upload stages at, SFTP_STREAMING_UPLOAD
+    off), with what it would tell the client kept."""
+    from app.sftp import sftp_server as S
+    handle = S.VaultSFTPHandle()
+    handle.writepath = str(staged_at)
+    handle.writefile = open(staged_at, "wb")
+    said = []
+    handle._set_status_desc = said.append
+    return handle, said
+
+
+def test_a_buffered_sftp_upload_staged_on_the_storage_volume_stops_at_its_floor(volume, tmp_path, monkeypatch):
+    """With no tmpfs over .sftp_tmp, a buffered upload stages its bytes on the storage volume itself: it is held to the
+    floor as they arrive, as a streaming upload is, and marked for discard."""
+    import paramiko
+    monkeypatch.setattr(free_space, "storage_path", lambda: tmp_path)
+    (tmp_path / ".sftp_tmp").mkdir()
+    handle, said = _buffered_handle(tmp_path / ".sftp_tmp" / "up_one")
+    try:
+        assert handle.write(0, b"x" * MB) == paramiko.SFTP_OK
+        volume["free"] = 5 * GIB - 1
+        result = paramiko.SFTP_OK
+        offset = MB
+        for _ in range(free_space.CHECK_EVERY_BYTES // MB + 1):
+            result = handle.write(offset, b"x" * MB)
+            if result != paramiko.SFTP_OK:
+                break
+            offset += MB
+    finally:
+        handle.writefile.close()
+    assert result == paramiko.SFTP_FAILURE
+    assert handle.write_failed is True, "the upload was not marked for discard"
+    assert len(said) == 1 and said[0].startswith("upload rejected: The server's storage is nearly full")
+    assert (tmp_path / ".sftp_tmp" / "up_one").stat().st_size == offset, "a write was buffered after the refusal"
+
+
+def test_a_buffered_sftp_upload_staged_on_another_filesystem_is_not_held_to_the_volumes_floor(volume, tmp_path,
+                                                                                          monkeypatch):
+    """The composes mount a tmpfs over .sftp_tmp: a buffer there is RAM, bounded by the tmpfs, and the storage volume's
+    floor does not apply to it."""
+    import os
+    import paramiko
+    from app.sftp import sftp_server as S
+    storage = tmp_path / "storage"
+    staging = tmp_path / "staging"
+    storage.mkdir()
+    staging.mkdir()
+    monkeypatch.setattr(free_space, "storage_path", lambda: storage)
+    real_stat = os.stat
+
+    def stat(path, *a, **k):
+        found = real_stat(path, *a, **k)
+        if str(path) == str(staging):
+            return SimpleNamespace(st_dev=found.st_dev + 1)
+        return found
+    monkeypatch.setattr(S.os, "stat", stat)
+    volume["free"] = GIB                          # far below the floor of 5 GB
+    handle, said = _buffered_handle(staging / "up_two")
+    try:
+        assert handle.write(0, b"x" * MB) == paramiko.SFTP_OK
+    finally:
+        handle.writefile.close()
+    assert handle.write_failed is False and said == []
+    assert volume["asked"] == 0, "the storage volume was looked at for a buffer that is not on it"
