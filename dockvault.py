@@ -1123,6 +1123,13 @@ def install_byo_cert(cert_dir, cert_path, key_path, run=subprocess.run):
 RENEWAL_HOOK = "/etc/letsencrypt/renewal-hooks/deploy/dockvault-vault.sh"
 
 
+def renewal_hook_platform_ok():
+    """True on Linux, where the renewal hook runs as written: its `stat -c` and `mv -T` are GNU coreutils' (or
+    BusyBox's). macOS and the BSDs have neither, so there every renewal would stop before it deployed the certificate:
+    Let's Encrypt automation is refused there, and Windows has no certbot hooks at all."""
+    return sys.platform.startswith("linux")
+
+
 def render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=None, owners=(0, APP_UID)):
     """The certbot deploy-hook script text, which certbot runs as root, unattended, at each renewal: stage the new
     fullchain/privkey, VALIDATE the pair, swap it into cert_dir keeping the live key's owner and mode, then restart
@@ -1134,7 +1141,8 @@ def render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=None, 
     physical path, so not a link put in its place), owned by root or by the container's app user (`owners`), and
     writable by nobody else; then nobody else can put a name in it. It stages in a fresh folder of its own there,
     and its changes of owner and mode follow no link (chown -h, files it just made), its moves replace names
-    (mv -T). Anything else stops it before it changes anything. Pure text (POSIX-only, GNU coreutils)."""
+    (mv -T). Anything else stops it before it changes anything. Pure text, for Linux (bash, and the stat -c and
+    mv -T of GNU coreutils or BusyBox; renewal_hook_platform_ok)."""
     q = shlex.quote
     real = os.path.realpath(cert_dir)
     live = live_dir or "/etc/letsencrypt/live/%s" % server_name
@@ -1165,7 +1173,10 @@ def render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=None, 
         'chmod 644 "$T/cert.pem"',
         '_c="$(openssl x509 -in "$T/cert.pem" -pubkey -noout)"',
         '_k="$(openssl pkey -in "$T/key.pem" -pubout)"',
-        '[ -n "$_c" ] && [ "$_c" = "$_k" ]  # non-empty so a missing openssl fails (never swaps unvalidated)',
+        # Under set -e a failure in an && list stops nothing unless it is the list's last command: an empty "$_c"
+        # (an openssl that printed nothing) would have let the swap go on. The list's outcome stops it here.
+        '[ -n "$_c" ] && [ "$_c" = "$_k" ] || { %s; }' % (stop % "the renewed certificate and key are not a pair, "
+                                                                "or openssl could not read them"),
         'mv -fT "$T/key.pem" key.pem',
         'mv -fT "$T/cert.pem" cert.pem',
         "docker restart %s" % q(service),
@@ -1227,13 +1238,17 @@ def refresh_renewal_hook(app_dir, cert_dir, service, owners=None, hook=RENEWAL_H
     deployment kept the hook an earlier version wrote, which runs docker compose as root with the checkout's files.
     This brings this deployment's hook (the one that names its certificate folder) to the text install_renewal_hook
     writes now, keeping the live folder it renews from. Returns (outcome, a message or None), the outcome one of:
-    "none" (no hook, another deployment's, or not POSIX: nothing to do), "current", "rewritten", "not-root" (only
-    root may write it: left as it is), "unreadable" (it could not be read, or names no certificate folder and live
-    folder: left as it is) and "failed" (it could not be written). `owners`: the owners the hook accepts for the
+    "none" (no hook, or another deployment's: nothing to do), "unsupported" (not Linux: left as it is), "current",
+    "rewritten", "not-root" (only root may write it: left as it is), "unreadable" (it could not be read, or names no
+    certificate folder and live folder: left as it is) and "failed" (it could not be written). `owners`: the owners
+    the hook accepts for the
     certificate folder, as obtain_letsencrypt_cert gives them (root, the app's uid, the uid a remapping engine maps
     it to) when None."""
-    if os.name == "nt" or not os.path.lexists(hook):
+    if not os.path.lexists(hook):
         return "none", None
+    if not renewal_hook_platform_ok():
+        return "unsupported", ("the Let's Encrypt renewal hook %s was left as it is: this version writes it on Linux "
+                               "only (it needs the stat -c and mv -T of GNU coreutils or BusyBox)" % hook)
     try:
         with open(hook, encoding="utf-8") as f:
             text = f.read()
@@ -1270,8 +1285,10 @@ def obtain_letsencrypt_cert(cert_dir, server_name, email, app_dir, service, run=
     """Obtain a Let's Encrypt cert via certbot standalone (http-01, binds port 80), install it, and
     write the auto-renewal deploy hook. POSIX-only (needs certbot + root + a public DNS name reachable
     on port 80). Returns (ok, message)."""
-    if os.name == "nt":
-        return False, "Let's Encrypt automation is Linux-only here; use --cert-mode byo on Windows."
+    if not renewal_hook_platform_ok():
+        return False, ("Let's Encrypt automation is Linux-only here (the renewal hook needs the stat -c and mv -T of "
+                       "GNU coreutils or BusyBox, which this system does not have): use --cert-mode byo with a "
+                       "certificate you renew yourself, or self-signed")
     if is_ipv4(server_name):
         return False, "Let's Encrypt cannot issue for a bare IP - use a DNS name, or self-signed."
     if shutil.which("certbot") is None:

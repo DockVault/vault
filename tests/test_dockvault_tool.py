@@ -3436,6 +3436,35 @@ def test_icacls_and_whoami_run_from_system32_never_by_their_bare_names(monkeypat
     assert [c[0] for c in calls] == [os.path.join(system32, "whoami.exe"), os.path.join(system32, "icacls.exe")] * 2
 
 
+# --- the Let's Encrypt renewal hook is Linux's --------------------------------------------------------------
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14", "win32"])
+def test_lets_encrypt_automation_is_refused_off_linux_before_certbot_runs(tmp_path, monkeypatch, platform):
+    """The renewal hook needs the stat -c and mv -T of GNU coreutils or BusyBox: on macOS (and the BSDs) it would
+    stop at each renewal before it deployed the certificate, which would then expire. Refused there, before certbot
+    runs, saying what to use instead."""
+    monkeypatch.setattr(dv.sys, "platform", platform)
+    ok, msg = dv.obtain_letsencrypt_cert(str(tmp_path / "certs"), "vault.example.test", "ops@example.test",
+                                         str(tmp_path), "vault", run=lambda *a, **k: pytest.fail("certbot ran"))
+    assert ok is False
+    assert "Let's Encrypt automation is Linux-only here" in msg and "the stat -c and mv -T" in msg
+    assert "--cert-mode byo" in msg
+    assert not (tmp_path / "certs").exists()
+
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14"])
+def test_a_renewal_hook_off_linux_is_left_as_it_is(tmp_path, monkeypatch, platform):
+    """Rewriting an earlier version's hook there would put in the hook that stops at each renewal."""
+    monkeypatch.setattr(dv.sys, "platform", platform)
+    hook = tmp_path / "dockvault-vault.sh"
+    old = '#!/bin/bash\nCD=%s\nLIVE=/etc/letsencrypt/live/x\ndocker compose up -d\n' % (tmp_path / "certs")
+    hook.write_text(old, encoding="utf-8")
+    outcome, said = dv.refresh_renewal_hook(str(tmp_path), str(tmp_path / "certs"), "vault", owners=(0,),
+                                            hook=str(hook), is_root=True)
+    assert outcome == "unsupported" and hook.read_text(encoding="utf-8") == old
+    assert "was left as it is: this version writes it on Linux only" in said
+
+
 @pytest.mark.parametrize("answer, env, grantee", [
     ("", {"USERNAME": "operator", "USERDOMAIN": "CORP"}, "CORP\\operator"),
     ("", {"USERNAME": "operator"}, "operator"),

@@ -136,6 +136,23 @@ def test_a_renewed_pair_that_does_not_match_is_not_installed(tmp_path):
     assert sorted(p.name for p in host.certs.iterdir()) == ["cert.pem", "key.pem"]
 
 
+def test_an_openssl_that_prints_nothing_stops_the_hook_with_nothing_changed(tmp_path):
+    """Under set -e, a failing test in an && list stops nothing unless it is the list's last command: an openssl that
+    printed nothing and answered 0 left "$_c" empty, the list failed at its first test, and the hook went on to swap
+    in a pair nobody had checked and restart the container. The list's outcome stops it now."""
+    host = _Host(tmp_path)
+    silent = host.bin / "openssl"
+    silent.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(silent, 0o755)
+    before = host.held()
+    r = host.run()
+    assert r.returncode != 0
+    assert host.held() == before and host.docker_calls() == []
+    assert sorted(p.name for p in host.certs.iterdir()) == ["cert.pem", "key.pem"], "no staging left behind"
+    assert ("dockvault renewal: the renewed certificate and key are not a pair, or openssl could not read them; "
+            "nothing was renewed") in r.stderr
+
+
 def test_the_hook_file_is_written_over_its_name_never_through_a_link(tmp_path):
     victim = tmp_path / "victim"
     victim.write_text("leave me\n", encoding="utf-8")
