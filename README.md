@@ -713,8 +713,12 @@ refused with nothing changed. Each extraction then reads its archive once more a
 it extracts in that same read: a bundle on a share or a removable disk, or one someone else can write
 while the restore waits for its confirmation, can change in between, and other bytes than the ones
 checked stop the restore there. The checksums of an unsealed backup show damage only: whoever can write
-the bundle can rewrite them too. A backup made before backups recorded checksums is still restored,
-with a notice that its archives could only be read through, not matched. `--bundle-dir` and
+the bundle can rewrite them too. A backup made before backups recorded checksums (its manifest is of
+format 1) is still restored, with a notice that its archives could only be read through, not matched;
+a manifest of the format that records them and lacks one is refused. A sealed backup also says, inside
+its sealed `env.enc`, that its manifest is authenticated: one stripped of its MAC and its checksums to
+pass for an older backup is refused, and only a sealed backup made before manifests were
+authenticated restores without a MAC, with a notice. `--bundle-dir` and
 `--backup-dir` may be relative paths. A restore that stops part way, once it has stopped the
 deployment (a volume that cannot be cleared, an archive that does not extract or changed after the
 check, the audit log's restore mark that cannot be written), changes nothing more: it does not install

@@ -2194,16 +2194,35 @@ def coupling_marker_verdict(marker, env):
     return "ok" if verify_backup_coupling(env, marker or {}) else None
 
 
+# The manifest's format ("dockvault_backup"). 1: the backups made before archives had checksums (an entry records no
+# sha256 or size). 2: every entry records its archive's sha256 and size, and a restore refuses a format-2 manifest
+# that lacks one. Nothing in an unsealed bundle is authenticated, so whoever can write it can also write format 1
+# with no checksums: a restore of a format-1 bundle says that nothing shows its archives are the backup's.
+BACKUP_MANIFEST_FORMAT = 2
+
+
+def manifest_format(manifest):
+    """A manifest's format: 1 when it names none (every backup before formats were numbered wrote 1), the number when
+    it is one this tool knows (1 .. BACKUP_MANIFEST_FORMAT), else None."""
+    fmt = manifest.get("dockvault_backup", 1) if isinstance(manifest, dict) else None
+    if isinstance(fmt, int) and not isinstance(fmt, bool) and 1 <= fmt <= BACKUP_MANIFEST_FORMAT:
+        return fmt
+    return None
+
+
 def build_backup_manifest(prefix, bundle_id, volumes, salt, env, created=""):
     """The backup manifest dict (NO secrets): identifies the set + records the salted coupling
     fingerprint of the paired .env. `volumes` is a list of {role, name, archive, sha256, size}: the archive's
-    SHA-256 and size as check_archive_file found them on the host (a backup made before them lacks both)."""
+    SHA-256 and size as check_archive_file found them on the host (a backup made before them lacks both). Its
+    format (BACKUP_MANIFEST_FORMAT) is the one that records them when every entry does, else 1."""
+    entries = list(volumes)
+    recorded = bool(entries) and all(isinstance(e, dict) and "sha256" in e and "size" in e for e in entries)
     return {
-        "dockvault_backup": 1,
+        "dockvault_backup": BACKUP_MANIFEST_FORMAT if recorded else 1,
         "created": created,
         "volume_prefix": prefix,
         "bundle_id": bundle_id or "default",
-        "volumes": list(volumes),
+        "volumes": entries,
         "env_file": "env",
         "coupling": {"salt": salt, "sha256": compute_coupling_fingerprint(env, salt)},
         "note": "The 'env' file in this backup holds ENCRYPTION_KEY - protect the whole bundle off-host.",
@@ -2334,6 +2353,44 @@ def manifest_mac_matches(dek, manifest_bytes, recorded):
     if not isinstance(recorded, str) or not ARCHIVE_DIGEST_RE.match(recorded):
         return False
     return hmac.compare_digest(manifest_mac(dek, manifest_bytes), recorded)
+
+
+# What a sealed bundle's env.enc seals: its env, then one line saying that the bundle's manifest is authenticated
+# (BUNDLE_MANIFEST_MAC), with an identifier of the data key it is sealed under. The line is sealed with the env, under
+# that key, so nobody without the passphrase or the recovery key can take it out: a sealed bundle stripped of its MAC
+# and of its checksums, to look like one made before them, is refused. Each seal has a data key of its own: such a
+# line that reached a .env from elsewhere (an earlier version of the tool installs a payload as it is, line and all)
+# names another key than the seal of the next backup of that .env, and does not make that backup, sealed by an
+# earlier version with no MAC, look new.
+_SEALED_LINE = b"\n# dockvault sealed backup %s: its manifest is authenticated (manifest.json.mac)\n"
+_SEALED_LINE_RE = re.compile(rb"\n# dockvault sealed backup ([0-9a-f]{32}): its manifest is authenticated "
+                             rb"\(manifest\.json\.mac\)\n\Z")
+_SEALED_LINE_LABEL = b"dockvault sealed backup line v1"
+
+
+def sealed_line_id(dek):
+    """The identifier of the data key `dek` the line of a sealed bundle names (HMAC-SHA256 under the key, of a fixed
+    label, cut to 32 hex): it says nothing of the key, and only the key's holder can make it."""
+    import hmac
+    raw = dek if isinstance(dek, (bytes, bytearray)) else str(dek).encode("ascii")
+    return hmac.new(bytes(raw), _SEALED_LINE_LABEL, hashlib.sha256).hexdigest()[:32]
+
+
+def sealed_bundle_payload(env_bytes, dek):
+    """The bytes a sealed bundle's env.enc seals under the data key `dek`: the env, then the line that says its
+    manifest is authenticated, naming that key (sealed_line_id)."""
+    return bytes(env_bytes) + _SEALED_LINE % sealed_line_id(dek).encode("ascii")
+
+
+def split_sealed_bundle_payload(payload, dek):
+    """(the env bytes, True) for a payload sealed_bundle_payload made under the data key `dek` it was just opened
+    with; else (the payload as it is, False): a bundle sealed before manifests were authenticated, whose payload is
+    its env (a line there that names another key came from another seal)."""
+    import hmac
+    m = _SEALED_LINE_RE.search(bytes(payload))
+    if m and dek is not None and hmac.compare_digest(m.group(1), sealed_line_id(dek).encode("ascii")):
+        return bytes(payload)[:m.start()], True
+    return bytes(payload), False
 
 
 def tar_volume(volume, dest_dir, archive_name, run=subprocess.run):
@@ -6573,19 +6630,27 @@ class DockVault:
         passphrase = self._read_passphrase(args, confirm=True)
         import datetime as _dt
         now_iso = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
-        enc_text, dek = env_lock_seal(fernet, env_bytes, passphrase,
+        # The env, and after it the line that says this bundle's manifest is authenticated, naming the bundle's own data
+        # key (sealed_bundle_payload): sealed with the env, it cannot be taken out to make the bundle look like one made
+        # before MACs.
+        dek = fernet.generate_key()
+        payload = sealed_bundle_payload(env_bytes, dek)
+        enc_text, dek = env_lock_seal(fernet, payload, passphrase, dek=dek,
                                       hint=getattr(args, "hint", None), now_iso=now_iso)
         self._atomic_write_secret(enc_file, enc_text)
         # Verify-before-destroy: the freshly written env.enc must decrypt (by passphrase) back to the
         # exact bytes, or _abort keeps the complete plaintext bundle. (The recovery key is the same
-        # DEK this verify confirmed opens the payload, so the recovery-key path is verified too.)
+        # DEK this verify confirmed opens the payload, so the recovery-key path is verified too.) A restore must read
+        # it back as this env with its line, the line naming the key it was opened with.
         try:
             with open(enc_file, encoding="utf-8") as f:
-                check_bytes, _ = env_lock_open(fernet, f.read(), passphrase=passphrase)
-        except EnvLockError as exc:
+                check_bytes, opened_with = env_lock_open(fernet, f.read(), passphrase=passphrase)
+        except (OSError, EnvLockError) as exc:
             _abort("sealed env failed verification (%s)" % exc)
-        if check_bytes != env_bytes:
+        if check_bytes != payload:
             _abort("sealed env did not round-trip")
+        if split_sealed_bundle_payload(check_bytes, opened_with) != (env_bytes, True):
+            _abort("the sealed env does not read back as one whose manifest is authenticated")
         # The manifest, authenticated under the same data key: the checksums it records of the archives then show not
         # only damage but any change by whoever can write the bundle without that key (manifest_mac). Written and read
         # back before the plaintext env goes. (A backup writes its manifest before it seals; a bundle without one is
@@ -6637,9 +6702,11 @@ class DockVault:
 
     def _unseal_bundle_env(self, enc_path, args, with_key=False):
         """Decrypt a sealed bundle's env.enc and return the plaintext env BYTES (never written to
-        disk), or (the bytes, the data key) with `with_key`: the data key opens what else the bundle sealed
-        with it. Uses the recovery key when --recovery-key-file/-stdin or --use-recovery-key is given,
-        else the passphrase. A wrong credential fails here, before the restore touches the stack."""
+        disk), or (the bytes, the data key, whether it says its manifest is authenticated) with `with_key`: the data
+        key opens what else the bundle sealed with it, and a bundle sealed since manifests were authenticated says so
+        in its sealed payload (split_sealed_bundle_payload; the line is not part of the env). Uses the recovery key
+        when --recovery-key-file/-stdin or --use-recovery-key is given, else the passphrase. A wrong credential fails
+        here, before the restore touches the stack."""
         fernet = self._require_fernet()
         try:
             with open(enc_path, encoding="utf-8") as f:
@@ -6657,7 +6724,8 @@ class DockVault:
                                                passphrase=self._read_passphrase(args, confirm=False))
         except EnvLockError as exc:
             self._fail("cannot open the sealed backup (%s) - the deployment was NOT touched." % exc)
-        return (env_bytes, dek) if with_key else env_bytes
+        env_bytes, authenticated = split_sealed_bundle_payload(env_bytes, dek)
+        return (env_bytes, dek, authenticated) if with_key else env_bytes
 
     def _carried_chain_key(self, bundle, dek):
         """The old AUDIT_CHAIN_KEY `bundle` carries (a backup taken during an unfinished key change): from its
@@ -6688,12 +6756,19 @@ class DockVault:
 
     def _recorded_archives(self, manifest):
         """{archive name: (SHA-256 hex, size)} the backup recorded, for each manifest entry of a known role that has a
-        checksum; {} for a backup made before backups recorded them. Fails on a checksum or size that is not one."""
-        out = {}
+        checksum; {} for a backup made before backups recorded them. Fails on a checksum or size that is not one, on
+        a manifest format this tool does not know, and on a manifest of the format that records every archive's
+        checksum (BACKUP_MANIFEST_FORMAT) that lacks one: only a format-1 manifest, made before checksums, has none."""
+        fmt = manifest_format(manifest)
+        if fmt is None:
+            self._fail("this backup's manifest is of format %r, which this version of the tool does not know - "
+                       "refusing to restore. Nothing changed." % (manifest.get("dockvault_backup"),))
+        out, without = {}, []
         for e in (manifest.get("volumes") or []):
             if not isinstance(e, dict) or e.get("role") not in VOLUME_BASENAMES:
                 continue                     # an unknown role is refused below, with the volumes
             if "sha256" not in e and "size" not in e:
+                without.append(e["role"])
                 continue
             digest, size = e.get("sha256"), e.get("size")
             if not (isinstance(digest, str) and ARCHIVE_DIGEST_RE.match(digest)
@@ -6701,16 +6776,26 @@ class DockVault:
                 self._fail("the backup's manifest records a checksum or size for volume role %r that is not one - "
                            "refusing to restore. Nothing changed." % e.get("role"))
             out["%s.tar.gz" % VOLUME_BASENAMES[e["role"]]] = (digest, size)
+        if fmt >= 2 and without:
+            self._fail("this backup's manifest is of the format that records the checksum of every archive, and it "
+                       "records none for %s: it was changed since the backup was made. Refusing to restore; nothing "
+                       "changed." % ", ".join(without))
         return out
 
-    def _check_manifest_mac(self, bundle, manifest_bytes, dek, has_digests):
+    def _check_manifest_mac(self, bundle, manifest_bytes, dek, has_digests, authenticated=False, fmt=1):
         """A sealed bundle: its manifest must be the one it was sealed with, proven by the MAC beside it
-        (BUNDLE_MANIFEST_MAC, under the key env.enc was just opened with). A manifest that records checksums but has
-        no MAC lost it on the way (every bundle that records them and is sealed has one): refused. A bundle with
-        neither was sealed before manifests were authenticated: restored, with a notice."""
+        (BUNDLE_MANIFEST_MAC, under the key env.enc was just opened with). Every bundle sealed since manifests were
+        authenticated has one, and says so where nobody without its key can take it out (`authenticated`: its sealed
+        payload, split_sealed_bundle_payload); its manifest also records checksums, in format 2 (`fmt`). Such a bundle
+        without a MAC lost it on the way: refused. One that says none of it was sealed before manifests were
+        authenticated: restored, with a notice."""
         mac_path = os.path.join(bundle, BUNDLE_MANIFEST_MAC)
         if not os.path.lexists(mac_path):
-            if has_digests:
+            if authenticated:
+                self._fail("this sealed backup was made with its manifest authenticated (its sealed env says so), "
+                           "but %s, which proves the manifest is the one sealed with it, is missing: refusing to "
+                           "restore. Nothing changed." % BUNDLE_MANIFEST_MAC)
+            if has_digests or fmt >= 2:
                 self._fail("this sealed backup's manifest records the checksums of its archives but %s, which proves "
                            "the manifest is the one sealed with it, is missing: refusing to restore. Nothing changed."
                            % BUNDLE_MANIFEST_MAC)
@@ -6812,9 +6897,9 @@ class DockVault:
         # A sealed bundle carries env.enc instead of a plaintext env. Decrypt it into MEMORY here --
         # before manifest/coupling checks and long before the stack is stopped -- so a wrong
         # passphrase/recovery key aborts with the deployment intact and no plaintext ever hits disk.
-        sealed_env_bytes, sealed_dek = None, None
+        sealed_env_bytes, sealed_dek, authenticated = None, None, False
         if not os.path.exists(env_path) and os.path.exists(enc_path):
-            sealed_env_bytes, sealed_dek = self._unseal_bundle_env(enc_path, args, with_key=True)
+            sealed_env_bytes, sealed_dek, authenticated = self._unseal_bundle_env(enc_path, args, with_key=True)
         if not os.path.exists(man_path) or (sealed_env_bytes is None and not os.path.exists(env_path)):
             self._fail("that bundle is missing manifest.json or its env - refusing to restore")
         try:
@@ -6826,10 +6911,13 @@ class DockVault:
         if not isinstance(manifest, dict):
             self._fail("the backup's manifest is not one this tool writes - refusing to restore")
         # What the backup recorded of each archive (its checksum and size), before anything of the manifest is used:
-        # a sealed bundle's manifest is first proven to be the one it was sealed with.
+        # a sealed bundle's manifest is first proven to be the one it was sealed with. Only a bundle that is old by
+        # every sign (format 1, no checksums, and for a sealed one, a sealed env that does not say its manifest is
+        # authenticated) is restored without that proof, with a notice.
         recorded = self._recorded_archives(manifest)
         if sealed_dek is not None:
-            self._check_manifest_mac(bundle, manifest_bytes, sealed_dek, bool(recorded))
+            self._check_manifest_mac(bundle, manifest_bytes, sealed_dek, bool(recorded), authenticated=authenticated,
+                                     fmt=manifest_format(manifest))
         bundle_env = parse_env(sealed_env_bytes.decode("utf-8") if sealed_env_bytes is not None
                                else open(env_path, encoding="utf-8").read())
         # COUPLING: the bundle's .env must be the one its volumes were created with - never restore

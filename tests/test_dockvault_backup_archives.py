@@ -265,17 +265,107 @@ def test_a_sealed_backup_with_its_manifest_as_sealed_restores(tmp_path, monkeypa
     pytest.importorskip("cryptography")
     bundle = _backed_up(tmp_path, monkeypatch, "dvarchmacok", lock=True)
     steps = []
+    host_env = (tmp_path / ".env").read_bytes()
+    (tmp_path / ".env").unlink()
     _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(
         _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt")))
     assert steps[0] == ("stop",) and ("start",) in steps
+    assert (tmp_path / ".env").read_bytes() == host_env, "the .env installed is the one backed up, byte for byte"
 
 
-def _old_backup(tmp_path, prefix, sealed=False):
-    """A backup as a dockvault.py before checksums wrote it: entries without sha256/size, and no MAC."""
+def _sealed_payload(bundle, passphrase="seal-passphrase-1"):
+    """(the payload a bundle's env.enc seals, the data key it is sealed under)."""
+    text = (bundle / "env.enc").read_text(encoding="utf-8")
+    return dv.env_lock_open(dv.load_fernet(), text, passphrase=passphrase)
+
+
+def test_a_sealed_backup_says_in_its_sealed_env_that_its_manifest_is_authenticated(tmp_path, monkeypatch):
+    pytest.importorskip("cryptography")
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchsays", lock=True)
+    payload, dek = _sealed_payload(bundle)
+    env, line = payload.rsplit(b"\n# dockvault sealed backup ", 1)
+    assert env == (tmp_path / ".env").read_bytes(), "the env, then the line"
+    assert line == b"%s: its manifest is authenticated (manifest.json.mac)\n" % dv.sealed_line_id(dek).encode()
+    assert dv.split_sealed_bundle_payload(payload, dek) == (env, True)
+    assert (bundle / dv.BUNDLE_MANIFEST_MAC).exists()
+    assert json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))["dockvault_backup"] == 2
+
+
+@pytest.mark.parametrize("strip", ["mac-and-checksums", "mac-checksums-and-format"])
+def test_a_sealed_backup_stripped_to_look_old_is_refused(tmp_path, monkeypatch, capsys, strip):
+    """Whoever can write a sealed bundle, with neither its passphrase nor its recovery key, deleted its MAC and every
+    checksum (and set its manifest's format back to 1): the restore took it for a backup made before both, said so,
+    and restored archives nobody had checked (a database of their choosing, say). Its sealed env says it was made
+    with its manifest authenticated, and that cannot be taken out without the key: refused, with nothing changed."""
+    pytest.importorskip("cryptography")
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchstrip", lock=True)
+    (bundle / dv.BUNDLE_MANIFEST_MAC).unlink()
+    man = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    for e in man["volumes"]:
+        del e["sha256"], e["size"]
+    if strip == "mac-checksums-and-format":
+        man["dockvault_backup"] = 1
+    (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    _tgz(bundle / "vault_pg_data.tar.gz", {"planted.txt": b"a database of their choosing"})
+    host_env = (tmp_path / ".env").read_bytes()
+    steps = []
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(
+            _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt")))
+    assert steps == [] and (tmp_path / ".env").read_bytes() == host_env
+    said = _said(capsys)
+    assert "made before backups" not in said
+    if strip == "mac-checksums-and-format":
+        assert ("this sealed backup was made with its manifest authenticated (its sealed env says so), but %s, which "
+                "proves the manifest is the one sealed with it, is missing" % dv.BUNDLE_MANIFEST_MAC) in said
+    else:
+        assert "is of the format that records the checksum of every archive, and it records none for keys" in said
+
+
+@pytest.mark.parametrize("fmt", [3, 0, "2", True, None], ids=["newer", "zero", "a-text", "a-bool", "null"])
+def test_a_manifest_of_a_format_this_tool_does_not_know_is_refused(tmp_path, monkeypatch, capsys, fmt):
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchfmt")
+    man = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    man["dockvault_backup"] = fmt
+    (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    steps = []
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(_restore_args(bundle))
+    assert steps == []
+    assert "this backup's manifest is of format %r, which this version of the tool does not know" % (fmt,) in _said(
+        capsys)
+
+
+def test_split_sealed_bundle_payload_takes_only_the_line_of_its_own_seal():
+    """The line names the data key the payload is sealed under: under that key it is this bundle's line, taken off
+    the env; under another key (another seal's line, which an earlier version installed with a .env) it is part of
+    the env, and the bundle an old one."""
+    env, key, other = b"A=1\nB=2\n", b"the-seal's-own-data-key", b"another-seal's-data-key"
+    payload = dv.sealed_bundle_payload(env, key)
+    line_id = dv.sealed_line_id(key)
+    assert len(line_id) == 32 and line_id != dv.sealed_line_id(other)
+    assert payload == env + b"\n# dockvault sealed backup %s: its manifest is authenticated (manifest.json.mac)\n" % (
+        line_id.encode())
+    assert dv.split_sealed_bundle_payload(payload, key) == (env, True)
+    assert dv.split_sealed_bundle_payload(payload, key.decode()) == (env, True), "the recovery key as text"
+    for wrong in (other, None):
+        assert dv.split_sealed_bundle_payload(payload, wrong) == (payload, False), "another seal's line"
+    assert dv.split_sealed_bundle_payload(payload + b"C=3\n", key) == (payload + b"C=3\n", False)
+    assert dv.split_sealed_bundle_payload(env, key) == (env, False)
+    assert dv.split_sealed_bundle_payload(dv.sealed_bundle_payload(b"", key), key) == (b"", True)
+    no_end = b"X=1"
+    assert dv.split_sealed_bundle_payload(dv.sealed_bundle_payload(no_end, key), key) == (no_end, True)
+
+
+def _old_backup(tmp_path, prefix, sealed=False, env_tail=b""):
+    """A backup as a dockvault.py before checksums wrote it: entries without sha256/size, and no MAC; its env is the
+    host's .env with `env_tail` after it."""
     env = _env(tmp_path, prefix)
     bundle = tmp_path / "old-bundle"
     bundle.mkdir()
-    (bundle / "env").write_bytes((tmp_path / ".env").read_bytes())
+    (bundle / "env").write_bytes((tmp_path / ".env").read_bytes() + env_tail)
     entries = [{"role": r, "name": dv.set_volume_names(prefix)[r], "archive": "%s.tar.gz" % dv.VOLUME_BASENAMES[r]}
                for r in ("keys", "pg", "storage")]
     for e in entries:
@@ -306,6 +396,24 @@ def test_a_backup_made_before_checksums_restores_with_a_notice(tmp_path, monkeyp
     assert ("this sealed backup was made before backups authenticated their manifest" in said) is sealed
 
 
+def test_an_old_sealed_backup_whose_env_carries_another_seals_line_restores_as_an_old_one(tmp_path, monkeypatch,
+                                                                                          capsys):
+    """An earlier version of the tool installs a sealed payload as it is, so the line that says a manifest is
+    authenticated can reach a .env, and the backup an earlier version then seals of that .env (no MAC, no checksums)
+    carries it at the end of its env. That line names the data key of another seal: the backup is an old one, restored
+    with its notice, and its env (line and all) installed as it is."""
+    pytest.importorskip("cryptography")
+    tail = dv.sealed_bundle_payload(b"", dv.load_fernet().generate_key())    # the line of an earlier seal
+    bundle = _old_backup(tmp_path, "dvarchtail", sealed=True, env_tail=tail)
+    host_env = (tmp_path / ".env").read_bytes()
+    steps = []
+    _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(
+        _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt")))
+    assert ("start",) in steps
+    assert "this sealed backup was made before backups authenticated their manifest" in _said(capsys)
+    assert (tmp_path / ".env").read_bytes() == host_env + tail
+
+
 def test_an_old_backup_whose_archive_does_not_read_whole_is_still_refused(tmp_path, monkeypatch, capsys):
     bundle = _old_backup(tmp_path, "dvarcholdbad")
     (bundle / "vault_storage.tar.gz").write_bytes(b"x")
@@ -316,15 +424,22 @@ def test_an_old_backup_whose_archive_does_not_read_whole_is_still_refused(tmp_pa
     assert "the archive for volume dvarcholdbad_vault_storage cannot be restored" in _said(capsys)
 
 
-@pytest.mark.parametrize("manifest", ["some-only", "not-a-checksum", "not-a-size", "a-size-as-a-float"])
+@pytest.mark.parametrize("manifest", ["some-only", "none-left", "some-only-format-1", "not-a-checksum", "not-a-size",
+                                      "a-size-as-a-float"])
 def test_a_manifest_whose_checksums_no_backup_writes_is_refused(tmp_path, monkeypatch, capsys, manifest):
     """Each by the check of what a backup writes, before any archive is compared with it: a size of the right value
-    as a float compares equal to the archive's own, and True to 1."""
+    as a float compares equal to the archive's own, and True to 1. A manifest of the format that records every
+    archive's checksum, with one or all of them taken out, is refused too."""
     bundle = _backed_up(tmp_path, monkeypatch, "dvarchodd")
     man = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-    assert man["volumes"][0]["role"] == "keys"
-    if manifest == "some-only":
+    assert man["volumes"][0]["role"] == "keys" and man["dockvault_backup"] == 2
+    if manifest.startswith("some-only"):
         del man["volumes"][2]["sha256"], man["volumes"][2]["size"]
+        if manifest == "some-only-format-1":
+            man["dockvault_backup"] = 1
+    elif manifest == "none-left":
+        for e in man["volumes"]:
+            del e["sha256"], e["size"]
     elif manifest == "not-a-checksum":
         man["volumes"][0]["sha256"] = "not-hex"
     elif manifest == "not-a-size":
@@ -339,6 +454,12 @@ def test_a_manifest_whose_checksums_no_backup_writes_is_refused(tmp_path, monkey
     assert steps == []
     said = _said(capsys)
     if manifest == "some-only":
+        assert ("this backup's manifest is of the format that records the checksum of every archive, and it records "
+                "none for storage: it was changed since the backup was made") in said
+    elif manifest == "none-left":
+        assert ("this backup's manifest is of the format that records the checksum of every archive, and it records "
+                "none for keys, pg, storage: it was changed since the backup was made") in said
+    elif manifest == "some-only-format-1":
         assert "records the checksum of some of its archives only" in said
     else:
         assert "records a checksum or size for volume role 'keys' that is not one" in said
