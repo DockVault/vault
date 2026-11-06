@@ -3484,6 +3484,23 @@ def _parse_env_lock(enc_text):
     return body
 
 
+def sealed_set_differs(sealed_bytes, env_bytes):
+    """Why the .env sealed in `sealed_bytes` belongs to another set than `env_bytes`, or "" when both are the
+    same set's (an edited .env, sealed again). A set is its volumes (VAULT_VOLUME_PREFIX) and the key its data is
+    encrypted under (ENCRYPTION_KEY): another set's .env differs in either. Names neither key's value."""
+    def _read(raw):
+        try:
+            return parse_env(bytes(raw).decode("utf-8"))
+        except (UnicodeDecodeError, TypeError):
+            return {}
+    sealed, new = _read(sealed_bytes), _read(env_bytes)
+    if volume_prefix(sealed) != volume_prefix(new):
+        return "set '%s', while .env is set '%s'" % (volume_prefix(sealed), volume_prefix(new))
+    if (sealed.get("ENCRYPTION_KEY") or "").strip() != (new.get("ENCRYPTION_KEY") or "").strip():
+        return "set '%s' with another ENCRYPTION_KEY than this .env's" % volume_prefix(sealed)
+    return ""
+
+
 def env_lock_open(fernet, enc_text, passphrase=None, recovery_key=None):
     """Decrypt a .env.enc. Provide EITHER passphrase OR recovery_key. Returns (env_bytes, dek).
     Raises EnvLockError on a wrong credential, tampering, or a malformed file."""
@@ -3723,6 +3740,16 @@ class DockVault:
         """True when .env is sealed: no plaintext .env, but a .env.enc is present."""
         return (not os.path.exists(self._env_path())) and os.path.exists(self._env_lock_path())
 
+    def _refuse_while_locked(self, what):
+        """Stop `what`, a command that writes .env, while .env is sealed by `lock`, before it writes anything. A .env
+        written beside the sealed one would be another set's (fresh secrets, a new set's, another set's copy), and a
+        later `lock` (or `down --lock`) would seal it over the sealed one: the sealed set's ENCRYPTION_KEY would then
+        be nowhere, and its volumes could never be read again."""
+        if self._is_locked():
+            self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run %s "
+                       "again. A .env written beside the sealed one, and sealed over it by a later lock, would lose "
+                       "the sealed set's keys. Nothing changed." % what)
+
     def _atomic_write_secret(self, path, data):
         """Write `data` to `path` atomically (temp in the same dir -> fsync -> os.replace) and tighten
         perms to owner-only. The temp file is created mode-600 on POSIX so a secret is never briefly
@@ -3853,9 +3880,20 @@ class DockVault:
             passphrase = self._read_passphrase(args, confirm=False)
             try:
                 with open(enc_path, encoding="utf-8") as f:
-                    _, dek = env_lock_open(fernet, f.read(), passphrase=passphrase)
+                    sealed_bytes, dek = env_lock_open(fernet, f.read(), passphrase=passphrase)
             except EnvLockError as exc:
                 print(pal.paint("  Cannot re-lock: %s." % exc, "red"))
+                raise SystemExit(2)
+            # Re-locking writes over .env.enc, so it may only seal the same set's .env again (an edited one).
+            # The .env of another set (another VAULT_VOLUME_PREFIX, or another ENCRYPTION_KEY) sealed over it
+            # would leave the sealed set's ENCRYPTION_KEY nowhere: its volumes could never be read again.
+            other = sealed_set_differs(sealed_bytes, env_bytes)
+            if other:
+                print(pal.paint(
+                    "  Refusing to lock: .env.enc holds the .env of another set (%s), and sealing this .env over it "
+                    "would lose that set's keys. Keep it first: move .env.enc somewhere safe (it still opens with "
+                    "its passphrase or recovery key), then run lock again to seal this .env under a passphrase of "
+                    "its own. Nothing changed." % other, "red"))
                 raise SystemExit(2)
         else:
             print(pal.paint(
@@ -4142,8 +4180,10 @@ class DockVault:
         """Configure + start the standalone HTTPS vault: author (or reuse) .env, provision a TLS
         certificate (self-signed / Let's Encrypt / bring-your-own, with rootless-cert-perm handling),
         then start the secure stack — pulling the published release image or building this
-        checkout, per the .env's DOCKVAULT_IMAGE (see _resolve_setup_image)."""
+        checkout, per the .env's DOCKVAULT_IMAGE (see _resolve_setup_image). Refused while .env is sealed by
+        `lock` (_refuse_while_locked)."""
         pal = self.pal
+        self._refuse_while_locked("setup")
         no_start = bool(args and getattr(args, "no_start", False))
         # "Start" rather than "Build + start": the deployment may be pulling a published release
         # rather than building, and for a fresh install the choice is not made until Settings.
@@ -6101,8 +6141,10 @@ class DockVault:
 
     def _volume_new(self, env, args=None):
         """Author a FRESH set (new prefix + brand-new secrets) with its own .env, archiving the current
-        one. Does NOT start it (run Setup next); the current set's volumes are left intact."""
+        one. Does NOT start it (run Setup next); the current set's volumes are left intact. Refused while .env is
+        sealed (_refuse_while_locked): the sealed set's .env could not be archived first."""
         pal = self.pal
+        self._refuse_while_locked("volumes --action new")
         interactive = not (args and getattr(args, "non_interactive", False))
         if interactive and not confirm(
                 "Create a NEW empty set (fresh secrets + .env)? Your current set is kept.", pal, default=False):
@@ -6129,8 +6171,10 @@ class DockVault:
     def _volume_repoint(self, env, args=None):
         """Point the deployment at ANOTHER set. Requires that set's matching .env (auto-found as
         .env.<prefix>, or --env-source), verifies it names the target set, and validates it against the
-        set's data via the secret guard - refusing on mismatch and RESTORING the current .env."""
+        set's data via the secret guard - refusing on mismatch and RESTORING the current .env. Refused while .env is
+        sealed (_refuse_while_locked)."""
         pal = self.pal
+        self._refuse_while_locked("volumes --action repoint")
         interactive = not (args and getattr(args, "non_interactive", False))
         cur_prefix = volume_prefix(env)
         others = [p for p, _ in group_volumes_by_prefix(list_managed_volumes()) if p and p != cur_prefix]

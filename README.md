@@ -320,8 +320,11 @@ recovery key (the recovery key itself stays the same).
 
 `lock` asks for an **unlock passphrase** and shows a one-time **credential recovery key** (save it in a
 password manager — it opens `.env` if you forget the passphrase). `start` will offer to unlock inline.
-Every command that writes `.env` (`update`, `audit change-key`, `audit retention --set` and the other
-settings) refuses while it is sealed, with nothing written: unlock it first.
+Every command that writes `.env` (`setup`, Volumes' new set and repoint, restore, `update`, `audit change-key`,
+`audit retention --set` and the other settings) refuses while it is sealed, with nothing written: unlock it
+first. A `.env` written beside the sealed one would belong to another set, and a later `lock` would seal it
+over the sealed set's only copy. For the same reason a re-`lock` seals only the same set's `.env` again (the
+same `VAULT_VOLUME_PREFIX` and `ENCRYPTION_KEY`): it refuses another set's `.env`, leaving `.env.enc` as it was.
 Requires the `cryptography` package (`pip install cryptography`).
 
 `lock` seals `.env` only: the `.env.<set>` archives that Volumes and Reset set aside stay in plain text, and so

@@ -121,12 +121,18 @@ Two files, two strict states, never a header-marked half-`.env`:
   1. Read `.env` bytes.
   2. If `.env.enc` exists: unwrap the existing DEK with the passphrase (verifies the passphrase, keeps
      the recovery key stable); else generate a fresh DEK (first lock → show the recovery key once).
+     A re-lock seals only the same set's `.env` again: when the sealed payload names another
+     `VAULT_VOLUME_PREFIX` or holds another `ENCRYPTION_KEY`, `lock` refuses with both files as they were
+     (written over, the sealed set's `ENCRYPTION_KEY` would be nowhere).
   3. Write `.env.enc` **atomically** (temp file in the same dir, `fsync`, `os.replace`), mode `600`.
   4. **Verify:** re-read `.env.enc`, decrypt with the in-memory DEK, assert byte-identical to step 1.
   5. Only then delete `.env`. A failure at any step leaves BOTH files intact and exits loud.
 - All writes reuse the existing atomic-write + `600`/`icacls` helpers.
 - A bad passphrase, a failed AEAD tag, or a format-version mismatch fails **loud** and never touches the
   counterpart file.
+- While locked, every command that would write `.env` (setup, Volumes' new set and repoint, restore,
+  update and the settings commands) refuses before it writes anything: a `.env` written beside the
+  sealed one would be another set's, and the next `lock` would otherwise seal it over the sealed one.
 
 **Data-loss warning (shown at first `lock`):** the recovery key and passphrase are the only ways back
 to `ENCRYPTION_KEY`. Lose both → every stored file is permanently unrecoverable. Save the recovery key

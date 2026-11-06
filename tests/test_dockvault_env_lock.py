@@ -275,3 +275,101 @@ def test_change_passphrase_without_enc_exits(tmp_path):
     app = _app(tmp_path)  # no .env.enc
     with pytest.raises(SystemExit):
         app.change_passphrase(_args(passphrase_file=_passfile(tmp_path), new_passphrase_file=_passfile(tmp_path)))
+
+
+# --- a sealed set is never written over by another set's .env ----------------------------------
+
+def _set_env(prefix, key="ZmFrZS1lbmMta2V5"):
+    return ("VAULT_VOLUME_PREFIX=%s\nENCRYPTION_KEY=%s\nVAULT_DB_PASSWORD=db-%s\nJWT_SECRET_KEY=jwt-%s\n"
+            % (prefix, key, prefix, prefix))
+
+
+def _sealed(tmp_path, text):
+    """`text` written as .env and sealed by lock; returns the passphrase file."""
+    (tmp_path / ".env").write_text(text, encoding="utf-8")
+    pf = _passfile(tmp_path)
+    _app(tmp_path).lock(_args(passphrase_file=pf))
+    assert not (tmp_path / ".env").exists()
+    return pf
+
+
+def _opens_to(tmp_path, pf):
+    fernet = dv.load_fernet()
+    payload, _ = dv.env_lock_open(fernet, (tmp_path / ".env.enc").read_text(encoding="utf-8"),
+                                  passphrase=open(pf, encoding="utf-8").readline().strip())
+    return payload.decode("utf-8")
+
+
+@pytest.mark.parametrize("other", ["prefix", "encryption-key"])
+def test_lock_never_seals_another_sets_env_over_the_sealed_one(tmp_path, capsys, other):
+    """Sealed set A; a .env of another set appears beside it (another prefix, or the same prefix with another
+    ENCRYPTION_KEY: a set reset and made again). Re-locking with A's passphrase would write it over A's only
+    sealed copy: refused, with .env.enc still opening to A's .env and the other .env left in place."""
+    a = _set_env("dvsetaaa")
+    pf = _sealed(tmp_path, a)
+    b = _set_env("dvsetbbb") if other == "prefix" else _set_env("dvsetaaa", key="b3RoZXIta2V5LW9mLWEtbmV3LXNldA")
+    (tmp_path / ".env").write_text(b, encoding="utf-8")
+    before = (tmp_path / ".env.enc").read_bytes()
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _app(tmp_path).lock(_args(passphrase_file=pf))
+    assert (tmp_path / ".env.enc").read_bytes() == before
+    assert _opens_to(tmp_path, pf) == a
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == b
+    said = " ".join(capsys.readouterr().out.split())
+    assert "Refusing to lock: .env.enc holds the .env of another set" in said and "Nothing changed." in said
+    assert "ZmFrZS1lbmMta2V5" not in said and "b3RoZXIta2V5" not in said, "a key's value is never printed"
+
+
+def test_lock_seals_the_same_sets_edited_env_again(tmp_path):
+    a = _set_env("dvsetaaa")
+    pf = _sealed(tmp_path, a)
+    _app(tmp_path).unlock(_args(passphrase_file=pf))
+    (tmp_path / ".env").write_text(a + "WEB_HOST_PORT=8443\n", encoding="utf-8")
+    _app(tmp_path).lock(_args(passphrase_file=pf))
+    assert not (tmp_path / ".env").exists()
+    assert _opens_to(tmp_path, pf) == a + "WEB_HOST_PORT=8443\n"
+
+
+def _refused_while_sealed(tmp_path, capsys, run):
+    a = _set_env("dvsetaaa")
+    pf = _sealed(tmp_path, a)
+    before = sorted(p.name for p in tmp_path.iterdir())
+    sealed = (tmp_path / ".env.enc").read_bytes()
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run(_app(tmp_path))
+    assert sorted(p.name for p in tmp_path.iterdir()) == before, "nothing was written beside the sealed .env"
+    assert (tmp_path / ".env.enc").read_bytes() == sealed and _opens_to(tmp_path, pf) == a
+    said = " ".join(capsys.readouterr().out.split())
+    assert ".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock)" in said
+    assert "Nothing changed." in said
+    return said
+
+
+def test_setup_while_env_is_sealed_is_refused_before_it_writes_anything(tmp_path, monkeypatch, capsys):
+    """A fresh setup beside a sealed .env would write a new set's .env there (new secrets), and a later lock with
+    the same passphrase used to seal it over the sealed set's."""
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: pytest.fail("setup went on"))
+    args = argparse.Namespace(non_interactive=True, no_start=True, server_name="localhost", admin_username=None,
+                              admin_email=None, admin_password=None, image_source="build")
+    said = _refused_while_sealed(tmp_path, capsys, lambda app: app.setup(args))
+    assert "then run setup again" in said
+
+
+def test_a_new_volume_set_while_env_is_sealed_is_refused(tmp_path, monkeypatch, capsys):
+    """It said 'your current set is kept' and wrote a new set's .env beside the sealed one, archiving nothing."""
+    said = _refused_while_sealed(tmp_path, capsys, lambda app: app._volume_new(
+        {}, argparse.Namespace(non_interactive=True)))
+    assert "volumes --action new" in said
+
+
+def test_a_repoint_while_env_is_sealed_is_refused(tmp_path, monkeypatch, capsys):
+    other = tmp_path.parent / (tmp_path.name + "-other.env")
+    other.write_text(_set_env("dvsetbbb"), encoding="utf-8")
+    monkeypatch.setattr(dv, "list_managed_volumes", lambda *a, **k: [
+        {"name": "dvsetbbb_vault_pg_data", "role": "pg", "bundle": "b"}])
+    monkeypatch.setattr(dv.DockVault, "_stop_stack", lambda self: pytest.fail("the deployment was stopped"))
+    said = _refused_while_sealed(tmp_path, capsys, lambda app: app._volume_repoint(
+        {}, argparse.Namespace(non_interactive=True, target_prefix="dvsetbbb", env_source=str(other))))
+    assert "volumes --action repoint" in said
