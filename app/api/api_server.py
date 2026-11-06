@@ -80,6 +80,7 @@ from app.core.upload_attempt_header import HeadPeek, header_token_mismatch
 from app.core import durable_write
 from app.core import off_loop
 from app.core import vault_access
+from app.core import after_commit as _after_commit_work
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -8768,9 +8769,10 @@ def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
         )
 
 
-# The force-close signals a session's transaction will send once it commits (_force_close_after_commit).
-_FORCE_CLOSE_PENDING = "force_close_after_commit"
-_FORCE_CLOSE_LISTENING = "force_close_listening"
+# The force-close signals a session's transaction sends once it commits (_force_close_after_commit), handed over
+# by the one after-commit dispatcher (app/core/after_commit.py), which drops them when the transaction does not
+# commit.
+_FORCE_CLOSE_WORK = "sftp_force_close"
 
 
 def _force_close_after_commit(db, message: dict, actor_username: str) -> None:
@@ -8779,22 +8781,12 @@ def _force_close_after_commit(db, message: dict, actor_username: str) -> None:
     that then rolled back (a reset whose transaction failed, answered "nothing changed") had already cut the
     person's live SFTP transfers. Sent after it, the session's row is ended by the time a client that reconnects
     is checked again."""
-    pending = db.info.setdefault(_FORCE_CLOSE_PENDING, [])
-    pending.append((message, actor_username))
-    if not db.info.get(_FORCE_CLOSE_LISTENING):
-        from sqlalchemy import event as _sa_event
-        _sa_event.listen(db, "after_commit", _send_force_closes)
-        _sa_event.listen(db, "after_rollback", _drop_force_closes)
-        db.info[_FORCE_CLOSE_LISTENING] = True
+    _after_commit_work.later(db, _FORCE_CLOSE_WORK, (message, actor_username))
 
 
-def _drop_force_closes(session) -> None:
-    session.info.pop(_FORCE_CLOSE_PENDING, None)
-
-
-def _send_force_closes(session) -> None:
+def _send_force_closes(items) -> None:
     """After a commit: the force-close signals its transaction gathered. Never raises (the change is committed)."""
-    for message, actor_username in session.info.pop(_FORCE_CLOSE_PENDING, None) or ():
+    for message, actor_username in items:
         try:
             sent = _guarded_publish_force('session_terminations', json.dumps(message))
             if sent:
@@ -8806,6 +8798,9 @@ def _send_force_closes(session) -> None:
                       f"skipped (cache guard), teardown falls to the session's own recheck")
         except Exception as e:  # noqa: BLE001
             print(f"❌ Failed to publish termination signal ({type(e).__name__})")
+
+
+_after_commit_work.handler(_FORCE_CLOSE_WORK, _send_force_closes)
 
 
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
@@ -9568,30 +9563,19 @@ async def terminate_temp_credential_sessions(
     
     terminated_count = 0
     audit_logger = AuditLogger(db)
-    
-    # Get Redis connection for publishing termination signals
-    from app.core.database import redis_client
-    
+
     for session in active_sessions:
         session.is_active = False
         terminated_count += 1
-        
-        # Publish termination signal to Redis for the SFTP server to close the transport.
-        try:
-            sent = _guarded_publish_force('session_terminations', json.dumps({
-                'session_token': session.session_token,
-                'session_id': str(session.id),
-                'temp_username': temp_username,
-                'terminated_by': current_user.username
-            }))
-            if sent:
-                print(f"📢 Published termination signal for session {session.session_token[:8]}...")
-            else:
-                print(f"↩ Revoked session {session.session_token[:8]}...; live signal skipped "
-                      f"(cache guard), teardown falls to the session's own recheck")
-        except Exception as e:
-            print(f"❌ Failed to publish termination signal: {e}")
-        
+
+        # The SFTP server closes the transport once the end of the session is committed.
+        _force_close_after_commit(db, {
+            'session_token': session.session_token,
+            'session_id': str(session.id),
+            'temp_username': temp_username,
+            'terminated_by': current_user.username
+        }, current_user.username)
+
         # Log the termination
         audit_logger.log_action(
             action="terminate_session",

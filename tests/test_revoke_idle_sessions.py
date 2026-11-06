@@ -213,3 +213,54 @@ def test_a_temporary_credential_revocation_counts_only_its_live_sessions(db, pub
     assert _state(db, ended) == (False, False)
     assert _state(db, parent_idle) == (False, False), "the credential's owner's own sessions are not its to end"
     assert published == [_token(db, live)]
+
+
+def test_ending_a_temporary_credentials_sessions_signals_the_sftp_server_once_the_end_commits(db, monkeypatch):
+    """The temporary credential's own "end its sessions" route told the SFTP server to close the transports before
+    it committed: a change that then did not commit had already cut the live transfers. The signal now goes once
+    the change commits, and not at all when it does not."""
+    import inspect
+    import types
+    from datetime import datetime, timedelta
+
+    from _async_run import run_coroutine
+    from app.core.models import RoleEnum, TemporaryCredential
+
+    TemporaryCredential.__table__.create(db.get_bind())
+    owner = uuid.uuid4()
+    now = datetime.utcnow()
+    cred = TemporaryCredential(id=uuid.uuid4(), user_id=owner, temp_username="tmp_ends", credential_hash="x",
+                               expires_at=now + timedelta(hours=1), deactivate_at=now + timedelta(minutes=20),
+                               is_used=True, used_at=now, is_active=True)
+    db.add(cred)
+    db.commit()
+    live = _row(db, owner, active=True, temp_credential_id=cred.id)
+    seen = []
+
+    def publish(channel, message):
+        other = sessionmaker(bind=db.get_bind())()
+        row = other.query(ActiveSession).filter(ActiveSession.id == live).one()
+        seen.append((channel, S.json.loads(message)["session_token"], row.is_active))
+        other.close()
+        return True
+
+    monkeypatch.setattr(S, "_guarded_publish_force", publish)
+    monkeypatch.setattr(S, "AuditLogger", lambda db_: types.SimpleNamespace(log_action=lambda **kw: None))
+    route = inspect.unwrap(S.terminate_temp_credential_sessions)
+    admin = types.SimpleNamespace(id=uuid.uuid4(), username="root", role=RoleEnum.ADMIN)
+
+    real_commit = db.commit
+
+    def failing_commit():
+        raise RuntimeError("the database went away")
+    monkeypatch.setattr(db, "commit", failing_commit)
+    with pytest.raises(RuntimeError):
+        run_coroutine(route(temp_username="tmp_ends", current_user=admin, db=db))
+    db.rollback()
+    assert seen == [], "a change that did not commit cut the live transport"
+    assert _state(db, live) == (True, False)
+
+    monkeypatch.setattr(db, "commit", real_commit)
+    out = run_coroutine(route(temp_username="tmp_ends", current_user=admin, db=db))
+    assert out["terminated_count"] == 1
+    assert seen == [("session_terminations", _token(db, live), False)], "the signal went before the end committed"
