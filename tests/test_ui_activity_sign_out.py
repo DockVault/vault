@@ -12,17 +12,21 @@ What the first person unlocked stays with them too: the vaults whose names they 
 one. And an export of the events on its way at the sign-out stops: one whose answer has not come yet is cancelled,
 and one whose answer is being read never lands in the browser's downloads.
 
+A step to the next event (Older, Newer, the keys) whose read is on its way at the sign-out never comes back, its
+answer being dropped, and it does not keep the next person's steps from moving.
+
 Waits are on state, never on time, but for the moments after which something must not happen.
 """
+import re
 import uuid
 
 import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import psql
-from _activity_ui import login, open_activity, sign_in, sign_out
+from _activity_ui import login, open_activity, rows, sign_in, sign_out, summary, total_of
 from _recording_levels import levels_restored, store, wait_for  # noqa: F401 -- a fixture
-from conftest import unique
+from conftest import ApiClient, unique
 
 pytestmark = pytest.mark.ui
 
@@ -101,6 +105,81 @@ def test_answers_for_the_person_who_signed_out_are_drawn_for_nobody(page: Page, 
     assert marker not in text, "an answer for the person who signed out was drawn for the next person"
     assert marker not in page.content()
     assert DRAWN_COUNT not in text and str(COUNT) not in text, "a count for the person who signed out was drawn"
+    assert errors == []
+
+
+def _next_of(page: Page, dir_):
+    """The id of the event before (-1) or after (+1) the one selected in the list, as the list stands now."""
+    ids = rows(page).evaluate_all("rs => rs.map((r) => r.dataset.id)")
+    at = ids.index(page.locator("#activity-rows tr.act-row.is-selected").get_attribute("data-id"))
+    return ids[at + dir_]
+
+
+@pytest.mark.parametrize("how", ["answered after the sign-out", "refused for the ended session"])
+def test_a_step_on_its_way_at_a_sign_out_leaves_the_next_person_free_to_step(page: Page, admin, two_admins, how):
+    """The first person moves with Older from the last event of a page onto the next page, and the read of that page
+    is on its way when they sign out; its answer then arrives, and the page drops it. The next person signs in on the
+    tab and opens the page: Older, the j key and Newer move them from event to event. The control: the read refused
+    for the ended session, which signs the page out itself (the app's own handling of the refusal)."""
+    ada, ben = two_admins
+    total = admin.get("/activity/events", params={"page": 1, "limit": 25}).json().get("total") or 0
+    for _ in range(max(0, 30 - total)):       # more events than a page of 25 holds: a sign-in each
+        ApiClient().login(ada["_username"], ada["_password"])
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    login(page, ada)
+    open_activity(page)
+    page.select_option("#act-page-size", "25")
+    expect(page.locator("#activity-summary")).to_have_text(re.compile(r"^1–25 of"), timeout=10000)
+    assert total_of(summary(page)) > 25, summary(page)
+    rows(page).nth(24).click()
+    older = page.locator("#act-detail .act-d-older")
+    expect(older).to_be_visible(timeout=10000)
+
+    held, holding = [], {"on": True}
+
+    def hold(route):
+        if not (holding["on"] and "page=2" in route.request.url):
+            route.continue_()
+        elif how.startswith("refused"):
+            route.fulfill(status=401, content_type="application/json",
+                          body='{"detail": "Session has been terminated. Please login again."}')
+        else:
+            held.append((route, route.fetch()))
+
+    page.route(lambda url: "/activity/events?" in url, hold)
+    older.click()
+    if how.startswith("refused"):
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        holding["on"] = False
+    else:
+        for _ in range(200):
+            if held:
+                break
+            page.wait_for_timeout(50)
+        assert held, "the step did not read the next page"
+        sign_out(page)
+        holding["on"] = False
+        for route, answer in held:
+            route.fulfill(response=answer)
+        page.evaluate("() => fetch('/health').then((r) => r.text())")    # the page has had the answer
+        page.wait_for_timeout(500)
+
+    sign_in(page, ben)
+    open_activity(page)
+    expect(rows(page).nth(2)).to_be_visible(timeout=15000)
+    rows(page).nth(0).click()
+    selected = page.locator("#activity-rows tr.act-row.is-selected")
+    expect(page.locator("#act-detail .act-d-older")).to_be_visible(timeout=10000)
+    want = _next_of(page, +1)
+    page.click("#act-detail .act-d-older")
+    expect(selected).to_have_attribute("data-id", want, timeout=5000)
+    want = _next_of(page, +1)
+    page.keyboard.press("j")
+    expect(selected).to_have_attribute("data-id", want, timeout=5000)
+    want = _next_of(page, -1)
+    page.click("#act-detail .act-d-newer")
+    expect(selected).to_have_attribute("data-id", want, timeout=5000)
     assert errors == []
 
 

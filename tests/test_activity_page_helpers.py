@@ -407,6 +407,65 @@ const signOut = () => { S = { name: 'next' }; };
     assert out == want
 
 
+# A step to the next event (Older, Newer, the keys) across a page's edge, whose read of the next page is held, and
+# the page's sign-out (resetActivity) as it is shipped.
+RESET = JS[JS.index("    window.resetActivity = function resetActivity() {"):]
+RESET = RESET[:RESET.index("\n    };\n") + 7]
+STEP = """
+const window = {};
+const page = (ids, n, pages) => ({ rows: ids.map((id) => ({ id })), selectedId: null, page: n, pages, pageSize: '25',
+  detail: null, blocked: null });
+let S = page(['a', 'b'], 1, 2);
+const selected = [];
+let reads = 0;
+const select = (id) => { selected.push(id); S.selectedId = id; };
+const indexOfSelected = () => S.rows.findIndex((r) => r.id === S.selectedId);
+const focusInList = () => false;
+const gotoPage = () => { reads++; return new Promise(() => {}); };   // its read made before a sign-out: dropped
+const loadMore = gotoPage;
+const listParams = () => new URLSearchParams();
+const get = () => new Promise(() => {});
+const renderDetail = () => {}, renderSelection = () => {}, writeHash = () => {}, announce = () => {};
+const positionText = () => '';
+const showError = () => {};
+const $ = () => null;
+const stopTimers = () => {}, closePanel = () => {}, closeMenu = () => {}, closeOnline = () => {};
+const unblock = () => {}, setPausedButton = () => {};
+let phonePushed = false, exporting = null, chartUi = null, wired = false;
+const UNLOCKS = new Map();
+const P = {};
+const freshState = () => page([], 1, null);
+""" + _line("let stepping") + _fn("step") + RESET
+
+
+@pytest.mark.parametrize("case, want", [
+    ("the next person steps after a sign-out", {"selected": ["y"], "reads": 1}),
+    ("a second step while the first is on its way", {"selected": [], "reads": 1}),
+])
+def test_a_step_on_its_way_at_a_sign_out_does_not_hold_up_the_next_persons_steps(case, want):
+    """One step at a time: a second step while one is on its way does nothing (the control). A step whose read is
+    on its way at a sign-out never comes back (its answer is dropped), so the sign-out frees the next person's steps:
+    without that, Older, Newer and the keys would do nothing for them until the page was loaded again."""
+    out = _node(STEP + """
+(async () => {
+  S.selectedId = 'b';                        // the last event of the page
+  step(1);                                   // onto the next page: its read is on its way
+  await new Promise((r) => setTimeout(r, 0));
+  if (%s === 'the next person steps after a sign-out') {
+    window.resetActivity();
+    S = page(['x', 'y'], 1, 1);              // the next person's list
+    S.selectedId = 'x';
+  } else {
+    S.selectedId = 'a';
+  }
+  step(1);
+  await new Promise((r) => setTimeout(r, 0));
+  console.log(JSON.stringify({ selected, reads }));
+})();
+""" % json.dumps(case))
+    assert out == want
+
+
 def test_a_vault_receipt_that_comes_back_after_a_sign_out_is_not_kept():
     """A vault's names unlocked with its password: the receipt is kept for the reads that follow, but not when the
     person signed out while it was on its way (the next person's reads would carry it)."""

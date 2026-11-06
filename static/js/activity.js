@@ -1658,7 +1658,9 @@
     }
 
     // Move to the next (older, +1) or previous (newer, -1) event, across the page's edge, and from an
-    // event that is not in the list, by keyset under the current filters.
+    // event that is not in the list, by keyset under the current filters. One step at a time: `stepping` is set while
+    // one is under way. A step whose read is on its way at a sign-out never comes back (get drops the answer), so
+    // the sign-out clears it (resetActivity) for the next person on the tab.
     let stepping = false;
     async function step(dir, byKey) {
         if (stepping) return;
@@ -5151,6 +5153,9 @@
         UNLOCKS.clear();
         if (exporting) { try { exporting.abort(); } catch (_) { /* done */ } exporting = null; }
         S = freshState();
+        // A step to the next event whose read is on its way never comes back to say it is done (its answer is
+        // dropped): left set, it would keep Newer, Older and the keys from moving for the next person.
+        stepping = false;
         P.open = false;
         P.draft = null;
         P.built = false;
