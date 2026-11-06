@@ -131,7 +131,7 @@ def get_active_operations_count() -> int:
 # every operation for the activity feed and cancellation, while admission governs the things that
 # hold memory, and a database connection, for a duration -- serving a download, assembling an
 # upload, and copying or moving a file or a folder.
-from app.core.transfer_admission import TransferAdmission, TransferBusy, copy_share, link_ceiling  # noqa: E402
+from app.core.transfer_admission import TransferAdmission, TransferBusy, ShareBusy, copy_share, link_ceiling  # noqa: E402
 
 transfer_admission = TransferAdmission(
     limit=settings.max_concurrent_transfers,
@@ -155,7 +155,18 @@ def _busy_response(exc: TransferBusy) -> HTTPException:
     503 with Retry-After, not 500: the deployment is working correctly and is momentarily full,
     which is a different thing from the file being unreadable. A client that cannot tell those
     apart either retries something hopeless or gives up on something that would have worked.
+
+    An account past its own share of the slots (a copy, a move to another vault, a folder copy: ShareBusy) is told
+    that, with 429: the deployment may have slots free, and the account's own transfers are what it waits for.
     """
+    if isinstance(exc, ShareBusy):
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(f"This account already has {exc.share} {'copy or move' if exc.share == 1 else 'copies or moves'} "
+                    f"running at once, the most one account may run, and others waiting for one of them to finish. "
+                    f"Try again when one has finished."),
+            headers={"Retry-After": str(exc.retry_after)},
+        )
     return HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail=(f"The server is already handling {exc.limit} transfers. "
@@ -3128,7 +3139,7 @@ def _activity_transfers() -> dict:
     waiting for it, with the gate's limit. SFTP transfers are in another process and not counted."""
     stats = transfer_admission.stats()
     return {"in_progress": get_active_operations_count(), "in_flight": stats["in_flight"],
-            "waiting": stats["waiting"], "limit": stats["limit"]}
+            "waiting": stats["waiting"] + stats["waiting_for_share"], "limit": stats["limit"]}
 
 
 @app.get("/activity/now")
@@ -24506,11 +24517,14 @@ async def get_monitoring_metrics(
             "downloadTraffic": download_traffic,
             "activeOperations": active_operations,
             "transfersInFlight": transfers["in_flight"],
-            "transfersWaiting": transfers["waiting"],
+            # Waiting for a slot, or for their account's share of the slots (each in a room of its own).
+            "transfersWaiting": transfers["waiting"] + transfers["waiting_for_share"],
+            "transfersWaitingForShare": transfers["waiting_for_share"],
             "transferLimit": transfers["limit"],
             "transfersPeak": transfers["peak_in_flight"],
             "transfersAdmitted": transfers["admitted"],
             "transfersRefused": transfers["refused"],
+            "transfersRefusedOverShare": transfers["refused_over_share"],
             "totalFiles": total_files
             # Timestamp removed: Including timestamp prevents ETag caching since it changes every request
             # Frontend can add timestamp when displaying if needed

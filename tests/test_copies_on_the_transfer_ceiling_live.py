@@ -18,8 +18,8 @@ with it.
   also reads the database for a listing and writes a file on the storage disk for the health check, both of
   which the burst keeps busy. Before, the event loop waited for a connection for most of the burst: five
   answers in eleven seconds, up to five seconds each, so each of the three bounds catches that. Every request
-  of the burst is answered 200, or, past the ceiling's queue, 503 with Retry-After; what each stored reads back
-  whole.
+  of the burst is answered 200, or, past the ceiling's queue, 503 with Retry-After, or, past the account's own
+  share of the slots and its room to wait for one, 429 with Retry-After; what each stored reads back whole.
 - With every slot held by a download whose client does not read, copies, moves, folder copies and direct uploads
   sent meanwhile wait for a slot, and the database shows none of them holding a connection in a transaction.
 
@@ -236,12 +236,15 @@ def _burst(admin, requests_):
 
 
 def _check_burst_answers(answers):
-    """Every answer 200, or 503 with Retry-After past the ceiling's queue; at least a ceiling's worth stored."""
+    """Every answer 200, or with Retry-After: 503 past the ceiling's queue, or 429 past the account's own share of the
+    slots and the room it has to wait for one (the burst is one account's); at least a ceiling's worth stored."""
     codes = [a[0] for a in answers]
-    assert set(codes) <= {200, 503}, [(a[0], a[2]) for a in answers if a[0] not in (200, 503)]
+    assert set(codes) <= {200, 429, 503}, [(a[0], a[2]) for a in answers if a[0] not in (200, 429, 503)]
     for status, headers, payload in answers:
         if status == 503:
             assert int(headers.get("Retry-After", "0")) >= 1 and "transfers" in str(payload), payload
+        if status == 429:
+            assert int(headers.get("Retry-After", "0")) >= 1 and "copies or moves" in str(payload), payload
     assert codes.count(200) >= min(len(answers), _setting("MAX_CONCURRENT_TRANSFERS", 16)), codes
     return [i for i, code in enumerate(codes) if code == 200]
 

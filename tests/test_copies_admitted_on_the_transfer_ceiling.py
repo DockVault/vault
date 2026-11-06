@@ -287,17 +287,64 @@ def test_one_account_holds_at_most_its_share_of_the_slots_with_copies(monkeypatc
             assert await until(lambda: len(world.ran) == 1)
             second = asyncio.ensure_future(_call(kind, world, user=one))
             third = asyncio.ensure_future(_call(kind, world, user=another))
-            await until(lambda: len(world.ran) == 2 and gate.stats()["waiting"] == 1)
-            seen = (gate.stats()["in_flight"], gate.stats()["waiting"], len(world.ran))
+            await until(lambda: len(world.ran) == 2 and gate.stats()["waiting_for_share"] == 1)
+            seen = (gate.stats()["in_flight"], gate.stats()["waiting_for_share"], gate.stats()["waiting"],
+                    len(world.ran))
         finally:
             hold.set()
         answers = await asyncio.gather(first, second, third)
         return seen, answers, gate.stats()
 
     seen, answers, after = run_coroutine(scenario())
-    assert seen == (2, 1, 2), f"(in flight, waiting, run) while the first copy ran: {seen}"
+    assert seen == (2, 1, 0, 2), f"(in flight, waiting for its share, waiting, run) while the first copy ran: {seen}"
     assert all(a["id"] for a in answers)
     assert (after["in_flight"], after["waiting"], after["admitted"]) == (0, 0, 3), after
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_an_account_past_its_share_is_told_its_share_is_in_use_not_that_the_server_is_full(monkeypatch, kind):
+    """One account's copy past its share, with no room to wait for it: 429 saying the account's copies are what it
+    waits for, with Retry-After, and not counted as load the deployment shed. The deployment has slots free."""
+    async def scenario():
+        gate = TransferAdmission(limit=4, max_waiting=0, wait_seconds=20)
+        hold = threading.Event()
+        world = _World(monkeypatch, gate, hold=hold)
+        one = SimpleNamespace(id=uuid.uuid4())
+        try:
+            first = asyncio.ensure_future(_call(kind, world, user=one))
+            for _ in range(500):
+                if world.ran:
+                    break
+                await asyncio.sleep(0.01)
+            try:
+                await _call(kind, world, user=one)
+            except HTTPException as exc:
+                refused = exc
+            else:
+                refused = None
+            stats = gate.stats()
+        finally:
+            hold.set()
+        await first
+        return refused, stats, world
+
+    refused, stats, world = run_coroutine(scenario())
+    assert refused is not None and refused.status_code == 429, refused
+    assert refused.headers["Retry-After"] == "20"
+    assert refused.detail.startswith("This account already has 1 copy or move running at once"), refused.detail
+    assert "already handling" not in refused.detail
+    assert (stats["refused"], stats["refused_over_share"], stats["in_flight"]) == (0, 1, 1), stats
+    assert len(world.ran) == 1, "the refused copy ran"
+
+
+def test_a_full_deployment_and_a_full_share_are_told_apart():
+    full = S._busy_response(S.TransferBusy(retry_after=20, waiting=32, limit=16))
+    share = S._busy_response(S.ShareBusy(retry_after=20, share=4))
+    assert (full.status_code, share.status_code) == (503, 429)
+    assert full.detail == "The server is already handling 16 transfers. Try again in a few seconds."
+    assert share.detail == ("This account already has 4 copies or moves running at once, the most one account may "
+                            "run, and others waiting for one of them to finish. Try again when one has finished.")
+    assert full.headers == share.headers == {"Retry-After": "20"}
 
 
 # ---- the pool ----------------------------------------------------------------------------------------------------
