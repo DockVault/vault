@@ -32,6 +32,14 @@ def _hermetic_acl(monkeypatch):
     monkeypatch.setattr(dv, "tighten_secret_file", lambda _p: True)
 
 
+@pytest.fixture(autouse=True)
+def _app_data_under_the_test(tmp_path, monkeypatch):
+    """A recovery key shown with no terminal goes to a file in the user's DockVault application-data folder: under
+    this test's own folder here, never the home of whoever runs the tests."""
+    for name in ("XDG_DATA_HOME", "LOCALAPPDATA", "APPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / "app-data"))
+
+
 def _app(root):
     return dv.DockVault(dv.Palette(False), root=str(root))
 

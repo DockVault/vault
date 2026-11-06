@@ -3955,31 +3955,88 @@ class DockVault:
                 raise SystemExit(2)
         return ask_secret("Credential recovery key", self.pal).strip()
 
-    def _emit_secret(self, text):
+    def _emit_secret(self, text, label="secret", kept_in=None):
         """Write a one-time secret to the controlling TERMINAL (/dev/tty, or CON on Windows), NOT
-        stdout - so a redirected or tee'd stdout (a setup log, CI output) can't capture it. Falls
-        back to stdout when there is no controlling terminal (then --recovery-out is the safe
-        channel)."""
+        stdout - so a redirected or tee'd stdout (a setup log, CI output) can't capture it. With no
+        controlling terminal (cloud-init, a CI job, a service) it goes to a new file only this user can read
+        (_write_secret_file), and stdout names only that file - or, with `kept_in` (a file the caller writes the
+        secret to anyway, as --recovery-out), only that one. stdout carries the secret only when no file can be
+        written either, and says so."""
         dev = "CON" if os.name == "nt" else "/dev/tty"
         try:
             with open(dev, "w", encoding="utf-8") as tty:
                 tty.write(text + "\n")
                 return
         except OSError:
-            print(text)
+            pass
+        what = label.replace("-", " ")
+        if kept_in:
+            print(self.pal.paint("  No terminal to show the %s on: it is written to %s only." % (what, kept_in),
+                                 "yellow"))
+            return
+        path = self._write_secret_file(label, text)
+        if path:
+            print(self.pal.paint("  No terminal to show the %s on: it is in %s, which only you can read. Read it, "
+                                 "keep it somewhere safe, then delete that file." % (what, path), "yellow"))
+            return
+        print(self.pal.paint("  WARNING: no terminal, and no file could be written, to take the %s: it is printed "
+                             "here, so remove it from any log this output reaches." % what, "red"))
+        print(text)
+
+    def _write_secret_file(self, label, text):
+        """Write a one-time secret (`text`, colour codes removed) to a new file of its own in this user's DockVault
+        application-data folder (beside the default backups, never in the checkout, which the image build copies
+        and git tracks): created mode 600, never over a file already there, the folder made 0700 if the tool makes
+        it. Returns its path, or None when it cannot be written."""
+        folder = os.path.join(os.path.dirname(_app_data_backup_root()), "secrets")
+        try:
+            if not os.path.isdir(folder):
+                os.makedirs(os.path.dirname(folder), exist_ok=True)
+                try:
+                    os.mkdir(folder, 0o700)
+                    if os.name != "nt":
+                        os.chmod(folder, 0o700)
+                except FileExistsError:
+                    pass
+            plain = re.sub("\x1b\\[[0-9;]*m", "", text).strip("\n") + "\n"
+            base = os.path.join(folder, "%s-%s" % (label, _timestamp()))
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            for n in range(100):
+                path = base if n == 0 else "%s-%d" % (base, n)
+                try:
+                    fd = os.open(path, flags, 0o600)
+                except FileExistsError:
+                    continue
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(plain)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except OSError:
+                    try:
+                        os.remove(path)          # no part of a secret is left in a file nobody was told of
+                    except OSError:
+                        pass
+                    raise
+                tighten_secret_file(path)
+                return path
+        except OSError:
+            return None
+        return None
 
     def _show_recovery_key(self, dek, args):
         key = dek.decode("ascii") if isinstance(dek, (bytes, bytearray)) else str(dek)
         pal = self.pal
-        # Show the key + its guidance on the controlling terminal only (see _emit_secret).
+        out = getattr(args, "recovery_out", None)
+        # Show the key + its guidance on the controlling terminal only (see _emit_secret); with no terminal, in
+        # --recovery-out when given, else in a file of its own.
         self._emit_secret("\n".join([
             pal.paint("\n  ===== CREDENTIAL RECOVERY KEY (shown once) =====", "bold", "yellow"),
             "    " + pal.paint(key, "bold"),
             pal.paint("  Save this in a password manager. It unlocks .env if you forget the passphrase.\n"
                       "  It does NOT recover vault files or deployments. If you lose BOTH this key and the\n"
                       "  passphrase, every stored file becomes permanently unrecoverable.", "yellow"),
-        ]))
-        out = getattr(args, "recovery_out", None)
+        ]), label="recovery-key", kept_in=out)
         if out:
             self._atomic_write_secret(out, key + "\n")
             print(pal.paint("  Also written to %s - move it OFF this host, then delete it here." % out,
@@ -4316,6 +4373,7 @@ class DockVault:
         `lock` (_refuse_while_locked)."""
         pal = self.pal
         self._refuse_while_locked("setup")
+        self._read_cli_admin_password(args)
         no_start = bool(args and getattr(args, "no_start", False))
         # "Start" rather than "Build + start": the deployment may be pulling a published release
         # rather than building, and for a fresh install the choice is not made until Settings.
@@ -4756,6 +4814,33 @@ class DockVault:
             replace_file_durably(path, "\n".join(out) + "\n")
             tighten_secret_file(path)
         return removed
+
+    def _read_cli_admin_password(self, args):
+        """Take the first admin's password from --admin-password-file (its first line) or --admin-password-stdin (one
+        line) into args.admin_password, which the rest of setup reads; warn when it came as --admin-password, a value
+        other users of the host can read in the process list and the shell keeps in its history. A file that cannot
+        be read, or holds no password, stops setup before it writes anything."""
+        if args is None:
+            return
+        pf = getattr(args, "admin_password_file", None)
+        if pf:
+            try:
+                with open(pf, encoding="utf-8") as f:
+                    value = f.readline().rstrip("\r\n")
+            except OSError as exc:
+                self._fail("cannot read --admin-password-file %s: %s" % (pf, exc))
+            if not value:
+                self._fail("--admin-password-file %s holds no password on its first line" % pf)
+            args.admin_password = value
+        elif getattr(args, "admin_password_stdin", False):
+            value = sys.stdin.readline().rstrip("\r\n")
+            if not value:
+                self._fail("--admin-password-stdin read no password from standard input")
+            args.admin_password = value
+        elif getattr(args, "admin_password", None):
+            print(self.pal.paint("  WARNING: --admin-password puts the password on the command line, where other users "
+                                 "of this host can read it (the process list) and your shell history keeps it. Prefer "
+                                 "--admin-password-file or --admin-password-stdin.", "yellow"))
 
     def _apply_cli_admin_overrides(self, path, env, args):
         """On a setup reuse, write an EXPLICIT --admin-password/--admin-username/--admin-email into the
@@ -5338,7 +5423,7 @@ class DockVault:
             # Show the freshly-generated admin password on the controlling terminal only (like the
             # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
             self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
-                                        % cfg["admin_password"], "bold", "yellow"))
+                                        % cfg["admin_password"], "bold", "yellow"), label="admin-password")
 
     def _destroy_data(self, vol):
         """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined."""
@@ -5418,7 +5503,9 @@ class DockVault:
         if summary.get("admin_username"):
             print(" Admin login  : %s" % summary["admin_username"])
         if summary.get("admin_password"):
-            print(pal.paint(" Admin passwd : %s   (auto-generated - store it NOW)" % summary["admin_password"], "yellow"))
+            # On the controlling terminal only, never stdout (a setup log, cloud-init's output): _emit_secret.
+            self._emit_secret(pal.paint(" Admin passwd : %s   (auto-generated - store it NOW)" % summary["admin_password"],
+                                        "yellow"), label="admin-password")
         print(pal.paint("\n *** ENCRYPT THE HOST DISK (LUKS / BitLocker / FileVault / encrypted cloud"
                         " volume). ***", "yellow"))
         print(pal.paint("     Names, descriptions, notes and file contents are sealed at rest, but the"
@@ -6512,7 +6599,7 @@ class DockVault:
             # Show the freshly-generated admin password on the controlling terminal only (like the
             # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
             self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
-                                        % cfg["admin_password"], "bold", "yellow"))
+                                        % cfg["admin_password"], "bold", "yellow"), label="admin-password")
         print(pal.paint("  Run Setup to build + start the new (empty) set.\n", "cyan"))
 
     def _volume_repoint(self, env, args=None):
@@ -8404,7 +8491,14 @@ def build_parser():
     sp.add_argument("--server-name", dest="server_name")
     sp.add_argument("--admin-username", dest="admin_username")
     sp.add_argument("--admin-email", dest="admin_email")
-    sp.add_argument("--admin-password", dest="admin_password")
+    pw = sp.add_mutually_exclusive_group()
+    pw.add_argument("--admin-password", dest="admin_password",
+                    help="the first admin's password (visible to other users in the process list and kept in shell "
+                         "history: prefer --admin-password-file or --admin-password-stdin)")
+    pw.add_argument("--admin-password-file", dest="admin_password_file",
+                    help="read the first admin's password from this file (its first line)")
+    pw.add_argument("--admin-password-stdin", dest="admin_password_stdin", action="store_true",
+                    help="read the first admin's password from standard input (one line)")
     sp.add_argument("--cert-mode", dest="cert_mode", choices=CERT_MODES, help="selfsigned | letsencrypt | byo")
     sp.add_argument("--le-email", dest="le_email", help="email for Let's Encrypt expiry notices")
     sp.add_argument("--cert-path", dest="cert_path", help="bring-your-own fullchain cert (PEM)")

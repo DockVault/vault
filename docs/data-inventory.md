@@ -366,6 +366,10 @@ the recipients' mailboxes.
   (and, under `--lock`, `manifest.json.mac` an HMAC of the manifest under the sealing key): no personal data.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
   erased.
+- **One-time secrets** `python dockvault.py` shows (a generated admin password, a recovery key, a password
+  reset link) go to the controlling terminal. With no terminal (cloud-init, a CI job) each is written to a
+  file of its own, mode 600, under `secrets/` in the DockVault folder of the user's application data
+  (beside the default backups): the tool never deletes it. Read it, keep the secret, then delete the file.
 - **`python dockvault.py accounts`** on the host: the server's operator can look an account up (its
   email and last sign-in are printed on the host's terminal, and the lookup is not audited, since the
   operator can read the database anyway) and change it (audited as the host operator). **New in

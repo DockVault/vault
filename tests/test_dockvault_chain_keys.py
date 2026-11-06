@@ -43,6 +43,14 @@ def _docker_sees_the_host_folder(monkeypatch):
     monkeypatch.setattr(dv, "archive_digest_in_docker", _host_digest, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _app_data_under_the_test(tmp_path, monkeypatch):
+    """A recovery key shown with no terminal goes to a file in the user's DockVault application-data folder: under
+    this test's own folder here, never the home of whoever runs the tests."""
+    for name in ("XDG_DATA_HOME", "LOCALAPPDATA", "APPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / "app-data"))
+
+
 def _kept(tmp_path, prefix=dv.DEFAULT_PROJECT):
     """The file a key change keeps the old key of the volume set `prefix` in."""
     return Path(dv.kept_chain_key_path(str(tmp_path), prefix))

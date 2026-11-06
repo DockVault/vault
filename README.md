@@ -84,9 +84,18 @@ when it is missing; `restart` does that before it takes anything down, so a host
 the registry keeps its running deployment. Only `update` moves a deployment to another image.
 
 Setup creates the first admin account from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` it writes to
-`.env` (a blank password auto-generates a strong one, printed once). Then open
+`.env` (a blank password auto-generates a strong one, shown once). Then open
 `https://<your-domain>` and log in with those credentials — change the password from Settings after
 the first login. No license key, no activation.
+
+A one-time secret the tool shows (a generated admin password, a recovery key, a password reset link)
+goes to the controlling terminal, never to standard output, which a log of the run keeps. With no
+terminal (cloud-init, a CI job) it goes to a new file only you can read, under the DockVault folder of
+your user's application data (beside the default backups, never in the checkout), and the output
+names only that file: read it, keep the secret, then delete the file. For an unattended setup, give
+the admin password with `--admin-password-file <file>` (its first line) or `--admin-password-stdin`;
+`--admin-password <value>` still works but warns, as other users of the host can read a command line
+and the shell keeps it in its history.
 
 ### Production without the script (advanced)
 
