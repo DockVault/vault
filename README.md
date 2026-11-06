@@ -665,7 +665,11 @@ name with `--backup-dir` keeps its own permissions when it already exists; one t
 A running deployment is paused (not stopped) while its volumes are archived, so the database, the
 stored files and the keys are copies of one moment: the vault does not answer until the last archive
 is written, then carries on (with the app running, a file deleted between the database's archive and
-the storage volume's would come back as a row without its file).
+the storage volume's would come back as a row without its file). A backup stopped meanwhile (Ctrl-C,
+a closed SSH session, `kill`, a timeout or a service stop) resumes the deployment before it ends and
+removes the incomplete backup; one run under `nohup` goes on when its terminal closes. Only `kill -9`
+(or the out-of-memory killer) leaves the deployment paused: `docker ps --filter status=paused` lists
+what it left, and `docker unpause <name> ...` resumes it.
 
 Backup counts an archive only once it is in the backup folder on this host, not empty, and read
 through whole as a `tar.gz` (a Docker daemon that writes to a folder of its own, such as one on

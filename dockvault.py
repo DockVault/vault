@@ -246,6 +246,7 @@ import json     # noqa: E402
 import math     # noqa: E402
 import re       # noqa: E402
 import shlex    # noqa: E402
+import signal   # noqa: E402
 import tempfile # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
@@ -1891,6 +1892,92 @@ BACKUP_PAUSED_SERVICES = ("vault", "vault-api", "vault-sftp", "vault-db")
 # and saying so is load-bearing now that an upgrade takes one on the operator's behalf and
 # proceeds with an irreversible change on the strength of it.
 BACKUP_REQUIRED_ROLES = ("pg", "storage", "keys")
+# The signals whose default action ends the process at once, without running a single `finally`: a closed SSH
+# session or terminal (SIGHUP), kill, a timeout or a service stop (SIGTERM), and on Windows Ctrl-Break (SIGBREAK).
+# While a backup holds the deployment paused, SignalsEndTheRun turns them into an exit that resumes it first. Ctrl-C
+# is a KeyboardInterrupt already, which runs them. Each is used where this platform has it.
+RUN_ENDING_SIGNALS = ("SIGHUP", "SIGTERM", "SIGBREAK")
+
+
+class StoppedBySignal(SystemExit):
+    """The run was ended by one of RUN_ENDING_SIGNALS while SignalsEndTheRun was in force. A SystemExit, so that the
+    `finally` blocks on the way out run; its exit status is 128 + the signal's number, as a shell reports a process
+    a signal ended."""
+
+    def __init__(self, signum):
+        super().__init__(128 + int(signum))
+        self.signum = int(signum)
+
+    def signal_name(self):
+        try:
+            return signal.Signals(self.signum).name
+        except ValueError:
+            return "signal %d" % self.signum
+
+
+class SignalsEndTheRun(object):
+    """A `with` block in which RUN_ENDING_SIGNALS raise StoppedBySignal (in the main thread) instead of ending the
+    process at once, so that the block's `finally` runs first: a backup resumes the deployment it paused. Only a
+    signal whose action is the default one is taken over: one that is ignored (a run under nohup goes on when its
+    terminal closes) or already handled is left as it is. Each signal's previous action is put back when the block
+    ends. Outside the main thread, where Python sets no handler, it changes nothing.
+
+    hold() starts a stretch that a signal must not cut short (a pause, the resume): a signal that comes then is
+    noted, release() raises it at the end of the stretch, and the end of the block raises one still noted (unless
+    the block is already ending on an exception). Once one has been raised, every later one is only noted: a second
+    signal does not cut short the `finally` the first one runs."""
+
+    def __init__(self):
+        self._previous = {}
+        self._holding = False
+        self._raised = False
+        self._noted = None
+
+    def _on_signal(self, signum, _frame):
+        if self._holding or self._raised:
+            if self._noted is None:
+                self._noted = signum
+            return
+        self._raised = True
+        raise StoppedBySignal(signum)
+
+    def hold(self):
+        self._holding = True
+
+    def release(self):
+        self._holding = False
+        self._raise_noted()
+
+    def _raise_noted(self):
+        if self._noted is not None and not self._raised:
+            signum, self._noted = self._noted, None
+            self._raised = True
+            raise StoppedBySignal(signum)
+
+    def __enter__(self):
+        for name in RUN_ENDING_SIGNALS:
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                if signal.getsignal(signum) is not signal.SIG_DFL:
+                    continue
+                signal.signal(signum, self._on_signal)
+            except (OSError, ValueError, RuntimeError):
+                continue               # not the main thread, or a signal this platform gives no handler
+            self._previous[signum] = signal.SIG_DFL
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for signum, previous in self._previous.items():
+            try:
+                signal.signal(signum, previous)
+            except (OSError, ValueError, RuntimeError):
+                pass
+        self._previous = {}
+        if exc_type is None:
+            self._raise_noted()
+        return False
 
 
 def gen_salt():
@@ -3463,6 +3550,19 @@ def container_running(name, run=subprocess.run):
     if getattr(r, "returncode", 1) != 0:
         return False
     return (getattr(r, "stdout", "") or "").strip() == "true"
+
+
+def container_paused(name, run=subprocess.run):
+    """True if a container named `name` is paused, False if it is there and not paused, None when Docker cannot
+    tell (no such container, or Docker did not answer)."""
+    try:
+        r = run(["docker", "inspect", "-f", "{{.State.Paused}}", name], capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    answer = (getattr(r, "stdout", "") or "").strip()
+    return True if answer == "true" else False if answer == "false" else None
 
 
 def container_exists(name, run=subprocess.run):
@@ -5829,6 +5929,30 @@ class DockVault:
         shutil.rmtree(bundle, ignore_errors=True)
         self._fail("%s - the incomplete backup was removed." % msg)
 
+    def _backup_stopped(self, bundle, exc, paused, resumed):
+        """A backup ended (Ctrl-C, or a signal SignalsEndTheRun turned into StoppedBySignal) while it held the
+        deployment paused (`paused`: the services it paused or may have), which its `finally` has resumed by now
+        (`resumed`: _resume_after_backup's answer, None if that was cut short): remove the incomplete bundle (it
+        holds a copy of .env), and say so as far as there is still somewhere to say it (a closed terminal takes no
+        output)."""
+        shutil.rmtree(bundle, ignore_errors=True)
+        what = exc.signal_name() if isinstance(exc, StoppedBySignal) else "Ctrl-C"
+        if not paused:
+            state = "nothing had been paused"
+        elif resumed:
+            state = "the deployment was resumed"
+        elif resumed is None:
+            state = "the deployment may still be paused: run docker unpause %s" % " ".join(paused)
+        else:
+            state = "the deployment could not be resumed (see the warning above)"
+        left = ("and %s, which is not a backup, could not be removed: remove it yourself (it holds a copy of .env)"
+                % bundle if os.path.lexists(bundle) else "and the incomplete backup was removed")
+        try:
+            print(self.pal.paint("\n  The backup was stopped (%s) before it was complete: %s, %s." % (what, state, left),
+                                 "yellow"))
+        except (OSError, ValueError):
+            pass
+
     def _do_backup(self, env, args=None):
         """Dump the current set into ONE bundle dir: the paired .env (mode-600), a tar.gz per data
         volume, and a manifest with a NON-secret coupling fingerprint. Skips a volume that doesn't
@@ -5902,16 +6026,26 @@ class DockVault:
         # file deleted (or uploaded) by the running app between the two would leave a restored row without its file.
         # So the running deployment is paused (not stopped: its connections wait) until the last archive is
         # written, and resumed whatever happens. A deployment that is not running is archived as it is.
-        paused, why = self._pause_for_backup()
-        if why:
-            self._fail_backup(bundle, why)
+        # "Whatever happens" includes the end of the run itself: Ctrl-C, and the signals that would otherwise end the
+        # process without resuming anything (a closed SSH session, kill, a timeout: SignalsEndTheRun), resume the
+        # deployment first; the incomplete backup is then removed (_backup_stopped).
+        paused, maybe_paused, resumed = [], [], None
         try:
-            for role, vol, archive in planned:
-                print(pal.paint("  archiving %s ..." % vol, "cyan"))
-                if not tar_volume(vol, bundle, archive):
-                    self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
-        finally:
-            self._resume_after_backup(paused)
+            with SignalsEndTheRun() as signals:
+                try:
+                    why = self._pause_for_backup(paused, maybe_paused, signals)
+                    if why:
+                        self._fail_backup(bundle, why)
+                    for role, vol, archive in planned:
+                        print(pal.paint("  archiving %s ..." % vol, "cyan"))
+                        if not tar_volume(vol, bundle, archive):
+                            self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
+                finally:
+                    signals.hold()          # a second signal does not cut the resume short
+                    resumed = self._resume_after_backup(paused, maybe_paused)
+        except (StoppedBySignal, KeyboardInterrupt) as exc:
+            self._backup_stopped(bundle, exc, paused + maybe_paused, resumed)
+            raise
         entries = []
         for role, vol, archive in planned:
             # The archive was written by a container through a bind mount, and its exit code says only that the
@@ -5980,42 +6114,71 @@ class DockVault:
                             "back beside .env. Finish the change: python dockvault.py audit rekey --old-key-file %s\n"
                             % (kept, " (sealed with its env)" if seal else "", kept), "yellow"))
 
-    def _pause_for_backup(self):
+    def _pause_for_backup(self, paused, maybe_paused, signals=None):
         """Pause every running container of the deployment that writes to the volumes a backup archives (the app's,
         in either layout, and the database), so that every archive is of one moment: a tar of a running data
         directory is not (Postgres keeps writing pages behind it), and neither is a storage volume archived while the
-        app deletes or adds files after the database was archived. Returns (the services paused, None), or (None, why
-        not) when a running one could not be paused (whatever did pause is resumed)."""
+        app deletes or adds files after the database was archived. Returns None, or why not when a running one could
+        not be paused.
+
+        Each service paused goes into `paused`, and one whose pause was cut short (a timeout, Ctrl-C) and may have
+        taken effect into `maybe_paused`: both are the caller's lists, which it resumes (_resume_after_backup) however
+        this ends. Each pause runs held (`signals`, SignalsEndTheRun.hold): a signal that comes meanwhile is raised once
+        the pause has answered and its service is in the list."""
         running = [s for s in BACKUP_PAUSED_SERVICES if container_running(s)]
         if not running:
-            return [], None
+            return None
         print(self.pal.paint("  pausing the deployment while its volumes are copied (%s; it does not answer meanwhile)"
                              " ..." % ", ".join(running), "cyan"))
-        paused = []
         for service in running:
+            if signals is not None:
+                signals.hold()
             try:
-                r = self._run_dc("pause", service, timeout=60)
-            except (OSError, subprocess.SubprocessError):
-                r = None
-            if getattr(r, "returncode", 1) != 0:
-                self._resume_after_backup(paused)
-                return None, ("could not pause %s for the backup, and the volumes are only copies of one moment "
-                              "while nothing writes to them; nothing was archived" % service)
-            paused.append(service)
-        return paused, None
+                try:
+                    r = self._run_dc("pause", service, timeout=60)
+                except subprocess.TimeoutExpired:
+                    maybe_paused.append(service)
+                    r = None
+                except (OSError, subprocess.SubprocessError):
+                    r = None
+                except BaseException:
+                    maybe_paused.append(service)
+                    raise
+                if getattr(r, "returncode", 1) != 0:
+                    return ("could not pause %s for the backup, and the volumes are only copies of one moment while "
+                            "nothing writes to them; nothing was archived" % service)
+                paused.append(service)
+            finally:
+                if signals is not None:
+                    signals.release()
+        return None
 
-    def _resume_after_backup(self, paused):
-        """Resume what _pause_for_backup paused; says how to do it by hand when Docker would not."""
-        if not paused:
-            return
-        try:
-            r = self._run_dc("unpause", *paused, timeout=60)
-            failed = getattr(r, "returncode", 1) != 0
-        except (OSError, subprocess.SubprocessError):
-            failed = True
+    def _resume_after_backup(self, paused, maybe_paused=()):
+        """Resume what _pause_for_backup paused, and each service whose pause was cut short on its own (it may never
+        have paused, and Docker then refuses to resume it). Says how to do it by hand when Docker would not. Returns
+        True when everything paused is running again (or nothing was), False otherwise."""
+        failed = []
+        if paused:
+            try:
+                r = self._run_dc("unpause", *paused, timeout=60)
+                if getattr(r, "returncode", 1) != 0:
+                    failed.extend(paused)
+            except (OSError, subprocess.SubprocessError):
+                failed.extend(paused)
+        for service in maybe_paused:
+            try:
+                self._run_dc("unpause", service, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if container_paused(service) is not False:
+                failed.append(service)
         if failed:
-            print(self.pal.paint("  WARNING: the deployment could not be resumed after the backup: run docker compose "
-                                 "-f docker-compose.secure.yml unpause %s" % " ".join(paused), "red"))
+            try:
+                print(self.pal.paint("  WARNING: the deployment could not be resumed after the backup: run docker "
+                                     "unpause %s" % " ".join(failed), "red"))
+            except (OSError, ValueError):
+                pass                        # nowhere left to say it (a closed terminal)
+        return not failed
 
     def _seal_bundle_env(self, bundle, args):
         """Seal bundle/env -> bundle/env.enc (envelope encryption; passphrase + one-time recovery key),
@@ -8690,6 +8853,8 @@ class DockVault:
                 continue
             try:
                 self.handler(MENU[choice - 1][0])()
+            except StoppedBySignal:
+                raise           # a hangup, kill or timeout ends the session; it is not a handler's error
             except SystemExit:
                 # a handler's _fail (e.g. a bad repoint selection or Docker briefly down) reports its
                 # own error; in the menu loop that shouldn't end the whole session - back to the menu.
