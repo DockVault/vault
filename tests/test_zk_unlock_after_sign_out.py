@@ -203,6 +203,55 @@ def test_a_name_index_key_read_across_a_sign_out_is_kept_in_the_cache_it_was_rea
     assert out["before"] == {"V": out["got"] if out["got"] is not None else False}
 
 
+# The mint of a vault's name-index key (at its creation), every step held until the test answers it.
+MINT_STEPS = ["identity", "public key", "new key", "wrap", "vault key", "store"]
+MINT = _function("zkMintOwnIndexKey") + """
+const zkState = { vaultIndexKeys: {} };
+const waiting = {};
+const held = (name, value) => () => new Promise((resolve) => { waiting[name] = () => resolve(value); });
+const zkProofIdentity = held('identity', { pem: 'PEM', userId: 'u' });
+const lib = {
+  importPublicKeyPEM: held('public key', 'PUB'),
+  generateVaultDEK: held('new key', 'MINTED'),
+  wrapNameIndexKeyV2: held('wrap', { wrappedKey: 'w', ephemeralPublicKey: 'e' }),
+};
+const eccLib = () => lib;
+const zkCurrentKeyMaterial = held('vault key', { expect: 'x', material: 'm' });
+const zkKeyProofRequest = held('store', {});
+const tick = () => new Promise((r) => setTimeout(r, 0));
+"""
+
+
+@pytest.mark.parametrize("at", MINT_STEPS + [None])
+def test_a_name_index_key_minted_across_a_sign_out_is_kept_in_the_cache_it_was_minted_for(at):
+    """A sign-out (or a lock) replaces the cache of name-index keys while a vault's key is minted, at any of its
+    steps: the key minted is kept in the cache the mint began with, never in the next person's. The control: with
+    nothing replaced, the key is kept in the cache, as before."""
+    node = shutil.which("node")
+    assert node, "Node is required"
+    script = MINT + f"""
+(async () => {{
+  const before = zkState.vaultIndexKeys;
+  const p = zkMintOwnIndexKey('V');
+  for (const name of {json.dumps(MINT_STEPS)}) {{
+    await tick();
+    if (!waiting[name]) break;
+    if (name === {json.dumps(at)}) zkState.vaultIndexKeys = {{}};   // a sign-out (or a lock) replaces the cache
+    waiting[name]();
+  }}
+  const got = await p;
+  console.log(JSON.stringify({{ got, next: zkState.vaultIndexKeys === before ? 'the same cache' : zkState.vaultIndexKeys, before,
+    steps: Object.keys(waiting) }}));
+}})();
+"""
+    done = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    assert out["got"] == "MINTED" and out["steps"] == MINT_STEPS, out
+    assert out["before"] == {"V": "MINTED"}, out
+    assert out["next"] == ("the same cache" if at is None else {}), "kept in the next person's cache"
+
+
 # The four operations of the encryption key dialog, lifted out verbatim with the steps they run on. Every prompt,
 # request, derivation and import is held until the test answers it, in the order the operation asks.
 KEYOPS_SHIPPED = "".join(_function(n) for n in (
