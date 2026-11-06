@@ -2148,11 +2148,12 @@ def test_update_from_source_checks_out_and_recreates(tmp_path, monkeypatch):
     # asserted and the work is skipped.
     backups = []
     monkeypatch.setattr(tool, "_do_backup", lambda env, args: backups.append(True))
-    # a downgrade, explicitly confirmed via --yes, built from source
-    tool.update(argparse.Namespace(non_interactive=True, tag="v0.5.0", source=True, yes=True))
-    assert any(("checkout" in c and "v0.5.0" in c) for c in calls), "must git checkout the chosen tag"
+    # a change confirmed via --yes, built from source (going back from a guessed origin is refused
+    # unless forced; that is pinned in tests/test_data_requirements.py)
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.7.0", source=True, yes=True))
+    assert any(("checkout" in c and "v0.7.0" in c) for c in calls), "must git checkout the chosen tag"
     assert started == [1]
-    assert backups, "a downgrade proceeded without demanding a backup"
+    assert backups, "a change from a guessed origin proceeded without demanding a backup"
 
 
 def test_update_pull_path_sets_image_and_recreates_without_build(tmp_path, monkeypatch):
@@ -2313,6 +2314,56 @@ def test_resolve_rerun_image_source_release_unpublished_keeps_env(tmp_path, monk
     env = dv.parse_env(env_path.read_text(encoding="utf-8"))
     assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE, "must not pin an unpublished release on a re-run"
     assert "not published" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("choice, pinned", [
+    ("release", "ghcr.io/dockvault/vault:v0.34.0"),
+    ("build", "ghcr.io/dockvault/vault:v0.34.0"),
+    (None, dv.LOCAL_IMAGE),
+], ids=["pull-the-release", "build-this-checkout", "keep-a-local-build"])
+def test_a_setup_rerun_never_goes_back_to_an_older_version(tmp_path, monkeypatch, capsys, choice, pinned):
+    """'Pull the published release image' pinned this checkout's VERSION, which an update by pull leaves behind
+    (0.33.6 here, under a deployment that runs 0.34.0); building, or rebuilding a kept local build, starts the same
+    older version. Setup went back over the data with none of update's checks: it now refuses, before .env or the
+    stack is changed, and names the update command that checks first."""
+    (tmp_path / "VERSION").write_text("0.33.6\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.34.0", "v0.33.6"])
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=%s\n" % pinned, encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.34.0", "the running container"))
+    with pytest.raises(SystemExit):
+        tool._resolve_rerun_image_source(str(env_path), argparse.Namespace(image_source=choice), interactive=False)
+    assert env_path.read_text(encoding="utf-8") == "DOCKVAULT_IMAGE=%s\n" % pinned
+    said = " ".join(capsys.readouterr().out.split())
+    assert "0.33.6, which is older than 0.34.0, the version this deployment has run" in said
+    assert "python dockvault.py update --tag v0.33.6" in said
+
+
+def test_a_setup_rerun_with_nothing_running_is_held_back_by_the_release_env_pins(tmp_path, monkeypatch, capsys):
+    """Nothing running and no container: the release .env pins (0.34.0) is the version the data was last on, and
+    pulling the checkout's older release over it is refused just the same."""
+    (tmp_path / "VERSION").write_text("0.33.6\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.34.0", "v0.33.6"])
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(1, b"" if "cp" in cmd else "", "no container"))
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.34.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    with pytest.raises(SystemExit):
+        tool._resolve_rerun_image_source(str(env_path), argparse.Namespace(image_source="release"), interactive=False)
+    assert env_path.read_text(encoding="utf-8") == "DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.34.0\n"
+    assert "the release image .env names (nothing is running to ask)" in " ".join(capsys.readouterr().out.split())
+
+
+@pytest.mark.parametrize("version", ["0.34.0", "0.34.1"])
+def test_a_setup_rerun_to_the_same_or_a_newer_version_goes_on(tmp_path, monkeypatch, version):
+    (tmp_path / "VERSION").write_text(version + "\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.34.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.34.0", "the running container"))
+    tool._resolve_rerun_image_source(str(env_path), argparse.Namespace(image_source="build"), interactive=False)
+    assert dv.parse_env(env_path.read_text(encoding="utf-8"))["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
 
 
 def test_resolve_rerun_image_source_interactive_build_choice_repoints(tmp_path, monkeypatch):
@@ -2477,15 +2528,15 @@ def test_update_from_source_stops_pointing_at_the_release_it_replaces(tmp_path, 
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, ""))
     monkeypatch.setattr(tool, "_start_secure_stack", lambda: True)
     monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
-    # This is a downgrade (0.9.0 -> 0.8.0) and the origin comes from the file, so the update gates
-    # on a backup. Recorded rather than taken: against faked docker there are no volumes to
-    # archive, and this test is about the image reference the build inherits.
+    # The origin comes from a guess (nothing runs), so the update gates on a backup. Recorded rather
+    # than taken: against faked docker there are no volumes to archive, and this test is about the
+    # image reference the build inherits.
     backups = []
     monkeypatch.setattr(tool, "_do_backup", lambda env, args: backups.append(True))
-    tool.update(argparse.Namespace(non_interactive=True, tag="v0.8.0", source=True, yes=True))
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.9.1", source=True, yes=True))
     env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
-    assert backups, "a downgrade proceeded without demanding a backup"
+    assert backups, "a change from a guessed origin proceeded without demanding a backup"
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")

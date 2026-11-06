@@ -545,14 +545,57 @@ def test_an_upgrade_does_not_ask(tmp_path, monkeypatch):
     assert deployment.image().endswith(":v0.34.0")
 
 
+_GUESSED = "this checkout's VERSION file (nothing is running to ask)"
+
+
 def test_a_guessed_running_version_is_not_asked(tmp_path, monkeypatch):
     """With nothing running there is nothing to ask; the older image's own check still holds."""
-    deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]),
-                             source="this checkout's VERSION file (nothing is running to ask)")
+    deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]), source=_GUESSED)
 
-    deployment.update("v0.33.1")
+    deployment.update("v0.33.1", force_downgrade=True)
 
     assert deployment.asked() == []
+    assert deployment.image().endswith(":v0.33.1")
+
+
+def test_going_back_from_a_guessed_version_is_taken_only_when_asked_for_by_name(tmp_path, monkeypatch, capsys):
+    """Nothing runs, so nothing can say what the data holds that the older version cannot read: the downgrade used to
+    go ahead on the guess with neither question put. It now needs --force-downgrade, and says to start the
+    deployment instead so that it can be asked."""
+    deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]), source=_GUESSED)
+
+    with pytest.raises(SystemExit):
+        deployment.update("v0.33.1")
+
+    assert deployment.asked() == []
+    assert deployment.image() == deployment.dv.LOCAL_IMAGE, "nothing was changed"
+    said = " ".join(capsys.readouterr().out.split())
+    assert "0.34.0 -> v0.33.1 is a downgrade from a version that could only be guessed" in said
+    assert "Start the deployment (python dockvault.py start) and run update again" in said
+    assert "--force-downgrade" in said
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_going_back_from_a_guessed_version_to_one_that_checks_nothing_is_refused_even_when_forced(
+        tmp_path, monkeypatch, capsys, forced):
+    """The older image checks nothing itself, and nothing could be asked: the only check there is cannot run."""
+    deployment = _Deployment(tmp_path, monkeypatch, ask=_answers([_HOLD]), source=_GUESSED)
+
+    with pytest.raises(SystemExit):
+        deployment.update("v0.33.0", **({"force_downgrade": True} if forced else {}))
+
+    assert deployment.image() == deployment.dv.LOCAL_IMAGE
+    said = " ".join(capsys.readouterr().out.split())
+    assert "v0.33.0 is older than 0.33.1, the first version that checks for data it cannot read" in said
+    assert "--force-downgrade does not go back to a version older than 0.33.1" in said
+
+
+def test_an_upgrade_from_a_guessed_version_is_not_held_back(tmp_path, monkeypatch):
+    deployment = _Deployment(tmp_path, monkeypatch, running="0.33.1", source=_GUESSED)
+
+    deployment.update("v0.34.0")
+
+    assert deployment.image().endswith(":v0.34.0")
 
 
 @pytest.mark.parametrize("version, checks", [

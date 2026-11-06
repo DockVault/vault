@@ -2303,6 +2303,13 @@ def uses_release_image(env):
     return image.startswith(GHCR_IMAGE + ":") or image.startswith(GHCR_IMAGE + "@")
 
 
+def release_image_version(image):
+    """The version a published release image reference names ('ghcr.io/dockvault/vault:v0.34.0' -> '0.34.0'), or
+    None for anything else (a local build, a digest-pinned reference, another repository)."""
+    m = re.match(r"^%s:v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?)$" % re.escape(GHCR_IMAGE), (image or "").strip())
+    return m.group(1) if m else None
+
+
 def image_present(image, run=None):
     """True when `image` is already in this host's Docker image store (`docker image inspect` finds it), so the
     stack can be recreated from it without the registry. False when it is not, and when Docker cannot be asked."""
@@ -4870,6 +4877,20 @@ class DockVault:
             kw.setdefault("capture_output", True)
         return subprocess.run(self._dc(*args), stdin=subprocess.DEVNULL, **kw)
 
+    def _refuse_setup_downgrade(self, version, what):
+        """Stop a setup re-run that would start `version` (this checkout's VERSION) when the deployment has run a newer
+        one (_running_version: the running container, or its best guess), before .env or the stack is changed. Going
+        back over data a newer version wrote is update's to do: it asks the running version what the older one
+        cannot read, and refuses what nothing would check."""
+        if not parse_semver(version):
+            return
+        running, source = self._running_version()
+        if parse_semver(running) and parse_semver(version) < parse_semver(running):
+            self._fail("this re-run would %s %s, which is older than %s, the version this deployment has run (from %s). "
+                       "Setup does not go back to an older version: python dockvault.py update --tag v%s does, after "
+                       "it checks what the data holds that %s cannot read. The image source and the stack were left "
+                       "as they were." % (what, version, running, source, version.lstrip("vV"), version))
+
     def _resolve_rerun_image_source(self, env_path, args, interactive):
         """On a setup RE-RUN, let the operator confirm or CHANGE the image mode (pull the published
         release vs. build the current checkout), then repoint .env accordingly.
@@ -4904,6 +4925,14 @@ class DockVault:
                     print(pal.paint("  %s is not published (this checkout is ahead of the latest "
                                     "release); keeping %s." % (candidate, describe_image_mode(env)), "yellow"))
                     choice = ""
+        # What the re-run is about to start is this checkout's VERSION when it pulls that release or builds this
+        # checkout (a kept local build is built again). That can be older than what this deployment has run (a
+        # deployment updated by pull leaves VERSION where it was; an older checkout): setup would then go back over
+        # the data with none of update's checks. So the same rule as update: setup never goes back to an older
+        # version, update does (_refuse_setup_downgrade).
+        if choice in ("release", "build") or (not choice and not uses_release_image(env)):
+            self._refuse_setup_downgrade(version, "pull the published release of" if choice == "release"
+                                         else "build and start this checkout at")
         action, value = rerun_image_target(env, choice, version)
         if action == "set":
             self._set_env_key(env_path, "DOCKVAULT_IMAGE", value)
@@ -6596,6 +6625,12 @@ class DockVault:
         Asked over `docker exec` rather than HTTP: the endpoint that carries the version sits
         behind whatever port and certificate the deployment chose, and a self-signed certificate on
         a non-default port is the normal case here, not an edge one.
+
+        With nothing running to ask, the answer is a guess, and its source says so (it is never "the running
+        container"): the highest of what the stopped web container's image holds in /app/VERSION (read with
+        `docker cp`, which needs no running container), the release .env pins in DOCKVAULT_IMAGE, and this
+        checkout's VERSION file. The highest, because the data may have been written by the newest of them, and
+        a move from a guess that turns out lower than the truth is a downgrade the gates would not see.
         """
         service = self._web_service(profiles or self._load_env().get("COMPOSE_PROFILES", "combined"))
         try:
@@ -6608,7 +6643,34 @@ class DockVault:
             if parse_semver(found):
                 return found, "the running container"
         fallback = read_version_file(self.root)
-        return fallback, "this checkout's VERSION file (nothing is running to ask)"
+        guesses = [(v, where) for v, where in (
+            (self._stopped_container_version(service), "the version in the stopped %s container's image" % service),
+            (release_image_version(self._load_env().get("DOCKVAULT_IMAGE")), "the release image .env names"),
+            (fallback, "this checkout's VERSION file")) if parse_semver(v)]
+        if not guesses:
+            return fallback, "this checkout's VERSION file (nothing is running to ask)"
+        best = max(guesses, key=lambda g: parse_semver(g[0]))       # the first of equals: the image's own file
+        return best[0], "%s (nothing is running to ask)" % best[1]
+
+    def _stopped_container_version(self, service):
+        """The version in /app/VERSION of the `service` container, which need not be running (`docker cp` reads a
+        stopped or restarting container's files), or None when there is no such container or no version in it."""
+        import io
+        import tarfile
+        try:
+            r = subprocess.run(["docker", "cp", "%s:/app/VERSION" % service, "-"], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        data = getattr(r, "stdout", None)
+        if getattr(r, "returncode", 1) != 0 or not isinstance(data, (bytes, bytearray)):
+            return None
+        try:
+            with tarfile.open(fileobj=io.BytesIO(bytes(data))) as tar:
+                member = next((m for m in tar if m.isfile()), None)
+                text = tar.extractfile(member).read(64).decode("utf-8", "replace").strip() if member else ""
+        except (tarfile.TarError, OSError, ValueError, AttributeError):
+            return None
+        return text if parse_semver(text) else None
 
     def _describe_hop(self, plan, source, current, tag, down=False):
         """Print what the hop does. Returns nothing; the caller decides what to require, from the same
@@ -6928,6 +6990,31 @@ class DockVault:
                         "in a way %s cannot read, %s starts anyway and may delete or change what %s "
                         "keeps." % (tag, tag, FIRST_NEWER_DATA_CHECK, current, tag, tag, current),
                         "yellow"))
+        elif down:
+            # Going back from a guessed origin (nothing running to ask): nobody can say what the data holds that the
+            # older version cannot read, so neither question above can be put. An older image from
+            # FIRST_NEWER_DATA_CHECK on still checks the data itself, so the move is taken only when asked for by
+            # name (--force-downgrade); to an older one, which checks nothing, it is refused even then. Starting
+            # the deployment lets update ask it.
+            ask_first = ("Start the deployment (python dockvault.py start) and run update again: it then asks the "
+                         "running version what it has changed")
+            if not checks_newer_data(tag):
+                self._fail(
+                    "%s -> %s is a downgrade from a version that could only be guessed (%s), and %s is older "
+                    "than %s, the first version that checks for data it cannot read: it would start on this "
+                    "data regardless and may delete or change what %s keeps. --force-downgrade does not go back "
+                    "to a version older than %s without the running version's answer. %s."
+                    % (current, tag, version_source, tag, FIRST_NEWER_DATA_CHECK, current,
+                       FIRST_NEWER_DATA_CHECK, ask_first))
+            if not (args and getattr(args, "force_downgrade", False)):
+                self._fail(
+                    "%s -> %s is a downgrade from a version that could only be guessed (%s), so whether %s "
+                    "can read this data cannot be asked. %s. Or pass --force-downgrade to go back on the guess: "
+                    "%s refuses to start on data it cannot read, and says how to undo the change."
+                    % (current, tag, version_source, tag, ask_first, tag))
+            print(pal.paint(
+                "  --force-downgrade given: going back from a guessed version. %s refuses to start on data it "
+                "cannot read." % tag, "yellow"))
 
         dry_run = bool(getattr(args, "dry_run", False)) if args else False
         if dry_run:

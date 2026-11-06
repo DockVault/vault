@@ -514,6 +514,15 @@ description for is treated as the riskiest case rather than assumed safe. A down
 upgrade it takes back: along upgrades the matrix marks reversible it says so, and it is refused across one
 it marks irreversible; it always takes a backup first, as there are no down-migrations.
 
+The version a change starts from is asked of the running container. With nothing running it is a guess,
+and the tool says so: the highest of the stopped container's own version, the release `DOCKVAULT_IMAGE`
+names, and the checkout's `VERSION` (which an update by pull leaves where it was). Going back from a
+guess cannot ask what the data holds that the older version cannot read, so `update` takes it only with
+`--force-downgrade`, and to a version older than 0.33.1 (which checks nothing itself) not even then:
+start the deployment and run `update` again, so that it can ask. A setup re-run never goes back to an
+older version either (pulling the release of an older checkout's `VERSION`, or building it): it stops,
+before anything changes, and names the `update --tag` command to use instead.
+
 ### Support lifecycle and the minimum supported version
 
 Each version in the matrix also declares a support lifecycle: whether it is **end-of-life**, whether

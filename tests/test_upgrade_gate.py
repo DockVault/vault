@@ -462,6 +462,47 @@ def test_it_falls_back_to_the_file_and_says_so_when_nothing_is_running(tmp_path,
     assert version == "0.1.0" and "VERSION file" in source
 
 
+def _version_tar(text):
+    """What `docker cp <container>:/app/VERSION -` writes to its standard output: a tar holding the file."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        data = text.encode("utf-8")
+        info = tarfile.TarInfo("VERSION")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("stopped, image, expected, where", [
+    ("0.34.0\n", dv.LOCAL_IMAGE, "0.34.0", "the version in the stopped vault container's image"),
+    (None, "ghcr.io/dockvault/vault:v0.34.0", "0.34.0", "the release image .env names"),
+    ("0.33.2\n", "ghcr.io/dockvault/vault:v0.34.0", "0.34.0", "the release image .env names"),
+    (None, dv.LOCAL_IMAGE, "0.33.0", "this checkout's VERSION file"),
+], ids=["stopped-container", "env-image", "highest-wins", "file-only"])
+def test_with_nothing_running_the_guess_is_the_highest_version_the_host_knows(tmp_path, monkeypatch, stopped, image,
+                                                                              expected, where):
+    """The checkout's VERSION file is where the deployment was installed from, not what it runs after a pull update:
+    with the container down, a downgrade was checked against that older file and was not seen as one. The guess is
+    now the highest of the stopped container's own version file, the release .env pins, and the checkout's file;
+    and it is still said to be a guess."""
+    tool = _deployment(tmp_path, version="0.33.0")
+    (tmp_path / ".env").write_text("COMPOSE_PROFILES=combined\nDOCKVAULT_IMAGE=%s\n" % image, encoding="utf-8")
+
+    def run(cmd, **k):
+        if cmd[:2] == ["docker", "cp"] and stopped is not None:
+            return argparse.Namespace(returncode=0, stdout=_version_tar(stopped), stderr=b"")
+        return argparse.Namespace(returncode=1, stdout=b"" if cmd[:2] == ["docker", "cp"] else "",
+                                  stderr="No such container")
+
+    monkeypatch.setattr(dv.subprocess, "run", run)
+    version, source = tool._running_version("combined")
+    assert version == expected
+    assert source == "%s (nothing is running to ask)" % where
+    assert source != "the running container"
+
+
 def test_unparseable_output_from_the_container_is_not_believed(tmp_path, monkeypatch):
     """A container that answers with something that is not a version is not a source of truth."""
     tool = _deployment(tmp_path, version="0.1.0")
@@ -512,6 +553,27 @@ def test_the_running_version_is_read_from_a_real_container():
     assert dv.parse_semver(reported), (
         f"the container's /app/VERSION is {reported!r}, which is not a version. The tool would "
         "silently fall back to the checkout's file, which is the defect this replaced")
+
+
+@pytest.mark.docker
+def test_the_version_in_a_containers_image_is_read_without_exec(tmp_path):
+    """`docker cp` reads /app/VERSION from a container whether or not it runs: the transport the guess uses when
+    nothing answers `docker exec`, proved against the stack the suite runs against."""
+    import os
+    import subprocess as sp
+
+    container = os.environ.get("VAULT_API_CONTAINER")
+    if not container:
+        pytest.skip("VAULT_API_CONTAINER is unset; no deployment to read")
+    try:
+        probe = sp.run(["docker", "exec", container, "cat", "/app/VERSION"], capture_output=True, text=True, timeout=60)
+    except (OSError, sp.SubprocessError) as exc:
+        pytest.skip(f"cannot run docker: {exc}")
+    skip_if_container_absent(probe, container)
+    assert probe.returncode == 0, probe.stderr[-200:]
+    tool = _deployment(tmp_path)
+    assert tool._stopped_container_version(container) == probe.stdout.strip()
+    assert tool._stopped_container_version("no-such-container-here") is None
 
 
 def test_a_guessed_origin_is_not_described(tmp_path, monkeypatch, capsys):
