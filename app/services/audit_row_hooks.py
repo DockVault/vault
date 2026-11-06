@@ -10,7 +10,11 @@ this order, once each:
                                 row.recorded, and what stays in the row's own fields and details);
                                 raw_details is the caller's details as given;
     seal_nonce(row)             the value per row under which the log's integrity chain commits to the
-                                row's personal values (row.seal_nonce).
+                                row's personal values (row.seal_nonce);
+    kept_records(row, db)       what the row's being written keeps in the database: a row of the compliance
+                                category that records a step taken keeps the data marker that stops an
+                                earlier release from starting, written in db, the session build_row was
+                                given, which writes the row.
 
 The row's id is set before the first hook runs, so a hook may bind something to it; SQLAlchemy would
 otherwise give the row its id only when it is flushed. A hook changes the row in place and returns
@@ -18,8 +22,9 @@ nothing. It must not raise: build_row runs inside the transaction of the change 
 exception here fails that change. raw_details is a copy, and the caller's own dict is never changed.
 
 In this release privacy applies the recording levels (app/core/audit_privacy.py), case puts the id of the
-compliance case the code acts under on the row, and seal_nonce gives the row its nonce; provenance leaves the
-row as it is, so its column stays NULL.
+compliance case the code acts under on the row, seal_nonce gives the row its nonce, and kept_records keeps the
+compliance records' marker (app/core/compliance_marker.py); provenance leaves the row as it is, so its column
+stays NULL.
 """
 
 
@@ -52,3 +57,27 @@ def seal_nonce(row) -> None:
     against a guess of the old values."""
     import secrets
     row.seal_nonce = secrets.token_bytes(16)
+
+
+_compliance_actions = None
+
+
+def kept_records(row, db=None) -> None:
+    """A row of the compliance category (app/core/audit_catalog.py) is kept COMPLIANCE_RECORD_MIN_DAYS, which an
+    earlier release would not do. When the row records a step of compliance access taken (compliance_marker.counts:
+    not a refusal, not a vault owner's own step, not the record of telling an owner), the marker that stops one from
+    starting is written in ``db``'s transaction, the one that writes the row (app/core/compliance_marker.py, ensure).
+    Any other row: nothing. Never raises."""
+    global _compliance_actions
+    try:
+        if _compliance_actions is None:
+            from app.core import audit_catalog
+            _compliance_actions = frozenset(audit_catalog.stored_names(["compliance"]))
+        if row.action not in _compliance_actions or db is None:
+            return
+        from app.core import compliance_marker
+        if not compliance_marker.counts(row.action, row.status):
+            return
+        compliance_marker.ensure(db)
+    except Exception:  # noqa: BLE001 -- a hook never fails the change its row records; the pruner writes it
+        return

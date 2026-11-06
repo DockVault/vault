@@ -449,24 +449,37 @@ def run_compliance_cases(p: Pass) -> JobResult:
     """The compliance cases' clock (app/core/cases.py): a case nobody approved within 7 days expires, and a case
     whose access reached its end closes or keeps only its legal hold, its owners told in the same transaction; a case
     closed 30 days ago keeps the counts of its audit rows (files opened, exports) on itself, before those rows may
-    leave the table. Deletes nothing: a case's rows are its record. Not stopped by the hold switch."""
-    from app.core import cases
+    leave the table. Then the data marker that stops an earlier release from starting while the records of compliance
+    access must be kept (app/core/compliance_marker.py), in a transaction of its own. Deletes nothing: a case's rows
+    are its record. Not stopped by the hold switch."""
+    from app.core import cases, compliance_marker
     with p.transaction() as db:
         cases.expire_pending(db, p.now)
         cases.end_due(db, p.now)
         cases.keep_counts(db, p.now)
+    with p.transaction() as db:
+        compliance_marker.sync(db, now=p.now)
     return JobResult()
 
 
 def run_legal_holds(p: Pass) -> JobResult:
     """The legal holds' clock (app/core/legal_holds.py): holds nobody confirmed in time lapse, those due a review
-    ask for one, and what released holds kept is purged once their delay is over (a batch per transaction, each
+    ask for one, while anything is held an SFTP server of another version is looked for again (the administrators
+    are told of one), and what released holds kept is purged once their delay is over (a batch per transaction, each
     file's held_file_purged row in it, the blobs secure-deleted after its commit). Not stopped by the hold switch:
-    a hold's purge is the end of what a case kept, not a log."""
+    a hold's purge is the end of what a case kept, not a log. The SFTP check runs in a transaction of its own, and
+    its failure is said and goes no further: the lapses and the review prompts commit without it, and the purge
+    runs."""
     from app.core import legal_holds
     with p.transaction() as db:
         legal_holds.lapse_due(db, p.now)
         legal_holds.prompt_reviews(db, p.now)
+    try:
+        with p.transaction() as db:
+            legal_holds.sftp_while_held(db, p.now)
+    except Exception as exc:  # noqa: BLE001 -- the check asks again at the next pass
+        print(f"Warning: the SFTP servers' versions were not checked while legal holds keep files "
+              f"({type(exc).__name__}); the next pass asks again")
     done = JobResult()
 
     def record(db, count, table):

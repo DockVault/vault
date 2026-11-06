@@ -8,7 +8,11 @@ The pruner's ``audit_archive`` job, after the audit job, each pass:
 
 1. waits out the grace period: archiving starts ``audit_archive_start_after_days`` (AUDIT_ARCHIVE_START_AFTER_DAYS,
    14 by default) after the chain's genesis, which the first start of this release writes on its first pass and
-   which the chain authenticates (a database writer cannot move it). Until then a rollback needs no unarchive. A
+   which the chain authenticates (a database writer cannot move it), and again that long after sealing resumes
+   following a gap (more than 12 hours without a seal) in which an earlier release wrote to the audit log, or one
+   longer than RESTART_AFTER (3 days), from the first seal after it (grace_from); nothing while a gap is open. Until
+   then a rollback needs no unarchive, so coming back from an earlier release after weeks starts no archiving that
+   would stop the next rollback at once, while a server stopped every night still archives. A
    day ``audit unarchive`` put back stays rows for the same grace (at least a day) after that, so a rollback right
    after an unarchive finds no new block;
 2. takes the oldest UTC day older than ``audit_hot_days`` (90 by default, 31 to 3650, so the 30-day summary
@@ -46,7 +50,9 @@ bytes of the hours it holds (app/core/audit_chain_size.py).
 
 The host's ``audit unarchive`` restores a range of days as rows (identical rows, so the seals still hold), writes
 back each hour's working data (row_ids, checked against the seal, and the salt the block kept), removes the
-blocks and writes an ``archive`` seal with no parts, in two phases like every host command that writes a seal.
+blocks and writes an ``archive`` seal with no parts, in two phases like every host command that writes a seal. A
+day whose rows include the record of a step of compliance access younger than COMPLIANCE_RECORD_MIN_DAYS gets the
+compliance records' marker back in its own transaction (app/core/compliance_marker.py).
 ``audit compact`` is a VACUUM FULL of the audit tables: Postgres gives freed space back to the system only that
 way, and it blocks audit writes while it runs.
 """
@@ -174,10 +180,48 @@ def first_start(view) -> Optional[datetime]:
     return view.at(1) if view.position else None
 
 
-def starts_at(view) -> Optional[datetime]:
-    """When archiving may begin: the chain's genesis plus the grace. None before genesis."""
+# A gap in sealing (two seals more than 12 hours apart) after which the grace runs again from its end: one in which an
+# earlier release wrote to the audit log (its rows have no privacy version, which this release gives every row it
+# writes), or any longer than RESTART_AFTER (time on an earlier release nobody used, or a long stop). A shorter stop
+# with no such row, a server switched off for the night, leaves the grace as it was, so such a deployment archives.
+RESTART_AFTER = timedelta(days=3)
+
+
+def written_by_an_earlier_release(db, begin: datetime, end: datetime) -> bool:
+    """Whether the audit log holds a row dated between ``begin`` and ``end`` with no privacy version: one a release
+    before this one wrote."""
+    from app.core.models import AuditLog
+    return db.query(AuditLog.id).filter(AuditLog.timestamp > begin, AuditLog.timestamp < end,
+                                        AuditLog.privacy_version.is_(None)).first() is not None
+
+
+def grace_from(view, now: Optional[datetime] = None, db=None) -> Optional[datetime]:
+    """When the grace runs from: the chain's genesis, or the first seal after the newest gap in sealing that restarts
+    it (RESTART_AFTER; with no ``db`` only the length of a gap is read), whichever is later; while a gap is open at
+    ``now`` (the newest seal more than 12 hours old), ``now``. A gap that ended a grace or more before ``now`` cannot
+    hold archiving back, and is not read. None before genesis."""
+    from app.core import audit_chain_times as times
     first = first_start(view)
-    return first + timedelta(days=start_after_days()) if first is not None else None
+    if first is None:
+        return None
+    start = first
+    grace = timedelta(days=start_after_days())
+    for seq in reversed(view.gap_ends):
+        begin, end = view.at(seq - 1), view.at(seq)
+        if now is not None and end + grace <= now:
+            break
+        if end - begin > RESTART_AFTER or (db is not None and written_by_an_earlier_release(db, begin, end)):
+            start = max(start, end)
+            break
+    if now is not None and times.us(now) - view.at_us(view.position) > times.GAP_US:
+        start = max(start, now)
+    return start
+
+
+def starts_at(view, now: Optional[datetime] = None, db=None) -> Optional[datetime]:
+    """When archiving may begin: grace_from plus the grace. None before genesis."""
+    begins = grace_from(view, now, db)
+    return begins + timedelta(days=start_after_days()) if begins is not None else None
 
 
 def unarchived_until(view, day: date) -> Optional[datetime]:
@@ -646,7 +690,8 @@ def archive_job(p):
         _daily_marker(db, p.now)
     if st.stopped is not None or st.view.newest_policy() is None:
         return result
-    begins = starts_at(st.view)
+    with p.transaction() as db:
+        begins = starts_at(st.view, p.now, db)
     if begins is None or p.now < begins:
         return result
     engine = ai._engine_of(p.session_factory)
@@ -976,8 +1021,10 @@ def _restore_rows(db, rows: List[dict]) -> None:
 
 
 def restore_day(w, day: date, now: datetime) -> int:
-    """Put ``day``'s archived rows back into audit_logs, in ``w``'s transaction (see the module's docstring).
-    Returns the rows restored. Raises NotVerified."""
+    """Put ``day``'s archived rows back into audit_logs, in ``w``'s transaction (see the module's docstring), with the
+    compliance records' marker when a row it restores keeps it (app/core/compliance_marker.py, restored). Returns the
+    rows restored. Raises NotVerified."""
+    from app.core import compliance_marker
     from app.core.models import AuditArchiveBlock as B, AuditLog as A
     ai = _ai()
     db, view = w.db, w.st.view
@@ -986,6 +1033,7 @@ def restore_day(w, day: date, now: datetime) -> int:
         return 0
     _check_day_blocks(db, entry, day)
     restored = 0
+    counted: Optional[datetime] = None     # the newest restored row that keeps the compliance records' marker
     for part in sorted(entry.parts, key=lambda p: p.first_hour):
         hours = hours_between(part.first_hour, part.last_hour)
         if db.query(func.count()).select_from(A).filter(A.timestamp >= part.first_hour,
@@ -997,6 +1045,8 @@ def restore_day(w, day: date, now: datetime) -> int:
         chunk: List[dict] = []
         for row in reader.rows():
             by_hour.setdefault(ai.hour_floor(row["timestamp"]), bytearray()).extend(row["id"].bytes)
+            if compliance_marker.counts(row.get("action"), row.get("status")):
+                counted = row["timestamp"] if counted is None else max(counted, row["timestamp"])
             chunk.append(row)
             if len(chunk) >= PROBE_CHUNK:
                 _restore_rows(db, chunk)
@@ -1023,6 +1073,9 @@ def restore_day(w, day: date, now: datetime) -> int:
     db.query(B).filter(B.day == day).delete(synchronize_session=False)
     db.flush()
     sync_marker(db, now)
+    # The rows come back without build_row, which writes the compliance records' marker for a row that keeps it; the
+    # archive's own marker may have just gone with the last block.
+    compliance_marker.restored(db, counted, now=now)
     _write_archive_seal(w, day, "unarchive", [])
     return restored
 
@@ -1437,6 +1490,21 @@ def preview(db, view, *, age_cut: Optional[datetime], admin_cut: Optional[dateti
 
 # --------------------------------------------------------------------------- what the pages show
 
+def _starts_on(view, now: datetime) -> Optional[datetime]:
+    """starts_at, with a session of this process when it has one; else from the lengths of the gaps alone."""
+    try:
+        from app.core.database import started_session
+        db = started_session()
+    except Exception:  # noqa: BLE001 -- the process has no database yet
+        return starts_at(view, now)
+    try:
+        return starts_at(view, now, db)
+    except Exception:  # noqa: BLE001 -- a page never fails over the date
+        return starts_at(view, now)
+    finally:
+        db.close()
+
+
 def summary(st=None) -> dict:
     """The archive as the verified view knows it: when archiving starts, the row window, and what is archived."""
     ai = _ai()
@@ -1445,7 +1513,7 @@ def summary(st=None) -> dict:
     first = first_start(view)
     days = sorted(d for d, e in view.archives.items() if e.parts)
     parts = [p for _d, p in view.archived_parts()]
-    begins = starts_at(view)
+    begins = _starts_on(view, st.clock())
     return {"hot_days": hot_days(), "start_after_days": start_after_days(),
             "first_start": fmt.time_text(first) if first is not None else None,
             "starts_on": fmt.time_text(begins) if begins is not None else None,

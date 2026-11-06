@@ -25879,6 +25879,10 @@ END $$;""",
                 db.rollback()
                 print(f"⚠ Legal hold tables and triggers skipped: {e}")
                 recorder.record(kept_step, SchemaStep.OUTCOME_FAILED, str(e))
+            # While a compliance case is open or the records of compliance access must be kept, an older release
+            # must not start on this data either. Never raises; the pruner's passes check it again.
+            from app.core import compliance_marker
+            compliance_marker.check_at_start()
 
             recorder.forget_steps_no_longer_declared()
             recording_failed = recorder.broken

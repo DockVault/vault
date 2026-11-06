@@ -135,3 +135,15 @@ def test_a_web_container_started_on_its_own_never_answers_that_sftp_is_off():
     assert (now["ok"], now["reason"]) == (True, "same"), now
     none_live = _check(OWN, ahead_seconds=3600)
     assert (none_live["ok"], none_live["reason"]) == (False, "none_live"), none_live
+
+
+def test_a_row_its_process_stopped_refreshing_counts_for_about_a_minute_only():
+    """A killed SFTP process leaves its row behind. Asked 70 seconds from now (more than two record intervals after
+    the SFTP container's last refresh), that row no longer proves every SFTP server runs this version, so an older one
+    that started in its place is not hidden behind it for two minutes."""
+    deadline = time.monotonic() + 60
+    while not _sftp_rows() and time.monotonic() < deadline:
+        time.sleep(1)
+    assert _check(SPLIT)["reason"] == "same"
+    later = _check(SPLIT, ahead_seconds=70)
+    assert (later["ok"], later["reason"]) == (False, "none_live"), later

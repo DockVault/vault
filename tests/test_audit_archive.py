@@ -333,6 +333,20 @@ def test_the_row_window_is_a_setting(env):
     assert _hot(env, young) == 0 and arc.summary(env.st)["hot_days"] == 31
 
 
+def _running(env, **kw):
+    """The clock moves on by ``kw`` while the server runs: a sealing pass at least every 6 hours, as the pruner's
+    longest interval gives."""
+    end = env.clock() + timedelta(**kw)
+    while env.clock() < end:
+        env.clock.at = min(end, env.clock() + timedelta(hours=6))
+        env.seal()
+
+
+def _away(env, **kw):
+    """The server is stopped, or an earlier release runs, for ``kw``: nothing is sealed meanwhile."""
+    env.clock.advance(**kw)
+
+
 def test_nothing_is_archived_inside_the_grace_period_after_the_chains_genesis(env):
     env.settings.audit_archive_start_after_days = 14
     _sealed_day(env)
@@ -340,17 +354,108 @@ def test_nothing_is_archived_inside_the_grace_period_after_the_chains_genesis(en
     assert genesis == T0
     _archive(env)
     assert _hot(env) == 6 and _blocks(env) == []
-    env.clock.advance(days=13, hours=23)
-    env.seal()
+    _running(env, days=13, hours=23)
     _archive(env)
     assert _hot(env) == 6 and _blocks(env) == []
     s = arc.summary(env.st)
     assert s["first_start"] == fmt.time_text(genesis) and s["starts_on"] == fmt.time_text(genesis + timedelta(days=14))
     assert s["start_after_days"] == 14
-    env.clock.advance(hours=1)
-    env.seal()
+    _running(env, hours=1)
     _archive(env)
     assert _hot(env) == 0
+
+
+def _after_a_gap(env, *, before_days, away, written=False):
+    """0.34.0 runs ``before_days`` from its genesis, then is away for ``away`` (an earlier release wrote to the audit
+    log meanwhile when ``written``: rows with no privacy version), and starts again. Returns when it started again."""
+    env.settings.audit_archive_start_after_days = 14
+    _sealed_day(env)
+    _running(env, days=before_days)
+    left = env.clock()
+    _away(env, **away)
+    if written:
+        env.row(left + timedelta(hours=1), action="login_success")
+    env.fresh_process()
+    env.seal()
+    return env.clock()
+
+
+def test_a_return_after_a_long_rollback_waits_the_grace_again(env):
+    """Back after 37 days, the grace of genesis long run out: nothing is archived for 14 days from the first seal of
+    the return, so going back again meanwhile needs no unarchive; then the day is archived."""
+    back = _after_a_gap(env, before_days=3, away=dict(days=37))
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    assert arc.summary(env.st)["starts_on"] == fmt.time_text(back + timedelta(days=14))
+    _running(env, days=13, hours=23)
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    _running(env, hours=1)
+    _archive(env)
+    assert _hot(env) == 0 and [b.day for b in _blocks(env)] == [DAY]
+
+
+def test_a_return_after_a_short_rollback_an_earlier_release_wrote_in_waits_the_grace_again(env):
+    """Back after 2 days on an earlier release that recorded a sign-in: the grace runs again from the return, though
+    that of genesis ended meanwhile."""
+    back = _after_a_gap(env, before_days=13, away=dict(days=2), written=True)
+    assert back > T0 + timedelta(days=14)
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    _running(env, days=13, hours=23)
+    _archive(env)
+    assert _hot(env) == 6
+    _running(env, hours=1)
+    _archive(env)
+    assert _hot(env) == 0
+
+
+def test_the_settings_page_dates_the_start_from_a_return_an_earlier_release_wrote_in(env, monkeypatch):
+    """The page reads the rows an earlier release wrote, through a session of the process, as the job does: after 2
+    days on one that wrote to the log it shows the grace from the return. A process with no database yet can tell
+    only the gaps' lengths, so it shows the grace from genesis."""
+    from app.core import database
+    back = _after_a_gap(env, before_days=13, away=dict(days=2), written=True)
+    monkeypatch.setattr(database, "started_session", env.session)
+    assert arc.summary(env.st)["starts_on"] == fmt.time_text(back + timedelta(days=14))
+
+    def not_yet():
+        raise database.RuntimeNotReady("no runtime")
+    monkeypatch.setattr(database, "started_session", not_yet)
+    assert arc.summary(env.st)["starts_on"] == fmt.time_text(T0 + timedelta(days=14))
+
+
+@pytest.mark.parametrize("away", [dict(hours=11), dict(hours=13), dict(days=2, hours=23)])
+def test_a_stop_with_nothing_written_leaves_the_grace_as_it_was(env, away):
+    """A stop of less than 12 hours is no gap; a longer one up to 3 days in which nothing was written, a server
+    switched off for the night or a weekend, does not start the grace again: such a deployment still archives."""
+    _after_a_gap(env, before_days=14, away=away)
+    _archive(env)
+    assert _hot(env) == 0
+
+
+def test_nothing_is_archived_while_a_gap_is_open(env):
+    """Past the grace, archiving waits while the newest seal is more than 12 hours old: the first pass of a process
+    back from an earlier release that runs before any seal of its own."""
+    env.settings.audit_archive_start_after_days = 14
+    _sealed_day(env)
+    _running(env, days=15)
+    _away(env, hours=13)
+    _archive(env)
+    assert _hot(env) == 6 and _blocks(env) == []
+    env.seal()
+    _archive(env)
+    assert _hot(env) == 0, "a gap of 13 hours with nothing written does not start the grace again"
+
+
+def test_a_gap_older_than_the_grace_is_not_read_again(env, monkeypatch):
+    back = _after_a_gap(env, before_days=3, away=dict(days=37))
+    _running(env, days=15)
+    asked = []
+    monkeypatch.setattr(arc, "written_by_an_earlier_release", lambda *a: asked.append(a) or True)
+    with env.session() as db:
+        assert arc.grace_from(env.st.view, env.clock(), db) == T0 and asked == []
+    assert arc.grace_from(env.st.view, back + timedelta(days=1)) == back
 
 
 def test_a_day_the_host_put_back_stays_rows_for_the_grace(env):
@@ -1184,6 +1289,87 @@ def test_unarchive_clears_the_link_of_an_account_deleted_since(env):
     (row,) = _rows(env, at(0), at(23))
     assert row["user_id"] is None and row["username"] == "bob"
     assert failures(env.verify()) == []
+
+
+def _keys(env):
+    with env.session() as db:
+        try:
+            return [k for (k,) in db.execute(text("SELECT key FROM data_requirements ORDER BY key"))]
+        except Exception:  # noqa: BLE001 -- no table yet
+            return []
+
+
+@pytest.fixture
+def released(env, monkeypatch):
+    """The archive of a 0.34.0 build, which keeps the records of compliance access 2190 days."""
+    from app.core import recording_marker
+    monkeypatch.setattr(recording_marker, "running_version", lambda: "0.34.0")
+    env.settings.compliance_record_min_days = 2190
+    return env
+
+
+def _compliance_day(env, action="auditor_granted", status="success"):
+    for hour in (3, 4, 6):
+        _put(env, at(hour), action=action, status=status, username="admin")
+    env.run_until_sealed()
+    assert failures(env.verify()) == []
+
+
+def test_an_unarchive_brings_back_the_compliance_records_marker_with_the_rows_that_keep_it(released):
+    """Only a case's rows stay rows: an auditor right's steps older than the row window are archived like any row,
+    and while they are, the archive's own marker alone stops an earlier release. Put back as rows they bring the
+    compliance records' marker back in their day's transaction, the one that removes the archive's marker: in no
+    moment does an earlier release start on them. (They come back as they were, not through build_row, which writes
+    that marker for a row it builds.)"""
+    from app.core import host_compliance
+    env = released
+    _compliance_day(env)
+    _archive(env)
+    assert _hot(env) == 0 and _keys(env) == [arc.MARKER_KEY]
+    _unarchive(env)
+    assert _hot(env) == 3 and _blocks(env) == [] and _keys(env) == ["compliance-records"]
+    with env.session() as db:
+        assert [b["key"] for b in host_compliance.downgrade_blockers(db, "0.33.6")] == ["compliance-records"]
+    assert failures(env.verify()) == []
+
+
+@pytest.mark.parametrize("rows, floor", [
+    (dict(action="case_access_refused", status="failure"), None),   # a refusal keeps no marker
+    (dict(action="owner_notice_seen"), None),                       # nor an owner's own step
+    (dict(action="owner_notice_written"), None),                    # nor the record of telling an owner
+    (dict(action="owner_notice_email_sent"), None),                 # by email
+    (dict(action="file_uploaded"), None),                           # nor a row of another category
+    (dict(action="auditor_granted"), 99),                           # nor a step past the floor (DAY is 100 days ago)
+])
+def test_an_unarchive_brings_back_no_compliance_records_marker_for_rows_that_do_not_keep_it(
+        released, monkeypatch, rows, floor):
+    from app.core import compliance_retention
+    env = released
+    if floor is not None:
+        monkeypatch.setattr(compliance_retention, "floor_days", lambda: floor)
+    _compliance_day(env, **rows)
+    _archive(env)
+    _unarchive(env)
+    assert _hot(env) == 3 and _keys(env) == []
+
+
+def test_a_day_whose_compliance_records_marker_cannot_be_written_stays_archived(released, monkeypatch):
+    from app.core import compliance_marker
+    env = released
+    _compliance_day(env)
+    _archive(env)
+
+    params = compliance_marker._params
+
+    def broken(_when):
+        raise RuntimeError("no version")
+    monkeypatch.setattr(compliance_marker, "_params", broken)
+    with pytest.raises(RuntimeError):
+        _unarchive(env)
+    assert _hot(env) == 0 and len(_blocks(env)) == 1 and _keys(env) == [arc.MARKER_KEY]
+    monkeypatch.setattr(compliance_marker, "_params", params)
+    _unarchive(env)
+    assert _hot(env) == 3 and _keys(env) == ["compliance-records"]
 
 
 def test_a_late_row_after_an_unarchive_of_a_legacy_day_is_sealed_again(env):

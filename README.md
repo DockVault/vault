@@ -463,7 +463,13 @@ able to do.
 - **Going back:** while a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones)
   waits for its purge, a release before 0.34.0 refuses to start (from 0.33.1 on) and `dockvault.py update` refuses
   the rollback. Release the holds, wait for the purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more,
-  then roll back. Never roll back below 0.33.1 while holds exist: those releases do not check.
+  then roll back. The same holds while a compliance case is open, or while its records, or those of any step of
+  compliance access taken (an auditor right given or taken, a name revealed), are younger than
+  `COMPLIANCE_RECORD_MIN_DAYS`: an earlier release knows no cases, and when `AUDIT_LOG_RETENTION_DAYS` is positive it
+  deletes every audit row older than that. A refused request, a vault owner's own steps on Access to my vaults and a
+  notice to a vault's owner (such as of access someone else gave to their vault) do not count. Close the cases and
+  wait until those records are that old. Never roll back below 0.33.1 while holds or such records exist: those
+  releases do not check.
 
 ### Database migrations
 

@@ -11,8 +11,10 @@ administrator who is not a person the case concerns (an owner of one of its vaul
 step-up, and takes effect at once: each vault's row is locked FOR UPDATE first, which waits for a deletion that
 holds the vault's row lock, so the hold covers every deletion that commits after it. It is refused while an SFTP
 server of another version may run (sftp_guard): an older SFTP server's own delete would destroy the blob the
-trigger keeps the row of. The owner of each vault is told in the placing transaction, in the app and by email
-through the outbox (app/core/owner_notices.py), as for every later step of the hold; the administrators after it.
+trigger keeps the row of. While anything is held, every pass of the pruner asks again and tells the administrators
+when one may run (sftp_while_held), since the SFTP container can change after the placing. The owner of each vault
+is told in the placing transaction, in the app and by email through the outbox (app/core/owner_notices.py), as for
+every later step of the hold; the administrators after it.
 
 Confirming. A different person, independent of the one who placed it by the one rule every two-person step uses
 (app/core/independence.py), confirms it within COMPLIANCE_HOLD_CONFIRM_DAYS, or the server's operator does on the
@@ -428,6 +430,45 @@ def sftp_guard(db) -> None:
     check = sftp_same_version(db)
     if not check.ok:
         raise HoldRefused(SFTP_VERSION, detail=check.explain())
+
+
+SFTP_WARNING_TITLE = "An SFTP server of another version may be running"
+
+
+def sftp_while_held(db, now: Optional[datetime] = None):
+    """sftp_guard's question again, at every pass of the pruner's legal_holds job while a hold stands or what one
+    kept waits for its purge (legal_hold_marker.holds_or_kept): the SFTP container can be replaced after a hold was
+    placed, and one older than the triggers' release deletes a held file's bytes (the trigger keeps its row). When
+    one may run, the log says so at each pass and every active administrator is told, once a day while the answer
+    stays the same. Returns the answer, or None when nothing is held or kept."""
+    from app.core import legal_hold_marker
+    from app.core.sftp_versions import sftp_same_version
+    now = now or utcnow()
+    if not legal_hold_marker.holds_or_kept(db):
+        return None
+    check = sftp_same_version(db, now=now)
+    if check.ok:
+        return check
+    print(f"Warning: an SFTP server of another version may run while legal holds keep files: {check.explain()}")
+    body = (check.explain() + " Legal holds keep files: an SFTP server older than this release deletes the bytes of "
+            "a file a hold keeps when someone deletes it over SFTP. Update the SFTP container to this version.")
+    _tell_administrators(SFTP_WARNING_TITLE, body,
+                         f"sftp-version-{check.reason}-{'-'.join(check.versions)[:100]}-{now.date().isoformat()}")
+    return check
+
+
+def _tell_administrators(title: str, body: str, dedup: str) -> None:
+    """Every active administrator, in the app, once for ``dedup``. Never raises."""
+    try:
+        from app.api import api_server as api
+        from app.core.database import get_db_context
+        from app.core.models import RoleEnum, User
+        with get_db_context() as session:
+            admins = [str(a[0]) for a in session.query(User.id).filter(User.role == RoleEnum.ADMIN,
+                                                                         User.is_active.is_(True)).all()]
+        api._notify_users(admins, NOTICE_TYPE, title=title, body=body, target=TARGET, dedup_prefix=dedup)
+    except Exception as exc:  # noqa: BLE001 -- the log line stands
+        print(f"Warning: the administrators were not told ({type(exc).__name__})")
 
 
 # --------------------------------------------------------------------------- recording and telling
