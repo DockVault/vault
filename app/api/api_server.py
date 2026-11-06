@@ -23511,7 +23511,8 @@ def _admitted_again(db, token, vault_id, password_hash_before, group_name, cap, 
     _user_for_token, from the request's bearer token; a temporary credential's scope is read again with it), the
     endpoint permission and the vault capability (the route's decorators), then the vault's access check
     (membership, group access, a share when `allow_share`, a temporary credential's vault scope). The caller then
-    asks its own item checks again and reads its rows again.
+    asks its own item checks again and reads its rows again. A refusal of the endpoint permission or of the
+    capability is recorded as the decorators record it at the door.
 
     Synchronous, so a copy asks it in the thread its work runs in, with nothing between the answer and the work.
 
@@ -23520,10 +23521,10 @@ def _admitted_again(db, token, vault_id, password_hash_before, group_name, cap, 
     and a vault whose password was set, cleared or changed meanwhile is refused. Verifying it again would count
     against the vault's password throttle, and redeem a temporary credential's passcode a second time."""
     from app.core.endpoint_permissions import check_endpoint_permission
-    from app.core.temp_scope import require_cap
+    from app.core.temp_scope import require_cap_recorded
     user = _user_for_token(token, db)
     check_endpoint_permission(db, user, group_name, {"vault_id": vault_id, "db": db})
-    require_cap(user, vault_id, cap)
+    require_cap_recorded(db, user, vault_id, cap)
     return user, _vault_again(db, user, vault_id, password_hash_before, allow_share=allow_share)
 
 

@@ -375,6 +375,26 @@ def test_what_changed_while_it_waited_refuses_it_before_it_starts(monkeypatch, k
     assert stats["in_flight"] == 0, "its slot was not given back"
 
 
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("refused", ["capability", "source vault"])
+def test_a_capability_refused_after_the_wait_is_recorded_as_at_the_door(monkeypatch, kind, refused):
+    """The route's decorator records a capability it refuses at the door (a vault_cap_denied row). Refused once the
+    transfer has its slot, the same capability is recorded the same way, for the principal asked again and the
+    vault the transfer is in. A capability that is still held is not recorded when a later check refuses."""
+    import app.core.temp_scope as temp_scope
+    recorded = []
+    monkeypatch.setattr(temp_scope, "_audit_vault_cap_denial",
+                        lambda db, user, vault_id, cap: recorded.append((getattr(user, "username", None),
+                                                                         vault_id, cap)))
+    world, _waiting, answer, _stats = _run(monkeypatch, kind, refuse=_check_name(kind, refused))
+    assert _status(answer) == 403, answer
+    if refused != "capability":
+        assert recorded == [], recorded
+        return
+    ((who, vault_id, cap),) = recorded
+    assert (who, world.which[vault_id], cap) == ("asked-again", "source", CAP[kind]), recorded
+
+
 @pytest.mark.parametrize("kind", ["copy", "move"])
 def test_a_replace_withdrawn_while_it_waited_is_not_made(monkeypatch, kind):
     """Overwriting a same-name file deletes it, so it needs delete authority on the destination: decided again
