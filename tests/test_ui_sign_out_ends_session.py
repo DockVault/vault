@@ -22,7 +22,9 @@ the token back from the server afterwards:
   signs out the other tabs; a check that could not be answered (a server error, a proxy's 502 or 503 while the
   vault restarts, a proxy's own 403 page, a rate limit, no answer at all) signs out that tab alone, as it always
   did, and the session and the other tabs using it go on;
-- no answer from the server (offline): the page is signed out all the same;
+- no answer from the server (offline): the page is signed out all the same, and sends the sign-out again as soon
+  as the browser is back online; a sign-out refused by its rate limit is sent again after the wait the server asks
+  for (Retry-After);
 - a preference saved at the sign-out is sent before the session is ended, so it is not refused; a save that does
   not come back holds the sign-out for at most three seconds.
 
@@ -392,8 +394,55 @@ def test_the_page_signs_out_even_when_the_server_cannot_be_reached(page: Page, a
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
     assert page.evaluate("() => authToken") is None
     assert page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')") is None
-    # The call never reached the server, so the session there runs on until it expires: nothing else could end it.
+    # The call never reached the server (the page keeps it to send again, and this route refuses each one), so the
+    # session there runs on.
     assert _refused(token) == 200
+
+
+def test_a_sign_out_sent_while_offline_is_sent_again_once_the_browser_is_back_online(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    failed = []
+    page.on("requestfailed", lambda r: _is_sign_out(r) and failed.append(r))
+    page.context.set_offline(True)
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    _until(page, lambda: len(failed) == 1, "the sign-out was not tried while offline")
+    assert page.evaluate("() => authToken") is None
+    assert _refused(token) == 200 and session_row(token) == "t|f", "the session ended with the browser offline"
+    started = time.monotonic()
+    with page.expect_request(_is_sign_out, timeout=10000) as sent:
+        page.context.set_offline(False)
+    assert time.monotonic() - started < 5, "sent again by its own timer, not when the browser came back online"
+    assert sent.value.headers.get("authorization") == f"Bearer {token}"
+    _ended(token)
+    assert _refused(token) == 401
+
+
+def test_a_sign_out_refused_by_its_limit_is_sent_again_after_the_wait_the_server_asks_for(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    sent = []
+
+    def first_refused(route):
+        sent.append(time.monotonic())
+        if len(sent) == 1:
+            route.fulfill(status=429, content_type="application/json", headers={"Retry-After": "2"},
+                          body='{"detail": "Rate limit exceeded. Please try again later."}')
+        else:
+            route.continue_()
+
+    page.route(f"**{SIGN_OUT}", first_refused)
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    _until(page, lambda: len(sent) == 1, "the sign-out was not sent")
+    assert session_row(token) == "t|f"
+    # Waited on through the page, so that the route gets the second sign-out when it comes.
+    _until(page, lambda: session_row(token) == "f|t", "the session was not ended on the server")
+    assert len(sent) == 2, f"{len(sent)} sign-outs sent"
+    waited = sent[1] - sent[0]
+    assert 1.8 <= waited < 10, f"sent again {waited:.1f}s after the refusal, which asked for 2"
+    assert _refused(token) == 401
 
 
 def _hold_preference_saves(page: Page):

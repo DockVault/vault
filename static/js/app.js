@@ -1959,12 +1959,22 @@ function _buildStepUpBody(action, methods) {
 //
 // A preference saved at the sign-out (the Activity page's page size, saved as the page is left) is sent before
 // the session ends, or the server would refuse it: the call waits for saves still on their way, at most
-// SIGN_OUT_WAIT_MS. Once sent, the request is kept alive, so it completes even when the page goes away; a page
-// closed while it still waits for such a save sends nothing, and that session then ends when it expires.
+// SIGN_OUT_WAIT_MS. Once sent, the request is kept alive, so it completes even when the page goes away.
+//
+// A call that does not reach the server, or that the server cannot answer yet (offline, refused by the sign-out's
+// rate limit, a server error such as a proxy's 502 or 503), is sent again while the page lives: as soon as the
+// browser is back online, after the wait the server asks for (Retry-After), or else after a wait that doubles from
+// SIGN_OUT_RETRY_FIRST_MS to SIGN_OUT_RETRY_MOST_MS; until the server answers it, or the token runs out (it lets
+// nothing in from then on). The token is kept for that in memory only (_signOutsOwed), never in the browser's
+// storage, so a page closed or reloaded before the call is answered, or while it still waits for a preference
+// save, sends nothing more: that session ends when its token expires.
 const SIGN_OUT_THIS_TAB = 'this-tab';
 const SIGN_OUT_TOLD = 'told';
 const SIGN_OUT_WAIT_MS = 3000;
+const SIGN_OUT_RETRY_FIRST_MS = 15000;
+const SIGN_OUT_RETRY_MOST_MS = 300000;
 const _preferenceSaves = new Set();
+const _signOutsOwed = new Map();     // token -> { timer, wait, sending }
 
 function _endServerSession(token) {
     if (!token) return;
@@ -1973,18 +1983,64 @@ function _endServerSession(token) {
     const send = () => {
         if (sent) return;
         sent = true;
-        try {
-            fetch(`${API_BASE}/auth/sign-out`, {
-                method: 'POST', keepalive: true, cache: 'no-store',
-                headers: { 'Authorization': `Bearer ${token}` },
-            }).catch(() => {});
-        } catch (_) { /* signed out all the same */ }
+        _sendSignOut(token);
     };
     const saving = Array.from(_preferenceSaves);
     if (!saving.length) { send(); return; }
     Promise.allSettled(saving).then(send);
     setTimeout(send, SIGN_OUT_WAIT_MS);
 }
+
+function _sendSignOut(token) {
+    const owed = _signOutsOwed.get(token) || { timer: null, wait: 0, sending: false };
+    if (owed.sending) return;
+    if (owed.timer) { clearTimeout(owed.timer); owed.timer = null; }
+    owed.sending = true;
+    _signOutsOwed.set(token, owed);
+    let answer;
+    try {
+        answer = fetch(`${API_BASE}/auth/sign-out`, {
+            method: 'POST', keepalive: true, cache: 'no-store',
+            headers: { 'Authorization': `Bearer ${token}` },
+        });
+    } catch (e) {
+        answer = Promise.reject(e);
+    }
+    answer.then((resp) => {
+        if (resp.status === 408 || resp.status === 429 || resp.status >= 500) {
+            _signOutAgain(token, _retryAfterMs(resp.headers.get('Retry-After')));
+        } else {
+            _signOutsOwed.delete(token);     // ended, or refused for good: the server will not take that token
+        }
+    }, () => _signOutAgain(token, null));
+}
+
+function _signOutAgain(token, afterMs) {
+    const owed = _signOutsOwed.get(token);
+    if (!owed) return;
+    owed.sending = false;
+    const claims = _tokenClaims(token);
+    if (claims && typeof claims.exp === 'number' && Date.now() >= claims.exp * 1000) {
+        _signOutsOwed.delete(token);         // run out: the token lets nothing in any more
+        return;
+    }
+    owed.wait = afterMs != null ? afterMs
+        : Math.min(owed.wait ? owed.wait * 2 : SIGN_OUT_RETRY_FIRST_MS, SIGN_OUT_RETRY_MOST_MS);
+    owed.timer = setTimeout(() => _sendSignOut(token), owed.wait);
+}
+
+// Retry-After as seconds or as a date, in milliseconds between one second and SIGN_OUT_RETRY_MOST_MS; null when it
+// says neither.
+function _retryAfterMs(value) {
+    if (value == null || String(value).trim() === '') return null;
+    let ms = /^\s*\d+\s*$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+    if (!Number.isFinite(ms)) return null;
+    return Math.min(Math.max(ms, 1000), SIGN_OUT_RETRY_MOST_MS);
+}
+
+window.addEventListener('online', () => {
+    _signOutsOwed.forEach((owed, token) => _sendSignOut(token));    // not one already on its way (_sendSignOut)
+});
 
 // A sign-out in another tab of this browser. The tabs share one stored session, so the session another tab has
 // just ended is this tab's too when it holds the same token: told so, this tab signs out at once, instead of at its
@@ -2028,14 +2084,23 @@ function _refreshLoginPolicyWhenShown() {
     window.addEventListener('focus', refresh);
 }
 
-// The session a token names (the session_token claim of its payload), so that two tokens of one session are told
-// apart from the tokens of two sessions; the token itself when the page cannot read it.
-function _sessionOf(token) {
-    if (!token) return null;
+// A token's claims (its payload), read without checking its signature (the server checks that); null when the page
+// cannot read them.
+function _tokenClaims(token) {
     try {
         const claims = JSON.parse(atob(String(token).split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
-        if (claims && typeof claims.session_token === 'string' && claims.session_token) return claims.session_token;
-    } catch (_) { /* not a token the page can read */ }
+        return claims && typeof claims === 'object' ? claims : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+// The session a token names (the session_token claim), so that two tokens of one session are told apart from the
+// tokens of two sessions; the token itself when the page cannot read it.
+function _sessionOf(token) {
+    if (!token) return null;
+    const claims = _tokenClaims(token);
+    if (claims && typeof claims.session_token === 'string' && claims.session_token) return claims.session_token;
     return String(token);
 }
 
