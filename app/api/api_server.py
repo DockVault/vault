@@ -15676,6 +15676,12 @@ async def receiver_complete_upload(
         raise _busy_response(busy)
 
     try:
+        # Asked again once it has its slot: the link revoked or expired, the links switched off, its owner locked
+        # or deactivated, or the session cancelled while it waited for one.
+        resolved = _receiver_resolve_session(db, token, session_id)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="This upload is not available.")
+        receiver, session, vault, owner = resolved
         sdir = _upload_session_dir(vault_service, str(session.id))
         present = _received_chunk_indices(sdir)
         missing = [i for i in range(session.total_chunks) if i not in present]
@@ -20072,6 +20078,10 @@ async def upload_file(
     vault_size_limit = 0
 
     try:
+        # The vault's password hash, to compare with once the upload has its slot (_admitted_again). Read before the
+        # door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
         # Verify vault access and password (from header for security)
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
         # A path-scoped temp credential may only upload INTO a folder within its scope
@@ -20230,7 +20240,14 @@ async def upload_file(
         # above, the one thing that does precede admission. The read transaction ends first, so a
         # request waiting for a slot holds no database connection meanwhile.
         if files:
+            token = _bearer_credentials(request).credentials
             transfer_slot = await _admitted_holding_no_connection(db)
+            # What let it in, asked again once it has its slot, as a download asks it (_admitted_again): the session
+            # signed out, the account locked, a temporary credential switched off or its scope narrowed, a capability
+            # withdrawn, the vault's password changed while it waited.
+            current_user, vault = _admitted_again(db, token, vault_id, password_hash_before, "FILE_UPLOAD",
+                                                  "file.upload")
+            require_folder_scope(db, current_user, vault_id, folder_id)
 
         for upload_file in files:
             # Validate filename
@@ -21811,18 +21828,26 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
+    # The vault's password hash, to compare with once the completion has its slot (_admitted_again). Read before the
+    # door checks the password: a change committed between the two then fails that comparison, rather than becoming
+    # the value the request is compared with.
+    password_hash_before = _vault_credential_fingerprint(db, vault_id)
     vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
 
-    session = db.query(ChunkedUploadSession).filter(
-        ChunkedUploadSession.id == session_id,
-        ChunkedUploadSession.vault_id == vault_id,
-        ChunkedUploadSession.user_id == current_user.id,
-        _session_principal(current_user),
-    ).first()
-    if session is None:
-        raise HTTPException(status_code=404, detail="Upload session not found")
-    # A scoped credential may only finalize a session whose target folder is in scope.
-    require_folder_scope(db, current_user, vault_id, session.folder_id)
+    def _the_session(user):
+        found = db.query(ChunkedUploadSession).filter(
+            ChunkedUploadSession.id == session_id,
+            ChunkedUploadSession.vault_id == vault_id,
+            ChunkedUploadSession.user_id == user.id,
+            _session_principal(user),
+        ).first()
+        if found is None:
+            raise HTTPException(status_code=404, detail="Upload session not found")
+        # A scoped credential may only finalize a session whose target folder is in scope.
+        require_folder_scope(db, user, vault_id, found.folder_id)
+        return found
+
+    session = _the_session(current_user)
     # Unreachable: nothing writes `file_id` (see the column), and a session is deleted once it
     # completes. Left in place rather than removed with an unrelated change.
     if session.status == 'completed' and session.file_id:
@@ -21847,7 +21872,15 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     # request reads the staged chunks and encrypts them, which is what the ceiling governs -- so
     # this is where it is applied, and a caller who is going to be told 403, 404, 409 or 410 is
     # told that instead of being made to queue for a slot they were never going to use.
+    token = _bearer_credentials(request).credentials
     await admit()
+    # What let it in, asked again once it has its slot, as a download asks it (_admitted_again): the session signed
+    # out, the account locked, a temporary credential switched off or its scope narrowed, a capability withdrawn, the
+    # vault's password changed while it waited. Then its upload session again, which may have been cancelled.
+    current_user, vault = _admitted_again(db, token, vault_id, password_hash_before, "FILE_UPLOAD", "file.upload")
+    session = _the_session(current_user)
+    if session.status != 'active':
+        raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
 
     sdir = _upload_session_dir(vault_service, str(session.id))
     present = _received_chunk_indices(sdir)
