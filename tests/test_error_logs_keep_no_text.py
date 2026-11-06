@@ -100,6 +100,15 @@ class _Query:
     def first(self):
         return self.row
 
+    def update(self, values, **_k):
+        """The sign-out ends its row with one UPDATE of that row (by its id, while it is not yet revoked):
+        written onto the one row there is, which it reports as the one row it changed."""
+        if self.row is None:
+            return 0
+        for column, value in values.items():
+            setattr(self.row, column.key, value)
+        return 1
+
 
 class _Db:
     def __init__(self, row):
@@ -123,7 +132,7 @@ def test_a_sign_out_logs_the_prefix_of_the_tokens_hash_never_of_the_token(monkey
     monkeypatch.setattr(auth_service, "denylist_token", lambda value, ttl: None)
     monkeypatch.setattr(api, "AuditLogger", lambda db: SimpleNamespace(log_logout=lambda user, ip: None))
     monkeypatch.setattr(api, "broadcast_event", lambda event: None)
-    row = SimpleNamespace(is_active=True, revoked=False, temp_credential_id=None) if found else None
+    row = SimpleNamespace(id=7, is_active=True, revoked=False, temp_credential_id=None) if found else None
     request = SimpleNamespace(headers={"Authorization": "Bearer signed"}, client=SimpleNamespace(host="192.0.2.7"))
     capsys.readouterr()
     run_coroutine(api.logout(request=request, response=Response(), current_user=SimpleNamespace(username="ada"),
@@ -131,4 +140,4 @@ def test_a_sign_out_logs_the_prefix_of_the_tokens_hash_never_of_the_token(monkey
     logged = _logged(capsys)
     assert api.hash_session_token(token)[:8] in logged
     assert token[:8] not in logged, "no part of the token itself"
-    assert (row.revoked is True) if found else ("not found" in logged)
+    assert (row.revoked is True and row.is_active is False) if found else ("not found" in logged)
