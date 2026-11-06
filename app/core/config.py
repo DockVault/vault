@@ -542,8 +542,9 @@ class Settings(BaseSettings):
     # compressed into daily blocks, each checked against the seals before its rows are removed; nothing is
     # deleted, and `dockvault.py audit unarchive` restores them. The panel can change the window within those
     # bounds. Archiving starts AUDIT_ARCHIVE_START_AFTER_DAYS (0-90) after this release first ran here (the
-    # chain's genesis), and again that long after it runs once more following time on an earlier release (or a
-    # stop of more than 3 days), so going back to an earlier release meanwhile needs no unarchive.
+    # chain's genesis), and again that long after it runs once more following more than 12 hours on an earlier
+    # release that wrote to the audit log, or more than 3 days on one or stopped, so going back to an earlier
+    # release meanwhile needs no unarchive.
     audit_hot_days: int = Field(default=90)
     audit_archive_start_after_days: int = Field(default=14)
     
