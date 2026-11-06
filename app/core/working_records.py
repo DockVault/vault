@@ -12,8 +12,9 @@
 
 The log-access file's size (LOG_PULL_SINK_MAX_MB, app/services/log_sink.py) is listed here too, so the Settings
 page can say how much of the server's output it keeps. These jobs are not stopped by the hold switch: they are
-working records, not logs. They wait while a legal hold stands or a compliance case is open (the rules registered
-with person_erase.register_wait), asked in each batch's transaction.
+working records, not logs. They wait while a confirmed legal hold stands or a compliance case is open, a case that
+holds only a hold nobody has confirmed yet aside (compliance_retention.holds_back, among the rules registered with
+person_erase.register_wait), asked in each batch's transaction.
 """
 from __future__ import annotations
 
