@@ -49,7 +49,10 @@ from datetime import datetime, timedelta, timezone
 
 EVERY_SECONDS = 60
 RETRY_SECONDS = 5
-# A write that keeps failing is logged at its first failure and then once in so many attempts (once a minute).
+# A write that keeps failing is logged at its first failure and then once in so many attempts. Attempts are
+# RETRY_SECONDS apart after each failure, so that is about once a minute while the database refuses connections at
+# once, and about every two minutes while each attempt first waits 5 s (the connection's lock_timeout against a held
+# row, or its connect timeout against a database that does not answer).
 LOG_EVERY = 12
 EXIT_SECONDS = 5.0
 # The vaults whose last opening this process remembers for the readers; past it, the older half is forgotten
