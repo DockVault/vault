@@ -247,6 +247,34 @@ def test_no_hook_or_one_that_names_no_folders_is_not_written(tmp_path, hook_text
         assert hook.read_text(encoding="utf-8") == hook_text
 
 
+@pytest.mark.parametrize("this_folder_first", [True, False])
+def test_a_hook_that_names_two_certificate_folders_is_left_as_it_is(tmp_path, this_folder_first):
+    """Which deployment such a hook serves cannot be told (each of its `CD=` lines names one), so neither line is taken
+    for its folder: it is not rewritten, nor passed over as another deployment's."""
+    certs = tmp_path / "certs"
+    certs.mkdir()
+    lines = _hook_as_first_written(tmp_path, certs, "vault.example.test").split("\n")
+    at = next(i for i, line in enumerate(lines) if line.startswith("CD="))
+    other = 'CD="%s"' % (tmp_path / "other" / "certs")
+    lines.insert(at + 1 if this_folder_first else at, other)
+    before = "\n".join(lines)
+    assert [line for line in lines if line.startswith("CD=")][1 if this_folder_first else 0] == other
+    hook = tmp_path / "dockvault-vault.sh"
+    hook.write_text(before, encoding="utf-8")
+    assert dv.renewal_hook_targets(before) is None
+    outcome, said = dv.refresh_renewal_hook(str(tmp_path), str(certs), "vault", owners=_owners(), hook=str(hook),
+                                            is_root=True)
+    assert outcome == "unreadable" and "left as it is" in said
+    assert hook.read_text(encoding="utf-8") == before
+
+
+def test_a_hook_that_names_two_live_folders_names_none():
+    text = ('CD="/srv/certs"\nLIVE="/etc/letsencrypt/live/a.example.test"\n'
+            'LIVE="/etc/letsencrypt/live/b.example.test"\n')
+    assert dv.renewal_hook_targets(text) is None
+    assert dv.renewal_hook_targets(text.rsplit("LIVE=", 1)[0]) == ("/srv/certs", "/etc/letsencrypt/live/a.example.test")
+
+
 @pytest.mark.parametrize("profile, service", [("combined", "vault"), ("split", "vault-api")])
 def test_a_setup_rerun_that_keeps_the_certificate_brings_its_renewal_hook_up_to_date(tmp_path, monkeypatch, capsys,
                                                                                       profile, service):
