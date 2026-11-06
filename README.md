@@ -727,7 +727,11 @@ deployment (a volume that cannot be cleared, an archive that does not extract or
 check, the audit log's restore mark that cannot be written), changes nothing more: it does not install
 the backup's `.env` or start the stack, names the volumes it replaced so far, and prints the way back
 (start the set the host was on, or run the same restore again; after an archive changed, from a copy
-of a backup you trust in a folder only you can write).
+of a backup you trust in a folder only you can write). From before it clears the first volume until
+it has installed the backup's `.env`, a restore keeps `.restore-incomplete.<prefix>` beside `.env`,
+so a restore that stopped part way, was interrupted or crashed leaves it: while it is there, start,
+restart, setup and update refuse to start that set (its volumes hold part of a backup) and say the
+way back. The next restore of that set, or Reset of it, removes it.
 
 Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
 the set the host was on; `.env.<prefix>.1`, `.2`, ... after the highest copy there when one is, never

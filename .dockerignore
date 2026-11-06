@@ -81,3 +81,6 @@ dockvault.py
 # The previous AUDIT_CHAIN_KEY of each volume set, kept by `dockvault.py audit change-key` until the chain has
 # moved off it (and moved aside by Reset), and the lock a key change holds.
 .audit-chain-key.*
+# The marker of a restore that began to replace a volume set's volumes and did not finish (one for each set),
+# which `dockvault.py` writes beside .env.
+.restore-incomplete.*

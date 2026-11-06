@@ -691,6 +691,185 @@ def test_a_restore_whose_mark_cannot_be_written_stops_before_any_other_volume(tm
     assert "the deployment is stopped" in said and _again(tmp_path) in said
 
 
+# --------------------------------------------------------------------------- a restore that did not finish
+
+def _marker(tmp_path, prefix="dvarchstop"):
+    return tmp_path / (".restore-incomplete." + prefix)
+
+
+def _starting(tool, monkeypatch, started):
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_print_status", lambda *a, **k: None)
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+
+
+@pytest.mark.parametrize("fail", ["clear", "untar", "changed", "mark"])
+def test_a_restore_that_stopped_part_way_leaves_a_marker_and_start_refuses_that_set(tmp_path, monkeypatch, capsys,
+                                                                                    fail):
+    """The restore said not to start the set (its volumes hold part of a backup), but nothing kept anyone from it:
+    start, restart, setup and update started it on those volumes. The marker the restore leaves stops them, and says
+    the way back."""
+    steps, names, host_env, said = _stopping(tmp_path, monkeypatch, capsys, fail)
+    marker = _marker(tmp_path)
+    doc = json.loads(marker.read_text(encoding="utf-8"))
+    bundle = next((tmp_path / "backups").iterdir())
+    assert doc["volume_prefix"] == "dvarchstop" and doc["bundle"] == str(bundle)
+    assert doc["volumes"] == ([names["keys"]] if fail == "mark" else [names["keys"], names["pg"]])
+    assert doc["backup_changed"] is (fail == "changed")
+    assert "Until set 'dvarchstop' is restored, start, restart, setup and update refuse to start it" in said
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    started = []
+    _starting(tool, monkeypatch, started)
+    with pytest.raises(SystemExit):
+        tool.start()
+    assert started == []
+    said = _said(capsys)
+    assert "start would start set 'dvarchstop', but a restore of set 'dvarchstop' from %s" % bundle in said
+    assert "Nothing was started." in said and str(marker) in said
+    if fail == "changed":
+        assert "restore it from a copy of a backup of set 'dvarchstop' you trust" in said and _again(tmp_path) not in said
+    else:
+        assert "run the restore again (it starts over from the backup): %s" % _again(tmp_path) in said
+
+
+def test_a_restore_of_another_set_that_stopped_part_way_does_not_keep_the_host_set_from_starting(tmp_path,
+                                                                                                monkeypatch, capsys):
+    """The host's own set is untouched: start brings it back, and says what the other set's restore left."""
+    _stopping(tmp_path, monkeypatch, capsys, "untar", "another-set")
+    assert _marker(tmp_path).exists() and not _marker(tmp_path, "dvarchhost").exists()
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    started = []
+    _starting(tool, monkeypatch, started)
+    tool.start()
+    assert started == [1]
+    assert "Note: a restore of set 'dvarchstop' from" in _said(capsys)
+
+
+def test_a_restore_marks_the_set_before_it_changes_a_volume_and_removes_the_mark_once_it_is_whole(tmp_path,
+                                                                                                 monkeypatch):
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchmark")
+    marker = _marker(tmp_path, "dvarchmark")
+    seen = []
+    tool = _restoring_tool(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(dv, "clear_volume", lambda vol, **k: seen.append(("clear", marker.exists())) or True)
+    real_install = tool._atomic_write_secret
+
+    def install(path, data):
+        seen.append(("write", os.path.basename(path), marker.exists()))
+        return real_install(path, data)
+
+    monkeypatch.setattr(tool, "_atomic_write_secret", install)
+    monkeypatch.setattr(dv, "_copy_secret", lambda src, dst: seen.append(("env", marker.exists())) or shutil.copyfile(
+        src, dst))
+    tool._do_restore(_restore_args(bundle))
+    clears = [s for s in seen if s[0] == "clear"]
+    assert clears and all(present for _c, present in clears), "the mark is there before each volume is cleared"
+    assert ("env", True) in seen, "and while the backup's .env is installed"
+    assert not marker.exists(), "a restore that finished leaves no mark"
+
+
+def test_a_restore_that_finishes_removes_the_mark_an_earlier_one_left(tmp_path, monkeypatch, capsys):
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchagain")
+    marker = _marker(tmp_path, "dvarchagain")
+    marker.write_text(json.dumps({"volume_prefix": "dvarchagain", "bundle": str(bundle)}), encoding="utf-8")
+    steps = []
+    _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(_restore_args(bundle))
+    assert ("start",) in steps and not marker.exists()
+    assert "an earlier restore of set 'dvarchagain' did not finish" in _said(capsys)
+
+
+def test_a_restore_ended_by_ctrl_c_part_way_leaves_its_mark(tmp_path, monkeypatch):
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchctrlc")
+    tool = _restoring_tool(tmp_path, monkeypatch, [])
+
+    def untar(vol, src, archive, **k):
+        if vol.endswith("_vault_pg_data"):
+            raise KeyboardInterrupt
+        return True
+
+    monkeypatch.setattr(dv, "untar_volume", untar)
+    with pytest.raises(KeyboardInterrupt):
+        tool._do_restore(_restore_args(bundle))
+    assert _marker(tmp_path, "dvarchctrlc").exists()
+
+
+def test_a_restore_whose_mark_cannot_be_written_changes_no_volume(tmp_path, monkeypatch, capsys):
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchnomark")
+    steps = []
+    tool = _restoring_tool(tmp_path, monkeypatch, steps)
+
+    def cannot(prefix, bundle, changed=(), backup_changed=False):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tool, "_mark_restore_incomplete", cannot)
+    with pytest.raises(SystemExit):
+        tool._do_restore(_restore_args(bundle))
+    assert steps == [("stop",)], "stopped, and no volume cleared or extracted"
+    said = _said(capsys)
+    assert "could not write %s" % _marker(tmp_path, "dvarchnomark") in said and "no volume was changed" in said
+    assert not _marker(tmp_path, "dvarchnomark").exists()
+
+
+def test_a_restore_that_stops_before_any_volume_keeps_the_mark_an_earlier_one_left(tmp_path, monkeypatch, capsys):
+    """The volumes an earlier restore did not finish still hold part of a backup: a restore that stops before it
+    changes any of them leaves that restore's mark as it is."""
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchkeep")
+    marker = _marker(tmp_path, "dvarchkeep")
+    earlier = json.dumps({"volume_prefix": "dvarchkeep", "bundle": "/b/earlier", "volumes": ["dvarchkeep_vault_keys"]})
+    marker.write_text(earlier, encoding="utf-8")
+    steps = []
+    tool = _restoring_tool(tmp_path, monkeypatch, steps)
+
+    def cannot(prefix, bundle, changed=(), backup_changed=False):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tool, "_mark_restore_incomplete", cannot)
+    with pytest.raises(SystemExit):
+        tool._do_restore(_restore_args(bundle))
+    assert steps == [("stop",)]
+    assert marker.read_text(encoding="utf-8") == earlier
+    said = _said(capsys)
+    assert "Until set 'dvarchkeep' is restored, start, restart, setup and update refuse to start it" in said
+    assert "This restore changed nothing, but an earlier restore of the set did not finish" in said
+    assert "start brings it back as it was" not in said
+
+
+@pytest.mark.parametrize("command", ["restart", "setup", "update"])
+def test_restart_setup_and_update_refuse_to_start_a_set_whose_restore_did_not_finish(tmp_path, monkeypatch, capsys,
+                                                                                    command):
+    _env(tmp_path, "dvarchcmd")
+    _marker(tmp_path, "dvarchcmd").write_text(json.dumps({"volume_prefix": "dvarchcmd", "bundle": "/b/x"}),
+                                              encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: pytest.fail("%s went on" % command))
+    monkeypatch.setattr(tool, "_tear_down_containers", lambda: pytest.fail("the deployment was taken down"))
+    monkeypatch.setattr(tool, "_container_logs_readable", lambda: True)
+    args = argparse.Namespace(non_interactive=True, no_start=False)
+    with pytest.raises(SystemExit):
+        getattr(tool, command)(args)
+    said = _said(capsys)
+    assert "%s would start set 'dvarchcmd', but a restore of set 'dvarchcmd' from /b/x" % command in said
+    assert "Nothing was started." in said
+
+
+def test_reset_of_a_set_removes_the_mark_its_restore_left(tmp_path, monkeypatch):
+    _env(tmp_path, "dvarchreset")
+    marker = _marker(tmp_path, "dvarchreset")
+    marker.write_text("{}", encoding="utf-8")
+    other = _marker(tmp_path, "dvarchother")
+    other.write_text("{}", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda **k: (True, "ok"))
+
+    class _Ran:
+        returncode = 0
+
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Ran())
+    tool.reset(argparse.Namespace(non_interactive=True, confirm=True))
+    assert not marker.exists() and other.exists(), "another set's mark is that set's"
+
+
 # --------------------------------------------------------------------------- the extraction reads what was checked
 
 def test_an_extraction_extracts_only_a_copy_whose_checksum_is_the_one_checked(tmp_path):

@@ -365,7 +365,9 @@ the recipients' mailboxes.
   under `--lock`), which a restore puts back. Its `manifest.json` records each archive's SHA-256 and size
   (and, under `--lock`, `manifest.json.mac` an HMAC of the manifest under the sealing key): no personal data.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
-  erased.
+  erased. While a restore is replacing a set's volumes, `.restore-incomplete.<VAULT_VOLUME_PREFIX>` beside
+  `.env` names the backup folder, the time and the volumes changed so far (no personal data); the restore
+  removes it when it has finished, and Reset of that set does too.
 - **One-time secrets** `python dockvault.py` shows (a generated admin password, a recovery key, a password
   reset link) go to the controlling terminal. With no terminal (cloud-init, a CI job) each is written to a
   file of its own, mode 600, under `secrets/` in the DockVault folder of the user's application data

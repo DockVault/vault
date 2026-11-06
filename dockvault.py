@@ -2483,6 +2483,20 @@ KEPT_CHAIN_KEY_BUNDLE = "audit-chain-key.previous"
 # Held by a key change, and by the key an update offers, from before either reads AUDIT_CHAIN_KEY in .env until it
 # ends: another one started meanwhile is refused at once (an empty file, left in place).
 CHAIN_KEY_LOCK = ".audit-chain-key.lock"
+# Beside .env, one for each volume set (.restore-incomplete.<VAULT_VOLUME_PREFIX>): a restore of that set has begun to
+# replace its volumes and has not finished. Written before the first volume is cleared and removed once the backup's
+# .env is installed, so it stays after a restore that stopped part way, after Ctrl-C, after a crash. While it is
+# there, start, restart, setup and update refuse to start that set, whose volumes hold part of a backup, and say
+# the way back (run the restore again, or Reset). Reset of that set removes it. It holds no secret.
+RESTORE_INCOMPLETE = ".restore-incomplete."
+
+
+def restore_incomplete_path(root, prefix):
+    """The restore-incomplete marker of set `prefix` in `root`. ValueError for a prefix that is not a volume set's
+    name (it would not be a plain file name)."""
+    if not (valid_volume_prefix(prefix) and prefix == prefix.strip()):
+        raise ValueError("VAULT_VOLUME_PREFIX %r is not a volume set's name" % (prefix,))
+    return os.path.join(root, RESTORE_INCOMPLETE + prefix)
 
 
 def kept_chain_key_path(root, prefix):
@@ -4759,6 +4773,7 @@ class DockVault:
         if not os.path.exists(self._env_path()):
             print(pal.paint("  No .env - run 'setup' first (or 'unlock' if it is sealed).", "red"))
             raise SystemExit(2)
+        self._refuse_incomplete_restore("start")
         ok, msg = docker_available()
         if not ok:
             print(pal.paint("  Docker is not available: %s" % msg, "red"))
@@ -4876,6 +4891,7 @@ class DockVault:
         if not self._container_logs_readable():
             raise SystemExit(1)
         if os.path.exists(self._env_path()):
+            self._refuse_incomplete_restore("restart")
             if uses_release_image(self._load_env()):
                 if not self._ensure_release_image():
                     print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.",
@@ -4966,6 +4982,8 @@ class DockVault:
         self._refuse_while_locked("setup")
         self._read_cli_admin_password(args)
         no_start = bool(args and getattr(args, "no_start", False))
+        if not no_start:
+            self._refuse_incomplete_restore("setup")
         # "Start" rather than "Build + start": the deployment may be pulling a published release
         # rather than building, and for a fresh install the choice is not made until Settings.
         steps = ["Settings", "Write .env", "Certificate"] + ([] if no_start else ["Start", "Health check"])
@@ -6975,6 +6993,12 @@ class DockVault:
                            "finished, and this backup carries the key of its own unfinished change. Finish the change "
                            "here (python dockvault.py audit rekey --old-key-file %s), or move that file somewhere "
                            "safe, then restore again. Nothing was changed." % (kept_here, prefix, kept_here))
+        # A restore of this set that began to replace its volumes and did not finish (its marker, RESTORE_INCOMPLETE):
+        # this one replaces them again, and removes the marker once it has installed the backup's .env.
+        was_incomplete = prefix in self._incomplete_restores()
+        if was_incomplete:
+            print(pal.paint("  Note: an earlier restore of set '%s' did not finish (%s): this restore replaces its "
+                            "volumes again." % (prefix, restore_incomplete_path(self.root, prefix)), "yellow"))
         force = bool(getattr(args, "force", False)) if args else False
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
@@ -7036,10 +7060,33 @@ class DockVault:
 
             def stopped_part_way(why, vol, touched, backup_changed=False):
                 # Every stop from here on: nothing more is cleared or extracted, .env is not installed and the stack
-                # is not started, and the message says what was replaced and the way back.
-                self._fail(self._restore_stopped_part_way(why, vol, replaced, touched, prefix, current_prefix, bundle,
-                                                          backup_changed=backup_changed))
+                # is not started, and the message says what was replaced and the way back. The restore-incomplete
+                # marker says it too, to the next start: it stays (with what was changed) when a volume was, and goes
+                # when none was.
+                changed = list(replaced) + ([vol] if touched and vol and vol not in replaced else [])
+                message = self._restore_stopped_part_way(why, vol, replaced, touched, prefix, current_prefix, bundle,
+                                                         backup_changed=backup_changed,
+                                                         earlier_incomplete=was_incomplete)
+                if changed:
+                    try:
+                        self._mark_restore_incomplete(prefix, bundle, changed, backup_changed)
+                    except OSError:
+                        pass                     # the marker written before the first clear stays
+                if changed or was_incomplete:
+                    message += (" Until set '%s' is restored, start, restart, setup and update refuse to start it (%s "
+                                "says why)." % (prefix, restore_incomplete_path(self.root, prefix)))
+                else:
+                    self._drop_restore_incomplete(prefix)
+                self._fail(message)
 
+            # Before the first volume is touched: the marker that the restore of this set has begun (removed once the
+            # backup's .env is installed). Without it, nothing is changed.
+            try:
+                self._mark_restore_incomplete(prefix, bundle)
+            except OSError as exc:
+                stopped_part_way("could not write %s, which keeps the deployment from being started on volumes a "
+                                 "restore did not finish (%s)" % (restore_incomplete_path(self.root, prefix), exc),
+                                 None, False)
             for vol, archive in plan:
                 print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
                 # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
@@ -7094,6 +7141,11 @@ class DockVault:
         except BaseException:
             self._drop_kept_env_if_unneeded(kept_env)
             raise
+        # The set is whole again: its restore-incomplete marker goes.
+        if not self._drop_restore_incomplete(prefix):
+            print(pal.paint("  WARNING: could not remove %s, though the restore finished: delete it yourself (while it "
+                            "is there, start, restart, setup and update refuse to start set '%s')."
+                            % (restore_incomplete_path(self.root, prefix), prefix), "red"))
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
         self._say_what_the_restore_kept(kept_env, current_prefix, prefix)
         finish = "python dockvault.py audit accept-restore"
@@ -7135,15 +7187,88 @@ class DockVault:
         else:
             self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
 
+    def _mark_restore_incomplete(self, prefix, bundle, changed=(), backup_changed=False):
+        """Write set `prefix`'s restore-incomplete marker (RESTORE_INCOMPLETE): the backup the restore is from, when it
+        began, the volumes it changed so far, and whether that backup changed while it was read. Raises OSError."""
+        import datetime as _dt
+        doc = {"volume_prefix": prefix, "bundle": bundle,
+               "at": _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat(),
+               "volumes": list(changed), "backup_changed": bool(backup_changed)}
+        replace_file_durably(restore_incomplete_path(self.root, prefix), json.dumps(doc, indent=2) + "\n")
+
+    def _drop_restore_incomplete(self, prefix):
+        """Remove set `prefix`'s restore-incomplete marker, if there is one. False when one is there and could not be
+        removed."""
+        path = os.path.join(self.root, RESTORE_INCOMPLETE + prefix)
+        if not os.path.lexists(path):
+            return True
+        try:
+            os.remove(path)
+        except OSError:
+            return False
+        return True
+
+    def _incomplete_restores(self):
+        """{set prefix: its marker's document ({} when it cannot be read)} of each restore here that began to replace a
+        set's volumes and did not finish (RESTORE_INCOMPLETE)."""
+        found = {}
+        for path in sorted(glob.glob(os.path.join(self.root, RESTORE_INCOMPLETE + "*"))):
+            prefix = os.path.basename(path)[len(RESTORE_INCOMPLETE):]
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (OSError, ValueError):
+                doc = {}
+            found[prefix] = doc if isinstance(doc, dict) else {}
+        return found
+
+    def _incomplete_restore_text(self, prefix, doc):
+        """What a restore of set `prefix` that did not finish left (from its marker's document `doc`), and the way
+        back: the same restore again, or a restore from a trusted copy when that backup changed while it was read, or
+        Reset; or, for an operator who knows the volumes are as wanted, the marker's own removal."""
+        marker = os.path.join(self.root, RESTORE_INCOMPLETE + prefix)
+        bundle = doc.get("bundle") if isinstance(doc.get("bundle"), str) and doc.get("bundle") else None
+        at = doc.get("at") if isinstance(doc.get("at"), str) else None
+        said = ("a restore of set '%s'%s%s began to replace its volumes and did not finish: they hold part of a backup"
+                % (prefix, " from %s" % bundle if bundle else "", " (%s)" % at if at else ""))
+        if doc.get("backup_changed") is True:
+            way = ("restore it from a copy of a backup of set '%s' you trust, in a folder only you can write (that "
+                   "backup changed while it was read): python dockvault.py backup --action restore --bundle-dir <that "
+                   "folder> --force" % prefix)
+        elif bundle:
+            arg = '"%s"' % bundle if any(c.isspace() for c in bundle) else bundle
+            way = ("run the restore again (it starts over from the backup): python dockvault.py backup --action restore "
+                   "--bundle-dir %s --force" % arg)
+        else:
+            way = ("restore it again from its backup: python dockvault.py backup --action restore --bundle-dir <the "
+                   "backup> --force")
+        return ("%s. To get it back, %s. Or, to start that set afresh, delete its volumes (python dockvault.py reset, "
+                "with that set's .env). If you know its volumes are as you want them, delete %s." % (said, way, marker))
+
+    def _refuse_incomplete_restore(self, command, prefix=None):
+        """Stop `command`, which starts the deployment, while a restore of the set it would start (`prefix`, else the
+        set .env names) began to replace its volumes and did not finish (RESTORE_INCOMPLETE): its volumes hold part of
+        a backup. Says so for every other set's too, which `command` does not start."""
+        if prefix is None:
+            prefix = volume_prefix(self._load_env())
+        found = self._incomplete_restores()
+        for other, doc in found.items():
+            if other != prefix:
+                print(self.pal.paint("  Note: %s" % self._incomplete_restore_text(other, doc), "yellow"))
+        if prefix in found:
+            self._fail("%s would start set '%s', but %s Nothing was started."
+                       % (command, prefix, self._incomplete_restore_text(prefix, found[prefix])))
+
     def _restore_stopped_part_way(self, why, vol, replaced, touched, prefix, current_prefix, bundle,
-                                  backup_changed=False):
+                                  backup_changed=False, earlier_incomplete=False):
         """The message of a restore that stops after it stopped the deployment (a volume that cannot be cleared, an
         archive that does not extract, a restore mark or a kept key that cannot be written): what happened, which
         volumes it changed (`replaced`, and `vol` when `touched`: a clear or an extraction that failed part way), that
         .env and the stack were left as they were, and the way back: the set the host was on, or the same restore run
         again from the same (checked, unchanged) backup. With `backup_changed` (an archive changed after the restore
         checked it), the backup is not that: the way back is a copy of a backup the operator trusts, in a folder
-        nobody else can write."""
+        nobody else can write. With `earlier_incomplete` (an earlier restore of the set did not finish), a stop that
+        changed nothing leaves the set as that restore left it: not a set to start."""
         arg = '"%s"' % bundle if any(c.isspace() for c in bundle) else bundle
         again = "python dockvault.py backup --action restore --bundle-dir %s --force" % arg
         changed = list(replaced) + ([vol] if touched and vol and vol not in replaced else [])
@@ -7167,6 +7292,9 @@ class DockVault:
             lines.append("The set the host was on, '%s', is untouched: python dockvault.py start brings it back. To "
                          "restore set '%s', fix the cause, then run the restore again: %s"
                          % (current_prefix, prefix, again))
+        elif not changed and earlier_incomplete:
+            lines.append("This restore changed nothing, but an earlier restore of the set did not finish: its volumes "
+                         "hold part of a backup. Fix the cause, then run the restore again: %s" % again)
         elif had_env and not changed:
             lines.append("Nothing of the set was changed: python dockvault.py start brings it back as it was. Or fix "
                          "the cause, then run the restore again: %s" % again)
@@ -7557,6 +7685,8 @@ class DockVault:
                        ".env is untouched. A volume may still be in use; free it and retry." % r.returncode)
         archived = self._archive_env("removed-" + prefix)   # keep the (now-orphaned) .env, don't leave it live
         kept = self._archive_kept_key(prefix)
+        # Its volumes are gone, and with them what a restore that did not finish left in them.
+        self._drop_restore_incomplete(prefix)
         print(pal.paint("\n  Set '%s' destroyed." % prefix, "green"))
         if archived:
             print("  Its .env (no longer matching any data) was moved to: %s" % archived)
@@ -7689,6 +7819,7 @@ class DockVault:
         if self._is_locked():
             self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run "
                        "update again. Nothing changed.")
+        self._refuse_incomplete_restore("update")
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
