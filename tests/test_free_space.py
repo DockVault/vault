@@ -3,7 +3,8 @@
 On the shipped defaults nothing else bounds the disk: no deployment storage limit, and what legal holds keep after a
 deletion is in no vault's size, so a member of a held vault could upload and delete in turn until the disk was full,
 and the database, which usually shares it, with it. Every write of a file's bytes now keeps at least the floor free:
-by default the larger of 2 GB and 5% of the volume, 0 turns it off, any other value is that many GB.
+by default the larger of 2 GB and 5% of the volume (never more than half of it), 0 turns it off, any other value is
+that many GB.
 
 - before a transfer starts, when its size is known: an upload's declared length, a chunked upload's declared size, a
   chunk's, a copy's (507 with the free space and the floor);
@@ -65,6 +66,45 @@ def volume(monkeypatch):
 ])
 def test_the_floor_is_the_larger_of_2_gb_and_5_percent_unless_set(total, configured, floor):
     assert free_space.floor_bytes(total, configured=configured if configured is not None else -1) == floor
+
+
+@pytest.mark.parametrize("total, floor", [
+    (GIB, GIB // 2),                         # 2 GB would be more than the whole volume
+    (3 * GIB, 3 * GIB // 2),
+    (4 * GIB, 2 * GIB),                      # exactly half: the two rules meet
+    (6 * GIB, 2 * GIB),
+])
+def test_the_automatic_floor_is_never_more_than_half_the_volume(total, floor):
+    assert free_space.floor_bytes(total, configured=-1) == floor
+
+
+def test_a_small_volume_still_takes_uploads_on_the_default(volume):
+    """A 1 GB volume with 900 MB free: on the default the floor is 512 MB, not 2 GB, so a 100 MB upload is let in
+    and a 500 MB one is refused (it would leave 400 MB)."""
+    volume["total"], volume["free"] = GIB, 900 * MB
+    assert free_space.short_of(100 * MB) is None
+    short = free_space.short_of(500 * MB)
+    assert short == free_space.Room(free=900 * MB, floor=GIB // 2, total=GIB)
+
+
+@pytest.mark.parametrize("configured", [float("inf"), float("-inf"), "inf", "Infinity", "-inf"])
+def test_a_setting_that_is_not_a_finite_number_reads_as_the_default(volume, configured):
+    """'inf' is a float the settings accept; read as GB it raised in int(), and every upload would have answered
+    500. It reads as the default, as NaN and text do."""
+    volume["configured"], volume["free"] = configured, 6 * GIB
+    assert free_space.floor_bytes(100 * GIB, configured=configured) == 5 * GIB
+    assert free_space.short_of(GIB) is None
+    assert free_space.short_of(GIB + 1) == free_space.Room(free=6 * GIB, floor=5 * GIB, total=100 * GIB)
+
+
+def test_a_floor_larger_than_any_volume_refuses_every_write_and_says_so(volume):
+    """A finite value whose bytes overflow a float (1e300 GB) is held at MAX_FLOOR_BYTES: every write is refused, and
+    the refusal can still be written."""
+    volume["configured"] = 1e300
+    assert free_space.floor_bytes(100 * GIB, configured=1e300) == free_space.MAX_FLOOR_BYTES
+    short = free_space.short_of(0)
+    assert short is not None and short.floor == free_space.MAX_FLOOR_BYTES
+    assert free_space.refusal_text(short).startswith("The server's storage is nearly full: 50 GB is free")
 
 
 def test_a_write_that_would_leave_less_than_the_floor_is_short(volume):

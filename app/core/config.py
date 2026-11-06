@@ -313,8 +313,9 @@ class Settings(BaseSettings):
     )
     # The free space, in GB, the storage volume keeps: an upload, an SFTP write or a copy that would leave less is
     # refused, before it starts when its size is known and as its bytes are written (app/core/free_space.py). -1,
-    # the default, is the larger of 2 GB and 5% of the volume; 0 turns it off. Nothing else bounds the disk while
-    # MAX_STORAGE_GB is unlimited, and the database usually shares it.
+    # the default, is the larger of 2 GB and 5% of the volume, never more than half of it; 0 turns it off; a value
+    # that is not a finite number reads as -1. Nothing else bounds the disk while MAX_STORAGE_GB is unlimited, and
+    # the database usually shares it.
     min_free_space_gb: float = Field(default=-1)
     transfer_speed_limit_kb: int = Field(default=0)  # 0 = no limit, otherwise KB/s
     # Hours a resumable chunked-upload session may live before it is considered

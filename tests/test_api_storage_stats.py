@@ -52,7 +52,9 @@ def test_the_routes_of_the_removed_pages_are_gone(admin):
 
 
 def test_the_storage_panel_reports_the_free_space_the_volume_keeps(admin):
-    """MIN_FREE_SPACE_GB unset (the shipped .env leaves it commented): the larger of 2 GB and 5% of the volume."""
+    """MIN_FREE_SPACE_GB unset (the shipped .env leaves it commented): the larger of 2 GB and 5% of the volume, never
+    more than half of it; set to a value that is not a finite number (inf), the same."""
+    import math
     import subprocess
     import os
     api = os.environ.get("VAULT_API_CONTAINER", "vault-api")
@@ -63,9 +65,10 @@ def test_the_storage_panel_reports_the_free_space_the_volume_keeps(admin):
         import pytest
         pytest.skip("docker is not available to read the deployment's setting")
     body = admin.get("/storage/stats").json()
+    automatic = min(max(2 * 1024 ** 3, int(body["total"] * 0.05)), int(body["total"] * 0.5))
     if set_to.returncode != 0 and body["total"]:
-        assert body["free_space_floor_bytes"] == max(2 * 1024 ** 3, int(body["total"] * 0.05)), body
+        assert body["free_space_floor_bytes"] == automatic, body
     elif set_to.returncode == 0:
         configured = float(set_to.stdout.strip())
-        expected = max(2 * 1024 ** 3, int(body["total"] * 0.05)) if configured < 0 else int(configured * 1024 ** 3)
+        expected = automatic if (configured < 0 or not math.isfinite(configured)) else int(configured * 1024 ** 3)
         assert body["free_space_floor_bytes"] == expected, body

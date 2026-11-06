@@ -15,12 +15,14 @@ So every write of a file's bytes to the storage volume keeps at least ``floor_by
   the disk.
 
 A refused file is removed. The floor is MIN_FREE_SPACE_GB: by default (-1) the larger of 2 GB and 5% of the volume,
-0 turns it off, any other value is that many GB. A volume that reports no size (some network filesystems) cannot be
-judged and is not checked; a volume whose free space cannot be read is not checked either, and the server's log says
-so once.
+but never more than half of it (on a volume of less than 4 GB, 2 GB would leave little or nothing to store), 0 turns
+it off, any other value is that many GB. A value that is not a finite number reads as the default. A volume that
+reports no size (some network filesystems) cannot be judged and is not checked; a volume whose free space cannot be
+read is not checked either, and the server's log says so once.
 """
 from __future__ import annotations
 
+import math
 import shutil
 import threading
 from dataclasses import dataclass
@@ -28,9 +30,12 @@ from pathlib import Path
 from typing import Optional
 
 GIB = 1024 ** 3
-# The automatic floor: the larger of these.
+# The automatic floor: the larger of these, but never more than AUTO_MAX_SHARE of the volume.
 AUTO_MIN_BYTES = 2 * GIB
 AUTO_FRACTION = 0.05
+AUTO_MAX_SHARE = 0.5
+# A configured floor larger than this (4 EiB, more than any volume) is held at it.
+MAX_FLOOR_BYTES = 2 ** 62
 # How many bytes a transfer writes between two looks at the free space (a look costs one statvfs call).
 CHECK_EVERY_BYTES = 8 * 1024 * 1024
 
@@ -56,9 +61,12 @@ def floor_bytes(total: int, configured=None) -> int:
         value = float(value)
     except (TypeError, ValueError):
         value = -1.0
-    if value != value or value < 0:        # NaN or negative: automatic
-        return max(AUTO_MIN_BYTES, int(total * AUTO_FRACTION))
-    return int(value * GIB)
+    # Negative, NaN or infinite: automatic. ('inf' is a float the settings accept, and int() of it raises, which
+    # would turn every upload into a 500.)
+    if not math.isfinite(value) or value < 0:
+        return min(max(AUTO_MIN_BYTES, int(total * AUTO_FRACTION)), int(total * AUTO_MAX_SHARE))
+    # A value so large its bytes are no longer a finite float still means "more than any volume".
+    return int(min(value * GIB, float(MAX_FLOOR_BYTES)))
 
 
 def storage_path():
