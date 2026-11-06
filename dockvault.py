@@ -4588,12 +4588,60 @@ class DockVault:
         if getattr(args, "show_recovery_key", False):
             self._show_recovery_key(dek, args)
             return
-        if os.path.exists(env_path) and not getattr(args, "force", False):
-            print(pal.paint("  .env already exists; refusing to overwrite. Re-run with --force to replace it.",
-                            "red"))
-            raise SystemExit(2)
+        kept = None
+        if os.path.exists(env_path):
+            if not getattr(args, "force", False):
+                print(pal.paint("  .env already exists; refusing to overwrite. Re-run with --force to replace it.",
+                                "red"))
+                raise SystemExit(2)
+            kept = self._keep_env_before_unlock(env_bytes)
+            if kept is False:
+                print(pal.paint("  .env already reads as the sealed one; nothing was changed.", "green"))
+                return
         self._atomic_write_secret(env_path, env_bytes)
         print(pal.paint("  Unlocked: .env.enc -> .env.", "green"))
+        if kept:
+            prefix = volume_prefix(parse_env(env_bytes.decode("utf-8", "replace")))
+            arg = '"%s"' % kept if any(c.isspace() for c in kept) else kept
+            print(pal.paint("  The .env it replaced is kept as %s. To go back to it: python dockvault.py volumes "
+                            "--non-interactive --action repoint --target-prefix %s --env-source %s"
+                            % (kept, prefix, arg), "yellow"))
+
+    def _keep_env_before_unlock(self, env_bytes):
+        """`unlock --force` writes the sealed .env (`env_bytes`) over the .env there, which may be the only copy of
+        its set's keys. Returns False when that .env already reads as the sealed one (nothing to write). Refuses, with
+        nothing changed, when it is another set's (another VAULT_VOLUME_PREFIX or ENCRYPTION_KEY: sealed_set_differs),
+        whose keys the overwrite would leave nowhere. Otherwise (the same set's .env, edited since the lock) keeps it
+        first as .env.<prefix>[.n] (_keep_env_copy) and returns the copy's path. A .env that cannot be read or kept
+        is not replaced."""
+        env_path = self._env_path()
+        try:
+            with open(env_path, "rb") as f:
+                current = f.read()
+        except OSError as exc:
+            self._fail("could not read the current .env (%s), so it was not replaced. Nothing changed." % exc)
+        if current == bytes(env_bytes):
+            return False
+        prefix = volume_prefix(parse_env(current.decode("utf-8", "replace")))
+        label = prefix if valid_volume_prefix(prefix) else "before-unlock"
+        other = sealed_set_differs(env_bytes, current)
+        if other:
+            aside = next(env_copy_names(self.root, label))
+            self._fail(".env.enc holds the .env of another set (%s): unlocking it over .env would leave the keys of the "
+                       "set .env opens (its ENCRYPTION_KEY and database password) nowhere. Nothing changed. To switch "
+                       "this host to the sealed set, first move .env to %s (a name Volumes' repoint finds it by), "
+                       "then run unlock again; to come back to set '%s' later: python dockvault.py volumes "
+                       "--non-interactive --action repoint --target-prefix %s --env-source %s. If .env.enc is an old "
+                       "seal nobody needs, move it somewhere safe instead and lock this .env under a passphrase of "
+                       "its own." % (other, aside, prefix, prefix, aside))
+        try:
+            kept = self._keep_env_copy(label, current)
+        except OSError as exc:
+            self._fail("could not keep the current .env as %s (%s), so it was not replaced. Nothing changed."
+                       % (getattr(exc, "kept_as", None) or next(env_copy_names(self.root, label)), exc))
+        print(self.pal.paint("  Kept the current .env (set '%s') as %s before unlocking over it." % (prefix, kept),
+                             "cyan"))
+        return kept
 
     def change_passphrase(self, args=None):
         """Set a NEW unlock passphrase for .env.enc, keeping the same data key and recovery key.

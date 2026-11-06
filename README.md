@@ -354,6 +354,9 @@ Every command that writes `.env` (`setup`, Volumes' new set and repoint, restore
 first. A `.env` written beside the sealed one would belong to another set, and a later `lock` would seal it
 over the sealed set's only copy. For the same reason a re-`lock` seals only the same set's `.env` again (the
 same `VAULT_VOLUME_PREFIX` and `ENCRYPTION_KEY`): it refuses another set's `.env`, leaving `.env.enc` as it was.
+`unlock --force` (unlock over a `.env` that is there) refuses another set's `.env` the same way, and says how
+to switch sets without losing it; over the same set's `.env`, edited since the lock, it keeps that one first as
+`.env.<set>` and prints the command that goes back to it.
 Requires the `cryptography` package (`pip install cryptography`).
 
 `lock` seals `.env` only: the `.env.<set>` archives that Volumes and Reset set aside stay in plain text, and so

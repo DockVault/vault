@@ -115,7 +115,9 @@ Two files, two strict states, never a header-marked half-`.env`:
 | Locked (sealed)    | **absent** | present |
 
 - **`unlock`** materialises `.env` from `.env.enc`, keeping `.env.enc`. It **refuses to overwrite an
-  existing `.env`** without `--force` (never clobber a plaintext you might be mid-edit on).
+  existing `.env`** without `--force` (never clobber a plaintext you might be mid-edit on). With `--force`
+  it still refuses a `.env` of another set (another `VAULT_VOLUME_PREFIX` or `ENCRYPTION_KEY`), whose keys
+  the overwrite would leave nowhere, and keeps the same set's edited `.env` as `.env.<set>` first.
 - **`lock`** re-encrypts the current `.env` and, only after proving the new ciphertext round-trips,
   deletes `.env`. Concretely:
   1. Read `.env` bytes.
@@ -145,7 +147,7 @@ in a password manager; keep an off-host backup of `.env` or `.env.enc`.
 | Command | Behaviour |
 |---------|-----------|
 | `lock` | Seal `.env` → `.env.enc`, delete `.env`. Prompts for the passphrase (first time: set + confirm, then **display the recovery key once**). Non-interactive: `--passphrase-file PATH` or `--passphrase-stdin`. `--hint TEXT` stores a non-secret hint. |
-| `unlock` | `.env.enc` → `.env`. Prompts for the passphrase; `--recovery-key` (prompt) / `--recovery-key-file PATH` to use the recovery key instead. `--force` to overwrite an existing `.env`. |
+| `unlock` | `.env.enc` → `.env`. Prompts for the passphrase; `--recovery-key` (prompt) / `--recovery-key-file PATH` to use the recovery key instead. `--force` to overwrite an existing `.env` of the same set (kept first as `.env.<set>`; another set's is refused). |
 | `unlock --show-recovery-key` | Unlock in memory and re-display the recovery key (for someone who has the passphrase but lost the key). |
 | `change-passphrase` | Set a new unlock passphrase, authenticating with the CURRENT passphrase OR the recovery key. Re-wraps the same data key, so the recovery key is unchanged - this is how a forgotten passphrase is replaced. |
 

@@ -117,11 +117,12 @@ def test_unlock_refuses_to_clobber_without_force(tmp_path):
     app = _app(tmp_path)
     pf = _passfile(tmp_path)
     app.lock(_args(passphrase_file=pf))
-    (tmp_path / ".env").write_text("SOMETHING-ELSE=1\n", encoding="utf-8")  # a plaintext exists again
+    edited = ENV_TEXT + "SOMETHING-ELSE=1\n"
+    (tmp_path / ".env").write_text(edited, encoding="utf-8")  # a plaintext exists again
     with pytest.raises(SystemExit):
         app.unlock(_args(passphrase_file=pf))               # refuses
-    assert (tmp_path / ".env").read_text(encoding="utf-8") == "SOMETHING-ELSE=1\n"
-    app.unlock(_args(passphrase_file=pf, force=True))       # --force overwrites
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == edited
+    app.unlock(_args(passphrase_file=pf, force=True))       # --force overwrites the same set's edited .env
     assert (tmp_path / ".env").read_text(encoding="utf-8") == ENV_TEXT
 
 
@@ -381,3 +382,95 @@ def test_a_repoint_while_env_is_sealed_is_refused(tmp_path, monkeypatch, capsys)
     said = _refused_while_sealed(tmp_path, capsys, lambda app: app._volume_repoint(
         {}, argparse.Namespace(non_interactive=True, target_prefix="dvsetbbb", env_source=str(other))))
     assert "volumes --action repoint" in said
+
+
+# --- unlock --force never writes over the only copy of a set's keys ---------------------------
+
+def _beside_the_seal(tmp_path, sealed_text, env_text):
+    """Set A sealed in .env.enc, and `env_text` as .env beside it (the state a restore, a repoint or a new set leaves
+    after an unlock: .env.enc stays). Returns the passphrase file."""
+    pf = _sealed(tmp_path, sealed_text)
+    (tmp_path / ".env").write_text(env_text, encoding="utf-8")
+    return pf
+
+
+@pytest.mark.parametrize("other", ["prefix", "encryption-key"])
+def test_unlock_force_over_another_sets_env_is_refused_with_nothing_changed(tmp_path, capsys, other):
+    """Set B's .env beside a sealed .env of set A: lock refuses to seal B over A, and unlock --force used to write A
+    over B's .env with no copy, leaving B's ENCRYPTION_KEY nowhere. Refused: both files as they were, no copy made,
+    and the message says how to switch to the sealed set without losing B."""
+    a = _set_env("dvsetaaa")
+    b = _set_env("dvsetbbb") if other == "prefix" else _set_env("dvsetaaa", key="b3RoZXIta2V5LW9mLWEtbmV3LXNldA")
+    pf = _beside_the_seal(tmp_path, a, b)
+    sealed = (tmp_path / ".env.enc").read_bytes()
+    before = sorted(p.name for p in tmp_path.iterdir())
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _app(tmp_path).unlock(_args(passphrase_file=pf, force=True))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == b
+    assert (tmp_path / ".env.enc").read_bytes() == sealed
+    assert sorted(p.name for p in tmp_path.iterdir()) == before, "no file was written or removed"
+    said = " ".join(capsys.readouterr().out.split())
+    assert ".env.enc holds the .env of another set" in said and "Nothing changed." in said
+    aside = ".env.dvsetbbb" if other == "prefix" else ".env.dvsetaaa"
+    assert "first move .env to %s" % (tmp_path / aside) in said
+    assert "--action repoint --target-prefix %s --env-source %s" % (aside[5:], tmp_path / aside) in said
+    assert "ZmFrZS1lbmMta2V5" not in said and "b3RoZXIta2V5" not in said, "a key's value is never printed"
+
+
+def test_unlock_force_over_the_same_sets_edited_env_keeps_it_first(tmp_path, capsys):
+    """The same set's .env, edited since the lock (a setting changed): unlock --force puts the sealed one back and
+    keeps the edited one first, byte for byte, as .env.<set>, and says how to go back to it."""
+    a = _set_env("dvsetaaa")
+    edited = a + "WEB_HOST_PORT=8443\n"
+    pf = _beside_the_seal(tmp_path, a, edited)
+    capsys.readouterr()
+    _app(tmp_path).unlock(_args(passphrase_file=pf, force=True))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == a
+    kept = tmp_path / ".env.dvsetaaa"
+    assert kept.read_text(encoding="utf-8") == edited
+    said = " ".join(capsys.readouterr().out.split())
+    assert "Kept the current .env (set 'dvsetaaa') as %s" % kept in said
+    assert ("To go back to it: python dockvault.py volumes --non-interactive --action repoint --target-prefix "
+            "dvsetaaa --env-source %s" % kept) in said
+
+
+def test_unlock_force_takes_the_number_after_the_copies_there(tmp_path):
+    a = _set_env("dvsetaaa")
+    pf = _beside_the_seal(tmp_path, a, a + "X=1\n")
+    (tmp_path / ".env.dvsetaaa").write_text("an older copy\n", encoding="utf-8")
+    _app(tmp_path).unlock(_args(passphrase_file=pf, force=True))
+    assert (tmp_path / ".env.dvsetaaa").read_text(encoding="utf-8") == "an older copy\n"
+    assert (tmp_path / ".env.dvsetaaa.1").read_text(encoding="utf-8") == a + "X=1\n"
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == a
+
+
+def test_unlock_force_over_the_sealed_env_itself_writes_nothing(tmp_path, capsys):
+    a = _set_env("dvsetaaa")
+    pf = _beside_the_seal(tmp_path, a, a)
+    before = sorted(p.name for p in tmp_path.iterdir())
+    capsys.readouterr()
+    _app(tmp_path).unlock(_args(passphrase_file=pf, force=True))
+    assert sorted(p.name for p in tmp_path.iterdir()) == before, "no copy of the same bytes is made"
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == a
+    assert ".env already reads as the sealed one; nothing was changed." in capsys.readouterr().out
+
+
+def test_unlock_force_whose_copy_cannot_be_kept_leaves_env_as_it_was(tmp_path, monkeypatch, capsys):
+    a = _set_env("dvsetaaa")
+    edited = a + "X=1\n"
+    pf = _beside_the_seal(tmp_path, a, edited)
+
+    def cannot(self, label, data):
+        exc = OSError(28, "No space left on device")
+        exc.kept_as = str(tmp_path / ".env.dvsetaaa")
+        raise exc
+
+    monkeypatch.setattr(dv.DockVault, "_keep_env_copy", cannot)
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _app(tmp_path).unlock(_args(passphrase_file=pf, force=True))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == edited
+    said = " ".join(capsys.readouterr().out.split())
+    assert "could not keep the current .env as %s" % (tmp_path / ".env.dvsetaaa") in said
+    assert "so it was not replaced. Nothing changed." in said
