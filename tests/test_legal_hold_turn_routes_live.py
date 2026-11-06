@@ -1,5 +1,5 @@
-"""A hold, an undone release and a case asked for, through their routes on a running stack, while a deletion step
-holds the turn of holds and deletions (app/core/legal_holds.py take_turn; app/api/compliance_router.py
+"""A hold, its confirmation, an undone release and a case asked for, through their routes on a running stack, while a
+deletion step holds the turn of holds and deletions (app/core/legal_holds.py take_turn; app/api/compliance_router.py
 _take_the_turn).
 
 A deletion step holds the turn shared for its whole transaction (an archived day's scan or rewrite can take
@@ -145,6 +145,39 @@ def _hold_released(admins, vid, cases):
                         headers=compliance_receipt(client, "compliance.hold.decide", account["_password"], codes))
         assert r.status_code == 200, r.text
     return case["id"]
+
+
+def _confirm(admins, case_id, headers=None):
+    account, client, codes = admins["bob"]
+    headers = headers or compliance_receipt(client, "compliance.hold.decide", account["_password"], codes)
+    t0 = time.monotonic()
+    r = client.post(f"/compliance/cases/{case_id}/hold/confirm", headers=headers)
+    return r, round(time.monotonic() - t0, 2), headers
+
+
+def test_a_confirmation_waits_for_a_deletion_step_or_is_refused_past_the_bound_with_its_code_kept(admins, vault):
+    """From its confirmation a hold holds back every deletion step (until then it holds none back), so the
+    confirmation takes the turn as a placing does."""
+    vid, cases = vault
+    r, _w, _h = _place(admins["ada"], vid)
+    assert r.status_code == 201, r.text
+    case_id = r.json()["id"]
+    cases.append(case_id)
+    bound = _turn_wait_seconds()
+    before = _refusals("hold_confirmed", "deletion_running")
+    step = _DeletionStep(bound + 12)
+    r, waited, headers = _confirm(admins, case_id)
+    _busy(r, waited, bound)
+    assert psql(f"SELECT count(*) FROM legal_hold_vaults WHERE case_id = '{case_id}' "
+                "AND confirmed_at IS NOT NULL") == "0"
+    assert _refusals("hold_confirmed", "deletion_running") == before + 1
+    step.wait()
+    step = _DeletionStep(10)
+    r, waited, _h = _confirm(admins, case_id, headers=headers)                # the same receipt
+    step.wait()
+    assert r.status_code == 200, (r.status_code, waited, r.text)
+    assert r.json()["holds"][0]["confirmed_by"] == admins["bob"][0]["_username"], r.text
+    assert waited >= 6, waited
 
 
 def _undo(admins, case_id, headers=None):

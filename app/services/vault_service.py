@@ -151,13 +151,22 @@ def _name_match_filter(model, vault, name: str):
     return plain_col == name
 
 
-def deployment_storage_used(db) -> int:
+def vaults_stored_bytes(db) -> int:
     """Total stored bytes across all active vaults in this deployment (one deployment =
-    one customer org)."""
+    one customer org): the bytes their counters hold."""
     from sqlalchemy import func as _f
     return int(db.query(_f.coalesce(_f.sum(Vault.total_size_bytes), 0)).filter(
         Vault.is_active == True  # noqa: E712
     ).scalar() or 0)
+
+
+def deployment_storage_used(db) -> int:
+    """What the deployment's storage limit counts: the active vaults' stored bytes, and the bytes
+    legal holds keep (app/core/kept_tables.py). A file deleted from a vault under a hold leaves the
+    vault's counters but stays on the disk until its purge, so without them a member of a held vault
+    could fill the disk past the limit by uploading and deleting in turn. A vault's own size limit
+    does not count them: nobody using the vault can remove them."""
+    return vaults_stored_bytes(db) + kept_tables.kept_bytes(db)
 
 
 def deployment_storage_limit_bytes(db):
@@ -186,9 +195,9 @@ def would_exceed_deployment_storage(db, additional_bytes: int):
     (sftp_server) so both honor the aggregate limit; each caller turns a True into its own
     error (HTTP 413 / SFTP failure).
 
-    This counts STORED bytes only — declaring a vault size allocates against the owner's own
-    account budget, never against the deployment, so a thousand empty vaults leave this number
-    untouched.
+    This counts STORED bytes only (the vaults' and those legal holds keep, deployment_storage_used)
+    — declaring a vault size allocates against the owner's own account budget, never against the
+    deployment, so a thousand empty vaults leave this number untouched.
 
     On its own this is a SUM read at one moment, so it is an early answer, not the guard: two
     files can both pass it where together they would not. The guard is the same check made again

@@ -632,8 +632,17 @@ def confirm_hold(case_id: uuid.UUID, request: Request, current_user: User = Depe
                  db: Session = Depends(get_db)):
     """Confirm a case's legal hold, as an administrator independent of whoever placed it."""
     from app.core import legal_holds as holds
-    _check_decision(case_id, current_user, db, action="hold_confirmed", refusal=_confirm_refusal)
-    STEP_UP_HOLD_DECIDE(db, current_user, request)
+    case = _check_decision(case_id, current_user, db, action="hold_confirmed", refusal=_confirm_refusal)
+    asked = _no_receipt(request)
+    if asked:
+        with _code_session() as own:
+            STEP_UP_HOLD_DECIDE(own, current_user, request)    # asks for the code before waiting for the turn
+    # From its confirmation the hold holds back every deletion step (legal_holds.confirm): it takes the turn before
+    # the code is used (see _take_the_turn).
+    _take_the_turn(db, "hold_confirmed", case, current_user)
+    if not asked:
+        with _code_session() as own:
+            STEP_UP_HOLD_DECIDE(own, current_user, request)    # the code used once the step has the turn
     return _take_decision(case_id, current_user, db, action="hold_confirmed", refusal=_confirm_refusal,
                           step=lambda case: holds.confirm(db, case, by=current_user))
 
@@ -1038,7 +1047,8 @@ def vault_picker(owner: str = Query(..., min_length=1, max_length=255),
                  current_user: User = Depends(require_live_auditor_or_admin), db: Session = Depends(get_db)):
     """One owner's vaults for a case or a legal hold (by account id or username): type, size, file count, creation
     date and id; a name only where the caller can already read the vault. A live auditor, or an administrator (who
-    places holds). Each query is recorded."""
+    places holds). Each query is recorded, one that finds no account too (as a failure, with whether it named an id
+    or a username, never what it named): looking names up leaves a record whether or not they exist."""
     from app.core import cases
     from app.core.authorization import PermissionService
     from app.core.models import Vault
@@ -1048,6 +1058,11 @@ def vault_picker(owner: str = Query(..., min_length=1, max_length=255),
     person = db.get(User, person_id) if person_id is not None else (
         db.query(User).filter(User.username == owner.strip()).first())
     if person is None:
+        db.add(AuditLogger(db).build_row(action="case_picker_viewed", status="failure", user=current_user,
+                                         resource_type="user", resource_id=None,
+                                         details={"reason": "no_such_account",
+                                                  "via": "id" if person_id is not None else "username"}))
+        db.commit()
         raise HTTPException(status_code=404, detail="No such account.")
     permissions = PermissionService(db)
     out = []

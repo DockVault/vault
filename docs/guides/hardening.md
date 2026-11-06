@@ -105,7 +105,8 @@ hold also tells the owner). The purpose "Regulator or authority request" does no
 - **The vault picker shows any administrator, and any auditor whose right is in force, an account's vaults**: for
   each, its type, whether it has a password, its number of files, its size and when it was made (an administrator
   needs this to place a legal hold). It never shows a vault's name to someone who could not read the vault anyway,
-  and each look is recorded (`case_picker_viewed`, with the id of the account looked at).
+  and each look is recorded (`case_picker_viewed`, with the id of the account looked at; a look that finds no
+  such account is recorded too, as a failure, without what was looked for).
 - **An administrator a case concerns cannot see it on the Compliance page, but can learn of it from the Activity
   page**, which every administrator reads whole. The rows of compliance access are there with no vault or file
   name: a case asked for or approved, a hold placed (with the vault's id), and an auditor's look at the vault
@@ -125,8 +126,11 @@ key versions are not retired: what was kept was sealed under them, and only thei
 about a person (its custodian) keeps their account as well: it cannot be deleted while the case's hold stands or
 what the hold kept waits for its purge. Each refusal is recorded under the case (`hold_blocked_delete`), and says
 why: to the vault's owner and to an administrator it names the case, while another manager of the vault refused a
-retire is told only that a legal hold keeps it. A per-person erase waits while any hold stands or any case is
-open, and says which case it waits for.
+retire is told only that a legal hold keeps it. A per-person erase waits while any confirmed hold stands or any
+case is open, and says which case it waits for. A hold nobody has confirmed yet keeps what is deleted from its
+vaults, which counts toward the deployment's storage limit (`MAX_STORAGE_GB`, or the lower limit set on the
+Settings page), but holds no erase back: one person places it alone. One person can have at most five hold-only
+cases waiting for confirmation at once.
 
 ### Upgrading with SFTP in its own container
 

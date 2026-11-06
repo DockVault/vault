@@ -58,8 +58,10 @@ def _start_with(**env):
         args += ["-e", f"{name}={value}"]
     try:
         r = subprocess.run(args + ["-i", API, "python", "-c", _START], capture_output=True, text=True, timeout=90)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, API)
     assert r.returncode == 0, (r.stderr or r.stdout)[-800:]
     return r.stdout

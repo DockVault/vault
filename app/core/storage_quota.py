@@ -9,8 +9,9 @@ and pass them in; nothing here touches a database or raises HTTP.
 Three DIFFERENT numbers get called "storage", and conflating them is the bug this module exists
 to prevent:
 
-* STORED   — bytes actually written into vaults. The ONLY thing the deployment-wide limit
-             counts. A million empty vaults cost nothing.
+* STORED   — bytes actually written into vaults, and those legal holds keep after their
+             deletion. The ONLY thing the deployment-wide limit counts. A million empty vaults
+             cost nothing.
 * ALLOCATED — the sum of the size limits people have handed to vaults out of their own account
              quota. Spending an account budget is what makes "give 2 GB to a shared vault, take
              it back later" possible, so allocation is a reservation INSIDE one account. It

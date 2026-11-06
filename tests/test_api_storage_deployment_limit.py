@@ -2,7 +2,8 @@
 
 Two layers. MAX_STORAGE_GB is the deployment's hard ceiling, set by whoever runs the deployment;
 the admin panel then chooses any live limit between 0 and that ceiling. Only STORED bytes count
-toward it — allocating a vault size spends the owner's own quota, never the deployment's — so a
+toward it (what the vaults hold, and what legal holds keep after its deletion: /storage/stats'
+on_disk_bytes) — allocating a vault size spends the owner's own quota, never the deployment's — so a
 deployment full of empty vaults is not full at all.
 """
 import math
@@ -28,6 +29,11 @@ def _stats(admin):
     r = admin.get("/storage/stats")
     assert r.status_code == 200, r.text
     return r.json()
+
+
+def _counted(admin):
+    """What the limit counts: the vaults' stored bytes and those legal holds keep."""
+    return _stats(admin)["on_disk_bytes"]
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +74,7 @@ def test_storage_stats_separates_stored_from_allocated(admin):
 def test_an_empty_vault_never_consumes_the_deployment_limit(admin):
     """The property the whole design rests on: allocation is a promise against the OWNER's
     quota, so a limit pinned exactly at what is stored still permits new vaults."""
-    used = _stats(admin)["used"]
+    used = _counted(admin)
     assert _set_limit(admin, max(1, math.ceil(used / GIB))).status_code in (200, 204)
     v = admin.post("/vaults", json={"name": unique("dep-empty"), "size_limit_gb": 5})
     try:
@@ -81,7 +87,7 @@ def test_an_empty_vault_never_consumes_the_deployment_limit(admin):
 # --- setting the limit --------------------------------------------------------------------------
 
 def test_admin_can_lower_and_clear_the_limit(admin):
-    used_gb = math.ceil(_stats(admin)["used"] / GIB)
+    used_gb = math.ceil(_counted(admin) / GIB)
     target = max(1, used_gb + 1)
     assert _set_limit(admin, target).status_code in (200, 204)
     assert _stats(admin)["limit_bytes"] == target * GIB
@@ -113,7 +119,7 @@ def test_the_limit_cannot_be_set_below_what_is_already_stored(admin, temp_vault)
     up = admin.post(f"/vaults/{temp_vault['id']}/files",
                     files=[("files", (unique("f") + ".txt", content, "text/plain"))])
     assert up.status_code == 200, up.text
-    used = _stats(admin)["used"]
+    used = _counted(admin)
     assert used > 0
 
     # A limit below the stored bytes is refused (a GB below what is stored, floored at 0).
@@ -137,7 +143,7 @@ def _pin_limit_at_current_usage(admin):
     literal 0 GB freeze; on one that has, it is the same stop one byte higher. Float truncation
     can land the computed GB value a byte BELOW what is stored, which the server rightly refuses,
     so nudge upward until it takes."""
-    used = _stats(admin)["used"]
+    used = _counted(admin)
     gb = used / GIB
     for _ in range(5):
         if _set_limit(admin, gb).status_code in (200, 204):
@@ -161,7 +167,7 @@ def test_a_reached_limit_blocks_the_next_upload(admin, temp_vault):
     assert r.status_code == 413, r.text
     assert "storage limit" in r.text.lower()
     # nothing was stored by the refused upload
-    assert _stats(admin)["used"] == used
+    assert _counted(admin) == used
 
 
 def test_a_full_deployment_still_allows_reading_and_deleting(admin, temp_vault):

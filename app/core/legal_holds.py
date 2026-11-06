@@ -18,7 +18,10 @@ Confirming. A different person, independent of the one who placed it by the one 
 (app/core/independence.py), confirms it within COMPLIANCE_HOLD_CONFIRM_DAYS, or the server's operator does on the
 host. Unconfirmed, it lapses: it keeps nothing more, what it kept follows the release path, and the person who
 placed it cannot place another unconfirmed hold on any of those vaults for PLACE_BLOCK_DAYS (another person can).
-So one person cannot keep deleted data for ever with rolling holds.
+So one person cannot keep deleted data for ever with rolling holds. Nor can one person keep more than
+MAX_UNCONFIRMED_CASES hold-only cases waiting for confirmation at once. Until it is confirmed a hold keeps what is
+deleted from its vaults but holds no erase or other deletion of records back (compliance_retention.holds_back): the
+confirmation takes the turn of holds and deletions, as a placing does.
 
 Reviewing. Every COMPLIANCE_HOLD_REVIEW_DAYS the case's auditor and the administrators are asked whether the hold
 is still needed; answering records ``hold_reviewed``. Nothing is released by the clock: that would destroy evidence.
@@ -51,6 +54,8 @@ NOTICE_TYPE = "legal_hold"
 TARGET = "#compliance"
 # After a lapse, the person who placed the hold cannot place another unconfirmed one on its vaults this long.
 PLACE_BLOCK_DAYS = 30
+# How many hold-only cases one person may have waiting for a second person's confirmation at once.
+MAX_UNCONFIRMED_CASES = 5
 # What a hold-only case is for and on what basis, and the least its justification says: the case rules' own (one
 # list for every case).
 JUSTIFICATION_MIN = case_rules.JUSTIFICATION_MIN
@@ -66,6 +71,7 @@ TOO_MANY_VAULTS = "too_many_vaults"
 NO_SUCH_VAULT = "no_such_vault"
 PLACER_CONCERNED = "placer_concerned"
 PLACE_BLOCKED = "place_blocked"
+TOO_MANY_UNCONFIRMED = "too_many_unconfirmed"
 SFTP_VERSION = "sftp_version"
 BAD_PURPOSE = case_rules.BAD_PURPOSE
 BAD_BASIS = case_rules.BAD_BASIS
@@ -93,6 +99,9 @@ TEXTS = {
     PLACER_CONCERNED: "you own one of those vaults: a hold on it must be placed by someone it does not concern",
     PLACE_BLOCKED: (f"a hold you placed on one of those vaults ended unconfirmed (it lapsed, or it was released) "
                     f"less than {PLACE_BLOCK_DAYS} days ago: another person must place the next one"),
+    TOO_MANY_UNCONFIRMED: (f"{MAX_UNCONFIRMED_CASES} legal holds you placed are waiting for another person to "
+                           "confirm them: you can place another once one of them is confirmed, released or has "
+                           "lapsed"),
     SFTP_VERSION: "an SFTP server of another version may be running",
     BAD_PURPOSE: "choose what the case is for",
     BAD_BASIS: "choose the case's legal basis",
@@ -306,11 +315,11 @@ def after_starter_change(db, target, kind: str, now: Optional[datetime] = None) 
 
 # --------------------------------------------------------------------------- the turn of holds and deletions
 
-# A hold or a case and the deletions they hold back take turns: every step that makes a hold stand or opens a case
-# takes this lock, exclusively, in its own transaction before it writes; every path of the audit log and the
-# records that changes or deletes what they hold back takes it shared, in the transaction that checks for them
-# and then changes (compliance_retention.holds_back). So a hold committed before such a check is seen by it, and
-# one placed while such a transaction runs is written once that transaction has ended.
+# A hold or a case and the deletions they hold back take turns: every step that makes a hold stand, confirms one or
+# opens a case takes this lock, exclusively, in its own transaction before it writes; every path of the audit log
+# and the records that changes or deletes what they hold back takes it shared, in the transaction that checks for
+# them and then changes (compliance_retention.holds_back). So a hold committed before such a check is seen by it,
+# and one placed while such a transaction runs is written once that transaction has ended.
 HOLD_TURN = (0x6c68, 1)
 # How long a step that makes a hold stand or opens a case waits for the turn while a deletion step holds it, at most:
 # a deletion step holds it for its whole transaction (an archived day's scan or rewrite can take seconds), longer
@@ -566,6 +575,22 @@ def _check_block(db, placer, vault_ids, now: datetime) -> None:
         raise HoldRefused(PLACE_BLOCKED)
 
 
+def _check_unconfirmed(db, placer, now: datetime) -> None:
+    """Refuse a placing by whoever has MAX_UNCONFIRMED_CASES hold-only cases waiting for a second person's
+    confirmation already (a hold of theirs standing unconfirmed, before its confirm deadline). Placing one needs
+    nobody else, and each keeps what is deleted from its vaults until it is confirmed or lapses. Counted in the
+    exclusive turn of holds and deletions, so two placings by one person at once count each other."""
+    from sqlalchemy import func, or_
+    from app.core.models import LegalHoldVault
+    waiting = (db.query(func.count(func.distinct(LegalHoldVault.case_id)))
+               .filter(LegalHoldVault.placed_by == placer.id, LegalHoldVault.confirmed_at.is_(None),
+                       LegalHoldVault.released_at.is_(None), LegalHoldVault.lapsed_at.is_(None),
+                       or_(LegalHoldVault.confirm_by_deadline.is_(None), LegalHoldVault.confirm_by_deadline > now))
+               .scalar())
+    if int(waiting or 0) >= MAX_UNCONFIRMED_CASES:
+        raise HoldRefused(TOO_MANY_UNCONFIRMED)
+
+
 def place_hold_only(db, placer, vault_ids: Iterable, *, purpose: str, legal_basis: str, justification: str,
                     owner_note: str, lia_reference: Optional[str] = None, now: Optional[datetime] = None):
     """Open a hold-only case holding ``vault_ids`` at once, placed by ``placer``, in the caller's transaction (the
@@ -598,6 +623,7 @@ def place_hold_only(db, placer, vault_ids: Iterable, *, purpose: str, legal_basi
         raise HoldRefused(PLACER_CONCERNED, code=403)
     sftp_guard(db)
     _check_block(db, placer, ids, now)
+    _check_unconfirmed(db, placer, now)
 
     standing_grant = auditor_rights.auditor_live(db, placer)
     case = ComplianceCase(id=uuid.uuid4(), status="hold_only", purpose=purpose, legal_basis=legal_basis,
@@ -667,8 +693,14 @@ def independent_confirmers(db, case, now: Optional[datetime] = None) -> list:
 
 def confirm(db, case, *, by=None, now: Optional[datetime] = None) -> int:
     """Confirm every hold of ``case`` that stands unconfirmed and may still be confirmed, as ``by`` (None: the
-    server's operator on the host), in the caller's transaction. Returns how many."""
+    server's operator on the host), in the caller's transaction. Returns how many.
+
+    From its confirmation a hold holds back every erase and other deletion of records
+    (compliance_retention.holds_back), so this takes the turn of holds and deletions first, as a placing does: one
+    that checked before it ends first, and one that checks after it sees it. Raises TurnBusy when a deletion step
+    keeps the turn too long."""
     now = now or utcnow()
+    take_turn(db, shared=False)
     name = by.username if by is not None else HOST_OPERATOR
     count = 0
     confirmed = []
@@ -1024,7 +1056,12 @@ def _host_confirm(db, case, *, reason=None):
         return _refuse(f"An independent administrator can confirm this hold "
                        f"({', '.join(sorted(a.username for a in others))}), so the server's operator may not: the "
                        "host operator has no account the independence rule could check.")
-    count = confirm(db, case, by=None, now=now)
+    try:
+        count = confirm(db, case, by=None, now=now)
+    except TurnBusy:
+        record_refusal(db, "hold_confirmed", case, actor=None, reason=DELETION_RUNNING)
+        want_turn()
+        return _refuse(text(DELETION_RUNNING).capitalize() + ".")
     return {"id": str(case.id), "number": case.number, "confirmed": count}
 
 

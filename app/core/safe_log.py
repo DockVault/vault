@@ -106,3 +106,15 @@ def exception_outline(exc: BaseException) -> str:
         blocks.append(f"{frames}{type(current).__module__}.{type(current).__qualname__}")
         current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
     return "\n(the exception above led to the one below)\n".join(reversed(blocks))
+
+
+def log_failure(what: str, exc: BaseException) -> str:
+    """Say, for the operator, that ``what`` failed: an error id, the exception's class and where it was raised
+    (exception_outline), never its message. Returns the error id, for the answer the caller gives, so the person who
+    saw it can name the line. ``what`` is a fixed phrase at the call site, never built from input."""
+    import uuid
+
+    error_id = str(uuid.uuid4())
+    print(f"[ERROR] {what} (ID: {error_id}): {type(exc).__name__}", flush=True)
+    print(exception_outline(exc), flush=True)
+    return error_id

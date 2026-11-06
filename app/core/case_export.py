@@ -27,7 +27,8 @@ is told ("N files exported from your vaults"), in the app and through the email 
 The stream reads with sessions of its own (the request's may be gone while it runs) and checks the case again
 before each file: an export stops when the case's access does. Each file is checked again too, as the fetch checked
 it: one moved out of the case's folders or time range, in a vault narrowed out of the case or made zero-knowledge,
-or in a vault that has a password the fetch did not open, is left out and listed as having left the case. Files are decrypted piece by piece and written
+or in a vault that has a password the fetch did not open (a password changed since the fetch included), is left out
+and listed as having left the case, by its id and status alone. Files are decrypted piece by piece and written
 straight into the archive, so memory stays bounded whatever their size. The stored checksum is used only to compare
 and is never written out. When the stream ends, ``case_export_completed`` records the manifest's SHA-256, the
 number of files and the bytes; a stream that stops early (the client went away, the case's access ended, a file
@@ -208,8 +209,10 @@ class Entry:
     sha256: Optional[str] = None
     integrity: Optional[str] = None
     when: Optional[datetime] = None
-    # Its vault's password was given (a receipt) when the export was fetched: the stream reads it as opened then.
+    # Its vault's password was given (a receipt) when the export was fetched: the stream reads it as opened then,
+    # while the vault's password is still the one it had then (``credential``, its digest, as the receipt binds it).
     unlocked: bool = False
+    credential: Optional[bytes] = None
 
 
 def claim(db, case_id, export_id, user, *, unlocked_given=None, session_hash=None, now: Optional[datetime] = None):
@@ -218,6 +221,7 @@ def claim(db, case_id, export_id, user, *, unlocked_given=None, session_hash=Non
     Raises Refused before anything changes."""
     from sqlalchemy import update
     from app.core import owner_notices
+    from app.core import vault_unlock_receipts as receipts
     from app.core.models import ComplianceExport
     now = now or ca.utcnow()
     case = ca.case_for(db, case_id, user, now=now)
@@ -242,8 +246,10 @@ def claim(db, case_id, export_id, user, *, unlocked_given=None, session_hash=Non
             entries.append(Entry(file_id=str(fid)))
             continue
         ca.content_opening(case, found, unlocked)
+        opened = str(found.vault.id) in unlocked
         entries.append(Entry(file_id=str(found.item.id), vault_id=str(found.vault.id), kept=found.kept,
-                             status=found.status, unlocked=str(found.vault.id) in unlocked))
+                             status=found.status, unlocked=opened,
+                             credential=receipts.credential_digest(found.vault.password_hash) if opened else None))
         if found.vault.owner_id is not None:
             counts = owners.setdefault(str(found.vault.owner_id), {"files": 0, "vaults": set()})
             counts["files"] += 1
@@ -432,7 +438,8 @@ What it holds
                                      what was stored, or no checksum was stored). A file listed as "missing" had
                                      left the vault before it could be exported, one listed as "unreadable"
                                      could not be opened, and one listed as "left_case" was no longer in the
-                                     case when its turn came (moved out of its folders, for example); none of
+                                     case when its turn came (moved out of its folders, or its vault's password
+                                     changed, for example), and is listed by its id and status alone; none of
                                      them is in files/. In the CSV, a value a spreadsheet
                                      would read as a formula starts with an apostrophe.
   case.json                          the case: its number, purpose, legal basis, scope, auditor, approver and dates.
@@ -462,6 +469,16 @@ def _open_stored(db_factory, entry: Entry, now: datetime):
         return ca._vault_service(db)._open_stored_file(item, vault, item.id, whole=False)
     finally:
         db.close()
+
+
+def _opened_as_fetched(entry: Entry, vault) -> bool:
+    """Whether ``vault`` opens for ``entry`` as it did at the fetch: its password was given then, and is the same
+    password now."""
+    import hmac
+    from app.core import vault_unlock_receipts as receipts
+    now_digest = receipts.credential_digest(getattr(vault, "password_hash", None))
+    return bool(entry.unlocked and entry.credential is not None and now_digest is not None
+                and hmac.compare_digest(entry.credential, now_digest))
 
 
 class Stopped(Exception):
@@ -535,7 +552,12 @@ class ExportStream:
     def _may_read(self, entry: Entry) -> bool:
         """Before each file: the case still gives its auditor access, and export (else the export stops: Stopped);
         and the file is still one the case may export, as the fetch checked it, now: else it is left out, listed
-        LEFT_CASE, or MISSING when it is gone from the vault (also a kept file now due for its purge)."""
+        LEFT_CASE, or MISSING when it is gone from the vault (also a kept file now due for its purge).
+
+        A vault whose password was given at the fetch opens only while its password is the one it had then, as an
+        interactive read checks its receipt against the password on every read: once it is changed, its files left
+        the case. A file that left the case is listed by its id and status alone: its name, folder path and who
+        uploaded or changed it, and when, are left out of the manifest."""
         from app.core.models import User
         db = self._db_factory()
         try:
@@ -552,9 +574,14 @@ class ExportStream:
                 raise Stopped(why)
             try:
                 found = ca.file_for(db, case, entry.file_id, now=now)
-                ca.content_opening(case, found, {entry.vault_id} if entry.unlocked else ())
+                ca.content_opening(case, found, {entry.vault_id} if _opened_as_fetched(entry, found.vault) else ())
             except ca.Refused as refused:
-                entry.status = MISSING if refused.reason == ca.NO_SUCH_FILE else LEFT_CASE
+                if refused.reason == ca.NO_SUCH_FILE:
+                    entry.status = MISSING
+                else:
+                    entry.status = LEFT_CASE
+                    entry.folder_path, entry.name = [], None
+                    entry.uploaded_at = entry.uploaded_by = entry.changed_at = entry.changed_by = None
                 return False
             return True
         finally:

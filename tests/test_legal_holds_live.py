@@ -7,6 +7,9 @@ gate in app/services/vault_service.py, app/core/legal_hold_marker.py).
     bytes, which still decrypt, while for the vault's people the file is gone; the owner is told; the storage page
     counts what is kept; an older release is kept from starting (the marker row, and the host's
     downgrade-blockers); release, undo, release again, then the purge secure-deletes and records each file;
+  * what a hold keeps counts toward the deployment's storage limit: uploading and deleting in a held vault stops
+    at the limit, on the web and over SFTP, and the limit cannot be set below what it counts; the vault's own size
+    limit does not count it;
   * a hold placed while a deletion holds the vault's row waits for it, and the next deletion is kept;
   * a hold nobody confirms lapses, and its placer cannot place another on that vault for 30 days; nor after
     releasing their own hold before anyone confirmed it;
@@ -234,11 +237,17 @@ def test_expiry_under_a_hold_is_kept_and_marked_held_by_case(admin, admins, vaul
     assert _blob_exists(f) and _open_kept(f) == "expiring bytes|expiring.txt"
 
 
+def _sftp_session():
+    """An SFTP session as the session's administrator (the admin fixture has the password, or the test skipped)."""
+    import paramiko          # in the test requirements: a missing one fails the test rather than skipping it
+    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+    transport.banner_timeout = 30
+    transport.connect(username=ADMIN_USER, password=ADMIN_PASS)
+    return transport, paramiko.SFTPClient.from_transport(transport)
+
+
 @pytest.mark.sftp
 def test_the_sftp_servers_remove_and_replacement_are_kept(admin, admins, vaults):
-    paramiko = pytest.importorskip("paramiko")
-    if not ADMIN_PASS:
-        pytest.skip("No admin password (set VAULT_ADMIN_PASS)")
     made, cases = vaults
     vid, vname = made[0]["id"], made[0]["name"]
     removed = _upload(admin, vid, "sftp-removed.txt", b"sftp removed")
@@ -246,11 +255,8 @@ def test_the_sftp_servers_remove_and_replacement_are_kept(admin, admins, vaults)
     r = _place(admins["ada"], [vid])
     assert r.status_code == 201, r.text
     cases.append(r.json()["id"])
-    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-    transport.banner_timeout = 30
+    transport, sftp = _sftp_session()
     try:
-        transport.connect(username=ADMIN_USER, password=ADMIN_PASS)
-        sftp = paramiko.SFTPClient.from_transport(transport)
         sftp.remove(f"/{vname}/sftp-removed.txt")
         with sftp.open(f"/{vname}/sftp-same.txt", "wb") as fh:
             fh.write(b"sftp second")
@@ -260,6 +266,83 @@ def test_the_sftp_servers_remove_and_replacement_are_kept(admin, admins, vaults)
     assert _kept(removed).startswith("deleted|") and _kept(replaced).startswith("replaced|")
     assert _open_kept(removed) == "sftp removed|sftp-removed.txt"
     assert _open_kept(replaced) == "sftp first|sftp-same.txt"
+
+
+GIB = 1024 ** 3
+CYCLE = 200_000
+
+
+@pytest.fixture
+def held_with_room(admin, admins, vaults):
+    """A held vault, and the deployment's storage limit set to what it counts now and room for one and a half
+    files of CYCLE bytes: (vault, the bytes the limit counted before). The limit is put back after."""
+    made, cases = vaults
+    r = _place(admins["ada"], [made[0]["id"]])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+    before = admin.get("/settings").json().get("deployment_storage_limit_gb")
+    counted = admin.get("/storage/stats").json()["on_disk_bytes"]
+    try:
+        r = admin.put("/settings", json={"deployment_storage_limit_gb": (counted + CYCLE + CYCLE // 2) / GIB})
+        assert r.status_code in (200, 204), r.text
+        yield made[0], counted
+    finally:
+        admin.put("/settings", json={"deployment_storage_limit_gb": before})
+
+
+def _upload_then_delete(admin, vid, name):
+    """One turn of the cycle: a file of CYCLE bytes uploaded, then deleted (the hold keeps it)."""
+    f = _upload(admin, vid, name, b"k" * CYCLE)
+    assert admin.post(f"/vaults/{vid}/files/{f}/delete").status_code == 200
+    assert _kept(f).startswith("deleted|")
+    return f
+
+
+def test_what_a_hold_keeps_counts_toward_the_deployments_storage_limit(admin, held_with_room):
+    vault, counted = held_with_room
+    vid = vault["id"]
+    _upload_then_delete(admin, vid, "cycle-1.txt")
+    stats, settings = admin.get("/storage/stats").json(), admin.get("/settings").json()
+    assert stats["on_disk_bytes"] == counted + CYCLE, "the kept file is still on the disk"
+    assert settings["deployment_storage_used_bytes"] == stats["on_disk_bytes"], "the panel shows what the limit counts"
+    # The vault's counters dropped, so its own size limit has room again; the deployment's limit does not.
+    r = admin.post(f"/vaults/{vid}/files", files=[("files", ("cycle-2.txt", b"k" * CYCLE, "text/plain"))])
+    assert r.status_code == 413 and "storage limit" in r.text.lower(), r.text
+    assert admin.get("/storage/stats").json()["on_disk_bytes"] == counted + CYCLE, "the refused file left nothing"
+    # An administrator cannot set the limit below what it counts, the kept file included.
+    r = admin.put("/settings", json={"deployment_storage_limit_gb": (counted + CYCLE // 2) / GIB})
+    assert r.status_code == 400 and "already" in r.text, r.text
+
+
+def test_a_vaults_own_size_limit_does_not_count_what_a_hold_keeps_of_it(admin, admins, vaults):
+    made, cases = vaults
+    vid = made[0]["id"]
+    psql(f"UPDATE vaults SET size_limit = {3 * CYCLE // 2} WHERE id = '{vid}'")
+    r = _place(admins["ada"], [vid])
+    assert r.status_code == 201, r.text
+    cases.append(r.json()["id"])
+    for turn in range(3):            # three files kept: twice what the vault's limit allows
+        _upload_then_delete(admin, vid, f"own-limit-{turn}.txt")
+    assert int(psql(f"SELECT count(*) FROM held_files WHERE vault_id = '{vid}'")) == 3
+
+
+@pytest.mark.sftp
+def test_an_sftp_write_counts_what_a_hold_keeps_toward_the_deployments_storage_limit(admin, held_with_room):
+    vault, counted = held_with_room
+    vid, vname = vault["id"], vault["name"]
+    _upload_then_delete(admin, vid, "cycle-sftp-1.txt")
+    transport, sftp = _sftp_session()
+    try:
+        try:
+            with sftp.open(f"/{vname}/cycle-sftp-2.txt", "wb") as fh:
+                fh.write(b"s" * CYCLE)
+        except IOError:
+            pass             # the refusal comes at the close, which the client does not always report
+        assert "cycle-sftp-2.txt" not in sftp.listdir(f"/{vname}")
+        sftp.close()
+    finally:
+        transport.close()
+    assert admin.get("/storage/stats").json()["on_disk_bytes"] == counted + CYCLE, "the refused file left nothing"
 
 
 def test_a_hold_placed_while_a_delete_holds_the_vault_waits_and_the_next_delete_is_kept(admin, admins, vaults):

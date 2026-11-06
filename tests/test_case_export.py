@@ -371,11 +371,14 @@ def test_hostile_names_become_safe_unique_entries_and_the_manifest_keeps_them(db
 
 # --------------------------------------------------------------------------- the stream's end
 
-def _stream(db, people, case, files):
-    """An ExportStream for ``files``, claimed (the owners told), on sessions of the test's database."""
+def _stream(db, people, case, files, unlocked=None):
+    """An ExportStream for ``files``, claimed (the owners told), on sessions of the test's database; ``unlocked``
+    ({vault id: receipt}) are the vault passwords given at the fetch."""
     from sqlalchemy.orm import sessionmaker
-    out = _prepare(db, people, case, files)
-    case_, export, entries = ce.claim(db, case.id, out["export_id"], people.uma, session_hash=SESSION)
+    unlock = ",".join(f"{v}={r}" for v, r in (unlocked or {}).items()) or None
+    out = _prepare(db, people, case, files, unlock=unlock)
+    case_, export, entries = ce.claim(db, case.id, out["export_id"], people.uma, unlocked_given=unlocked,
+                                      session_hash=SESSION)
     make = sessionmaker(bind=db.get_bind(), autoflush=False)
     return ce.ExportStream(make, case_.id, export.id, people.uma.id, entries), out["export_id"]
 
@@ -429,36 +432,53 @@ def test_an_export_stops_when_the_cases_access_ends(db, people, storage, codes):
 
 def test_a_file_no_longer_in_the_case_when_its_turn_comes_is_left_out_and_listed(db, people, storage, codes):
     """Each file is checked again as the fetch checked it: one moved out of the case's folder, one in a vault the
-    case was narrowed away from, and one in a vault given a password the fetch did not open are left out of the
-    archive and listed as having left the case; the file still in the case is exported."""
+    case was narrowed away from, one in a vault given a password the fetch did not open, and one in a vault whose
+    password the fetch opened and that was changed since are left out of the archive and listed as having left the
+    case, by their id and status alone (no name, folder path, or who uploaded or changed them, in the JSON or the
+    CSV manifest); the file still in the case is exported."""
     from app.core import cases
     board = _folder(db, people.v1)
     side = _folder(db, people.v1, None, "Side")
     other = _vault(db, people.olga)
+    pv = _vault(db, people.olga, password="argon2-hash")
     stays = _file(db, storage, people.v1, name="a.txt", content=b"alpha-stays", folder=board)
     moved = _file(db, storage, people.v1, name="b.txt", content=b"bravo-moved", folder=board)
     narrowed = _file(db, storage, people.v2, name="c.txt", content=b"charlie-narrowed")
     locked = _file(db, storage, other, name="d.txt", content=b"delta-locked")
-    case = _case(db, people, [{"kind": "folder", "target_id": board.id}, *_vaults(people.v2, other)],
+    relocked = _file(db, storage, pv, name="e.txt", content=b"echo-relocked")
+    case = _case(db, people, [{"kind": "folder", "target_id": board.id}, *_vaults(people.v2, other, pv)],
                  can_export=True)
-    parts, _export_id = _stream(db, people, case, [stays, moved, narrowed, locked])
+    parts, _export_id = _stream(db, people, case, [stays, moved, narrowed, locked, relocked],
+                                unlocked={str(pv.id): _receipt(case, pv, people.uma)})
+    assert {e.file_id: e.unlocked for e in parts.entries}[str(relocked.id)] is True, "opened at the fetch"
     moved.folder_id = side.id
     other.password_hash = "argon2-hash"
+    pv.password_hash = "argon2-changed-since"
     db.commit()
     cases.narrow(db, case, by=people.uma, scope=[{"kind": "folder", "target_id": board.id},
-                                                  *_vaults(other)])
+                                                  *_vaults(other, pv)])
     db.commit()
     data = b"".join(parts)
     parts.close()
     archive = _archive(data)
-    status = {r["file_id"]: (r["status"], r["entry"]) for r in _manifest(archive)["files"]}
-    assert status[str(stays.id)][0] == ca.LIVE and archive.read(status[str(stays.id)][1]) == b"alpha-stays"
-    for f in (moved, narrowed, locked):
-        assert status[str(f.id)] == (ce.LEFT_CASE, None), f.name
-    assert all(x not in data for x in (b"bravo-moved", b"charlie-narrowed", b"delta-locked"))
+    rows = {r["file_id"]: r for r in _manifest(archive)["files"]}
+    assert rows[str(stays.id)]["status"] == ca.LIVE and archive.read(rows[str(stays.id)]["entry"]) == b"alpha-stays"
+    assert (rows[str(stays.id)]["name"], rows[str(stays.id)]["path"]) == ("a.txt", "Board minutes")
+    left = (moved, narrowed, locked, relocked)
+    for f in left:
+        row = rows[str(f.id)]
+        assert (row["status"], row["entry"]) == (ce.LEFT_CASE, None), f.name
+        assert (row["name"], row["path"], row["uploaded_by"], row["changed_by"], row["uploaded_at"],
+                row["changed_at"]) == (None, "", None, None, None, None), f.name
+    table = {r["file_id"]: r for r in csv.DictReader(io.StringIO(archive.read("manifest.csv").decode("utf-8")))}
+    for f in left:
+        assert (table[str(f.id)]["status"], table[str(f.id)]["name"], table[str(f.id)]["path"]) == \
+            (ce.LEFT_CASE, "", ""), f.name
+    assert all(x not in data for x in (b"bravo-moved", b"charlie-narrowed", b"delta-locked", b"echo-relocked",
+                                       b"Side"))
     assert storage.opened == [str(stays.id)], "nothing of the files that left the case was read"
     (row,) = _rows(db, "case_export_completed")
-    assert row.details["left_case"] == 3 and row.details["file_count"] == 1 and row.details["missing"] == 0
+    assert row.details["left_case"] == 4 and row.details["file_count"] == 1 and row.details["missing"] == 0
 
 
 def test_a_file_gone_since_the_fetch_is_listed_missing_and_one_kept_since_is_exported(db, people, storage, codes):

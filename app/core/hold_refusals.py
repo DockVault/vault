@@ -23,7 +23,7 @@ undone, and what was kept must still open. So:
   approval committed before it is seen and one placed meanwhile waits for the deleting transaction; the delete
   asks before it locks any vault row, the order a placing takes them in.
 
-A per-person erase waits while any hold stands or any case is open (compliance_retention.holds_back), the
+A per-person erase waits while any confirmed hold stands or any case is open (compliance_retention.holds_back), the
 custodian's included; an erase is refused anyway while an account has the name.
 """
 from __future__ import annotations

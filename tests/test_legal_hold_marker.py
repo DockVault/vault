@@ -119,6 +119,37 @@ def test_the_marker_goes_when_nothing_is_held_or_kept(db, monkeypatch):
     assert marker.sync(db) is False and _row(db) == []
 
 
+def test_the_removal_runs_the_detect_query_again_and_keeps_the_marker_of_a_hold_there_by_then(db, monkeypatch):
+    """What sync read before the removal can be older than the removal (a placing that committed in between): the
+    removal itself finds the hold, and the marker stays. test_legal_hold_marker_race_live.py runs the race on
+    Postgres."""
+    monkeypatch.setattr(recording_marker, "running_version", lambda: "0.34.0")
+    db.add(m.LegalHoldVault(case_id=uuid.uuid4(), vault_id=uuid.uuid4(), placed_by_username="a"))
+    assert marker.sync(db) is True
+    db.commit()
+    monkeypatch.setattr(marker, "holds_or_kept", lambda db_: False)     # what was read before the placing committed
+    assert marker.sync(db) is True and len(_row(db)) == 1
+
+
+def test_the_marker_is_written_with_one_upsert_that_keeps_when_it_was_first_written(db, monkeypatch):
+    from sqlalchemy import text
+    monkeypatch.setattr(recording_marker, "running_version", lambda: "0.34.0")
+    db.add(m.HeldFile(id=uuid.uuid4(), vault_id=uuid.uuid4(), storage_path="p"))
+    first = datetime(2026, 11, 1, 9, 0)
+    assert marker.sync(db, now=first) is True
+    db.execute(text("UPDATE data_requirements SET requires_at_least = '0.33.9', reason = 'old', undo = NULL"))
+    statements = []
+    real = db.execute
+    monkeypatch.setattr(db, "execute", lambda stmt, *a, **k: statements.append(str(stmt)) or real(stmt, *a, **k))
+    assert marker.sync(db, now=datetime(2026, 11, 5, 9, 0)) is True
+    ((_key, needs, reason, undo),) = _row(db)
+    assert needs == "0.34.0" and reason.startswith("Legal holds keep") and "Release every legal hold" in undo
+    assert str(db.execute(text("SELECT since FROM data_requirements")).scalar()).startswith("2026-11-01 09:00")
+    writes = [s for s in statements if "data_requirements" in s and not s.lstrip().upper().startswith(("SELECT",
+                                                                                                         "CREATE"))]
+    assert len(writes) == 1 and "ON CONFLICT (key) DO UPDATE" in writes[0], writes
+
+
 @pytest.mark.parametrize("running, needs", [("0.33.2", "0.33.2"), ("0.34.0", "0.34.0"), ("0.34.1", "0.34.0"),
                                              ("", "0.34.0")])
 def test_the_marker_asks_for_the_release_with_the_holds_or_an_earlier_builds_own_version(monkeypatch, running,

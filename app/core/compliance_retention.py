@@ -20,10 +20,11 @@ A case's rows are also kept as they are, where they are (retention.register_keep
 a day that holds one as rows, and a per-person erase, a removal of earlier values or the shortening of addresses
 leaves them unchanged.
 
-What every such path waits for (person_erase.register_wait): while a legal hold stands or a case is open, an
-erase, a removal of earlier values, the shortening of addresses, and the deletion of ended invitations, ended
-one-time proofs, old notifications and the sealed name of an erase that ended wait (holds_back), checked in the
-transaction that would change or delete, in its turn with the holds and cases (legal_holds.take_turn).
+What every such path waits for (person_erase.register_wait): while a confirmed legal hold stands or a case is open
+(a case holding only a hold nobody has confirmed yet aside), an erase, a removal of earlier values, the shortening
+of addresses, and the deletion of ended invitations, ended one-time proofs, old notifications and the sealed name of
+an erase that ended wait (holds_back), checked in the transaction that would change or delete, in its turn with the
+holds and cases (legal_holds.take_turn).
 """
 from __future__ import annotations
 
@@ -107,16 +108,23 @@ def _numbered(rows) -> tuple:
 
 
 def holds_back(db, now: datetime) -> Optional[str]:
-    """Why every path that changes or deletes what a hold or a case may need waits now, or None: a legal hold stands
-    (placed, neither released nor lapsed), a case is open (not closed, whatever its state), or a step that would
-    place a hold or open a case gave up waiting for its turn a moment ago (legal_holds.want_turn). Any hold and any
-    case, not only those of the rows a path would touch: an audit row of what was done in a held vault need not carry
-    the case. In the caller's transaction, after taking the turn of holds and deletions shared, so a hold or a case
-    committed before this check is seen, and one placed meanwhile waits until the caller's transaction ends.
+    """Why every path that changes or deletes what a hold or a case may need waits now, or None: a confirmed legal
+    hold stands (placed, confirmed by a second person, neither released nor lapsed), a case is open (not closed,
+    whatever its state, but one that holds only a hold nobody has confirmed yet), or a step that would place a hold,
+    confirm one or open a case gave up waiting for its turn a moment ago (legal_holds.want_turn). Any such hold and
+    any such case, not only those of the rows a path would touch: an audit row of what was done in a held vault need
+    not carry the case. In the caller's transaction, after taking the turn of holds and deletions shared, so a hold,
+    a confirmation or a case committed before this check is seen, and one made meanwhile waits until the caller's
+    transaction ends.
+
+    A hold nobody has confirmed holds nothing back here: one person places it alone, and every erase in the
+    deployment would wait for it until it lapses. It keeps what is deleted from its vaults all the same
+    (app/core/kept_tables.py), and from its confirmation on it holds back as any other.
 
     The reason names the cases (at most NAMED_CASES, then how many more): an erase, a removal of earlier values and
     the other paths that wait show it to the administrators, who see the cases, so they know which one to wait
     for."""
+    from app.core import case_rules
     from app.core import legal_holds
     from app.core.models import ComplianceCase, LegalHoldVault
     legal_holds.take_turn(db, shared=True)
@@ -124,7 +132,8 @@ def holds_back(db, now: datetime) -> Optional[str]:
         return "a legal hold or a compliance case is being asked for"
     held = (db.query(LegalHoldVault.case_id, ComplianceCase.number)
             .outerjoin(ComplianceCase, ComplianceCase.id == LegalHoldVault.case_id)
-            .filter(LegalHoldVault.released_at.is_(None), LegalHoldVault.lapsed_at.is_(None)).distinct().all())
+            .filter(LegalHoldVault.released_at.is_(None), LegalHoldVault.lapsed_at.is_(None),
+                    LegalHoldVault.confirmed_at.isnot(None)).distinct().all())
     if held:
         numbers, unnumbered = _numbered(held)
         if not numbers:
@@ -132,7 +141,9 @@ def holds_back(db, now: datetime) -> Optional[str]:
         if len(numbers) == 1 and not unnumbered:
             return f"the legal hold of case {numbers[0]} stands"
         return f"the legal holds of {_cases(numbers, unnumbered)} stand"
-    open_cases = db.query(ComplianceCase.id, ComplianceCase.number).filter(ComplianceCase.closed_at.is_(None)).all()
+    # A hold-only case is open while its hold stands: once confirmed, that hold is counted above.
+    open_cases = db.query(ComplianceCase.id, ComplianceCase.number).filter(
+        ComplianceCase.closed_at.is_(None), ComplianceCase.status != case_rules.HOLD_ONLY).all()
     if open_cases:
         numbers, unnumbered = _numbered(open_cases)
         if not numbers:

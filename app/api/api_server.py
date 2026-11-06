@@ -31,7 +31,6 @@ from sqlalchemy.orm import Session
 import io
 import os
 import shutil
-import traceback
 from pathlib import Path
 
 # Importing this module is itself the API launch contract (including ASGI import-string
@@ -224,10 +223,13 @@ async def _http_exception_handler(request: StarletteRequest, exc: StarletteHTTPE
     detail can embed SQL text, DB schema, or storage paths. Those responses are produced inside
     the ASGI exception layer and flow back out already-serialized, so the header middleware can't
     rewrite them. Intercept here: for a 500, emit a generic message + a server-side-logged
-    correlation id and never the raw detail. Every other status renders exactly as before."""
+    correlation id and never the raw detail. Every other status renders exactly as before.
+
+    The log has the id, and the class and place of the 500 and of the error that led to it
+    (app/core/safe_log.py, log_failure), never the detail: the same text the answer leaves out."""
     if exc.status_code == 500:
-        error_id = str(uuid.uuid4())
-        print(f"[ERROR] Sanitized HTTP 500 (ID: {error_id}): {exc.detail}")
+        from app.core.safe_log import log_failure
+        error_id = log_failure("Sanitized HTTP 500", exc)
         return JSONResponse(
             status_code=500,
             content={"detail": "An internal error occurred. Please contact support if the problem persists.",
@@ -7117,17 +7119,21 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
         legal_holds.after_starter_change(db, user, "password")
     else:
         password_origin.set_by_self(user)
-    db.commit()
     try:
-        # _revoke_sessions mutates session rows but does NOT commit — commit it ourselves so the durable
-        # DB-level revocation persists (a hijacked session must not outlive the reset).
+        # The account's sessions end in the transaction that writes the password: both commit, or neither does
+        # (a hijacked session must not outlive the reset). _revoke_sessions mutates the session rows but does not
+        # commit. On a failure nothing changed, the link is not used, and the person is told to try it again.
         _revoke_sessions(db, user_id=user.id, actor_username="password-reset")   # force re-login everywhere
         db.commit()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         try:
             db.rollback()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
+        from app.core.safe_log import log_failure
+        error_id = log_failure("password reset not completed", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"The password was not changed: try the link again (error {error_id}).")
     try:
         AuditLogger(db).log_action(action="password_reset_completed", status="success", user=user,
                                    ip_address=ip, details={"link_made_by_other": bool(made_by_other)})
@@ -9578,8 +9584,8 @@ async def storage_stats(
     limit — reported so an operator can see how much has been promised, NOT enforced against this
     limit: an empty vault costs nothing until files land in it."""
     from sqlalchemy import func as _f
-    from app.services.vault_service import deployment_storage_used, deployment_storage_limit_bytes
-    used = deployment_storage_used(db)
+    from app.services.vault_service import vaults_stored_bytes, deployment_storage_limit_bytes
+    used = vaults_stored_bytes(db)
     total = available = 0
     try:
         usage = shutil.disk_usage(settings.file_storage_path)
@@ -9597,7 +9603,8 @@ async def storage_stats(
         "total": total,
         "used": used,
         "kept_for_cases": kept,
-        # What the vaults' files take on the disk: their counted bytes and the kept ones.
+        # What the vaults' files take on the disk: their counted bytes and the kept ones. The
+        # deployment's storage limit counts both (vault_service.deployment_storage_used).
         "on_disk_bytes": used + kept["bytes"],
         "available": available,
         "allocated_bytes": allocated,
@@ -19476,11 +19483,11 @@ async def rotate_vault_encryption_key(
         raise
     except Exception as e:
         db.rollback()
-        print(f"ERROR: Key rotation failed for vault {vault_id}: {str(e)}")
+        # Logged by the 500 handler: an id, the class and the place, never the message.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Key rotation failed: {str(e)}"
-        )
+            detail="Key rotation failed."
+        ) from e
 
 
 @app.get("/vaults/{vault_id}/key-history")
@@ -19550,11 +19557,11 @@ async def get_vault_key_history(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"ERROR: Failed to get key history for vault {vault_id}: {str(e)}")
+        # Logged by the 500 handler: an id, the class and the place, never the message.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve key history: {str(e)}"
-        )
+            detail="Failed to retrieve key history."
+        ) from e
 
 
 # File Operation Endpoints
@@ -20471,8 +20478,7 @@ async def upload_file(
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
             except Exception as e:
-                # Log error
-                print(f"Error during upload: {e}")
+                # Logged by the 500 handler below (an id, the class and the place, never the message).
                 audit_logger.log_action(
                     action='file_upload',
                     status='failure',
@@ -20484,8 +20490,8 @@ async def upload_file(
                 )
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Upload failed: {str(e)}"
-                )
+                    detail="Upload failed."
+                ) from e
                     
             finally:
 
@@ -22016,7 +22022,7 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
         fail_chunk_session(db, session, sdir, e)
         _release_web_upload_name(vault_id, _lock_folders, _lock_name, _lock_session)
-        raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to finalize upload.") from e
     except PermissionDeniedError as e:
         # A permission denial is a 403, not a 500 — and it isn't a corrupt upload, so leave
         # the session/blob for the TTL cleanup rather than force-failing it here.
@@ -22027,8 +22033,8 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
         # chunks now, rather than leaving the plaintext name + chunks on disk until the TTL sweep.
         fail_chunk_session(db, session, sdir, e)
         _release_web_upload_name(vault_id, _lock_folders, _lock_name, _lock_session)
-        print(f"Error finalizing chunked upload: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {str(e)}")
+        # Logged by the 500 handler: an id, the class and the place, never the message.
+        raise HTTPException(status_code=500, detail="Failed to finalize upload.") from e
 
     # Success: delete the upload session row entirely. It stored the plaintext
     # filename/MIME (working state during the transfer); keeping it as 'completed'
@@ -22908,14 +22914,11 @@ async def download_file(
             })
         except Exception:
             pass
-        import traceback
-        print(f"[ERROR] Download failed - Exception type: {type(e).__name__}")
-        print(f"[ERROR] Download failed - Exception message: {str(e)}")
-        traceback.print_exc()
+        # Logged by the 500 handler: an id, the class and the place, never the message.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to download file: {str(e)}",
-        )
+            detail="Failed to download file.",
+        ) from e
     finally:
         # Before response handoff, this function owns cleanup. Afterwards the
         # streaming generator owns the terminal transition, the open blob, and the local active
@@ -23921,7 +23924,7 @@ async def delete_folder(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vault or folder not found")
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete folder: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete folder.") from e
 
 
 # ============================================================================
@@ -24113,9 +24116,9 @@ async def logout(
             session, _ended = _end_web_session(db, session_token)
             if session:
                 session_invalidated = True
-                print(f"🔓 Session invalidated for user {current_user.username} (session_token: {session_token[:16]}...)")
+                print(f"🔓 Session invalidated for user {current_user.username} (session {hash_session_token(session_token)[:8]}..., as stored)")
             else:
-                print(f"⚠️ Session not found in database for token {session_token[:16]}...")
+                print(f"⚠️ Session not found in database for token {hash_session_token(session_token)[:8]}... (as stored)")
             # Denylist the token so it stops working IMMEDIATELY for the rest of its life
             # (regular-user JWTs aren't re-validated against the session row each request).
             import time as _time
@@ -24318,9 +24321,8 @@ async def get_monitoring_metrics(
         return handle_conditional_response(request, metrics_data)
         
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error fetching metrics: {str(e)}")
+        # Logged by the 500 handler: an id, the class and the place, never the message.
+        raise HTTPException(status_code=500, detail="Error fetching metrics.") from e
 
 
 @app.post("/api/operations/{operation_id}/cancel")
@@ -24400,9 +24402,8 @@ async def get_security_metrics(
         
         return metrics
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error fetching security metrics: {str(e)}")
+        # Logged by the 500 handler: an id, the class and the place, never the message.
+        raise HTTPException(status_code=500, detail="Error fetching security metrics.") from e
 
 
 @app.get("/api/security/alerts")
@@ -24449,9 +24450,8 @@ async def get_security_alerts(
             ]
         }
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error fetching security alerts: {str(e)}")
+        # Logged by the 500 handler: an id, the class and the place, never the message.
+        raise HTTPException(status_code=500, detail="Error fetching security alerts.") from e
 
 
 @app.post("/api/security/alerts/{alert_id}/resolve")
@@ -24480,9 +24480,8 @@ async def resolve_security_alert(
         
         return {"message": "Alert resolved successfully"}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error resolving security alert: {str(e)}")
+        # Logged by the 500 handler: an id, the class and the place, never the message.
+        raise HTTPException(status_code=500, detail="Error resolving security alert.") from e
 
 
 @app.get("/api/security/user-activity/{user_id}")
@@ -24522,12 +24521,10 @@ async def get_user_security_activity(
 
         return analysis
     except Exception as e:
-        # Never echo str(e) — it can embed SQL / schema / storage paths. Log server-side, return generic.
-        error_id = str(uuid.uuid4())
-        print(f"[ERROR] user-activity analysis failed (ID: {error_id}): {e}")
-        traceback.print_exc()
+        # Never echo str(e) — it can embed SQL / schema / storage paths. The 500 handler logs an id, the class and
+        # the place, never the message, and answers with the id.
         raise HTTPException(status_code=500,
-                            detail="An internal error occurred while analyzing user activity.")
+                            detail="An internal error occurred while analyzing user activity.") from e
 
 
 # ============================================================================
@@ -24672,12 +24669,11 @@ async def grant_user_permission(
         }
     except Exception as exc:
         db.rollback()
-        error_id = str(uuid.uuid4())
-        print(f"[ERROR] permission grant failed (ID: {error_id}): {exc}")
+        # The 500 handler logs an id, the class and the place, never the message, and answers with the id.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Permission update failed (reference: {error_id})",
-        )
+            detail="Permission update failed.",
+        ) from exc
 
 
 @app.delete("/permissions/users/{user_id}/revoke/{group_name}")
@@ -24734,12 +24730,11 @@ async def revoke_user_permission(
         }
     except Exception as exc:
         db.rollback()
-        error_id = str(uuid.uuid4())
-        print(f"[ERROR] permission revoke failed (ID: {error_id}): {exc}")
+        # The 500 handler logs an id, the class and the place, never the message, and answers with the id.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Permission update failed (reference: {error_id})",
-        )
+            detail="Permission update failed.",
+        ) from exc
 
 
 # All imported routers and monolithic routes have now applied their guards.

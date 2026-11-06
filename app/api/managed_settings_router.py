@@ -49,6 +49,7 @@ from app.core import setting_changes
 from app.core import settings_registry as registry
 from app.core.database import get_db
 from app.core.models import User
+from app.core.safe_log import log_failure
 
 router = APIRouter(tags=["Managed settings"])
 
@@ -217,9 +218,10 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001 -- no change without its audit row
         db.rollback()
-        registry._say(f"Warning: a change of {key} was not saved ({type(exc).__name__}: {exc})")
+        # The class, the place and an id, never the message: a database error's carries the statement's values.
+        error_id = log_failure(f"a change of {spec.key} was not saved", exc)
         raise HTTPException(status_code=503, detail="The change was not saved: its audit record could not be "
-                                                    "written. Nothing was changed.")
+                                                    f"written. Nothing was changed (error {error_id}).")
     if outcome.status == "applied":
         registry.refresh()
     setting_changes.announce_outcome(outcome, current_user.username)
@@ -254,9 +256,9 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:  # noqa: BLE001 -- no cancel without its audit row
         db.rollback()
-        registry._say(f"Warning: a cancel of a waiting change was not saved ({type(exc).__name__}: {exc})")
+        error_id = log_failure("a cancel of a waiting change was not saved", exc)
         raise HTTPException(status_code=503, detail="The change was not cancelled: its audit record could not "
-                                                    "be written. It is still waiting.")
+                                                    f"be written. It is still waiting (error {error_id}).")
     details = {"key": out["key"], "old": out["old"], "new": out["new"], "requested_by": out["requested_by"]}
     setting_changes.announce(setting_changes.CANCELLED_BY_ADMIN, details, current_user.username)
     return {"status": "cancelled", "change": out}

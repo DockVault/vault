@@ -1,6 +1,7 @@
 """Settings -> Storage shows what legal holds keep after a deletion ("Kept for cases"), in a real browser.
 
-Kept bytes are on the deployment's disk and in no vault's size, so the storage panel says so beside its totals
+Kept bytes are on the deployment's disk and count toward its storage limit, but in no vault's size, so the storage
+panel says so beside its totals
 (static/js/compliance.js, renderKeptForCases, fed by GET /storage/stats' kept_for_cases). A kept row and the hold
 that keeps it are written straight into the database here (a vault id nothing else uses), and removed after.
 """
@@ -56,7 +57,7 @@ def test_the_storage_panel_says_what_is_kept_for_cases(page: Page, admin_creds, 
     line = page.locator("#storage-stat-kept")
     expect(line).to_be_visible(timeout=10000)
     expect(line).to_contain_text(f"Kept for cases: {files} file" + ("" if files == 1 else "s"))
-    expect(line).to_contain_text("in no vault's size")
+    expect(line).to_contain_text("counted in the deployment's storage limit, in no vault's size")
     # The line sits right after the allocated figure it qualifies.
     assert page.evaluate("() => document.getElementById('storage-stat-allocated').nextElementSibling.id") == \
         "storage-stat-kept"
