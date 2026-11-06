@@ -598,7 +598,7 @@ def test_a_guessed_origin_is_not_described(tmp_path, monkeypatch, capsys):
     assert backups, "a hop planned from a guessed origin proceeded without a backup"
 
 
-def test_a_backup_that_captured_no_data_is_not_a_backup(tmp_path, monkeypatch):
+def test_a_backup_that_captured_no_data_is_not_a_backup(tmp_path, monkeypatch, capsys):
     """The gate's worst failure would be accepting an empty bundle.
 
     `_do_backup` skipped a volume that was not found -- right for the optional brand volume, and it
@@ -613,6 +613,7 @@ def test_a_backup_that_captured_no_data_is_not_a_backup(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit):
         tool._do_backup(tool._load_env(), argparse.Namespace(backup_dir=str(tmp_path / "b")))
+    assert "no archive was made" in " ".join(capsys.readouterr().out.split())
 
 
 def _matrix_with_backport():

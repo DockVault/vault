@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,9 @@ dv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dv)
 # The real one, kept before the fixture below stands in for it (a test that stubs the commands it runs uses it).
 _TIGHTEN_SECRET_FILE = dv.tighten_secret_file
+# What the tool asks Docker about the deployment's containers, as loaded (before conftest.py answers a unit test).
+_ASKS_DOCKER_ABOUT_THE_DEPLOYMENT = {name: getattr(dv, name) for name in (
+    "container_running", "container_paused", "container_exists", "admin_bootstrap_done", "read_key_canary")}
 
 
 @pytest.fixture(autouse=True)
@@ -1644,7 +1648,7 @@ def test_restore_refuses_missing_archive(tmp_path, monkeypatch):
         tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
 
 
-def test_backup_aborts_and_removes_partial_on_tar_failure(tmp_path, monkeypatch):
+def test_backup_aborts_and_removes_partial_on_tar_failure(tmp_path, monkeypatch, capsys):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(
         dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-fail", deployment_id="f"))) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
@@ -1653,6 +1657,8 @@ def test_backup_aborts_and_removes_partial_on_tar_failure(tmp_path, monkeypatch)
     with pytest.raises(SystemExit):
         tool._do_backup(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")),
                         argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    # it stopped at the archive, not before it
+    assert "failed to archive volume dockvault-vault-fail_vault_pg_data" in " ".join(capsys.readouterr().out.split())
     # the partial, secret-bearing bundle (it holds a copy of .env) must be gone - no manifest left behind
     assert not list((tmp_path / "backups").glob("dockvault-*")), "a failed backup must leave no partial bundle"
 
@@ -1693,6 +1699,101 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     if os.name != "nt":
         assert (os.stat(bundle / "env").st_mode & 0o077) == 0, "the backup .env must be mode-600"
         assert (os.stat(bundle).st_mode & 0o077) == 0, "the bundle dir must be owner-only (0700)"
+
+
+# A `docker` that answers as a host where the deployment is up answers for its containers (each of them runs, none is
+# paused), and refuses everything else, `docker compose pause` included: there is no compose file in a test's folder.
+# Each call is a line in the log.
+_DOCKER_OF_A_HOST_WHERE_THE_DEPLOYMENT_RUNS = """#!/bin/sh
+echo "$*" >> {log}
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+    {names})
+        case "$*" in
+            *State.Running*) echo true; exit 0;;
+            *State.Paused*) echo false; exit 0;;
+        esac;;
+esac
+echo "not answered here" >&2
+exit 1
+"""
+
+
+def _docker_of_a_host_where_the_deployment_runs(tmp_path, monkeypatch):
+    """Put that stand-in first on PATH, check that it is the docker this test's processes run, and return its log
+    (no calls in it yet)."""
+    bin_dir, log = tmp_path / "bin", tmp_path / "docker-calls.log"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(_DOCKER_OF_A_HOST_WHERE_THE_DEPLOYMENT_RUNS.format(
+        log=shlex.quote(str(log)), names="|".join(dv.BACKUP_PAUSED_SERVICES)), encoding="utf-8")
+    (bin_dir / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    for name in dv.BACKUP_PAUSED_SERVICES:
+        answer = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name], capture_output=True,
+                                text=True, timeout=20)
+        assert (answer.returncode, answer.stdout.strip()) == (0, "true")
+    log.unlink()
+    return log
+
+
+def _calls_naming_the_deployment(log):
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return [c for c in calls if set(c.split()) & set(dv.BACKUP_PAUSED_SERVICES)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the stand-in docker is a shell script")
+@pytest.mark.parametrize("call", [
+    ("container_running", ("vault-db",), False),
+    ("container_paused", ("vault-db",), None),
+    ("container_exists", ("vault-db",), False),
+    ("admin_bootstrap_done", ("vault-db", dv.PG_USER, dv.PG_DB, "a-test-password"), None),
+    ("read_key_canary", ("vault-db", dv.PG_USER, dv.PG_DB, "a-test-password"), None),
+], ids=lambda call: call[0])
+def test_a_unit_test_asks_no_docker_about_the_deployments_containers(tmp_path, monkeypatch, call):
+    """What the tool asks Docker about the deployment's containers by their fixed names is answered "nothing runs" in
+    a unit test (conftest.py), never by the Docker of the host the test runs on."""
+    log = _docker_of_a_host_where_the_deployment_runs(tmp_path, monkeypatch)
+    name, args, nothing_runs = call
+    assert getattr(dv, name)(*args) == nothing_runs
+    assert _calls_naming_the_deployment(log) == []
+
+
+@pytest.mark.docker
+def test_a_test_marked_docker_asks_the_real_docker():
+    """The "nothing runs" answers are for unit tests: one marked docker drives a real engine and keeps its answers."""
+    assert {name: getattr(dv, name) for name in _ASKS_DOCKER_ABOUT_THE_DEPLOYMENT} == _ASKS_DOCKER_ABOUT_THE_DEPLOYMENT
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the stand-in docker is a shell script")
+@pytest.mark.parametrize("case", ["written", "an-archive-fails", "no-volume-found"])
+def test_a_unit_backup_takes_nothing_from_a_host_where_the_deployment_runs(tmp_path, monkeypatch, capsys, case):
+    """The full suite runs every test, unit ones too, on a host where a deployment is up. A unit backup there reaches
+    the step it tests: it does not find that deployment running, pause it, or stop because the pause failed."""
+    log = _docker_of_a_host_where_the_deployment_runs(tmp_path, monkeypatch)
+    root = tmp_path / "deployment"
+    root.mkdir()
+    (root / ".env").write_text("\n".join(dv.build_env_lines(
+        dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-g1", deployment_id="g1"))) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    found = {"written": lambda name: not name.endswith("_vault_brand"),
+             "an-archive-fails": lambda name: name.endswith("_vault_pg_data"),
+             "no-volume-found": lambda name: False}[case]
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: found(name))
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: case != "an-archive-fails"
+                        and _tgz(Path(bundle) / archive) and True)
+    args = argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups"))
+    env = dv.parse_env((root / ".env").read_text(encoding="utf-8"))
+    if case == "written":
+        tool._do_backup(env, args)
+        assert len(list((tmp_path / "backups").glob("dockvault-dockvault-vault-g1-*"))) == 1
+    else:
+        with pytest.raises(SystemExit):
+            tool._do_backup(env, args)
+        said = " ".join(capsys.readouterr().out.split())
+        assert {"an-archive-fails": "failed to archive volume dockvault-vault-g1_vault_pg_data",
+                "no-volume-found": "no archive was made"}[case] in said
+    assert _calls_naming_the_deployment(log) == []
 
 
 @pytest.mark.docker
