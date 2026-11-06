@@ -307,6 +307,32 @@ def test_one_holder_past_its_share_waits_while_another_is_admitted_at_once():
     run_coroutine(_go())
 
 
+def test_its_share_still_holds_once_one_of_its_transfers_ends_while_another_runs():
+    """The holder's entry counts every acquire using it, so it outlives the end of any one of them while another
+    still runs. Were it forgotten at the first release, the holder's next acquire would start a share of its own,
+    and the holder would run past its share."""
+    async def _go():
+        gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=5)
+        first = await gate.acquire(holder="a", share=2)
+        second = await gate.acquire(holder="a", share=2)
+        third = asyncio.create_task(gate.acquire(holder="a", share=2))
+        await asyncio.sleep(0.05)
+        assert not third.done(), "a holder took more than its share"
+        gate.release(first)
+        third_token = await asyncio.wait_for(third, timeout=1)
+        # Two of its transfers run (the second and the third): one more waits for one of them to end.
+        fourth = asyncio.create_task(gate.acquire(holder="a", share=2))
+        await asyncio.sleep(0.05)
+        assert not fourth.done(), "once one of its transfers ended, the holder ran past its share"
+        assert gate.stats()["in_flight"] == 2 and gate.stats()["waiting"] == 1
+        gate.release(second)
+        fourth_token = await asyncio.wait_for(fourth, timeout=1)
+        for t in (third_token, fourth_token):
+            gate.release(t)
+        assert gate.stats()["in_flight"] == 0 and gate._holders == {} and gate._holder_of == {}
+    run_coroutine(_go())
+
+
 def test_a_holder_past_its_share_for_the_whole_wait_is_told_to_come_back():
     async def _go():
         gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=0.2)
