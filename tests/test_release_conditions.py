@@ -361,7 +361,9 @@ def test_the_text_on_older_images_names_every_record_kept_in_data_requirements()
              "app/core/recording_marker.py": (recording_marker.KEY, "recording levels below Full"),
              "app/core/compliance_marker.py": (compliance_marker.KEY, "open compliance cases and the records of "
                                                                       "compliance access while they must be kept")}
-    writes = re.compile(r"INSERT INTO \{(?:\w+\.)?TABLE\} \(key, requires_at_least")
+    # A module writes the row with an INSERT of its own, or through recording_marker.write_row, the one upsert the
+    # markers that write theirs the same way share (the legal holds' marker does).
+    writes = re.compile(r"INSERT INTO \{(?:\w+\.)?TABLE\} \(key, requires_at_least|\bwrite_row\(")
     writers = sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "app").rglob("*.py")
                      if writes.search(path.read_text(encoding="utf-8")))
     assert writers == sorted(named)
