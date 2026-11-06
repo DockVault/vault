@@ -1720,6 +1720,26 @@ def env_copy_names(root, label):
             yield name
 
 
+def kept_env_copies(root, label):
+    """The kept or archived copies of set `label`'s .env in `root` (the names env_copy_names gives: .env.<label>, then
+    .env.<label>.1, .2, ...), the newest first: by the number, as a number (.10 after .9, which a sort by text puts
+    first), and .env.<label> itself last. A name with any other ending (.env.<label>.x is another set's, whose
+    prefix is <label>.x) is not one of them. Plain files only."""
+    base = ".env." + label
+    found = []
+    for path in glob.glob(os.path.join(glob.escape(root), glob.escape(base) + "*")):
+        name = os.path.basename(path)
+        if name == base:
+            number = 0
+        elif name.startswith(base + ".") and re.match(r"^[0-9]+$", name[len(base) + 1:]):
+            number = int(name[len(base) + 1:])
+        else:
+            continue
+        if os.path.isfile(path) and not os.path.islink(path):
+            found.append((number, path))
+    return [path for _n, path in sorted(found, reverse=True)]
+
+
 def group_volumes_by_prefix(records):
     """Group parsed volume records into physical SETS by their name prefix, first-seen order:
     [(prefix, [records...]), ...]. Records whose name doesn't parse are grouped under their raw
@@ -3566,6 +3586,48 @@ def admin_bootstrap_done(container, user, db, password, run=subprocess.run):
     return (getattr(r, "stdout", "") or "").strip() == "1"
 
 
+def read_key_canary(container, user, db, password, run=subprocess.run):
+    """The ENCRYPTION_KEY check the vault keeps in its database (app/core/key_canary.py: a Fernet token of a fixed
+    text, sealed under the deployment's ENCRYPTION_KEY at its first start), read from the RUNNING postgres
+    `container` the way probe_pg_password connects (its own IP, PGPASSWORD inside the container, never on the host
+    argv). Returns the token, '' when the database holds none (a set whose app has not started yet), or None when it
+    cannot be read (any docker, exec or SQL error): unknown, never a mismatch."""
+    try:
+        ipr = run(["docker", "exec", container, "hostname", "-i"], capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    parts = (getattr(ipr, "stdout", "") or "").split() if getattr(ipr, "returncode", 1) == 0 else []
+    if not parts:
+        return None
+    try:
+        r = run(["docker", "exec", "-e", "PGPASSWORD", container,
+                 "psql", "-h", parts[0], "-U", user, "-d", db, "-tAc",
+                 "SELECT value->>'ct' FROM system_settings WHERE key='encryption_key_canary'"],
+                capture_output=True, text=True, timeout=30, env=dict(os.environ, PGPASSWORD=password))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    return (getattr(r, "stdout", "") or "").strip()
+
+
+def fernet_token_signed_by(key, token):
+    """True when the Fernet `token` was made under the Fernet `key`: its HMAC-SHA256, under the key's signing half,
+    verifies. Stdlib only (no decryption, so no crypto dependency); a token of a fixed text that verifies under a key
+    proves it is that key. False for another key, a garbled token, or anything not a key."""
+    import hmac
+    try:
+        raw = base64.urlsafe_b64decode((key or "").strip().encode("ascii"))
+        text = (token or "").strip().encode("ascii")
+        data = base64.urlsafe_b64decode(text + b"=" * (-len(text) % 4))
+    except (ValueError, UnicodeEncodeError):
+        return False
+    if len(raw) != 32 or len(data) < 1 + 8 + 16 + 16 + 32 or data[0] != 0x80:
+        return False
+    mac = hmac.new(raw[:16], data[:-32], hashlib.sha256).digest()
+    return hmac.compare_digest(mac, data[-32:])
+
+
 def db_guard_decision(volume_exists_flag, probe_result):
     """The pure guardrail decision: 'proceed' | 'refuse'. A fresh (non-existent) volume always
     proceeds (the .env password is baked in on first init). An existing volume proceeds ONLY on a
@@ -3927,6 +3989,9 @@ class DockVault:
         self._db_was_running = False
         # Set by _verify_env_against_volume: the pg volume the current check is about.
         self._guard_vol = None
+        # Set by _guard_db_secret: how a .env whose database password opens the volume has its ENCRYPTION_KEY checked
+        # too (the vault's key check in the database), or None for no such check (a stand-in probe).
+        self._canary_check = None
 
     # Area handlers — accept an optional argparse namespace so the SAME handler serves both the
     # interactive menu (args=None) and arg-mode (args=<namespace>).
@@ -5339,14 +5404,19 @@ class DockVault:
         return False
 
     def _guard_db_secret(self, env, interactive=False, exists_fn=None, start_fn=None, wait_fn=None,
-                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None, env_is_fresh=False):
+                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None, env_is_fresh=False,
+                         canary_fn=None):
         """Guardrail against the 'existing volume + wrong .env' footgun. No-op (True) for a fresh
         volume. NON-interactive (a script): auto-verify the current .env's DB password and FAIL CLOSED
         on a mismatch/ambiguous result. INTERACTIVE: do NOT auto-wait - present choices (verify / point
         at a .env / new set / destroy / cancel) and run the ~30s DB probe only if the operator asks.
         Never prints a secret. The *_fn hooks are injectable for tests. env_is_fresh flags a .env this
-        setup run just authored and never used, so the interactive 'new set' option can discard it."""
+        setup run just authored and never used, so the interactive 'new set' option can discard it.
+        With the real password probe, a .env whose password opens the volume has its ENCRYPTION_KEY checked
+        too, against the key check the vault keeps in its database (_key_canary_verdict; canary_fn stands in
+        for it in tests): a copy of another .env can share the password and not the key."""
         exists_fn = exists_fn or volume_exists
+        self._canary_check = canary_fn or (self._key_canary_verdict if probe_fn is None else None)
         vol = "%s_vault_pg_data" % volume_prefix(env)
         if not exists_fn(vol):
             return True   # brand-new volume: the .env password is baked in on first init
@@ -5396,10 +5466,26 @@ class DockVault:
         print(pal.paint("  Authenticating VAULT_DB_PASSWORD against the stored database (vault-db)...",
                         "cyan"), flush=True)
         result = probe_fn(DB_CONTAINER, PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+        # The password opens the database; ENCRYPTION_KEY is the other half of the pairing, and the one whose loss
+        # is final. With the database up, its key check is read too: one sealed under another key refuses the .env.
+        # No check there yet (an app never started on this set) or none readable is not a refusal: the app's own
+        # check refuses to start under a wrong key.
+        if result == "ok" and self._canary_check is not None:
+            print(pal.paint("  Checking ENCRYPTION_KEY against the key check in the database...", "cyan"), flush=True)
+            if self._canary_check(env) == "mismatch":
+                result = "encryption_key_mismatch"
         stop_fn()
         if result == "ok":
             stamp_fn(vol, env)   # best-effort: make the next check instant
-        return result if result in ("ok", "mismatch") else "ambiguous"
+        return result if result in ("ok", "mismatch", "encryption_key_mismatch") else "ambiguous"
+
+    def _key_canary_verdict(self, env):
+        """'ok' when the key check in the running vault-db opens under env's ENCRYPTION_KEY, 'mismatch' when it does
+        not, 'unknown' when there is none yet or it cannot be read (read_key_canary, fernet_token_signed_by)."""
+        token = read_key_canary(DB_CONTAINER, PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+        if not token:
+            return "unknown"
+        return "ok" if fernet_token_signed_by(env.get("ENCRYPTION_KEY", ""), token) else "mismatch"
 
     def _resolve_existing_volume(self, env, vol, hooks, env_is_fresh=False):
         """Interactive menu shown when an existing data volume is found. NOTHING starts until the
@@ -5434,6 +5520,17 @@ class DockVault:
                 if not os.path.exists(src):
                     print(pal.paint("  No file at %s." % src, "red"))
                     continue
+                # The current .env is the only key to the set it names: kept first, as a restore keeps it, unless
+                # this run just authored it and it never opened anything (env_is_fresh).
+                if not env_is_fresh:
+                    try:
+                        kept = self._keep_env_before_replacing(src)
+                    except OSError as exc:
+                        print(pal.paint("  Could not keep the current .env (%s), so it was not replaced. Pick "
+                                        "another option." % exc, "red"))
+                        continue
+                    if kept:
+                        print(pal.paint("  Kept the current .env as %s before installing that one." % kept, "cyan"))
                 _copy_secret(src, self._env_path())
                 tighten_secret_file(self._env_path())
                 try:
@@ -5471,10 +5568,29 @@ class DockVault:
             print(pal.paint("  That .env's VAULT_DB_PASSWORD does NOT match this volume - pick another option.", "red"))
         elif result == "encryption_key":
             print(pal.paint("  That .env's ENCRYPTION_KEY isn't a valid key; stored files couldn't be decrypted.", "red"))
+        elif result == "encryption_key_mismatch":
+            print(pal.paint("  That .env's VAULT_DB_PASSWORD opens this volume, but its ENCRYPTION_KEY is not the key "
+                            "the stored data was sealed with - pick another option.", "red"))
         else:
             print(pal.paint("  Couldn't verify (the database didn't start/respond in time) - NOT a confirmed "
                             "mismatch. Try again, or pick another option.", "yellow"))
         return False
+
+    def _keep_env_before_replacing(self, src):
+        """Keep the current .env, before setup installs the .env at `src` over it, as .env.<the set it names> (or
+        .env.<prefix>.1, .2, ...; never over a file already there: _keep_env_copy). Returns the copy's path, or None
+        when there is no .env or it already reads as `src` (nothing would be lost). Raises OSError when it cannot be
+        kept: the caller then does not replace it."""
+        env_now = self._env_path()
+        if not os.path.exists(env_now):
+            return None
+        with open(env_now, "rb") as f:
+            current = f.read()
+        with open(src, "rb") as f:
+            if f.read() == current:
+                return None
+        prefix = volume_prefix(parse_env(current.decode("utf-8", "replace")))
+        return self._keep_env_copy(prefix if valid_volume_prefix(prefix) else "before-setup", current)
 
     def _new_set_from(self, env, current_env_is_fresh=False):
         """Author a fresh set (new prefix + secrets) with its own .env. The old data is left untouched
@@ -5537,6 +5653,10 @@ class DockVault:
         elif kind == "encryption_key":
             print("  ENCRYPTION_KEY in .env is not a valid key, so files stored in this volume could not")
             print("  be decrypted. It must be the ENCRYPTION_KEY this volume's data was created under.")
+        elif kind == "encryption_key_mismatch":
+            print("  VAULT_DB_PASSWORD in .env opens the stored database, but ENCRYPTION_KEY is not the key its")
+            print("  data was sealed with (the key check the vault keeps in the database does not open with")
+            print("  it): files stored in this volume could not be decrypted, and the vault refuses to start.")
         else:  # ambiguous
             print("  Could NOT verify the .env against the volume (the database did not become reachable")
             print("  in time). Refusing to start rather than risk a broken pairing.")
@@ -6716,10 +6836,17 @@ class DockVault:
         # locate the target set's .env: an explicit source, else the auto-archive, else prompt.
         src = getattr(args, "env_source", None) if args else None
         if not src:
-            cands = sorted(glob.glob(os.path.join(self.root, ".env." + target)) +
-                           glob.glob(os.path.join(self.root, ".env." + target + ".*")))
-            if cands:
-                src = cands[-1]
+            cands = kept_env_copies(self.root, target)       # the newest copy first, by its number
+            if len(cands) > 1 and interactive:
+                print(pal.paint("\n  Kept copies of set '%s''s .env (the newest first):" % target, "cyan"))
+                for i, c in enumerate(cands, 1):
+                    print("    %d) %s" % (i, c))
+                sel = ask("Which copy", pal, "1").strip()
+                if not (sel.isdigit() and 1 <= int(sel) <= len(cands)):
+                    self._fail("not a listed copy")
+                src = cands[int(sel) - 1]
+            elif cands:
+                src = cands[0]
             elif interactive:
                 src = ask("Path to the .env for set '%s'" % target, pal).strip()
         if not src or not os.path.exists(src):

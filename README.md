@@ -635,6 +635,13 @@ secrets). Don't edit the prefix by hand; the management tool's **Volumes** menu 
   your current set is kept, its `.env` saved aside.
 - **Repoint** — point the deployment at another set; you must supply that set's matching `.env`, and
   the tool verifies it against the set's data (the same secret check as on start) before switching.
+  Without `--env-source` it takes the newest kept copy (`.env.<set>`, `.env.<set>.1`, `.2`, ... by
+  number), and lists them when run interactively.
+
+The secret check opens the set's database with the `.env`'s `VAULT_DB_PASSWORD`, then checks its
+`ENCRYPTION_KEY` against the key check the vault keeps in that database: a `.env` with the right
+password and another key is refused. When setup's existing-volume menu installs a `.env` you point it
+at, it first keeps the current one as `.env.<set>`, as a restore does.
 
 The **Reset** menu tears the current set down with `docker compose down -v` (a strong, typed
 confirmation — this destroys the data) and moves the `.env` aside so a later setup starts fresh.
