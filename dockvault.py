@@ -1471,6 +1471,13 @@ def parse_single_request_upload_mb(raw):
     return None if value is None else max(0, int(value))
 
 
+def parse_min_free_space_gb(raw):
+    """MIN_FREE_SPACE_GB (a setup flag or an .env value) -> GB to write, or None, so nothing is written and the
+    application's default applies. 'inf' and 'nan' come back None: the application reads them as its default, and
+    format_gb_value cannot write them."""
+    return _finite_float(raw)
+
+
 def format_gb_value(gb):
     """A GB number as an .env value. Deliberately not '%g': that renders large numbers in
     exponent notation ('1e+06'), and a whole number should read as '64', not '64.0'."""
@@ -1744,7 +1751,7 @@ def new_set_config(current_env, new_prefix, new_id):
         "max_storage_gb": parse_max_storage_gb(
             current_env.get("MAX_STORAGE_GB") or current_env.get("PLAN_MAX_STORAGE_GB")),
         # And the free space the storage volume keeps.
-        "min_free_space_gb": parse_max_storage_gb(current_env.get("MIN_FREE_SPACE_GB")),
+        "min_free_space_gb": parse_min_free_space_gb(current_env.get("MIN_FREE_SPACE_GB")),
         # Likewise for the transfer ceiling: an operator who lowered it to fit the machine's
         # memory should not find it back at the default because they took a fresh volume set.
         "max_concurrent_transfers": parse_transfer_limit(
@@ -4494,7 +4501,8 @@ class DockVault:
             "audit_fingerprint_key": gen_hex(32),
             "audit_chain_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
-            "min_free_space_gb": (getattr(args, "min_free_space_gb", None) if args else None),
+            "min_free_space_gb": parse_min_free_space_gb(
+                getattr(args, "min_free_space_gb", None) if args else None),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.
             "max_concurrent_transfers": parse_transfer_limit(

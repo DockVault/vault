@@ -3090,6 +3090,30 @@ def test_setup_writes_the_free_space_floor_only_when_asked_and_a_fresh_set_keeps
     assert Settings.model_fields["min_free_space_gb"].default == -1
 
 
+@pytest.mark.parametrize("given", ["inf", "-inf", "nan", "Infinity"])
+def test_a_free_space_floor_that_is_not_a_finite_number_is_not_written(tmp_path, monkeypatch, given):
+    """argparse's float takes 'inf' and 'nan', and an .env may carry them: writing either raised in format_gb_value,
+    so setup (or a fresh volume set) stopped with a traceback. Neither is written: the application reads both as its
+    default, and that default then applies."""
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "dockvault-vault:latest")
+    parsed = dv.build_parser().parse_args(["setup", "--non-interactive", "--min-free-space-gb=" + given])
+    args = argparse.Namespace(non_interactive=True, server_name="vault.example.com",
+                              admin_password="Strong-Pass-1234", min_free_space_gb=parsed.min_free_space_gb)
+    cfg = tool._collect_setup_config(args)
+    assert cfg["min_free_space_gb"] is None
+    assert not [ln for ln in dv.build_env_lines(cfg) if ln.startswith("MIN_FREE_SPACE_GB")]
+    fresh = dv.new_set_config({"MIN_FREE_SPACE_GB": given}, "prefix-1", "dep-1")
+    assert fresh["min_free_space_gb"] is None
+    assert not [ln for ln in dv.build_env_lines({**fresh, "server_name": "localhost"})
+                if ln.startswith("MIN_FREE_SPACE_GB")]
+    # A number is still written as it was given, 0 (off) included.
+    for value, line in (("0", "MIN_FREE_SPACE_GB=0"), ("'7.5'", "MIN_FREE_SPACE_GB=7.5"),
+                        ("-1", "MIN_FREE_SPACE_GB=-1")):
+        kept = dv.new_set_config({"MIN_FREE_SPACE_GB": value}, "prefix-1", "dep-1")
+        assert line in dv.build_env_lines({**kept, "server_name": "localhost"})
+
+
 # The transfer ceiling (MAX_CONCURRENT_TRANSFERS and the two queue settings beside it). It is a
 # memory ceiling in the same sense MAX_STORAGE_GB is a disk one, so it is handled on the same
 # terms: written only when the deployment has a value, and carried across a fresh volume set.
