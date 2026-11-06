@@ -5443,8 +5443,9 @@ class DockVault:
     def _ensure_release_image(self):
         """The release image .env pins, made present: used as it is when Docker already has it, pulled otherwise.
         A start or a restart then needs no registry when the image is here (offline, a registry outage or rate limit),
-        and does not fetch the tag again each time it starts: only `update` moves the deployment to another image,
-        with its gates. True when the image is here."""
+        and does not fetch the tag again each time it starts: a start or a restart never moves the deployment to
+        another image (update does, with its gates; a restore starts the image the backup's .env names; a setup
+        re-run can start this checkout's version). True when the image is here."""
         image = (self._load_env().get("DOCKVAULT_IMAGE") or "").strip()
         if image_present(image):
             print(self.pal.paint("  Using %s, already on this host (no pull)." % image, "cyan"))
