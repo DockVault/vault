@@ -132,7 +132,10 @@ docker compose -f docker-compose.secure.yml up -d
 > docker run --rm -v "$PWD/certs:/certs" busybox sh -c 'chown 10001:10001 /certs/*.pem && chmod 600 /certs/key.pem && chmod 644 /certs/cert.pem'
 > ```
 >
-> `dockvault.py setup` does this for you and refuses to start if the key is still unreadable.
+> `dockvault.py setup` does this for you and refuses to start if the key is still unreadable. Run as
+> root it hands the pair to uid `10001` itself; run as another user (in the `docker` group, or with a
+> rootless engine) it does it from a container as above, keeping the key `600`, and makes the key
+> world-readable (`644`) only when that fails too. Your own user then no longer reads `key.pem`.
 
 > **`.env` is found automatically — never move it.** The root `docker-compose.secure.yml` (and the
 > `docker-compose.yml` below) are thin `include:` shims over the real files in `deploy/`. Running
@@ -641,8 +644,11 @@ bundle really is the one those volumes were created with. **Restore** verifies t
 recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
-Each backup is a folder of its own that only you can open (mode `0700`). The backup folder you name
-with `--backup-dir` keeps its own permissions when it already exists; one the tool creates is `0700`.
+Each backup is a folder of its own that only you can open: mode `0700` on Linux and macOS, and on
+Windows an ACL for your user, SYSTEM and Administrators only, set before anything is written into it
+(a folder on a second drive otherwise commonly lets every signed-in user in). The backup folder you
+name with `--backup-dir` keeps its own permissions when it already exists; one the tool creates is
+`0700`.
 
 A running deployment is paused (not stopped) while its volumes are archived, so the database, the
 stored files and the keys are copies of one moment: the vault does not answer until the last archive

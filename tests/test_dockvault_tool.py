@@ -344,8 +344,15 @@ def test_setup_no_start_authors_env_and_cert(tmp_path, _working_cert_tool):
     assert parsed["PLAN_LOG_PULL"] == "true" and len(parsed.get("LOG_TOKEN_PEPPER", "")) >= 32
     assert parsed["UPDATE_CHECK_ENABLED"] == "true"
     cert = (tmp_path / "certs" / "cert.pem").read_text(encoding="utf-8", errors="ignore")
-    key = (tmp_path / "certs" / "key.pem").read_text(encoding="utf-8", errors="ignore")
-    assert "BEGIN CERTIFICATE" in cert and "PRIVATE KEY" in key
+    assert "BEGIN CERTIFICATE" in cert
+    key_path = tmp_path / "certs" / "key.pem"
+    if os.access(str(key_path), os.R_OK):
+        assert "PRIVATE KEY" in key_path.read_text(encoding="utf-8", errors="ignore")
+    else:
+        # Not run as root, with Docker on this host: a container handed the key to the app's user and kept it 600
+        # (rather than making it world-readable), so this user no longer reads it.
+        assert os.stat(key_path).st_uid == dv.APP_UID and (os.stat(key_path).st_mode & 0o777) == 0o600
+        assert "re-owned to uid %d" % dv.APP_UID in proc.stdout
 
 
 @pytest.mark.docker
@@ -2578,7 +2585,15 @@ def test_setup_byo_cert_mode_installs_pair(tmp_path):
         env=env, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "BEGIN CERTIFICATE" in (root / "certs" / "cert.pem").read_text(encoding="utf-8", errors="ignore")
-    assert dv.cert_key_match(str(root / "certs" / "cert.pem"), str(root / "certs" / "key.pem")) is True
+    installed_key = root / "certs" / "key.pem"
+    if os.access(str(installed_key), os.R_OK):
+        assert dv.cert_key_match(str(root / "certs" / "cert.pem"), str(installed_key)) is True
+    else:
+        # Not run as root, with Docker on this host: a container handed the key to the app's user and kept it 600
+        # (rather than making it world-readable), so this user no longer reads it.
+        assert os.stat(installed_key).st_uid == dv.APP_UID
+        assert (os.stat(installed_key).st_mode & 0o777) == 0o600
+        assert "re-owned to uid %d" % dv.APP_UID in r.stdout
     assert "bring-your-own" in r.stdout
 
 
@@ -3059,6 +3074,111 @@ def test_docker_absent_leaves_certs_undetermined_not_denied(monkeypatch):
     monkeypatch.setattr(dv.shutil, "which", lambda *_a: None)     # no docker at all
     ok, msg = dv.apply_cert_owner("/certs")
     assert ok is False and "did not answer" in msg and "delete" not in msg.lower()
+
+
+def _cert_pair(tmp_path):
+    certs = tmp_path / "certs"
+    certs.mkdir()
+    (certs / "cert.pem").write_text("cert", encoding="utf-8")
+    (certs / "key.pem").write_text("key", encoding="utf-8")
+    return certs
+
+
+def _engine(engine, calls, chown_works=True):
+    """`docker` as a POSIX host answers: `docker info` names the engine; the container's chown succeeds when
+    `chown_works`; the app user's read succeeds once a chown has run."""
+    def run(cmd, **kw):
+        calls.append(cmd)
+        joined = " ".join(cmd)
+        if cmd[:2] == ["docker", "info"]:
+            return _Proc(0, "name=seccomp,rootless" if engine == "rootless" else "name=seccomp")
+        if "chown" in joined:
+            return _Proc(0 if chown_works else 1)
+        repaired = chown_works and any("chown" in " ".join(c) for c in calls[:-1])
+        return _Proc(0) if repaired else _Proc(1)
+    return run
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and modes")
+@pytest.mark.parametrize("engine", ["rootful", "rootless"])
+def test_a_setup_not_run_as_root_re_owns_the_key_from_a_container_keeping_it_600(tmp_path, monkeypatch, engine):
+    """The host's chown fails for a user who is not root (and is no use on a rootless engine): the key was made
+    world-readable (644) at once, although a container, as Docker's root, could hand it to the app user and keep it
+    600, as Windows already does. That is now tried first, and verified."""
+    certs = _cert_pair(tmp_path)
+
+    def no_chown(*a, **k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(dv.os, "chown", no_chown)
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    calls = []
+    ok, msg = dv.apply_cert_owner(str(certs), run=_engine(engine, calls))
+    assert ok is True and "not world-readable" in msg
+    assert (os.stat(certs / "key.pem").st_mode & 0o777) == 0o600, "the key stays 600"
+    assert (os.stat(certs).st_mode & 0o777) == 0o755, "the folder lets the container's user reach the files"
+    assert any("chown 10001:10001" in " ".join(c) for c in calls)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and modes")
+def test_the_key_is_made_world_readable_only_when_a_container_cannot_re_own_it_either(tmp_path, monkeypatch):
+    certs = _cert_pair(tmp_path)
+
+    def no_chown(*a, **k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(dv.os, "chown", no_chown)
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    ok, msg = dv.apply_cert_owner(str(certs), run=_engine("rootful", [], chown_works=False))
+    assert ok is False and "world-readable (644)" in msg
+    assert (os.stat(certs / "key.pem").st_mode & 0o777) == 0o644
+
+
+def _windows_backup(tmp_path, monkeypatch, icacls_ok=True):
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setenv("USERNAME", "operator")
+    events = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: events.append(("run", cmd)) or _Proc(
+        0 if icacls_ok or cmd[0] != "icacls" else 5, "", "Access is denied." if not icacls_ok else ""))
+    real_copy = dv._copy_secret
+    monkeypatch.setattr(dv, "_copy_secret", lambda src, dst: events.append(("copy", os.path.basename(dst)))
+                        or real_copy(src, dst))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    # os.name is "nt" here: no Path() (it would make a WindowsPath), plain strings only.
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: events.append(("tar", archive))
+                        or _tgz(os.path.join(bundle, archive)) and True)
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(dict(_reusable_env_cfg(), volume_prefix="dvwin",
+                                                                     deployment_id="w"))) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    return tool, events
+
+
+def test_a_windows_backup_folder_is_restricted_to_the_user_before_anything_is_written(tmp_path, monkeypatch):
+    """Only the bundle's env was restricted on Windows: on a folder outside the profile (a second drive), whose
+    inherited ACL commonly lets every signed-in user read and change it, the database and keys archives were open
+    to them. The folder is now restricted, inheritance off, before the env or any archive is written."""
+    tool, events = _windows_backup(tmp_path, monkeypatch)
+    backups = str(tmp_path / "b")
+    tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=backups))
+    bundle = os.path.join(backups, os.listdir(backups)[0])
+    acl = [i for i, e in enumerate(events) if e[0] == "run" and e[1][0] == "icacls" and e[1][1] == bundle]
+    assert acl, events
+    cmd = events[acl[0]][1]
+    assert "/inheritance:r" in cmd and "operator:(OI)(CI)F" in cmd
+    assert "BUILTIN\\Administrators:(OI)(CI)F" in cmd and "NT AUTHORITY\\SYSTEM:(OI)(CI)F" in cmd
+    first_write = min(i for i, e in enumerate(events) if e[0] in ("copy", "tar"))
+    assert acl[0] < first_write, "restricted before the env or any archive is written"
+
+
+def test_a_windows_backup_whose_folder_cannot_be_restricted_writes_nothing(tmp_path, monkeypatch, capsys):
+    tool, events = _windows_backup(tmp_path, monkeypatch, icacls_ok=False)
+    backups = str(tmp_path / "b")
+    with pytest.raises(SystemExit):
+        tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=backups))
+    assert not [e for e in events if e[0] in ("copy", "tar")]
+    assert os.listdir(backups) == [], "no bundle is left behind"
+    assert "could not restrict the backup folder" in " ".join(capsys.readouterr().out.split())
 
 
 def test_tail_logs_reports_whether_anything_was_shown(tmp_path, monkeypatch, capsys):

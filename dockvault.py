@@ -940,6 +940,22 @@ def tighten_secret_file(path):
         return False
 
 
+def restrict_folder_to_owner(path):
+    """Windows: restrict a folder to the current user, SYSTEM and Administrators (inheritance from where it was made
+    removed), so that what is written inside inherits that and nothing wider. True ONLY when icacls did it."""
+    user = os.environ.get("USERNAME") or ""
+    if not user:
+        return False          # can't form a valid icacls grant without a user name
+    try:
+        r = subprocess.run(
+            ["icacls", path, "/inheritance:r", "/grant:r", "%s:(OI)(CI)F" % user,
+             "BUILTIN\\Administrators:(OI)(CI)F", "NT AUTHORITY\\SYSTEM:(OI)(CI)F"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
+
+
 def _copy_secret(src, dst):
     """Copy `src` to `dst`, CREATING dst mode-600 on POSIX so a private key is never briefly
     world-readable before the perms are tightened (Windows perms are set by tighten_secret_file)."""
@@ -1242,10 +1258,11 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
     """Make cert_dir/{cert,key}.pem readable by the in-container app user through the read-only bind
     mount. On a plain rootful engine, chown to APP_UID (10001) keeping the key mode 600.
     On a userns-remap engine, chown to the MAPPED host uid (resolved from /etc/subuid), keeping 600.
-    On a ROOTLESS engine (or when the mapped uid can't be resolved), the container's uid is a
-    subordinate host uid we cannot target, so fall back to a world-readable key (644, single-tenant
-    host) so the container CAN read it - matching setup-secure.sh, and NEVER falsely reporting a
-    mode-600 key when it would be unreadable. Returns (mode600, message)."""
+    When the host cannot chown (setup not run as root, a ROOTLESS engine, a mapped uid that can't be
+    resolved), a throwaway container re-owns the pair, keeping 600, and the container's view is
+    verified. Only when that fails too does it fall back to a world-readable key (644, single-tenant
+    host) so the container CAN read it - NEVER falsely reporting a mode-600 key when it would be
+    unreadable. Returns (mode600, message)."""
     if os.name == "nt":
         # NOT a no-op: a Docker Desktop bind mount carries the POSIX mode of whatever wrote the file,
         # and openssl writes key.pem 0600 owned by uid 0 - unreadable to the app's uid 10001. The host
@@ -1267,14 +1284,26 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
                 pass
         return False, reason
 
+    def _in_a_container(reason):
+        # The host cannot hand the pair to the container's user (setup is not run as root, or the engine maps that
+        # user to a subordinate uid): a container can, as Docker's own root, keeping the key 600, as on Windows.
+        # The folder is opened to 755 (its names, not the key) so that the container's user reaches the files, and
+        # what the container then sees is verified. Only when that fails is the key made world-readable.
+        try:
+            os.chmod(cert_dir, 0o755)
+        except OSError:
+            pass
+        ok, msg = _apply_cert_owner_container(cert_dir, run)
+        return (True, msg) if ok else _world_readable(reason)
+
     if _engine_is_remapped(run):
         owner = _remapped_cert_owner(run)   # mapped host uid (userns-remap), or None (rootless/unresolvable)
         if owner is None:
-            return _world_readable(
+            return _in_a_container(
                 "rootless/userns Docker: the container's app user is a subordinate host uid, so a "
-                "mode-600 key owned by uid %d would be unreadable inside the container. Made the TLS "
-                "key world-readable (644) so the container can read it - host assumed single-tenant, "
-                "restrict access accordingly." % APP_UID)
+                "mode-600 key owned by uid %d would be unreadable inside the container, and a container "
+                "could not re-own it either. Made the TLS key world-readable (644) so the container can read "
+                "it - host assumed single-tenant, restrict access accordingly." % APP_UID)
     else:
         owner = APP_UID
     try:
@@ -1284,9 +1313,21 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
             return True, "certs owned by uid %d (key mode 600, not world-readable)" % owner
     except OSError:
         pass
-    return _world_readable(
-        "could not chown certs to the container uid; made the TLS key world-readable (644) so the "
-        "container can read it - host assumed single-tenant, restrict access accordingly.")
+    return _in_a_container(
+        "could not chown certs to the container uid, on the host or from a container; made the TLS key "
+        "world-readable (644) so the container can read it - host assumed single-tenant, restrict access "
+        "accordingly.")
+
+
+def _key_already_private(key):
+    """POSIX: the key's mode gives nothing to group or others. A key a container re-owned to the app user (a setup
+    not run as root) cannot be chmodded by this user again, and needs not be: it is 600 already."""
+    if os.name == "nt":
+        return False
+    try:
+        return (os.stat(key).st_mode & 0o077) == 0
+    except OSError:
+        return False
 
 
 def _remapped_cert_owner(run=subprocess.run):
@@ -4457,7 +4498,7 @@ class DockVault:
         # Lock the key file (icacls/chmod), then make it readable by the container uid (POSIX chown;
         # repairs a reused or root-owned pair too).
         key = os.path.join(cert_dir, "key.pem")
-        if os.path.exists(key) and not tighten_secret_file(key):
+        if os.path.exists(key) and not tighten_secret_file(key) and not _key_already_private(key):
             print(pal.paint("  WARNING: could not restrict the TLS key's permissions.", "yellow"))
         owner_ok, owner_msg = apply_cert_owner(cert_dir)
         if owner_msg:
@@ -5657,11 +5698,17 @@ class DockVault:
             os.makedirs(bundle)
             # Restrict the whole bundle dir to the owner (makedirs' mode is umask-masked): the volume
             # tar.gz archives inside include the DB dump + key material, so keep them unreadable to
-            # other local users, matching the mode-600 .env copy. (No-op perms on Windows.)
+            # other local users, matching the mode-600 .env copy.
             if os.name != "nt":
                 os.chmod(bundle, 0o700)
         except OSError as exc:
             self._fail("could not create the backup directory %s: %s" % (bundle, exc))
+        # On Windows the folder takes the ACL of where it is made, and a folder outside the user's profile (a second
+        # drive, a share) commonly lets every signed-in user read and change it: it is restricted to this user, SYSTEM
+        # and Administrators before anything is written into it, and what is written inherits that.
+        if os.name == "nt" and not restrict_folder_to_owner(bundle):
+            self._fail_backup(bundle, "could not restrict the backup folder %s to your user (icacls), and its "
+                                      "archives hold the database and the keys" % bundle)
         # the paired .env FIRST, mode-600 (it holds ENCRYPTION_KEY)
         _copy_secret(self._env_path(), os.path.join(bundle, "env"))
         tighten_secret_file(os.path.join(bundle, "env"))
