@@ -1872,7 +1872,8 @@ def coupling_marker_verdict(marker, env):
 
 def build_backup_manifest(prefix, bundle_id, volumes, salt, env, created=""):
     """The backup manifest dict (NO secrets): identifies the set + records the salted coupling
-    fingerprint of the paired .env. `volumes` is a list of {role, name, archive}."""
+    fingerprint of the paired .env. `volumes` is a list of {role, name, archive, sha256, size}: the archive's
+    SHA-256 and size as check_archive_file found them on the host (a backup made before them lacks both)."""
     return {
         "dockvault_backup": 1,
         "created": created,
@@ -1896,6 +1897,99 @@ def verify_backup_coupling(env, manifest):
     if not (salt and expected):
         return False
     return compute_coupling_fingerprint(env, salt) == expected
+
+
+# What a backup records of each archive, in its manifest entry: the SHA-256 of the archive file and its size in bytes,
+# taken on the host once the archive has been read through whole (check_archive_file). A restore takes nothing from
+# an archive whose bytes differ. A plain hash catches an archive damaged on the way; it does not stop someone who can
+# write the bundle, who can write the manifest's hash as well. A sealed bundle's manifest is therefore authenticated
+# too, under the key its env.enc is sealed with (BUNDLE_MANIFEST_MAC, manifest_mac): only that key's holder can make
+# a manifest that passes.
+ARCHIVE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+BUNDLE_MANIFEST_MAC = "manifest.json.mac"
+_MANIFEST_MAC_LABEL = b"dockvault backup manifest mac v1"
+
+
+class _HashingReader:
+    """A read-only file wrapper that feeds every byte read through it into `digest` and counts them."""
+
+    def __init__(self, raw, digest):
+        self._raw = raw
+        self._digest = digest
+        self.size = 0
+
+    def read(self, n=-1):
+        data = self._raw.read(n)
+        self._digest.update(data)
+        self.size += len(data)
+        return data
+
+
+def check_archive_file(path):
+    """(SHA-256 hex, size) of the tar.gz at `path`, once it has been read through to its end in one pass: a gzip
+    stream whose own checksum is right, holding a tar whose every entry lists (what `tar -tzf` checks). Raises
+    ValueError saying what is wrong: missing, not a plain file, empty, or not readable as a whole tar.gz."""
+    import gzip
+    import tarfile
+    import zlib
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError("%s is not there (no plain file by that name)" % path)
+    if os.path.getsize(path) == 0:
+        raise ValueError("%s is empty" % path)
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as raw:
+            reader = _HashingReader(raw, digest)
+            with gzip.GzipFile(fileobj=reader, mode="rb") as gz:
+                with tarfile.open(fileobj=gz, mode="r|") as tar:
+                    for _member in tar:
+                        pass
+                while gz.read(1 << 20):          # the rest of the stream, through to its checksum
+                    pass
+            while reader.read(1 << 20):          # anything after it is hashed too
+                pass
+    except (OSError, EOFError, ValueError, tarfile.TarError, zlib.error) as exc:
+        raise ValueError("%s does not read as a whole tar.gz archive (%s)" % (path, exc))
+    return digest.hexdigest(), reader.size
+
+
+def archive_digest_in_docker(src_dir, archive_name, run=subprocess.run):
+    """The SHA-256 hex of <src_dir>/<archive_name> as Docker sees it, through the same read-only bind mount the
+    restore's untar_volume uses, once busybox tar has listed it to its end (gunzip checks the stream's own checksum
+    on the way). Returns (digest or None, why not). A Docker that does not see the host's folder (another host's
+    daemon, a confined one), or sees another file there, answers with no digest or another one."""
+    script = ('f=/src/%s; [ -f "$f" ] && [ -s "$f" ] || { echo "no such archive, or an empty one" >&2; exit 3; }; '
+              'tar tzf "$f" >/dev/null || exit 4; sha256sum "$f"' % archive_name)
+    try:
+        r = run(["docker", "run", "--rm", "--network", "none", "-v", "%s:/src:ro" % src_dir, "busybox", "sh", "-c",
+                 script], capture_output=True, text=True, timeout=1200)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return None, "Docker could not be run (%s)" % type(exc).__name__
+    if getattr(r, "returncode", 1) != 0:
+        why = " ".join((getattr(r, "stderr", "") or "").split())[-200:]
+        return None, why or "exit %s" % getattr(r, "returncode", "?")
+    words = (getattr(r, "stdout", "") or "").split()
+    if not words or not ARCHIVE_DIGEST_RE.match(words[0]):
+        return None, "no checksum came back"
+    return words[0], ""
+
+
+def manifest_mac(dek, manifest_bytes):
+    """HMAC-SHA256, hex, of a sealed bundle's manifest.json bytes, under a key derived from the data key its env.enc
+    is sealed with (the recovery key). The passphrase or the recovery key opens env.enc and with it this key; nobody
+    without either can make a manifest whose MAC is right."""
+    import hmac
+    raw = dek if isinstance(dek, (bytes, bytearray)) else str(dek).encode("ascii")
+    key = hmac.new(bytes(raw), _MANIFEST_MAC_LABEL, hashlib.sha256).digest()
+    return hmac.new(key, bytes(manifest_bytes), hashlib.sha256).hexdigest()
+
+
+def manifest_mac_matches(dek, manifest_bytes, recorded):
+    """True only when `recorded` is the MAC manifest_mac() gives for these bytes (compared in constant time)."""
+    import hmac
+    if not isinstance(recorded, str) or not ARCHIVE_DIGEST_RE.match(recorded):
+        return False
+    return hmac.compare_digest(manifest_mac(dek, manifest_bytes), recorded)
 
 
 def tar_volume(volume, dest_dir, archive_name, run=subprocess.run):
@@ -5387,7 +5481,9 @@ class DockVault:
             self._fail("no .env found - nothing to back up (run Setup first)")
         names = set_volume_names(prefix)
         ts = _timestamp()
-        root = self._backup_root(args)
+        # Absolute: the archives are written by a container through `-v <bundle>:/dest`, and Docker takes a source
+        # that is not an absolute path for the name of a volume.
+        root = os.path.abspath(self._backup_root(args))
         bundle = os.path.join(root, "dockvault-%s-%s" % (prefix, ts))
         # The stamp has second resolution, so two backups inside one second want the same
         # directory and the second one dies on FileExistsError. That used to need an operator
@@ -5450,7 +5546,19 @@ class DockVault:
                     self._unpause_database()
             if not archived:
                 self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
-            entries.append({"role": role, "name": vol, "archive": archive})
+            # The archive was written by a container through a bind mount, and its exit code says only that the
+            # container's tar finished. Docker can see another folder than this host's under the same path (a daemon
+            # on another host, a confined one), and then nothing reaches the bundle. So the archive must be here, on
+            # this host, not empty, and read through whole, before the backup counts it; its checksum and size go
+            # into the manifest, for the restore to check against.
+            try:
+                digest, size = check_archive_file(os.path.join(bundle, archive))
+            except ValueError as exc:
+                self._fail_backup(bundle, "the archive of volume %s did not reach the backup folder whole (%s): "
+                                          "the backup is not complete. If Docker runs on another host or in a "
+                                          "confined package, it writes elsewhere; back up to a folder Docker "
+                                          "shares with this host" % (vol, exc))
+            entries.append({"role": role, "name": vol, "archive": archive, "sha256": digest, "size": size})
 
         # Refuse a bundle that captured no data. Skipping a volume that is not there is right for
         # `brand`, which genuinely may not exist -- but the same `continue` used to swallow the
@@ -5529,17 +5637,20 @@ class DockVault:
         exact bytes before the plaintext is removed. A seal FAILURE keeps the complete plaintext bundle
         (a valid UNSEALED backup) rather than discarding it. Reuses the same crypto as `dockvault.py
         lock`. The old AUDIT_CHAIN_KEY a bundle carries during an unfinished key change is sealed the same way,
-        under the same data key (so the same passphrase or recovery key opens it), and verified too."""
+        under the same data key (so the same passphrase or recovery key opens it), and verified too. The manifest
+        is authenticated under that data key as well (BUNDLE_MANIFEST_MAC), so that the checksums it records of the
+        archives cannot be changed by anyone without the passphrase or the recovery key."""
         pal = self.pal
         env_file = os.path.join(bundle, "env")
         enc_file = os.path.join(bundle, "env.enc")
         kept_file = os.path.join(bundle, KEPT_CHAIN_KEY_BUNDLE)
         kept_enc = kept_file + ".enc"
+        mac_file = os.path.join(bundle, BUNDLE_MANIFEST_MAC)
 
         def _abort(msg):
             # A failed OPTIONAL seal must NOT destroy the complete plaintext bundle: drop any partial
             # env.enc and keep {env, volumes, manifest} -- it restores normally, just unsealed.
-            for partial in (enc_file, kept_enc):
+            for partial in (enc_file, kept_enc, mac_file):
                 try:
                     os.remove(partial)
                 except OSError:
@@ -5579,6 +5690,22 @@ class DockVault:
             _abort("sealed env failed verification (%s)" % exc)
         if check_bytes != env_bytes:
             _abort("sealed env did not round-trip")
+        # The manifest, authenticated under the same data key: the checksums it records of the archives then show not
+        # only damage but any change by whoever can write the bundle without that key (manifest_mac). Written and read
+        # back before the plaintext env goes. (A backup writes its manifest before it seals; a bundle without one is
+        # refused by every restore, so there is nothing to authenticate.)
+        if os.path.lexists(os.path.join(bundle, "manifest.json")):
+            try:
+                with open(os.path.join(bundle, "manifest.json"), "rb") as f:
+                    manifest_bytes = f.read()
+                self._atomic_write_secret(mac_file, json.dumps({"dockvault_manifest_mac": 1,
+                                                                "hmac_sha256": manifest_mac(dek, manifest_bytes)}) + "\n")
+                with open(mac_file, encoding="utf-8") as f:
+                    written = json.load(f).get("hmac_sha256")
+            except (OSError, ValueError, AttributeError) as exc:
+                _abort("the manifest could not be authenticated (%s)" % exc)
+            if not manifest_mac_matches(dek, manifest_bytes, written):
+                _abort("the manifest's MAC did not read back")
         carried = os.path.lexists(kept_file)
         if carried:
             try:
@@ -5663,6 +5790,85 @@ class DockVault:
             self._fail("the old AUDIT_CHAIN_KEY this backup carries is not a key - the deployment was NOT touched.")
         return key
 
+    def _recorded_archives(self, manifest):
+        """{archive name: (SHA-256 hex, size)} the backup recorded, for each manifest entry of a known role that has a
+        checksum; {} for a backup made before backups recorded them. Fails on a checksum or size that is not one."""
+        out = {}
+        for e in (manifest.get("volumes") or []):
+            if not isinstance(e, dict) or e.get("role") not in VOLUME_BASENAMES:
+                continue                     # an unknown role is refused below, with the volumes
+            if "sha256" not in e and "size" not in e:
+                continue
+            digest, size = e.get("sha256"), e.get("size")
+            if not (isinstance(digest, str) and ARCHIVE_DIGEST_RE.match(digest)
+                    and isinstance(size, int) and not isinstance(size, bool) and size > 0):
+                self._fail("the backup's manifest records a checksum or size for volume role %r that is not one - "
+                           "refusing to restore. Nothing changed." % e.get("role"))
+            out["%s.tar.gz" % VOLUME_BASENAMES[e["role"]]] = (digest, size)
+        return out
+
+    def _check_manifest_mac(self, bundle, manifest_bytes, dek, has_digests):
+        """A sealed bundle: its manifest must be the one it was sealed with, proven by the MAC beside it
+        (BUNDLE_MANIFEST_MAC, under the key env.enc was just opened with). A manifest that records checksums but has
+        no MAC lost it on the way (every bundle that records them and is sealed has one): refused. A bundle with
+        neither was sealed before manifests were authenticated: restored, with a notice."""
+        mac_path = os.path.join(bundle, BUNDLE_MANIFEST_MAC)
+        if not os.path.lexists(mac_path):
+            if has_digests:
+                self._fail("this sealed backup's manifest records the checksums of its archives but %s, which proves "
+                           "the manifest is the one sealed with it, is missing: refusing to restore. Nothing changed."
+                           % BUNDLE_MANIFEST_MAC)
+            print(self.pal.paint(
+                "  Note: this sealed backup was made before backups authenticated their manifest, so nothing shows "
+                "that its manifest and archives are the ones it was sealed with. Restore it only if you are sure "
+                "nobody changed it.", "yellow"))
+            return False
+        try:
+            with open(mac_path, encoding="utf-8") as f:
+                doc = json.load(f)
+            recorded = doc.get("hmac_sha256") if isinstance(doc, dict) else None
+        except (OSError, ValueError):
+            recorded = None
+        if not manifest_mac_matches(dek, manifest_bytes, recorded):
+            self._fail("the manifest of this sealed backup is not the one it was sealed with (its MAC does not match): "
+                       "it was changed since the backup was made. Refusing to restore; nothing changed.")
+        return True
+
+    def _check_bundle_archives(self, bundle, plan, recorded):
+        """Before the restore stops or clears anything, each archive it is about to extract must: read through whole
+        as a tar.gz on this host (check_archive_file); be, byte for byte, the archive the backup made, when the
+        backup recorded its checksum; and be the very file Docker sees through the bind mount the extraction uses
+        (archive_digest_in_docker), so that an extraction cannot fail for want of it after a volume was emptied.
+        Fails with nothing changed otherwise. A backup that recorded no checksums (made before backups did) is
+        restored with a notice, its archives still read through whole."""
+        pal = self.pal
+        checked = [archive for _vol, archive in plan if archive in recorded]
+        if checked and len(checked) != len(plan):
+            self._fail("this backup's manifest records the checksum of some of its archives only, as no backup "
+                       "writes it: it was changed since. Refusing to restore; nothing changed.")
+        print(pal.paint("  Checking the backup's archives before anything is stopped (each is read through) ...",
+                        "cyan"))
+        for vol, archive in plan:
+            path = os.path.join(bundle, archive)
+            try:
+                digest, size = check_archive_file(path)
+            except ValueError as exc:
+                self._fail("the archive for volume %s cannot be restored: %s. Refusing to restore; nothing changed."
+                           % (vol, exc))
+            want = recorded.get(archive)
+            if want is not None and (digest, size) != want:
+                self._fail("%s is not the archive this backup made (its checksum is not the one the backup recorded): "
+                           "it was changed or damaged since the backup. Refusing to restore; nothing changed." % path)
+            seen, why = archive_digest_in_docker(bundle, archive)
+            if seen != digest:
+                self._fail("Docker does not see %s as this host does (%s), and the restore extracts each archive "
+                           "through Docker. Run the restore where Docker shares this folder with the host. Refusing "
+                           "to restore; nothing changed." % (path, why or "it sees another file there"))
+        if plan and not checked:
+            print(pal.paint(
+                "  Note: this backup was made before backups recorded the checksums of their archives: each was read "
+                "through whole, but nothing shows it is the archive the backup made.", "yellow"))
+
     def _do_restore(self, args=None):
         """Restore a bundle: verify the bundle's .env matches its volumes (coupling fingerprint),
         then STOP the stack, REPLACE each target volume's contents from the backup, install the
@@ -5696,6 +5902,9 @@ class DockVault:
             bundle = cands[int(sel) - 1]
         if not bundle or not os.path.isdir(bundle):
             self._fail("backup bundle not found (pass --bundle-dir)")
+        # Absolute before anything uses it: each archive is extracted through `-v <bundle>:/src`, and Docker takes a
+        # source that is not an absolute path for the name of a volume (an empty one, made there and then).
+        bundle = os.path.abspath(bundle)
         man_path = os.path.join(bundle, "manifest.json")
         env_path = os.path.join(bundle, "env")
         enc_path = os.path.join(bundle, "env.enc")
@@ -5708,9 +5917,18 @@ class DockVault:
         if not os.path.exists(man_path) or (sealed_env_bytes is None and not os.path.exists(env_path)):
             self._fail("that bundle is missing manifest.json or its env - refusing to restore")
         try:
-            manifest = json.load(open(man_path, encoding="utf-8"))
+            with open(man_path, "rb") as f:
+                manifest_bytes = f.read()
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
         except (OSError, ValueError) as exc:
             self._fail("could not read the manifest: %s" % exc)
+        if not isinstance(manifest, dict):
+            self._fail("the backup's manifest is not one this tool writes - refusing to restore")
+        # What the backup recorded of each archive (its checksum and size), before anything of the manifest is used:
+        # a sealed bundle's manifest is first proven to be the one it was sealed with.
+        recorded = self._recorded_archives(manifest)
+        if sealed_dek is not None:
+            self._check_manifest_mac(bundle, manifest_bytes, sealed_dek, bool(recorded))
         bundle_env = parse_env(sealed_env_bytes.decode("utf-8") if sealed_env_bytes is not None
                                else open(env_path, encoding="utf-8").read())
         # COUPLING: the bundle's .env must be the one its volumes were created with - never restore
@@ -5768,6 +5986,9 @@ class DockVault:
         for vol, archive in plan:
             if not os.path.exists(os.path.join(bundle, archive)):
                 self._fail("the bundle is missing %s (for volume %s) - refusing to restore" % (archive, vol))
+        # And every archive is read through whole, is the one the backup made, and is what Docker sees through the
+        # mount the extraction uses, all before anything is stopped or cleared (_check_bundle_archives).
+        self._check_bundle_archives(bundle, plan, recorded)
         # Restore REPLACES the current data with the backup. Confirm loudly for an interactive
         # over-existing restore (mirrors the Reset typed-name gate); --non-interactive --force skips it.
         if existing and interactive:

@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from test_dockvault_tool import _host_digest, _tgz
+
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +46,14 @@ HERE, THERE = "dvhere", "dvthere"
 def _no_acl_changes(monkeypatch):
     """The host's ACLs of the temporary secret files are left alone (as in tests/test_dockvault_tool.py)."""
     monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
+
+
+@pytest.fixture(autouse=True)
+def _docker_sees_the_host_folder(request, monkeypatch):
+    """Docker is stubbed: the restore's look at each archive through it sees what the host sees. The test marked
+    docker keeps the real one."""
+    if request.node.get_closest_marker("docker") is None:
+        monkeypatch.setattr(dv, "archive_digest_in_docker", _host_digest, raising=False)
 
 
 def _env_bytes(prefix, **extra):
@@ -69,7 +79,7 @@ def _bundle(tmp_path, env, name="bundle", roles=("keys", "pg", "storage")):
                                    dv.gen_salt(), parsed)
     (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
     for e in entries:
-        (bundle / e["archive"]).write_bytes(b"x")
+        _tgz(bundle / e["archive"])
     return bundle
 
 

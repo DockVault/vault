@@ -362,7 +362,8 @@ the recipients' mailboxes.
   the `audit` menu too).
 - **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above, and,
   while a change of the chain's key is not finished, the old key kept beside `.env` (sealed with `.env`
-  under `--lock`), which a restore puts back.
+  under `--lock`), which a restore puts back. Its `manifest.json` records each archive's SHA-256 and size
+  (and, under `--lock`, `manifest.json.mac` an HMAC of the manifest under the sealing key): no personal data.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
   erased.
 - **`python dockvault.py accounts`** on the host: the server's operator can look an account up (its

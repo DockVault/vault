@@ -620,6 +620,19 @@ bundle really is the one those volumes were created with. **Restore** verifies t
 recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
+Backup counts an archive only once it is in the backup folder on this host, not empty, and read
+through whole as a `tar.gz` (a Docker daemon that writes to a folder of its own, such as one on
+another host, fails the backup instead of leaving a bundle without data). The manifest records each
+archive's SHA-256 and size. A sealed backup (`--lock`) also carries `manifest.json.mac`, an HMAC of
+the manifest under the key its `env.enc` is sealed with. Before restore stops or clears anything, it
+reads every archive through, checks it against the recorded checksum, and checks that Docker sees the
+same file through the mount it extracts from; for a sealed backup it first checks the manifest's
+MAC. A changed or damaged archive, a changed sealed manifest, or an archive Docker cannot see is
+refused with nothing changed. The checksums of an unsealed backup show damage only: whoever can write
+the bundle can rewrite them too. A backup made before backups recorded checksums is still restored,
+with a notice that its archives could only be read through, not matched. `--bundle-dir` and
+`--backup-dir` may be relative paths.
+
 Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
 the set the host was on; `.env.<prefix>.1`, `.2`, ... when that name is taken, never over a file already
 there, and never as `.env.enc` or `.env.example`, the sealed file's and the template's names) and says

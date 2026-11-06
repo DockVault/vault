@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 import dockvault as dv
-from test_dockvault_tool import _reusable_env_cfg, _write_bundle
+from test_dockvault_tool import _host_digest, _reusable_env_cfg, _tgz, _write_bundle
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +35,12 @@ def _env_file(tmp_path, **cfg):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(dict(_reusable_env_cfg(), **cfg))) + "\n",
                                    encoding="utf-8")
     return dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+
+
+@pytest.fixture(autouse=True)
+def _docker_sees_the_host_folder(monkeypatch):
+    """The restore's look at each archive through Docker sees what the host sees (Docker is stubbed here)."""
+    monkeypatch.setattr(dv, "archive_digest_in_docker", _host_digest, raising=False)
 
 
 def _kept(tmp_path, prefix=dv.DEFAULT_PROJECT):
@@ -55,7 +61,8 @@ def test_a_backup_archives_the_keys_volume_first_and_pauses_the_database_around_
     order = []
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
     monkeypatch.setattr(dv, "container_running", lambda name, **k: True)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, *a, **k: order.append(vol.rsplit("_vault_", 1)[1]) or True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: order.append(vol.rsplit("_vault_", 1)[1])
+                        or _tgz(Path(bundle) / archive) and True)
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: order.append(" ".join(a[:2])) or _Result())
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
     assert order == ["keys", "pause vault-db", "pg_data", "unpause vault-db", "storage"]
@@ -69,7 +76,8 @@ def test_the_database_is_resumed_when_its_copy_fails(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: True)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, *a, **k: not vol.endswith("_vault_pg_data"))
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: not vol.endswith("_vault_pg_data")
+                        and _tgz(Path(bundle) / archive) and True)
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a[0]) or _Result())
     with pytest.raises(SystemExit):
         tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
@@ -82,7 +90,7 @@ def test_a_stopped_database_is_copied_without_a_pause(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
-    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a[0]) or _Result())
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
     assert calls == []
@@ -100,7 +108,7 @@ def _restore(tmp_path, monkeypatch, entries, head_file=None):
         man = dv.build_backup_manifest("dockvault-vault-rk", "rk", entries, dv.gen_salt(), man_env)
         (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
     for e in entries:
-        (bundle / e["archive"]).write_bytes(b"x")
+        _tgz(bundle / e["archive"])
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     order = []
@@ -624,8 +632,7 @@ def _backing_up(tmp_path, monkeypatch, env, **args):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: (Path(bundle) / archive).write_bytes(b"x")
-                        or True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups"), **args))
     return next((tmp_path / "backups").iterdir())
 
@@ -681,7 +688,7 @@ def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, 
                {"role": "pg", "name": "x", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="bundle-rc")
     for e in entries:
-        (bundle / e["archive"]).write_bytes(b"x")
+        _tgz(bundle / e["archive"])
     if carried is not None:
         (bundle / "audit-chain-key.previous").write_text(carried + "\n", encoding="utf-8")
     passfile = tmp_path / "pass.txt"
@@ -827,8 +834,7 @@ def test_each_volume_set_keeps_its_old_key_in_a_file_of_its_own_through_a_change
 
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: (Path(bundle) / archive).write_bytes(b"x")
-                        or True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
     bundle = next((tmp_path / "backups").iterdir())
     assert not [p for p in bundle.iterdir() if p.name.startswith("audit-chain-key")]

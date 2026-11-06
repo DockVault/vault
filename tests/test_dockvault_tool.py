@@ -31,6 +31,32 @@ def _keep_secret_acl_changes_hermetic(monkeypatch):
     monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
 
 
+def _host_digest(src_dir, archive_name, **_k):
+    """archive_digest_in_docker as a Docker that sees this host's folder answers: the archive's own SHA-256."""
+    import hashlib
+    with open(os.path.join(src_dir, archive_name), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest(), ""
+
+
+@pytest.fixture(autouse=True)
+def _docker_sees_the_host_folder(request, monkeypatch):
+    """Without real Docker, the restore's look at each archive through Docker sees what the host sees. A test
+    marked docker keeps the real one."""
+    if request.node.get_closest_marker("docker") is None:
+        monkeypatch.setattr(dv, "archive_digest_in_docker", _host_digest, raising=False)
+
+
+def _tgz(path, files=None):
+    """Write a small real tar.gz at `path` (what a volume archive is), holding `files` ({name: bytes})."""
+    import tarfile
+    with tarfile.open(str(path), "w:gz") as tar:
+        for name, data in (files or {"marker.txt": b"x"}).items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return path
+
+
 class _Proc:
     """A stand-in for subprocess.CompletedProcess (injected `run` return value)."""
     def __init__(self, returncode, stdout="", stderr=""):
@@ -1640,7 +1666,7 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     # operator's behalf and proceeds with an irreversible change on the strength of it.
     monkeypatch.setattr(dv, "volume_exists",
                         lambda name, **k: not name.endswith("_vault_brand"))
-    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
     bundles = list((tmp_path / "backups").glob("dockvault-dockvault-vault-b9-*"))
@@ -1798,7 +1824,7 @@ def test_restore_stops_before_replacing_and_starts_after(tmp_path, monkeypatch):
     cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-ord", deployment_id="ord")
     entries = [{"role": "pg", "name": "dockvault-vault-ord_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="bord")
-    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")     # pre-flight archive-existence check
+    _tgz(bundle / "vault_pg_data.tar.gz")     # the pre-flight archive check reads it through
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     order = []
@@ -1822,7 +1848,7 @@ def test_restore_interactive_over_existing_requires_typed_confirm(tmp_path, monk
     cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-cfm", deployment_id="cfm")
     entries = [{"role": "pg", "name": "dockvault-vault-cfm_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="bcfm")
-    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    _tgz(bundle / "vault_pg_data.tar.gz")
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     touched = []
@@ -1843,7 +1869,7 @@ def test_restore_aborts_if_database_still_running_after_stop(tmp_path, monkeypat
     cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-live", deployment_id="live")
     entries = [{"role": "pg", "name": "dockvault-vault-live_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="blive")
-    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    _tgz(bundle / "vault_pg_data.tar.gz")
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     touched = []
