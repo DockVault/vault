@@ -254,15 +254,20 @@ def test_one_person_keeps_at_most_five_hold_only_cases_waiting_for_confirmation(
     assert _refused(holds.place_hold_only, db, people.ada, [people.v2.id], now=NOW,
                     **TEXT).reason == holds.TOO_MANY_UNCONFIRMED
     db.rollback()
-    # A hold the placer releases frees its place, as the refusal says.
+    # A hold the placer releases frees its place, as the refusal says. Releasing it unconfirmed keeps the placer
+    # from its vaults for PLACE_BLOCK_DAYS, so the next is placed on a third vault.
     assert holds.release_refusal(db, cases[1], people.ada, now=NOW) is None
     assert holds.release(db, cases[1], by=people.ada, reason="no longer needed", now=NOW) == 2
     db.commit()
-    _place(db, people.ada, [people.v2])
+    v3 = _vault(db, people.olga)
     assert _refused(holds.place_hold_only, db, people.ada, [people.v2.id], now=NOW,
+                    **TEXT).reason == holds.PLACE_BLOCKED
+    db.rollback()
+    _place(db, people.ada, [v3])
+    assert _refused(holds.place_hold_only, db, people.ada, [v3.id], now=NOW,
                     **TEXT).reason == holds.TOO_MANY_UNCONFIRMED
     db.rollback()
-    assert _place(db, people.ada, [people.v2], now=NOW + timedelta(days=7)).status == "hold_only"
+    assert _place(db, people.ada, [v3], now=NOW + timedelta(days=7)).status == "hold_only"
 
 
 def test_each_vault_is_locked_for_update_before_its_hold_is_written(db, people, monkeypatch):
