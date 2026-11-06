@@ -3367,7 +3367,7 @@ def _windows_backup(tmp_path, monkeypatch, icacls_ok=True):
     monkeypatch.setenv("USERNAME", "operator")
     events = []
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: events.append(("run", cmd)) or _whoami_answers(cmd)
-                        or _Proc(0 if icacls_ok or cmd[0] != "icacls" else 5, "",
+                        or _Proc(0 if icacls_ok or cmd[0] != dv.windows_system_tool("icacls.exe") else 5, "",
                                  "Access is denied." if not icacls_ok else ""))
     real_copy = dv._copy_secret
     monkeypatch.setattr(dv, "_copy_secret", lambda src, dst: events.append(("copy", os.path.basename(dst)))
@@ -3391,7 +3391,8 @@ def test_a_windows_backup_folder_is_restricted_to_the_user_before_anything_is_wr
     backups = str(tmp_path / "b")
     tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=backups))
     bundle = os.path.join(backups, os.listdir(backups)[0])
-    acl = [i for i, e in enumerate(events) if e[0] == "run" and e[1][0] == "icacls" and e[1][1] == bundle]
+    icacls = dv.windows_system_tool("icacls.exe")
+    acl = [i for i, e in enumerate(events) if e[0] == "run" and e[1][0] == icacls and e[1][1] == bundle]
     assert acl, events
     cmd = events[acl[0]][1]
     assert "/inheritance:r" in cmd and "*%s:(OI)(CI)F" % _SID in cmd
@@ -3416,8 +3417,23 @@ def test_windows_access_is_granted_to_the_users_sid_never_to_a_bare_name(monkeyp
     assert dv.windows_user_grantee() == "*" + sid
     assert dv.restrict_folder_to_owner("D:\\backups\\b") is True
     assert _TIGHTEN_SECRET_FILE("C:\\vault\\.env") is True
-    grants = [c[c.index("/grant:r") + 1] for c in calls if c[0] == "icacls"]
+    grants = [c[c.index("/grant:r") + 1] for c in calls if c[0] == dv.windows_system_tool("icacls.exe")]
     assert grants == ["*%s:(OI)(CI)F" % sid, "*%s:(R,W)" % sid]
+
+
+def test_icacls_and_whoami_run_from_system32_never_by_their_bare_names(monkeypatch):
+    """Windows looks a bare program name up in the folder of the program that starts it and in the current folder
+    before System32, so an icacls.exe in the folder the tool is run from (a checkout, a download folder) would run
+    in its place, with the folder and the file it is asked to restrict. Both tools run by their System32 path."""
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setenv("SystemRoot", "D:\\WinRoot")
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _whoami_answers(cmd)
+                        or _Proc(0, "", ""))
+    assert dv.restrict_folder_to_owner("D:\\backups\\b") is True
+    assert _TIGHTEN_SECRET_FILE("C:\\vault\\.env") is True
+    system32 = os.path.join("D:\\WinRoot", "System32")
+    assert [c[0] for c in calls] == [os.path.join(system32, "whoami.exe"), os.path.join(system32, "icacls.exe")] * 2
 
 
 @pytest.mark.parametrize("answer, env, grantee", [

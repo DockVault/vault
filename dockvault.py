@@ -922,13 +922,20 @@ def replace_file_durably(path, data):
     sync_directory(directory)
 
 
+def windows_system_tool(name):
+    """The full path of a Windows tool in System32 (whoami.exe, icacls.exe). Each is run by that path, never by its
+    bare name: Windows looks a bare name up in the folder of the program that starts it and in the current folder
+    before System32, so a file of that name in the folder the tool is run from would run instead."""
+    return os.path.join(os.environ.get("SystemRoot") or "C:\\Windows", "System32", name)
+
+
 def windows_user_grantee():
     """Windows: how icacls is to name the account this process runs as. Its SID (`*S-1-...`, from whoami /user),
     which names that one account; else DOMAIN\\user from the environment; else the bare user name; else None. A
     bare name is looked up among this computer's own accounts first, so a domain user who has a same-named local
     account would grant that one, and a run as SYSTEM has the computer's account in USERNAME (COMPUTER$)."""
     import csv
-    whoami = os.path.join(os.environ.get("SystemRoot") or "C:\\Windows", "System32", "whoami.exe")
+    whoami = windows_system_tool("whoami.exe")
     try:
         r = subprocess.run([whoami, "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=15,
                            stdin=subprocess.DEVNULL)
@@ -956,7 +963,7 @@ def tighten_secret_file(path):
             if not user:
                 return False  # can't form a valid icacls grant without a user name
             r = subprocess.run(
-                ["icacls", path, "/inheritance:r", "/grant:r", "%s:(R,W)" % user,
+                [windows_system_tool("icacls.exe"), path, "/inheritance:r", "/grant:r", "%s:(R,W)" % user,
                  "BUILTIN\\Administrators:(F)", "NT AUTHORITY\\SYSTEM:(F)"],
                 capture_output=True, text=True, timeout=15)
             return r.returncode == 0
@@ -975,7 +982,7 @@ def restrict_folder_to_owner(path):
         return False          # can't form a valid icacls grant without a user name
     try:
         r = subprocess.run(
-            ["icacls", path, "/inheritance:r", "/grant:r", "%s:(OI)(CI)F" % user,
+            [windows_system_tool("icacls.exe"), path, "/inheritance:r", "/grant:r", "%s:(OI)(CI)F" % user,
              "BUILTIN\\Administrators:(OI)(CI)F", "NT AUTHORITY\\SYSTEM:(OI)(CI)F"],
             capture_output=True, text=True, timeout=30)
     except (OSError, ValueError, subprocess.SubprocessError):
