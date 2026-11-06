@@ -601,9 +601,12 @@ jobs:
           sed -i '/^MIN_FREE_SPACE_GB=/d' .env
           docker compose up -d --force-recreate vault-api vault-sftp
           for attempt in $(seq 1 40); do
-            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1; then break; fi
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1 \
+                && docker compose exec -T vault-sftp python -c "import socket; socket.create_connection(('127.0.0.1', 2222), 3)" >/dev/null 2>&1; then
+              break
+            fi
             if [ "$attempt" -eq 40 ]; then
-              echo "::error::vault-api did not return after restoring the shipped free-space floor"
+              echo "::error::the servers did not return after restoring the shipped free-space floor"
               exit 1
             fi
             sleep 3
