@@ -67,6 +67,31 @@ def test_a_stray_release_cannot_widen_the_gate(gated: str) -> None:
     assert "ok   stray releases do not widen the gate (peak was 2)" in gated, gated
 
 
+def test_a_reset_frees_every_slot_and_drops_what_was_queued(gated: str) -> None:
+    """A sign-out resets the page's gate. Of what the person who signed out had running, some never ends (a
+    transfer waiting for their account key never settles once they have gone): without the reset, five of them
+    would leave the next person on the tab a gate in which nothing starts. What does end gives nothing back to the
+    new gate, so the next person's five are never joined by a sixth, and what was queued never starts (it would run
+    with the next person's session)."""
+    for line in (
+        "ok   the first person's five run and three wait (active 5, waiting 3)",
+        "ok   a reset frees every slot (active 0, waiting 0)",
+        "ok   the next person's five start at once after a reset (5, waiting 1)",
+        "ok   transfers from before a reset that end give nothing back (active 5, started 5)",
+        "ok   the next person's sixth runs once a slot is theirs (peak 5)",
+        "ok   what was queued before a reset never starts (0)",
+        "ok   the gate empties afterwards (active 0, waiting 0)",
+    ):
+        assert line in gated, gated
+
+
+def test_a_slot_handed_over_before_a_reset_is_not_given_back_after_it(gated: str) -> None:
+    """A slot passed to a waiter just before a reset is the old gate's: its release after the reset is ignored."""
+    assert ("ok   a slot handed over before a reset is not given back to the gate after it (active 1, waiting 1)"
+            in gated), gated
+    assert "ok   the next caller of the gate after a reset is served when its slot is given back" in gated, gated
+
+
 def test_a_nonsense_limit_is_refused(gated: str) -> None:
     for bad in ("0", "-1", "1.5", "NaN", "5", "null"):
         assert f"ok   a limit of {bad} is refused" in gated, gated

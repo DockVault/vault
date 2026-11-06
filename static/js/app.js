@@ -2180,6 +2180,10 @@ function logout(how) {
     state.selectedFileIds = new Set();
     try { clearMoveCopy(); } catch (_) {}          // move/copy clipboard + its floating bar
     try { uploadManager.reset(); } catch (_) {}    // upload tray items + DOM (no server cancels)
+    // The transfers' slots (static/js/transfer_gate.js) are all free again for the next person, and what this person
+    // had queued never starts: a download or upload waiting for their account key never ends once they have signed
+    // out (see _zkSignOuts), so it would keep its slot for the life of the page.
+    try { transferGate.reset(); } catch (_) {}
     ['vaults-list', 'vault-files-grid', 'vault-files-table-body', 'receivers-list',
      'dashboard-vaults-count', 'dashboard-storage', 'dashboard-temp-creds-count',
      'dashboard-users-count'].forEach(id => {

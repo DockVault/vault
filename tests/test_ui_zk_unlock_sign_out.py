@@ -7,14 +7,21 @@ their own: it asks the server for their envelope (here they have none, so it say
 one's. The first one's derivation then ends, and its key is not kept. The derivation is held by the test (the
 page's own one is wrapped, and let go when the test says).
 
-Waits are on state, never on time, but for the moment after the derivation ends in which the key must not be kept.
+An unlock that a sign-out ends never comes back, and neither do the transfers waiting on it: the first person's
+downloads of a zero-knowledge vault, waiting at the passphrase prompt when they sign out, hold the five places the
+page gives transfers (static/js/transfer_gate.js). The sign-out frees those places, so the next person's own
+download and upload start.
+
+Waits are on state, never on time, but for the moments after which something must not happen.
 """
+from pathlib import Path
+
 import pytest
 from playwright.sync_api import Page, expect
 
 from _ui_hand_over import sign_in_on_the_tab
 from conftest import BASE_URL
-from test_ui_e2e import _login
+from test_ui_e2e import _create_zk_vault_via_ui, _login, _u
 from test_ui_zk_key_proof import PASSPHRASE, _keyed, zk  # noqa: F401 (zk is a fixture)
 
 pytestmark = pytest.mark.ui
@@ -202,3 +209,88 @@ def test_a_recovery_key_export_that_ends_after_a_sign_out_downloads_nothing(brow
         assert errors == []
     finally:
         page.context.close()
+
+
+# How many transfers run, and how many wait for a place (static/js/transfer_gate.js: five places).
+GATE = "() => [transferGate.active, transferGate.waiting]"
+
+
+def _open_vault(page: Page, vault_id: str):
+    page.click('.sidebar-item[data-section="vaults"]')
+    page.click(f'.open-vault-btn[data-vault-id="{vault_id}"]', timeout=15000)
+    expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+
+
+def _files(client, vault_id):
+    return [i for i in client.get(f"/vaults/{vault_id}/files").json()["items"] if i["type"] == "file"]
+
+
+def test_transfers_waiting_for_the_key_at_a_sign_out_leave_the_next_person_room(browser, zk):
+    """The first person's key locks, as it does after a time without use, and they download five files of their
+    zero-knowledge vault: all five wait at the passphrase prompt, each in one of the five places the page gives
+    transfers. They sign out at the prompt. The places are free again: the next person signs in on the tab, and a
+    download and an upload in a vault of their own start and finish. The first person's five never end, and none of
+    them lands in the browser's downloads."""
+    ada, ada_c = zk("admin")
+    ben, ben_c = zk("admin")
+    page = browser.new_context(base_url=BASE_URL, accept_downloads=True).new_page()
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    landed = []
+    page.on("download", lambda d: landed.append(d.suggested_filename))
+    zk_vault = own_vault = None
+    try:
+        _login(page, ada["_username"], ada["_password"])
+        zk_vault = _create_zk_vault_via_ui(page, ada_c, PASSPHRASE)
+        _open_vault(page, zk_vault)
+        page.set_input_files("#file-upload-input", files=[
+            {"name": f"{_u('waits')}-{i}.txt", "mimeType": "text/plain", "buffer": b"x" * 100} for i in range(5)])
+        for _ in range(120):
+            if len(_files(ada_c, zk_vault)) == 5:
+                break
+            page.wait_for_timeout(250)
+        assert len(_files(ada_c, zk_vault)) == 5, "the first person's five files were not uploaded"
+        page.wait_for_function("() => (state.currentFiles || []).filter((f) => f.type === 'file').length === 5 "
+                               "&& transferGate.active === 0 && transferGate.waiting === 0", timeout=30000)
+        ids = page.evaluate("() => state.currentFiles.filter((f) => f.type === 'file').map((f) => f.id)")
+        # The key locks (the page's own lock after a time without use), and the five downloads start at once.
+        page.evaluate("(ids) => { zkIdleLock(); window.__firsts = []; ids.forEach((id, n) => "
+                      "downloadFile(id, 'first-' + n + '.txt').then(() => window.__firsts.push('ended'), "
+                      "(e) => window.__firsts.push('failed: ' + e.message))); }", ids)
+        assert page.evaluate("() => zkState.privateKey === null")
+        expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=15000)
+        page.wait_for_function("() => transferGate.active === 5", timeout=15000)
+        assert page.evaluate(GATE) == [5, 0]
+
+        page.evaluate("() => logout()")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        assert page.evaluate(GATE) == [0, 0], "the sign-out left the places of the transfers waiting for the key taken"
+
+        own_vault = ben_c.create_vault(name=_u("own"))["id"]
+        sent = ben_c.post(f"/vaults/{own_vault}/files",
+                          files=[("files", ("theirs.txt", b"the next person's file", "text/plain"))])
+        assert sent.status_code in (200, 201), sent.text
+        fid = _files(ben_c, own_vault)[0]["id"]
+        sign_in_on_the_tab(page, ben)
+        _open_vault(page, own_vault)
+        with page.expect_download(timeout=20000) as got:
+            page.locator(f'button[data-action="download"][data-id="{fid}"]:visible').first.click()
+        assert Path(got.value.path()).read_bytes() == b"the next person's file"
+        page.set_input_files("#file-upload-input", files=[
+            {"name": "uploaded.txt", "mimeType": "text/plain", "buffer": b"the next person's upload"}])
+        for _ in range(120):
+            if any(f["name"] == "uploaded.txt" for f in _files(ben_c, own_vault)):
+                break
+            page.wait_for_timeout(250)
+        assert any(f["name"] == "uploaded.txt" for f in _files(ben_c, own_vault)), "the next person's upload never ran"
+
+        page.wait_for_timeout(1500)                           # the moment in which a first person's download would end
+        assert landed == ["theirs.txt"], landed
+        assert page.evaluate("() => window.__firsts") == [], "a download of the first person ended for the next"
+        assert errors == []
+    finally:
+        page.context.close()
+        if own_vault:
+            ben_c.delete_vault(own_vault)
+        if zk_vault:
+            ada_c.delete_vault(zk_vault)
