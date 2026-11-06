@@ -1,5 +1,5 @@
 """The upgrade matrix's conditions of 0.34.0: their ids (CONDITIONS), the edges they go on (INTO, SOURCE_FLOOR),
-their detect queries (DETECT) and the texts written so far (SUMMARY). The release commit copies each, with the
+their detect queries (DETECT) and their texts (SUMMARY). The release commit copies each, with the
 condition's text, onto every edge into 0.34.0 in docs/upgrade-matrix.json; until then they live here, so the tests
 can run every query against a database, check each text kept here against the code it describes, and check the
 release commit's matrix against this file (tests/test_release_conditions.py).
@@ -88,7 +88,7 @@ DETECT = {
         "SELECT key, requires_at_least, reason, since FROM data_requirements ORDER BY key"),
 }
 
-# The texts of the conditions whose text is written already, for the release commit to copy with the query.
+# The text of every condition, for the release commit to copy with the query.
 SUMMARY = {
     "audit-history-compressed-after-90-days": (
         "From 0.34.0 the audit log is still kept for ever by default, but each UTC day older than 90 days "
@@ -101,6 +101,54 @@ SUMMARY = {
         "days; a tool that reads audit_logs directly sees only the newer days. python dockvault.py audit unarchive "
         "puts days back as rows once they fit. The check counts the rows archiving will move when it starts, with "
         "the default windows: those of the days before the day 76 days ago."),
+    "audit-retention-runs-on-a-timer": (
+        "Before 0.34.0 a positive AUDIT_LOG_RETENTION_DAYS deleted old audit rows only when an administrator opened "
+        "the activity dashboard, so rows older than it can be in the database now. From 0.34.0 the pruner deletes "
+        "them on a timer. On an install that already has a positive value nothing is deleted at the upgrade: the "
+        "value first waits RETENTION_REDUCTION_DELAY_DAYS (7 by default) as a change that deletes sooner, every "
+        "administrator is told, and any administrator can cancel it in Settings, Activity and records. "
+        "Administration and security rows are kept at least 365 days whatever the value "
+        "(AUDIT_PROTECTED_MIN_DAYS). python dockvault.py audit retention shows the values in force. The check shows "
+        "the number of audit rows and the oldest."),
+    "audit-protected-minimum-365-days": (
+        "From 0.34.0 administration and security audit rows (what administrators did, and the security events) are "
+        "kept at least AUDIT_PROTECTED_MIN_DAYS (365 by default) whatever the maximum days, and the size cap never "
+        "deletes them; only .env lowers the minimum. A deployment whose AUDIT_LOG_RETENTION_DAYS is below 365 keeps "
+        "these rows longer than before; one that must delete them sooner sets AUDIT_PROTECTED_MIN_DAYS before the "
+        "upgrade. The server refuses to start when AUDIT_PROTECTED_MIN_DAYS or AUDIT_MIN_RETENTION_DAYS is longer "
+        "than PLAN_LOG_MAX_DAYS, or AUDIT_LOG_RETENTION_DAYS is shorter than AUDIT_MIN_RETENTION_DAYS."),
+    "container-output-rotates": (
+        "From 0.34.0 the shipped compose files rotate each container's output (docker logs): Docker's json-file "
+        "driver keeps at most DOCKER_LOG_MAX_FILE files (5 by default) of DOCKER_LOG_MAX_SIZE (10m by default) per "
+        "container. Only installs whose compose files come from 0.34.0 get it: set up from it, or updated after "
+        "updating the checkout (git pull, or git fetch --tags and git checkout v0.34.0). An install that updates by "
+        "pulling images keeps its old compose files, which never rotate: update the checkout, or add the logging "
+        "block to each service by hand. A Docker host whose default log driver is journald or syslog refuses these "
+        "options: remove the block there (README, Container logs)."),
+    "alert-names-and-addresses-cleared-after-30-days": (
+        "From 0.34.0 each failed sign-in is kept in full in the security record for SECURITY_RECORD_DAYS (30 by "
+        "default, 7 to 365), and security alerts lose the name and the address that raised them after the same "
+        "time, resolved or not; their messages no longer spell them out. The first pass after the upgrade clears "
+        "every older alert. Resolved alerts are deleted after SECURITY_ALERT_RETENTION_DAYS (90 by default) on a "
+        "timer, where earlier releases deleted them only when the alerts were read. The check counts the alerts "
+        "whose name or address will be cleared."),
+    "ended-invitations-and-codes-deleted-after-30-days": (
+        "From 0.34.0 invitations are deleted 30 days after they are accepted, revoked or expire, and used or expired "
+        "password reset links, one-time codes and email-change codes 30 days after they end; earlier releases kept "
+        "them. The first pass after the upgrade deletes every older one, so the list of invitations shows only the "
+        "ended ones of the last 30 days. The lineage an administrator's accepted invitation gave is kept apart, and "
+        "the audit log keeps every event. Notifications stay until the person dismisses them unless "
+        "NOTIFICATION_RETENTION_DAYS (or Settings, Activity and records) gives them a window. The check counts what "
+        "the first pass deletes."),
+    "panel-retention-not-read": (
+        "Going back to 0.33.x: the values administrators set in Settings, Activity and records are not read, and "
+        "the changes waiting do not run. Retention falls back to AUDIT_LOG_RETENTION_DAYS, applied again only when "
+        "the activity dashboard is opened, and resolved alerts are deleted only when they are read. Set "
+        "AUDIT_LOG_RETENTION_DAYS=0 before going back: the older release would otherwise delete old audit rows the "
+        "integrity chain has sealed, and back on 0.34.0 python dockvault.py audit verify reports them missing until "
+        "python dockvault.py audit acknowledge-removed-before --before <time> --retention-days <days> seals over "
+        "them. What the older "
+        "release ignores stays for the next upgrade. The check lists the values set in the panel."),
     "archived-audit-history-hidden": (
         "An earlier release cannot read the audit log's compressed daily blocks. While any block exists, 0.33.1 and "
         "later refuse to start on this database, and 0.33.0 and earlier start without seeing those days. Before "
@@ -236,7 +284,7 @@ def edge_problems(matrix: dict) -> list:
     """What the edges into INTO of an upgrade matrix (docs/upgrade-matrix.json, as loaded) lack, as a list of
     sentences; empty when every such edge that can be taken leaves from SOURCE_FLOOR or later and carries every
     condition of CONDITIONS as kept here: the same query, the rollback flag on exactly the conditions that block a
-    rollback, and the text where one is kept here."""
+    rollback, and the same text."""
     problems = []
     edges = [edge for edge in matrix.get("edges", []) if edge.get("to") == INTO and edge.get("kind") != "blocked"]
     if INTO in matrix.get("versions", {}) and not edges:
@@ -257,15 +305,15 @@ def edge_problems(matrix: dict) -> list:
                 problems.append(f"{where} leaves blocks_rollback off {cid}, which blocks a rollback")
             if cid not in BLOCKS_ROLLBACK and "blocks_rollback" in condition:
                 problems.append(f"{where} marks {cid} with blocks_rollback, which blocks none")
-            if cid in SUMMARY and condition.get("summary") != SUMMARY[cid]:
+            if condition.get("summary") != SUMMARY[cid]:
                 problems.append(f"{where} gives {cid} another text than the one kept here")
     return problems
 
 
 def condition(cid: str) -> dict:
-    """The condition ``cid`` as the release commit writes it on an edge into INTO: the text kept here (a stand-in
-    where none is kept yet), the query and the rollback flag."""
-    out = {"id": cid, "summary": SUMMARY.get(cid, "What the release commit writes.")}
+    """The condition ``cid`` as the release commit writes it on an edge into INTO: the text kept here, the query and
+    the rollback flag."""
+    out = {"id": cid, "summary": SUMMARY[cid]}
     if cid in DETECT:
         out["detect"] = DETECT[cid]
     if cid in BLOCKS_ROLLBACK:
