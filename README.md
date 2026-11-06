@@ -661,7 +661,9 @@ its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
 Each backup is a folder of its own that only you can open: mode `0700` on Linux and macOS, and on
 Windows an ACL for your user, SYSTEM and Administrators only, set before anything is written into it
-(a folder on a second drive otherwise commonly lets every signed-in user in). The backup folder you
+(a folder on a second drive otherwise commonly lets every signed-in user in). Your account is named
+there by its SID, as it is for `.env`, never by a bare name, which Windows can take for a local account
+of the same name. The backup folder you
 name with `--backup-dir` keeps its own permissions when it already exists; one the tool creates is
 `0700`.
 

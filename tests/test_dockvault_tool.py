@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("dockvault_mod", ROOT / "dockvault.py")
 dv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dv)
+# The real one, kept before the fixture below stands in for it (a test that stubs the commands it runs uses it).
+_TIGHTEN_SECRET_FILE = dv.tighten_secret_file
 
 
 @pytest.fixture(autouse=True)
@@ -3137,12 +3139,23 @@ def test_the_key_is_made_world_readable_only_when_a_container_cannot_re_own_it_e
     assert (os.stat(certs / "key.pem").st_mode & 0o777) == 0o644
 
 
+_SID = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+
+
+def _whoami_answers(cmd, sid=_SID):
+    """What whoami /user /fo csv /nh prints (None for any other command)."""
+    if cmd[0].endswith("whoami.exe") and cmd[1:] == ["/user", "/fo", "csv", "/nh"]:
+        return _Proc(0, '"corp\\operator","%s"\r\n' % sid if sid else "", "")
+    return None
+
+
 def _windows_backup(tmp_path, monkeypatch, icacls_ok=True):
     monkeypatch.setattr(dv.os, "name", "nt")
     monkeypatch.setenv("USERNAME", "operator")
     events = []
-    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: events.append(("run", cmd)) or _Proc(
-        0 if icacls_ok or cmd[0] != "icacls" else 5, "", "Access is denied." if not icacls_ok else ""))
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: events.append(("run", cmd)) or _whoami_answers(cmd)
+                        or _Proc(0 if icacls_ok or cmd[0] != "icacls" else 5, "",
+                                 "Access is denied." if not icacls_ok else ""))
     real_copy = dv._copy_secret
     monkeypatch.setattr(dv, "_copy_secret", lambda src, dst: events.append(("copy", os.path.basename(dst)))
                         or real_copy(src, dst))
@@ -3168,10 +3181,47 @@ def test_a_windows_backup_folder_is_restricted_to_the_user_before_anything_is_wr
     acl = [i for i, e in enumerate(events) if e[0] == "run" and e[1][0] == "icacls" and e[1][1] == bundle]
     assert acl, events
     cmd = events[acl[0]][1]
-    assert "/inheritance:r" in cmd and "operator:(OI)(CI)F" in cmd
+    assert "/inheritance:r" in cmd and "*%s:(OI)(CI)F" % _SID in cmd
     assert "BUILTIN\\Administrators:(OI)(CI)F" in cmd and "NT AUTHORITY\\SYSTEM:(OI)(CI)F" in cmd
     first_write = min(i for i, e in enumerate(events) if e[0] in ("copy", "tar"))
     assert acl[0] < first_write, "restricted before the env or any archive is written"
+
+
+@pytest.mark.parametrize("who", ["a-domain-user", "the-system-account"])
+def test_windows_access_is_granted_to_the_users_sid_never_to_a_bare_name(monkeypatch, who):
+    """icacls looks a bare name up among the computer's own accounts first: a domain user with a same-named local
+    account granted that account, and a run as SYSTEM has USERNAME set to the computer's account (COMPUTER$), so the
+    backup failed or opened the folder to another account. The secrets file and the backup folder are granted to
+    the SID whoami gives, which names the one account the process runs as."""
+    monkeypatch.setattr(dv.os, "name", "nt")
+    sid = _SID if who == "a-domain-user" else "S-1-5-18"
+    monkeypatch.setenv("USERNAME", "operator" if who == "a-domain-user" else "HOST01$")
+    monkeypatch.setenv("USERDOMAIN", "CORP" if who == "a-domain-user" else "WORKGROUP")
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _whoami_answers(cmd, sid)
+                        or _Proc(0, "", ""))
+    assert dv.windows_user_grantee() == "*" + sid
+    assert dv.restrict_folder_to_owner("D:\\backups\\b") is True
+    assert _TIGHTEN_SECRET_FILE("C:\\vault\\.env") is True
+    grants = [c[c.index("/grant:r") + 1] for c in calls if c[0] == "icacls"]
+    assert grants == ["*%s:(OI)(CI)F" % sid, "*%s:(R,W)" % sid]
+
+
+@pytest.mark.parametrize("answer, env, grantee", [
+    ("", {"USERNAME": "operator", "USERDOMAIN": "CORP"}, "CORP\\operator"),
+    ("", {"USERNAME": "operator"}, "operator"),
+    ("", {}, None),
+    ('"corp\\operator","not a sid"', {"USERNAME": "operator", "USERDOMAIN": "CORP"}, "CORP\\operator"),
+])
+def test_without_a_sid_from_whoami_the_grant_names_the_domain_too(monkeypatch, answer, env, grantee):
+    monkeypatch.setattr(dv.os, "name", "nt")
+    for name in ("USERNAME", "USERDOMAIN"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, answer, ""))
+    assert dv.windows_user_grantee() == grantee
+    assert dv.restrict_folder_to_owner("D:\\backups\\b") is (grantee is not None)
 
 
 def test_a_windows_backup_whose_folder_cannot_be_restricted_writes_nothing(tmp_path, monkeypatch, capsys):

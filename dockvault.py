@@ -922,13 +922,37 @@ def replace_file_durably(path, data):
     sync_directory(directory)
 
 
+def windows_user_grantee():
+    """Windows: how icacls is to name the account this process runs as. Its SID (`*S-1-...`, from whoami /user),
+    which names that one account; else DOMAIN\\user from the environment; else the bare user name; else None. A
+    bare name is looked up among this computer's own accounts first, so a domain user who has a same-named local
+    account would grant that one, and a run as SYSTEM has the computer's account in USERNAME (COMPUTER$)."""
+    import csv
+    whoami = os.path.join(os.environ.get("SystemRoot") or "C:\\Windows", "System32", "whoami.exe")
+    try:
+        r = subprocess.run([whoami, "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
+        lines = (getattr(r, "stdout", "") or "").strip().splitlines() if getattr(r, "returncode", 1) == 0 else []
+        fields = next(csv.reader([lines[-1]])) if lines else []
+    except (OSError, ValueError, subprocess.SubprocessError, csv.Error, StopIteration):
+        fields = []
+    sid = fields[-1].strip() if fields else ""
+    if re.match(r"^S-1-[0-9]+(-[0-9]+)+$", sid):
+        return "*" + sid
+    user = os.environ.get("USERNAME") or ""
+    domain = os.environ.get("USERDOMAIN") or ""
+    if user and domain:
+        return "%s\\%s" % (domain, user)
+    return user or None
+
+
 def tighten_secret_file(path):
     """Restrict a secrets file to the current user - chmod 600 on POSIX, icacls on Windows. Returns
     True ONLY if the tightening actually succeeded, so a caller never falsely reports a secrets file
     (which holds ENCRYPTION_KEY) as locked down when it isn't."""
     try:
         if os.name == "nt":
-            user = os.environ.get("USERNAME") or ""
+            user = windows_user_grantee()
             if not user:
                 return False  # can't form a valid icacls grant without a user name
             r = subprocess.run(
@@ -943,9 +967,10 @@ def tighten_secret_file(path):
 
 
 def restrict_folder_to_owner(path):
-    """Windows: restrict a folder to the current user, SYSTEM and Administrators (inheritance from where it was made
-    removed), so that what is written inside inherits that and nothing wider. True ONLY when icacls did it."""
-    user = os.environ.get("USERNAME") or ""
+    """Windows: restrict a folder to the current user (by SID: windows_user_grantee), SYSTEM and Administrators
+    (inheritance from where it was made removed), so that what is written inside inherits that and nothing wider.
+    True ONLY when icacls did it."""
+    user = windows_user_grantee()
     if not user:
         return False          # can't form a valid icacls grant without a user name
     try:
