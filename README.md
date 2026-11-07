@@ -718,7 +718,9 @@ refused with nothing changed. Each extraction then copies its archive into the c
 extracts it, hashes the copy, and extracts the copy only when it is the archive checked: a bundle on a
 share or a removable disk, or one someone else can write while the restore waits for its
 confirmation, can change in between, and an archive changed since is not extracted at all (the
-restore stops there). The copy needs room in Docker's storage for one archive at a time; the check
+restore stops there). The copy needs room in Docker's storage for one archive at a time: besides the
+room the restored data takes, keep free, on the disk that holds Docker's storage, as much as the
+largest archive in the bundle (its size is in the bundle folder, and in `manifest.json`). The check
 before anything is stopped makes the same copy, so a host without that room is refused with nothing
 changed. The checksums of an unsealed backup show damage only: whoever can write
 the bundle can rewrite them too. A backup made before backups recorded checksums (its manifest is of
