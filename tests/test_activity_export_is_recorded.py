@@ -36,7 +36,12 @@ class _Db:
 
 @pytest.fixture
 def export(monkeypatch):
-    """Run the export route; `fail` decides whether its audit row can be written."""
+    """Run the export route; `fail` decides whether its audit row can be written. The process has read the audit
+    log's integrity chain (a new one: nothing archived), as the web process does before it serves."""
+    from app.core import audit_integrity
+    read = audit_integrity.ChainState()
+    read.view_read = True
+    monkeypatch.setattr(audit_integrity, "_state", read)
     written = []
 
     class _Logger:

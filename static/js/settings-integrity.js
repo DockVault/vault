@@ -95,8 +95,13 @@
             'checked against the seals first; nothing is deleted by it. ';
         if (a.starts_on) text += 'Archiving ' + (new Date(a.starts_on) > new Date() ? 'starts' : 'started') + ' on ' +
             when(a.starts_on) + '. ';
-        else text += 'Archiving starts ' + a.start_after_days + ' days after the log is first sealed. ';
-        text += a.days ? (a.days + ' days are archived, ' + a.oldest_day + ' to ' + a.newest_day + '.')
+        else if (a.read !== false) {
+            text += 'Archiving starts ' + a.start_after_days + ' days after the log is first sealed. ';
+        }
+        if (a.read === false) {
+            text += "Which audit days are archived is not known yet: this server has not read the audit log's " +
+                'integrity chain through (it does so as it starts).';
+        } else text += a.days ? (a.days + ' days are archived, ' + a.oldest_day + ' to ' + a.newest_day + '.')
             : 'No day is archived yet.';
         box.appendChild(el('span', null, text));
         box.hidden = false;

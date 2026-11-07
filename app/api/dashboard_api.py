@@ -196,7 +196,7 @@ async def get_recent_events(
     # any, is in the archive headers (app/services/activity_archive.py).
     from app.services import activity_archive
     response = handle_conditional_response(request, events_data)
-    response.headers.update(activity_archive.headers_for())
+    response.headers.update(activity_archive.headers_for(db=db))
     return response
 
 

@@ -12,6 +12,10 @@
 (function () {
     'use strict';
 
+    // What the archive's summary says while the server has not read the chain through (its ``read`` false).
+    const UNREAD_ARCHIVE = "Which audit days are archived is not known yet: this server has not read the audit " +
+        "log's integrity chain through (it does so as it starts).";
+
     function el(tag, cls, text) {
         const node = document.createElement(tag);
         if (cls) node.className = cls;
@@ -25,9 +29,11 @@
         return isNaN(d.getTime()) ? text : d.toLocaleString();
     }
 
-    // The archive (app/core/audit_archive.py summary): when it starts, and the days it holds.
+    // The archive (app/core/audit_archive.py summary): when it starts, and the days it holds; not known while the
+    // server has not read the audit log's integrity chain through (read false).
     function archiveText(a) {
         if (!a || !a.hot_days) return '';
+        if (a.read === false) return UNREAD_ARCHIVE;
         if (a.days) {
             return 'Audit days older than ' + a.hot_days + ' days are kept compressed: ' + a.days + ' days, ' +
                 a.oldest_day + ' to ' + a.newest_day + '.';

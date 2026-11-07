@@ -73,10 +73,12 @@ from app.core.audit_chain_view import ArchivePart
 
 HOT_DAYS_KEY = "audit_hot_days"
 START_AFTER_KEY = "audit_archive_start_after_days"
+# The shortest row window: no day younger than this many days is ever archived (unarchived_from).
+HOT_DAYS_LEAST = 31
 
 registry.register(registry.SettingSpec(
     level=registry.ADVANCED, since="0.34.0",
-    key=HOT_DAYS_KEY, kind="int", default=90, env="audit_hot_days", minimum=31, maximum=3650,
+    key=HOT_DAYS_KEY, kind="int", default=90, env="audit_hot_days", minimum=HOT_DAYS_LEAST, maximum=3650,
     group="audit_retention", unit="days", label="Keep audit rows uncompressed for",
     help="Older days are compressed into daily blocks, each checked against the log's seals before its rows "
          "are removed. Nothing is deleted: the rows can be restored with dockvault.py audit unarchive."))
@@ -139,6 +141,14 @@ def start_after_days() -> int:
         return int(registry.resolve(START_AFTER_KEY))
     except Exception:  # noqa: BLE001
         return 14
+
+
+def unarchived_from(now: datetime) -> datetime:
+    """The start of the UTC day HOT_DAYS_LEAST days before ``now``. Every archived hour is before it: next_day takes
+    only days before the row window, which is never shorter, as the clock read when it archived. So a range that starts
+    at or after it reaches no archived day, whatever the chain holds; but for a clock set back since, which the readers
+    that rely on it check against the blocks themselves (app/services/activity_archive.py)."""
+    return day_start((now - timedelta(days=HOT_DAYS_LEAST)).date())
 
 
 def _is_pg(db) -> bool:
@@ -1517,15 +1527,21 @@ def _starts_on(view, now: datetime) -> Optional[datetime]:
 
 
 def summary(st=None) -> dict:
-    """The archive as the verified view knows it: when archiving starts, the row window, and what is archived."""
+    """The archive as the verified view knows it: when archiving starts, the row window, and what is archived.
+    ``read`` False while this process has not read the chain through (audit_integrity.ChainState.view_read): what
+    the view holds is then not known, and is None rather than read from an empty or partial view."""
     ai = _ai()
     st = st or ai.state()
     view = st.view
+    if not st.view_read:
+        return {"read": False, "hot_days": hot_days(), "start_after_days": start_after_days(), "first_start": None,
+                "starts_on": None, "days": None, "oldest_day": None, "newest_day": None, "blocks": None,
+                "bytes": None, "rows": None}
     first = first_start(view)
     days = sorted(d for d, e in view.archives.items() if e.parts)
     parts = [p for _d, p in view.archived_parts()]
     begins = _starts_on(view, st.clock())
-    return {"hot_days": hot_days(), "start_after_days": start_after_days(),
+    return {"read": True, "hot_days": hot_days(), "start_after_days": start_after_days(),
             "first_start": fmt.time_text(first) if first is not None else None,
             "starts_on": fmt.time_text(begins) if begins is not None else None,
             "days": len(days), "oldest_day": days[0].isoformat() if days else None,

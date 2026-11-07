@@ -54,6 +54,9 @@ PENDING = "pending"
 RUNNING = "running"
 COMPLETED = "completed"
 CANCELLED = "cancelled"
+# A row the view holds no request of while this process has not read the chain through: not known yet, rather than
+# "not recorded".
+UNREAD = "unread"
 
 REQUESTED_ACTION = "audit_values_removal_requested"
 CANCELLED_ACTION = "audit_values_removal_cancelled"
@@ -391,11 +394,17 @@ def entry_of(row, view, extra_seal=None) -> dict:
 
 
 def listing(db, st=None) -> list:
-    """Every removal, newest first, as the chain holds it; a row the chain holds no request of says so."""
+    """Every removal, newest first, as the chain holds it; a row the chain holds no request of says so, or, while
+    this process has not read the chain through (ChainState.view_read), that it is not known yet (UNREAD)."""
     from app.core.models import AuditValueRemoval
     st = st or _ai().state()
     rows = db.query(AuditValueRemoval).order_by(AuditValueRemoval.requested_at.desc()).limit(100).all()
-    return [entry_of(r, st.view) for r in rows]
+    out = [entry_of(r, st.view) for r in rows]
+    if not st.view_read:
+        for entry in out:
+            if entry["status"] == "not recorded":
+                entry["status"] = UNREAD
+    return out
 
 
 # --------------------------------------------------------------------------- telling the administrators

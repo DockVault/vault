@@ -86,7 +86,7 @@ def cap_counted(now: datetime, st=None, db=None) -> Optional[dict]:
     bytes now, from WARN_AT of the cap, so a sudden growth is warned of before the cap counts it; ``over_from`` is
     the earliest the cap's count passes the cap on what is sealed now (None when it does not), the day it would
     start deleting unless the cap is raised or the hold turned on. ``counted_bytes`` is None while the chain has
-    nothing verified to count."""
+    nothing verified to count, or this process has not read it through (audit_integrity.ChainState.view_read)."""
     from app.core import audit_chain_size as chain_size
     from app.core import audit_integrity as ai
     from app.core import audit_retention as ar
@@ -95,7 +95,7 @@ def cap_counted(now: datetime, st=None, db=None) -> Optional[dict]:
         return None
     cap = numbers.max_mb * ar.MB
     st = st or ai.state()
-    if not st.view.position:
+    if not st.view_read or not st.view.position:
         return {"cap_bytes": cap, "counted_bytes": None, "now_bytes": None, "fraction": None, "warn": False,
                 "over_from": None}
     record = st.known_record()

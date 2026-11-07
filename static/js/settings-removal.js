@@ -20,7 +20,7 @@
 
     const S = { preview: null, busy: false, data: null };
     const STATUS = { pending: 'Waiting', running: 'Running', completed: 'Completed', cancelled: 'Cancelled',
-        'not recorded': 'Not in the audit log' };
+        'not recorded': 'Not in the audit log', unread: 'Not known yet' };
     const LEVEL_WORDS = { none: 'not recorded', fingerprint: 'fingerprint', shortened: 'shortened', full: 'full' };
     const KIND_WORDS = { names: 'names', signin_names: 'names typed at sign-in', emails: 'email addresses',
         ip: 'IP addresses', user_agent: 'browser descriptions' };
@@ -124,6 +124,9 @@
             else if (r.status === 'completed') text += `; completed on ${when(r.completed_at)}.`;
             else if (r.status === 'cancelled') {
                 text += `; cancelled${r.decided_by ? ' by ' + r.decided_by : ''}${r.decided_at ? ' on ' + when(r.decided_at) : ''}.`;
+            } else if (r.status === 'unread') {
+                text += ". Its state is not known yet: this server has not read the audit log's integrity chain " +
+                    'through (it does so as it starts).';
             } else text += '. The audit log holds no request of it, so it does not run.';
             item.appendChild(el('p', 'text-secondary text-sm', text));
             if (r.waiting) item.appendChild(el('p', 'text-secondary text-sm removal-waiting', r.waiting));

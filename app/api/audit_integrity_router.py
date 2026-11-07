@@ -50,14 +50,32 @@ MAX_ROWS_SHOWN = 200
 ACKNOWLEDGED_ACTION = "audit_integrity_acknowledged"
 
 
+# What a refusal while this process cannot read the chain tells the client to wait before it asks again (Retry-After).
+UNREAD_RETRY_SECONDS = 60
+
+
+def require_chain_read(db, what: str) -> None:
+    """For a route whose answer comes from this process's view of the chain: read the chain first when this process
+    has not read it through (audit_integrity.read_view), and refuse with 503 (and Retry-After) when it still is not,
+    rather than answer ``what`` from an empty or partial view."""
+    st = audit_integrity.state()
+    if audit_integrity.read_view(db.get_bind(), st):
+        return
+    retry = "" if (st.stopped is not None or st.read_stopped) else " Try again in a minute."
+    raise HTTPException(status_code=503, detail=f"{what} cannot be told yet: {audit_integrity.unread_reason(st)}."
+                                                f"{retry}", headers={"Retry-After": str(UNREAD_RETRY_SECONDS)})
+
+
 def _entries(table: dict) -> list:
     return [{"kind": kind, "message": e.get("message", ""), "first_seen": e.get("first_seen"),
              "last_seen": e.get("last_seen")} for kind, e in sorted((table or {}).items())]
 
 
 @router.get("/activity/integrity")
-def get_integrity(current_user: User = Depends(require_interactive_admin)):
-    """The integrity status of the audit log."""
+def get_integrity(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """The integrity status of the audit log. The chain is read first when this process has not read it through
+    (the archive's summary is from the view; until it is read, it says so: ``read`` false)."""
+    audit_integrity.read_view(db.get_bind())
     status = audit_integrity.status()
     return {"head": status.get("head"), "sealed_through": status.get("sealed_through"),
             "key_id": status.get("key_id"), "key_shared": bool(status.get("key_shared")),

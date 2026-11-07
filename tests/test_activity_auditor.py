@@ -50,6 +50,17 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture(autouse=True)
+def chain_read(monkeypatch):
+    """The process has read the audit log's integrity chain, as the web process does before it serves: a new one,
+    nothing archived (app/services/activity_archive.py reads no archive from a view it has not read)."""
+    from app.core import audit_integrity
+    st = audit_integrity.ChainState()
+    st.view_read = True
+    monkeypatch.setattr(audit_integrity, "_state", st)
+    return st
+
+
+@pytest.fixture(autouse=True)
 def denials(monkeypatch):
     out = []
     monkeypatch.setattr(api, "_audit_admin_denial", lambda db_, user, reason: out.append((user.username, reason)))

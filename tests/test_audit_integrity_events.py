@@ -418,7 +418,7 @@ def test_the_status_route_is_a_plain_function_for_administrators(env):
     from app.api import audit_integrity_router as r
     assert not inspect.iscoroutinefunction(r.get_integrity)
     _sealed(env)
-    out = r.get_integrity(current_user=None)
+    out = r.get_integrity(current_user=None, db=env.session())
     assert out["head"].startswith("dvchain1:") and out["outcome"] == "clean" and out["failures"] == []
     assert "not against the server's operator" in out["claim"]
 

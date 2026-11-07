@@ -2487,7 +2487,7 @@ async def recent_audit_events(
     span is in the activity_archive.ARCHIVE_HEADERS when there are any."""
     from app.core.models import AuditLog
     from app.services import activity_archive
-    response.headers.update(activity_archive.headers_for())
+    response.headers.update(activity_archive.headers_for(db=db))
     limit = max(1, min(limit, 50))
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
     out = []
@@ -2582,7 +2582,7 @@ async def search_audit_log(
     from app.core.models import AuditLog
     from app.services import activity_archive
     response.headers.update(activity_archive.headers_for(audit_range.lower_bound(from_date),
-                                                         audit_range.upper_bound(to_date)))
+                                                         audit_range.upper_bound(to_date), db=db))
     limit = max(1, min(limit, 2000))
     rows = (
         _build_audit_query(db, user_id, action, from_date, to_date)
@@ -2673,7 +2673,9 @@ def activity_events(
     archive together, the same filters running over both (app/services/activity_archive.py): at most
     activity_archive.MAX_DAYS archived days at a time (400 beyond it). `archive` in the response says
     where the archive is, whether this read searched it, and the days it could not read; it is there only
-    when the range reaches the archive.
+    when the range reaches the archive. While this server cannot tell which days are archived (it reads the audit
+    log's integrity chain as it starts), a read that could reach one is refused with 503 and Retry-After, never
+    answered from rows alone (activity_archive.Unread).
 
     A plain def, so FastAPI runs it in its thread pool: a count and a page over a large audit table
     must not hold the event loop. It never writes an audit row: the page re-reads it as events arrive,
@@ -2687,15 +2689,15 @@ def activity_events(
     start, end = audit_range.lower_bound(from_date), audit_range.upper_bound(to_date)
     # Reading the rows after a point reaches the archive only when that point is in it; reading rows by id only when
     # one of them is no row of audit_logs (the live list's new rows always are).
-    reach = start
+    reach, by_rows = start, False
     if wanted_ids and archive.ids_are_rows(db, wanted_ids):
-        reach = None
+        reach, by_rows = None, True
     anchor = ev.read_anchor(after) if after and not wanted_ids else None
     if anchor and anchor[0] == "cursor":
         since = anchor[1][0] - timedelta(seconds=overlap)
         reach = since if start is None or since > start else start
     try:
-        with archive.source(db, reach, end) as src:
+        with archive.source(db, reach, end, rows_only=by_rows) as src:
             out = _activity_events_page(
                 src.db, src.entity, request, current_user, db, wanted_ids, after, overlap, cursor, page,
                 count_only, limit, dict(categories=category, channels=channel, statuses=status, actions=action,
@@ -2709,6 +2711,15 @@ def activity_events(
             return out
     except archive.TooBroad as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except archive.Unread as exc:
+        raise _archive_unread(exc)
+
+
+def _archive_unread(exc) -> HTTPException:
+    """A read refused while the archived days cannot be told (activity_archive.Unread): 503, with when to ask again."""
+    from app.services import activity_archive as archive
+    return HTTPException(status_code=503, detail=str(exc),
+                         headers={"Retry-After": str(archive.UNREAD_RETRY_SECONDS)})
 
 
 def _activity_events_page(rdb, AuditLog, request, current_user, db, wanted_ids, after, overlap, cursor, page,
@@ -3118,7 +3129,7 @@ def activity_summary(
         end = min(until, now) if until else now
         first = summary.oldest(s, AuditLog, filters, until)           # all time is charted from it
         # or from the oldest archived part the events block counts, when that is older
-        archived = archive.oldest_archived(summary.block_filters(filters)["events"], until)
+        archived = archive.oldest_archived(summary.block_filters(filters)["events"], until, db=s)
         if archived is not None and (first is None or archived < first):
             first = archived
         return summary.summarize(s, AuditLog, summary.all_time(first, end, tz_offset, zone), filters,
@@ -3126,7 +3137,7 @@ def activity_summary(
 
     def compute():
         # Over archived hours the band reads rows and the parts' aggregates in one state of the database.
-        if not archive.reaches_archive(since, min(until, now) if until else now):
+        if not archive.reaches_archive(since, min(until, now) if until else now, db=db):
             return band(db)
         s = archive.snapshot_session(db.get_bind())
         try:
@@ -3135,7 +3146,10 @@ def activity_summary(
             s.rollback()
             s.close()
 
-    band, age = summary.cached(key, range_, compute)
+    try:
+        band, age = summary.cached(key, range_, compute)
+    except archive.Unread as exc:
+        raise _archive_unread(exc)
     out = {"range": range_, "time_zone": zone_name, **band, "age_seconds": round(age, 1),
            "fresh_seconds": round(summary.fresh_for(range_, age), 1)}
     # Live sessions and transfers are an administrator's, not log review.
@@ -3209,7 +3223,9 @@ def activity_export(
     A range with a start that reaches archived days is exported from rows and archive together, as the
     Events list reads them (app/services/activity_archive.py): then every batch is read in the one
     transaction that holds the archived rows, open while the export streams. Its last lines name any
-    archived day it could not read, or, for a range with no start, the archived days it left out."""
+    archived day it could not read, or, for a range with no start, the archived days it left out. While this server
+    cannot tell which days are archived, an export that could reach one is refused with 503 before anything is
+    recorded or sent (activity_archive.Unread)."""
     import contextlib
     from starlette.background import BackgroundTask
     from app.core import audit_range
@@ -3237,6 +3253,9 @@ def activity_export(
     except archive.TooBroad as exc:
         held.close()
         raise HTTPException(status_code=400, detail=str(exc))
+    except archive.Unread as exc:          # refused before anything is recorded or sent: never a partial file
+        held.close()
+        raise _archive_unread(exc)
     searched = bool(src.note and src.note["searched"])
     if not searched:
         held.close()
@@ -26691,6 +26710,18 @@ async def lifespan(app: FastAPI):
     # values, and keep them fresh in the background so no request reads them from the database.
     from app.core import settings_registry
     settings_registry.start()
+
+    # The audit log's integrity chain, read before the first request: which audit days are archived, the waiting
+    # changes, erases and removals are known only from this process's view of it, which the pruner's first pass would
+    # fill only a minute in, and every page that reads it would answer from an empty one until then. At most
+    # START_READ_SECONDS, off the event loop; a chain that cannot be read never stops the start (the pages that need
+    # it read it again, and say so when they cannot). See app/core/audit_integrity.py, read_at_start.
+    from app.core import audit_integrity
+    from app.core.database import _require_engine
+    try:
+        await asyncio.to_thread(audit_integrity.read_at_start, _require_engine())
+    except Exception as e:  # noqa: BLE001 -- never stops the start
+        print(f"⚠ The audit log's integrity chain was not read at the start ({type(e).__name__})")
 
     # Database maintenance the app does not need in order to be correct (an index built or dropped
     # concurrently, a table's storage settings), last and off the startup path, on a thread of its own,

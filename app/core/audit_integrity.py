@@ -320,6 +320,15 @@ class ChainState:
         # archive seq when read, the rows of the name, the newest of them, the newest protected one). A day whose
         # archive seal changes is read again (app/core/audit_chain_erase.py).
         self.erase_scans: Dict[tuple, Any] = {}
+        # Whether the view holds the database's chain read through by a check (ChainWriter.check): set once a check
+        # has read every seal (or found no chain at all); cleared when a check starts the view again (a new
+        # generation), and when one stops while the view holds seals up to the head record whose link it has not
+        # reached. Until then the view is empty, or partial, or not verified, and what it lacks (an archived day)
+        # would read as if it did not exist: the readers of the view read the chain first (read_view), and say so
+        # when they cannot.
+        self.view_read = False
+        # The kind of stop the last read for a reader met (read_view), or None.
+        self.read_stopped: Optional[str] = None
 
     def cfg(self):
         return self.settings or _settings()
@@ -673,11 +682,13 @@ class ChainWriter:
         view = st.view
         if record is not None and (int(record.get("generation", 1)), int(record.get("discards", 0))) > \
                 (view.generation, view.discards):
+            st.view_read = False
             view.reset(int(record.get("generation", 1)), int(record.get("discards", 0)))
             st.own.clear()
         newest = newest_seq(db)
         if record is None:
             if newest == 0:
+                st.view_read = True
                 return            # only now may genesis run
             raise ChainStopped("head-record-missing",
                                f"the audit chain has {newest} seals but no head record at {store.path}; "
@@ -696,31 +707,41 @@ class ChainWriter:
                                    f"seal {view.position} changed or went after this process accepted it")
         held = st.keys_held()
         early: Optional[ChainStopped] = None
-        for seal in read_seals(db, view.position):
-            if seal.seq != view.position + 1:
-                raise ChainStopped("seq-gap", f"the seals jump from {view.position} to {seal.seq}")
-            link = fmt.link(view.link_at(seal.seq - 1), seal.body())
-            if seal.seq <= rec_seq:
-                # Up to the record, the seals are authenticated by the recorded link alone: a seal edited
-                # anywhere before it changes that link. A break of the key sequence there is reported once
-                # the link checks out.
-                problem = key_sequence_problem(view, seal)
-                if problem and early is None:
-                    early = ChainStopped("key-sequence", problem, seal.seq)
-                if seal.seq == rec_seq:
-                    if link != rec_link:
-                        raise ChainStopped("head-record-mismatch",
-                                           f"seal {rec_seq} is not the one the head record holds")
-                    if early is not None:
-                        raise early
+        # Whether the view holds seals up to the record that this check accepted before reaching the record's link.
+        unverified = False
+        try:
+            for seal in read_seals(db, view.position):
+                if seal.seq != view.position + 1:
+                    raise ChainStopped("seq-gap", f"the seals jump from {view.position} to {seal.seq}")
+                link = fmt.link(view.link_at(seal.seq - 1), seal.body())
+                if seal.seq <= rec_seq:
+                    # Up to the record, the seals are authenticated by the recorded link alone: a seal edited
+                    # anywhere before it changes that link. A break of the key sequence there is reported once
+                    # the link checks out.
+                    problem = key_sequence_problem(view, seal)
+                    if problem and early is None:
+                        early = ChainStopped("key-sequence", problem, seal.seq)
+                    if seal.seq == rec_seq:
+                        if link != rec_link:
+                            raise ChainStopped("head-record-mismatch",
+                                               f"seal {rec_seq} is not the one the head record holds")
+                        unverified = False
+                        if early is not None:
+                            raise early
+                    view.accept(seal, link)
+                    unverified = seal.seq < rec_seq
+                    continue
+                self._accept_after_record(seal, link, held)
+                if seal.kind in ROOT_KINDS:
+                    seal.salt = _salt_of(db, seal)
+                self.accepted.append((seal, link))
                 view.accept(seal, link)
-                continue
-            self._accept_after_record(seal, link, held)
-            if seal.kind in ROOT_KINDS:
-                seal.salt = _salt_of(db, seal)
-            self.accepted.append((seal, link))
-            view.accept(seal, link)
+        except BaseException:
+            if unverified:
+                st.view_read = False
+            raise
         view.record_seq = rec_seq
+        st.view_read = True
         if self.check_key:
             self._check_current_key(held)
 
@@ -942,6 +963,84 @@ def chain_lock(engine, st: Optional[ChainState] = None, *, wait: float = 30.0):
         yield
     finally:
         lock._release()
+
+
+# How long a reader of the view waits for the chain lock to read the chain (a pass, a change or the start's own read
+# may hold it).
+READ_WAIT_SECONDS = 10.0
+# How long the start of the web process waits for its read of the chain before it serves all the same (the read goes
+# on, on its own thread, and a reader of the view that comes meanwhile waits for it).
+START_READ_SECONDS = 20.0
+
+
+def read_view(engine, st: Optional[ChainState] = None, *, wait: Optional[float] = None) -> bool:
+    """Whether this process's view holds the chain read through (ChainState.view_read), reading it now when it does
+    not: the check a writer makes before it extends the chain (ChainWriter.check, without its step on the current
+    key), under the chain lock, writing no seal of its own (the head record is written as after any check: the seals
+    another writer appended after it, once accepted). Never raises: a lock busy past ``wait``, a chain that does not
+    check out (its kind in ``read_stopped``), a head record or a database that cannot be read leave it unread.
+    ``wait``: READ_WAIT_SECONDS when None."""
+    st = st or state()
+    if st.view_read:
+        return True
+    if engine is None:
+        return False
+    try:
+        with ChainWriter(engine, st, wait=READ_WAIT_SECONDS if wait is None else wait, writer="reader",
+                         check_key=False):
+            pass
+        st.read_stopped = None
+    except ChainStopped as stop:
+        st.read_stopped = stop.kind
+    except Exception:  # noqa: BLE001 -- busy, or a database or a record that cannot be read: read again next time
+        pass
+    return st.view_read
+
+
+def read_at_start(engine, st: Optional[ChainState] = None, *, timeout: float = START_READ_SECONDS) -> bool:
+    """The web process's read of the chain before it serves: read_view on a thread of its own, waited for at most
+    ``timeout`` seconds. Without it the view stays empty until the pruner's first pass, a minute after the start, and
+    every reader of it answers from nothing meanwhile (an archived day reads as one without events). A read that
+    takes longer goes on while the process serves, and a reader of the view waits for it. Says how it went; never
+    raises, so a chain that cannot be read never stops the start (the pruner's pass reports why)."""
+    st = st or state()
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            read_view(engine, st, wait=timeout)
+        finally:
+            done.set()
+
+    began = time.monotonic()
+    try:
+        threading.Thread(target=run, name="audit-chain-read", daemon=True).start()
+    except Exception as exc:  # noqa: BLE001 -- the readers read it when they first need it
+        _say(f"Warning: the audit log's integrity chain was not read at the start ({type(exc).__name__}); "
+             "its readers read it when they first need it")
+        return False
+    done.wait(timeout)
+    if st.view_read:
+        _say(f"[OK] The audit log's integrity chain was read ({st.view.position} seals, "
+             f"{time.monotonic() - began:.1f} s)")
+    elif not done.is_set():
+        _say(f"Warning: the audit log's integrity chain was not read within {timeout:.0f} s of the start; the read "
+             "goes on, and the pages that need it wait for it or say so")
+    else:
+        why = f" (sealing would stop: {st.read_stopped})" if st.read_stopped else ""
+        _say(f"Warning: the audit log's integrity chain could not be read at the start{why}; the pages that need it "
+             "say so until it is")
+    return st.view_read
+
+
+def unread_reason(st: Optional[ChainState] = None) -> str:
+    """Why this process's view is not read through, as a clause for a page."""
+    st = st or state()
+    kind = st.stopped.kind if st.stopped is not None else st.read_stopped
+    if kind:
+        return (f"the audit log's integrity chain does not check out ({kind}), so this server has not read it "
+                "through; the integrity status on the Activity page says what to do")
+    return "this server has not finished reading the audit log's integrity chain since it started"
 
 
 def _salt_of(db, seal: Seal) -> Optional[bytes]:
@@ -1895,9 +1994,10 @@ def status(st: Optional[ChainState] = None) -> dict:
         if unacknowledged_foreign(view, record):
             out["warnings"].setdefault("after-record", {"message": "seals another writer appended after the "
                                                                    "head record wait for the host"})
-        # This process reads the chain at the pruner's first pass after it starts; until then, the warnings
-        # from the seals are the ones the last writer recorded.
-        seqs = view_warning_seqs(view, record) if view.position else (record.get("view_warnings") or {})
+        # This process reads the chain as it starts (read_at_start), and again at every pass; until it has read
+        # it through, the warnings from the seals are the ones the last writer recorded.
+        seqs = view_warning_seqs(view, record) if st.view_read and view.position else \
+            (record.get("view_warnings") or {})
         late = list(seqs.get("late") or [])
         if late:
             out["warnings"]["late"] = {"message": f"{len(late)} late seals wait to be acknowledged",

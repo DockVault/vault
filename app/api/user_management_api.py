@@ -1145,7 +1145,7 @@ async def get_user_activity(
         content=content,
         media_type="application/json",
         headers={"ETag": f'"{response_hash}"',
-                 **activity_archive.headers_for(date_threshold.replace(tzinfo=None), None)}
+                 **activity_archive.headers_for(date_threshold.replace(tzinfo=None), None, db=db)}
     )
 
 

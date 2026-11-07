@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.audit_integrity_router import require_chain_read
 from app.api.recording_levels_router import STEP_UP_ACTION, limit_statements
 from app.api.user_management_api import require_interactive_admin
 from app.core import audit_chain_policy_seals as chain_seals
@@ -53,6 +54,7 @@ PREVIEW_STATEMENT_TIMEOUT_MS = 30000
 @router.get("/settings/value-removals")
 def list_removals(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     limit_statements(db)
+    audit_integrity.read_view(db.get_bind())     # until it has, a request reads as not known yet (removal.UNREAD)
     st = audit_integrity.state()
     return {"requests": removal.listing(db, st), "delay_days": removal.delay_days(st.view, st),
             "levels": removal.in_force(db)}
@@ -61,6 +63,7 @@ def list_removals(current_user: User = Depends(require_interactive_admin), db: S
 @router.post("/settings/value-removals/preview")
 def preview_removal(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     limit_statements(db, PREVIEW_STATEMENT_TIMEOUT_MS)
+    require_chain_read(db, "What a removal would change (its archived days and its delay)")
     st = audit_integrity.state()
     return removal.preview(db, st, st.clock())
 

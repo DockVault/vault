@@ -1,9 +1,10 @@
 """Waiting, on a running stack, for the web process to have read the audit log's integrity chain.
 
-The web process reads the chain at its pruner's first pass, about a minute after it starts (longer on a large
-chain). Until then GET /settings/managed shows no value of a setting the chain records as in force (the row says
-``chain_read`` false), and lists no change waiting (``pending_chain.read`` false). A test that reads either waits
-here first, so that it holds right after the stack or its web container was started too."""
+The web process reads the chain as it starts, before it serves (it waits at most audit_integrity.START_READ_SECONDS
+for that read; one that takes longer goes on while it serves), and the page reads it again when it has not. Until it
+has, GET /settings/managed shows no value of a setting the chain records as in force (the row says ``chain_read``
+false), and lists no change waiting (``pending_chain.read`` false). A test that reads either waits here first, so
+that it holds right after the stack or its web container was started too, however long the read takes."""
 import time
 
 

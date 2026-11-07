@@ -21,7 +21,7 @@
     // for the person who signed out is cleared, and the answer to a request they made is dropped when it comes.
     let resets = 0;
     const STATUS = { pending: 'Waiting', running: 'Running', completed: 'Completed', cancelled: 'Cancelled',
-        'not recorded': 'Not in the audit log' };
+        'not recorded': 'Not in the audit log', unread: 'Not known yet' };
 
     function el(tag, cls, text) {
         const node = document.createElement(tag);
@@ -117,6 +117,9 @@
             else if (e.status === 'completed') text += `; completed on ${when(e.completed_at)}.`;
             else if (e.status === 'cancelled') {
                 text += `; cancelled${e.decided_by ? ' by ' + e.decided_by : ''}${e.decided_at ? ' on ' + when(e.decided_at) : ''}.`;
+            } else if (e.status === 'unread') {
+                text += ". Its state is not known yet: this server has not read the audit log's integrity chain " +
+                    'through (it does so as it starts).';
             } else text += '. The audit log holds no request of it, so it does not run.';
             item.appendChild(el('p', 'text-secondary text-sm', text));
             if (e.waiting) item.appendChild(el('p', 'text-secondary text-sm erase-waiting', e.waiting));

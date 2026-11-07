@@ -34,6 +34,15 @@ who edits them changes the band's counts until the daily check reads that block,
 
 **The other readers** (``/audit/log``, ``/users/{id}/activity``, the dashboard's feed) read rows only and say where
 the archive is in two response headers (ARCHIVE_HEADERS) when their range reaches it.
+
+**Before the view is read.** Which days are archived is known only from the chain's view, which the web process
+reads as it starts (audit_integrity.read_at_start) and every reader here reads first when it has not
+(audit_integrity.read_view). Until it is read through (the start's read not finished, a chain that does not check
+out), the view is empty or partial, and a day it does not name would read as a day without events: so no read here
+answers from it. A read that could reach an archived day is refused instead (Unread, said as a 503 that says why);
+one that cannot is answered from rows as ever: a range that starts at or after audit_archive.unarchived_from (no day
+younger than the shortest row window is archived) and that no block in the table reaches, and a read of specific
+rows that are all rows. The readers of rows only say so in a third header (UNREAD_HEADER) rather than refuse.
 """
 from __future__ import annotations
 
@@ -65,12 +74,22 @@ IDLE_TIMEOUT_MS = 120_000
 INSERT_CHUNK = 2000
 # The headers the readers of rows only say where the archive is in: its oldest and newest archived UTC days.
 ARCHIVE_HEADERS = ("X-Audit-Archive-Oldest-Day", "X-Audit-Archive-Newest-Day")
+# The header they send instead while the archived days cannot be told (Unread) and their range could reach one.
+UNREAD_HEADER = "X-Audit-Archive-Unread"
 # How long a search waits before it is taken again, when the view has not yet caught up with a block.
 RETRY_PAUSE = 0.2
+# What a refusal for Unread tells the client to wait before it asks again (Retry-After).
+UNREAD_RETRY_SECONDS = 60
 
 
 class TooBroad(ValueError):
     """A range whose archived part needs more than one search reads."""
+
+
+class Unread(RuntimeError):
+    """The archived days cannot be told yet: this process has not read the audit log's integrity chain through (see
+    the module's docstring). A read that could reach an archived day is refused with it, never answered from rows
+    alone; its text says why and what to do."""
 
 
 def _ai():
@@ -83,11 +102,58 @@ def _arc():
     return audit_archive
 
 
+def unread_message(st=None) -> str:
+    """What a refused read is told: why the archived days cannot be told, and the ranges that can be read now."""
+    ai = _ai()
+    st = st or ai.state()
+    since = f"{_arc().unarchived_from(st.clock()):%Y-%m-%d}"
+    head = f"The archived days of the audit log cannot be read yet: {ai.unread_reason(st)}."
+    if st.stopped is not None or st.read_stopped:
+        return f"{head} A range that starts on or after {since} reaches no archived day, and can be read now."
+    return f"{head} Try again in a minute, or choose a range that starts on or after {since}, which no archived day " \
+           "reaches."
+
+
 def archives(st=None) -> dict:
     """{day: ArchiveEntry} of the chain's verified view, copied in one step (a dict copy, which the process's
-    sealer cannot change midway: its entries are replaced, never changed)."""
+    sealer cannot change midway: its entries are replaced, never changed). Raises Unread while the view is not read
+    through (audit_integrity.ChainState.view_read): an empty or partial one would leave out days that are archived."""
     st = st or _ai().state()
+    if not st.view_read:
+        raise Unread(unread_message(st))
     return dict(st.view.archives)
+
+
+def read_archives(db=None, st=None) -> dict:
+    """archives(st), the chain read first when this process has not read it through (audit_integrity.read_view, over
+    ``db``'s engine; with no ``db`` it is not read here). Raises Unread when it still is not."""
+    ai = _ai()
+    st = st or ai.state()
+    if not st.view_read and db is not None:
+        try:
+            engine = db.get_bind()
+        except Exception:  # noqa: BLE001 -- not read here, then
+            engine = None
+        ai.read_view(engine, st)
+    return archives(st)
+
+
+def could_reach(db, start: Optional[datetime], end: Optional[datetime], now: datetime) -> bool:
+    """Whether [start, end) may reach an archived day, told without the chain's view: a range with no start, one that
+    starts before audit_archive.unarchived_from(now), and one that a block in the table reaches (given ``db``). The
+    table is not the chain's word: it may only make a read refuse, never answer one."""
+    if start is None or start < _arc().unarchived_from(now):
+        return True
+    if db is None:
+        return False
+    from app.core.models import AuditArchiveBlock as B
+    try:
+        q = db.query(B.day).filter(B.last_hour > start - HOUR)
+        if end is not None:
+            q = q.filter(B.first_hour < end)
+        return q.first() is not None
+    except Exception:  # noqa: BLE001 -- when the table cannot be read, the range could reach one
+        return True
 
 
 def parts_between(entries: dict, start: Optional[datetime], end: Optional[datetime]) -> List[tuple]:
@@ -112,12 +178,21 @@ def span(entries: dict, start: Optional[datetime] = None, end: Optional[datetime
     return {"oldest_day": days[0].isoformat(), "newest_day": days[-1].isoformat(), "days": len(days)}
 
 
-def headers_for(start: Optional[datetime] = None, end: Optional[datetime] = None, st=None) -> Dict[str, str]:
+def headers_for(start: Optional[datetime] = None, end: Optional[datetime] = None, st=None, db=None) -> Dict[str, str]:
     """The ARCHIVE_HEADERS a reader of rows only sends for a range [start, end): {} when it reaches no archived
-    day. Never raises: a reader is never refused for this."""
+    day; while the archived days cannot be told (Unread), UNREAD_HEADER when the range could reach one (could_reach,
+    over ``db``). It never reads the chain itself: its readers are coroutines, which must not wait for the chain
+    lock; the start's read, and every other reader here, read it. Never raises: a reader is never refused for this."""
+    st = st or _ai().state()
     try:
         where = span(archives(st), start, end)
-    except Exception:  # noqa: BLE001 -- a chain not started yet has no view to read
+    except Unread:
+        try:
+            reach = could_reach(db, start, end, st.clock())
+        except Exception:  # noqa: BLE001 -- when it cannot be told, it could
+            reach = True
+        return {UNREAD_HEADER: "1"} if reach else {}
+    except Exception:  # noqa: BLE001 -- the rows are answered all the same
         return {}
     if where is None:
         return {}
@@ -159,7 +234,7 @@ def check_budget(parts: Sequence[tuple]) -> None:
 
 def plan(start: Optional[datetime], end: Optional[datetime], st=None) -> Optional[Plan]:
     """The search a range [start, end) needs: None when it has no start or reaches no archived part (it then
-    reads rows only). Raises TooBroad."""
+    reads rows only). Raises TooBroad, and Unread while the view is not read through (source() reads it first)."""
     if start is None:
         return None
     parts = parts_between(archives(st), start, end)
@@ -398,17 +473,25 @@ class Source:
 
 
 @contextlib.contextmanager
-def source(db, start: Optional[datetime], end: Optional[datetime], st=None) -> Iterator[Source]:
+def source(db, start: Optional[datetime], end: Optional[datetime], st=None, *,
+           rows_only: bool = False) -> Iterator[Source]:
     """Where to read the Events list's rows for a range [start, end): the request's session and AuditLog when the
     range reaches no archived day or has no start, else an archive search. ``note`` (for the response's
     ``archive``): where the archive is, whether this read searched it, the days it could not read, and the most
-    days a search reads. Raises TooBroad."""
+    days a search reads. ``rows_only``: the read is of rows that are all rows (ids_are_rows), whatever the range.
+    The chain is read first when this process has not read it through; while it still is not, a read that could
+    reach an archived day raises Unread (could_reach), and any other reads rows with no note. Raises TooBroad."""
     from app.core.models import AuditLog
     st = st or _ai().state()
     try:
-        entries = archives(st)
-    except Exception:  # noqa: BLE001 -- no view yet: no archive to read
-        entries = {}
+        entries = read_archives(db, st)
+    except Unread:
+        if not rows_only and could_reach(db, start, end, st.clock()):
+            raise
+        entries = None
+    if entries is None:
+        yield Source(db, AuditLog, None)
+        return
     where = span(entries, start, end)
     if where is None:
         yield Source(db, AuditLog, None)
@@ -471,17 +554,21 @@ def band_archive(db, win, per_block: Dict[str, dict], since: Optional[datetime],
     BAND_BLOCKS whose filters aggregates answer, and the note for the page (None when the range reaches no archived
     hour): where the archive is, the blocks counted from it, those counting rows only, and the days whose
     aggregates could not be read. The events block's rows carry their bucket (the one holding the hour's start);
-    the other blocks' carry none, and count the hours inside their own time filter."""
+    the other blocks' carry none, and count the hours inside their own time filter. Raises Unread while the chain is
+    not read through and the range could reach an archived hour (``since`` None, all time, always could)."""
     from app.core.models import AuditArchiveBlock as B
     from app.services import activity_events as ev
     from app.services import activity_summary as summary
     arc = _arc()
+    st = st or _ai().state()
     lo = since if since is not None else win.start
     hi = min(until, now) if until is not None else max(now, win.end)
     try:
-        entries = archives(st)
-    except Exception:  # noqa: BLE001 -- no view yet
-        entries = {}
+        entries = read_archives(db, st)
+    except Unread:
+        if could_reach(db, since, hi, st.clock()):
+            raise
+        return {}, None
     parts = parts_between(entries, lo, hi)
     if not parts:
         return {}, None
@@ -547,18 +634,16 @@ def _part_hours(agg, part) -> Optional[List[tuple]]:
     return out
 
 
-def oldest_archived(per_block_events: dict, until: Optional[datetime], st=None) -> Optional[datetime]:
+def oldest_archived(per_block_events: dict, until: Optional[datetime], st=None, db=None) -> Optional[datetime]:
     """The first hour of the oldest archived part the band's events block counts (its filters answered by
     aggregates), before ``until``: all time is charted from it when it is older than the oldest row. None when the
     filters need rows, or nothing archived is before ``until``. An estimate in whole parts: the part's first hour,
-    whatever its aggregates say of its rows."""
+    whatever its aggregates say of its rows. Raises Unread while the chain is not read through (read first over
+    ``db``): all time could reach any archived day."""
     from app.services import activity_events as ev
     if not ev.aggregate_countable(per_block_events):
         return None
-    try:
-        parts = parts_between(archives(st), None, until)
-    except Exception:  # noqa: BLE001
-        return None
+    parts = parts_between(read_archives(db, st), None, until)
     return parts[0][1].first_hour if parts else None
 
 
@@ -585,14 +670,19 @@ def ids_are_rows(db, ids: Sequence[str]) -> bool:
     return found >= len(wanted)
 
 
-def reaches_archive(start: Optional[datetime], end: Optional[datetime], st=None) -> bool:
+def reaches_archive(start: Optional[datetime], end: Optional[datetime], st=None, db=None) -> bool:
+    """Whether an archived part has an hour in [start, end), the chain read first over ``db`` when this process has
+    not read it through. Raises Unread when it still is not and the range could reach one (could_reach)."""
+    st = st or _ai().state()
     try:
-        return bool(parts_between(archives(st), start, end))
-    except Exception:  # noqa: BLE001
+        return bool(parts_between(read_archives(db, st), start, end))
+    except Unread:
+        if could_reach(db, start, end, st.clock()):
+            raise
         return False
 
 
 __all__ = ["ARCHIVE_HEADERS", "MAX_BYTES", "MAX_DAYS", "MAX_ROWS", "Plan", "Search", "Source", "TooBroad",
-           "archives", "band_archive", "check_budget", "headers_for", "ids_are_rows", "oldest_archived",
-           "parts_between", "plan",
-           "reaches_archive", "search", "snapshot_session", "source", "span"]
+           "UNREAD_HEADER", "Unread", "archives", "band_archive", "check_budget", "could_reach", "headers_for",
+           "ids_are_rows", "oldest_archived", "parts_between", "plan", "reaches_archive", "read_archives", "search",
+           "snapshot_session", "source", "span", "unread_message"]

@@ -89,8 +89,11 @@ def get_managed_settings(current_user: User = Depends(require_interactive_admin)
                          db: Session = Depends(get_db)):
     """Every managed setting, from this process's copy, the changes waiting as the audit log's integrity chain
     holds them (app/core/audit_chain_pending.py: the database's rows neither add to that list nor hide an entry),
-    and when the audit archive starts and what it holds."""
+    and when the audit archive starts and what it holds. The chain is read first when this process has not read it
+    through (audit_integrity.read_view): until it has read any of it, the rows and the list say so (``chain_read``,
+    ``pending_chain.read``), and the archive until it has read it through (``archive.read``)."""
     limit_statements(db)
+    audit_integrity.read_view(db.get_bind())
     from app.core import audit_archive, audit_chain_pending
     return {"settings": with_chain(registry.describe()), "locked": sorted(registry.locked_tokens()),
             "reduction_delay_days": registry.resolve(setting_changes.DELAY_KEY),
@@ -115,8 +118,9 @@ SOURCE_UNREAD = "unread"
 
 
 def chain_read(st=None) -> bool:
-    """Whether this process has read the audit chain's retention state (the pruner's first pass after a start reads
-    it, about a minute in; a change's own writer reads it too)."""
+    """Whether this process has read the audit chain's retention state (it reads the chain as it starts,
+    audit_integrity.read_at_start, and again at each pass and before each change; this page reads it too when it has
+    not)."""
     st = st or audit_integrity.state()
     return bool(st.view.position) and st.view.newest_policy() is not None
 
@@ -267,8 +271,10 @@ def cancel_managed_setting_change(change_id: uuid.UUID,
 @router.get("/settings/managed/storage")
 def managed_storage(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """The page's Storage card (app/core/retention_storage.py). On Postgres it reads the planner's estimate of the
-    audit rows and counts them only on a table never analysed; the size cap's count comes from the chain's view."""
+    audit rows and counts them only on a table never analysed; the size cap's count comes from the chain's view, read
+    first when this process has not read it through."""
     limit_statements(db)
+    audit_integrity.read_view(db.get_bind())
     from app.core import config, retention_storage
     return retention_storage.summary(db, setting_changes.utcnow(), config.settings.file_storage_path)
 
@@ -285,7 +291,8 @@ def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[i
                             db: Session = Depends(get_db)):
     """What the audit job would delete now if the three numbers were these (each left out: the value in
     force): rows and bytes by age and by size, by the same conditions the job uses. ``bytes_now``: the size cap
-    counts what the log takes now, as it will once growth has waited its delay (the Storage card's warning)."""
+    counts what the log takes now, as it will once growth has waited its delay (the Storage card's warning). The
+    archived rows and the size cap's plan come from the chain's view: refused (503) while it cannot be read."""
     limit_statements(db, PREVIEW_STATEMENT_TIMEOUT_MS)
     from app.core import audit_retention as ar
     numbers = ar.current()
@@ -301,6 +308,8 @@ def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[i
         asked[key] = value
     numbers = ar.Numbers(asked.get(ar.MAX_DAYS, numbers.max_days), asked.get(ar.MIN_DAYS, numbers.min_days),
                          asked.get(ar.ADMIN_MIN_DAYS, numbers.admin_min_days), asked.get(ar.MAX_MB, numbers.max_mb))
+    from app.api.audit_integrity_router import require_chain_read
+    require_chain_read(db, "What the audit job would delete")
     out = ar.preview(db, setting_changes.utcnow(), numbers, bytes_now=bytes_now)
     out["numbers"] = {ar.MAX_DAYS: numbers.max_days, ar.MIN_DAYS: numbers.min_days,
                       ar.ADMIN_MIN_DAYS: numbers.admin_min_days, ar.MAX_MB: numbers.max_mb}

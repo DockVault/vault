@@ -748,6 +748,7 @@ def test_the_export_names_the_archived_days_it_left_out():
 
 def test_the_other_readers_are_told_where_the_archive_is(env):
     _corpus(env, None)
+    env.run_until_sealed()
     assert archive.headers_for(None, None, env.st) == {}
     _archive_all(env)
     assert archive.headers_for(None, None, env.st) == {"X-Audit-Archive-Oldest-Day": ARCHIVED[0].isoformat(),
@@ -766,10 +767,10 @@ def test_the_readers_of_rows_only_send_the_headers():
         assert body.count("activity_archive.headers_for(") == 1, route
     users = (root / "app" / "api" / "user_management_api.py").read_text(encoding="utf-8")
     body = users.split("async def get_user_activity(", 1)[1].split("\n@router.", 1)[0]
-    assert "**activity_archive.headers_for(date_threshold.replace(tzinfo=None), None)" in body
+    assert "**activity_archive.headers_for(date_threshold.replace(tzinfo=None), None, db=db)" in body
     dash = (root / "app" / "api" / "dashboard_api.py").read_text(encoding="utf-8")
     body = dash.split("async def get_recent_events(", 1)[1].split("\n@router.", 1)[0]
-    assert "response.headers.update(activity_archive.headers_for())" in body
+    assert "response.headers.update(activity_archive.headers_for(db=db))" in body
 
 
 def test_the_archived_days_an_export_read_are_recorded_as_a_count():

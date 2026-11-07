@@ -61,6 +61,9 @@ PENDING = "pending"
 RUNNING = "running"
 COMPLETED = "completed"
 CANCELLED = "cancelled"
+# A row the view holds no request of while this process has not read the chain through: not known yet, rather than
+# "not recorded".
+UNREAD = "unread"
 
 REQUESTED_ACTION = "person_erase_requested"
 CANCELLED_ACTION = "person_erase_cancelled"
@@ -1011,11 +1014,17 @@ def entry_of(row, view, extra_seal=None) -> dict:
 
 
 def listing(db, st=None) -> list:
-    """Every erase, newest first, as the chain holds it; a row the chain holds no request of says so."""
+    """Every erase, newest first, as the chain holds it; a row the chain holds no request of says so, or, while
+    this process has not read the chain through (ChainState.view_read), that it is not known yet (UNREAD)."""
     from app.core.models import EraseRequest
     st = st or _ai().state()
     rows = db.query(EraseRequest).order_by(EraseRequest.requested_at.desc()).limit(200).all()
-    return [entry_of(r, st.view) for r in rows]
+    out = [entry_of(r, st.view) for r in rows]
+    if not st.view_read:
+        for entry in out:
+            if entry["status"] == "not recorded":
+                entry["status"] = UNREAD
+    return out
 
 
 # --------------------------------------------------------------------------- telling the administrators
