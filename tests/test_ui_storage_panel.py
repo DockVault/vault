@@ -35,8 +35,8 @@ def test_storage_panel_shows_real_values(admin_page: Page):
 
 def test_storage_panel_says_the_free_space_the_volume_keeps(admin_page: Page):
     """The panel says the floor of free space in force (MIN_FREE_SPACE_GB), as /storage/stats reports it: on the
-    shipped default the larger of 2 GB and 5% of the volume (never more than half of it), so never none on a volume
-    that says its size."""
+    shipped default the larger of 2 GB and 5% of the volume (never more than half of it nor more than 20 GB), so
+    never none on a volume that says its size."""
     page = admin_page
     page.click('.sidebar-item[data-section="settings"]')
     page.click('.tab-btn[data-tab="storage"]')

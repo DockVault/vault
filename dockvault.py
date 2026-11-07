@@ -769,7 +769,8 @@ def build_env_lines(cfg):
     if cfg.get("max_storage_gb") not in (None, ""):
         bare("MAX_STORAGE_GB", format_gb_value(cfg["max_storage_gb"]))
     # The free space the storage volume keeps. Same rule: written only when the operator chose one, so the app's
-    # default (-1: the larger of 2 GB and 5% of the volume, never more than half of it) applies otherwise.
+    # default (-1: the larger of 2 GB and 5% of the volume, never more than half of it nor more than 20 GB) applies
+    # otherwise.
     if cfg.get("min_free_space_gb") not in (None, ""):
         bare("MIN_FREE_SPACE_GB", format_gb_value(cfg["min_free_space_gb"]))
     # Transfer ceiling. The one that costs memory is MAX_CONCURRENT_TRANSFERS; the other two only
@@ -7998,7 +7999,7 @@ def build_parser():
     sp.add_argument("--min-free-space-gb", dest="min_free_space_gb", type=float,
                     help="the free space in GB the storage volume keeps: uploads that would leave less are "
                          "refused (-1, the default: the larger of 2 GB and 5%% of the volume, never more than "
-                         "half of it; 0 = off)")
+                         "half of it nor more than 20 GB; 0 = off)")
     sp.add_argument("--max-concurrent-transfers", dest="max_concurrent_transfers", type=int,
                     help="how many uploads and downloads may run at once (16 by default). Each "
                          "costs a fixed amount of memory whatever the file weighs, so lower this "

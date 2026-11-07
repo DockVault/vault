@@ -53,7 +53,7 @@ def test_the_routes_of_the_removed_pages_are_gone(admin):
 
 def test_the_storage_panel_reports_the_free_space_the_volume_keeps(admin):
     """MIN_FREE_SPACE_GB unset (the shipped .env leaves it commented): the larger of 2 GB and 5% of the volume, never
-    more than half of it; set to a value that is not a finite number (inf), the same."""
+    more than half of it nor more than 20 GB; set to a value that is not a finite number (inf), the same."""
     import math
     import subprocess
     import os
@@ -65,7 +65,7 @@ def test_the_storage_panel_reports_the_free_space_the_volume_keeps(admin):
         import pytest
         pytest.skip("docker is not available to read the deployment's setting")
     body = admin.get("/storage/stats").json()
-    automatic = min(max(2 * 1024 ** 3, int(body["total"] * 0.05)), int(body["total"] * 0.5))
+    automatic = min(max(2 * 1024 ** 3, int(body["total"] * 0.05)), int(body["total"] * 0.5), 20 * 1024 ** 3)
     if set_to.returncode != 0 and body["total"]:
         assert body["free_space_floor_bytes"] == automatic, body
     elif set_to.returncode == 0:

@@ -3,8 +3,8 @@
 On the shipped defaults nothing else bounds the disk: no deployment storage limit, and what legal holds keep after a
 deletion is in no vault's size, so a member of a held vault could upload and delete in turn until the disk was full,
 and the database, which usually shares it, with it. Every write of a file's bytes now keeps at least the floor free:
-by default the larger of 2 GB and 5% of the volume (never more than half of it), 0 turns it off, any other value is
-that many GB.
+by default the larger of 2 GB and 5% of the volume (never more than half of it nor more than 20 GB), 0 turns it off,
+any other value is that many GB.
 
 - before a transfer starts, when its size is known: an upload's declared length, a chunked upload's declared size, a
   chunk's, a copy's (507 with the free space and the floor);
@@ -78,6 +78,28 @@ def test_the_floor_is_the_larger_of_2_gb_and_5_percent_unless_set(total, configu
 ])
 def test_the_automatic_floor_is_never_more_than_half_the_volume(total, floor):
     assert free_space.floor_bytes(total, configured=-1) == floor
+
+
+@pytest.mark.parametrize("total, floor", [
+    (300 * GIB, 15 * GIB),                   # 5%, below the cap
+    (400 * GIB, 20 * GIB),                   # exactly 5%: the rule and the cap meet
+    (1024 * GIB, 20 * GIB),                  # 5% would be 51 GB
+    (20 * 1024 * GIB, 20 * GIB),             # and a terabyte of a 20 TB volume
+    (100 * 1024 * GIB, 20 * GIB),
+])
+def test_the_automatic_floor_is_never_more_than_20_gb(total, floor):
+    """5% of a large volume holds back far more than the server and its database need, and an install that was
+    already that full would refuse every upload, SFTP write and copy from its first start: the automatic floor stops
+    at 20 GB. One set in MIN_FREE_SPACE_GB is that many GB, more than 20 too."""
+    assert free_space.floor_bytes(total, configured=-1) == floor
+    assert free_space.floor_bytes(total, configured=50) == 50 * GIB
+
+
+def test_a_large_volume_a_little_past_20_gb_free_takes_uploads_on_the_default(volume):
+    """A 20 TB volume with 25 GB free: 5% would be a terabyte and refuse everything; the floor is 20 GB."""
+    volume["total"], volume["free"] = 20 * 1024 * GIB, 25 * GIB
+    assert free_space.short_of(5 * GIB) is None
+    assert free_space.short_of(5 * GIB + 1) == free_space.Room(free=25 * GIB, floor=20 * GIB, total=20 * 1024 * GIB)
 
 
 def test_a_small_volume_still_takes_uploads_on_the_default(volume):

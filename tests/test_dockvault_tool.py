@@ -3081,9 +3081,9 @@ def test_a_fresh_volume_set_keeps_the_configured_ceiling():
 
 
 def test_setup_writes_the_free_space_floor_only_when_asked_and_a_fresh_set_keeps_it():
-    """MIN_FREE_SPACE_GB: the app's own default (the larger of 2 GB and 5% of the volume, never more than half of it)
-    unless the operator chose a value at setup (--min-free-space-gb), and kept across a fresh volume set of the same
-    deployment."""
+    """MIN_FREE_SPACE_GB: the app's own default (the larger of 2 GB and 5% of the volume, never more than half of it
+    nor more than 20 GB) unless the operator chose a value at setup (--min-free-space-gb), and kept across a fresh
+    volume set of the same deployment."""
     from app.core.config import Settings
     cfg = _reusable_env_cfg()
     assert not [ln for ln in dv.build_env_lines(cfg) if ln.startswith("MIN_FREE_SPACE_GB")]
