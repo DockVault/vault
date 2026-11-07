@@ -19,6 +19,7 @@ its disk; test_api_storage_stats.py checks the floor the storage panel reports.
 """
 import uuid
 from collections import namedtuple
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,7 @@ from test_storage_room_at_finish import MB, _DB, _copy_service, _vault, finish, 
 pytestmark = pytest.mark.unit
 
 GIB = 1024 ** 3
+ROOT = Path(__file__).resolve().parent.parent
 Usage = namedtuple("Usage", "total used free")
 
 
@@ -95,6 +97,26 @@ def test_a_setting_that_is_not_a_finite_number_reads_as_the_default(volume, conf
     assert free_space.floor_bytes(100 * GIB, configured=configured) == 5 * GIB
     assert free_space.short_of(GIB) is None
     assert free_space.short_of(GIB + 1) == free_space.Room(free=6 * GIB, floor=5 * GIB, total=100 * GIB)
+
+
+@pytest.mark.parametrize("raw, starts", [("inf", True), ("nan", True), ("-1", True), ("abc", False), ("", False)])
+def test_inf_or_nan_reads_as_the_default_and_a_value_that_is_no_number_stops_the_start(monkeypatch, raw, starts):
+    """What .env.example says of a value that is not a finite number, held to what the settings do: inf and nan are
+    floats the settings take, and read as -1; text, or an empty value, is no number at all, and the settings refuse
+    it, so the server does not start, as for any other setting. It said that any value that is not a number reads as
+    -1."""
+    from pydantic import ValidationError
+    from app.core.config import Settings
+    monkeypatch.setenv("MIN_FREE_SPACE_GB", raw)
+    if starts:
+        assert free_space.floor_bytes(100 * GIB, configured=Settings().min_free_space_gb) == 5 * GIB
+    else:
+        with pytest.raises(ValidationError):
+            Settings()
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    said = " ".join(line.lstrip("#").strip() for line in example.splitlines())
+    assert ("any other value is that many GB (inf or nan reads as -1; a value that is not a number, or an empty one, "
+            "stops the server at its start, as for any other setting)") in said
 
 
 def test_a_floor_larger_than_any_volume_refuses_every_write_and_says_so(volume):
