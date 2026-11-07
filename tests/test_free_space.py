@@ -292,6 +292,29 @@ def test_a_refusal_that_reaches_the_applications_handler_is_507(volume):
     assert vault.status_code == 413
 
 
+@pytest.mark.parametrize("endpoint", ["signed in", "upload link"])
+def test_a_chunk_the_volume_has_no_room_for_is_refused_before_its_body_is_read(volume, tmp_path, monkeypatch,
+                                                                              endpoint):
+    """A chunked upload, signed in or through an upload link, is held to the floor at its start for its whole size,
+    and each chunk again for its own: what other uploads (or a legal hold) took since the start is not there to stage
+    it on. Refused 507 with the floor's words, before its body is read: nothing staged. With room, the same chunk is
+    staged, so the refusal is the floor's."""
+    from fastapi import HTTPException
+    from _chunk_endpoints import ChunkWorld, SIZE, send_chunk
+    world = ChunkWorld(monkeypatch, tmp_path)
+    volume["free"] = 5 * GIB + SIZE - 1                      # floor 5 GB: staging it would leave one byte less
+    answer, body = send_chunk(world, endpoint)
+    assert isinstance(answer, HTTPException) and answer.status_code == 507, answer
+    assert answer.detail.startswith("The server's storage is nearly full: ") and "MIN_FREE_SPACE_GB" in answer.detail
+    assert not body.read, "the chunk's body was read before it was refused"
+    assert world.staged() == []
+    volume["free"] = 5 * GIB + SIZE                          # it leaves exactly the floor
+    answer, body = send_chunk(world, endpoint)
+    assert not isinstance(answer, HTTPException), answer
+    assert answer["received"] == 1 and body.read and world.staged() == ["chunk_000000", "hash_000000"], (
+        answer, world.staged())
+
+
 def test_the_deployments_early_check_is_still_its_own_and_asked_after_the_bytes_land(volume, monkeypatch):
     """The direct upload asks the deployment's limit again with the file's real size once its bytes are written:
     the volume's floor is not asked there with that size, which the volume's free space counts already."""

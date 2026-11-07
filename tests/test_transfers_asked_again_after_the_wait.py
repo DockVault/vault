@@ -429,6 +429,26 @@ def test_a_password_changed_while_the_door_checked_it_refuses_the_transfer_after
     assert stats["in_flight"] == 0, "its slot was not given back"
 
 
+@pytest.mark.parametrize("changed", [True, False])
+def test_a_password_changed_while_the_door_checked_it_refuses_the_chunk_sent_after(monkeypatch, tmp_path, changed):
+    """The same for a chunk of a chunked upload, which waits for no slot but for its body, sent at the client's pace:
+    the vault's password hash is read before the door checks the request's password and compared once the body has
+    arrived. A change committed while the door checked it refuses the chunk (409, start again) and stages nothing.
+    Read after the door, the new hash was the one compared with, and the chunk was staged. Unchanged, it is staged."""
+    from _chunk_endpoints import ChunkWorld, send_chunk
+    monkeypatch.setattr(S, "_enforce_free_space", lambda additional: None)     # the volume's floor is not asked here
+    world = ChunkWorld(monkeypatch, tmp_path, change_password_at_door=changed)
+    answer, body = send_chunk(world, "signed in")
+    assert body.read and world.doors == 2, "the door and the check after the body were not both asked"
+    if changed:
+        assert isinstance(answer, HTTPException) and answer.status_code == 409, answer
+        assert "password changed while the chunk was being sent" in answer.detail, answer.detail
+        assert world.staged() == []
+    else:
+        assert not isinstance(answer, HTTPException), answer
+        assert answer["received"] == 1 and world.staged() == ["chunk_000000", "hash_000000"]
+
+
 @pytest.mark.parametrize("kind", ["copy", "move"])
 def test_each_vault_is_compared_with_its_own_hash_after_the_wait(monkeypatch, kind):
     """The source's password hash and the destination's differ: each is compared with its own after the wait, so a
