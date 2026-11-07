@@ -226,11 +226,15 @@ def _files(client, vault_id):
 
 
 def test_transfers_waiting_for_the_key_at_a_sign_out_leave_the_next_person_room(browser, zk):
-    """The first person's key locks, as it does after a time without use, and they download five files of their
-    zero-knowledge vault: all five wait at the passphrase prompt, each in one of the five places the page gives
-    transfers. They sign out at the prompt. The places are free again: the next person signs in on the tab, and a
-    download and an upload in a vault of their own start and finish. The first person's five never end, and none of
-    them lands in the browser's downloads."""
+    """The first person's key locks, as it does after a time without use, and they download six files of their
+    zero-knowledge vault: five wait at the passphrase prompt, each in one of the five places the page gives
+    transfers, and the sixth waits for a place. They sign out at the prompt. The places are free again and nothing
+    waits: the next person signs in on the tab, and a download and an upload in a vault of their own start and
+    finish. None of the first person's six ends, and none of them begins a download after the sign-out.
+
+    Each of the five hands the browser its download as it begins, before it asks for the key (the file is streamed
+    into it as it is decrypted), so the browser holds five downloads of the first person when they sign out; nothing
+    is written into them, since the key never comes."""
     ada, ada_c = zk("admin")
     ben, ben_c = zk("admin")
     page = browser.new_context(base_url=BASE_URL, accept_downloads=True).new_page()
@@ -253,18 +257,27 @@ def test_transfers_waiting_for_the_key_at_a_sign_out_leave_the_next_person_room(
         page.wait_for_function("() => (state.currentFiles || []).filter((f) => f.type === 'file').length === 5 "
                                "&& transferGate.active === 0 && transferGate.waiting === 0", timeout=30000)
         ids = page.evaluate("() => state.currentFiles.filter((f) => f.type === 'file').map((f) => f.id)")
-        # The key locks (the page's own lock after a time without use), and the five downloads start at once.
-        page.evaluate("(ids) => { zkIdleLock(); window.__firsts = []; ids.forEach((id, n) => "
+        assert page.evaluate("() => state.downloadSink") == "streaming", "the stack does not stream downloads"
+        # The key locks (the page's own lock after a time without use), and six downloads start at once: the five
+        # files, and the first one again.
+        page.evaluate("(ids) => { zkIdleLock(); window.__firsts = []; ids.concat([ids[0]]).forEach((id, n) => "
                       "downloadFile(id, 'first-' + n + '.txt').then(() => window.__firsts.push('ended'), "
                       "(e) => window.__firsts.push('failed: ' + e.message))); }", ids)
         assert page.evaluate("() => zkState.privateKey === null")
         expect(page.locator("#confirm-modal-input")).to_be_visible(timeout=15000)
-        page.wait_for_function("() => transferGate.active === 5", timeout=15000)
-        assert page.evaluate(GATE) == [5, 0]
+        page.wait_for_function("() => transferGate.active === 5 && transferGate.waiting === 1", timeout=15000)
+        # The browser has the five downloads: each of the five asked for the key right after handing it its download.
+        for _ in range(300):
+            if len(landed) == 5:
+                break
+            page.wait_for_timeout(50)
+        assert sorted(landed) == [f"first-{n}.txt" for n in range(5)], landed
+        assert page.evaluate(GATE) == [5, 1]
 
         page.evaluate("() => logout()")
         expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
         assert page.evaluate(GATE) == [0, 0], "the sign-out left the places of the transfers waiting for the key taken"
+        before = len(landed)
 
         own_vault = ben_c.create_vault(name=_u("own"))["id"]
         sent = ben_c.post(f"/vaults/{own_vault}/files",
@@ -285,7 +298,7 @@ def test_transfers_waiting_for_the_key_at_a_sign_out_leave_the_next_person_room(
         assert any(f["name"] == "uploaded.txt" for f in _files(ben_c, own_vault)), "the next person's upload never ran"
 
         page.wait_for_timeout(1500)                           # the moment in which a first person's download would end
-        assert landed == ["theirs.txt"], landed
+        assert landed[before:] == ["theirs.txt"], landed
         assert page.evaluate("() => window.__firsts") == [], "a download of the first person ended for the next"
         assert errors == []
     finally:
