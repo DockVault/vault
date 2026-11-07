@@ -5,7 +5,9 @@ there is a preview of the name in the field (changing the name asks for a new on
 needs "erase" typed: dismissed, nothing is sent; confirmed, it asks for the password, the field is cleared and the
 erase is listed by its placeholder, never by the name, with a Cancel any administrator can use. An account's name
 is previewed as refused, and asking stays off. The name is never kept in the browser. The card fits a phone. No
-console error.
+console error. A sign-out takes the name typed, its preview (with the near-miss names the records hold) and the Ask
+button it turned on out of the page, so the next person on the tab finds none of them, and a preview on its way at
+the sign-out is drawn for nobody.
 """
 import re
 import uuid
@@ -14,6 +16,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import psql
+from _ui_hand_over import sign_in_on_the_tab
 
 pytestmark = pytest.mark.ui
 
@@ -133,3 +136,77 @@ def test_the_erase_card_fits_a_phone(page: Page, admin_creds):
                              " return c.scrollWidth - c.clientWidth; }")
     assert overflow <= 1
     assert page.evaluate("() => document.documentElement.scrollWidth <= window.innerWidth + 1")
+
+
+def _signed_out(page: Page):
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+
+
+def test_the_form_and_a_preview_on_its_way_are_gone_for_the_next_person_on_the_tab(page: Page, admin):
+    # Errors of the page's code (a request of the person who signed out may still meet the ended session, which
+    # the console reports as a failed load: that is not one).
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    ada = admin.create_user(role="admin")
+    ben = admin.create_user(role="admin")
+    try:
+        name = "ui-erase-" + uuid.uuid4().hex[:8]
+        near = name.upper()                                 # a near miss: the same name in another case
+        _typed(name)
+        _typed(near)
+        _login(page, ada["_username"], ada["_password"])
+        _open(page)
+        _preview(page, name)
+        expect(page.locator("#erase-preview")).to_contain_text(near)
+        expect(page.locator("#erase-ask")).to_be_enabled()
+        _signed_out(page)
+        # Out of the page at once, though it is hidden behind the sign-in screen.
+        assert page.input_value("#erase-name") == ""
+        assert page.locator("#erase-preview").evaluate("(n) => n.childNodes.length") == 0
+        assert near not in (page.locator("#erase-card").text_content() or "")
+        expect(page.locator("#erase-ask")).to_be_disabled()
+        # ben signs in on the tab and opens the card: nothing of ada's.
+        sign_in_on_the_tab(page, ben)
+        _open(page)
+        expect(page.locator("#erase-name")).to_have_value("")
+        expect(page.locator("#erase-preview")).to_be_empty()
+        expect(page.locator("#erase-ask")).to_be_disabled()
+
+        # ben's own preview, answered for him and held on its way; he signs out, ada signs in again and opens the
+        # card, and then it arrives.
+        held = []
+
+        def hold_the_first(route):
+            if held:
+                route.continue_()
+            else:
+                held.append((route, route.fetch()))
+
+        page.route("**/settings/erase-requests/preview", hold_the_first)
+        page.fill("#erase-name", name)
+        page.click("#erase-preview-btn")
+        for _ in range(300):
+            if held:
+                break
+            page.wait_for_timeout(50)
+        assert len(held) == 1, "the preview was not asked for"
+        _signed_out(page)
+        sign_in_on_the_tab(page, ada)
+        _open(page)
+        route, answer = held[0]
+        with page.expect_event("requestfinished", lambda r: r.url.endswith("/settings/erase-requests/preview"),
+                               timeout=15000):
+            route.fulfill(response=answer)
+        page.unroute("**/settings/erase-requests/preview")
+        page.evaluate("() => fetch('/health').then((r) => r.text())")
+        page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
+        expect(page.locator("#erase-preview")).to_be_empty()
+        # The name ben previewed, typed by ada: no preview of hers, so asking stays off.
+        page.fill("#erase-name", name)
+        expect(page.locator("#erase-ask")).to_be_disabled()
+        expect(page.locator("#erase-preview")).not_to_contain_text(near)
+        assert errors == []
+    finally:
+        admin.delete_user(ada["id"])
+        admin.delete_user(ben["id"])

@@ -92,6 +92,73 @@ async function main() {
         note(peak === 2, `stray releases do not widen the gate (peak was ${peak})`);
     }
 
+    // A reset (a sign-out on the page) frees every slot and drops every caller still waiting. Some of what the person
+    // who signed out had running never ends (a transfer waiting for their account key never settles once they have
+    // gone), so it never gives its slot back; what does end gives nothing back to the new gate; what was queued never
+    // starts, since it would run with the next person's session.
+    {
+        const gate = new TransferGate(5);
+        const held = () => { let let_go; const p = new Promise(r => { let_go = r; }); return { p, let_go }; };
+        const forever = () => new Promise(() => {});
+        const before = [held(), held()];
+        let queuedStarted = 0;
+        gate.run(forever); gate.run(forever); gate.run(forever);
+        before.forEach(h => gate.run(() => h.p));
+        for (let i = 0; i < 3; i++) gate.run(async () => { queuedStarted += 1; });
+        await tick();
+        note(gate.active === 5 && gate.waiting === 3,
+             `the first person's five run and three wait (active ${gate.active}, waiting ${gate.waiting})`);
+
+        gate.reset();
+        note(gate.active === 0 && gate.waiting === 0,
+             `a reset frees every slot (active ${gate.active}, waiting ${gate.waiting})`);
+
+        let running = 0, peak = 0, started = 0;
+        const next = Array.from({ length: 6 }, () => held());
+        const runs = next.map(h => gate.run(async () => {
+            started += 1; running += 1; peak = Math.max(peak, running);
+            await h.p;
+            running -= 1;
+        }));
+        await tick();
+        note(started === 5 && gate.waiting === 1,
+             `the next person's five start at once after a reset (${started}, waiting ${gate.waiting})`);
+
+        before.forEach(h => h.let_go());     // two transfers from before the reset end now
+        await tick();
+        note(gate.active === 5 && started === 5,
+             `transfers from before a reset that end give nothing back (active ${gate.active}, started ${started})`);
+
+        next.forEach(h => h.let_go());
+        await Promise.all(runs);
+        await tick();
+        note(started === 6 && peak === 5, `the next person's sixth runs once a slot is theirs (peak ${peak})`);
+        note(queuedStarted === 0, `what was queued before a reset never starts (${queuedStarted})`);
+        note(gate.active === 0 && gate.waiting === 0,
+             `the gate empties afterwards (active ${gate.active}, waiting ${gate.waiting})`);
+    }
+
+    // A slot handed to a waiter before a reset belongs to the gate before it: given back after the reset, it is
+    // ignored, so it cannot open a sixth place beside the next person's five.
+    {
+        const gate = new TransferGate(1);
+        const first = await gate.acquire();
+        const handed = gate.acquire();       // waits
+        gate.release(first);                 // the slot passes to the waiter...
+        gate.reset();                        // ...and the person signs out before it runs
+        const epoch = await handed;
+        const mine = await gate.acquire();   // the next person's
+        gate.release(epoch);                 // the one from before ends
+        let second = false;
+        gate.acquire().then(() => { second = true; });
+        await tick();
+        note(!second && gate.active === 1 && gate.waiting === 1,
+             `a slot handed over before a reset is not given back to the gate after it (active ${gate.active}, waiting ${gate.waiting})`);
+        gate.release(mine);
+        await tick();
+        note(second, 'the next caller of the gate after a reset is served when its slot is given back');
+    }
+
     // A limit that makes no sense is refused rather than silently treated as one.
     for (const bad of [0, -1, 1.5, NaN, '5', null, undefined]) {
         let threw = false;

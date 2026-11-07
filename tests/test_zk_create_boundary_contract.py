@@ -103,14 +103,15 @@ def test_first_identity_key_registration_remains_interactive_and_pop_bound():
         "// Change the encryption passphrase",
     )
 
-    warning = registration.index("await showConfirm(")
-    first_prompt = registration.index("await showPrompt(")
-    key_generation = registration.index("await lib.generateKeypair()")
+    # Each await is a step of the setup, which a sign-out ends (_zkSteps).
+    warning = registration.index("await step(() => showConfirm(")
+    first_prompt = registration.index("await step(() => showPrompt(")
+    key_generation = registration.index("await step(() => lib.generateKeypair())")
     challenge = registration.index("'/ecc/keys/register/challenge'")
-    proof = registration.index("await lib.computeRegistrationPoP(")
+    proof = registration.index("await step(() => lib.computeRegistrationPoP(")
     register = registration.index("'/ecc/keys/register'")
 
-    assert registration.count("await showPrompt(") >= 2
+    assert registration.count("await step(() => showPrompt(") >= 2
     assert warning < first_prompt < key_generation < challenge < proof < register
 
 

@@ -314,7 +314,7 @@ def test_the_page_posts_a_read_with_typed_filters_and_every_export():
     script = (ROOT / "static" / "js" / "activity.js").read_text(encoding="utf-8")
     assert "const TYPED_FILTERS = ['user', 'q', 'ip', 'temp_credential'];" in script
     assert "SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)" in script
-    assert script.count("await post('/activity/export', p)") == 1
+    assert script.count("await post('/activity/export', p, ctl.signal)") == 1
     assert "/activity/export?" not in script
     assert "'/activity/events': '/activity/events/search'" in script
     assert "'/activity/summary': '/activity/summary/search'" in script

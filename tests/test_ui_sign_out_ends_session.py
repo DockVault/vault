@@ -15,12 +15,16 @@ the token back from the server afterwards:
 - a sign-out in another tab: a tab holding the same token signs out at once (told by the other tab, not by a
   refusal), sends nothing of its own, asks for the sign-in screen's policy only when it is next shown (once), and
   leaves a session stored since by another tab (and the uploads saved since), while a tab of another account stays
-  signed in; the tab the person signs out in asks for that policy at once;
+  signed in; the tab the person signs out in asks for that policy at once; a tab never told, whose request with
+  the ended token is refused (without Clear-Site-Data), signs out and leaves the session stored since, its uploads
+  and the look kept for the browser;
 - the sign-in check of a tab being loaded: a refusal of the session (a 401, an account's 403) ends the session and
   signs out the other tabs; a check that could not be answered (a server error, a proxy's 502 or 503 while the
   vault restarts, a proxy's own 403 page, a rate limit, no answer at all) signs out that tab alone, as it always
   did, and the session and the other tabs using it go on;
-- no answer from the server (offline): the page is signed out all the same;
+- no answer from the server (offline): the page is signed out all the same, and sends the sign-out again as soon
+  as the browser is back online; a sign-out refused by its rate limit is sent again after the wait the server asks
+  for (Retry-After);
 - a preference saved at the sign-out is sent before the session is ended, so it is not refused; a save that does
   not come back holds the sign-out for at most three seconds.
 
@@ -191,7 +195,7 @@ def test_a_tab_told_late_leaves_the_session_stored_since_by_another_tab(page: Pa
     signed in again in another tab since: the session then stored for this browser is that new one. The told tab
     signs out (it held the ended session) and leaves the stored one where it is, so the other tab's next load still
     finds it, and the zero-knowledge uploads saved in this browser (which every tab shares), now that session's, so
-    they can be resumed. A full sign-out still empties that store (the control)."""
+    they can be resumed. A full sign-out of the session stored still empties that store (the control)."""
     sign_in_on_the_tab(page, ana)
     token = page.evaluate("() => authToken")
     sent = []
@@ -213,9 +217,52 @@ def test_a_tab_told_late_leaves_the_session_stored_since_by_another_tab(page: Pa
     page.wait_for_timeout(1000)
     assert sent == [], "a tab told of the sign-out sent one of its own"
     assert page.evaluate(SAVED_SINCE) is True, "the uploads saved by the session stored since were wiped"
-    # The control: a full sign-out on this tab empties the store, as it always did.
-    page.evaluate("() => logout()")
+    # The control: a full sign-out of the session stored (here this tab holds it) empties the store, as it always did.
+    page.evaluate("() => { authToken = localStorage.getItem('authToken'); logout(); }")
     _until(page, lambda: page.evaluate(SAVED_SINCE) is False, "a full sign-out left the saved uploads")
+
+
+def test_a_tab_never_told_leaves_the_session_signed_in_since_its_uploads_and_the_look(page: Page, ana):
+    """A tab of a session that another tab signed out, and that was not told (its message lost), sends a request
+    with the ended token once the person has signed in again in the first tab. The server refuses it without
+    Clear-Site-Data (which a browser applies to the whole origin, in every tab), and the tab signs out without
+    touching what is stored for the browser: the session signed in since, the uploads it saved, the look."""
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    late = page.context.new_page()
+    late.goto("/")
+    expect(late.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert late.evaluate("() => authToken") == token
+    # Never told: its channel is closed, and it sends nothing until the test asks (its own timers stopped, and the
+    # reads of its loading answered: one still on its way at the sign-out would meet the ended session at once).
+    late.evaluate("() => { clearInterval(notifPollTimer); _signOutChannel.close(); _signOutChannel = null; }")
+    late.wait_for_load_state("networkidle")
+    sign_out(page)
+    _ended(token)
+    expect(late.locator("#dashboard-screen")).to_be_visible()
+    # The person signs in again in the first tab, which stores its session and saves an upload, and picks a look.
+    sign_in_on_the_tab(page, ana)
+    newer = page.evaluate("() => authToken")
+    assert newer != token
+    page.evaluate("() => { localStorage.setItem('theme', 'dark'); localStorage.setItem('accent', 'teal'); }")
+    saved = page.evaluate("() => zkUploadStore.put({ sessionId: 'saved-since', vaultId: 'v', createdAt: Date.now(), "
+                          "schema: zkUploadStore.schemaVersion(), blob: zkUploadStore.neutralBlob(new Blob(['x'])) })")
+    assert saved == {"ok": True}, saved
+
+    with late.expect_response(lambda r: r.request.method == "GET" and r.url.endswith("/users/me"),
+                              timeout=15000) as answered:
+        late.evaluate("() => { apiRequest('/users/me').catch(() => {}); }")
+    assert answered.value.status == 401
+    assert "clear-site-data" not in answered.value.all_headers(), answered.value.all_headers()
+    expect(late.locator("#login-screen")).to_be_visible(timeout=15000)
+    assert late.evaluate("() => authToken") is None
+    assert page.evaluate("() => [localStorage.getItem('authToken'), localStorage.getItem('theme'), "
+                         "localStorage.getItem('accent')]") == [newer, "dark", "teal"]
+    assert page.evaluate(SAVED_SINCE) is True, "the uploads saved by the session signed in since were wiped"
+    # The first tab's next load finds its session.
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => authToken") == newer and _refused(newer) == 200
 
 
 def _is_policy(request):
@@ -347,8 +394,55 @@ def test_the_page_signs_out_even_when_the_server_cannot_be_reached(page: Page, a
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
     assert page.evaluate("() => authToken") is None
     assert page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')") is None
-    # The call never reached the server, so the session there runs on until it expires: nothing else could end it.
+    # The call never reached the server (the page keeps it to send again, and this route refuses each one), so the
+    # session there runs on.
     assert _refused(token) == 200
+
+
+def test_a_sign_out_sent_while_offline_is_sent_again_once_the_browser_is_back_online(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    failed = []
+    page.on("requestfailed", lambda r: _is_sign_out(r) and failed.append(r))
+    page.context.set_offline(True)
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    _until(page, lambda: len(failed) == 1, "the sign-out was not tried while offline")
+    assert page.evaluate("() => authToken") is None
+    assert _refused(token) == 200 and session_row(token) == "t|f", "the session ended with the browser offline"
+    started = time.monotonic()
+    with page.expect_request(_is_sign_out, timeout=10000) as sent:
+        page.context.set_offline(False)
+    assert time.monotonic() - started < 5, "sent again by its own timer, not when the browser came back online"
+    assert sent.value.headers.get("authorization") == f"Bearer {token}"
+    _ended(token)
+    assert _refused(token) == 401
+
+
+def test_a_sign_out_refused_by_its_limit_is_sent_again_after_the_wait_the_server_asks_for(page: Page, ana):
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    sent = []
+
+    def first_refused(route):
+        sent.append(time.monotonic())
+        if len(sent) == 1:
+            route.fulfill(status=429, content_type="application/json", headers={"Retry-After": "2"},
+                          body='{"detail": "Rate limit exceeded. Please try again later."}')
+        else:
+            route.continue_()
+
+    page.route(f"**{SIGN_OUT}", first_refused)
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    _until(page, lambda: len(sent) == 1, "the sign-out was not sent")
+    assert session_row(token) == "t|f"
+    # Waited on through the page, so that the route gets the second sign-out when it comes.
+    _until(page, lambda: session_row(token) == "f|t", "the session was not ended on the server")
+    assert len(sent) == 2, f"{len(sent)} sign-outs sent"
+    waited = sent[1] - sent[0]
+    assert 1.8 <= waited < 10, f"sent again {waited:.1f}s after the refusal, which asked for 2"
+    assert _refused(token) == 401
 
 
 def _hold_preference_saves(page: Page):

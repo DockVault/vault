@@ -396,6 +396,16 @@ stayed valid on the server until it expired. Display choices are kept. A tab tha
 session as it loaded (no answer from the server, a server error, a rate limit) signs out only itself, as
 before, and ends nothing: the session is refused only when the server says so.
 
+A sign-out the server did not answer (the browser offline, the sign-out's rate limit, a server error) is
+sent again while the page stays open: when the browser is back online, after the wait the server asks
+for, or after a wait that grows from 15 seconds to 5 minutes, until the server answers it or the token
+expires. The page keeps the token for that in memory only, never in the browser's storage. **The limit
+that remains:** when the page is closed or reloaded before the server has answered (or within the 3
+seconds the sign-out waits for a preference being saved), nothing sends it again, and that session stays
+valid on the server until its token expires (the session timeout an administrator sets). Signing in
+again and signing out on another page does not end it either; an administrator can end it with the
+account's other sessions (Terminate Sessions, on the Users page).
+
 ## Erasing a person
 
 1. **Delete the account** (Users page). It is refused while the person owns vaults (transfer or

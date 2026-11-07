@@ -342,6 +342,159 @@ let S = { vaultList: null };
     assert out == {"got": [], "kept": ["Mine"], "own": ["Mine"]}
 
 
+# The page's reads (get), with a fetch the test answers when it chooses, and a sign-out (a new state, S) made while
+# a read is on its way. The outcome of each read: "data", "threw: <status>", or "pending" (it never settles).
+READ = _fn("dropped") + _fn("get") + """
+class RequestError extends Error { constructor(m, s, d) { super(m); this.status = s; this.detail = d; } }
+const SEARCHES = {};
+const API_BASE = '';
+let authToken = 't';
+const typedIn = () => false;
+const unlockHeader = () => ({});
+const caseHeader = () => ({});
+const calls = { app: 0, json: 0, refused: 0 };
+const refused = () => { calls.refused++; };
+let S = { name: 'first' };
+let answer, appAnswer, appRefusal;
+const fetch = () => new Promise((resolve, reject) => { answer = { resolve, reject }; });
+const apiRequest = () => { calls.app++; return new Promise((resolve, reject) => { appAnswer = resolve; appRefusal = reject; }); };
+const reply = (status, body, onRead) => ({ status, ok: status >= 200 && status < 300,
+  json: () => { calls.json++; if (onRead) onRead(); return Promise.resolve(body); } });
+const outcome = (p) => Promise.race([
+  p.then(() => 'data', (e) => 'threw: ' + (e.status || e.message)),
+  new Promise((r) => setTimeout(() => r('pending'), 50)),
+]);
+"""
+
+
+@pytest.mark.parametrize("case, want", [
+    ("answered after a sign-out", {"got": "pending", "app": 0, "json": 0}),
+    ("refused after a sign-out", {"got": "pending", "app": 0, "json": 0}),
+    ("failed after a sign-out", {"got": "pending", "app": 0, "json": 0}),
+    ("signed out while it was read", {"got": "pending", "app": 0, "json": 1}),
+    ("its refusal signs the page out", {"got": "threw: Session expired. Please log in again.", "app": 1, "json": 0}),
+    ("answered", {"got": "data", "app": 0, "json": 1}),
+    ("refused", {"got": "threw: 401", "app": 1, "json": 0}),
+    ("forbidden", {"got": "threw: 403", "app": 0, "json": 1}),
+])
+def test_a_read_answered_after_a_sign_out_is_dropped(case, want):
+    """An answer to a read made before a sign-out, or its failure, is drawn for nobody: the read never settles, and
+    a refusal is not handed to the app's sign-in handling with the next person's session. The counters the list,
+    the summary and the Now panel compare their answers with start again at each sign-out, so only this tells the
+    first person's answer from the next person's. The controls: a read of the same person settles as before (an
+    answer, a 401, a 403), and so does a read whose refusal itself ends the session: the app's own request
+    (apiRequest) signs the page out and then throws, and the read passes that failure on, as it did before."""
+    out = _node(READ + """
+const signOut = () => { S = { name: 'next' }; };
+(async () => {
+  const p = get('/activity/events?range=7d');
+  const CASE = %s;
+  if (CASE === 'answered after a sign-out') { signOut(); answer.resolve(reply(200, { events: [] })); }
+  if (CASE === 'refused after a sign-out') { signOut(); answer.resolve(reply(401, {})); }
+  if (CASE === 'failed after a sign-out') { signOut(); answer.reject(new TypeError('Failed to fetch')); }
+  if (CASE === 'signed out while it was read') answer.resolve(reply(200, { events: [] }, signOut));
+  if (CASE === 'its refusal signs the page out') {
+    // As apiRequest does with a refusal of the session the tab still holds: it signs the page out, then throws.
+    answer.resolve(reply(401, {}));
+    await new Promise((r) => setTimeout(r, 0));
+    signOut();
+    appRefusal(new Error('Session expired. Please log in again.'));
+  }
+  if (CASE === 'answered') answer.resolve(reply(200, { events: [] }));
+  if (CASE === 'refused') { answer.resolve(reply(401, {})); await new Promise((r) => setTimeout(r, 0)); appAnswer(); }
+  if (CASE === 'forbidden') answer.resolve(reply(403, { detail: 'Not allowed' }));
+  const got = await outcome(p);
+  console.log(JSON.stringify({ got, app: calls.app, json: calls.json }));
+})();
+""" % json.dumps(case))
+    assert out == want
+
+
+# A step to the next event (Older, Newer, the keys) across a page's edge, whose read of the next page is held, and
+# the page's sign-out (resetActivity) as it is shipped.
+RESET = JS[JS.index("    window.resetActivity = function resetActivity() {"):]
+RESET = RESET[:RESET.index("\n    };\n") + 7]
+STEP = """
+const window = {};
+const page = (ids, n, pages) => ({ rows: ids.map((id) => ({ id })), selectedId: null, page: n, pages, pageSize: '25',
+  detail: null, blocked: null });
+let S = page(['a', 'b'], 1, 2);
+const selected = [];
+let reads = 0;
+const select = (id) => { selected.push(id); S.selectedId = id; };
+const indexOfSelected = () => S.rows.findIndex((r) => r.id === S.selectedId);
+const focusInList = () => false;
+const gotoPage = () => { reads++; return new Promise(() => {}); };   // its read made before a sign-out: dropped
+const loadMore = gotoPage;
+const listParams = () => new URLSearchParams();
+const get = () => new Promise(() => {});
+const renderDetail = () => {}, renderSelection = () => {}, writeHash = () => {}, announce = () => {};
+const positionText = () => '';
+const showError = () => {};
+const $ = () => null;
+const stopTimers = () => {}, closePanel = () => {}, closeMenu = () => {}, closeOnline = () => {};
+const unblock = () => {}, setPausedButton = () => {};
+let phonePushed = false, exporting = null, chartUi = null, wired = false;
+const UNLOCKS = new Map();
+const P = {};
+const freshState = () => page([], 1, null);
+""" + _line("let stepping") + _fn("step") + RESET
+
+
+@pytest.mark.parametrize("case, want", [
+    ("the next person steps after a sign-out", {"selected": ["y"], "reads": 1}),
+    ("a second step while the first is on its way", {"selected": [], "reads": 1}),
+])
+def test_a_step_on_its_way_at_a_sign_out_does_not_hold_up_the_next_persons_steps(case, want):
+    """One step at a time: a second step while one is on its way does nothing (the control). A step whose read is
+    on its way at a sign-out never comes back (its answer is dropped), so the sign-out frees the next person's steps:
+    without that, Older, Newer and the keys would do nothing for them until the page was loaded again."""
+    out = _node(STEP + """
+(async () => {
+  S.selectedId = 'b';                        // the last event of the page
+  step(1);                                   // onto the next page: its read is on its way
+  await new Promise((r) => setTimeout(r, 0));
+  if (%s === 'the next person steps after a sign-out') {
+    window.resetActivity();
+    S = page(['x', 'y'], 1, 1);              // the next person's list
+    S.selectedId = 'x';
+  } else {
+    S.selectedId = 'a';
+  }
+  step(1);
+  await new Promise((r) => setTimeout(r, 0));
+  console.log(JSON.stringify({ selected, reads }));
+})();
+""" % json.dumps(case))
+    assert out == want
+
+
+def test_a_vault_receipt_that_comes_back_after_a_sign_out_is_not_kept():
+    """A vault's names unlocked with its password: the receipt is kept for the reads that follow, but not when the
+    person signed out while it was on its way (the next person's reads would carry it)."""
+    out = _node(_fn("dropped") + _fn("unlockVault") + """
+const UNLOCKS = new Map();
+let answer;
+let reloads = 0;
+const apiRequest = () => new Promise((resolve) => { answer = resolve; });
+const reloadAfterUnlock = async () => { reloads++; };
+let S = { name: 'first' };
+const outcome = (p) => Promise.race([p.then(() => 'done', () => 'threw'), new Promise((r) => setTimeout(() => r('pending'), 50))]);
+(async () => {
+  const late = unlockVault('v1', 'pw');
+  S = { name: 'next' };                          // signed out while the receipt was on its way
+  answer({ receipt: 'r1', expires_at: new Date(Date.now() + 60000).toISOString() });
+  const lateOut = await outcome(late);
+  const kept = Array.from(UNLOCKS.keys());
+  const own = unlockVault('v2', 'pw');
+  answer({ receipt: 'r2', expires_at: new Date(Date.now() + 60000).toISOString() });
+  const ownOut = await outcome(own);
+  console.log(JSON.stringify({ lateOut, kept, ownOut, after: Array.from(UNLOCKS.keys()), reloads }));
+})();
+""")
+    assert out == {"lateOut": "pending", "kept": [], "ownOut": "done", "after": ["v2"], "reloads": 1}
+
+
 # ---- the band's total and the list's -------------------------------------------------------------
 
 RECONCILE = _line("let reconcileTimer") + _fn("reconcileTotals") + """

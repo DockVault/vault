@@ -7,7 +7,9 @@ route ends the session as logout does and answers without that header. What is h
 - the session ends at once: its token is refused, the row is inactive and revoked, another session of the same
   account goes on; the answer clears nothing (no Clear-Site-Data, no cookie);
 - it is idempotent: a second call answers 200 again, says it ended nothing, and records nothing; of two calls at
-  once, one ends the session and one sign-out is recorded;
+  once, one ends the session and one sign-out is recorded; a call for a session already ended writes nothing to its
+  row (a row revoked elsewhere and still listed as active is marked inactive);
+- it does its work off the server's event loop: a sign-out waiting on its session's row holds up no other request;
 - an expired token still ends its session (whose row stayed listed as signed in), and that session's other,
   unexpired token is then refused too;
 - only a token this server signed for a session ends one: no token, a malformed one, one signed with another key
@@ -15,7 +17,8 @@ route ends the session as logout does and answers without that header. What is h
   token signed by the server that names another account than the session's;
 - a token used after it is refused everywhere one is accepted: the web API, an upload (a new one, the chunks of one
   begun before, its completion, the direct upload), a download, the live-monitor socket (a new one and one already
-  open), and the minting of SFTP temporary credentials;
+  open), and the minting of SFTP temporary credentials; refused without Clear-Site-Data (by the denylist, by the
+  session's row, for a temporary credential's session), which a token that has run out still gets;
 - a temporary credential's web session ends and frees the credential's slot, as logout does;
 - the token is held in the cache's denylist for the rest of its life (none for a token that has run out, none for
   a token naming another account);
@@ -29,14 +32,16 @@ route ends the session as logout does and answers without that header. What is h
 tests/test_ui_sign_out_ends_session.py holds the web app's side: every sign-out path calls this route.
 """
 import json
+import subprocess
 import threading
 import time
+from contextlib import contextmanager
 
 import jwt
 import pytest
 import requests
 
-from _account_change_helpers import psql, signed_in
+from _account_change_helpers import DB, psql, signed_in
 from _sign_out_helpers import claims as _claims, expired_copy as _expired_copy, signed_by_the_server as _signed
 from _sign_out_helpers import redis_cli, session_digest, shipped_auth_limit
 from _sign_out_helpers import session_row as _row, sign_outs_recorded as _sign_outs_recorded
@@ -117,6 +122,89 @@ def test_two_sign_outs_at_once_end_the_session_once(person):
         t.join(timeout=60)
     assert sorted((a.status_code, a.json()["session_ended"]) for a in answers) == [(200, False), (200, True)]
     assert _sign_outs_recorded(person["id"]) == before + 1
+
+
+def _row_version(token):
+    """The version of the session row the database keeps (its xmin): every UPDATE of the row writes a new one, even
+    one that sets the values the row already holds."""
+    return psql(f"SELECT xmin FROM active_sessions WHERE session_token = '{session_digest(token)}'")
+
+
+def test_a_sign_out_of_a_session_already_ended_writes_nothing_to_its_row(person):
+    one = signed_in(person)
+    assert _sign_out(one.token).json()["session_ended"] is True
+    assert _row(one.token) == "f|t"
+    version = _row_version(one.token)
+    for _ in range(2):
+        again = _sign_out(one.token)
+        assert again.status_code == 200 and again.json() == {"signed_out": True, "session_ended": False}, again.text
+    assert _row_version(one.token) == version, "a sign-out of a session already ended wrote its row again"
+
+
+def test_a_session_revoked_elsewhere_and_still_listed_as_active_is_marked_inactive(person):
+    """The control of the test above: the row is written when there is still something to write."""
+    one = signed_in(person)
+    psql(f"UPDATE active_sessions SET revoked = true WHERE session_token = '{session_digest(one.token)}'")
+    assert _row(one.token) == "t|t"
+    r = _sign_out(one.token)
+    assert r.status_code == 200 and r.json() == {"signed_out": True, "session_ended": False}, r.text
+    assert _row(one.token) == "f|t"
+
+
+ROW_HOLDER = "sign-out-row-holder"
+
+
+@contextmanager
+def _row_held(token):
+    """Another database session holds the lock of the session row ``token`` names until this ends."""
+    holder = subprocess.Popen(
+        ["docker", "exec", "-i", DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-Atc",
+         f"BEGIN; SELECT 1 FROM active_sessions WHERE session_token = '{session_digest(token)}' FOR UPDATE; "
+         f"SELECT pg_sleep(900); -- {ROW_HOLDER}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _until(lambda: psql("SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'PgSleep' "
+                            f"AND query LIKE '%{ROW_HOLDER}%' AND pid <> pg_backend_pid()") == "1",
+               30, "the row's lock to be taken")
+        yield
+    finally:
+        # Ending the docker client does not end psql inside the container: end its session.
+        psql("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+             f"WHERE query LIKE '%{ROW_HOLDER}%' AND pid <> pg_backend_pid()")
+        holder.kill()
+        holder.wait(timeout=30)
+
+
+def _until(condition, seconds, what):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"waited {seconds}s for {what}")
+
+
+def test_a_sign_out_waiting_on_its_row_holds_up_no_other_request(person):
+    """The sign-out's work runs off the server's event loop. Its session's row is held by another database session,
+    so the sign-out waits on it; while it waits, another request (the health check) is answered at once. On the
+    loop, every other request waited until the row was let go or the wait timed out (five seconds), and the
+    sign-out then failed."""
+    one = signed_in(person)
+    answers = []
+    with _row_held(one.token):
+        sending = threading.Thread(target=lambda: answers.append(_sign_out(one.token)))
+        sending.start()
+        _until(lambda: psql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                            "AND query LIKE 'UPDATE active_sessions%'") != "0", 20, "the sign-out to wait on its row")
+        started = time.monotonic()
+        health = requests.get(f"{BASE_URL}/health", timeout=30)
+        took = time.monotonic() - started
+    sending.join(60)
+    assert health.status_code == 200, health.text
+    assert took < 2, f"another request waited {took:.1f}s behind a sign-out waiting on its row"
+    assert answers and answers[0].status_code == 200, answers and (answers[0].status_code, answers[0].text[:200])
+    assert answers[0].json() == {"signed_out": True, "session_ended": True}
+    assert _row(one.token) == "f|t"
 
 
 def test_an_expired_token_still_ends_its_session(person):
@@ -398,6 +486,44 @@ def test_a_temporary_credentials_web_session_ends_and_frees_its_slot(admin):
     recorded = psql("SELECT temp_credential_name FROM audit_logs WHERE action = 'logout' "
                     f"AND temp_credential_name = '{cred['temp_username']}'")
     assert recorded == cred["temp_username"], "the sign-out was not recorded as the temporary credential's"
+
+
+def _clears_site_data(r):
+    return "clear-site-data" in {k.lower() for k in r.headers}
+
+
+def test_a_session_that_has_ended_is_refused_without_clear_site_data(admin, person):
+    """A request a tab sends with the token of a session ended by a sign-out (a poll on its way, a tab told late) is
+    refused without Clear-Site-Data, which a browser applies to the whole origin in every tab: by the denylist, by
+    the session's row when the denylist does not hold it, and for a temporary credential's session. A token that
+    has run out is still refused with it (the control)."""
+    one = signed_in(person)
+    assert _sign_out(one.token).json()["session_ended"] is True
+    refused = _as(one.token, "GET", "/users/me")
+    assert refused.status_code == 401 and "terminated" in refused.text, refused.text
+    assert not _clears_site_data(refused), dict(refused.headers)
+    redis_cli("DEL", _denylisted(one.token))                 # the session's row refuses it now
+    assert redis_cli("EXISTS", _denylisted(one.token)) == "0"
+    refused = _as(one.token, "GET", "/users/me")
+    assert refused.status_code == 401 and "terminated" in refused.text, refused.text
+    assert not _clears_site_data(refused), dict(refused.headers)
+
+    made = admin.post("/auth/temp-credentials", json={"note": unique("ended-session")})
+    assert made.status_code == 200, made.text
+    cred = made.json()
+    holder = requests.post(f"{BASE_URL}/auth/login",
+                           json={"username": cred["temp_username"], "password": cred["credential"]}, timeout=30)
+    assert holder.status_code == 200, holder.text
+    temp = holder.json()["access_token"]
+    assert _sign_out(temp).json()["session_ended"] is True
+    redis_cli("DEL", _denylisted(temp))
+    refused = _as(temp, "GET", "/users/me")
+    assert refused.status_code == 401 and "terminated" in refused.text, refused.text
+    assert not _clears_site_data(refused), dict(refused.headers)
+
+    other = signed_in(person)
+    run_out = _as(_expired_copy(other.token), "GET", "/users/me")
+    assert run_out.status_code == 401 and _clears_site_data(run_out), dict(run_out.headers)
 
 
 def test_api_logout_keeps_its_answer_for_its_callers(person):

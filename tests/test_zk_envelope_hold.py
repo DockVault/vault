@@ -433,8 +433,10 @@ def _function(name):
 def test_every_fetch_of_the_envelope_goes_through_the_hold():
     assert APP.count("apiRequest('/ecc/keys/private', { silent: true })") == 1
     assert "return await apiRequest('/ecc/keys/private', { silent: true });" in _function("zkFetchPrivateEnvelope")
+    # Each reads it once, directly or as a step of the key operation (which a sign-out ends: _zkSteps).
+    read = re.compile(r"const priv = await (zkFetchPrivateEnvelope\(\)|step\(\(\) => zkFetchPrivateEnvelope\(\)\));")
     for name in ("_zkUnlockOnce", "zkChangePassphrase", "zkExportRecoveryKey"):
-        assert "const priv = await zkFetchPrivateEnvelope();" in _function(name), name
+        assert len(read.findall(_function(name))) == 1, name
     fetch = _function("zkFetchPrivateEnvelope")
     assert "if (!e || e.reason !== 'zk-envelope-hold' || attempt > 0) throw e;" in fetch
     release = _function("zkReleaseEnvelopeHold")
@@ -451,7 +453,7 @@ def test_every_new_passphrase_passes_the_rule_and_an_old_one_is_only_nudged():
     unlock = _function("_zkUnlockOnce")
     # After the key is in memory: the unlock has already succeeded when the person is told.
     assert "    zkNudgeWeakPassphrase(pass);\n    return zkState.privateKey;\n}\n" in unlock
-    assert unlock.index("zkState.privateKey = await eccLib().importPrivateKeyPEM(pem, false);") < unlock.index(
+    assert unlock.index("zkState.privateKey = await step(() => eccLib().importPrivateKeyPEM(pem, false));") < unlock.index(
         "zkNudgeWeakPassphrase(pass);")
     nudge = _function("zkNudgeWeakPassphrase")
     assert "throw" not in nudge and "showWarning(" in nudge

@@ -281,16 +281,18 @@
         return out;
     }
 
-    function post(path, params) {
+    function post(path, params, signal) {
         return fetch(API_BASE + path, {
             method: 'POST',
             headers: Object.assign({ Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, unlockHeader(), caseHeader()),
             body: JSON.stringify(bodyOf(params)),
+            signal,
         });
     }
 
     // Vaults whose names were unlocked with the vault password: a receipt each, good for 15 minutes, sent with
-    // every read (POST /activity/vaults/{id}/unlock). Kept in memory only.
+    // every read (POST /activity/vaults/{id}/unlock). Kept in memory only, and forgotten at a sign-out
+    // (resetActivity): the next person on the tab is asked for the password again.
     const UNLOCKS = new Map();
 
     function unlockHeader() {
@@ -307,8 +309,10 @@
     }
 
     async function unlockVault(vid, password) {
+        const asked = S;
         const out = await apiRequest(`/activity/vaults/${encodeURIComponent(vid)}/unlock`,
             { method: 'POST', body: JSON.stringify({ password }), silent: true });
+        if (asked !== S) return dropped();    // a receipt for the person who signed out meanwhile
         UNLOCKS.set(vid, { receipt: out.receipt, expires: Date.parse(out.expires_at) || (Date.now() + 15 * 60000) });
         await reloadAfterUnlock();
     }
@@ -399,19 +403,39 @@
         return box;
     }
 
+    // An answer, or a failure, that comes back after a sign-out belongs to the person who asked, not to whoever has
+    // signed in on the tab since: a sign-out gives the page a new state (resetActivity), and a read made for the
+    // state before is dropped. Its promise never settles, so nothing that waits on it draws it, counts it or reports
+    // it (the list, the summary, who is signed in now, the details). The list's, the summary's and the now panel's
+    // own counters start again from 0 with each new state, so they could not tell such an answer from the next
+    // person's.
+    function dropped() {
+        return new Promise(() => {});
+    }
+
     // A GET under /activity (or the session probe). A 401 is handed to the app's own sign-in handling;
     // a refusal for a temporary credential stops the page (see blockAsTemporary).
     async function get(path) {
+        const asked = S;
         const [base, query] = path.split('?');
         const params = new URLSearchParams(query || '');
-        const resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
-            : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader(), caseHeader()) });
+        let resp;
+        try {
+            resp = SEARCHES[base] && typedIn(params) ? await post(SEARCHES[base], params)
+                : await fetch(API_BASE + path, { headers: Object.assign({ Authorization: `Bearer ${authToken}` }, unlockHeader(), caseHeader()) });
+        } catch (err) {
+            if (asked !== S) return dropped();
+            throw err;
+        }
+        if (asked !== S) return dropped();
         if (resp.status === 401) {
             await apiRequest(path, { silent: true });          // the app signs out
+            if (asked !== S) return dropped();
             throw new RequestError('Your session has ended.', 401, null);
         }
         let data = null;
         try { data = await resp.json(); } catch (_) { data = null; }
+        if (asked !== S) return dropped();
         if (!resp.ok) {
             const detail = data && data.detail;
             const text = typeof detail === 'string' ? detail : `the server answered ${resp.status}`;
@@ -837,6 +861,10 @@
         }
     }
 
+    // An export on its way: a sign-out stops it (resetActivity), so a file of the person who signed out never lands
+    // in the browser's downloads after they have gone.
+    let exporting = null;
+
     // Every event that matches the filters, as a file. The server streams it, stops at its row limit and
     // says so in the last line; the headers carry both counts.
     async function exportEvents(fmt) {
@@ -844,11 +872,16 @@
         const p = listParams();
         p.set('format', fmt);
         btn.setAttribute('aria-busy', 'true');
+        const asked = S;
+        const ctl = new AbortController();
+        exporting = ctl;
         try {
-            const resp = await post('/activity/export', p);
+            const resp = await post('/activity/export', p, ctl.signal);
+            if (asked !== S) return;
             if (resp.status === 403) {
                 let data = null;
                 try { data = await resp.json(); } catch (_) { /* no body */ }
+                if (asked !== S) return;
                 refused(new RequestError((data && data.detail) || 'Refused', 403, null));
                 return;
             }
@@ -863,6 +896,7 @@
             const rows = Number(resp.headers.get('X-Export-Rows') || 0);
             const match = (resp.headers.get('Content-Disposition') || '').match(/filename=([^;]+)/);
             const blob = await resp.blob();
+            if (asked !== S) return;
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -876,8 +910,9 @@
                 showWarning(`Exported ${rows.toLocaleString()} of ${total.toLocaleString()} events, the most one export holds. Narrow the filters to export the rest.`);
             } else showSuccess(`Exported ${rows.toLocaleString()} ${rows === 1 ? 'event' : 'events'}`);
         } catch (err) {
-            showError(`Export failed: ${err.message}`);
+            if (asked === S) showError(`Export failed: ${err.message}`);
         } finally {
+            if (exporting === ctl) exporting = null;
             btn.removeAttribute('aria-busy');
         }
     }
@@ -1623,7 +1658,9 @@
     }
 
     // Move to the next (older, +1) or previous (newer, -1) event, across the page's edge, and from an
-    // event that is not in the list, by keyset under the current filters.
+    // event that is not in the list, by keyset under the current filters. One step at a time: `stepping` is set while
+    // one is under way. A step whose read is on its way at a sign-out never comes back (get drops the answer), so
+    // the sign-out clears it (resetActivity) for the next person on the tab.
     let stepping = false;
     async function step(dir, byKey) {
         if (stepping) return;
@@ -5112,7 +5149,13 @@
         const m = $('activity-event-modal');
         if (m) { delete m.dataset.actOpen; m.classList.remove('active'); }
         phonePushed = false;
+        // The vault receipts of the person who signed out, and their export on its way.
+        UNLOCKS.clear();
+        if (exporting) { try { exporting.abort(); } catch (_) { /* done */ } exporting = null; }
         S = freshState();
+        // A step to the next event whose read is on its way never comes back to say it is done (its answer is
+        // dropped): left set, it would keep Newer, Older and the keys from moving for the next person.
+        stepping = false;
         P.open = false;
         P.draft = null;
         P.built = false;
