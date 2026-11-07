@@ -2759,8 +2759,12 @@ def test_start_builds_a_checkout_as_new_as_the_version_the_deployment_runs(tmp_p
 
 
 def test_start_of_a_release_image_deployment_does_not_ask_the_version_it_runs(tmp_path, monkeypatch):
-    """A release image is the version it names: start uses it as it is, and there is no checkout to compare."""
-    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False)
+    """A release image is the version it names: start uses it as it is, and the checkout is not what runs. An update
+    by pull leaves the checkout's VERSION behind the release it pulled (here 0.33.6 under a 0.34.0 deployment), and
+    start must not take that for an older checkout to build."""
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False,
+                              image="ghcr.io/dockvault/vault:v0.34.0")
+    (tmp_path / "VERSION").write_text("0.33.6\n", encoding="utf-8")
     monkeypatch.setattr(tool, "_running_version", lambda *a, **k: pytest.fail("the running version was asked"))
     tool.start()
     assert _compose_verb(calls, "up")
