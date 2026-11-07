@@ -474,3 +474,27 @@ def test_unlock_force_whose_copy_cannot_be_kept_leaves_env_as_it_was(tmp_path, m
     said = " ".join(capsys.readouterr().out.split())
     assert "could not keep the current .env as %s" % (tmp_path / ".env.dvsetaaa") in said
     assert "so it was not replaced. Nothing changed." in said
+
+
+def test_unlock_force_over_an_env_it_cannot_read_leaves_it_as_it_was(tmp_path, monkeypatch, capsys):
+    """A .env that cannot be read can be neither compared with the sealed one nor kept first: it may be the only copy
+    of another set's keys. It is not replaced, and no copy is made."""
+    a = _set_env("dvsetaaa")
+    edited = a + "X=1\n"
+    pf = _beside_the_seal(tmp_path, a, edited)
+    env_path = os.path.abspath(str(tmp_path / ".env"))
+    real_open = open
+
+    def unreadable(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and os.path.abspath(os.fspath(path)) == env_path:
+            raise PermissionError(13, "Permission denied", env_path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(dv, "open", unreadable, raising=False)
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _app(tmp_path).unlock(_args(passphrase_file=pf, force=True))
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == edited
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".env")) == [".env", ".env.enc"]
+    said = " ".join(capsys.readouterr().out.split())
+    assert "could not read the current .env" in said and "so it was not replaced. Nothing changed." in said

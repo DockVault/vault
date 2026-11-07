@@ -2692,6 +2692,31 @@ def test_restart_of_a_deployment_that_builds_from_source_takes_nothing_down_when
     assert "The build failed" in said and "Nothing was taken down: the deployment keeps running as it is." in said
 
 
+@pytest.mark.parametrize("failure", [OSError(2, "No such file or directory"),
+                                     subprocess.TimeoutExpired(["docker", "compose", "build"], 1800)],
+                         ids=["cannot-run", "timed-out"])
+def test_restart_of_a_deployment_that_builds_from_source_takes_nothing_down_when_its_build_cannot_finish(
+        tmp_path, monkeypatch, capsys, failure):
+    """A build that could not be run, or ran out of time, is no build: the deployment keeps running as it is (a build
+    that timed out and was counted as done would be followed by the teardown)."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch)
+    answer = dv.subprocess.run
+
+    def run(cmd, **k):
+        if cmd[:2] == ["docker", "compose"] and "build" in cmd:
+            calls.append(cmd)
+            raise failure
+        return answer(cmd, **k)
+
+    monkeypatch.setattr(dv.subprocess, "run", run)
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert _compose_verb(calls, "build") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert "docker compose build failed" in said
+    assert "Nothing was taken down: the deployment keeps running as it is." in said
+
+
 def test_restart_never_builds_a_checkout_older_than_the_version_the_deployment_runs(tmp_path, monkeypatch, capsys):
     """A checkout moved back (an older tag checked out) would be built and started over data a newer version wrote:
     the image refuses to start on it, and nothing would run. Refused before anything is built or taken down."""
