@@ -595,7 +595,7 @@ jobs:
           ran = [c.get("name") for c in cases
                  if c.find("skipped") is None and c.find("failure") is None and c.find("error") is None]
           print(f"free-space floor: {len(ran)} of {len(cases)} ran and passed")
-          if len(cases) < 7 or len(ran) != len(cases):
+          if len(cases) < 8 or len(ran) != len(cases):
               sys.exit("::error::the free-space floor tests did not all run")
           PY
           sed -i '/^MIN_FREE_SPACE_GB=/d' .env

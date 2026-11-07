@@ -11,6 +11,7 @@ less than the floor free.
 - a chunked upload is refused at its start, before a byte is sent;
 - an upload link's upload is refused at its start, and reserves nothing of the link's room;
 - a copy and a move into another vault are answered 507, and the file stays where it was;
+- a folder copy is answered 507 before it makes a folder: the destination gains nothing;
 - an SFTP write is refused at its open, with the reason as its status, and stores nothing.
 
 tests/test_free_space.py covers the rules offline (the check as the bytes are written and as the row is written, the
@@ -49,7 +50,8 @@ from app.services.vault_service import VaultService
 with get_db_context() as db:
     user = db.query(User).filter(User.username == USERNAME).one()
     service = VaultService(db, PermissionService(db))
-    info, stream = service.upload_file_streaming(uuid.UUID(VAULT_ID), NAME, user, mime_type="text/plain")
+    info, stream = service.upload_file_streaming(uuid.UUID(VAULT_ID), NAME, user, mime_type="text/plain",
+                                                 folder_id=uuid.UUID(FOLDER_ID) if FOLDER_ID else None)
     with stream as ctx:
         ctx.write_chunk(b"a few bytes")
     made = service.finalize_streaming_upload(info, ctx.get_total_size(), ctx.get_checksum())
@@ -63,8 +65,9 @@ def _names(admin, vault_id):
     return [item.get("name") for item in r.json()["items"]]
 
 
-def _stored(vault_id, name):
-    script = f"USERNAME = {ADMIN_USER!r}\nVAULT_ID = {vault_id!r}\nNAME = {name!r}\n" + _STORE
+def _stored(vault_id, name, folder_id=None):
+    script = (f"USERNAME = {ADMIN_USER!r}\nVAULT_ID = {vault_id!r}\nNAME = {name!r}\nFOLDER_ID = {folder_id!r}\n"
+              + _STORE)
     try:
         r = subprocess.run(["docker", "exec", "-i", "-u", "10001:10001", API, "python", "-c", script],
                            capture_output=True, text=True, timeout=90)
@@ -153,6 +156,37 @@ def test_a_copy_or_a_move_into_another_vault_is_refused_507_and_the_file_stays(a
     assert detail.startswith(NEARLY_FULL) and "MIN_FREE_SPACE_GB" in detail
     assert _names(admin, dest["id"]) == []
     assert _names(admin, source["id"]) == [name]
+
+
+def _folder(admin, vault_id, name, parent=None):
+    r = admin.post(f"/vaults/{vault_id}/folders", json={"name": name, "parent_folder_id": parent})
+    assert r.status_code in (200, 201), r.text
+    return r.json()["folder"]["id"]
+
+
+def _items(admin, vault_id, folder_id):
+    r = admin.get(f"/vaults/{vault_id}/files", params={"folder_id": folder_id})
+    assert r.status_code == 200, r.text
+    return sorted(item.get("name") for item in r.json()["items"])
+
+
+def test_a_folder_copy_is_refused_507_before_it_makes_a_folder(admin, temp_vault):
+    """A folder with a file in it, copied into another folder of the vault: 507 with the floor's words, and the
+    destination holds nothing new. The copy held each file to the floor as it went, and was refused at the first,
+    after it had made the copied folder: the destination gained it, empty."""
+    vault_id = temp_vault["id"]
+    top = _folder(admin, vault_id, unique("floor-top"))
+    name = unique("floor") + ".txt"
+    _stored(vault_id, name, folder_id=top)
+    dest = _folder(admin, vault_id, unique("floor-dest"))
+    assert _items(admin, vault_id, top) == [name]
+    r = admin.post(f"/vaults/{vault_id}/folders/{top}/copy",
+                   json={"dest_vault_id": vault_id, "dest_parent_folder_id": dest})
+    assert r.status_code == 507, r.text
+    detail = r.json()["detail"]
+    assert detail.startswith(NEARLY_FULL) and "MIN_FREE_SPACE_GB" in detail
+    assert _items(admin, vault_id, dest) == [], "a folder copy refused at the floor left what it had made"
+    assert _items(admin, vault_id, top) == [name]
 
 
 def test_an_sftp_write_is_refused_at_its_open_with_the_reason(admin, temp_vault):

@@ -263,6 +263,83 @@ def test_a_copy_refused_as_its_row_is_written_keeps_the_volumes_words(monkeypatc
     assert refused.value.kind == "disk" and str(refused.value) == "found under the lock"
 
 
+def _folder_copy(monkeypatch, files, *, under=(), size_limit=None, stored=0):
+    """copy_folder over a vault's rows in memory (the filters applied as the database would): the folder "top", the
+    folders ``under`` it (name, parent), and the ``files`` (folder, bytes, expired). Beside the tree, a folder of the
+    vault holds a file of 100 GB the copy must not count. Returns the call, what it made and the service."""
+    from datetime import datetime, timedelta, timezone
+    from _memory_db import MemoryDB
+    from app.core.models import File, Folder
+    import app.services.vault_service as vs
+    monkeypatch.setattr(vs, "would_exceed_deployment_storage", lambda db, n: (False, 0, 0))
+    vault = _vault(stored, size_limit)
+    folders = {}
+    for name, parent in [("top", None), ("beside", None), *under]:
+        folders[name] = SimpleNamespace(id=uuid.uuid4(), vault_id=vault.id, name=name,
+                                        parent_folder_id=folders[parent].id if parent else None)
+    an_hour_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
+    rows = [SimpleNamespace(id=uuid.uuid4(), vault_id=vault.id, folder_id=folders[name].id, size_bytes=size,
+                            expires_at=an_hour_ago if expired else None)
+            for name, size, expired in [*files, ("beside", 100 * GIB, False)]]
+    svc = vs.VaultService.__new__(vs.VaultService)
+    svc.storage_path = None
+    svc.db = MemoryDB({Vault: [vault], Folder: list(folders.values()), File: rows})
+    svc._dest_folder_or_raise = lambda *a, **k: None
+    svc._assert_not_into_self_or_descendant = lambda *a, **k: None
+    made = []
+    svc._copy_folder_recursive = lambda folder, user, vault_id, parent, counter: made.append(folder.name) or folder
+    return (lambda: svc.copy_folder(folders["top"].id, SimpleNamespace(id="u"), vault.id, None)), made, svc
+
+
+def test_a_folder_copy_the_volume_has_no_room_for_is_refused_before_it_makes_a_folder(monkeypatch, volume):
+    """Each file of a folder copy is held to the floor as it is copied, but a copy refused there kept the folders it
+    had made: the destination gained the copied top folder, empty, beside the 507. The tree's bytes, the files of its
+    subfolders too and not those that have expired, are now measured before the first folder is made. With room, it
+    is copied."""
+    import app.services.vault_service as vs
+    files = [("top", GIB // 2, False), ("sub", GIB // 2 + 2, False), ("sub", 10 * GIB, True)]
+    copy, made, _svc = _folder_copy(monkeypatch, files, under=[("sub", "top")])
+    volume["free"] = 6 * GIB + 1                            # floor 5 GB: the tree's 1 GB and 2 bytes leave one less
+    with pytest.raises(vs.StorageLimitExceeded) as refused:
+        copy()
+    assert refused.value.kind == "disk" and str(refused.value).startswith("The server's storage is nearly full: ")
+    assert made == [], "a folder was made before the copy was refused"
+    copy, made, _svc = _folder_copy(monkeypatch, files, under=[("sub", "top")])
+    volume["free"] = 6 * GIB + 2                            # it leaves exactly the floor
+    copy()
+    assert made == ["top"]
+
+
+def test_a_folder_copy_past_the_vaults_limit_or_the_item_limit_makes_nothing(monkeypatch, volume):
+    """The vault's size limit and the item limit refused part-way too, keeping what had been made: both are asked
+    before the first folder now."""
+    import app.services.vault_service as vs
+    copy, made, _svc = _folder_copy(monkeypatch, [("top", 10, False), ("sub", 10, False)], under=[("sub", "top")],
+                                    size_limit=100, stored=81)
+    with pytest.raises(vs.FileTooLargeError) as refused:
+        copy()
+    assert str(refused.value) == "The copy would exceed the destination vault's size limit" and made == []
+    tree = dict(files=[("top", 10, False), ("a", 10, False)], under=[("a", "top"), ("b", "top")])
+    copy, made, svc = _folder_copy(monkeypatch, **tree)
+    svc._COPY_MAX_ITEMS = 4                                 # three folders and two files: five items
+    with pytest.raises(vs.FileServiceError) as refused:
+        copy()
+    assert str(refused.value) == "Folder is too large to copy (item limit reached)." and made == []
+    copy, made, svc = _folder_copy(monkeypatch, **tree)
+    svc._COPY_MAX_ITEMS = 5
+    copy()
+    assert made == ["top"]
+
+
+def test_a_folder_copy_of_folders_alone_is_not_held_to_the_floor(monkeypatch, volume):
+    """A tree with no file to copy (an expired one is not copied) copies no bytes: it is made as before, though the
+    volume is below its floor."""
+    copy, made, _svc = _folder_copy(monkeypatch, [("b", 10 * GIB, True)], under=[("a", "top"), ("b", "a")])
+    volume["free"] = GIB
+    copy()
+    assert made == ["top"]
+
+
 # --------------------------------------------------------------------------- what the routes answer
 
 def test_a_route_answers_507_with_the_free_space_and_the_floor(volume):
