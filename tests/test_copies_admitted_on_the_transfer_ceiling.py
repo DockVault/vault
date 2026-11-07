@@ -290,13 +290,16 @@ def test_one_account_holds_at_most_its_share_of_the_slots_with_copies(monkeypatc
             await until(lambda: len(world.ran) == 2 and gate.stats()["waiting_for_share"] == 1)
             seen = (gate.stats()["in_flight"], gate.stats()["waiting_for_share"], gate.stats()["waiting"],
                     len(world.ran))
+            # What the Activity page's "Now" panel shows: a copy waiting for its share is waiting too.
+            shown = S._activity_transfers()
         finally:
             hold.set()
         answers = await asyncio.gather(first, second, third)
-        return seen, answers, gate.stats()
+        return seen, shown, answers, gate.stats()
 
-    seen, answers, after = run_coroutine(scenario())
+    seen, shown, answers, after = run_coroutine(scenario())
     assert seen == (2, 1, 0, 2), f"(in flight, waiting for its share, waiting, run) while the first copy ran: {seen}"
+    assert (shown["in_flight"], shown["waiting"], shown["limit"]) == (2, 1, 4), shown
     assert all(a["id"] for a in answers)
     assert (after["in_flight"], after["waiting"], after["admitted"]) == (0, 0, 3), after
 
@@ -486,3 +489,28 @@ def test_a_database_that_cannot_be_asked_is_said_and_the_start_goes_on(monkeypat
     out = capsys.readouterr().out
     assert out == "Warning: the database's connection limit was not checked (ConnectionError)\n"
 
+
+def test_the_web_server_asks_at_its_start_whether_the_pools_fit(monkeypatch):
+    """The check above is the web server's start's: its lifespan asks it once the database is set up, before the
+    schema's statements run, so a ceiling the database cannot serve is said in the log of every start."""
+    import app.core.data_requirements as data_requirements
+    calls = []
+
+    class Asked(Exception):
+        pass
+
+    def room():
+        calls.append("pools")
+        raise Asked()
+
+    def went_on():
+        raise AssertionError("the start went on without asking whether the pools fit")
+
+    monkeypatch.setattr(S, "initialize_runtime", lambda *a, **k: calls.append("runtime"))
+    monkeypatch.setattr(data_requirements, "check_at_startup", lambda who: calls.append(("newer data", who)))
+    monkeypatch.setattr(S, "init_db", lambda: calls.append("tables"))
+    monkeypatch.setattr(database, "report_connection_room", room)
+    monkeypatch.setattr(S, "_run_lightweight_migrations", went_on)
+    with pytest.raises(Asked):
+        run_coroutine(S.lifespan(S.app).__aenter__())
+    assert calls == ["runtime", ("newer data", "web"), "tables", "pools"]
