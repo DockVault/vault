@@ -161,11 +161,12 @@ def _busy_response(exc: TransferBusy) -> HTTPException:
     that, with 429: the deployment may have slots free, and the account's own transfers are what it waits for.
     """
     if isinstance(exc, ShareBusy):
+        # Others of the account's own waiting are named only when there are some: a queue of 0 has none.
+        others = f", and {exc.waiting} more waiting for one of them to finish" if exc.waiting else ""
         return HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(f"This account already has {exc.share} {'copy or move' if exc.share == 1 else 'copies or moves'} "
-                    f"running at once, the most one account may run, and others waiting for one of them to finish. "
-                    f"Try again when one has finished."),
+                    f"running at once, the most one account may run{others}. Try again when one has finished."),
             headers={"Retry-After": str(exc.retry_after)},
         )
     return HTTPException(

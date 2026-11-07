@@ -345,6 +345,7 @@ def test_a_holder_past_its_share_for_the_whole_wait_is_told_its_share_is_in_use(
         with pytest.raises(ShareBusy) as refusal:
             await gate.acquire(holder="a", share=1)
         assert refusal.value.share == 1 and refusal.value.retry_after >= 1
+        assert refusal.value.waiting == 0, "nobody else of the account's waited, and the refusal said there were"
         assert isinstance(refusal.value, TransferBusy), "every caller that answers a refusal still answers this one"
         stats = gate.stats()
         assert (stats["in_flight"], stats["waiting"], stats["waiting_for_share"]) == (1, 0, 0)
@@ -355,13 +356,34 @@ def test_a_holder_past_its_share_for_the_whole_wait_is_told_its_share_is_in_use(
     run_coroutine(_go())
 
 
+def test_a_wait_for_its_share_that_runs_out_says_how_many_others_of_the_account_still_wait():
+    """The refusal says how many other acquires of the account are waiting for its share, not counting itself: one
+    while a later one still waits, none for the last."""
+    async def _go():
+        gate = TransferAdmission(limit=4, max_waiting=8, wait_seconds=0.3)
+        held = await gate.acquire(holder="a", share=1)
+        first = asyncio.create_task(gate.acquire(holder="a", share=1))
+        await asyncio.sleep(0.15)
+        second = asyncio.create_task(gate.acquire(holder="a", share=1))
+        refusals = []
+        for task in (first, second):
+            with pytest.raises(ShareBusy) as refusal:
+                await asyncio.wait_for(task, timeout=2)
+            refusals.append(refusal.value.waiting)
+        assert refusals == [1, 0], refusals
+        gate.release(held)
+        assert gate.stats()["waiting_for_share"] == 0 and gate._holders == {}
+    run_coroutine(_go())
+
+
 def test_waiting_for_its_share_is_bounded_by_a_room_of_its_own():
     """As large as the deployment's: with no room to wait, one past its share is refused at once, as its share."""
     async def _go():
         gate = TransferAdmission(limit=4, max_waiting=0, wait_seconds=5)
         held = await gate.acquire(holder="a", share=1)
-        with pytest.raises(ShareBusy):
+        with pytest.raises(ShareBusy) as refusal:
             await gate.acquire(holder="a", share=1)
+        assert refusal.value.waiting == 0
         stats = gate.stats()
         assert (stats["refused"], stats["refused_over_share"], stats["in_flight"]) == (0, 1, 1)
         gate.release(held)
@@ -379,8 +401,9 @@ def test_one_holder_filling_its_own_room_leaves_the_deployments_room_to_everyone
         mine = await gate.acquire(holder="a", share=1)
         waiting = [asyncio.create_task(gate.acquire(holder="a", share=1)) for _ in range(2)]
         await asyncio.sleep(0.05)
-        with pytest.raises(ShareBusy):
+        with pytest.raises(ShareBusy) as refusal:
             await gate.acquire(holder="a", share=1)
+        assert refusal.value.waiting == 2, "the refusal did not say how many of the account's wait"
         assert gate.stats()["waiting_for_share"] == 2 and gate.stats()["waiting"] == 0
         others = [await asyncio.wait_for(gate.acquire(), timeout=1) for _ in range(2)]
         assert gate.stats()["in_flight"] == 3

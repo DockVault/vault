@@ -338,13 +338,18 @@ def test_an_account_past_its_share_is_told_its_share_is_in_use_not_that_the_serv
 
 
 def test_a_full_deployment_and_a_full_share_are_told_apart():
+    """A full share names the account's others that wait only when some do: with none (a queue of 0, or the last of
+    them gave up) it said "and others waiting" all the same."""
     full = S._busy_response(S.TransferBusy(retry_after=20, waiting=32, limit=16))
-    share = S._busy_response(S.ShareBusy(retry_after=20, share=4))
-    assert (full.status_code, share.status_code) == (503, 429)
+    share = S._busy_response(S.ShareBusy(retry_after=20, share=4, waiting=3))
+    alone = S._busy_response(S.ShareBusy(retry_after=20, share=4))
+    assert (full.status_code, share.status_code, alone.status_code) == (503, 429, 429)
     assert full.detail == "The server is already handling 16 transfers. Try again in a few seconds."
     assert share.detail == ("This account already has 4 copies or moves running at once, the most one account may "
-                            "run, and others waiting for one of them to finish. Try again when one has finished.")
-    assert full.headers == share.headers == {"Retry-After": "20"}
+                            "run, and 3 more waiting for one of them to finish. Try again when one has finished.")
+    assert alone.detail == ("This account already has 4 copies or moves running at once, the most one account may "
+                            "run. Try again when one has finished.")
+    assert full.headers == share.headers == alone.headers == {"Retry-After": "20"}
 
 
 # ---- the pool ----------------------------------------------------------------------------------------------------
@@ -480,3 +485,4 @@ def test_a_database_that_cannot_be_asked_is_said_and_the_start_goes_on(monkeypat
     database.report_connection_room()
     out = capsys.readouterr().out
     assert out == "Warning: the database's connection limit was not checked (ConnectionError)\n"
+

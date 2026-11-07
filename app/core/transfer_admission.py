@@ -71,10 +71,11 @@ class ShareBusy(TransferBusy):
 
     Not the deployment being full: it may have slots free. So it says whose share is in use, and is not counted as
     load the deployment shed (``refused``): an operator reading that count sizes the ceiling by it, and one account
-    at its share says nothing about the ceiling."""
+    at its share says nothing about the ceiling. ``waiting`` is how many other acquires of the holder's are waiting
+    for its share as it is refused: none when its room holds none (a queue of 0, or the last one gave up)."""
 
-    def __init__(self, retry_after: int, share: int):
-        TransferBusy.__init__(self, retry_after, waiting=0, limit=share)
+    def __init__(self, retry_after: int, share: int, waiting: int = 0):
+        TransferBusy.__init__(self, retry_after, waiting=waiting, limit=share)
         self.args = (f"This account already has its share of {share} transfers running",)
         self.share = share
 
@@ -221,7 +222,7 @@ class TransferAdmission:
         with self._counter_lock:
             if entry[2] >= self._max_waiting:
                 self._refused_over_share += 1
-                raise ShareBusy(retry_after=self._retry_after(), share=share)
+                raise ShareBusy(retry_after=self._retry_after(), share=share, waiting=entry[2])
             entry[2] += 1
             self._waiting_for_share += 1
         try:
@@ -229,7 +230,9 @@ class TransferAdmission:
         except asyncio.TimeoutError:
             with self._counter_lock:
                 self._refused_over_share += 1
-            raise ShareBusy(retry_after=self._retry_after(), share=share)
+                # Minus this one: it is refused, not left waiting.
+                others = max(0, entry[2] - 1)
+            raise ShareBusy(retry_after=self._retry_after(), share=share, waiting=others)
         finally:
             with self._counter_lock:
                 entry[2] -= 1
