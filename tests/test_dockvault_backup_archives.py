@@ -541,6 +541,8 @@ def test_a_backup_and_a_restore_through_relative_folders_live(tmp_path, monkeypa
                 _docker("docker", "volume", "create", v)
             seed = _docker("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox", "sh", "-c",
                            "echo LIVE-KEYS > /d/marker.txt")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         if seed.returncode != 0:
@@ -583,6 +585,8 @@ def test_an_archive_changed_after_the_backup_leaves_every_volume_as_it_was_live(
                 _docker("docker", "volume", "create", v)
             seed = _docker("docker", "run", "--rm", "-v", names["keys"] + ":/d", "busybox", "sh", "-c",
                            "echo KEPT-KEYS > /d/marker.txt")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         if seed.returncode != 0:
@@ -1234,6 +1238,8 @@ def test_an_extraction_of_real_bytes_is_checked_before_anything_is_extracted_liv
     try:
         try:
             made = _docker("docker", "volume", "create", vol)
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         if made.returncode != 0:
@@ -1277,6 +1283,8 @@ def test_an_archive_swapped_after_the_restore_checked_it_is_caught_before_its_ex
                 _docker("docker", "volume", "create", v)
             seed = _docker("docker", "run", "--rm", "-v", names["storage"] + ":/d", "busybox", "sh", "-c",
                            "echo STORED > /d/marker.txt")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         if seed.returncode != 0:

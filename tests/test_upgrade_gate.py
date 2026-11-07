@@ -660,6 +660,8 @@ def test_the_version_in_a_containers_image_is_read_without_exec(tmp_path):
         pytest.skip("VAULT_API_CONTAINER is unset; no deployment to read")
     try:
         probe = sp.run(["docker", "exec", container, "cat", "/app/VERSION"], capture_output=True, text=True, timeout=60)
+    except sp.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except (OSError, sp.SubprocessError) as exc:
         pytest.skip(f"cannot run docker: {exc}")
     skip_if_container_absent(probe, container)

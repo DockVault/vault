@@ -388,6 +388,8 @@ def test_the_key_check_is_read_from_a_running_database_and_tells_its_key_live():
         pytest.skip("no running stack with its .env here")
     try:
         reachable = subprocess.run(["docker", "exec", container, "true"], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail("the command did not finish within %s s" % exc.timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         pytest.skip("cannot run docker: %s" % exc)
     skip_if_container_absent(reachable, container)
