@@ -717,7 +717,8 @@ def test_a_restore_that_stopped_part_way_leaves_a_marker_and_start_refuses_that_
     assert doc["volume_prefix"] == "dvarchstop" and doc["bundle"] == str(bundle)
     assert doc["volumes"] == ([names["keys"]] if fail == "mark" else [names["keys"], names["pg"]])
     assert doc["backup_changed"] is (fail == "changed")
-    assert "Until set 'dvarchstop' is restored, start, restart, setup and update refuse to start it" in said
+    assert ("Until set 'dvarchstop' is restored, start, restart, setup, update, storage, logs and audit change-key "
+            "refuse to start it") in said
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     started = []
     _starting(tool, monkeypatch, started)
@@ -830,7 +831,8 @@ def test_a_restore_that_stops_before_any_volume_keeps_the_mark_an_earlier_one_le
     assert steps == [("stop",)]
     assert marker.read_text(encoding="utf-8") == earlier
     said = _said(capsys)
-    assert "Until set 'dvarchkeep' is restored, start, restart, setup and update refuse to start it" in said
+    assert ("Until set 'dvarchkeep' is restored, start, restart, setup, update, storage, logs and audit change-key "
+            "refuse to start it") in said
     assert "This restore changed nothing, but an earlier restore of the set did not finish" in said
     assert "start brings it back as it was" not in said
 
@@ -851,6 +853,167 @@ def test_restart_setup_and_update_refuse_to_start_a_set_whose_restore_did_not_fi
     said = _said(capsys)
     assert "%s would start set 'dvarchcmd', but a restore of set 'dvarchcmd' from /b/x" % command in said
     assert "Nothing was started." in said
+
+
+class _Ran:
+    returncode = 0
+    stdout = stderr = ""
+
+
+def _marked_tool(tmp_path, monkeypatch, prefix="dvarchcmd"):
+    """The host on set `prefix`, whose restore did not finish (its marker there), with every compose command recorded
+    instead of run (nothing real is touched). Returns (the tool, the compose commands, .env's bytes)."""
+    _env(tmp_path, prefix)
+    _marker(tmp_path, prefix).write_text(json.dumps({"volume_prefix": prefix, "bundle": "/b/x"}), encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    composed = []
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: composed.append(list(a)) or _Ran())
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(tool, "_container_logs_readable", lambda: True)
+    monkeypatch.setattr(tool, "_stored_bytes", lambda: None)
+    monkeypatch.setattr(tool, "_volume_capacity", lambda: None)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_audit_tool", lambda *a, **k: pytest.fail("the audit tool was asked"))
+    return tool, composed, (tmp_path / ".env").read_bytes()
+
+
+@pytest.mark.parametrize("command", ["storage", "logs", "audit change-key"])
+def test_storage_logs_and_audit_change_key_refuse_a_set_whose_restore_did_not_finish(tmp_path, monkeypatch, capsys,
+                                                                                    command):
+    """Each writes .env and then recreates the stack (docker compose up): they started the set whose volumes a restore
+    had half replaced. Each now refuses before it writes anything, and no compose up runs."""
+    tool, composed, env_before = _marked_tool(tmp_path, monkeypatch)
+    run = {"storage": lambda: tool.storage(argparse.Namespace(non_interactive=True, set_gb=64.0, set_transfers=None,
+                                                              no_restart=False)),
+           "logs": lambda: tool.logs(argparse.Namespace(non_interactive=True, enable=True)),
+           "audit change-key": lambda: tool.audit(dv.build_parser().parse_args(["audit", "change-key", "--yes"]))}
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run[command]()
+    assert not [c for c in composed if "up" in c], "no compose up ran"
+    assert (tmp_path / ".env").read_bytes() == env_before
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env", ".restore-incomplete.dvarchcmd"]
+    said = _said(capsys)
+    assert "%s would start set 'dvarchcmd', but a restore of set 'dvarchcmd' from /b/x" % command in said
+    assert "Nothing was changed" in said and str(_marker(tmp_path, "dvarchcmd")) in said
+
+
+def test_storage_with_no_restart_still_writes_the_limit_of_a_set_whose_restore_did_not_finish(tmp_path, monkeypatch):
+    """--no-restart starts nothing: the limit goes into .env as before."""
+    tool, composed, _ = _marked_tool(tmp_path, monkeypatch)
+    tool.storage(argparse.Namespace(non_interactive=True, set_gb=64.0, set_transfers=None, no_restart=True))
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["MAX_STORAGE_GB"] == "64"
+    assert not [c for c in composed if "up" in c]
+
+
+@pytest.mark.parametrize("how", ["recreate", "recreate-with-build", "secure-start"])
+def test_the_stack_of_a_set_whose_restore_did_not_finish_is_never_started_whatever_asks(tmp_path, monkeypatch, capsys,
+                                                                                       how):
+    """Every compose up of the stack goes through _recreate_stack: whatever asks for it (a command that has its own
+    refusal, or one that has none yet), it refuses the set before anything is touched."""
+    tool, composed, _ = _marked_tool(tmp_path, monkeypatch)
+    monkeypatch.setattr(dv, "image_present", lambda *a, **k: True)
+    start = {"recreate": lambda: tool._recreate_stack(build=False),
+             "recreate-with-build": lambda: tool._recreate_stack(build=True),
+             "secure-start": tool._start_secure_stack}[how]
+    with pytest.raises(SystemExit):
+        start()
+    assert composed == [], "nothing was asked of compose, not even the removal of another profile's containers"
+    said = _said(capsys)
+    assert "set 'dvarchcmd' is not started: a restore of set 'dvarchcmd' from /b/x began" in said
+    assert "Nothing was started." in said
+
+
+def test_the_database_of_a_set_whose_restore_did_not_finish_is_not_started_to_check_env(tmp_path, monkeypatch, capsys):
+    """The check of .env against an existing volume starts the set's database (compose up -d vault-db): on a volume a
+    restore emptied, postgres would make a new database there. Not started; the check has no answer and says why."""
+    tool, composed, _ = _marked_tool(tmp_path, monkeypatch)
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert tool._start_db_only() is False
+    assert composed == []
+    said = _said(capsys)
+    assert "The database of set 'dvarchcmd' was not started to check .env: a restore of set 'dvarchcmd'" in said
+    assert tool._guard_db_secret(env, interactive=False, exists_fn=lambda v: True,
+                                 marker_fn=lambda v: None, stamp_fn=lambda v, e: None) is False
+    assert not [c for c in composed if "up" in c], "the guard's own check started nothing either"
+
+
+def test_setup_pointed_by_its_menu_at_a_set_whose_restore_did_not_finish_does_not_start_it(tmp_path, monkeypatch,
+                                                                                         capsys):
+    """Setup's refusal looked only at the set .env named when setup began. Its existing-volume menu (option 2) can
+    install the .env of a set whose restore did not finish, and setup then started that set. It is refused once the
+    menu is done, before anything is started."""
+    _env(tmp_path, "dvarchhost")
+    marked_text = (tmp_path / ".env").read_text(encoding="utf-8").replace("dvarchhost", "dvarchmenu")
+    _marker(tmp_path, "dvarchmenu").write_text(json.dumps({"volume_prefix": "dvarchmenu", "bundle": "/b/x"}),
+                                               encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "port_free", lambda *a, **k: True)
+
+    def option_2_installs_the_marked_sets_env(_env_now, **kwargs):
+        (tmp_path / ".env").write_text(marked_text, encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(tool, "_guard_db_secret", option_2_installs_the_marked_sets_env)
+    started = []
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_print_setup_summary", lambda *a, **k: None)
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "")
+    with pytest.raises(SystemExit):
+        tool.setup(argparse.Namespace(no_start=False, non_interactive=False))
+    assert started == []
+    said = _said(capsys)
+    assert "setup would start set 'dvarchmenu', but a restore of set 'dvarchmenu' from /b/x" in said
+    assert "Nothing was started." in said and _marker(tmp_path, "dvarchmenu").exists()
+
+
+def test_setup_destroying_the_data_of_a_set_whose_restore_did_not_finish_removes_its_mark(tmp_path, monkeypatch):
+    """Option 4 deletes the set's volumes (down -v), as Reset does: what the restore left is gone, and so is its mark,
+    so that setup can start the set afresh."""
+    tool, composed, _ = _marked_tool(tmp_path, monkeypatch)
+    monkeypatch.setattr(dv, "flush_stdin", lambda: None)
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: True)
+    assert tool._destroy_data("dvarchcmd_vault_pg_data") is True
+    assert ["down", "-v", "--remove-orphans"] in composed and not _marker(tmp_path, "dvarchcmd").exists()
+
+
+def test_setup_whose_destroy_failed_does_not_go_on_as_if_the_data_were_gone(tmp_path, monkeypatch, capsys):
+    """down -v that failed (a volume still in use) was taken as done: setup went on to start on the data it said it
+    had destroyed. It now says so and goes back to the menu, the mark (if any) left as it was."""
+    tool, composed, _ = _marked_tool(tmp_path, monkeypatch)
+    monkeypatch.setattr(dv, "flush_stdin", lambda: None)
+    monkeypatch.setattr(dv, "confirm", lambda *a, **k: True)
+
+    class _Failed:
+        returncode = 1
+
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: composed.append(list(a)) or _Failed())
+    assert tool._destroy_data("dvarchcmd_vault_pg_data") is False
+    assert _marker(tmp_path, "dvarchcmd").exists()
+    said = _said(capsys)
+    assert "'docker compose down -v' failed (exit 1): the data was NOT destroyed" in said
+    assert "Destroyed the old data" not in said
+
+
+def test_a_restore_that_cannot_remove_its_mark_does_not_start_the_set(tmp_path, monkeypatch, capsys):
+    """The restore finished, but its mark could not be removed: every start of the set refuses while it is there, so
+    the restore says so and does not try."""
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchstuck")
+    steps = []
+    tool = _restoring_tool(tmp_path, monkeypatch, steps)
+    monkeypatch.setattr(tool, "_drop_restore_incomplete", lambda prefix: False)
+    with pytest.raises(SystemExit):
+        tool._do_restore(_restore_args(bundle))
+    assert ("start",) not in steps and [s for s in steps if s[0] == "untar"], "restored, and not started"
+    said = _said(capsys)
+    marker = _marker(tmp_path, "dvarchstuck")
+    assert "WARNING: could not remove %s, though the restore finished" % marker in said
+    assert "restored, but not started: delete %s, then start it (python dockvault.py start)." % marker in said
 
 
 def test_reset_of_a_set_removes_the_mark_its_restore_left(tmp_path, monkeypatch):

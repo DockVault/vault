@@ -2522,9 +2522,17 @@ CHAIN_KEY_LOCK = ".audit-chain-key.lock"
 # Beside .env, one for each volume set (.restore-incomplete.<VAULT_VOLUME_PREFIX>): a restore of that set has begun to
 # replace its volumes and has not finished. Written before the first volume is cleared and removed once the backup's
 # .env is installed, so it stays after a restore that stopped part way, after Ctrl-C, after a crash. While it is
-# there, start, restart, setup and update refuse to start that set, whose volumes hold part of a backup, and say
-# the way back (run the restore again, or Reset). Reset of that set removes it. It holds no secret.
+# there, nothing starts that set, whose volumes hold part of a backup: every command that would (restore_incomplete_
+# refusers) refuses before it changes anything, and says the way back (run the restore again, or Reset); the stack's
+# start and the database's own start for a check of .env refuse it too, whatever asked for them. Reset of that set
+# removes it. It holds no secret.
 RESTORE_INCOMPLETE = ".restore-incomplete."
+
+
+def restore_incomplete_refusers(what):
+    """The commands that refuse set `what` (its name in quotes, or "it") while a restore of it that began to replace
+    its volumes has not finished (RESTORE_INCOMPLETE), as the messages and the README say them."""
+    return "start, restart, setup, update, storage, logs and audit change-key refuse to start %s" % what
 
 
 def restore_incomplete_path(root, prefix):
@@ -5141,6 +5149,9 @@ class DockVault:
         # a pointless plaintext-secret file.
         if not self._guard_db_secret(env_now, interactive=interactive, env_is_fresh=not reusing):
             raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
+        # The set setup starts is the one that .env names now: pointed at another set's .env by the guard's menu, it
+        # may be a set whose restore did not finish, which the check at setup's start never saw.
+        self._refuse_incomplete_restore("setup", notes=False)
         # The interactive guard can install a different .env or author a fresh set. Re-read it,
         # persist any supported legacy profile, and refresh every profile/port value used below.
         try:
@@ -5758,7 +5769,13 @@ class DockVault:
     def _recreate_stack(self, build):
         """Recreate the stack. build=True builds the local Dockerfile (setup / from-source update);
         build=False recreates from the already-present image (the pull-update path - must NOT rebuild,
-        or it would overwrite the just-pulled release image with a local build)."""
+        or it would overwrite the just-pulled release image with a local build).
+
+        Never for a set whose restore did not finish (RESTORE_INCOMPLETE), whatever asked: every `up` of the stack
+        comes here, and each command that starts the set refuses before it changes anything, so this one is the
+        backstop (SystemExit, with nothing touched). A restore starts the set it restored only once it has removed
+        that set's marker."""
+        self._refuse_incomplete_restore(None, notes=False)
         if not self._container_logs_readable():
             return False
         if not self._remove_inactive_profile():
@@ -5805,6 +5822,15 @@ class DockVault:
         self._db_was_running = container_running(DB_CONTAINER)
         if self._db_was_running:
             return self._live_db_serves_guarded_volume()
+        # Nor is the database of a set whose restore did not finish (RESTORE_INCOMPLETE) started: its volume may hold
+        # part of a backup, or nothing (in which postgres would make a new, empty database). The check of .env then
+        # has no answer, and says why.
+        prefix = volume_prefix(self._load_env())
+        found = self._incomplete_restores()
+        if prefix in found:
+            print(self.pal.paint("  The database of set '%s' was not started to check .env: %s"
+                                 % (prefix, self._incomplete_restore_text(prefix, found[prefix])), "red"))
+            return False
         try:
             r = self._run_dc("up", "-d", DB_CONTAINER, capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError):
@@ -5964,7 +5990,8 @@ class DockVault:
                         "(~20-40s)...", "cyan"), flush=True)
         if not start_fn():
             stop_fn()
-            print(pal.paint("  The database container did not start (the docker output is above).", "yellow"))
+            print(pal.paint("  The database container did not start (Docker's output, or why it was not started, is "
+                            "above).", "yellow"))
             return "ambiguous"
         print(pal.paint("  Waiting for the database to accept connections...", "cyan"), flush=True)
         if not wait_fn():
@@ -6162,9 +6189,18 @@ class DockVault:
             print(pal.paint("  Nothing was deleted.", "yellow"))
             return False
         try:
-            self._run_dc("down", "-v", "--remove-orphans", capture=False, timeout=180)
+            r = self._run_dc("down", "-v", "--remove-orphans", capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError) as exc:
             self._fail("teardown failed: %s" % exc)
+        if getattr(r, "returncode", 1) != 0:
+            # The data may survive (a volume still in use, say): setup must not go on as if it were gone, or it would
+            # start on a volume the current .env may not open.
+            print(pal.paint("  'docker compose down -v' failed (exit %s): the data was NOT destroyed. A volume may "
+                            "still be in use; free it and try again, or pick another option."
+                            % getattr(r, "returncode", "?"), "red"))
+            return False
+        # Its volumes are gone, and with them what a restore that did not finish left in them (as Reset).
+        self._drop_restore_incomplete(volume_prefix(self._load_env()))
         print(pal.paint("  Destroyed the old data; starting fresh with the current .env.", "green"))
         return True
 
@@ -7121,8 +7157,8 @@ class DockVault:
                     except OSError:
                         pass                     # the marker written before the first clear stays
                 if changed or was_incomplete:
-                    message += (" Until set '%s' is restored, start, restart, setup and update refuse to start it (%s "
-                                "says why)." % (prefix, restore_incomplete_path(self.root, prefix)))
+                    message += (" Until set '%s' is restored, %s (%s says why)."
+                                % (prefix, restore_incomplete_refusers("it"), restore_incomplete_path(self.root, prefix)))
                 else:
                     self._drop_restore_incomplete(prefix)
                 self._fail(message)
@@ -7189,11 +7225,13 @@ class DockVault:
         except BaseException:
             self._drop_kept_env_if_unneeded(kept_env)
             raise
-        # The set is whole again: its restore-incomplete marker goes.
-        if not self._drop_restore_incomplete(prefix):
+        # The set is whole again: its restore-incomplete marker goes. One that cannot be removed keeps the set from
+        # being started, this restore's own start too (_recreate_stack): the restore says so and does not try.
+        unmarked = self._drop_restore_incomplete(prefix)
+        if not unmarked:
             print(pal.paint("  WARNING: could not remove %s, though the restore finished: delete it yourself (while it "
-                            "is there, start, restart, setup and update refuse to start set '%s')."
-                            % (restore_incomplete_path(self.root, prefix), prefix), "red"))
+                            "is there, %s)." % (restore_incomplete_path(self.root, prefix),
+                                                restore_incomplete_refusers("set '%s'" % prefix)), "red"))
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
         self._say_what_the_restore_kept(kept_env, current_prefix, prefix)
         finish = "python dockvault.py audit accept-restore"
@@ -7209,6 +7247,10 @@ class DockVault:
         # Bring the restored set back up on ITS .env and health-check, so restore leaves a RUNNING
         # deployment serving the restored state (not a stopped stack the operator must remember to
         # start, which is what let the old no-op behaviour hide).
+        if not unmarked:
+            self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
+            self._fail("restored, but not started: delete %s, then start it (python dockvault.py start)."
+                       % restore_incomplete_path(self.root, prefix))
         ok, _ = docker_available()
         if not ok:
             print(pal.paint("  Docker is not available - start the restored set later with Start.\n",
@@ -7293,19 +7335,24 @@ class DockVault:
         return ("%s. To get it back, %s. Or, to start that set afresh, delete its volumes (python dockvault.py reset, "
                 "with that set's .env). If you know its volumes are as you want them, delete %s." % (said, way, marker))
 
-    def _refuse_incomplete_restore(self, command, prefix=None):
+    def _refuse_incomplete_restore(self, command, prefix=None, notes=True, tail="Nothing was started."):
         """Stop `command`, which starts the deployment, while a restore of the set it would start (`prefix`, else the
         set .env names) began to replace its volumes and did not finish (RESTORE_INCOMPLETE): its volumes hold part of
-        a backup. Says so for every other set's too, which `command` does not start."""
+        a backup. With `notes`, says so for every other set's too, which `command` does not start. `tail` ends the
+        refusal (what the command left as it was); a `command` of None is the stack's own start (_recreate_stack),
+        whatever asked for it."""
         if prefix is None:
             prefix = volume_prefix(self._load_env())
         found = self._incomplete_restores()
-        for other, doc in found.items():
-            if other != prefix:
-                print(self.pal.paint("  Note: %s" % self._incomplete_restore_text(other, doc), "yellow"))
+        if notes:
+            for other, doc in found.items():
+                if other != prefix:
+                    print(self.pal.paint("  Note: %s" % self._incomplete_restore_text(other, doc), "yellow"))
         if prefix in found:
-            self._fail("%s would start set '%s', but %s Nothing was started."
-                       % (command, prefix, self._incomplete_restore_text(prefix, found[prefix])))
+            said = self._incomplete_restore_text(prefix, found[prefix])
+            if command is None:
+                self._fail("set '%s' is not started: %s %s" % (prefix, said, tail))
+            self._fail("%s would start set '%s', but %s %s" % (command, prefix, said, tail))
 
     def _restore_stopped_part_way(self, why, vol, replaced, touched, prefix, current_prefix, bundle,
                                   backup_changed=False, earlier_incomplete=False):
@@ -8377,6 +8424,8 @@ class DockVault:
         if not do_enable:
             print(pal.paint("  Left unchanged.\n", "yellow"))
             return
+        # Enabling recreates the stack: never that of a set whose restore did not finish.
+        self._refuse_incomplete_restore("logs", tail="Nothing was changed.")
         self._set_env_key(self._env_path(), "PLAN_LOG_PULL", "true")
         if not pepper_ok:
             self._set_env_key(self._env_path(), "LOG_TOKEN_PEPPER", gen_hex(32))
@@ -8481,6 +8530,11 @@ class DockVault:
 
         requested = getattr(args, "set_gb", None) if args else None
         interactive = not (args and getattr(args, "non_interactive", False))
+        # A new limit recreates the stack (unless --no-restart): never that of a set whose restore did not finish.
+        # Asked before anything is written, so it is refused whole.
+        if (requested is not None or interactive) and not (args and getattr(args, "no_restart", False)):
+            self._refuse_incomplete_restore("storage", tail="Nothing was changed (with --no-restart, storage writes "
+                                                            ".env only).")
 
         wanted = parse_transfer_limit(getattr(args, "set_transfers", None) if args else None)
         if wanted is None and interactive:
@@ -8794,7 +8848,8 @@ class DockVault:
         taken before .env is read, the second is refused at once, and .env is read again after the confirmation.
 
         Refused, with nothing written, while .env is sealed by `lock` (it holds every secret: a .env written now
-        would hold only the new key, and a lock after it would seal that over the real one) or is not there. The
+        would hold only the new key, and a lock after it would seal that over the real one) or is not there, and
+        while a restore of the set .env names did not finish (RESTORE_INCOMPLETE: the recreate would start it). The
         new key is on the disk, in .env, before the stack is recreated under it (_set_env_key); when it cannot be
         written, .env is put back as it was."""
         if self._is_locked():
@@ -8803,6 +8858,8 @@ class DockVault:
         if not os.path.exists(self._env_path()):
             self._fail("there is no .env in %s: run audit change-key where the deployment's .env is. Nothing "
                        "changed." % self.root)
+        # The change recreates the stack under the new key: never that of a set whose restore did not finish.
+        self._refuse_incomplete_restore("audit change-key", tail="Nothing was changed.")
         with self._chain_key_lock("audit change-key"):
             self._audit_change_key_held(args)
 

@@ -733,8 +733,13 @@ the backup's `.env` or start the stack, names the volumes it replaced so far, an
 of a backup you trust in a folder only you can write). From before it clears the first volume until
 it has installed the backup's `.env`, a restore keeps `.restore-incomplete.<prefix>` beside `.env`,
 so a restore that stopped part way, was interrupted or crashed leaves it: while it is there, start,
-restart, setup and update refuse to start that set (its volumes hold part of a backup) and say the
-way back. The next restore of that set, or Reset of it, removes it.
+restart, setup, update, storage (a new limit, unless `--no-restart`), logs (`--enable`) and audit
+change-key refuse to start that set (its volumes hold part of a backup) before they change anything,
+and say the way back. Setup also refuses when its existing-volume menu points it at such a set's
+`.env`, and neither the stack nor, for a check of `.env`, the set's database is started for anything
+else while the file is there. A restore that finishes but cannot remove the file says so and does not
+start the set. The next restore of that set, Reset of it, or setup's choice to destroy its data
+removes it.
 
 Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
 the set the host was on; `.env.<prefix>.1`, `.2`, ... after the highest copy there when one is, never
