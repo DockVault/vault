@@ -636,6 +636,8 @@ def test_list_managed_volumes_live_roundtrip():
                                 "--label", "com.dockvault.role=%s" % role,
                                 "--label", "com.dockvault.bundle=dvmanagedbundle", name],
                                check=True, capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:   # binary present but daemon down -> skip, not error
             pytest.skip("docker daemon unavailable: %s" % exc)
         recs = [r for r in dv.list_managed_volumes() if r["bundle"] == "dvmanagedbundle"]
@@ -1130,6 +1132,8 @@ def test_probe_pg_password_live_distinguishes_secrets():
                             "-e", "POSTGRES_USER=sftp_user", "-e", "POSTGRES_PASSWORD=passA_1234",
                             "-e", "POSTGRES_DB=sftp_db", "-v", "%s:/var/lib/postgresql/data" % vol,
                             "postgres:15-alpine"], check=True, capture_output=True, timeout=90)
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker daemon/image unavailable: %s" % exc)
         # Ready the way the probe connects: over the container's own address. On its first start the image
@@ -1487,6 +1491,8 @@ def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
         try:
             up_a = dc("dvvolsets-a", "up", "-d")
             up_b = dc("dvvolsets-b", "up", "-d")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         # The image is local by now, so a failure here is compose or the daemon refusing to do
@@ -1689,6 +1695,8 @@ def test_backup_restore_round_trip_live(tmp_path, monkeypatch):
                        "sh", "-c", "echo SECRET-DATA-42 > /d/marker.txt")
             if seed.returncode != 0:
                 pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         backup_dir = tmp_path / "backups"
@@ -1753,6 +1761,8 @@ def test_backup_lock_restore_round_trip_live(tmp_path, monkeypatch):
                        "sh", "-c", "echo SEALED-DATA-7 > /d/marker.txt")
             if seed.returncode != 0:
                 pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         backup_dir = tmp_path / "backups"

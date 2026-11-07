@@ -46,6 +46,8 @@ def _psql(sql, on_error="fail"):
         probe = subprocess.run(
             ["docker", "exec", container, "sh", "-c", "echo $POSTGRES_USER; echo $POSTGRES_DB"],
             capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except (OSError, subprocess.SubprocessError) as exc:
         pytest.skip(f"cannot reach the docker engine: {exc}")
     if probe.returncode != 0:

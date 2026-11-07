@@ -88,6 +88,8 @@ def test_the_older_schema_listed_is_0_33_2s():
     try:
         out = subprocess.run(["git", "show", "v0.33.2:app/core/models.py"], cwd=ROOT, capture_output=True, text=True,
                              timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"git show did not finish within {exc.timeout} s")
     except (OSError, subprocess.SubprocessError) as exc:
         pytest.skip(f"git is not available: {exc}")
     if out.returncode != 0:

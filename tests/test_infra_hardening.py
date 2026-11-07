@@ -634,6 +634,9 @@ def _compose_render_blocker():
     try:
         probe = subprocess.run(["docker", "compose", "version"],
                                capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        # Not a gap of the environment: a docker that does not answer in time.
+        pytest.fail(f"docker compose version did not finish within {exc.timeout} s")
     except Exception as exc:  # noqa: BLE001
         return f"docker compose unavailable: {exc}"
     if probe.returncode != 0:

@@ -75,6 +75,8 @@ def _db_container():
 def _docker(args, timeout=60):
     try:
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except (OSError, subprocess.SubprocessError) as exc:
         pytest.skip(f"cannot reach the docker engine: {exc}")
 

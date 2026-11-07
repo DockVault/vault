@@ -36,6 +36,8 @@ def _require_db_or_skip():
     try:
         ok = _pg_dump(timeout=30).returncode == 0
         why = ""
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail("pg_dump via `docker exec %s` did not finish within %s s" % (_DB_CONTAINER, exc.timeout))
     except Exception as exc:  # noqa: BLE001
         ok, why = False, " (%s)" % exc.__class__.__name__
     if ok:

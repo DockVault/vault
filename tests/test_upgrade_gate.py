@@ -493,6 +493,8 @@ def test_the_running_version_is_read_from_a_real_container():
     try:
         reachable = sp.run(["docker", "exec", container, "true"],
                            capture_output=True, text=True, timeout=60)
+    except sp.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except (OSError, sp.SubprocessError) as exc:
         pytest.skip(f"cannot run docker to reach {container}: {exc}")
     skip_if_container_absent(reachable, container)

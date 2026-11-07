@@ -520,10 +520,10 @@ def _backdate_deactivate_at(temp_username):
              "-c", "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
                    f"WHERE temp_username = '{temp_username}';"],
             capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        # A loaded host, not a refusal. Its neighbour _psql tolerates the same thing, and the
-        # integration job stops at the first failure, so one slow exec must not end the run.
-        return False
+    except subprocess.TimeoutExpired as exc:
+        # A database that does not answer in time is not one that is missing: skipping here passed a stack too
+        # slow or stuck to answer.
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, _DB_CONTAINER)
     assert r.returncode == 0 and "UPDATE 1" in r.stdout, (
         "did not close the validity window on exactly one credential, so the session below is "
@@ -615,6 +615,8 @@ def _psql(sql):
         return subprocess.run(
             ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
              "-c", sql], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except Exception:  # noqa: BLE001
         return None
 
