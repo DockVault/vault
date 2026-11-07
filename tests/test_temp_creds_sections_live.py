@@ -196,11 +196,14 @@ def _require_db_or_skip():
     tests must NOT vanish into a silent skip on a stack that is meant to run the live lane, or the
     HIGH they guard goes unproven and the suite reads green. So: when an explicit live-lane marker is
     set (CI), a failed probe is a hard ERROR that names the knob to fix; on an ad-hoc local run (no
-    marker) it degrades to a skip with the same message."""
+    marker) it degrades to a skip with the same message. A psql that does not answer in time is no
+    missing database: it fails, on either run."""
     try:
         ok = _psql("SELECT 1").returncode == 0
         why = ""
-    except Exception as exc:                       # docker missing, timeout, etc.
+    except _subprocess.TimeoutExpired as exc:
+        pytest.fail("psql via `docker exec %s` did not finish within %s s" % (_DB_CONTAINER, exc.timeout))
+    except Exception as exc:                       # docker missing, etc.
         ok, why = False, " (%s)" % exc.__class__.__name__
     if ok:
         return
