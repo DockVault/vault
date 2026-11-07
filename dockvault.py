@@ -2586,6 +2586,69 @@ def gateway_trust_note(trusted, gateways, current, target):
             % ((trusted or "").strip(), where))
 
 
+# From 0.34.0 the storage volume keeps a floor of free space (MIN_FREE_SPACE_GB, app/core/free_space.py): an upload, an
+# SFTP write or a copy that would leave less is refused. The automatic floor is computed here as the application
+# computes it (tests/test_upgrade_gate.py holds the two to one rule), so update can say before the upgrade whether the
+# volume already has less free than the new version keeps.
+FREE_SPACE_FLOOR_FROM = (0, 34, 0)
+FREE_SPACE_FLOOR_RULE = ("by default the larger of 2 GB and 5% of the volume, never more than half of it nor more "
+                         "than 20 GB")
+
+
+def gains_free_space_floor(current, target):
+    """Whether moving from ``current`` to ``target`` starts a version that keeps the free-space floor where the
+    running one does not (taken as so when the running version is not known)."""
+    cur, tgt = parse_semver(current), parse_semver(target)
+    return tgt is not None and tgt >= FREE_SPACE_FLOOR_FROM and (cur is None or cur < FREE_SPACE_FLOOR_FROM)
+
+
+def free_space_floor_bytes(raw, total):
+    """The free space in bytes a volume of ``total`` bytes keeps, for MIN_FREE_SPACE_GB set to ``raw`` in .env, as the
+    application reads it: 0 when it is off; unset, negative, inf or nan: the automatic floor; a value too large to be
+    bytes: 4 EiB, more than any volume."""
+    value = _finite_float(raw)
+    if value is None or value < 0:
+        return min(max(2 * GIB, int(total * 0.05)), int(total * 0.5), 20 * GIB)
+    return int(min(value * GIB, float(2 ** 62)))
+
+
+def free_space_floor_note(raw, capacity):
+    """The sentence to show before an upgrade onto the free-space floor (see gains_free_space_floor), or None.
+    ``raw`` is MIN_FREE_SPACE_GB from .env (None when absent), ``capacity`` the storage volume's (used, available,
+    total) bytes, or None when it could not be read. Said when the volume already has less free than the new version
+    keeps (it would refuse every upload, SFTP write and copy from its first start), when its free space could not be
+    read, and when the setting is not a number at all (the new version would not start). Pure."""
+    text = _unquoted(raw)
+    if text:
+        try:
+            float(text)
+        except ValueError:
+            return ("MIN_FREE_SPACE_GB=%s in .env is not a number: from 0.34.0 the server reads it, and does not "
+                    "start with it. Set a number of GB (0 turns the floor off) or remove the line before the "
+                    "upgrade." % text)
+    value = _finite_float(text)
+    if value == 0:
+        return None                                             # the floor is off
+    which = (("MIN_FREE_SPACE_GB=%s in .env" % text) if value is not None and value > 0
+             else ("MIN_FREE_SPACE_GB: %s" % FREE_SPACE_FLOOR_RULE))
+    said = ("From 0.34.0 the storage volume keeps a floor of free space (%s): an upload, an SFTP write or a copy "
+            "that would leave less is refused." % which)
+    if capacity is None:
+        return (said + " The free space of the storage volume could not be read here (is the deployment running?): "
+                "check that it has more than that free before the upgrade, or set MIN_FREE_SPACE_GB lower in .env "
+                "(0 turns it off).")
+    _used, available, total = capacity
+    if not total:
+        return None                                             # a volume that says no size is not judged
+    floor = free_space_floor_bytes(text, total)
+    if available >= floor:
+        return None
+    return (said + " This volume has %s free of %s, less than the %s it will keep, so 0.34.0 refuses every upload, "
+            "SFTP write and copy from its first start. Free some space or grow the volume first, or set "
+            "MIN_FREE_SPACE_GB lower in .env (0 turns it off)." % (format_bytes(available), format_bytes(total),
+                                                                  format_bytes(floor)))
+
+
 def backup_reason(plan, down=False):
     """Why a version change needs a backup first, or None when it does not.
 
@@ -6456,6 +6519,11 @@ class DockVault:
         gateway_note = gateway_trust_note(env.get("TRUSTED_PROXIES"), self._network_gateways(), current, tag)
         if gateway_note:
             print(pal.paint("  Note: " + gateway_note, "yellow"))
+        # The storage volume read only for an upgrade onto the free-space floor: the read execs into the container.
+        floor_note = (free_space_floor_note(env.get("MIN_FREE_SPACE_GB"), self._volume_capacity())
+                      if gains_free_space_floor(current, tag) else None)
+        if floor_note:
+            print(pal.paint("  Note: " + floor_note, "yellow"))
 
         # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
         # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version

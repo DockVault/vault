@@ -125,6 +125,12 @@ SUMMARY = {
         "pulling images keeps its old compose files, which never rotate: update the checkout, or add the logging "
         "block to each service by hand. A Docker host whose default log driver is journald or syslog refuses these "
         "options: remove the block there (README, Container logs)."),
+    "storage-volume-keeps-free-space": (
+        "From 0.34.0 the storage volume keeps free space: an upload, an SFTP write or a copy that would leave less "
+        "is refused (507). MIN_FREE_SPACE_GB sets it in GB; unset, it is the larger of 2 GB and 5% of the volume, "
+        "never more than half of it nor more than 20 GB; 0 turns it off. A volume that already has less free refuses "
+        "them all from the first start: python dockvault.py update says so before the upgrade. Free some space, grow "
+        "the volume or lower MIN_FREE_SPACE_GB in .env first."),
     "alert-names-and-addresses-cleared-after-30-days": (
         "From 0.34.0 each failed sign-in is kept in full in the security record for SECURITY_RECORD_DAYS (30 by "
         "default, 7 to 365), and security alerts lose the name and the address that raised them after the same "
@@ -229,7 +235,7 @@ BLOCKS_ROLLBACK = {"archived-audit-history-hidden", "recording-levels-changed", 
 ON_UPGRADED = {"archived-audit-history-hidden", "panel-retention-not-read", "recording-levels-changed",
                "legal-holds-block-rollback", "compliance-records-block-rollback", "older-images-refuse-newer-data"}
 # Conditions that have no query: what they say cannot be read from the database.
-WITHOUT_DETECT = ("audit-protected-minimum-365-days", "container-output-rotates",
+WITHOUT_DETECT = ("audit-protected-minimum-365-days", "container-output-rotates", "storage-volume-keeps-free-space",
                   "promotion-resets-passwords-set-by-others")
 # Every condition of 0.34.0, in the order the release commit writes them on each edge into it.
 CONDITIONS = (
@@ -237,6 +243,7 @@ CONDITIONS = (
     "audit-retention-runs-on-a-timer",
     "audit-protected-minimum-365-days",
     "container-output-rotates",
+    "storage-volume-keeps-free-space",
     "alert-names-and-addresses-cleared-after-30-days",
     "ended-invitations-and-codes-deleted-after-30-days",
     "archived-audit-history-hidden",

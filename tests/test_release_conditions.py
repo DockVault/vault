@@ -466,6 +466,27 @@ def test_the_container_output_text_says_what_the_compose_files_do():
     assert "(README, Container logs)" in text
 
 
+def test_the_free_space_text_says_what_the_floor_and_the_tool_do():
+    from app.api.api_server import _disk_full_refusal
+    from app.core import free_space
+    gib = 1024 ** 3
+    text = rc.SUMMARY["storage-volume-keeps-free-space"]
+    assert ("MIN_FREE_SPACE_GB sets it in GB; unset, it is the larger of 2 GB and 5% of the volume, never more than "
+            "half of it nor more than 20 GB; 0 turns it off.") in text
+    assert _settings_default("min_free_space_gb") == -1
+    for total, floor in ((10 * gib, 2 * gib), (100 * gib, 5 * gib), (3 * gib, 3 * gib // 2), (1024 * gib, 20 * gib)):
+        assert free_space.floor_bytes(total, configured=-1) == floor, total
+    assert free_space.floor_bytes(100 * gib, configured=0) == 0
+    assert free_space.floor_bytes(100 * gib, configured=25) == 25 * gib
+    assert "is refused (507)" in text and _disk_full_refusal("x").status_code == 507
+    spec = importlib.util.spec_from_file_location("dockvault_conditions", ROOT / "dockvault.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    assert tool.gains_free_space_floor("0.33.6", "v" + rc.INTO)
+    assert tool.free_space_floor_note(None, (98 * gib, 2 * gib, 100 * gib)) is not None
+    assert "python dockvault.py update says so before the upgrade" in text
+
+
 def test_the_security_alert_text_says_what_the_pruner_does():
     from app.core import retention
     from app.core import security_records as sr

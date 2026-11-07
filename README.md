@@ -462,6 +462,11 @@ able to do.
   address before that change, or anyone on a deployment without mail: release them with
   `python dockvault.py accounts --action release-key-hold`, or the hold ends `ZK_ENVELOPE_HOLD_DAYS` days after the
   last change. `ZK_ENVELOPE_HOLD_DAYS=0` in `.env` turns it off.
+- **Free space on the storage volume:** an upload, an SFTP write or a copy that would leave the volume less free than
+  `MIN_FREE_SPACE_GB` (unset: the larger of 2 GB and 5% of the volume, never more than half of it nor more than
+  20 GB) is refused with a 507. A volume that already has less free refuses them all from the first start, and
+  `python dockvault.py update` says so before the upgrade: free some space, grow the volume, or set
+  `MIN_FREE_SPACE_GB` lower in `.env` first (`0` turns it off).
 - **Going back:** while a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones)
   waits for its purge, a release before 0.34.0 refuses to start (from 0.33.1 on) and `dockvault.py update` refuses
   the rollback. Release the holds, wait for the purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more,
