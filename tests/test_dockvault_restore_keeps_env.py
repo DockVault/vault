@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from test_dockvault_tool import _host_digest, _tgz
+
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +46,14 @@ HERE, THERE = "dvhere", "dvthere"
 def _no_acl_changes(monkeypatch):
     """The host's ACLs of the temporary secret files are left alone (as in tests/test_dockvault_tool.py)."""
     monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
+
+
+@pytest.fixture(autouse=True)
+def _docker_sees_the_host_folder(request, monkeypatch):
+    """Docker is stubbed: the restore's look at each archive through it sees what the host sees. The test marked
+    docker keeps the real one."""
+    if request.node.get_closest_marker("docker") is None:
+        monkeypatch.setattr(dv, "archive_digest_in_docker", _host_digest, raising=False)
 
 
 def _env_bytes(prefix, **extra):
@@ -69,7 +79,7 @@ def _bundle(tmp_path, env, name="bundle", roles=("keys", "pg", "storage")):
                                    dv.gen_salt(), parsed)
     (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
     for e in entries:
-        (bundle / e["archive"]).write_bytes(b"x")
+        _tgz(bundle / e["archive"])
     return bundle
 
 
@@ -220,15 +230,15 @@ class _OsWhereTheNameIsTakenAsItIsCreated:
 @pytest.mark.parametrize("first_taken_by", ["a-folder", "a-file"])
 def test_a_name_already_there_is_passed_over_whatever_the_refusal_to_create_it_says(
         tmp_path, monkeypatch, capsys, first_taken_by):
-    """A name taken between the copy's look at it and the create (.env.<prefix> here) is passed over, as one taken
-    before (.env.<prefix>.1, a folder): on Windows, creating the copy over a folder is refused with PermissionError,
-    and the copy goes on to the next name as it does where the refusal is FileExistsError. os.open answers as on
-    Windows here, so this holds on every system the tests run on. (A refusal for a name that is free stops the
-    restore: below.)"""
+    """A name taken between the copy's look at it and the create (.env.<prefix>.2 here, the first one the copy tries,
+    after the highest one there) is passed over, as one taken before (.env.<prefix>.1, a folder): on Windows,
+    creating the copy over a folder is refused with PermissionError, and the copy goes on to the next name as it
+    does where the refusal is FileExistsError. os.open answers as on Windows here, so this holds on every system the
+    tests run on. (A refusal for a name that is free stops the restore: below.)"""
     current = _env_bytes(HERE)
     (tmp_path / ".env").write_bytes(current)
-    first = tmp_path / (".env." + HERE)
-    (tmp_path / (".env." + HERE + ".1")).mkdir()               # a folder holds the next name
+    first = tmp_path / (".env." + HERE + ".2")
+    (tmp_path / (".env." + HERE + ".1")).mkdir()               # a folder holds a name
     theirs = _env_bytes(THERE)
     bundle = _bundle(tmp_path, theirs)
     steps = []
@@ -236,7 +246,7 @@ def test_a_name_already_there_is_passed_over_whatever_the_refusal_to_create_it_s
     monkeypatch.setattr(dv, "os", _OsWhereTheNameIsTakenAsItIsCreated(first.name, first_taken_by))
     _restore(tool, bundle)
 
-    kept = tmp_path / (".env." + HERE + ".2")
+    kept = tmp_path / (".env." + HERE + ".3")
     assert kept.read_bytes() == current
     assert (tmp_path / ".env").read_bytes() == theirs
     if first_taken_by == "a-folder":
@@ -691,13 +701,16 @@ def test_the_volumes_of_the_set_the_host_was_on_open_again_from_the_kept_env(tmp
         monkeypatch.setattr(tool, "_start_db_only", lambda: (_start_pg(pg, names_a["pg"]), True)[1])
         monkeypatch.setattr(tool, "_wait_db_ready", lambda *a, **k: True)
         monkeypatch.setattr(tool, "_stop_db_only", lambda: _stop_pg(pg))
-        real_probe = dv.probe_pg_password
+        real_probe, real_key_check = dv.probe_pg_password, dv.read_key_canary
 
         def probe(_container, user, db, password, **k):
             checked.append(password)
             return real_probe(pg, user, db, password)
 
         monkeypatch.setattr(dv, "probe_pg_password", probe)
+        # The key check is read from the same database: this test's own, never a vault-db the host may run.
+        monkeypatch.setattr(dv, "read_key_canary",
+                            lambda _container, user, db, password, **k: real_key_check(pg, user, db, password))
         tool.volumes(args)
         assert checked == [pw_a], "the tool's own check opened A's database with the kept .env's password"
         assert (tmp_path / ".env").read_bytes() == env_a

@@ -362,9 +362,17 @@ the recipients' mailboxes.
   the `audit` menu too).
 - **Backups** made with `python dockvault.py`: every data volume and the `.env`, so everything above, and,
   while a change of the chain's key is not finished, the old key kept beside `.env` (sealed with `.env`
-  under `--lock`), which a restore puts back.
+  under `--lock`), which a restore puts back. Its `manifest.json` records each archive's SHA-256 and size
+  (and, under `--lock`, `manifest.json.mac` an HMAC of the manifest under the sealing key): no personal data.
   Keep and expire them under your own policy; a backup made before an erasure still holds what was
-  erased.
+  erased. While a restore is replacing a set's volumes, `.restore-incomplete.<VAULT_VOLUME_PREFIX>` beside
+  `.env` names the backup folder, the time and the volumes changed so far (no personal data); the restore
+  removes it when it has finished, and Reset of that set (or setup's choice to destroy its data) does too.
+- **One-time secrets** `python dockvault.py` shows (a generated admin password, a recovery key, a password
+  reset link) go to the controlling terminal. With no terminal (cloud-init, a CI job), and on Windows always
+  (a console may have no window), each is written to a file of its own, mode 600, under `secrets/` in the
+  DockVault folder of the user's application data (beside the default backups): the tool never deletes it.
+  Read it, keep the secret, then delete the file.
 - **`python dockvault.py accounts`** on the host: the server's operator can look an account up (its
   email and last sign-in are printed on the host's terminal, and the lookup is not audited, since the
   operator can read the database anyway) and change it (audited as the host operator). **New in

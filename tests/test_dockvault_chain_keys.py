@@ -1,7 +1,7 @@
 """The audit chain's keys and head record on the host (dockvault.py, the shipped compose files), offline:
 
-- a backup archives the keys volume (the head record) before the database, and pauses the database while its
-  volume is copied, resuming it whatever happens;
+- a backup archives the keys volume (the head record) before the database, and pauses the running deployment
+  (the app and the database) while the volumes are copied, resuming it whatever happens;
 - a restore puts the keys volume back first, whatever order the bundle lists, and writes the restore mark
   right after it, before any other volume, holding the head record it replaced and the one it restored;
 - an update to a release with the chain offers AUDIT_CHAIN_KEY (yes by default; --no-chain-key declines);
@@ -20,12 +20,13 @@
 Docker is stubbed throughout."""
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 import dockvault as dv
-from test_dockvault_tool import _reusable_env_cfg, _write_bundle
+from test_dockvault_tool import _host_digest, _reusable_env_cfg, _tgz, _write_bundle
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +36,20 @@ def _env_file(tmp_path, **cfg):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(dict(_reusable_env_cfg(), **cfg))) + "\n",
                                    encoding="utf-8")
     return dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+
+
+@pytest.fixture(autouse=True)
+def _docker_sees_the_host_folder(monkeypatch):
+    """The restore's look at each archive through Docker sees what the host sees (Docker is stubbed here)."""
+    monkeypatch.setattr(dv, "archive_digest_in_docker", _host_digest, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _app_data_under_the_test(tmp_path, monkeypatch):
+    """A recovery key shown with no terminal goes to a file in the user's DockVault application-data folder: under
+    this test's own folder here, never the home of whoever runs the tests."""
+    for name in ("XDG_DATA_HOME", "LOCALAPPDATA", "APPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / "app-data"))
 
 
 def _kept(tmp_path, prefix=dv.DEFAULT_PROJECT):
@@ -49,31 +64,129 @@ class _Result:
         self.stderr = ""
 
 
-def test_a_backup_archives_the_keys_volume_first_and_pauses_the_database_around_its_copy(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout", ["combined", "split"])
+def test_a_backup_archives_the_keys_volume_first_with_the_deployment_paused_around_every_copy(tmp_path, monkeypatch,
+                                                                                              layout):
+    """The storage volume is archived after the database: with the app running between the two, a file it deleted
+    meanwhile would be a restored row without its file. So the app (in either layout) and the database are paused
+    before the first archive and resumed after the last, and only those that run."""
     env = _env_file(tmp_path, volume_prefix="dockvault-vault-k1", deployment_id="k1")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     order = []
+    running = {"vault", "vault-db", "vault-redis"} if layout == "combined" else {"vault-api", "vault-sftp", "vault-db"}
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
-    monkeypatch.setattr(dv, "container_running", lambda name, **k: True)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, *a, **k: order.append(vol.rsplit("_vault_", 1)[1]) or True)
-    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: order.append(" ".join(a[:2])) or _Result())
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in running)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: order.append(vol.rsplit("_vault_", 1)[1])
+                        or _tgz(Path(bundle) / archive) and True)
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: order.append(" ".join(a)) or _Result())
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
-    assert order == ["keys", "pause vault-db", "pg_data", "unpause vault-db", "storage"]
+    app = ["vault"] if layout == "combined" else ["vault-api", "vault-sftp"]
+    paused = app + ["vault-db"]
+    assert order == ["pause %s" % s for s in paused] + ["keys", "pg_data", "storage", "unpause " + " ".join(paused)]
     man = json.loads(next((tmp_path / "backups").glob("dockvault-*/manifest.json")).read_text(encoding="utf-8"))
     assert [e["role"] for e in man["volumes"]] == ["keys", "pg", "storage"]
 
 
-def test_the_database_is_resumed_when_its_copy_fails(tmp_path, monkeypatch):
+def test_the_deployment_is_resumed_when_a_copy_fails(tmp_path, monkeypatch):
     env = _env_file(tmp_path, volume_prefix="dockvault-vault-k2", deployment_id="k2")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     calls = []
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: True)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, *a, **k: not vol.endswith("_vault_pg_data"))
-    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a[0]) or _Result())
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: not vol.endswith("_vault_pg_data")
+                        and _tgz(Path(bundle) / archive) and True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(" ".join(a)) or _Result())
     with pytest.raises(SystemExit):
         tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
-    assert calls == ["pause", "unpause"]
+    assert calls == ["pause vault", "pause vault-db", "unpause vault vault-db"]
+
+
+def test_a_deployment_that_cannot_be_paused_is_not_archived_and_what_paused_is_resumed(tmp_path, monkeypatch, capsys):
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-k4", deployment_id="k4")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: pytest.fail("a volume was archived while the app ran"))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(" ".join(a)) or _Result(
+        1 if " ".join(a) == "pause vault-db" else 0))
+    monkeypatch.setattr(dv, "container_paused", lambda name, **k: False)    # Docker refused it: it runs
+    with pytest.raises(SystemExit):
+        tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    # A pause that did not answer 0 may have been taken all the same (its docker ended by a signal): it is resumed on
+    # its own, which Docker refuses for a container that never paused.
+    assert calls == ["pause vault", "pause vault-db", "unpause vault", "unpause vault-db"]
+    assert not list((tmp_path / "backups").iterdir())
+    said = " ".join(capsys.readouterr().out.split())
+    assert "could not pause vault-db for the backup" in said
+    assert "could not be resumed" not in said
+
+
+@pytest.mark.parametrize("left_paused", [("vault-db",), ("vault", "vault-db")], ids=["the-database", "both"])
+def test_a_container_paused_before_the_backup_is_archived_as_it_is_and_left_paused(tmp_path, monkeypatch, capsys,
+                                                                                   left_paused):
+    """Docker says a paused container runs. The backup took one the operator had paused (or a killed backup had left
+    so) for a running one: its pause was refused ("already paused"), the backup stopped with nothing archived, and
+    the resume then unpaused the operator's container. It writes nothing while paused: it is archived as it is, and
+    neither paused nor resumed by the backup."""
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-k5", deployment_id="k5")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls, archived = [], []
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(dv, "container_paused", lambda name, **k: name in left_paused)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: archived.append(vol)
+                        or _tgz(Path(bundle) / archive) and True)
+    # As Docker answers: a container that is paused already cannot be paused again.
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(" ".join(a)) or _Result(
+        1 if a[0] == "pause" and a[1] in left_paused else 0))
+    tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    assert len(archived) == 3, "every volume was archived"
+    assert not [c for c in calls if set(c.split()[1:]) & set(left_paused)], "a container paused before is left so"
+    assert calls == ([] if "vault" in left_paused else ["pause vault", "unpause vault"])
+    said = " ".join(capsys.readouterr().out.split())
+    assert ("%s %s paused already: archived as" % (", ".join(left_paused), "is" if len(left_paused) == 1 else "are")
+            in said) and "and left paused (docker unpause %s resumes" % " ".join(left_paused) in said
+
+
+def _docker_refuses(a):
+    result = _Result(1)
+    result.stderr = "Error response from daemon:\n  cannot pause container: the engine cannot freeze it\n"
+    return result
+
+
+def _docker_does_not_answer(a):
+    raise subprocess.TimeoutExpired(["docker", "compose"] + list(a), 60)
+
+
+def _docker_cannot_run(a):
+    raise FileNotFoundError(2, "No such file or directory", "docker")
+
+
+@pytest.mark.parametrize("pause_db, docker_said", [
+    (_docker_refuses, "(docker: Error response from daemon: cannot pause container: the engine cannot freeze it)"),
+    (_docker_does_not_answer, "(docker: it did not answer within 60 seconds)"),
+    (_docker_cannot_run, "(docker: it could not be run: [Errno 2] No such file or directory: 'docker')"),
+], ids=["refused", "no-answer", "could-not-run"])
+def test_a_pause_docker_would_not_take_says_why_and_how_to_back_up_without_one(tmp_path, monkeypatch, capsys,
+                                                                                pause_db, docker_said):
+    """Docker's own reason, and the way through that needs no pause: a deployment that is not running is archived as
+    it is (test_a_stopped_database_is_copied_without_a_pause)."""
+    env = _env_file(tmp_path, volume_prefix="dockvault-vault-k5", deployment_id="k5")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name in ("vault", "vault-db"))
+    monkeypatch.setattr(dv, "container_paused", lambda name, **k: False)
+    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: pytest.fail("a volume was archived while the app ran"))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: pause_db(a) if " ".join(a) == "pause vault-db" else _Result())
+    with pytest.raises(SystemExit):
+        tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    said = " ".join(capsys.readouterr().out.split())
+    assert "could not pause vault-db for the backup %s" % docker_said in said
+    assert ("A deployment that is not running is archived as it is: stop it (python dockvault.py stop), back it up "
+            "(python dockvault.py backup --action backup) and start it again (python dockvault.py start). An update "
+            "then goes on with --backup-verified") in said
 
 
 def test_a_stopped_database_is_copied_without_a_pause(tmp_path, monkeypatch):
@@ -82,7 +195,7 @@ def test_a_stopped_database_is_copied_without_a_pause(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
-    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: calls.append(a[0]) or _Result())
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
     assert calls == []
@@ -100,7 +213,7 @@ def _restore(tmp_path, monkeypatch, entries, head_file=None):
         man = dv.build_backup_manifest("dockvault-vault-rk", "rk", entries, dv.gen_salt(), man_env)
         (bundle / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
     for e in entries:
-        (bundle / e["archive"]).write_bytes(b"x")
+        _tgz(bundle / e["archive"])
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     order = []
@@ -624,8 +737,7 @@ def _backing_up(tmp_path, monkeypatch, env, **args):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: (Path(bundle) / archive).write_bytes(b"x")
-                        or True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups"), **args))
     return next((tmp_path / "backups").iterdir())
 
@@ -672,7 +784,7 @@ def test_a_backup_whose_kept_file_holds_no_key_is_refused_and_removed(tmp_path, 
     assert "holds none" in capsys.readouterr().out
 
 
-def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, interactive=False):
+def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, interactive=False, on_env=None):
     """A restore of a bundle carrying the old key `carried` (or none), its env sealed or not, onto a host whose own
     kept file holds `here` (or none). Returns (the steps, in order, and whether the kept file was there when .env
     was installed)."""
@@ -681,7 +793,7 @@ def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, 
                {"role": "pg", "name": "x", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="bundle-rc")
     for e in entries:
-        (bundle / e["archive"]).write_bytes(b"x")
+        _tgz(bundle / e["archive"])
     if carried is not None:
         (bundle / "audit-chain-key.previous").write_text(carried + "\n", encoding="utf-8")
     passfile = tmp_path / "pass.txt"
@@ -702,8 +814,14 @@ def _restoring(tmp_path, monkeypatch, *, carried=None, sealed=False, here=None, 
     monkeypatch.setattr(dv, "clear_volume", lambda vol, **k: True)
     monkeypatch.setattr(dv, "untar_volume", lambda vol, *a, **k: steps.append("untar") or True)
     monkeypatch.setattr(dv, "write_volume_file", lambda *a, **k: steps.append("mark") or True)
-    monkeypatch.setattr(dv, "_copy_secret", lambda *a, **k: steps.append(("env", kept.exists())))
-    monkeypatch.setattr(tool, "_atomic_write_secret", lambda *a, **k: steps.append(("env", kept.exists())))
+    def install_env(*_a, **_k):
+        # The backup's .env being installed: whether the kept old key was there then, and (`on_env`) what else was.
+        steps.append(("env", kept.exists()))
+        if on_env is not None:
+            steps.append(("host set's .env kept", on_env()))
+
+    monkeypatch.setattr(dv, "_copy_secret", install_env)
+    monkeypatch.setattr(tool, "_atomic_write_secret", install_env)
     monkeypatch.setattr(dv, "tighten_secret_file", lambda *a, **k: True)
     monkeypatch.setattr(dv, "ask", lambda *a, **k: "dockvault-vault-rc")
     monkeypatch.setattr(tool, "_stop_stack", lambda: steps.append("stop"))
@@ -827,8 +945,7 @@ def test_each_volume_set_keeps_its_old_key_in_a_file_of_its_own_through_a_change
 
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: True)
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
-    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: (Path(bundle) / archive).write_bytes(b"x")
-                        or True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
     bundle = next((tmp_path / "backups").iterdir())
     assert not [p for p in bundle.iterdir() if p.name.startswith("audit-chain-key")]
@@ -858,12 +975,17 @@ def test_a_restore_of_another_sets_backup_puts_its_key_in_that_sets_file_and_lea
         tmp_path, monkeypatch):
     """The host's own set has an unfinished key change; a backup of another set carries the key of its own: the
     restore is not refused for a key that is not its set's, writes the carried key into its set's file, and leaves the
-    host set's file as it was."""
+    host set's file as it was. The host set's .env (the only key to its volumes, and to the chain its kept key belongs
+    to) is kept, byte for byte, before the backup's .env is installed."""
     mine = dv.gen_hex(32)
     _kept(tmp_path).write_text(mine + "\n", encoding="utf-8")
     carried = dv.gen_hex(32)
-    steps = _restoring(tmp_path, monkeypatch, carried=carried)
+    host_env = tmp_path / (".env." + dv.DEFAULT_PROJECT)
+    steps = _restoring(tmp_path, monkeypatch, carried=carried,
+                       on_env=lambda: host_env.exists() and host_env.read_text(encoding="utf-8") == "x=1\n")
     assert ("env", True) in steps
+    assert ("host set's .env kept", True) in steps, "the host set's .env was kept before the backup's was installed"
+    assert host_env.read_text(encoding="utf-8") == "x=1\n"
     assert _kept(tmp_path, "dockvault-vault-rc").read_text(encoding="utf-8") == carried + "\n"
     assert _kept(tmp_path).read_text(encoding="utf-8") == mine + "\n"
 

@@ -245,6 +245,8 @@ import hashlib  # noqa: E402
 import json     # noqa: E402
 import math     # noqa: E402
 import re       # noqa: E402
+import shlex    # noqa: E402
+import signal   # noqa: E402
 import tempfile # noqa: E402
 
 # The three secrets the compose file demands (an existing .env must carry these to be reusable).
@@ -863,8 +865,10 @@ def write_env(path, lines):
 def sync_to_disk(path):
     """Force a file just written, and its name in its directory, to the disk (the standard library's fsync, as the
     app's durable writes do), so a power cut right after cannot lose it. Windows, and a filesystem that cannot sync
-    a directory (EINVAL, EBADF), skip the directory; any other error (EIO) raises OSError."""
-    fd = os.open(path, os.O_RDONLY)
+    a directory (EINVAL, EBADF), skip the directory; any other error (EIO) raises OSError. On Windows the file is
+    opened for writing (nothing is written): fsync there flushes through a handle that may write, and refuses one
+    opened read-only (EBADF)."""
+    fd = os.open(path, (os.O_RDWR | getattr(os, "O_BINARY", 0)) if os.name == "nt" else os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
@@ -925,17 +929,48 @@ def replace_file_durably(path, data):
     sync_directory(directory)
 
 
+def windows_system_tool(name):
+    """The full path of a Windows tool in System32 (whoami.exe, icacls.exe). Each is run by that path, never by its
+    bare name: Windows looks a bare name up in the folder of the program that starts it and in the current folder
+    before System32, so a file of that name in the folder the tool is run from would run instead."""
+    return os.path.join(os.environ.get("SystemRoot") or "C:\\Windows", "System32", name)
+
+
+def windows_user_grantee():
+    """Windows: how icacls is to name the account this process runs as. Its SID (`*S-1-...`, from whoami /user),
+    which names that one account; else DOMAIN\\user from the environment; else the bare user name; else None. A
+    bare name is looked up among this computer's own accounts first, so a domain user who has a same-named local
+    account would grant that one, and a run as SYSTEM has the computer's account in USERNAME (COMPUTER$)."""
+    import csv
+    whoami = windows_system_tool("whoami.exe")
+    try:
+        r = subprocess.run([whoami, "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
+        lines = (getattr(r, "stdout", "") or "").strip().splitlines() if getattr(r, "returncode", 1) == 0 else []
+        fields = next(csv.reader([lines[-1]])) if lines else []
+    except (OSError, ValueError, subprocess.SubprocessError, csv.Error, StopIteration):
+        fields = []
+    sid = fields[-1].strip() if fields else ""
+    if re.match(r"^S-1-[0-9]+(-[0-9]+)+$", sid):
+        return "*" + sid
+    user = os.environ.get("USERNAME") or ""
+    domain = os.environ.get("USERDOMAIN") or ""
+    if user and domain:
+        return "%s\\%s" % (domain, user)
+    return user or None
+
+
 def tighten_secret_file(path):
     """Restrict a secrets file to the current user - chmod 600 on POSIX, icacls on Windows. Returns
     True ONLY if the tightening actually succeeded, so a caller never falsely reports a secrets file
     (which holds ENCRYPTION_KEY) as locked down when it isn't."""
     try:
         if os.name == "nt":
-            user = os.environ.get("USERNAME") or ""
+            user = windows_user_grantee()
             if not user:
                 return False  # can't form a valid icacls grant without a user name
             r = subprocess.run(
-                ["icacls", path, "/inheritance:r", "/grant:r", "%s:(R,W)" % user,
+                [windows_system_tool("icacls.exe"), path, "/inheritance:r", "/grant:r", "%s:(R,W)" % user,
                  "BUILTIN\\Administrators:(F)", "NT AUTHORITY\\SYSTEM:(F)"],
                 capture_output=True, text=True, timeout=15)
             return r.returncode == 0
@@ -943,6 +978,23 @@ def tighten_secret_file(path):
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def restrict_folder_to_owner(path):
+    """Windows: restrict a folder to the current user (by SID: windows_user_grantee), SYSTEM and Administrators
+    (inheritance from where it was made removed), so that what is written inside inherits that and nothing wider.
+    True ONLY when icacls did it."""
+    user = windows_user_grantee()
+    if not user:
+        return False          # can't form a valid icacls grant without a user name
+    try:
+        r = subprocess.run(
+            [windows_system_tool("icacls.exe"), path, "/inheritance:r", "/grant:r", "%s:(OI)(CI)F" % user,
+             "BUILTIN\\Administrators:(OI)(CI)F", "NT AUTHORITY\\SYSTEM:(OI)(CI)F"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
 
 
 def _copy_secret(src, dst):
@@ -1075,53 +1127,175 @@ def install_byo_cert(cert_dir, cert_path, key_path, run=subprocess.run):
     return True, "installed the bring-your-own certificate" + caveat
 
 
-def render_renewal_hook(app_dir, cert_dir, server_name, service):
-    """The certbot deploy-hook script text: on renewal, stage the new fullchain/privkey, preserve
-    the live key's owner+mode, VALIDATE the new pair, atomically swap them into cert_dir, then
-    restart the app service so uvicorn reloads. Pure text (POSIX-only; mirrors setup-secure.sh)."""
+RENEWAL_HOOK = "/etc/letsencrypt/renewal-hooks/deploy/dockvault-vault.sh"
+
+
+def renewal_hook_platform_ok():
+    """True on Linux, where the renewal hook runs as written: its `stat -c` and `mv -T` are GNU coreutils' (or
+    BusyBox's). macOS and the BSDs have neither, so there every renewal would stop before it deployed the certificate:
+    Let's Encrypt automation is refused there, and Windows has no certbot hooks at all."""
+    return sys.platform.startswith("linux")
+
+
+def render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=None, owners=(0, APP_UID)):
+    """The certbot deploy-hook script text, which certbot runs as root, unattended, at each renewal: stage the new
+    fullchain/privkey, VALIDATE the pair, swap it into cert_dir keeping the live key's owner and mode, then restart
+    the web container so uvicorn reloads.
+
+    It trusts nothing a less trusted account could change. It reads no file of the checkout (`app_dir`, which may
+    belong to another account): no compose file, no .env, and it restarts the container by its fixed name. It works
+    in the certificate folder only once it has entered it and found it to be the very folder setup made (its
+    physical path, so not a link put in its place), owned by root or by the container's app user (`owners`), and
+    writable by nobody else; then nobody else can put a name in it. It stages in a fresh folder of its own there,
+    and its changes of owner and mode follow no link (chown -h, files it just made), its moves replace names
+    (mv -T). Anything else stops it before it changes anything. Pure text, for Linux (bash, and the stat -c and
+    mv -T of GNU coreutils or BusyBox; renewal_hook_platform_ok)."""
+    q = shlex.quote
+    real = os.path.realpath(cert_dir)
+    live = live_dir or "/etc/letsencrypt/live/%s" % server_name
+    allowed = " ".join(str(int(o)) for o in sorted(set(owners)))
+    stop = 'echo "dockvault renewal: %s; nothing was renewed" >&2; exit 1'
     return "\n".join([
         "#!/bin/bash",
         "# Written by dockvault.py - deploys a renewed Let's Encrypt cert into the vault stack and",
-        "# restarts the API so uvicorn picks it up.",
-        "set -e",
-        'CD="%s"' % cert_dir,
-        'install -m 644 "/etc/letsencrypt/live/%s/fullchain.pem" "$CD/.new-cert.pem"' % server_name,
-        'install -m 600 "/etc/letsencrypt/live/%s/privkey.pem"   "$CD/.new-key.pem"' % server_name,
-        '_own="$(stat -c \'%u:%g\' "$CD/key.pem" 2>/dev/null || echo 0:0)"',
-        '_mode="$(stat -c \'%a\' "$CD/key.pem" 2>/dev/null || echo 644)"',
-        'chown "$_own" "$CD/.new-key.pem" "$CD/.new-cert.pem" 2>/dev/null || true',
-        'chmod "$_mode" "$CD/.new-key.pem" 2>/dev/null || chmod 644 "$CD/.new-key.pem"',
-        'chmod 644 "$CD/.new-cert.pem"',
-        '_c="$(openssl x509 -in "$CD/.new-cert.pem" -pubkey -noout)"',
-        '_k="$(openssl pkey -in "$CD/.new-key.pem" -pubout)"',
-        '[ -n "$_c" ] && [ "$_c" = "$_k" ]  # non-empty so a missing openssl fails (never swaps unvalidated)',
-        'mv "$CD/.new-key.pem"  "$CD/key.pem"',
-        'mv "$CD/.new-cert.pem" "$CD/cert.pem"',
-        'cd "%s" && docker compose --env-file "%s/.env" -f "%s/docker-compose.secure.yml" restart %s'
-        % (app_dir, app_dir, app_dir, service),
+        "# restarts the web container so uvicorn picks it up. It reads nothing from the checkout.",
+        "set -eu",
+        "LIVE=%s" % q(live),
+        "CD=%s" % q(real),
+        'cd -P -- "$CD" || { %s; }' % (stop % "cannot enter the certificate folder"),
+        '[ "$(pwd -P)" = "$CD" ] || { %s; }' % (stop % "the certificate folder is not the one setup made"),
+        "_o=\"$(stat -c '%u' .)\"",
+        "_m=\"$(stat -c '%a' .)\"",
+        'case " %s " in *" $_o "*) ;; *) %s;; esac' % (allowed, stop % "the certificate folder is not owned by "
+                                                                       "root or the app user"),
+        '[ $(( 0$_m & 022 )) -eq 0 ] || { %s; }' % (stop % "the certificate folder is writable by others"),
+        'T="$(mktemp -d .renew.XXXXXX)"',
+        "trap 'rm -rf -- \"$T\"' EXIT",
+        'install -m 600 "$LIVE/fullchain.pem" "$T/cert.pem"',
+        'install -m 600 "$LIVE/privkey.pem" "$T/key.pem"',
+        "_own=\"$(stat -c '%u:%g' key.pem 2>/dev/null || echo 0:0)\"",
+        "_mode=\"$(stat -c '%a' key.pem 2>/dev/null || echo 600)\"",
+        'chown -h "$_own" "$T/key.pem" "$T/cert.pem"',
+        'chmod "$_mode" "$T/key.pem"',
+        'chmod 644 "$T/cert.pem"',
+        '_c="$(openssl x509 -in "$T/cert.pem" -pubkey -noout)"',
+        '_k="$(openssl pkey -in "$T/key.pem" -pubout)"',
+        # Under set -e a failure in an && list stops nothing unless it is the list's last command: an empty "$_c"
+        # (an openssl that printed nothing) would have let the swap go on. The list's outcome stops it here.
+        '[ -n "$_c" ] && [ "$_c" = "$_k" ] || { %s; }' % (stop % "the renewed certificate and key are not a pair, "
+                                                                "or openssl could not read them"),
+        'mv -fT "$T/key.pem" key.pem',
+        'mv -fT "$T/cert.pem" cert.pem',
+        "docker restart %s" % q(service),
         "",
     ])
 
 
-def install_renewal_hook(app_dir, cert_dir, server_name, service):
-    """Write the certbot deploy hook (POSIX). Returns True on success."""
-    hook = "/etc/letsencrypt/renewal-hooks/deploy/dockvault-vault.sh"
+def install_renewal_hook(app_dir, cert_dir, server_name, service, owners=(0, APP_UID), hook=RENEWAL_HOOK,
+                         live_dir=None):
+    """Write the certbot deploy hook (POSIX), root's, 755: written whole beside its name and moved over it, so the
+    name is never written through (a link there is replaced, not followed). Returns True on success."""
+    tmp = None
     try:
         os.makedirs(os.path.dirname(hook), exist_ok=True)
-        with open(hook, "w", encoding="utf-8", newline="\n") as f:
-            f.write(render_renewal_hook(app_dir, cert_dir, server_name, service))
-        os.chmod(hook, 0o755)
+        fd, tmp = tempfile.mkstemp(prefix=".dockvault-hook-", dir=os.path.dirname(hook))
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(render_renewal_hook(app_dir, cert_dir, server_name, service, live_dir=live_dir, owners=owners))
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, hook)
+        tmp = None
         return True
     except Exception:  # noqa: BLE001
         return False
+    finally:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def renewal_hook_targets(text):
+    """(the certificate folder, the Let's Encrypt live folder) that a renewal hook this tool wrote names, in any of
+    its versions (`CD=` and `LIVE=` lines, or the live folder in the install lines of the first one), or None when
+    the text names either not, or not once."""
+    found = {}
+    for line in text.splitlines():
+        line = line.strip()
+        for name in ("CD", "LIVE"):
+            if line.startswith(name + "="):
+                try:
+                    words = shlex.split(line[len(name) + 1:])
+                except ValueError:
+                    return None
+                if len(words) != 1 or name in found:
+                    return None
+                found[name] = words[0]
+    if "LIVE" not in found:
+        lives = set(re.findall(r'/etc/letsencrypt/live/([^/"\'\s]+)/(?:fullchain|privkey)\.pem', text))
+        if len(lives) == 1:
+            found["LIVE"] = "/etc/letsencrypt/live/" + lives.pop()
+    if not found.get("CD") or not found.get("LIVE"):
+        return None
+    return found["CD"], found["LIVE"]
+
+
+def refresh_renewal_hook(app_dir, cert_dir, service, owners=None, hook=RENEWAL_HOOK, is_root=None):
+    """A setup re-run keeps the certificate it finds, so it never writes the Let's Encrypt renewal hook: an upgraded
+    deployment kept the hook an earlier version wrote, which runs docker compose as root with the checkout's files.
+    This brings this deployment's hook (the one that names its certificate folder) to the text install_renewal_hook
+    writes now, keeping the live folder it renews from. Returns (outcome, a message or None), the outcome one of:
+    "none" (no hook, or another deployment's: nothing to do), "unsupported" (not Linux: left as it is), "current",
+    "rewritten", "not-root" (only root may write it: left as it is), "unreadable" (it could not be read, or names no
+    certificate folder and live folder: left as it is) and "failed" (it could not be written). `owners`: the owners
+    the hook accepts for the
+    certificate folder, as obtain_letsencrypt_cert gives them (root, the app's uid, the uid a remapping engine maps
+    it to) when None."""
+    if not os.path.lexists(hook):
+        return "none", None
+    if not renewal_hook_platform_ok():
+        return "unsupported", ("the Let's Encrypt renewal hook %s was left as it is: this version writes it on Linux "
+                               "only (it needs the stat -c and mv -T of GNU coreutils or BusyBox)" % hook)
+    try:
+        with open(hook, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, ValueError) as exc:
+        return "unreadable", ("could not read the Let's Encrypt renewal hook %s (%s), so it was left as it is"
+                              % (hook, exc))
+    targets = renewal_hook_targets(text)
+    if targets is None:
+        return "unreadable", ("the Let's Encrypt renewal hook %s names no certificate folder and live folder this "
+                              "tool can read, so it was left as it is" % hook)
+    named, live = targets
+    if os.path.realpath(named) != os.path.realpath(cert_dir):
+        return "none", None
+    if owners is None:
+        mapped = _remapped_cert_owner()
+        owners = (0, APP_UID) + ((mapped,) if mapped is not None else ())
+    if text == render_renewal_hook(app_dir, cert_dir, os.path.basename(live), service, live_dir=live, owners=owners):
+        return "current", None
+    if is_root is None:
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if not is_root:
+        why = ("it was written by an earlier version, and at each renewal it runs, as root, what this checkout's "
+               "compose file and .env say" if "docker compose" in text else "it was written for other settings")
+        return "not-root", ("the Let's Encrypt renewal hook %s is not the one this version writes: %s. Run setup "
+                            "again as root (sudo python3 dockvault.py setup) to replace it" % (hook, why))
+    if not install_renewal_hook(app_dir, cert_dir, os.path.basename(live), service, owners=owners, hook=hook,
+                                live_dir=live):
+        return "failed", "could not rewrite the Let's Encrypt renewal hook %s; it was left as it was" % hook
+    return "rewritten", ("rewrote the Let's Encrypt renewal hook %s: it reads nothing of the checkout and restarts "
+                         "the %s container by name" % (hook, service))
 
 
 def obtain_letsencrypt_cert(cert_dir, server_name, email, app_dir, service, run=subprocess.run):
     """Obtain a Let's Encrypt cert via certbot standalone (http-01, binds port 80), install it, and
     write the auto-renewal deploy hook. POSIX-only (needs certbot + root + a public DNS name reachable
     on port 80). Returns (ok, message)."""
-    if os.name == "nt":
-        return False, "Let's Encrypt automation is Linux-only here; use --cert-mode byo on Windows."
+    if not renewal_hook_platform_ok():
+        return False, ("Let's Encrypt automation is Linux-only here (the renewal hook needs the stat -c and mv -T of "
+                       "GNU coreutils or BusyBox, which this system does not have): use --cert-mode byo with a "
+                       "certificate you renew yourself, or self-signed")
     if is_ipv4(server_name):
         return False, "Let's Encrypt cannot issue for a bare IP - use a DNS name, or self-signed."
     if shutil.which("certbot") is None:
@@ -1137,7 +1311,11 @@ def obtain_letsencrypt_cert(cert_dir, server_name, email, app_dir, service, run=
     ok, msg = install_byo_cert(cert_dir, live + "/fullchain.pem", live + "/privkey.pem", run=run)
     if not ok:
         return False, msg
-    install_renewal_hook(app_dir, cert_dir, server_name, service)
+    # The owners the hook accepts for the certificate folder: root, and whom apply_cert_owner hands it to (the app's
+    # uid, or the host uid it maps to on a userns-remap engine).
+    mapped = _remapped_cert_owner(run)
+    install_renewal_hook(app_dir, cert_dir, server_name, service,
+                         owners=(0, APP_UID) + ((mapped,) if mapped is not None else ()))
     return True, "obtained a Let's Encrypt certificate + installed the auto-renewal hook"
 
 
@@ -1247,10 +1425,11 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
     """Make cert_dir/{cert,key}.pem readable by the in-container app user through the read-only bind
     mount. On a plain rootful engine, chown to APP_UID (10001) keeping the key mode 600.
     On a userns-remap engine, chown to the MAPPED host uid (resolved from /etc/subuid), keeping 600.
-    On a ROOTLESS engine (or when the mapped uid can't be resolved), the container's uid is a
-    subordinate host uid we cannot target, so fall back to a world-readable key (644, single-tenant
-    host) so the container CAN read it - matching setup-secure.sh, and NEVER falsely reporting a
-    mode-600 key when it would be unreadable. Returns (mode600, message)."""
+    When the host cannot chown (setup not run as root, a ROOTLESS engine, a mapped uid that can't be
+    resolved), a throwaway container re-owns the pair, keeping 600, and the container's view is
+    verified. Only when that fails too does it fall back to a world-readable key (644, single-tenant
+    host) so the container CAN read it - NEVER falsely reporting a mode-600 key when it would be
+    unreadable. Returns (mode600, message)."""
     if os.name == "nt":
         # NOT a no-op: a Docker Desktop bind mount carries the POSIX mode of whatever wrote the file,
         # and openssl writes key.pem 0600 owned by uid 0 - unreadable to the app's uid 10001. The host
@@ -1272,14 +1451,26 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
                 pass
         return False, reason
 
+    def _in_a_container(reason):
+        # The host cannot hand the pair to the container's user (setup is not run as root, or the engine maps that
+        # user to a subordinate uid): a container can, as Docker's own root, keeping the key 600, as on Windows.
+        # The folder is opened to 755 (its names, not the key) so that the container's user reaches the files, and
+        # what the container then sees is verified. Only when that fails is the key made world-readable.
+        try:
+            os.chmod(cert_dir, 0o755)
+        except OSError:
+            pass
+        ok, msg = _apply_cert_owner_container(cert_dir, run)
+        return (True, msg) if ok else _world_readable(reason)
+
     if _engine_is_remapped(run):
         owner = _remapped_cert_owner(run)   # mapped host uid (userns-remap), or None (rootless/unresolvable)
         if owner is None:
-            return _world_readable(
+            return _in_a_container(
                 "rootless/userns Docker: the container's app user is a subordinate host uid, so a "
-                "mode-600 key owned by uid %d would be unreadable inside the container. Made the TLS "
-                "key world-readable (644) so the container can read it - host assumed single-tenant, "
-                "restrict access accordingly." % APP_UID)
+                "mode-600 key owned by uid %d would be unreadable inside the container, and a container "
+                "could not re-own it either. Made the TLS key world-readable (644) so the container can read "
+                "it - host assumed single-tenant, restrict access accordingly." % APP_UID)
     else:
         owner = APP_UID
     try:
@@ -1289,9 +1480,21 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
             return True, "certs owned by uid %d (key mode 600, not world-readable)" % owner
     except OSError:
         pass
-    return _world_readable(
-        "could not chown certs to the container uid; made the TLS key world-readable (644) so the "
-        "container can read it - host assumed single-tenant, restrict access accordingly.")
+    return _in_a_container(
+        "could not chown certs to the container uid, on the host or from a container; made the TLS key "
+        "world-readable (644) so the container can read it - host assumed single-tenant, restrict access "
+        "accordingly.")
+
+
+def _key_already_private(key):
+    """POSIX: the key's mode gives nothing to group or others. A key a container re-owned to the app user (a setup
+    not run as root) cannot be chmodded by this user again, and needs not be: it is 600 already."""
+    if os.name == "nt":
+        return False
+    try:
+        return (os.stat(key).st_mode & 0o077) == 0
+    except OSError:
+        return False
 
 
 def _remapped_cert_owner(run=subprocess.run):
@@ -1639,16 +1842,53 @@ def volume_set_prefix(name):
 RESERVED_ENV_NAMES = (".env.enc", ".env.example")
 
 
+def _env_copy_number(label, name):
+    """The number of the name `name` among the names of set `label`'s kept or archived .env copies (0 for
+    .env.<label>, n for .env.<label>.<n>), or None when it is not one of them (.env.<label>.x is another set's, whose
+    prefix is <label>.x)."""
+    base = ".env." + label
+    if name == base:
+        return 0
+    if name.startswith(base + ".") and re.match(r"^[0-9]+$", name[len(base) + 1:]):
+        return int(name[len(base) + 1:])
+    return None
+
+
+def _env_copies_there(root, label):
+    """[(number, path)] of every name in `root` that is one of set `label`'s copy names, of any kind."""
+    found = []
+    for path in glob.glob(os.path.join(glob.escape(root), glob.escape(".env." + label) + "*")):
+        number = _env_copy_number(label, os.path.basename(path))
+        if number is not None:
+            found.append((number, path))
+    return found
+
+
 def env_copy_names(root, label):
-    """The names a kept or archived .env of `label` may take in `root`, in order: .env.<label>, then .env.<label>.1,
-    .2, ..., never one of RESERVED_ENV_NAMES."""
+    """The names a kept or archived .env of `label` may take in `root`, in order: .env.<label> when no copy of it is
+    there, else .env.<label>.<n> from the number after the highest one there, so that the newest copy always has
+    the highest number (kept_env_copies takes the newest by it), never one of RESERVED_ENV_NAMES. A free name below
+    the highest (a copy deleted since) is not taken again: a copy made there would sort as an old one."""
     base = os.path.join(root, ".env." + label)
-    n = 0
+    taken = [number for number, _path in _env_copies_there(root, label)]
+    n = max(taken) + 1 if taken else 0
     while True:
         name = base if n == 0 else "%s.%d" % (base, n)
         n += 1
         if os.path.basename(name).rstrip(". ").lower() not in RESERVED_ENV_NAMES:
             yield name
+
+
+def kept_env_copies(root, label):
+    """The kept or archived copies of set `label`'s .env in `root` (the names env_copy_names gives: .env.<label>, then
+    .env.<label>.1, .2, ...), the newest first: by the number, as a number (.10 after .9, which a sort by text puts
+    first), and .env.<label> itself last. A name with any other ending (.env.<label>.x is another set's, whose
+    prefix is <label>.x) is not one of them, nor is one of RESERVED_ENV_NAMES (for a set named 'enc', .env.enc is
+    the sealed .env). Plain files only."""
+    found = [(number, path) for number, path in _env_copies_there(root, label)
+             if os.path.basename(path).rstrip(". ").lower() not in RESERVED_ENV_NAMES
+             and os.path.isfile(path) and not os.path.islink(path)]
+    return [path for _n, path in sorted(found, reverse=True)]
 
 
 def group_volumes_by_prefix(records):
@@ -1795,12 +2035,122 @@ def plan_volume_action(choice):
 # The order archived in, and restored in; brand is optional. The keys volume comes first: it holds the audit
 # chain's head record, and a database archived after it can only be ahead of its record (by the seals written
 # meanwhile, which the server lists and the host acknowledges), never behind it, which would stop sealing as a
-# cut tail does. The database is paused while its volume is archived, so the copy is one moment's.
+# cut tail does. The running deployment is paused while the volumes are archived, so every archive is of one moment.
 BACKUP_ROLES = ("keys", "pg", "storage", "brand")
+# The containers paused while a backup archives the volumes (each a compose service of the same name): the app's in
+# either layout, which write the stored files, the keys and the database rows, and the database itself.
+BACKUP_PAUSED_SERVICES = ("vault", "vault-api", "vault-sftp", "vault-db")
 # The three that carry data. A bundle without them is not a backup, whatever else it contains,
 # and saying so is load-bearing now that an upgrade takes one on the operator's behalf and
 # proceeds with an irreversible change on the strength of it.
 BACKUP_REQUIRED_ROLES = ("pg", "storage", "keys")
+# The signals whose default action ends the process at once, without running a single `finally`: a closed SSH
+# session or terminal (SIGHUP), kill, a timeout or a service stop (SIGTERM), and on Windows Ctrl-Break (SIGBREAK).
+# While a backup holds the deployment paused, SignalsEndTheRun turns them into an exit that resumes it first. Ctrl-C
+# is a KeyboardInterrupt already, which runs them. Each is used where this platform has it.
+RUN_ENDING_SIGNALS = ("SIGHUP", "SIGTERM", "SIGBREAK")
+# A resume of the deployment that Docker did not confirm is asked about and tried again: up to RESUME_RETRIES more
+# rounds, RESUME_RETRY_GAP seconds apart, none begun once RESUME_RETRY_SECONDS have passed since the first try (a
+# Docker that does not answer is not waited for again and again). The first try's docker child can be ended by the
+# signal that ends the run: one started in the very moment the signal reaches the run's process group is still in
+# that group, and systemd's stop signals every process of the service, whatever its group.
+RESUME_RETRIES = 3
+RESUME_RETRY_GAP = 0.5
+RESUME_RETRY_SECONDS = 30
+
+
+def own_session_kwargs():
+    """The subprocess keyword arguments that start a docker child out of reach of the signals that end this run. A
+    terminal's hangup (twice: the shell passes its SIGHUP on to its jobs, then the terminal sends its own), systemd's
+    stop and GNU timeout signal the run's whole process group, and a `docker compose pause` they end can have taken
+    effect with no answer, an `unpause` they end leaves the deployment paused. On POSIX a session of its own; on
+    Windows a process group of its own (Ctrl-Break sent to the run's group) with no console (Ctrl-Break typed at the
+    console reaches every process attached to it, whatever its group)."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {"start_new_session": True}
+
+
+class StoppedBySignal(SystemExit):
+    """The run was ended by one of RUN_ENDING_SIGNALS while SignalsEndTheRun was in force. A SystemExit, so that the
+    `finally` blocks on the way out run; its exit status is 128 + the signal's number, as a shell reports a process
+    a signal ended."""
+
+    def __init__(self, signum):
+        super().__init__(128 + int(signum))
+        self.signum = int(signum)
+
+    def signal_name(self):
+        try:
+            return signal.Signals(self.signum).name
+        except ValueError:
+            return "signal %d" % self.signum
+
+
+class SignalsEndTheRun(object):
+    """A `with` block in which RUN_ENDING_SIGNALS raise StoppedBySignal (in the main thread) instead of ending the
+    process at once, so that the block's `finally` runs first: a backup resumes the deployment it paused. Only a
+    signal whose action is the default one is taken over: one that is ignored (a run under nohup goes on when its
+    terminal closes) or already handled is left as it is. Each signal's previous action is put back when the block
+    ends. Outside the main thread, where Python sets no handler, it changes nothing.
+
+    hold() starts a stretch that a signal must not cut short (a pause, the resume): a signal that comes then is
+    noted, release() raises it at the end of the stretch, and the end of the block raises one still noted (unless
+    the block is already ending on an exception). Once one has been raised, every later one is only noted: a second
+    signal does not cut short the `finally` the first one runs."""
+
+    def __init__(self):
+        self._previous = {}
+        self._holding = False
+        self._raised = False
+        self._noted = None
+
+    def _on_signal(self, signum, _frame):
+        if self._holding or self._raised:
+            if self._noted is None:
+                self._noted = signum
+            return
+        self._raised = True
+        raise StoppedBySignal(signum)
+
+    def hold(self):
+        self._holding = True
+
+    def release(self):
+        self._holding = False
+        self._raise_noted()
+
+    def _raise_noted(self):
+        if self._noted is not None and not self._raised:
+            signum, self._noted = self._noted, None
+            self._raised = True
+            raise StoppedBySignal(signum)
+
+    def __enter__(self):
+        for name in RUN_ENDING_SIGNALS:
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                if signal.getsignal(signum) is not signal.SIG_DFL:
+                    continue
+                signal.signal(signum, self._on_signal)
+            except (OSError, ValueError, RuntimeError):
+                continue               # not the main thread, or a signal this platform gives no handler
+            self._previous[signum] = signal.SIG_DFL
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for signum, previous in self._previous.items():
+            try:
+                signal.signal(signum, previous)
+            except (OSError, ValueError, RuntimeError):
+                pass
+        self._previous = {}
+        if exc_type is None:
+            self._raise_noted()
+        return False
 
 
 def gen_salt():
@@ -1827,6 +2177,11 @@ def compute_coupling_fingerprint(env, salt):
 # of booting postgres for a ~20-40s auth probe. Postgres ignores unrecognised files in its data
 # directory (it only requires an EMPTY directory at initdb time, long before this is written).
 COUPLING_MARKER = "dockvault_coupling.json"
+# The stamp's version. A stamp is written once both halves of the pairing were checked: the database password opened
+# the database, and ENCRYPTION_KEY opened the key check the vault keeps there. Earlier versions of this tool stamped
+# after the password alone (version 1), so their stamp can vouch for a .env whose ENCRYPTION_KEY was never checked
+# (one that shares the password): it is not taken, the live check runs and stamps this version.
+COUPLING_STAMP_VERSION = 2
 
 
 def read_volume_coupling(volume, run=subprocess.run):
@@ -1855,7 +2210,7 @@ def build_coupling_marker(env, salt=None):
     """The marker document, in the SAME shape verify_backup_coupling() reads (the digest nested
     under "coupling") so the writer and the reader can never drift apart. Salt + digest only."""
     salt = salt or gen_salt()
-    return {"dockvault_coupling": 1,
+    return {"dockvault_coupling": COUPLING_STAMP_VERSION,
             "coupling": {"salt": salt, "sha256": compute_coupling_fingerprint(env, salt)}}
 
 
@@ -1880,19 +2235,44 @@ def coupling_marker_verdict(marker, env):
     """Pure: 'ok' when `marker` proves `env` is the .env this volume was stamped with, else None.
     NEVER returns a negative verdict - a stamp can go stale (the DB password was rotated in
     postgres and in .env), and only the live auth probe may refuse a start. Shares ONE digest
-    comparison with the backup manifests (verify_backup_coupling)."""
-    return "ok" if verify_backup_coupling(env, marker or {}) else None
+    comparison with the backup manifests (verify_backup_coupling). A stamp vouches for the exact
+    .env it was written for, and only one written once both halves were checked
+    (COUPLING_STAMP_VERSION) is taken; an older one (the password checked alone) is not."""
+    version = marker.get("dockvault_coupling") if isinstance(marker, dict) else None
+    if not (isinstance(version, int) and not isinstance(version, bool) and version >= COUPLING_STAMP_VERSION):
+        return None
+    return "ok" if verify_backup_coupling(env, marker) else None
+
+
+# The manifest's format ("dockvault_backup"). 1: the backups made before archives had checksums (an entry records no
+# sha256 or size). 2: every entry records its archive's sha256 and size, and a restore refuses a format-2 manifest
+# that lacks one. Nothing in an unsealed bundle is authenticated, so whoever can write it can also write format 1
+# with no checksums: a restore of a format-1 bundle says that nothing shows its archives are the backup's.
+BACKUP_MANIFEST_FORMAT = 2
+
+
+def manifest_format(manifest):
+    """A manifest's format: 1 when it names none (every backup before formats were numbered wrote 1), the number when
+    it is one this tool knows (1 .. BACKUP_MANIFEST_FORMAT), else None."""
+    fmt = manifest.get("dockvault_backup", 1) if isinstance(manifest, dict) else None
+    if isinstance(fmt, int) and not isinstance(fmt, bool) and 1 <= fmt <= BACKUP_MANIFEST_FORMAT:
+        return fmt
+    return None
 
 
 def build_backup_manifest(prefix, bundle_id, volumes, salt, env, created=""):
     """The backup manifest dict (NO secrets): identifies the set + records the salted coupling
-    fingerprint of the paired .env. `volumes` is a list of {role, name, archive}."""
+    fingerprint of the paired .env. `volumes` is a list of {role, name, archive, sha256, size}: the archive's
+    SHA-256 and size as check_archive_file found them on the host (a backup made before them lacks both). Its
+    format (BACKUP_MANIFEST_FORMAT) is the one that records them when every entry does, else 1."""
+    entries = list(volumes)
+    recorded = bool(entries) and all(isinstance(e, dict) and "sha256" in e and "size" in e for e in entries)
     return {
-        "dockvault_backup": 1,
+        "dockvault_backup": BACKUP_MANIFEST_FORMAT if recorded else 1,
         "created": created,
         "volume_prefix": prefix,
         "bundle_id": bundle_id or "default",
-        "volumes": list(volumes),
+        "volumes": entries,
         "env_file": "env",
         "coupling": {"salt": salt, "sha256": compute_coupling_fingerprint(env, salt)},
         "note": "The 'env' file in this backup holds ENCRYPTION_KEY - protect the whole bundle off-host.",
@@ -1912,6 +2292,162 @@ def verify_backup_coupling(env, manifest):
     return compute_coupling_fingerprint(env, salt) == expected
 
 
+# What a backup records of each archive, in its manifest entry: the SHA-256 of the archive file and its size in bytes,
+# taken on the host once the archive has been read through whole (check_archive_file). A restore takes nothing from
+# an archive whose bytes differ. A plain hash catches an archive damaged on the way; it does not stop someone who can
+# write the bundle, who can write the manifest's hash as well. A sealed bundle's manifest is therefore authenticated
+# too, under the key its env.enc is sealed with (BUNDLE_MANIFEST_MAC, manifest_mac): only that key's holder can make
+# a manifest that passes.
+ARCHIVE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+BUNDLE_MANIFEST_MAC = "manifest.json.mac"
+_MANIFEST_MAC_LABEL = b"dockvault backup manifest mac v1"
+
+
+class _HashingReader:
+    """A read-only file wrapper that feeds every byte read through it into `digest` and counts them."""
+
+    def __init__(self, raw, digest):
+        self._raw = raw
+        self._digest = digest
+        self.size = 0
+
+    def read(self, n=-1):
+        data = self._raw.read(n)
+        self._digest.update(data)
+        self.size += len(data)
+        return data
+
+
+def check_archive_file(path):
+    """(SHA-256 hex, size) of the tar.gz at `path`, once it has been read through to its end in one pass: a gzip
+    stream whose own checksum is right, holding a tar whose every entry lists (what `tar -tzf` checks). Raises
+    ValueError saying what is wrong: missing, not a plain file, empty, or not readable as a whole tar.gz."""
+    import gzip
+    import tarfile
+    import zlib
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError("%s is not there (no plain file by that name)" % path)
+    if os.path.getsize(path) == 0:
+        raise ValueError("%s is empty" % path)
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as raw:
+            reader = _HashingReader(raw, digest)
+            with gzip.GzipFile(fileobj=reader, mode="rb") as gz:
+                with tarfile.open(fileobj=gz, mode="r|") as tar:
+                    for _member in tar:
+                        pass
+                while gz.read(1 << 20):          # the rest of the stream, through to its checksum
+                    pass
+            while reader.read(1 << 20):          # anything after it is hashed too
+                pass
+    except (OSError, EOFError, ValueError, tarfile.TarError, zlib.error) as exc:
+        raise ValueError("%s does not read as a whole tar.gz archive (%s)" % (path, exc))
+    return digest.hexdigest(), reader.size
+
+
+def _copy_archive_in(archive_name, then):
+    """A busybox shell script that copies /src/<archive_name> (the bundle's file, which can change while the restore
+    runs) into the container's own file /tmp/dv-archive, prints the copy's SHA-256 as `dv-sha256 <hex>`, then runs
+    `then`, which reads that copy only ($1 holds its SHA-256): what it reads is the very file hashed, whatever happens
+    to the bundle meanwhile. It fails when the file is not there or is empty (exit 3), or when the copy cannot be
+    made whole or hashed (exit 4: no room for it in Docker's storage, say). The restore's look at each archive before
+    it stops anything (archive_digest_in_docker) and its extraction (untar_volume) both read this way: the look
+    proves the extraction can (Docker sees the file, and has room for the copy)."""
+    return ('f=/src/%s; [ -f "$f" ] && [ -s "$f" ] || { echo "no such archive, or an empty one" >&2; exit 3; }; '
+            'cp "$f" /tmp/dv-archive || { echo "the archive could not be copied into the container (is there room '
+            'for it in the Docker storage?)" >&2; exit 4; }; '
+            's="$(sha256sum < /tmp/dv-archive)" || exit 4; set -- $s; echo "dv-sha256 $1"; %s'
+            % (archive_name, then))
+
+
+def _copied_sum(stdout):
+    """The SHA-256 hex _copy_archive_in printed for its copy, or None."""
+    for line in (stdout or "").splitlines():
+        if line.startswith("dv-sha256 "):
+            word = line[len("dv-sha256 "):].strip()
+            return word if ARCHIVE_DIGEST_RE.match(word) else None
+    return None
+
+
+def archive_digest_in_docker(src_dir, archive_name, run=subprocess.run):
+    """The SHA-256 hex of <src_dir>/<archive_name> as Docker sees it, through the same read-only bind mount the
+    restore's untar_volume uses and read the same way (_copy_archive_in: copied into the container, then the copy
+    hashed), once busybox tar has listed the copy to its end (gunzip checks the stream's own checksum on the way).
+    Returns (digest or None, why not). A Docker that does not see the host's folder (another host's daemon, a
+    confined one), or sees another file there, answers with no digest or another one; one with no room for the copy
+    answers with none."""
+    script = _copy_archive_in(archive_name, "tar tzf /tmp/dv-archive > /dev/null")
+    try:
+        r = run(["docker", "run", "--rm", "--network", "none", "-v", "%s:/src:ro" % src_dir, "busybox", "sh", "-c",
+                 script], capture_output=True, text=True, timeout=3600)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return None, "Docker could not be run (%s)" % type(exc).__name__
+    if getattr(r, "returncode", 1) != 0:
+        why = " ".join((getattr(r, "stderr", "") or "").split())[-200:]
+        return None, why or "exit %s" % getattr(r, "returncode", "?")
+    seen = _copied_sum(getattr(r, "stdout", ""))
+    if seen is None:
+        return None, "no checksum came back"
+    return seen, ""
+
+
+def manifest_mac(dek, manifest_bytes):
+    """HMAC-SHA256, hex, of a sealed bundle's manifest.json bytes, under a key derived from the data key its env.enc
+    is sealed with (the recovery key). The passphrase or the recovery key opens env.enc and with it this key; nobody
+    without either can make a manifest whose MAC is right."""
+    import hmac
+    raw = dek if isinstance(dek, (bytes, bytearray)) else str(dek).encode("ascii")
+    key = hmac.new(bytes(raw), _MANIFEST_MAC_LABEL, hashlib.sha256).digest()
+    return hmac.new(key, bytes(manifest_bytes), hashlib.sha256).hexdigest()
+
+
+def manifest_mac_matches(dek, manifest_bytes, recorded):
+    """True only when `recorded` is the MAC manifest_mac() gives for these bytes (compared in constant time)."""
+    import hmac
+    if not isinstance(recorded, str) or not ARCHIVE_DIGEST_RE.match(recorded):
+        return False
+    return hmac.compare_digest(manifest_mac(dek, manifest_bytes), recorded)
+
+
+# What a sealed bundle's env.enc seals: its env, then one line saying that the bundle's manifest is authenticated
+# (BUNDLE_MANIFEST_MAC), with an identifier of the data key it is sealed under. The line is sealed with the env, under
+# that key, so nobody without the passphrase or the recovery key can take it out: a sealed bundle stripped of its MAC
+# and of its checksums, to look like one made before them, is refused. Each seal has a data key of its own: such a
+# line that reached a .env from elsewhere (an earlier version of the tool installs a payload as it is, line and all)
+# names another key than the seal of the next backup of that .env, and does not make that backup, sealed by an
+# earlier version with no MAC, look new.
+_SEALED_LINE = b"\n# dockvault sealed backup %s: its manifest is authenticated (manifest.json.mac)\n"
+_SEALED_LINE_RE = re.compile(rb"\n# dockvault sealed backup ([0-9a-f]{32}): its manifest is authenticated "
+                             rb"\(manifest\.json\.mac\)\n\Z")
+_SEALED_LINE_LABEL = b"dockvault sealed backup line v1"
+
+
+def sealed_line_id(dek):
+    """The identifier of the data key `dek` the line of a sealed bundle names (HMAC-SHA256 under the key, of a fixed
+    label, cut to 32 hex): it says nothing of the key, and only the key's holder can make it."""
+    import hmac
+    raw = dek if isinstance(dek, (bytes, bytearray)) else str(dek).encode("ascii")
+    return hmac.new(bytes(raw), _SEALED_LINE_LABEL, hashlib.sha256).hexdigest()[:32]
+
+
+def sealed_bundle_payload(env_bytes, dek):
+    """The bytes a sealed bundle's env.enc seals under the data key `dek`: the env, then the line that says its
+    manifest is authenticated, naming that key (sealed_line_id)."""
+    return bytes(env_bytes) + _SEALED_LINE % sealed_line_id(dek).encode("ascii")
+
+
+def split_sealed_bundle_payload(payload, dek):
+    """(the env bytes, True) for a payload sealed_bundle_payload made under the data key `dek` it was just opened
+    with; else (the payload as it is, False): a bundle sealed before manifests were authenticated, whose payload is
+    its env (a line there that names another key came from another seal)."""
+    import hmac
+    m = _SEALED_LINE_RE.search(bytes(payload))
+    if m and dek is not None and hmac.compare_digest(m.group(1), sealed_line_id(dek).encode("ascii")):
+        return bytes(payload)[:m.start()], True
+    return bytes(payload), False
+
+
 def tar_volume(volume, dest_dir, archive_name, run=subprocess.run):
     """Archive a docker volume to <dest_dir>/<archive_name> via a throwaway busybox container (read-only
     source mount). Returns True on success. Best-effort False on any docker error."""
@@ -1924,15 +2460,45 @@ def tar_volume(volume, dest_dir, archive_name, run=subprocess.run):
     return getattr(r, "returncode", 1) == 0
 
 
-def untar_volume(volume, src_dir, archive_name, run=subprocess.run):
+class ArchiveChanged(Exception):
+    """untar_volume found its archive, as copied for the extraction, to be other bytes than the ones the restore
+    checked, and extracted nothing of it. `seen` is the copy's SHA-256 hex."""
+
+    def __init__(self, seen):
+        Exception.__init__(self, seen)
+        self.seen = seen
+
+
+def untar_volume(volume, src_dir, archive_name, run=subprocess.run, sha256=None):
     """Restore <src_dir>/<archive_name> into a docker volume via a throwaway busybox container (the -v
-    mount creates the volume if absent). Returns True on success."""
+    mount creates the volume if absent). Returns True on success.
+
+    With `sha256` (the archive's SHA-256 hex as the restore checked it, before it stopped anything), the archive is
+    copied into the extracting container first, the copy hashed, and the copy extracted only when it is those bytes
+    (_copy_archive_in): the bundle can change between that check and this read (a bundle on a share or a removable
+    disk, or one anyone else can write while the restore waits for its confirmation), and other bytes never reach
+    tar, let alone the volume. They raise ArchiveChanged, with nothing extracted, and the caller stops there. A copy
+    that could not be made or hashed extracts nothing either: False."""
+    if sha256 is None:
+        script = "cd /dest && tar xzf /src/%s" % archive_name
+    elif not ARCHIVE_DIGEST_RE.match(str(sha256)):
+        return False
+    else:
+        script = "cd /dest || exit 5; " + _copy_archive_in(
+            archive_name, '[ "$1" = %s ] || { echo "not the archive checked" >&2; exit 6; }; tar xzf /tmp/dv-archive'
+            % sha256)
     try:
         r = run(["docker", "run", "--rm", "-v", "%s:/dest" % volume, "-v", "%s:/src:ro" % src_dir,
-                 "busybox", "sh", "-c", "cd /dest && tar xzf /src/%s" % archive_name],
-                capture_output=True, text=True, timeout=600)
+                 "busybox", "sh", "-c", script],
+                capture_output=True, text=True, timeout=3600)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
+    if sha256 is not None:
+        seen = _copied_sum(getattr(r, "stdout", ""))
+        if seen is None:
+            return False                     # nothing was copied or hashed: nothing was extracted
+        if seen != sha256:
+            raise ArchiveChanged(seen)       # stopped before tar: nothing was extracted
     return getattr(r, "returncode", 1) == 0
 
 
@@ -1967,6 +2533,29 @@ KEPT_CHAIN_KEY_BUNDLE = "audit-chain-key.previous"
 # Held by a key change, and by the key an update offers, from before either reads AUDIT_CHAIN_KEY in .env until it
 # ends: another one started meanwhile is refused at once (an empty file, left in place).
 CHAIN_KEY_LOCK = ".audit-chain-key.lock"
+# Beside .env, one for each volume set (.restore-incomplete.<VAULT_VOLUME_PREFIX>): a restore of that set has begun to
+# replace its volumes and has not finished. Written before the first volume is cleared and removed once the backup's
+# .env is installed, so it stays after a restore that stopped part way, after Ctrl-C, after a crash. While it is
+# there, nothing starts that set, whose volumes hold part of a backup: every command that would (restore_incomplete_
+# refusers) refuses before it changes anything, and says the way back (run the restore again, or Reset); the stack's
+# start and the database's own start for a check of .env refuse it too, whatever asked for them. Nor does backup take
+# those volumes for a whole set. Reset of that set removes it. It holds no secret.
+RESTORE_INCOMPLETE = ".restore-incomplete."
+
+
+def restore_incomplete_refusers(what):
+    """The commands that refuse set `what` (its name in quotes, or "it") while a restore of it that began to replace
+    its volumes has not finished (RESTORE_INCOMPLETE), as the messages and the README say them."""
+    return ("start, restart, setup, update, storage, logs and audit change-key refuse to start %s, and backup refuses "
+            "to back it up" % what)
+
+
+def restore_incomplete_path(root, prefix):
+    """The restore-incomplete marker of set `prefix` in `root`. ValueError for a prefix that is not a volume set's
+    name (it would not be a plain file name)."""
+    if not (valid_volume_prefix(prefix) and prefix == prefix.strip()):
+        raise ValueError("VAULT_VOLUME_PREFIX %r is not a volume set's name" % (prefix,))
+    return os.path.join(root, RESTORE_INCOMPLETE + prefix)
 
 
 def kept_chain_key_path(root, prefix):
@@ -1979,8 +2568,9 @@ def kept_chain_key_path(root, prefix):
 
 def kept_chain_key_files(root):
     """Every old AUDIT_CHAIN_KEY kept in plain text in `root`: each set's, and those Reset moved aside."""
-    return sorted(set(glob.glob(os.path.join(root, KEPT_CHAIN_KEY + "*")) +
-                      glob.glob(os.path.join(root, KEPT_CHAIN_KEY_REMOVED + "*"))))
+    here = glob.escape(root)            # the folder's own name may hold [, ], * or ?
+    return sorted(set(glob.glob(os.path.join(here, KEPT_CHAIN_KEY + "*")) +
+                      glob.glob(os.path.join(here, KEPT_CHAIN_KEY_REMOVED + "*"))))
 
 
 class LockBusy(Exception):
@@ -2075,14 +2665,23 @@ def write_volume_file(volume, rel, text, run=subprocess.run):
 # every secret-bearing bundle under Downloads. They now default to a per-OS application-data directory
 # and the location is overridable + can name SEVERAL directories.
 def _writable_dir(path):
-    """True if `path` exists-or-can-be-created AND a probe file can be written there (creating it 0700
-    on POSIX as a side effect, then removing the probe). Picking the first WRITABLE candidate stops a
-    full / read-only / disconnected-network location from silently swallowing a backup."""
+    """True if `path` exists-or-can-be-created AND a probe file can be written there (then removing the probe).
+    Picking the first WRITABLE candidate stops a full / read-only / disconnected-network location from silently
+    swallowing a backup. A folder this call makes is made 0700 on POSIX; a folder that was already there keeps its
+    mode (it is the operator's, often shared, as with a --backup-dir under sudo): each backup inside is made 0700
+    itself."""
     try:
-        os.makedirs(path, exist_ok=True)
-        if os.name != "nt":
+        made = False
+        if not os.path.isdir(path):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             try:
-                os.chmod(path, 0o700)
+                os.mkdir(path, 0o700)
+                made = True
+            except FileExistsError:
+                pass                           # made meanwhile by someone else: theirs, left as it is
+        if made and os.name != "nt":
+            try:
+                os.chmod(path, 0o700)          # mkdir's mode is masked by the umask
             except OSError:
                 pass
         probe = os.path.join(path, ".dockvault_write_probe")
@@ -2218,6 +2817,26 @@ def uses_release_image(env):
     and the deployment then reports a version it is not running."""
     image = (env.get("DOCKVAULT_IMAGE") or "").strip()
     return image.startswith(GHCR_IMAGE + ":") or image.startswith(GHCR_IMAGE + "@")
+
+
+def release_image_version(image):
+    """The version a published release image reference names ('ghcr.io/dockvault/vault:v0.34.0' -> '0.34.0'), or
+    None for anything else (a local build, a digest-pinned reference, another repository)."""
+    m = re.match(r"^%s:v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?)$" % re.escape(GHCR_IMAGE), (image or "").strip())
+    return m.group(1) if m else None
+
+
+def image_present(image, run=None):
+    """True when `image` is already in this host's Docker image store (`docker image inspect` finds it), so the
+    stack can be recreated from it without the registry. False when it is not, and when Docker cannot be asked."""
+    if not image:
+        return False
+    try:
+        r = (run or subprocess.run)(["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                capture_output=True, text=True, timeout=30)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return getattr(r, "returncode", 1) == 0
 
 
 def describe_image_mode(env):
@@ -3304,7 +3923,9 @@ def volume_exists(name, run=subprocess.run):
 
 def container_running(name, run=subprocess.run):
     """True if a container named `name` exists AND is running. Best-effort: any docker error
-    answers False, which callers must treat as 'not known to be running'."""
+    answers False, which callers must treat as 'not known to be running'. A paused container is
+    running here (Docker's .State.Running): it still holds its volumes. container_paused tells the
+    two apart where that matters (a backup pauses only what is not paused already)."""
     try:
         r = run(["docker", "inspect", "-f", "{{.State.Running}}", name],
                 capture_output=True, text=True, timeout=20)
@@ -3313,6 +3934,21 @@ def container_running(name, run=subprocess.run):
     if getattr(r, "returncode", 1) != 0:
         return False
     return (getattr(r, "stdout", "") or "").strip() == "true"
+
+
+def container_paused(name, run=subprocess.run):
+    """True if a container named `name` is paused, False if it is there and not paused, None when Docker cannot
+    tell (no such container, or Docker did not answer). Asked while a backup resumes the deployment, so its docker
+    child runs out of reach of the signals that end the run (own_session_kwargs)."""
+    try:
+        r = run(["docker", "inspect", "-f", "{{.State.Paused}}", name], capture_output=True, text=True, timeout=20,
+                stdin=subprocess.DEVNULL, **own_session_kwargs())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    answer = (getattr(r, "stdout", "") or "").strip()
+    return True if answer == "true" else False if answer == "false" else None
 
 
 def container_exists(name, run=subprocess.run):
@@ -3434,6 +4070,48 @@ def admin_bootstrap_done(container, user, db, password, run=subprocess.run):
     if getattr(r, "returncode", 1) != 0:
         return None
     return (getattr(r, "stdout", "") or "").strip() == "1"
+
+
+def read_key_canary(container, user, db, password, run=subprocess.run):
+    """The ENCRYPTION_KEY check the vault keeps in its database (app/core/key_canary.py: a Fernet token of a fixed
+    text, sealed under the deployment's ENCRYPTION_KEY at its first start), read from the RUNNING postgres
+    `container` the way probe_pg_password connects (its own IP, PGPASSWORD inside the container, never on the host
+    argv). Returns the token, '' when the database holds none (a set whose app has not started yet), or None when it
+    cannot be read (any docker, exec or SQL error): unknown, never a mismatch."""
+    try:
+        ipr = run(["docker", "exec", container, "hostname", "-i"], capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    parts = (getattr(ipr, "stdout", "") or "").split() if getattr(ipr, "returncode", 1) == 0 else []
+    if not parts:
+        return None
+    try:
+        r = run(["docker", "exec", "-e", "PGPASSWORD", container,
+                 "psql", "-h", parts[0], "-U", user, "-d", db, "-tAc",
+                 "SELECT value->>'ct' FROM system_settings WHERE key='encryption_key_canary'"],
+                capture_output=True, text=True, timeout=30, env=dict(os.environ, PGPASSWORD=password))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    return (getattr(r, "stdout", "") or "").strip()
+
+
+def fernet_token_signed_by(key, token):
+    """True when the Fernet `token` was made under the Fernet `key`: its HMAC-SHA256, under the key's signing half,
+    verifies. Stdlib only (no decryption, so no crypto dependency); a token of a fixed text that verifies under a key
+    proves it is that key. False for another key, a garbled token, or anything not a key."""
+    import hmac
+    try:
+        raw = base64.urlsafe_b64decode((key or "").strip().encode("ascii"))
+        text = (token or "").strip().encode("ascii")
+        data = base64.urlsafe_b64decode(text + b"=" * (-len(text) % 4))
+    except (ValueError, UnicodeEncodeError):
+        return False
+    if len(raw) != 32 or len(data) < 1 + 8 + 16 + 16 + 32 or data[0] != 0x80:
+        return False
+    mac = hmac.new(raw[:16], data[:-32], hashlib.sha256).digest()
+    return hmac.compare_digest(mac, data[-32:])
 
 
 def db_guard_decision(volume_exists_flag, probe_result):
@@ -3559,6 +4237,23 @@ def _parse_env_lock(enc_text):
     if body.get("version") != 1 or "payload" not in body:
         raise EnvLockError("unsupported or incomplete lock file (version %r)" % body.get("version"))
     return body
+
+
+def sealed_set_differs(sealed_bytes, env_bytes):
+    """Why the .env sealed in `sealed_bytes` belongs to another set than `env_bytes`, or "" when both are the
+    same set's (an edited .env, sealed again). A set is its volumes (VAULT_VOLUME_PREFIX) and the key its data is
+    encrypted under (ENCRYPTION_KEY): another set's .env differs in either. Names neither key's value."""
+    def _read(raw):
+        try:
+            return parse_env(bytes(raw).decode("utf-8"))
+        except (UnicodeDecodeError, TypeError):
+            return {}
+    sealed, new = _read(sealed_bytes), _read(env_bytes)
+    if volume_prefix(sealed) != volume_prefix(new):
+        return "set '%s', while .env is set '%s'" % (volume_prefix(sealed), volume_prefix(new))
+    if (sealed.get("ENCRYPTION_KEY") or "").strip() != (new.get("ENCRYPTION_KEY") or "").strip():
+        return "set '%s' with another ENCRYPTION_KEY than this .env's" % volume_prefix(sealed)
+    return ""
 
 
 def env_lock_open(fernet, enc_text, passphrase=None, recovery_key=None):
@@ -3780,6 +4475,9 @@ class DockVault:
         self._db_was_running = False
         # Set by _verify_env_against_volume: the pg volume the current check is about.
         self._guard_vol = None
+        # Set by _guard_db_secret: how a .env whose database password opens the volume has its ENCRYPTION_KEY checked
+        # too (the vault's key check in the database), or None for no such check (a stand-in probe).
+        self._canary_check = None
 
     # Area handlers — accept an optional argparse namespace so the SAME handler serves both the
     # interactive menu (args=None) and arg-mode (args=<namespace>).
@@ -3799,6 +4497,16 @@ class DockVault:
     def _is_locked(self):
         """True when .env is sealed: no plaintext .env, but a .env.enc is present."""
         return (not os.path.exists(self._env_path())) and os.path.exists(self._env_lock_path())
+
+    def _refuse_while_locked(self, what):
+        """Stop `what`, a command that writes .env, while .env is sealed by `lock`, before it writes anything. A .env
+        written beside the sealed one would be another set's (fresh secrets, a new set's, another set's copy), and a
+        later `lock` (or `down --lock`) would seal it over the sealed one: the sealed set's ENCRYPTION_KEY would then
+        be nowhere, and its volumes could never be read again."""
+        if self._is_locked():
+            self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run %s "
+                       "again. A .env written beside the sealed one, and sealed over it by a later lock, would lose "
+                       "the sealed set's keys. Nothing changed." % what)
 
     def _atomic_write_secret(self, path, data):
         """Write `data` to `path` atomically (temp in the same dir -> fsync -> os.replace) and tighten
@@ -3879,33 +4587,114 @@ class DockVault:
                 raise SystemExit(2)
         return ask_secret("Credential recovery key", self.pal).strip()
 
-    def _emit_secret(self, text):
+    def _emit_secret(self, text, label="secret", kept_in=None):
         """Write a one-time secret to the controlling TERMINAL (/dev/tty, or CON on Windows), NOT
-        stdout - so a redirected or tee'd stdout (a setup log, CI output) can't capture it. Falls
-        back to stdout when there is no controlling terminal (then --recovery-out is the safe
-        channel)."""
+        stdout - so a redirected or tee'd stdout (a setup log, CI output) can't capture it. With no
+        controlling terminal (cloud-init, a CI job, a service) it goes to a new file only this user can read
+        (_write_secret_file), and stdout names only that file - or, with `kept_in` (a file the caller writes the
+        secret to anyway, as --recovery-out), only that one. stdout carries the secret only when no file can be
+        written either, and says so.
+
+        On Windows, CON opens, and takes the secret, for a console nobody sees as well (a program started with no
+        window: a scheduled task, a service's child), and the secret would be lost. There it is shown on the console
+        and also written to such a file, which stdout names (unless `kept_in` holds it already)."""
         dev = "CON" if os.name == "nt" else "/dev/tty"
         try:
             with open(dev, "w", encoding="utf-8") as tty:
                 tty.write(text + "\n")
-                return
+            shown = True
         except OSError:
-            print(text)
+            shown = False
+        what = label.replace("-", " ")
+        if shown:
+            if os.name == "nt" and not kept_in:
+                path = self._write_secret_file(label, text)
+                if path:
+                    print(self.pal.paint("  The %s is also in %s, which only you can read (a console window may not "
+                                         "show it). Keep it somewhere safe, then delete that file." % (what, path),
+                                         "yellow"))
+                else:
+                    print(self.pal.paint("  The %s was shown on the console only: no file could be written to keep "
+                                         "it as well." % what, "yellow"))
+            return
+        if kept_in:
+            print(self.pal.paint("  No terminal to show the %s on: it is written to %s only." % (what, kept_in),
+                                 "yellow"))
+            return
+        path = self._write_secret_file(label, text)
+        if path:
+            print(self.pal.paint("  No terminal to show the %s on: it is in %s, which only you can read. Read it, "
+                                 "keep it somewhere safe, then delete that file." % (what, path), "yellow"))
+            return
+        print(self.pal.paint("  WARNING: no terminal, and no file could be written, to take the %s: it is printed "
+                             "here, so remove it from any log this output reaches." % what, "red"))
+        print(text)
+
+    def _write_secret_file(self, label, text):
+        """Write a one-time secret (`text`, colour codes removed) to a new file of its own in this user's DockVault
+        application-data folder (beside the default backups, never in the checkout, which the image build copies
+        and git tracks): created mode 600, never over a file already there, the folder made 0700 if the tool makes
+        it. Returns its path, or None when it cannot be written."""
+        folder = os.path.join(os.path.dirname(_app_data_backup_root()), "secrets")
+        try:
+            if not os.path.isdir(folder):
+                os.makedirs(os.path.dirname(folder), exist_ok=True)
+                try:
+                    os.mkdir(folder, 0o700)
+                    if os.name != "nt":
+                        os.chmod(folder, 0o700)
+                except FileExistsError:
+                    pass
+            plain = re.sub("\x1b\\[[0-9;]*m", "", text).strip("\n") + "\n"
+            base = os.path.join(folder, "%s-%s" % (label, _timestamp()))
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            for n in range(100):
+                path = base if n == 0 else "%s-%d" % (base, n)
+                try:
+                    fd = os.open(path, flags, 0o600)
+                except FileExistsError:
+                    continue
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(plain)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except OSError:
+                    try:
+                        os.remove(path)          # no part of a secret is left in a file nobody was told of
+                    except OSError:
+                        pass
+                    raise
+                tighten_secret_file(path)
+                return path
+        except OSError:
+            return None
+        return None
 
     def _show_recovery_key(self, dek, args):
         key = dek.decode("ascii") if isinstance(dek, (bytes, bytearray)) else str(dek)
         pal = self.pal
-        # Show the key + its guidance on the controlling terminal only (see _emit_secret).
+        out = getattr(args, "recovery_out", None)
+        # --recovery-out is written first, so that nothing says the key is there before it is. A file that cannot
+        # be written is said so, and the key goes where it would go without one.
+        written = False
+        if out:
+            try:
+                self._atomic_write_secret(out, key + "\n")
+                written = True
+            except OSError as exc:
+                print(pal.paint("  WARNING: could not write the recovery key to %s (%s): it is shown as without "
+                                "--recovery-out instead." % (out, exc), "red"))
+        # Show the key + its guidance on the controlling terminal only (see _emit_secret); with no terminal, in
+        # --recovery-out when it was written, else in a file of its own.
         self._emit_secret("\n".join([
             pal.paint("\n  ===== CREDENTIAL RECOVERY KEY (shown once) =====", "bold", "yellow"),
             "    " + pal.paint(key, "bold"),
             pal.paint("  Save this in a password manager. It unlocks .env if you forget the passphrase.\n"
                       "  It does NOT recover vault files or deployments. If you lose BOTH this key and the\n"
                       "  passphrase, every stored file becomes permanently unrecoverable.", "yellow"),
-        ]))
-        out = getattr(args, "recovery_out", None)
-        if out:
-            self._atomic_write_secret(out, key + "\n")
+        ]), label="recovery-key", kept_in=out if written else None)
+        if written:
             print(pal.paint("  Also written to %s - move it OFF this host, then delete it here." % out,
                             "yellow"))
 
@@ -3930,9 +4719,20 @@ class DockVault:
             passphrase = self._read_passphrase(args, confirm=False)
             try:
                 with open(enc_path, encoding="utf-8") as f:
-                    _, dek = env_lock_open(fernet, f.read(), passphrase=passphrase)
+                    sealed_bytes, dek = env_lock_open(fernet, f.read(), passphrase=passphrase)
             except EnvLockError as exc:
                 print(pal.paint("  Cannot re-lock: %s." % exc, "red"))
+                raise SystemExit(2)
+            # Re-locking writes over .env.enc, so it may only seal the same set's .env again (an edited one).
+            # The .env of another set (another VAULT_VOLUME_PREFIX, or another ENCRYPTION_KEY) sealed over it
+            # would leave the sealed set's ENCRYPTION_KEY nowhere: its volumes could never be read again.
+            other = sealed_set_differs(sealed_bytes, env_bytes)
+            if other:
+                print(pal.paint(
+                    "  Refusing to lock: .env.enc holds the .env of another set (%s), and sealing this .env over it "
+                    "would lose that set's keys. Keep it first: move .env.enc somewhere safe (it still opens with "
+                    "its passphrase or recovery key), then run lock again to seal this .env under a passphrase of "
+                    "its own. Nothing changed." % other, "red"))
                 raise SystemExit(2)
         else:
             print(pal.paint(
@@ -4009,12 +4809,60 @@ class DockVault:
         if getattr(args, "show_recovery_key", False):
             self._show_recovery_key(dek, args)
             return
-        if os.path.exists(env_path) and not getattr(args, "force", False):
-            print(pal.paint("  .env already exists; refusing to overwrite. Re-run with --force to replace it.",
-                            "red"))
-            raise SystemExit(2)
+        kept = None
+        if os.path.exists(env_path):
+            if not getattr(args, "force", False):
+                print(pal.paint("  .env already exists; refusing to overwrite. Re-run with --force to replace it.",
+                                "red"))
+                raise SystemExit(2)
+            kept = self._keep_env_before_unlock(env_bytes)
+            if kept is False:
+                print(pal.paint("  .env already reads as the sealed one; nothing was changed.", "green"))
+                return
         self._atomic_write_secret(env_path, env_bytes)
         print(pal.paint("  Unlocked: .env.enc -> .env.", "green"))
+        if kept:
+            prefix = volume_prefix(parse_env(env_bytes.decode("utf-8", "replace")))
+            arg = '"%s"' % kept if any(c.isspace() for c in kept) else kept
+            print(pal.paint("  The .env it replaced is kept as %s. To go back to it: python dockvault.py volumes "
+                            "--non-interactive --action repoint --target-prefix %s --env-source %s"
+                            % (kept, prefix, arg), "yellow"))
+
+    def _keep_env_before_unlock(self, env_bytes):
+        """`unlock --force` writes the sealed .env (`env_bytes`) over the .env there, which may be the only copy of
+        its set's keys. Returns False when that .env already reads as the sealed one (nothing to write). Refuses, with
+        nothing changed, when it is another set's (another VAULT_VOLUME_PREFIX or ENCRYPTION_KEY: sealed_set_differs),
+        whose keys the overwrite would leave nowhere. Otherwise (the same set's .env, edited since the lock) keeps it
+        first as .env.<prefix>[.n] (_keep_env_copy) and returns the copy's path. A .env that cannot be read or kept
+        is not replaced."""
+        env_path = self._env_path()
+        try:
+            with open(env_path, "rb") as f:
+                current = f.read()
+        except OSError as exc:
+            self._fail("could not read the current .env (%s), so it was not replaced. Nothing changed." % exc)
+        if current == bytes(env_bytes):
+            return False
+        prefix = volume_prefix(parse_env(current.decode("utf-8", "replace")))
+        label = prefix if valid_volume_prefix(prefix) else "before-unlock"
+        other = sealed_set_differs(env_bytes, current)
+        if other:
+            aside = next(env_copy_names(self.root, label))
+            self._fail(".env.enc holds the .env of another set (%s): unlocking it over .env would leave the keys of the "
+                       "set .env opens (its ENCRYPTION_KEY and database password) nowhere. Nothing changed. To switch "
+                       "this host to the sealed set, first move .env to %s (a name Volumes' repoint finds it by), "
+                       "then run unlock again; to come back to set '%s' later: python dockvault.py volumes "
+                       "--non-interactive --action repoint --target-prefix %s --env-source %s. If .env.enc is an old "
+                       "seal nobody needs, move it somewhere safe instead and lock this .env under a passphrase of "
+                       "its own." % (other, aside, prefix, prefix, aside))
+        try:
+            kept = self._keep_env_copy(label, current)
+        except OSError as exc:
+            self._fail("could not keep the current .env as %s (%s), so it was not replaced. Nothing changed."
+                       % (getattr(exc, "kept_as", None) or next(env_copy_names(self.root, label)), exc))
+        print(self.pal.paint("  Kept the current .env (set '%s') as %s before unlocking over it." % (prefix, kept),
+                             "cyan"))
+        return kept
 
     def change_passphrase(self, args=None):
         """Set a NEW unlock passphrase for .env.enc, keeping the same data key and recovery key.
@@ -4065,10 +4913,15 @@ class DockVault:
         if not os.path.exists(self._env_path()):
             print(pal.paint("  No .env - run 'setup' first (or 'unlock' if it is sealed).", "red"))
             raise SystemExit(2)
+        self._refuse_incomplete_restore("start")
         ok, msg = docker_available()
         if not ok:
             print(pal.paint("  Docker is not available: %s" % msg, "red"))
             raise SystemExit(2)
+        # A deployment that builds from source is built from the checkout as it is (up --build): never one older than
+        # the version the deployment has run, whose image would not start on the newer data (as restart and setup).
+        if not uses_release_image(self._load_env()):
+            self._refuse_older_build("start")
         profiles = self._load_env().get("COMPOSE_PROFILES", "combined")
         print(pal.paint("  Starting the deployment ...", "cyan"))
         if not self._start_secure_stack():
@@ -4172,11 +5025,59 @@ class DockVault:
         """Recreate the deployment (compose down + start, health-checked) so a changed .env takes
         effect. Data volumes are untouched. No prompt: this is an explicit in-place action, not the
         standalone `down`. A container-log rotation Docker would refuse stops it before anything is
-        taken down."""
+        taken down, and so does a published release image that is neither here nor can be pulled: it is
+        made present BEFORE the containers are removed, so a host without the registry (offline, an
+        outage, a rate limit) keeps the deployment it has rather than being left with nothing running. A deployment
+        that builds from source is built from the checkout as it is, BEFORE anything is taken down, for the same
+        reason: a build that fails (no network for the base image or the packages, a broken checkout) leaves the
+        deployment running as it is. A checkout older than the version the deployment has run is refused before
+        that (_refuse_older_build): its image would not start on the newer data."""
         if not self._container_logs_readable():
             raise SystemExit(1)
+        if os.path.exists(self._env_path()):
+            self._refuse_incomplete_restore("restart")
+            if uses_release_image(self._load_env()):
+                if not self._ensure_release_image():
+                    print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.",
+                                         "yellow"))
+                    raise SystemExit(1)
+            else:
+                self._refuse_older_build("restart")
+                if not self._build_checkout():
+                    print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.",
+                                         "yellow"))
+                    raise SystemExit(1)
         self._tear_down_containers()
         self.start(args)
+
+    def _build_checkout(self):
+        """`docker compose build`: the images of a deployment that builds from source, built from the checkout as it
+        is (start's `up --build` then finds them built). True when the build succeeded."""
+        print(self.pal.paint("  Building this checkout before anything is taken down ...", "cyan"))
+        try:
+            r = self._run_dc("build", capture=False, timeout=1800)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(self.pal.paint("  docker compose build failed: %s" % exc, "red"))
+            return False
+        if getattr(r, "returncode", 1) != 0:
+            print(self.pal.paint("  The build failed (Docker's output is above).", "red"))
+            return False
+        return True
+
+    def _refuse_older_build(self, command):
+        """Stop `command`, which builds this checkout and starts it, when this checkout's VERSION is older than the
+        version the deployment has run (_running_version): the older code would go back over data a newer version
+        wrote (an image from 0.33.1 on refuses to start on it, and the deployment would be left with nothing
+        running). Going back is update's to do, with its checks. Nothing was built or taken down."""
+        version = read_version_file(self.root)
+        if not parse_semver(version):
+            return
+        running, source = self._running_version()
+        if parse_semver(running) and parse_semver(version) < parse_semver(running):
+            self._fail("%s would build and start this checkout at %s, which is older than %s, the version this "
+                       "deployment has run (from %s). It does not go back to an older version: python dockvault.py "
+                       "update --tag v%s does, after it checks what the data holds that %s cannot read. Nothing was "
+                       "built or taken down." % (command, version, running, source, version.lstrip("vV"), version))
 
     def status(self, args=None):
         """Show credential lock state + container/health/port status (read-only)."""
@@ -4219,9 +5120,14 @@ class DockVault:
         """Configure + start the standalone HTTPS vault: author (or reuse) .env, provision a TLS
         certificate (self-signed / Let's Encrypt / bring-your-own, with rootless-cert-perm handling),
         then start the secure stack — pulling the published release image or building this
-        checkout, per the .env's DOCKVAULT_IMAGE (see _resolve_setup_image)."""
+        checkout, per the .env's DOCKVAULT_IMAGE (see _resolve_setup_image). Refused while .env is sealed by
+        `lock` (_refuse_while_locked)."""
         pal = self.pal
+        self._refuse_while_locked("setup")
+        self._read_cli_admin_password(args)
         no_start = bool(args and getattr(args, "no_start", False))
+        if not no_start:
+            self._refuse_incomplete_restore("setup")
         # "Start" rather than "Build + start": the deployment may be pulling a published release
         # rather than building, and for a fresh install the choice is not made until Settings.
         steps = ["Settings", "Write .env", "Certificate"] + ([] if no_start else ["Start", "Health check"])
@@ -4283,6 +5189,12 @@ class DockVault:
         cert_dir = self._certs_dir()
         if _cert_pair_present(cert_dir):
             print(pal.paint("  Certificates already present - keeping them (repairing ownership).", "green"))
+            # A kept Let's Encrypt certificate keeps the renewal hook an earlier version wrote for it: brought to the
+            # one this version writes (as root), or the operator is told how.
+            outcome, said = refresh_renewal_hook(self.root, cert_dir,
+                                                 self._web_service(summary.get("compose_profiles")))
+            if said:
+                print(pal.paint("  " + said + ".", "green" if outcome == "rewritten" else "yellow"))
         else:
             server = summary.get("server_name") or "localhost"
             if not validate_server_name(server):   # re-validate a reused .env's SERVER_NAME before it hits openssl
@@ -4304,7 +5216,7 @@ class DockVault:
         # Lock the key file (icacls/chmod), then make it readable by the container uid (POSIX chown;
         # repairs a reused or root-owned pair too).
         key = os.path.join(cert_dir, "key.pem")
-        if os.path.exists(key) and not tighten_secret_file(key):
+        if os.path.exists(key) and not tighten_secret_file(key) and not _key_already_private(key):
             print(pal.paint("  WARNING: could not restrict the TLS key's permissions.", "yellow"))
         owner_ok, owner_msg = apply_cert_owner(cert_dir)
         if owner_msg:
@@ -4335,6 +5247,9 @@ class DockVault:
         # a pointless plaintext-secret file.
         if not self._guard_db_secret(env_now, interactive=interactive, env_is_fresh=not reusing):
             raise SystemExit(1)   # the guard already printed the diagnosis + recovery paths
+        # The set setup starts is the one that .env names now: pointed at another set's .env by the guard's menu, it
+        # may be a set whose restore did not finish, which the check at setup's start never saw.
+        self._refuse_incomplete_restore("setup", notes=False)
         # The interactive guard can install a different .env or author a fresh set. Re-read it,
         # persist any supported legacy profile, and refresh every profile/port value used below.
         try:
@@ -4673,6 +5588,33 @@ class DockVault:
             tighten_secret_file(path)
         return removed
 
+    def _read_cli_admin_password(self, args):
+        """Take the first admin's password from --admin-password-file (its first line) or --admin-password-stdin (one
+        line) into args.admin_password, which the rest of setup reads; warn when it came as --admin-password, a value
+        other users of the host can read in the process list and the shell keeps in its history. A file that cannot
+        be read, or holds no password, stops setup before it writes anything."""
+        if args is None:
+            return
+        pf = getattr(args, "admin_password_file", None)
+        if pf:
+            try:
+                with open(pf, encoding="utf-8") as f:
+                    value = f.readline().rstrip("\r\n")
+            except OSError as exc:
+                self._fail("cannot read --admin-password-file %s: %s" % (pf, exc))
+            if not value:
+                self._fail("--admin-password-file %s holds no password on its first line" % pf)
+            args.admin_password = value
+        elif getattr(args, "admin_password_stdin", False):
+            value = sys.stdin.readline().rstrip("\r\n")
+            if not value:
+                self._fail("--admin-password-stdin read no password from standard input")
+            args.admin_password = value
+        elif getattr(args, "admin_password", None):
+            print(self.pal.paint("  WARNING: --admin-password puts the password on the command line, where other users "
+                                 "of this host can read it (the process list) and your shell history keeps it. Prefer "
+                                 "--admin-password-file or --admin-password-stdin.", "yellow"))
+
     def _apply_cli_admin_overrides(self, path, env, args):
         """On a setup reuse, write an EXPLICIT --admin-password/--admin-username/--admin-email into the
         reused .env so it can seed a not-yet-bootstrapped set (harmless on a bootstrapped one). Returns
@@ -4710,7 +5652,7 @@ class DockVault:
         sealed lock file. These are set aside by 'new set' / repoint / remove and still hold an
         ENCRYPTION_KEY; 'lock' does not manage them, so the tool surfaces them instead."""
         out = []
-        for p in glob.glob(os.path.join(self.root, ".env.*")):
+        for p in glob.glob(os.path.join(glob.escape(self.root), ".env.*")):
             base = os.path.basename(p)
             if base in (".env.example", ".env.enc") or not os.path.isfile(p):
                 continue
@@ -4802,6 +5744,20 @@ class DockVault:
             kw.setdefault("capture_output", True)
         return subprocess.run(self._dc(*args), stdin=subprocess.DEVNULL, **kw)
 
+    def _refuse_setup_downgrade(self, version, what):
+        """Stop a setup re-run that would start `version` (this checkout's VERSION) when the deployment has run a newer
+        one (_running_version: the running container, or its best guess), before .env or the stack is changed. Going
+        back over data a newer version wrote is update's to do: it asks the running version what the older one
+        cannot read, and refuses what nothing would check."""
+        if not parse_semver(version):
+            return
+        running, source = self._running_version()
+        if parse_semver(running) and parse_semver(version) < parse_semver(running):
+            self._fail("this re-run would %s %s, which is older than %s, the version this deployment has run (from %s). "
+                       "Setup does not go back to an older version: python dockvault.py update --tag v%s does, after "
+                       "it checks what the data holds that %s cannot read. The image source and the stack were left "
+                       "as they were." % (what, version, running, source, version.lstrip("vV"), version))
+
     def _resolve_rerun_image_source(self, env_path, args, interactive):
         """On a setup RE-RUN, let the operator confirm or CHANGE the image mode (pull the published
         release vs. build the current checkout), then repoint .env accordingly.
@@ -4836,6 +5792,14 @@ class DockVault:
                     print(pal.paint("  %s is not published (this checkout is ahead of the latest "
                                     "release); keeping %s." % (candidate, describe_image_mode(env)), "yellow"))
                     choice = ""
+        # What the re-run is about to start is this checkout's VERSION when it pulls that release or builds this
+        # checkout (a kept local build is built again). That can be older than what this deployment has run (a
+        # deployment updated by pull leaves VERSION where it was; an older checkout): setup would then go back over
+        # the data with none of update's checks. So the same rule as update: setup never goes back to an older
+        # version, update does (_refuse_setup_downgrade).
+        if choice in ("release", "build") or (not choice and not uses_release_image(env)):
+            self._refuse_setup_downgrade(version, "pull the published release of" if choice == "release"
+                                         else "build and start this checkout at")
         action, value = rerun_image_target(env, choice, version)
         if action == "set":
             self._set_env_key(env_path, "DOCKVAULT_IMAGE", value)
@@ -4847,15 +5811,27 @@ class DockVault:
         """Start/recreate the deployment the current .env describes.
 
         Builds the local Dockerfile UNLESS .env pins a published release image, in which case the
-        image is PULLED and the stack recreated without --build. Setup re-runs go through here, so
-        without the check the documented "re-run setup to upgrade" path would rebuild over a
-        release image an operator deliberately chose — the same clobber the Update menu's pull path
-        already avoids."""
+        image is used as it is when already here (pulled only when not: _ensure_release_image) and the
+        stack recreated without --build. Setup re-runs go through here, so without the check the
+        documented "re-run setup to upgrade" path would rebuild over a release image an operator
+        deliberately chose — the same clobber the Update menu's pull path already avoids."""
         if not self._container_logs_readable():
             return False
         if uses_release_image(self._load_env()):
-            return self._pull_release_image() and self._recreate_stack(build=False)
+            return self._ensure_release_image() and self._recreate_stack(build=False)
         return self._recreate_stack(build=True)
+
+    def _ensure_release_image(self):
+        """The release image .env pins, made present: used as it is when Docker already has it, pulled otherwise.
+        A start or a restart then needs no registry when the image is here (offline, a registry outage or rate limit),
+        and does not fetch the tag again each time it starts: a start or a restart never moves the deployment to
+        another image (update does, with its gates; a restore starts the image the backup's .env names; a setup
+        re-run can start this checkout's version). True when the image is here."""
+        image = (self._load_env().get("DOCKVAULT_IMAGE") or "").strip()
+        if image_present(image):
+            print(self.pal.paint("  Using %s, already on this host (no pull)." % image, "cyan"))
+            return True
+        return self._pull_release_image()
 
     def _container_logs_readable(self):
         """False, having said why, when .env sets a container-log rotation Docker would refuse: the stack is
@@ -4902,7 +5878,13 @@ class DockVault:
     def _recreate_stack(self, build):
         """Recreate the stack. build=True builds the local Dockerfile (setup / from-source update);
         build=False recreates from the already-present image (the pull-update path - must NOT rebuild,
-        or it would overwrite the just-pulled release image with a local build)."""
+        or it would overwrite the just-pulled release image with a local build).
+
+        Never for a set whose restore did not finish (RESTORE_INCOMPLETE), whatever asked: every `up` of the stack
+        comes here, and each command that starts the set refuses before it changes anything, so this one is the
+        backstop (SystemExit, with nothing touched). A restore starts the set it restored only once it has removed
+        that set's marker."""
+        self._refuse_incomplete_restore(None, notes=False)
         if not self._container_logs_readable():
             return False
         if not self._remove_inactive_profile():
@@ -4949,6 +5931,15 @@ class DockVault:
         self._db_was_running = container_running(DB_CONTAINER)
         if self._db_was_running:
             return self._live_db_serves_guarded_volume()
+        # Nor is the database of a set whose restore did not finish (RESTORE_INCOMPLETE) started: its volume may hold
+        # part of a backup, or nothing (in which postgres would make a new, empty database). The check of .env then
+        # has no answer, and says why.
+        prefix = volume_prefix(self._load_env())
+        found = self._incomplete_restores()
+        if prefix in found:
+            print(self.pal.paint("  The database of set '%s' was not started to check .env: %s"
+                                 % (prefix, self._incomplete_restore_text(prefix, found[prefix])), "red"))
+            return False
         try:
             r = self._run_dc("up", "-d", DB_CONTAINER, capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError):
@@ -5056,14 +6047,19 @@ class DockVault:
         return False
 
     def _guard_db_secret(self, env, interactive=False, exists_fn=None, start_fn=None, wait_fn=None,
-                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None, env_is_fresh=False):
+                         probe_fn=None, stop_fn=None, marker_fn=None, stamp_fn=None, env_is_fresh=False,
+                         canary_fn=None):
         """Guardrail against the 'existing volume + wrong .env' footgun. No-op (True) for a fresh
         volume. NON-interactive (a script): auto-verify the current .env's DB password and FAIL CLOSED
         on a mismatch/ambiguous result. INTERACTIVE: do NOT auto-wait - present choices (verify / point
         at a .env / new set / destroy / cancel) and run the ~30s DB probe only if the operator asks.
         Never prints a secret. The *_fn hooks are injectable for tests. env_is_fresh flags a .env this
-        setup run just authored and never used, so the interactive 'new set' option can discard it."""
+        setup run just authored and never used, so the interactive 'new set' option can discard it.
+        With the real password probe, a .env whose password opens the volume has its ENCRYPTION_KEY checked
+        too, against the key check the vault keeps in its database (_key_canary_verdict; canary_fn stands in
+        for it in tests): a copy of another .env can share the password and not the key."""
         exists_fn = exists_fn or volume_exists
+        self._canary_check = canary_fn or (self._key_canary_verdict if probe_fn is None else None)
         vol = "%s_vault_pg_data" % volume_prefix(env)
         if not exists_fn(vol):
             return True   # brand-new volume: the .env password is baked in on first init
@@ -5103,7 +6099,8 @@ class DockVault:
                         "(~20-40s)...", "cyan"), flush=True)
         if not start_fn():
             stop_fn()
-            print(pal.paint("  The database container did not start (the docker output is above).", "yellow"))
+            print(pal.paint("  The database container did not start (Docker's output, or why it was not started, is "
+                            "above).", "yellow"))
             return "ambiguous"
         print(pal.paint("  Waiting for the database to accept connections...", "cyan"), flush=True)
         if not wait_fn():
@@ -5113,10 +6110,33 @@ class DockVault:
         print(pal.paint("  Authenticating VAULT_DB_PASSWORD against the stored database (vault-db)...",
                         "cyan"), flush=True)
         result = probe_fn(DB_CONTAINER, PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+        # The password opens the database; ENCRYPTION_KEY is the other half of the pairing, and the one whose loss
+        # is final. With the database up, its key check is read too: one sealed under another key refuses the .env.
+        # No check there yet (an app never started on this set) or none readable is not a refusal: the app's own
+        # check refuses to start under a wrong key. It is not a check either, so the pairing is not stamped: a stamp
+        # would answer every later check of this .env, and its key would never be checked here again.
+        key_unchecked = False
+        if result == "ok" and self._canary_check is not None:
+            print(pal.paint("  Checking ENCRYPTION_KEY against the key check in the database...", "cyan"), flush=True)
+            verdict = self._canary_check(env)
+            if verdict == "mismatch":
+                result = "encryption_key_mismatch"
+            elif verdict != "ok":
+                key_unchecked = True
+                print(pal.paint("  The database holds no key check yet, or none could be read: the next check of "
+                                "this .env reads it again.", "cyan"), flush=True)
         stop_fn()
-        if result == "ok":
+        if result == "ok" and not key_unchecked:
             stamp_fn(vol, env)   # best-effort: make the next check instant
-        return result if result in ("ok", "mismatch") else "ambiguous"
+        return result if result in ("ok", "mismatch", "encryption_key_mismatch") else "ambiguous"
+
+    def _key_canary_verdict(self, env):
+        """'ok' when the key check in the running vault-db opens under env's ENCRYPTION_KEY, 'mismatch' when it does
+        not, 'unknown' when there is none yet or it cannot be read (read_key_canary, fernet_token_signed_by)."""
+        token = read_key_canary(DB_CONTAINER, PG_USER, PG_DB, env.get("VAULT_DB_PASSWORD", ""))
+        if not token:
+            return "unknown"
+        return "ok" if fernet_token_signed_by(env.get("ENCRYPTION_KEY", ""), token) else "mismatch"
 
     def _resolve_existing_volume(self, env, vol, hooks, env_is_fresh=False):
         """Interactive menu shown when an existing data volume is found. NOTHING starts until the
@@ -5151,17 +6171,37 @@ class DockVault:
                 if not os.path.exists(src):
                     print(pal.paint("  No file at %s." % src, "red"))
                     continue
+                # The current .env is the only key to the set it names: kept first, as a restore keeps it, unless
+                # this run just authored it and it never opened anything (env_is_fresh).
+                if not env_is_fresh:
+                    try:
+                        kept = self._keep_env_before_replacing(src)
+                    except OSError as exc:
+                        print(pal.paint("  Could not keep the current .env (%s), so it was not replaced. Pick "
+                                        "another option." % exc, "red"))
+                        continue
+                    if kept:
+                        print(pal.paint("  Kept the current .env as %s before installing that one." % kept, "cyan"))
                 _copy_secret(src, self._env_path())
                 tighten_secret_file(self._env_path())
+                # The installed .env may name another volume set: from here on the menu is about that set's volume,
+                # the one every option now acts on (verify, and down -v, which deletes the volumes of the set .env
+                # names), whatever happens next.
+                env = self._load_env()
+                env_is_fresh = False     # a real, operator-supplied .env now - never discard it
+                chosen = "%s_vault_pg_data" % volume_prefix(env)
+                if chosen != vol:
+                    vol = chosen
+                    print(pal.paint("  That .env is for another volume set: the choices below are now about %s."
+                                    % vol, "yellow"))
                 try:
                     self._normalize_compose_profile()
                 except (OSError, ValueError) as exc:
                     print(pal.paint("  That .env is not deployable: %s." % exc, "red"))
                     continue
-                env = self._load_env()   # the installed .env may name a different volume set
-                env_is_fresh = False     # a real, operator-supplied .env now - never discard it
+                env = self._load_env()
                 print(pal.paint("  Installed that .env; verifying it...", "cyan"))
-                if self._try_verify(env, "%s_vault_pg_data" % volume_prefix(env), hooks):
+                if self._try_verify(env, vol, hooks):
                     return True
             elif choice == "3":
                 self._new_set_from(env, current_env_is_fresh=env_is_fresh)
@@ -5188,10 +6228,30 @@ class DockVault:
             print(pal.paint("  That .env's VAULT_DB_PASSWORD does NOT match this volume - pick another option.", "red"))
         elif result == "encryption_key":
             print(pal.paint("  That .env's ENCRYPTION_KEY isn't a valid key; stored files couldn't be decrypted.", "red"))
+        elif result == "encryption_key_mismatch":
+            print(pal.paint("  That .env's VAULT_DB_PASSWORD opens this volume, but its ENCRYPTION_KEY is not the key "
+                            "the stored data was sealed with - pick another option.", "red"))
         else:
             print(pal.paint("  Couldn't verify (the database didn't start/respond in time) - NOT a confirmed "
                             "mismatch. Try again, or pick another option.", "yellow"))
         return False
+
+    def _keep_env_before_replacing(self, src):
+        """Keep the current .env, before setup installs the .env at `src` over it, as .env.<the set it names> (or
+        .env.<prefix>.<n>, numbered after the copies there; never over a file already there: _keep_env_copy).
+        Returns the copy's path, or None
+        when there is no .env or it already reads as `src` (nothing would be lost). Raises OSError when it cannot be
+        kept: the caller then does not replace it."""
+        env_now = self._env_path()
+        if not os.path.exists(env_now):
+            return None
+        with open(env_now, "rb") as f:
+            current = f.read()
+        with open(src, "rb") as f:
+            if f.read() == current:
+                return None
+        prefix = volume_prefix(parse_env(current.decode("utf-8", "replace")))
+        return self._keep_env_copy(prefix if valid_volume_prefix(prefix) else "before-setup", current)
 
     def _new_set_from(self, env, current_env_is_fresh=False):
         """Author a fresh set (new prefix + secrets) with its own .env. The old data is left untouched
@@ -5221,19 +6281,35 @@ class DockVault:
             # Show the freshly-generated admin password on the controlling terminal only (like the
             # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
             self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
-                                        % cfg["admin_password"], "bold", "yellow"))
+                                        % cfg["admin_password"], "bold", "yellow"), label="admin-password")
 
     def _destroy_data(self, vol):
-        """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined."""
+        """Strong-confirm + docker compose down -v. True to proceed (destroyed), False if declined. `down -v` deletes the
+        volumes of the set the installed .env names, so it runs only when that is the set of `vol`, the volume the
+        operator is asked about: never against another set's."""
         pal = self.pal
+        named = "%s_vault_pg_data" % volume_prefix(self._load_env())
+        if named != vol:
+            print(pal.paint("  Refusing to delete: .env now names the set of %s, not %s, and down -v deletes the "
+                            "volumes of the set .env names. Nothing was deleted." % (named, vol), "red"))
+            return False
         flush_stdin()
         if not confirm("This PERMANENTLY deletes the data in %s. Continue?" % vol, pal, default=False):
             print(pal.paint("  Nothing was deleted.", "yellow"))
             return False
         try:
-            self._run_dc("down", "-v", "--remove-orphans", capture=False, timeout=180)
+            r = self._run_dc("down", "-v", "--remove-orphans", capture=False, timeout=180)
         except (OSError, subprocess.SubprocessError) as exc:
             self._fail("teardown failed: %s" % exc)
+        if getattr(r, "returncode", 1) != 0:
+            # The data may survive (a volume still in use, say): setup must not go on as if it were gone, or it would
+            # start on a volume the current .env may not open.
+            print(pal.paint("  'docker compose down -v' failed (exit %s): the data was NOT destroyed. A volume may "
+                            "still be in use; free it and try again, or pick another option."
+                            % getattr(r, "returncode", "?"), "red"))
+            return False
+        # Its volumes are gone, and with them what a restore that did not finish left in them (as Reset).
+        self._drop_restore_incomplete(volume_prefix(self._load_env()))
         print(pal.paint("  Destroyed the old data; starting fresh with the current .env.", "green"))
         return True
 
@@ -5254,6 +6330,10 @@ class DockVault:
         elif kind == "encryption_key":
             print("  ENCRYPTION_KEY in .env is not a valid key, so files stored in this volume could not")
             print("  be decrypted. It must be the ENCRYPTION_KEY this volume's data was created under.")
+        elif kind == "encryption_key_mismatch":
+            print("  VAULT_DB_PASSWORD in .env opens the stored database, but ENCRYPTION_KEY is not the key its")
+            print("  data was sealed with (the key check the vault keeps in the database does not open with")
+            print("  it): files stored in this volume could not be decrypted, and the vault refuses to start.")
         else:  # ambiguous
             print("  Could NOT verify the .env against the volume (the database did not become reachable")
             print("  in time). Refusing to start rather than risk a broken pairing.")
@@ -5301,7 +6381,9 @@ class DockVault:
         if summary.get("admin_username"):
             print(" Admin login  : %s" % summary["admin_username"])
         if summary.get("admin_password"):
-            print(pal.paint(" Admin passwd : %s   (auto-generated - store it NOW)" % summary["admin_password"], "yellow"))
+            # On the controlling terminal only, never stdout (a setup log, cloud-init's output): _emit_secret.
+            self._emit_secret(pal.paint(" Admin passwd : %s   (auto-generated - store it NOW)" % summary["admin_password"],
+                                        "yellow"), label="admin-password")
         print(pal.paint("\n *** ENCRYPT THE HOST DISK (LUKS / BitLocker / FileVault / encrypted cloud"
                         " volume). ***", "yellow"))
         print(pal.paint("     Names, descriptions, notes and file contents are sealed at rest, but the"
@@ -5385,7 +6467,7 @@ class DockVault:
         disappears mid-scan is skipped rather than crashing the sort."""
         found, seen = [], set()
         for root in self._backup_search_roots(args):
-            for c in glob.glob(os.path.join(root, "dockvault-*")):
+            for c in glob.glob(os.path.join(glob.escape(root), "dockvault-*")):
                 if not os.path.isdir(c):
                     continue
                 ap = os.path.abspath(c)
@@ -5424,18 +6506,53 @@ class DockVault:
         shutil.rmtree(bundle, ignore_errors=True)
         self._fail("%s - the incomplete backup was removed." % msg)
 
+    def _backup_stopped(self, bundle, exc, paused, resumed):
+        """A backup ended (Ctrl-C, or a signal SignalsEndTheRun turned into StoppedBySignal) while it held the
+        deployment paused (`paused`: the services it paused or may have), which its `finally` has resumed by now
+        (`resumed`: _resume_after_backup's answer, None if that was cut short): remove the incomplete bundle (it
+        holds a copy of .env), and say so as far as there is still somewhere to say it (a closed terminal takes no
+        output)."""
+        shutil.rmtree(bundle, ignore_errors=True)
+        what = exc.signal_name() if isinstance(exc, StoppedBySignal) else "Ctrl-C"
+        if not paused:
+            state = "nothing had been paused"
+        elif resumed:
+            state = "the deployment was resumed"
+        elif resumed is None:
+            state = "the deployment may still be paused: run docker unpause %s" % " ".join(paused)
+        else:
+            state = "the deployment could not be resumed (see the warning above)"
+        left = ("and %s, which is not a backup, could not be removed: remove it yourself (it holds a copy of .env)"
+                % bundle if os.path.lexists(bundle) else "and the incomplete backup was removed")
+        try:
+            print(self.pal.paint("\n  The backup was stopped (%s) before it was complete: %s, %s." % (what, state, left),
+                                 "yellow"))
+        except (OSError, ValueError):
+            pass
+
     def _do_backup(self, env, args=None):
         """Dump the current set into ONE bundle dir: the paired .env (mode-600), a tar.gz per data
         volume, and a manifest with a NON-secret coupling fingerprint. Skips a volume that doesn't
-        exist (e.g. brand). Does NOT stop the stack (a running Postgres is crash-consistent for a
-        restore-then-start; note it)."""
+        exist (e.g. brand). The running deployment is paused (not stopped) for as long as its volumes are
+        archived (_pause_for_backup), so the database and the stored files are copies of one moment.
+
+        Refused, with nothing written, while a restore of the set began to replace its volumes and did not finish
+        (RESTORE_INCOMPLETE): they hold part of a backup, and a bundle of them would pass for a whole one, which a
+        restore would put back, its marker gone, and start."""
         pal = self.pal
         prefix = volume_prefix(env)
         if not env:
             self._fail("no .env found - nothing to back up (run Setup first)")
+        found = self._incomplete_restores()
+        if prefix in found:
+            self._fail("set '%s' is not backed up: %s A backup of its volumes now would hold that part of a backup as "
+                       "if it were the whole set. Nothing was written."
+                       % (prefix, self._incomplete_restore_text(prefix, found[prefix])))
         names = set_volume_names(prefix)
         ts = _timestamp()
-        root = self._backup_root(args)
+        # Absolute: the archives are written by a container through `-v <bundle>:/dest`, and Docker takes a source
+        # that is not an absolute path for the name of a volume.
+        root = os.path.abspath(self._backup_root(args))
         bundle = os.path.join(root, "dockvault-%s-%s" % (prefix, ts))
         # The stamp has second resolution, so two backups inside one second want the same
         # directory and the second one dies on FileExistsError. That used to need an operator
@@ -5451,11 +6568,17 @@ class DockVault:
             os.makedirs(bundle)
             # Restrict the whole bundle dir to the owner (makedirs' mode is umask-masked): the volume
             # tar.gz archives inside include the DB dump + key material, so keep them unreadable to
-            # other local users, matching the mode-600 .env copy. (No-op perms on Windows.)
+            # other local users, matching the mode-600 .env copy.
             if os.name != "nt":
                 os.chmod(bundle, 0o700)
         except OSError as exc:
             self._fail("could not create the backup directory %s: %s" % (bundle, exc))
+        # On Windows the folder takes the ACL of where it is made, and a folder outside the user's profile (a second
+        # drive, a share) commonly lets every signed-in user read and change it: it is restricted to this user, SYSTEM
+        # and Administrators before anything is written into it, and what is written inherits that.
+        if os.name == "nt" and not restrict_folder_to_owner(bundle):
+            self._fail_backup(bundle, "could not restrict the backup folder %s to your user (icacls), and its "
+                                      "archives hold the database and the keys" % bundle)
         # the paired .env FIRST, mode-600 (it holds ENCRYPTION_KEY)
         _copy_secret(self._env_path(), os.path.join(bundle, "env"))
         tighten_secret_file(os.path.join(bundle, "env"))
@@ -5483,22 +6606,47 @@ class DockVault:
                 write_kept_key(os.path.join(bundle, KEPT_CHAIN_KEY_BUNDLE), key)
             except OSError as exc:
                 self._fail_backup(bundle, "could not copy %s into the backup (%s)" % (kept, exc))
+        planned = [(role, names[role], "%s.tar.gz" % VOLUME_BASENAMES[role]) for role in BACKUP_ROLES
+                   if volume_exists(names[role])]           # e.g. brand isn't always present
+        # One moment for every volume: the database and the stored files are archived one after the other, and a
+        # file deleted (or uploaded) by the running app between the two would leave a restored row without its file.
+        # So the running deployment is paused (not stopped: its connections wait) until the last archive is
+        # written, and resumed whatever happens. A deployment that is not running is archived as it is.
+        # "Whatever happens" includes the end of the run itself: Ctrl-C, and the signals that would otherwise end the
+        # process without resuming anything (a closed SSH session, kill, a timeout: SignalsEndTheRun), resume the
+        # deployment first; the incomplete backup is then removed (_backup_stopped).
+        paused, maybe_paused, resumed = [], [], None
+        try:
+            with SignalsEndTheRun() as signals:
+                try:
+                    why = self._pause_for_backup(paused, maybe_paused, signals)
+                    if why:
+                        self._fail_backup(bundle, why)
+                    for role, vol, archive in planned:
+                        print(pal.paint("  archiving %s ..." % vol, "cyan"))
+                        if not tar_volume(vol, bundle, archive):
+                            self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
+                finally:
+                    signals.hold()          # a second signal does not cut the resume short
+                    resumed = self._resume_after_backup(paused, maybe_paused)
+        except (StoppedBySignal, KeyboardInterrupt) as exc:
+            self._backup_stopped(bundle, exc, paused + maybe_paused, resumed)
+            raise
         entries = []
-        for role in BACKUP_ROLES:
-            vol = names[role]
-            if not volume_exists(vol):
-                continue                                     # e.g. brand isn't always present
-            archive = "%s.tar.gz" % VOLUME_BASENAMES[role]
-            print(pal.paint("  archiving %s ..." % vol, "cyan"))
-            paused = self._pause_database() if role == "pg" else False
+        for role, vol, archive in planned:
+            # The archive was written by a container through a bind mount, and its exit code says only that the
+            # container's tar finished. Docker can see another folder than this host's under the same path (a daemon
+            # on another host, a confined one), and then nothing reaches the bundle. So the archive must be here, on
+            # this host, not empty, and read through whole, before the backup counts it; its checksum and size go
+            # into the manifest, for the restore to check against.
             try:
-                archived = tar_volume(vol, bundle, archive)
-            finally:
-                if paused:
-                    self._unpause_database()
-            if not archived:
-                self._fail_backup(bundle, "failed to archive volume %s (backup incomplete)" % vol)
-            entries.append({"role": role, "name": vol, "archive": archive})
+                digest, size = check_archive_file(os.path.join(bundle, archive))
+            except ValueError as exc:
+                self._fail_backup(bundle, "the archive of volume %s did not reach the backup folder whole (%s): "
+                                          "the backup is not complete. If Docker runs on another host or in a "
+                                          "confined package, it writes elsewhere; back up to a folder Docker "
+                                          "shares with this host" % (vol, exc))
+            entries.append({"role": role, "name": vol, "archive": archive, "sha256": digest, "size": size})
 
         # Refuse a bundle that captured no data. Skipping a volume that is not there is right for
         # `brand`, which genuinely may not exist -- but the same `continue` used to swallow the
@@ -5552,24 +6700,119 @@ class DockVault:
                             "back beside .env. Finish the change: python dockvault.py audit rekey --old-key-file %s\n"
                             % (kept, " (sealed with its env)" if seal else "", kept), "yellow"))
 
-    def _pause_database(self):
-        """Pause the running database container while its volume is archived, so the copy is one moment's (a
-        tar of a running data directory is not: Postgres keeps writing pages behind it). True when paused."""
-        if not container_running(DB_CONTAINER):
-            return False
-        print(self.pal.paint("  pausing the database while its volume is copied ...", "cyan"))
-        try:
-            r = self._run_dc("pause", "vault-db", timeout=60)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return getattr(r, "returncode", 1) == 0
+    def _pause_for_backup(self, paused, maybe_paused, signals=None):
+        """Pause every running container of the deployment that writes to the volumes a backup archives (the app's,
+        in either layout, and the database), so that every archive is of one moment: a tar of a running data
+        directory is not (Postgres keeps writing pages behind it), and neither is a storage volume archived while the
+        app deletes or adds files after the database was archived. Returns None, or why not when a running one could
+        not be paused.
 
-    def _unpause_database(self):
-        try:
-            self._run_dc("unpause", "vault-db", timeout=60)
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(self.pal.paint("  WARNING: the database could not be resumed (%s): run docker compose unpause "
-                                 "vault-db" % type(exc).__name__, "red"))
+        Each service paused goes into `paused`, and one whose pause may have taken effect without saying so into
+        `maybe_paused`: a pause cut short (a timeout, Ctrl-C), or one whose docker ran and did not answer 0. Both are
+        the caller's lists, which it resumes (_resume_after_backup) however this ends. Each pause runs held (`signals`,
+        SignalsEndTheRun.hold): a signal that comes meanwhile is raised once the pause has answered and its service is
+        in a list. Its docker child runs out of reach of the signals that end the run (own_session_kwargs), which
+        are sent to the run's whole process group."""
+        running = [s for s in BACKUP_PAUSED_SERVICES if container_running(s)]
+        # Docker says a paused container runs. One already paused (by the operator, or left so by a backup that was
+        # killed) writes nothing: it is archived as it is, neither paused again (Docker refuses that, which would
+        # stop the backup) nor resumed afterwards (this backup did not pause it).
+        already = [s for s in running if container_paused(s) is True]
+        if already:
+            one = len(already) == 1
+            print(self.pal.paint("  %s %s paused already: archived as %s, and left paused (docker unpause %s resumes "
+                                 "%s)." % (", ".join(already), "is" if one else "are", "it is" if one else "they are",
+                                           " ".join(already), "it" if one else "them"), "yellow"))
+        running = [s for s in running if s not in already]
+        if not running:
+            return None
+        print(self.pal.paint("  pausing the deployment while its volumes are copied (%s; it does not answer meanwhile)"
+                             " ..." % ", ".join(running), "cyan"))
+        for service in running:
+            if signals is not None:
+                signals.hold()
+            try:
+                try:
+                    r = self._run_dc("pause", service, timeout=60, **own_session_kwargs())
+                except subprocess.TimeoutExpired:
+                    maybe_paused.append(service)
+                    r, said = None, "it did not answer within 60 seconds"
+                except (OSError, subprocess.SubprocessError) as exc:
+                    r, said = None, "it could not be run: %s" % " ".join(str(exc).split())[-200:]
+                except BaseException:
+                    maybe_paused.append(service)
+                    raise
+                if getattr(r, "returncode", 1) != 0:
+                    # A docker that ran and did not answer 0 may have paused it all the same: one a signal ended after
+                    # its request reached Docker (systemd's stop signals every process of the service, whatever its
+                    # session) answers as one Docker refused. Resumed on its own, as a pause cut short is.
+                    if r is not None:
+                        if service not in maybe_paused:
+                            maybe_paused.append(service)
+                        said = (" ".join((getattr(r, "stderr", "") or "").split())[-300:]
+                                or "it answered %s" % getattr(r, "returncode", "?"))
+                    # Docker's own reason, and the way through that needs no pause: a deployment that is not running
+                    # is archived as it is.
+                    return ("could not pause %s for the backup (docker: %s), and the volumes are only copies of one "
+                            "moment while nothing writes to them; nothing was archived. A deployment that is not "
+                            "running is archived as it is: stop it (python dockvault.py stop), back it up (python "
+                            "dockvault.py backup --action backup) and start it again (python dockvault.py start). An "
+                            "update then goes on with --backup-verified; what changes after that backup is not in it"
+                            % (service, said))
+                paused.append(service)
+            finally:
+                if signals is not None:
+                    signals.release()
+        return None
+
+    def _resume_after_backup(self, paused, maybe_paused=()):
+        """Resume what _pause_for_backup paused, and each service that may have paused without saying so on its own
+        (it may never have paused, and Docker then refuses to resume it). A resume Docker did not confirm (an unpause
+        that did not answer 0, or a service Docker does not say is running) is asked about again and, while still
+        paused, tried again (RESUME_RETRIES): the signal that ends the run can end the docker child of the first try,
+        one started in the very moment it comes, or any one under systemd's stop, which signals every process of the
+        service. Says how to do it by hand when Docker would not. Returns True when everything paused is running
+        again (or nothing was), False otherwise. Each docker child runs out of reach of the signals that end the run
+        (own_session_kwargs)."""
+        import time
+        started = time.monotonic()
+        failed = []
+        if paused:
+            try:
+                r = self._run_dc("unpause", *paused, timeout=60, **own_session_kwargs())
+                if getattr(r, "returncode", 1) != 0:
+                    failed.extend(paused)
+            except (OSError, subprocess.SubprocessError):
+                failed.extend(paused)
+        for service in maybe_paused:
+            try:
+                self._run_dc("unpause", service, timeout=60, **own_session_kwargs())
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if container_paused(service) is not False:
+                failed.append(service)
+        for _again in range(RESUME_RETRIES):
+            if not failed or time.monotonic() - started > RESUME_RETRY_SECONDS:
+                break
+            time.sleep(RESUME_RETRY_GAP)
+            still = []
+            for service in failed:
+                if container_paused(service) is False:
+                    continue                    # running: the try before did resume it
+                try:
+                    self._run_dc("unpause", service, timeout=20, **own_session_kwargs())
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                if container_paused(service) is not False:
+                    still.append(service)
+            failed = still
+        if failed:
+            try:
+                print(self.pal.paint("  WARNING: the deployment could not be resumed after the backup: run docker "
+                                     "unpause %s" % " ".join(failed), "red"))
+            except (OSError, ValueError):
+                pass                        # nowhere left to say it (a closed terminal)
+        return not failed
 
     def _seal_bundle_env(self, bundle, args):
         """Seal bundle/env -> bundle/env.enc (envelope encryption; passphrase + one-time recovery key),
@@ -5577,17 +6820,20 @@ class DockVault:
         exact bytes before the plaintext is removed. A seal FAILURE keeps the complete plaintext bundle
         (a valid UNSEALED backup) rather than discarding it. Reuses the same crypto as `dockvault.py
         lock`. The old AUDIT_CHAIN_KEY a bundle carries during an unfinished key change is sealed the same way,
-        under the same data key (so the same passphrase or recovery key opens it), and verified too."""
+        under the same data key (so the same passphrase or recovery key opens it), and verified too. The manifest
+        is authenticated under that data key as well (BUNDLE_MANIFEST_MAC), so that the checksums it records of the
+        archives cannot be changed by anyone without the passphrase or the recovery key."""
         pal = self.pal
         env_file = os.path.join(bundle, "env")
         enc_file = os.path.join(bundle, "env.enc")
         kept_file = os.path.join(bundle, KEPT_CHAIN_KEY_BUNDLE)
         kept_enc = kept_file + ".enc"
+        mac_file = os.path.join(bundle, BUNDLE_MANIFEST_MAC)
 
         def _abort(msg):
             # A failed OPTIONAL seal must NOT destroy the complete plaintext bundle: drop any partial
             # env.enc and keep {env, volumes, manifest} -- it restores normally, just unsealed.
-            for partial in (enc_file, kept_enc):
+            for partial in (enc_file, kept_enc, mac_file):
                 try:
                     os.remove(partial)
                 except OSError:
@@ -5614,19 +6860,43 @@ class DockVault:
         passphrase = self._read_passphrase(args, confirm=True)
         import datetime as _dt
         now_iso = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
-        enc_text, dek = env_lock_seal(fernet, env_bytes, passphrase,
+        # The env, and after it the line that says this bundle's manifest is authenticated, naming the bundle's own data
+        # key (sealed_bundle_payload): sealed with the env, it cannot be taken out to make the bundle look like one made
+        # before MACs.
+        dek = fernet.generate_key()
+        payload = sealed_bundle_payload(env_bytes, dek)
+        enc_text, dek = env_lock_seal(fernet, payload, passphrase, dek=dek,
                                       hint=getattr(args, "hint", None), now_iso=now_iso)
         self._atomic_write_secret(enc_file, enc_text)
         # Verify-before-destroy: the freshly written env.enc must decrypt (by passphrase) back to the
         # exact bytes, or _abort keeps the complete plaintext bundle. (The recovery key is the same
-        # DEK this verify confirmed opens the payload, so the recovery-key path is verified too.)
+        # DEK this verify confirmed opens the payload, so the recovery-key path is verified too.) A restore must read
+        # it back as this env with its line, the line naming the key it was opened with.
         try:
             with open(enc_file, encoding="utf-8") as f:
-                check_bytes, _ = env_lock_open(fernet, f.read(), passphrase=passphrase)
-        except EnvLockError as exc:
+                check_bytes, opened_with = env_lock_open(fernet, f.read(), passphrase=passphrase)
+        except (OSError, EnvLockError) as exc:
             _abort("sealed env failed verification (%s)" % exc)
-        if check_bytes != env_bytes:
+        if check_bytes != payload:
             _abort("sealed env did not round-trip")
+        if split_sealed_bundle_payload(check_bytes, opened_with) != (env_bytes, True):
+            _abort("the sealed env does not read back as one whose manifest is authenticated")
+        # The manifest, authenticated under the same data key: the checksums it records of the archives then show not
+        # only damage but any change by whoever can write the bundle without that key (manifest_mac). Written and read
+        # back before the plaintext env goes. (A backup writes its manifest before it seals; a bundle without one is
+        # refused by every restore, so there is nothing to authenticate.)
+        if os.path.lexists(os.path.join(bundle, "manifest.json")):
+            try:
+                with open(os.path.join(bundle, "manifest.json"), "rb") as f:
+                    manifest_bytes = f.read()
+                self._atomic_write_secret(mac_file, json.dumps({"dockvault_manifest_mac": 1,
+                                                                "hmac_sha256": manifest_mac(dek, manifest_bytes)}) + "\n")
+                with open(mac_file, encoding="utf-8") as f:
+                    written = json.load(f).get("hmac_sha256")
+            except (OSError, ValueError, AttributeError) as exc:
+                _abort("the manifest could not be authenticated (%s)" % exc)
+            if not manifest_mac_matches(dek, manifest_bytes, written):
+                _abort("the manifest's MAC did not read back")
         carried = os.path.lexists(kept_file)
         if carried:
             try:
@@ -5662,9 +6932,11 @@ class DockVault:
 
     def _unseal_bundle_env(self, enc_path, args, with_key=False):
         """Decrypt a sealed bundle's env.enc and return the plaintext env BYTES (never written to
-        disk), or (the bytes, the data key) with `with_key`: the data key opens what else the bundle sealed
-        with it. Uses the recovery key when --recovery-key-file/-stdin or --use-recovery-key is given,
-        else the passphrase. A wrong credential fails here, before the restore touches the stack."""
+        disk), or (the bytes, the data key, whether it says its manifest is authenticated) with `with_key`: the data
+        key opens what else the bundle sealed with it, and a bundle sealed since manifests were authenticated says so
+        in its sealed payload (split_sealed_bundle_payload; the line is not part of the env). Uses the recovery key
+        when --recovery-key-file/-stdin or --use-recovery-key is given, else the passphrase. A wrong credential fails
+        here, before the restore touches the stack."""
         fernet = self._require_fernet()
         try:
             with open(enc_path, encoding="utf-8") as f:
@@ -5682,7 +6954,8 @@ class DockVault:
                                                passphrase=self._read_passphrase(args, confirm=False))
         except EnvLockError as exc:
             self._fail("cannot open the sealed backup (%s) - the deployment was NOT touched." % exc)
-        return (env_bytes, dek) if with_key else env_bytes
+        env_bytes, authenticated = split_sealed_bundle_payload(env_bytes, dek)
+        return (env_bytes, dek, authenticated) if with_key else env_bytes
 
     def _carried_chain_key(self, bundle, dek):
         """The old AUDIT_CHAIN_KEY `bundle` carries (a backup taken during an unfinished key change): from its
@@ -5710,6 +6983,107 @@ class DockVault:
         if key is None:
             self._fail("the old AUDIT_CHAIN_KEY this backup carries is not a key - the deployment was NOT touched.")
         return key
+
+    def _recorded_archives(self, manifest):
+        """{archive name: (SHA-256 hex, size)} the backup recorded, for each manifest entry of a known role that has a
+        checksum; {} for a backup made before backups recorded them. Fails on a checksum or size that is not one, on
+        a manifest format this tool does not know, and on a manifest of the format that records every archive's
+        checksum (BACKUP_MANIFEST_FORMAT) that lacks one: only a format-1 manifest, made before checksums, has none."""
+        fmt = manifest_format(manifest)
+        if fmt is None:
+            self._fail("this backup's manifest is of format %r, which this version of the tool does not know - "
+                       "refusing to restore. Nothing changed." % (manifest.get("dockvault_backup"),))
+        out, without = {}, []
+        for e in (manifest.get("volumes") or []):
+            if not isinstance(e, dict) or e.get("role") not in VOLUME_BASENAMES:
+                continue                     # an unknown role is refused below, with the volumes
+            if "sha256" not in e and "size" not in e:
+                without.append(e["role"])
+                continue
+            digest, size = e.get("sha256"), e.get("size")
+            if not (isinstance(digest, str) and ARCHIVE_DIGEST_RE.match(digest)
+                    and isinstance(size, int) and not isinstance(size, bool) and size > 0):
+                self._fail("the backup's manifest records a checksum or size for volume role %r that is not one - "
+                           "refusing to restore. Nothing changed." % e.get("role"))
+            out["%s.tar.gz" % VOLUME_BASENAMES[e["role"]]] = (digest, size)
+        if fmt >= 2 and without:
+            self._fail("this backup's manifest is of the format that records the checksum of every archive, and it "
+                       "records none for %s: it was changed since the backup was made. Refusing to restore; nothing "
+                       "changed." % ", ".join(without))
+        return out
+
+    def _check_manifest_mac(self, bundle, manifest_bytes, dek, has_digests, authenticated=False, fmt=1):
+        """A sealed bundle: its manifest must be the one it was sealed with, proven by the MAC beside it
+        (BUNDLE_MANIFEST_MAC, under the key env.enc was just opened with). Every bundle sealed since manifests were
+        authenticated has one, and says so where nobody without its key can take it out (`authenticated`: its sealed
+        payload, split_sealed_bundle_payload); its manifest also records checksums, in format 2 (`fmt`). Such a bundle
+        without a MAC lost it on the way: refused. One that says none of it was sealed before manifests were
+        authenticated: restored, with a notice."""
+        mac_path = os.path.join(bundle, BUNDLE_MANIFEST_MAC)
+        if not os.path.lexists(mac_path):
+            if authenticated:
+                self._fail("this sealed backup was made with its manifest authenticated (its sealed env says so), "
+                           "but %s, which proves the manifest is the one sealed with it, is missing: refusing to "
+                           "restore. Nothing changed." % BUNDLE_MANIFEST_MAC)
+            if has_digests or fmt >= 2:
+                self._fail("this sealed backup's manifest records the checksums of its archives but %s, which proves "
+                           "the manifest is the one sealed with it, is missing: refusing to restore. Nothing changed."
+                           % BUNDLE_MANIFEST_MAC)
+            print(self.pal.paint(
+                "  Note: this sealed backup was made before backups authenticated their manifest, so nothing shows "
+                "that its manifest and archives are the ones it was sealed with. Restore it only if you are sure "
+                "nobody changed it.", "yellow"))
+            return False
+        try:
+            with open(mac_path, encoding="utf-8") as f:
+                doc = json.load(f)
+            recorded = doc.get("hmac_sha256") if isinstance(doc, dict) else None
+        except (OSError, ValueError):
+            recorded = None
+        if not manifest_mac_matches(dek, manifest_bytes, recorded):
+            self._fail("the manifest of this sealed backup is not the one it was sealed with (its MAC does not match): "
+                       "it was changed since the backup was made. Refusing to restore; nothing changed.")
+        return True
+
+    def _check_bundle_archives(self, bundle, plan, recorded):
+        """Before the restore stops or clears anything, each archive it is about to extract must: read through whole
+        as a tar.gz on this host (check_archive_file); be, byte for byte, the archive the backup made, when the
+        backup recorded its checksum; and be the very file Docker sees through the bind mount the extraction uses
+        (archive_digest_in_docker), so that an extraction cannot fail for want of it after a volume was emptied.
+        Fails with nothing changed otherwise. A backup that recorded no checksums (made before backups did) is
+        restored with a notice, its archives still read through whole. Returns {archive name: its SHA-256 hex as
+        checked here}, which each extraction must read again (untar_volume's `sha256`): the files can change
+        after this check."""
+        pal = self.pal
+        digests = {}
+        checked = [archive for _vol, archive in plan if archive in recorded]
+        if checked and len(checked) != len(plan):
+            self._fail("this backup's manifest records the checksum of some of its archives only, as no backup "
+                       "writes it: it was changed since. Refusing to restore; nothing changed.")
+        print(pal.paint("  Checking the backup's archives before anything is stopped (each is read through) ...",
+                        "cyan"))
+        for vol, archive in plan:
+            path = os.path.join(bundle, archive)
+            try:
+                digest, size = check_archive_file(path)
+            except ValueError as exc:
+                self._fail("the archive for volume %s cannot be restored: %s. Refusing to restore; nothing changed."
+                           % (vol, exc))
+            want = recorded.get(archive)
+            if want is not None and (digest, size) != want:
+                self._fail("%s is not the archive this backup made (its checksum is not the one the backup recorded): "
+                           "it was changed or damaged since the backup. Refusing to restore; nothing changed." % path)
+            seen, why = archive_digest_in_docker(bundle, archive)
+            if seen != digest:
+                self._fail("Docker does not see %s as this host does (%s), and the restore extracts each archive "
+                           "through Docker. Run the restore where Docker shares this folder with the host. Refusing "
+                           "to restore; nothing changed." % (path, why or "it sees another file there"))
+            digests[archive] = digest
+        if plan and not checked:
+            print(pal.paint(
+                "  Note: this backup was made before backups recorded the checksums of their archives: each was read "
+                "through whole, but nothing shows it is the archive the backup made.", "yellow"))
+        return digests
 
     def _do_restore(self, args=None):
         """Restore a bundle: verify the bundle's .env matches its volumes (coupling fingerprint),
@@ -5744,21 +7118,36 @@ class DockVault:
             bundle = cands[int(sel) - 1]
         if not bundle or not os.path.isdir(bundle):
             self._fail("backup bundle not found (pass --bundle-dir)")
+        # Absolute before anything uses it: each archive is extracted through `-v <bundle>:/src`, and Docker takes a
+        # source that is not an absolute path for the name of a volume (an empty one, made there and then).
+        bundle = os.path.abspath(bundle)
         man_path = os.path.join(bundle, "manifest.json")
         env_path = os.path.join(bundle, "env")
         enc_path = os.path.join(bundle, "env.enc")
         # A sealed bundle carries env.enc instead of a plaintext env. Decrypt it into MEMORY here --
         # before manifest/coupling checks and long before the stack is stopped -- so a wrong
         # passphrase/recovery key aborts with the deployment intact and no plaintext ever hits disk.
-        sealed_env_bytes, sealed_dek = None, None
+        sealed_env_bytes, sealed_dek, authenticated = None, None, False
         if not os.path.exists(env_path) and os.path.exists(enc_path):
-            sealed_env_bytes, sealed_dek = self._unseal_bundle_env(enc_path, args, with_key=True)
+            sealed_env_bytes, sealed_dek, authenticated = self._unseal_bundle_env(enc_path, args, with_key=True)
         if not os.path.exists(man_path) or (sealed_env_bytes is None and not os.path.exists(env_path)):
             self._fail("that bundle is missing manifest.json or its env - refusing to restore")
         try:
-            manifest = json.load(open(man_path, encoding="utf-8"))
+            with open(man_path, "rb") as f:
+                manifest_bytes = f.read()
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
         except (OSError, ValueError) as exc:
             self._fail("could not read the manifest: %s" % exc)
+        if not isinstance(manifest, dict):
+            self._fail("the backup's manifest is not one this tool writes - refusing to restore")
+        # What the backup recorded of each archive (its checksum and size), before anything of the manifest is used:
+        # a sealed bundle's manifest is first proven to be the one it was sealed with. Only a bundle that is old by
+        # every sign (format 1, no checksums, and for a sealed one, a sealed env that does not say its manifest is
+        # authenticated) is restored without that proof, with a notice.
+        recorded = self._recorded_archives(manifest)
+        if sealed_dek is not None:
+            self._check_manifest_mac(bundle, manifest_bytes, sealed_dek, bool(recorded), authenticated=authenticated,
+                                     fmt=manifest_format(manifest))
         bundle_env = parse_env(sealed_env_bytes.decode("utf-8") if sealed_env_bytes is not None
                                else open(env_path, encoding="utf-8").read())
         # COUPLING: the bundle's .env must be the one its volumes were created with - never restore
@@ -5806,6 +7195,12 @@ class DockVault:
                            "finished, and this backup carries the key of its own unfinished change. Finish the change "
                            "here (python dockvault.py audit rekey --old-key-file %s), or move that file somewhere "
                            "safe, then restore again. Nothing was changed." % (kept_here, prefix, kept_here))
+        # A restore of this set that began to replace its volumes and did not finish (its marker, RESTORE_INCOMPLETE):
+        # this one replaces them again, and removes the marker once it has installed the backup's .env.
+        was_incomplete = prefix in self._incomplete_restores()
+        if was_incomplete:
+            print(pal.paint("  Note: an earlier restore of set '%s' did not finish (%s): this restore replaces its "
+                            "volumes again." % (prefix, restore_incomplete_path(self.root, prefix)), "yellow"))
         force = bool(getattr(args, "force", False)) if args else False
         existing = [v for v, _ in plan if volume_exists(v)]
         if existing and not force:
@@ -5816,6 +7211,10 @@ class DockVault:
         for vol, archive in plan:
             if not os.path.exists(os.path.join(bundle, archive)):
                 self._fail("the bundle is missing %s (for volume %s) - refusing to restore" % (archive, vol))
+        # And every archive is read through whole, is the one the backup made, and is what Docker sees through the
+        # mount the extraction uses, all before anything is stopped or cleared (_check_bundle_archives). Each
+        # extraction below reads it again and must read the bytes checked here (untar_volume's sha256).
+        digests = self._check_bundle_archives(bundle, plan, recorded)
         # Restore REPLACES the current data with the backup. Confirm loudly for an interactive
         # over-existing restore (mirrors the Reset typed-name gate); --non-interactive --force skips it.
         if existing and interactive:
@@ -5859,17 +7258,58 @@ class DockVault:
             # REPLACE each volume: clear it IN PLACE (keeps the volume + its DockVault labels) then extract
             # the archive. Strictly the RECONSTRUCTED names[role] - never a manifest-supplied name.
             marked = False
+            replaced = []
+
+            def stopped_part_way(why, vol, touched, backup_changed=False):
+                # Every stop from here on: nothing more is cleared or extracted, .env is not installed and the stack
+                # is not started, and the message says what was replaced and the way back. The restore-incomplete
+                # marker says it too, to the next start: it stays (with what was changed) when a volume was, and goes
+                # when none was.
+                changed = list(replaced) + ([vol] if touched and vol and vol not in replaced else [])
+                message = self._restore_stopped_part_way(why, vol, replaced, touched, prefix, current_prefix, bundle,
+                                                         backup_changed=backup_changed,
+                                                         earlier_incomplete=was_incomplete)
+                if changed:
+                    try:
+                        self._mark_restore_incomplete(prefix, bundle, changed, backup_changed)
+                    except OSError:
+                        pass                     # the marker written before the first clear stays
+                if changed or was_incomplete:
+                    message += (" Until set '%s' is restored, %s (%s says why)."
+                                % (prefix, restore_incomplete_refusers("it"), restore_incomplete_path(self.root, prefix)))
+                else:
+                    self._drop_restore_incomplete(prefix)
+                self._fail(message)
+
+            # Before the first volume is touched: the marker that the restore of this set has begun (removed once the
+            # backup's .env is installed). Without it, nothing is changed.
+            try:
+                self._mark_restore_incomplete(prefix, bundle)
+            except OSError as exc:
+                stopped_part_way("could not write %s, which keeps the deployment from being started on volumes a "
+                                 "restore did not finish (%s)" % (restore_incomplete_path(self.root, prefix), exc),
+                                 None, False)
             for vol, archive in plan:
                 print(pal.paint("  restoring %s (replacing current contents) ..." % vol, "cyan"))
                 # If the clear fails (e.g. the volume is still held), do NOT extract on top - that would
                 # silently degrade to the old MERGE (the exact "restored, saw the same files" trap). The
                 # stack is already stopped, so aborting loudly is the safe state.
                 if not clear_volume(vol):
-                    self._fail("could not clear volume %s before restore - the deployment is stopped; free "
-                               "the volume and retry (refusing to merge the backup over stale data)." % vol)
-                if not untar_volume(vol, bundle, archive):
-                    self._fail("failed to restore volume %s from %s - the deployment is stopped; fix the "
-                               "bundle and retry." % (vol, archive))
+                    stopped_part_way("could not clear volume %s before restoring it (the backup is never merged over "
+                                     "data left in it)" % vol, vol, True)
+                # The extraction reads the archive again: it copies it first and extracts the copy only when it is the
+                # archive checked above. Other bytes (someone changed the bundle since) are not extracted at all: the
+                # restore stops there, with this volume emptied, and says not to start.
+                try:
+                    extracted = untar_volume(vol, bundle, archive, sha256=digests.get(archive))
+                except ArchiveChanged as exc:
+                    stopped_part_way("%s changed after the restore checked it (its copy taken for the extraction has "
+                                     "the checksum %s): nothing of it was extracted, and volume %s, emptied for it, "
+                                     "is empty" % (os.path.join(bundle, archive), exc.seen, vol), vol, True,
+                                     backup_changed=True)
+                if not extracted:
+                    stopped_part_way("could not extract %s into volume %s" % (archive, vol), vol, True)
+                replaced.append(vol)
                 if vol == names["keys"] and head_rel:
                     # Right after the keys volume, before any other volume or .env: the restore mark. While it is
                     # there the audit pruner deletes nothing, until `audit accept-restore` (run below once the
@@ -5881,8 +7321,9 @@ class DockVault:
                                 "bundle": os.path.basename(os.path.normpath(bundle)), "record": replaced_record,
                                 "restored_record": restored_record}
                         if not write_volume_file(vol, head_rel + ".restore-pending", json.dumps(mark)):
-                            self._fail("could not write the restore mark into %s - the deployment is stopped; "
-                                       "retry the restore" % vol)
+                            stopped_part_way("could not write the restore mark into volume %s (it keeps the audit "
+                                             "log's pruner from deleting until the restore is accepted)" % vol,
+                                             vol, False)
                         marked = True
             # The old AUDIT_CHAIN_KEY the bundle carries, beside .env and on the disk before the .env that does not
             # hold it: the restored chain may be under it.
@@ -5890,8 +7331,8 @@ class DockVault:
                 try:
                     write_kept_key(kept_here, carried)
                 except OSError as exc:
-                    self._fail("could not put the old AUDIT_CHAIN_KEY this backup carries into %s (%s) - the "
-                               "deployment is stopped; retry the restore" % (kept_here, exc))
+                    stopped_part_way("could not put the old AUDIT_CHAIN_KEY this backup carries into %s (%s)"
+                                     % (kept_here, exc), None, False)
             # install the paired .env (mode-600) so the restored set is whole again. For a sealed bundle
             # the plaintext was decrypted into memory above; write those exact bytes.
             if sealed_env_bytes is not None:
@@ -5902,6 +7343,13 @@ class DockVault:
         except BaseException:
             self._drop_kept_env_if_unneeded(kept_env)
             raise
+        # The set is whole again: its restore-incomplete marker goes. One that cannot be removed keeps the set from
+        # being started, this restore's own start too (_recreate_stack): the restore says so and does not try.
+        unmarked = self._drop_restore_incomplete(prefix)
+        if not unmarked:
+            print(pal.paint("  WARNING: could not remove %s, though the restore finished: delete it yourself (while it "
+                            "is there, %s)." % (restore_incomplete_path(self.root, prefix),
+                                                restore_incomplete_refusers("set '%s'" % prefix)), "red"))
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
         self._say_what_the_restore_kept(kept_env, current_prefix, prefix)
         finish = "python dockvault.py audit accept-restore"
@@ -5917,6 +7365,10 @@ class DockVault:
         # Bring the restored set back up on ITS .env and health-check, so restore leaves a RUNNING
         # deployment serving the restored state (not a stopped stack the operator must remember to
         # start, which is what let the old no-op behaviour hide).
+        if not unmarked:
+            self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
+            self._fail("restored, but not started: delete %s, then start it (python dockvault.py start)."
+                       % restore_incomplete_path(self.root, prefix))
         ok, _ = docker_available()
         if not ok:
             print(pal.paint("  Docker is not available - start the restored set later with Start.\n",
@@ -5943,6 +7395,128 @@ class DockVault:
         else:
             self._say_how_to_finish(marked, carried, finish, rekey, kept_here)
 
+    def _mark_restore_incomplete(self, prefix, bundle, changed=(), backup_changed=False):
+        """Write set `prefix`'s restore-incomplete marker (RESTORE_INCOMPLETE): the backup the restore is from, when it
+        began, the volumes it changed so far, and whether that backup changed while it was read. Raises OSError."""
+        import datetime as _dt
+        doc = {"volume_prefix": prefix, "bundle": bundle,
+               "at": _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat(),
+               "volumes": list(changed), "backup_changed": bool(backup_changed)}
+        replace_file_durably(restore_incomplete_path(self.root, prefix), json.dumps(doc, indent=2) + "\n")
+
+    def _drop_restore_incomplete(self, prefix):
+        """Remove set `prefix`'s restore-incomplete marker, if there is one. False when one is there and could not be
+        removed."""
+        path = os.path.join(self.root, RESTORE_INCOMPLETE + prefix)
+        if not os.path.lexists(path):
+            return True
+        try:
+            os.remove(path)
+        except OSError:
+            return False
+        return True
+
+    def _incomplete_restores(self):
+        """{set prefix: its marker's document ({} when it cannot be read)} of each restore here that began to replace a
+        set's volumes and did not finish (RESTORE_INCOMPLETE)."""
+        found = {}
+        # The folder is escaped: its own name may hold [, ], * or ? (vault[1]), and then no marker would be found.
+        for path in sorted(glob.glob(os.path.join(glob.escape(self.root), RESTORE_INCOMPLETE + "*"))):
+            prefix = os.path.basename(path)[len(RESTORE_INCOMPLETE):]
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (OSError, ValueError):
+                doc = {}
+            found[prefix] = doc if isinstance(doc, dict) else {}
+        return found
+
+    def _incomplete_restore_text(self, prefix, doc):
+        """What a restore of set `prefix` that did not finish left (from its marker's document `doc`), and the way
+        back: the same restore again, or a restore from a trusted copy when that backup changed while it was read, or
+        Reset; or, for an operator who knows the volumes are as wanted, the marker's own removal."""
+        marker = os.path.join(self.root, RESTORE_INCOMPLETE + prefix)
+        bundle = doc.get("bundle") if isinstance(doc.get("bundle"), str) and doc.get("bundle") else None
+        at = doc.get("at") if isinstance(doc.get("at"), str) else None
+        said = ("a restore of set '%s'%s%s began to replace its volumes and did not finish: they hold part of a backup"
+                % (prefix, " from %s" % bundle if bundle else "", " (%s)" % at if at else ""))
+        if doc.get("backup_changed") is True:
+            way = ("restore it from a copy of a backup of set '%s' you trust, in a folder only you can write (that "
+                   "backup changed while it was read): python dockvault.py backup --action restore --bundle-dir <that "
+                   "folder> --force" % prefix)
+        elif bundle:
+            arg = '"%s"' % bundle if any(c.isspace() for c in bundle) else bundle
+            way = ("run the restore again (it starts over from the backup): python dockvault.py backup --action restore "
+                   "--bundle-dir %s --force" % arg)
+        else:
+            way = ("restore it again from its backup: python dockvault.py backup --action restore --bundle-dir <the "
+                   "backup> --force")
+        return ("%s. To get it back, %s. Or, to start that set afresh, delete its volumes (python dockvault.py reset, "
+                "with that set's .env). If you know its volumes are as you want them, delete %s." % (said, way, marker))
+
+    def _refuse_incomplete_restore(self, command, prefix=None, notes=True, tail="Nothing was started."):
+        """Stop `command`, which starts the deployment, while a restore of the set it would start (`prefix`, else the
+        set .env names) began to replace its volumes and did not finish (RESTORE_INCOMPLETE): its volumes hold part of
+        a backup. With `notes`, says so for every other set's too, which `command` does not start. `tail` ends the
+        refusal (what the command left as it was); a `command` of None is the stack's own start (_recreate_stack),
+        whatever asked for it."""
+        if prefix is None:
+            prefix = volume_prefix(self._load_env())
+        found = self._incomplete_restores()
+        if notes:
+            for other, doc in found.items():
+                if other != prefix:
+                    print(self.pal.paint("  Note: %s" % self._incomplete_restore_text(other, doc), "yellow"))
+        if prefix in found:
+            said = self._incomplete_restore_text(prefix, found[prefix])
+            if command is None:
+                self._fail("set '%s' is not started: %s %s" % (prefix, said, tail))
+            self._fail("%s would start set '%s', but %s %s" % (command, prefix, said, tail))
+
+    def _restore_stopped_part_way(self, why, vol, replaced, touched, prefix, current_prefix, bundle,
+                                  backup_changed=False, earlier_incomplete=False):
+        """The message of a restore that stops after it stopped the deployment (a volume that cannot be cleared, an
+        archive that does not extract, a restore mark or a kept key that cannot be written): what happened, which
+        volumes it changed (`replaced`, and `vol` when `touched`: a clear or an extraction that failed part way), that
+        .env and the stack were left as they were, and the way back: the set the host was on, or the same restore run
+        again from the same (checked, unchanged) backup. With `backup_changed` (an archive changed after the restore
+        checked it), the backup is not that: the way back is a copy of a backup the operator trusts, in a folder
+        nobody else can write. With `earlier_incomplete` (an earlier restore of the set did not finish), a stop that
+        changed nothing leaves the set as that restore left it: not a set to start."""
+        arg = '"%s"' % bundle if any(c.isspace() for c in bundle) else bundle
+        again = "python dockvault.py backup --action restore --bundle-dir %s --force" % arg
+        changed = list(replaced) + ([vol] if touched and vol and vol not in replaced else [])
+        state = ("the volumes it replaced from the backup, or emptied in part, so far are: %s" % ", ".join(changed)
+                 if changed else "no volume was changed")
+        had_env = os.path.exists(self._env_path())
+        lines = ["%s. The restore stopped there: the deployment is stopped, .env is as it was%s, and %s."
+                 % (why, " (set '%s')" % current_prefix if had_env else " (there was none)", state)]
+        if backup_changed:
+            from_copy = ("copy a backup of set '%s' you trust into a folder only you can write, then restore from that "
+                         "copy: python dockvault.py backup --action restore --bundle-dir <that folder> --force" % prefix)
+            if had_env and prefix != current_prefix:
+                lines.append("The set the host was on, '%s', is untouched: python dockvault.py start brings it back. "
+                             "To restore set '%s', %s." % (current_prefix, prefix, from_copy))
+            else:
+                lines.append("Do not start the deployment now: volume %s is empty and the volumes before it hold the "
+                             "backup's data. Do not restore from %s again: it changed while it was read. Instead, %s."
+                             % (vol, bundle, from_copy))
+            return " ".join(lines)
+        if had_env and prefix != current_prefix:
+            lines.append("The set the host was on, '%s', is untouched: python dockvault.py start brings it back. To "
+                         "restore set '%s', fix the cause, then run the restore again: %s"
+                         % (current_prefix, prefix, again))
+        elif not changed and earlier_incomplete:
+            lines.append("This restore changed nothing, but an earlier restore of the set did not finish: its volumes "
+                         "hold part of a backup. Fix the cause, then run the restore again: %s" % again)
+        elif had_env and not changed:
+            lines.append("Nothing of the set was changed: python dockvault.py start brings it back as it was. Or fix "
+                         "the cause, then run the restore again: %s" % again)
+        else:
+            lines.append("Do not start the deployment now: its volumes hold the backup's data in part. Fix the cause, "
+                         "then run the restore again (it starts over from the backup, which is unchanged): %s" % again)
+        return " ".join(lines)
+
     def _keep_env_before_restore(self, prefix, sealed_env_bytes, env_path):
         """Keep the current .env before a restore installs the backup's .env over it. `prefix` is the set the
         backup restores; `sealed_env_bytes` / `env_path` hold the backup's .env. Returns (the prefix of the set the
@@ -5955,7 +7529,8 @@ class DockVault:
         when it is the backup's own .env byte for byte (nothing would be lost).
 
         The copy is .env.<prefix of the set the host is on>, the name Volumes' repoint finds a set's .env by, or
-        .env.<prefix>.1, .2, ... when that name is taken or is one of RESERVED_ENV_NAMES: never written over a file
+        .env.<prefix>.<n> when copies of it are there already (n after the highest, so that the newest copy has the
+        highest number) or that name is one of RESERVED_ENV_NAMES: never written over a file
         already there. A current .env, or a backup's, that cannot be read, and a copy that cannot be made, refuse
         the restore here, before anything is stopped or replaced, with nothing changed."""
         current_prefix = volume_prefix(self._load_env())
@@ -5988,8 +7563,9 @@ class DockVault:
         return current_prefix, kept
 
     def _keep_env_copy(self, label, data):
-        """Write `data` (the current .env's bytes) to .env.<label>, or to .env.<label>.1, .2, ... when that name is
-        taken (a file, a folder or a link: never followed, never written over) or reserved (env_copy_names). Created
+        """Write `data` (the current .env's bytes) to .env.<label>, or to .env.<label>.<n> after the highest copy
+        there, when a name of that set is taken (a file, a folder or a link: never followed, never written over) or
+        reserved (env_copy_names). Created
         mode 600, written through to the disk with its name, tightened like .env and read back to the same bytes
         before its path is returned. Raises OSError, with the name it was making as `kept_as`; a file this call
         created but could not finish is removed."""
@@ -6124,7 +7700,8 @@ class DockVault:
 
     def _archive_env(self, label):
         """Move the current .env aside as .env.<label> so it isn't lost / left live. Collision-safe
-        (never clobbers an existing archive) and never under a reserved name (env_copy_names: .env.<label>.1, .2,
+        (never clobbers an existing archive; numbered after the copies there) and never under a reserved name
+        (env_copy_names: .env.<label>.1, .2,
         ... instead). Returns the archive path, or None if there was no .env."""
         env_path = self._env_path()
         if not os.path.exists(env_path):
@@ -6189,8 +7766,10 @@ class DockVault:
 
     def _volume_new(self, env, args=None):
         """Author a FRESH set (new prefix + brand-new secrets) with its own .env, archiving the current
-        one. Does NOT start it (run Setup next); the current set's volumes are left intact."""
+        one. Does NOT start it (run Setup next); the current set's volumes are left intact. Refused while .env is
+        sealed (_refuse_while_locked): the sealed set's .env could not be archived first."""
         pal = self.pal
+        self._refuse_while_locked("volumes --action new")
         interactive = not (args and getattr(args, "non_interactive", False))
         if interactive and not confirm(
                 "Create a NEW empty set (fresh secrets + .env)? Your current set is kept.", pal, default=False):
@@ -6211,14 +7790,16 @@ class DockVault:
             # Show the freshly-generated admin password on the controlling terminal only (like the
             # recovery key), so a redirected/tee'd stdout or CI log can't capture it.
             self._emit_secret(pal.paint("  New set's admin password: %s   (auto-generated - store it NOW)"
-                                        % cfg["admin_password"], "bold", "yellow"))
+                                        % cfg["admin_password"], "bold", "yellow"), label="admin-password")
         print(pal.paint("  Run Setup to build + start the new (empty) set.\n", "cyan"))
 
     def _volume_repoint(self, env, args=None):
         """Point the deployment at ANOTHER set. Requires that set's matching .env (auto-found as
         .env.<prefix>, or --env-source), verifies it names the target set, and validates it against the
-        set's data via the secret guard - refusing on mismatch and RESTORING the current .env."""
+        set's data via the secret guard - refusing on mismatch and RESTORING the current .env. Refused while .env is
+        sealed (_refuse_while_locked)."""
         pal = self.pal
+        self._refuse_while_locked("volumes --action repoint")
         interactive = not (args and getattr(args, "non_interactive", False))
         cur_prefix = volume_prefix(env)
         others = [p for p, _ in group_volumes_by_prefix(list_managed_volumes()) if p and p != cur_prefix]
@@ -6239,10 +7820,17 @@ class DockVault:
         # locate the target set's .env: an explicit source, else the auto-archive, else prompt.
         src = getattr(args, "env_source", None) if args else None
         if not src:
-            cands = sorted(glob.glob(os.path.join(self.root, ".env." + target)) +
-                           glob.glob(os.path.join(self.root, ".env." + target + ".*")))
-            if cands:
-                src = cands[-1]
+            cands = kept_env_copies(self.root, target)       # the newest copy first, by its number
+            if len(cands) > 1 and interactive:
+                print(pal.paint("\n  Kept copies of set '%s''s .env (the newest first):" % target, "cyan"))
+                for i, c in enumerate(cands, 1):
+                    print("    %d) %s" % (i, c))
+                sel = ask("Which copy", pal, "1").strip()
+                if not (sel.isdigit() and 1 <= int(sel) <= len(cands)):
+                    self._fail("not a listed copy")
+                src = cands[int(sel) - 1]
+            elif cands:
+                src = cands[0]
             elif interactive:
                 src = ask("Path to the .env for set '%s'" % target, pal).strip()
         if not src or not os.path.exists(src):
@@ -6311,6 +7899,8 @@ class DockVault:
                        ".env is untouched. A volume may still be in use; free it and retry." % r.returncode)
         archived = self._archive_env("removed-" + prefix)   # keep the (now-orphaned) .env, don't leave it live
         kept = self._archive_kept_key(prefix)
+        # Its volumes are gone, and with them what a restore that did not finish left in them.
+        self._drop_restore_incomplete(prefix)
         print(pal.paint("\n  Set '%s' destroyed." % prefix, "green"))
         if archived:
             print("  Its .env (no longer matching any data) was moved to: %s" % archived)
@@ -6331,6 +7921,12 @@ class DockVault:
         Asked over `docker exec` rather than HTTP: the endpoint that carries the version sits
         behind whatever port and certificate the deployment chose, and a self-signed certificate on
         a non-default port is the normal case here, not an edge one.
+
+        With nothing running to ask, the answer is a guess, and its source says so (it is never "the running
+        container"): the highest of what the stopped web container's image holds in /app/VERSION (read with
+        `docker cp`, which needs no running container), the release .env pins in DOCKVAULT_IMAGE, and this
+        checkout's VERSION file. The highest, because the data may have been written by the newest of them, and
+        a move from a guess that turns out lower than the truth is a downgrade the gates would not see.
         """
         service = self._web_service(profiles or self._load_env().get("COMPOSE_PROFILES", "combined"))
         try:
@@ -6343,7 +7939,34 @@ class DockVault:
             if parse_semver(found):
                 return found, "the running container"
         fallback = read_version_file(self.root)
-        return fallback, "this checkout's VERSION file (nothing is running to ask)"
+        guesses = [(v, where) for v, where in (
+            (self._stopped_container_version(service), "the version in the stopped %s container's image" % service),
+            (release_image_version(self._load_env().get("DOCKVAULT_IMAGE")), "the release image .env names"),
+            (fallback, "this checkout's VERSION file")) if parse_semver(v)]
+        if not guesses:
+            return fallback, "this checkout's VERSION file (nothing is running to ask)"
+        best = max(guesses, key=lambda g: parse_semver(g[0]))       # the first of equals: the image's own file
+        return best[0], "%s (nothing is running to ask)" % best[1]
+
+    def _stopped_container_version(self, service):
+        """The version in /app/VERSION of the `service` container, which need not be running (`docker cp` reads a
+        stopped or restarting container's files), or None when there is no such container or no version in it."""
+        import io
+        import tarfile
+        try:
+            r = subprocess.run(["docker", "cp", "%s:/app/VERSION" % service, "-"], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        data = getattr(r, "stdout", None)
+        if getattr(r, "returncode", 1) != 0 or not isinstance(data, (bytes, bytearray)):
+            return None
+        try:
+            with tarfile.open(fileobj=io.BytesIO(bytes(data))) as tar:
+                member = next((m for m in tar if m.isfile()), None)
+                text = tar.extractfile(member).read(64).decode("utf-8", "replace").strip() if member else ""
+        except (tarfile.TarError, OSError, ValueError, AttributeError):
+            return None
+        return text if parse_semver(text) else None
 
     def _describe_hop(self, plan, source, current, tag, down=False):
         """Print what the hop does. Returns nothing; the caller decides what to require, from the same
@@ -6410,6 +8033,7 @@ class DockVault:
         if self._is_locked():
             self._fail(".env is locked (sealed in .env.enc): unlock it first (python dockvault.py unlock), then run "
                        "update again. Nothing changed.")
+        self._refuse_incomplete_restore("update")
         ok, msg = docker_available()
         if not ok:
             self._fail(msg)
@@ -6668,6 +8292,31 @@ class DockVault:
                         "in a way %s cannot read, %s starts anyway and may delete or change what %s "
                         "keeps." % (tag, tag, FIRST_NEWER_DATA_CHECK, current, tag, tag, current),
                         "yellow"))
+        elif down:
+            # Going back from a guessed origin (nothing running to ask): nobody can say what the data holds that the
+            # older version cannot read, so neither question above can be put. An older image from
+            # FIRST_NEWER_DATA_CHECK on still checks the data itself, so the move is taken only when asked for by
+            # name (--force-downgrade); to an older one, which checks nothing, it is refused even then. Starting
+            # the deployment lets update ask it.
+            ask_first = ("Start the deployment (python dockvault.py start) and run update again: it then asks the "
+                         "running version what it has changed")
+            if not checks_newer_data(tag):
+                self._fail(
+                    "%s -> %s is a downgrade from a version that could only be guessed (%s), and %s is older "
+                    "than %s, the first version that checks for data it cannot read: it would start on this "
+                    "data regardless and may delete or change what %s keeps. --force-downgrade does not go back "
+                    "to a version older than %s without the running version's answer. %s."
+                    % (current, tag, version_source, tag, FIRST_NEWER_DATA_CHECK, current,
+                       FIRST_NEWER_DATA_CHECK, ask_first))
+            if not (args and getattr(args, "force_downgrade", False)):
+                self._fail(
+                    "%s -> %s is a downgrade from a version that could only be guessed (%s), so whether %s "
+                    "can read this data cannot be asked. %s. Or pass --force-downgrade to go back on the guess: "
+                    "%s refuses to start on data it cannot read, and says how to undo the change."
+                    % (current, tag, version_source, tag, ask_first, tag))
+            print(pal.paint(
+                "  --force-downgrade given: going back from a guessed version. %s refuses to start on data it "
+                "cannot read." % tag, "yellow"))
 
         dry_run = bool(getattr(args, "dry_run", False)) if args else False
         if dry_run:
@@ -6899,6 +8548,8 @@ class DockVault:
         if not do_enable:
             print(pal.paint("  Left unchanged.\n", "yellow"))
             return
+        # Enabling recreates the stack: never that of a set whose restore did not finish.
+        self._refuse_incomplete_restore("logs", tail="Nothing was changed.")
         self._set_env_key(self._env_path(), "PLAN_LOG_PULL", "true")
         if not pepper_ok:
             self._set_env_key(self._env_path(), "LOG_TOKEN_PEPPER", gen_hex(32))
@@ -7003,6 +8654,11 @@ class DockVault:
 
         requested = getattr(args, "set_gb", None) if args else None
         interactive = not (args and getattr(args, "non_interactive", False))
+        # A new limit recreates the stack (unless --no-restart): never that of a set whose restore did not finish.
+        # Asked before anything is written, so it is refused whole.
+        if (requested is not None or interactive) and not (args and getattr(args, "no_restart", False)):
+            self._refuse_incomplete_restore("storage", tail="Nothing was changed (with --no-restart, storage writes "
+                                                            ".env only).")
 
         wanted = parse_transfer_limit(getattr(args, "set_transfers", None) if args else None)
         if wanted is None and interactive:
@@ -7316,7 +8972,8 @@ class DockVault:
         taken before .env is read, the second is refused at once, and .env is read again after the confirmation.
 
         Refused, with nothing written, while .env is sealed by `lock` (it holds every secret: a .env written now
-        would hold only the new key, and a lock after it would seal that over the real one) or is not there. The
+        would hold only the new key, and a lock after it would seal that over the real one) or is not there, and
+        while a restore of the set .env names did not finish (RESTORE_INCOMPLETE: the recreate would start it). The
         new key is on the disk, in .env, before the stack is recreated under it (_set_env_key); when it cannot be
         written, .env is put back as it was."""
         if self._is_locked():
@@ -7325,6 +8982,8 @@ class DockVault:
         if not os.path.exists(self._env_path()):
             self._fail("there is no .env in %s: run audit change-key where the deployment's .env is. Nothing "
                        "changed." % self.root)
+        # The change recreates the stack under the new key: never that of a set whose restore did not finish.
+        self._refuse_incomplete_restore("audit change-key", tail="Nothing was changed.")
         with self._chain_key_lock("audit change-key"):
             self._audit_change_key_held(args)
 
@@ -8033,6 +9692,8 @@ class DockVault:
                 continue
             try:
                 self.handler(MENU[choice - 1][0])()
+            except StoppedBySignal:
+                raise           # a hangup, kill or timeout ends the session; it is not a handler's error
             except SystemExit:
                 # a handler's _fail (e.g. a bad repoint selection or Docker briefly down) reports its
                 # own error; in the menu loop that shouldn't end the whole session - back to the menu.
@@ -8048,7 +9709,14 @@ def build_parser():
     sp.add_argument("--server-name", dest="server_name")
     sp.add_argument("--admin-username", dest="admin_username")
     sp.add_argument("--admin-email", dest="admin_email")
-    sp.add_argument("--admin-password", dest="admin_password")
+    pw = sp.add_mutually_exclusive_group()
+    pw.add_argument("--admin-password", dest="admin_password",
+                    help="the first admin's password (visible to other users in the process list and kept in shell "
+                         "history: prefer --admin-password-file or --admin-password-stdin)")
+    pw.add_argument("--admin-password-file", dest="admin_password_file",
+                    help="read the first admin's password from this file (its first line)")
+    pw.add_argument("--admin-password-stdin", dest="admin_password_stdin", action="store_true",
+                    help="read the first admin's password from standard input (one line)")
     sp.add_argument("--cert-mode", dest="cert_mode", choices=CERT_MODES, help="selfsigned | letsencrypt | byo")
     sp.add_argument("--le-email", dest="le_email", help="email for Let's Encrypt expiry notices")
     sp.add_argument("--cert-path", dest="cert_path", help="bring-your-own fullchain cert (PEM)")

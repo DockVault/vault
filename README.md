@@ -80,12 +80,35 @@ Unattended runs (`--non-interactive`) **build** unless you pass `--image-source 
 scripted install always deploys the code it checked out rather than a different published artifact.
 If the checkout's `VERSION` has no matching release yet — which is normal on `main` — setup says so
 and builds instead. The choice is recorded as `DOCKVAULT_IMAGE` in `.env`, and re-running setup
-honours it: a release-image deployment is re-pulled, never rebuilt over.
+honours it: a release-image deployment is never rebuilt over. Setup, start, restart and the end of a
+restore use the release image already on the host as it is, without the registry, and pull it only
+when it is missing; `restart` does that before it takes anything down, so a host that cannot reach
+the registry keeps its running deployment. Start and restart keep a release-image deployment on its
+image. A deployment that builds from source is built again from the checkout as it is now by start
+and restart too; `restart` builds it before it takes anything down, so a build that fails leaves the
+deployment running, and both refuse a checkout older than the version the deployment has run.
+`update` moves a deployment to another image; so does a restore, to the image the backup's `.env`
+names (the one its data was made with), and a setup re-run that starts this checkout's version: one
+where you switch to the published release (it pulls the release of this checkout's `VERSION`) or to
+building from source, and any re-run of a deployment that builds from source (it is built again from
+the checkout as it is now). Setup, start and restart never go back to an older version than the
+deployment has run; `update --tag` does, after its checks.
 
 Setup creates the first admin account from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` it writes to
-`.env` (a blank password auto-generates a strong one, printed once). Then open
+`.env` (a blank password auto-generates a strong one, shown once). Then open
 `https://<your-domain>` and log in with those credentials — change the password from Settings after
 the first login. No license key, no activation.
+
+A one-time secret the tool shows (a generated admin password, a recovery key, a password reset link)
+goes to the controlling terminal, never to standard output, which a log of the run keeps. With no
+terminal (cloud-init, a CI job) it goes to a new file only you can read, under the DockVault folder of
+your user's application data (beside the default backups, never in the checkout), and the output
+names only that file: read it, keep the secret, then delete the file. On Windows it is shown on the
+console and also written to such a file, which the output names, since a console started without a
+window takes the secret and shows it to nobody. For an unattended setup, give
+the admin password with `--admin-password-file <file>` (its first line) or `--admin-password-stdin`;
+`--admin-password <value>` still works but warns, as other users of the host can read a command line
+and the shell keeps it in its history.
 
 ### Production without the script (advanced)
 
@@ -122,7 +145,18 @@ docker compose -f docker-compose.secure.yml up -d
 > docker run --rm -v "$PWD/certs:/certs" busybox sh -c 'chown 10001:10001 /certs/*.pem && chmod 600 /certs/key.pem && chmod 644 /certs/cert.pem'
 > ```
 >
-> `dockvault.py setup` does this for you and refuses to start if the key is still unreadable.
+> `dockvault.py setup` does this for you and refuses to start if the key is still unreadable. Run as
+> root it hands the pair to uid `10001` itself; run as another user (in the `docker` group, or with a
+> rootless engine) it does it from a container as above, keeping the key `600`, and makes the key
+> world-readable (`644`) only when that fails too. Your own user then no longer reads `key.pem`.
+>
+> The Let's Encrypt renewal hook setup installs runs as root at each renewal. It reads nothing from
+> the checkout: it restarts the web container by name (`docker restart`), and it writes the renewed
+> pair only into the certificate folder setup made, refusing (and renewing nothing) when that folder
+> has been replaced by a link, is writable by others, or is owned by anyone but root or the app user.
+> A hook an earlier version installed ran `docker compose` with the checkout's files instead: a setup
+> re-run as root (`sudo python3 dockvault.py setup`), which keeps the certificate it finds, rewrites
+> this deployment's hook to the current one; run as another user, it says so and leaves it.
 
 > **`.env` is found automatically — never move it.** The root `docker-compose.secure.yml` (and the
 > `docker-compose.yml` below) are thin `include:` shims over the real files in `deploy/`. Running
@@ -322,8 +356,14 @@ recovery key (the recovery key itself stays the same).
 
 `lock` asks for an **unlock passphrase** and shows a one-time **credential recovery key** (save it in a
 password manager — it opens `.env` if you forget the passphrase). `start` will offer to unlock inline.
-Every command that writes `.env` (`update`, `audit change-key`, `audit retention --set` and the other
-settings) refuses while it is sealed, with nothing written: unlock it first.
+Every command that writes `.env` (`setup`, Volumes' new set and repoint, restore, `update`, `audit change-key`,
+`audit retention --set` and the other settings) refuses while it is sealed, with nothing written: unlock it
+first. A `.env` written beside the sealed one would belong to another set, and a later `lock` would seal it
+over the sealed set's only copy. For the same reason a re-`lock` seals only the same set's `.env` again (the
+same `VAULT_VOLUME_PREFIX` and `ENCRYPTION_KEY`): it refuses another set's `.env`, leaving `.env.enc` as it was.
+`unlock --force` (unlock over a `.env` that is there) refuses another set's `.env` the same way, and says how
+to switch sets without losing it; over the same set's `.env`, edited since the lock, it keeps that one first as
+`.env.<set>` and prints the command that goes back to it.
 Requires the `cryptography` package (`pip install cryptography`).
 
 `lock` seals `.env` only: the `.env.<set>` archives that Volumes and Reset set aside stay in plain text, and so
@@ -521,6 +561,15 @@ description for is treated as the riskiest case rather than assumed safe. A down
 upgrade it takes back: along upgrades the matrix marks reversible it says so, and it is refused across one
 it marks irreversible; it always takes a backup first, as there are no down-migrations.
 
+The version a change starts from is asked of the running container. With nothing running it is a guess,
+and the tool says so: the highest of the stopped container's own version, the release `DOCKVAULT_IMAGE`
+names, and the checkout's `VERSION` (which an update by pull leaves where it was). Going back from a
+guess cannot ask what the data holds that the older version cannot read, so `update` takes it only with
+`--force-downgrade`, and to a version older than 0.33.1 (which checks nothing itself) not even then:
+start the deployment and run `update` again, so that it can ask. A setup re-run never goes back to an
+older version either (pulling the release of an older checkout's `VERSION`, or building it): it stops,
+before anything changes, and names the `update --tag` command to use instead.
+
 ### Support lifecycle and the minimum supported version
 
 Each version in the matrix also declares a support lifecycle: whether it is **end-of-life**, whether
@@ -616,6 +665,20 @@ secrets). Don't edit the prefix by hand; the management tool's **Volumes** menu 
   your current set is kept, its `.env` saved aside.
 - **Repoint** — point the deployment at another set; you must supply that set's matching `.env`, and
   the tool verifies it against the set's data (the same secret check as on start) before switching.
+  Without `--env-source` it takes the newest kept copy (`.env.<set>`, `.env.<set>.1`, `.2`, ... by
+  number: each new copy takes the number after the highest one there, even when a lower name is free),
+  and lists them when run interactively.
+
+The secret check opens the set's database with the `.env`'s `VAULT_DB_PASSWORD`, then checks its
+`ENCRYPTION_KEY` against the key check the vault keeps in that database: a `.env` with the right
+password and another key is refused. A database with no key check yet (its vault never started) lets
+the `.env` through, and the next check of it reads the key check again. A check that read both
+leaves a stamp in the volume, so the next check of that exact `.env` takes a second instead of
+starting the database; a stamp an earlier version left after checking the password alone is not
+taken, and the next check starts the database and reads both. When setup's existing-volume menu
+installs a `.env` you point it at, it first keeps the current one as `.env.<set>`, as a restore
+does. If that `.env` is another set's, the menu's choices are then about that set's volume: its
+"destroy" option deletes the volumes of the set `.env` names, and says which.
 
 The **Reset** menu tears the current set down with `docker compose down -v` (a strong, typed
 confirmation — this destroys the data) and moves the `.env` aside so a later setup starts fresh.
@@ -630,9 +693,76 @@ bundle really is the one those volumes were created with. **Restore** verifies t
 recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
+Each backup is a folder of its own that only you can open: mode `0700` on Linux and macOS, and on
+Windows an ACL for your user, SYSTEM and Administrators only, set before anything is written into it
+(a folder on a second drive otherwise commonly lets every signed-in user in). Your account is named
+there by its SID, as it is for `.env`, never by a bare name, which Windows can take for a local account
+of the same name. The backup folder you
+name with `--backup-dir` keeps its own permissions when it already exists; one the tool creates is
+`0700`.
+
+A running deployment is paused (not stopped) while its volumes are archived, so the database, the
+stored files and the keys are copies of one moment: the vault does not answer until the last archive
+is written, then carries on (with the app running, a file deleted between the database's archive and
+the storage volume's would come back as a row without its file). When Docker will not pause it, the
+backup stops with nothing archived and shows Docker's reason. A deployment that is not running is
+archived as it is, so `python dockvault.py stop`, then the backup, then `python dockvault.py start`
+backs it up without a pause (an update then goes on with `--backup-verified`; what changes after that
+backup is not in it). A backup stopped meanwhile (Ctrl-C,
+a closed SSH session, `kill`, a timeout or a service stop; Ctrl-Break on Windows) resumes the
+deployment before it ends and removes the incomplete backup; one run under `nohup` goes on when its
+terminal closes. A closed terminal and `timeout` signal the tool's whole process group, and a service
+stop every process of the service, so the `docker compose pause` and `unpause` it runs are started
+apart from its group, a pause that did not answer is resumed all the same, and a resume Docker does
+not confirm is asked about and tried again; what is still paused after that is named, with the
+command that resumes it. An end the tool cannot see leaves the deployment paused: `kill -9`, the
+out-of-memory killer, and on Windows closing the console window or ending the task.
+`docker ps --filter status=paused` then lists what it left, and `docker unpause <name> ...` resumes it.
+
+Backup counts an archive only once it is in the backup folder on this host, not empty, and read
+through whole as a `tar.gz` (a Docker daemon that writes to a folder of its own, such as one on
+another host, fails the backup instead of leaving a bundle without data). The manifest records each
+archive's SHA-256 and size. A sealed backup (`--lock`) also carries `manifest.json.mac`, an HMAC of
+the manifest under the key its `env.enc` is sealed with. Before restore stops or clears anything, it
+reads every archive through, checks it against the recorded checksum, and checks that Docker sees the
+same file through the mount it extracts from; for a sealed backup it first checks the manifest's
+MAC. A changed or damaged archive, a changed sealed manifest, or an archive Docker cannot see is
+refused with nothing changed. Each extraction then copies its archive into the container that
+extracts it, hashes the copy, and extracts the copy only when it is the archive checked: a bundle on a
+share or a removable disk, or one someone else can write while the restore waits for its
+confirmation, can change in between, and an archive changed since is not extracted at all (the
+restore stops there). The copy needs room in Docker's storage for one archive at a time: besides the
+room the restored data takes, keep as much free space on the disk that holds Docker's storage as the
+largest `.tar.gz` in the bundle takes. The check
+before anything is stopped makes the same copy, so a host without that room is refused with nothing
+changed. The checksums of an unsealed backup show damage only: whoever can write
+the bundle can rewrite them too. A backup made before backups recorded checksums (its manifest is of
+format 1) is still restored, with a notice that its archives could only be read through, not matched;
+a manifest of the format that records them and lacks one is refused. A sealed backup also says, inside
+its sealed `env.enc`, that its manifest is authenticated: one stripped of its MAC and its checksums to
+pass for an older backup is refused, and only a sealed backup made before manifests were
+authenticated restores without a MAC, with a notice. `--bundle-dir` and
+`--backup-dir` may be relative paths. A restore that stops part way, once it has stopped the
+deployment (a volume that cannot be cleared, an archive that does not extract or changed after the
+check, the audit log's restore mark that cannot be written), changes nothing more: it does not install
+the backup's `.env` or start the stack, names the volumes it replaced so far, and prints the way back
+(start the set the host was on, or run the same restore again; after an archive changed, from a copy
+of a backup you trust in a folder only you can write). From before it clears the first volume until
+it has installed the backup's `.env`, a restore keeps `.restore-incomplete.<prefix>` beside `.env`,
+so a restore that stopped part way, was interrupted or crashed leaves it: while it is there, start,
+restart, setup, update, storage (a new limit, unless `--no-restart`), logs (`--enable`) and audit
+change-key refuse to start that set (its volumes hold part of a backup) before they change anything,
+and say the way back. Setup also refuses when its existing-volume menu points it at such a set's
+`.env`, and neither the stack nor, for a check of `.env`, the set's database is started for anything
+else while the file is there. Backup refuses that set too: a bundle of those volumes would pass for a
+whole set, and its restore would put them back and start them. A restore that finishes but cannot
+remove the file says so and does not start the set. The next restore of that set, Reset of it, or
+setup's choice to destroy its data removes it.
+
 Before it installs the backup's `.env`, restore keeps the current one as `.env.<prefix>` (the prefix of
-the set the host was on; `.env.<prefix>.1`, `.2`, ... when that name is taken, never over a file already
-there, and never as `.env.enc` or `.env.example`, the sealed file's and the template's names) and says
+the set the host was on; `.env.<prefix>.1`, `.2`, ... after the highest copy there when one is, never
+over a file already there, and never as `.env.enc` or `.env.example`, the sealed file's and the
+template's names) and says
 where. Restoring **another set's** backup leaves the current set's volumes as they were,
 and that kept file is the only way to read them again: restore prints the `volumes --action repoint`
 command that goes back to them. It refuses to start if the current `.env` cannot be read or the copy

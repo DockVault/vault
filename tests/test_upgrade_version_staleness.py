@@ -23,12 +23,15 @@ nothing is running to ask. So the consequence described above -- an operator bei
 current version, and a step backwards announced as an ordinary change -- no longer happens on a
 live deployment.
 
+And with nothing running, the tool no longer falls back to the file alone: it takes the highest of
+the stopped container's own version file, the release `.env` pins in `DOCKVAULT_IMAGE` (which the
+pull path does rewrite) and the file. After a pull upgrade that is the version the pull went to, so
+a step back is announced as the DOWNGRADE it is, and gated as one from a guessed origin.
+
 These tests run with nothing running, so they exercise the fallback, and that is deliberate. They
-pin two things worth keeping: that the file really is stale after a pull upgrade (so the fallback
-is a fallback and not a second source of truth), and that when the tool is reduced to it, the
-protection does not go with the label -- a downgrade it cannot classify is still gated on a backup.
-A live deployment reading its version from the container is asserted separately, in the upgrade-gate
-tests.
+pin that the file really is stale after a pull upgrade (so it is one input to the guess and not a
+source of truth), and that the guess sees past it. A live deployment reading its version from the
+container is asserted separately, in the upgrade-gate tests.
 
 Nothing here touches Docker or the network: the update paths are driven with their compose and
 health calls stubbed, so what runs is the tool's real decision-making.
@@ -108,16 +111,16 @@ def test_the_pull_path_moves_the_image_and_leaves_version_behind(tmp_path, monke
     assert dv.read_version_file(str(tmp_path)) == "0.9.0"
 
 
-def test_with_nothing_running_the_stale_file_still_costs_the_downgrade_label(tmp_path, monkeypatch,
-                                                                             capsys):
-    """What the fallback costs, and what it does not.
+def test_with_nothing_running_a_step_back_after_a_pull_upgrade_is_seen_as_a_downgrade(tmp_path, monkeypatch,
+                                                                                       capsys):
+    """What the stale file used to cost, and no longer does.
 
     Two updates in sequence, both through the pull path. The first goes to 0.10.0. The second goes
-    to 0.9.5 -- a genuine step backwards from what is running -- and is announced as an ordinary
-    version change, because the tool is still comparing against the 0.9.0 it was installed at.
-
-    What is lost is the DOWNGRADE label, not the no-down-migrations warning, which prints on every
-    path regardless. Both are asserted below so the distinction cannot drift.
+    to 0.9.5 -- a genuine step backwards from what is running. Compared against the 0.9.0 the file
+    still holds, it was announced as an ordinary version change and went ahead. The guess now reads
+    the release the first update pinned in .env (0.10.0): the step back is a DOWNGRADE, from a
+    guessed origin, to a version that checks nothing of the data itself, so it is refused even when
+    forced, with nothing changed.
     """
     tool = _deployment(tmp_path, "0.9.0", image=dv.LOCAL_IMAGE)
     _stub_the_engine(monkeypatch, tool)
@@ -125,34 +128,17 @@ def test_with_nothing_running_the_stale_file_still_costs_the_downgrade_label(tmp
     _update(tool, "v0.10.0")
     capsys.readouterr()                      # the first run's output is not what is being read
 
-    _update(tool, "v0.9.5")
-    second = capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        _update(tool, "v0.9.5")
+    second = " ".join(capsys.readouterr().out.split())
 
-    assert "0.9.5" in second, "the second update did not run"
-    assert "DOWNGRADE" not in second, (
-        "the downgrade label now fires, so the tool has learned what it is running; this "
-        "characterization is obsolete")
-    assert "Version change: 0.9.0 -> v0.9.5" in second, (
-        "expected the announcement to be phrased against the stale installed version; got:\n"
-        + second)
-    # The more direct symptom, on the same screen: the tool states a version it is not running.
-    assert "current version : 0.9.0" in second, (
-        "expected the stale version to be reported as current; got:\n" + second)
-    # And the boundary of the claim: the generic caution is unconditional and still printed, so
-    # what the stale comparison costs is the label, not the warning.
-    assert "no down-migrations" in second, (
-        "the no-down-migrations warning is supposed to print on every path; if it has become "
-        "conditional, the surrounding docstring is now wrong")
-    # And the consequence of the stale comparison, now that a downgrade is gated: the tool did
-    # demand a backup, because it treats an unclassifiable hop as the worst case -- so the missing
-    # DOWNGRADE label costs the operator the label, not the protection.
-    assert tool.backups_taken, (
-        "a step backwards proceeded without a backup; the stale version cost more than the label")
-
-    # The same question asked of the version actually deployed, to show the warning was not
-    # withheld for some other reason: it is withheld only because 'current' is wrong.
-    assert dv.is_downgrade("v0.10.0", "v0.9.5") is True
-    assert dv.is_downgrade(dv.read_version_file(str(tmp_path)), "v0.9.5") is False
+    assert dv.read_version_file(str(tmp_path)) == "0.9.0", "the file is still stale"
+    assert "current version : 0.10.0 (from the release image .env names (nothing is running to ask))" in second
+    assert "DOWNGRADE: 0.10.0 -> v0.9.5" in second
+    assert "no down-migrations" in second, "the generic caution still prints on every path"
+    assert "0.10.0 -> v0.9.5 is a downgrade from a version that could only be guessed" in second
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    assert env["DOCKVAULT_IMAGE"] == "%s:v0.10.0" % dv.GHCR_IMAGE, "nothing was changed"
 
 
 def test_the_from_source_path_keeps_version_current_because_git_checkout_does(tmp_path, monkeypatch):

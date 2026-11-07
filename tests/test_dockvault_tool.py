@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,12 +24,43 @@ ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("dockvault_mod", ROOT / "dockvault.py")
 dv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dv)
+# The real one, kept before the fixture below stands in for it (a test that stubs the commands it runs uses it).
+_TIGHTEN_SECRET_FILE = dv.tighten_secret_file
+# What the tool asks Docker about the deployment's containers, as loaded (before conftest.py answers a unit test).
+_ASKS_DOCKER_ABOUT_THE_DEPLOYMENT = {name: getattr(dv, name) for name in (
+    "container_running", "container_paused", "container_exists", "admin_bootstrap_done", "read_key_canary")}
 
 
 @pytest.fixture(autouse=True)
 def _keep_secret_acl_changes_hermetic(monkeypatch):
     """Unit tests never change the host ACL of their temporary secret files."""
     monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
+
+
+def _host_digest(src_dir, archive_name, **_k):
+    """archive_digest_in_docker as a Docker that sees this host's folder answers: the archive's own SHA-256."""
+    import hashlib
+    with open(os.path.join(src_dir, archive_name), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest(), ""
+
+
+@pytest.fixture(autouse=True)
+def _docker_sees_the_host_folder(request, monkeypatch):
+    """Without real Docker, the restore's look at each archive through Docker sees what the host sees. A test
+    marked docker keeps the real one."""
+    if request.node.get_closest_marker("docker") is None:
+        monkeypatch.setattr(dv, "archive_digest_in_docker", _host_digest, raising=False)
+
+
+def _tgz(path, files=None):
+    """Write a small real tar.gz at `path` (what a volume archive is), holding `files` ({name: bytes})."""
+    import tarfile
+    with tarfile.open(str(path), "w:gz") as tar:
+        for name, data in (files or {"marker.txt": b"x"}).items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return path
 
 
 class _Proc:
@@ -318,8 +350,15 @@ def test_setup_no_start_authors_env_and_cert(tmp_path, _working_cert_tool):
     assert parsed["PLAN_LOG_PULL"] == "true" and len(parsed.get("LOG_TOKEN_PEPPER", "")) >= 32
     assert parsed["UPDATE_CHECK_ENABLED"] == "true"
     cert = (tmp_path / "certs" / "cert.pem").read_text(encoding="utf-8", errors="ignore")
-    key = (tmp_path / "certs" / "key.pem").read_text(encoding="utf-8", errors="ignore")
-    assert "BEGIN CERTIFICATE" in cert and "PRIVATE KEY" in key
+    assert "BEGIN CERTIFICATE" in cert
+    key_path = tmp_path / "certs" / "key.pem"
+    if os.access(str(key_path), os.R_OK):
+        assert "PRIVATE KEY" in key_path.read_text(encoding="utf-8", errors="ignore")
+    else:
+        # Not run as root, with Docker on this host: a container handed the key to the app's user and kept it 600
+        # (rather than making it world-readable), so this user no longer reads it.
+        assert os.stat(key_path).st_uid == dv.APP_UID and (os.stat(key_path).st_mode & 0o777) == 0o600
+        assert "re-owned to uid %d" % dv.APP_UID in proc.stdout
 
 
 @pytest.mark.docker
@@ -398,11 +437,14 @@ def test_key_is_encrypted():
 def test_render_renewal_hook():
     hook = dv.render_renewal_hook("/opt/vault", "/opt/vault/certs", "vault.example.com", "vault-api")
     assert hook.startswith("#!/bin/bash")
-    assert "/etc/letsencrypt/live/vault.example.com/fullchain.pem" in hook
+    assert "LIVE=/etc/letsencrypt/live/vault.example.com" in hook and '"$LIVE/fullchain.pem"' in hook
     assert "openssl x509" in hook and "openssl pkey" in hook            # validates the renewed pair
     assert '[ -n "$_c" ]' in hook                                       # non-empty guard (missing openssl -> fail)
-    assert 'mv "$CD/.new-key.pem"  "$CD/key.pem"' in hook               # atomic swap
-    assert "docker compose" in hook and "restart vault-api" in hook     # restarts so uvicorn reloads
+    assert 'mv -fT "$T/key.pem" key.pem' in hook                        # atomic swap, replacing the name
+    assert "docker restart vault-api" in hook                           # restarts so uvicorn reloads
+    # Run as root by certbot: nothing of the checkout (its compose file, its .env) is read. The hook's behaviour
+    # is run in tests/test_dockvault_renewal_hook.py.
+    assert "/opt/vault/.env" not in hook and "docker-compose" not in hook and "docker compose" not in hook
 
 
 def test_engine_is_remapped_detects_rootless_and_userns():
@@ -770,6 +812,28 @@ def test_container_running_reads_docker_inspect():
     assert dv.container_running("vault-db", run=lambda *a, **k: _Proc(1, "", "No such object")) is False
     assert dv.container_running(
         "vault-db", run=lambda *a, **k: (_ for _ in ()).throw(OSError("no docker"))) is False
+
+
+def _raises(exc):
+    def run(*a, **k):
+        raise exc
+    return run
+
+
+@pytest.mark.parametrize("run, paused", [
+    (lambda *a, **k: _Proc(0, "true\n"), True),
+    (lambda *a, **k: _Proc(0, "false\n"), False),
+    # Docker cannot tell: never "running", which would count a resume it could not confirm as done.
+    (lambda *a, **k: _Proc(1, "", "Error: No such object: vault-db"), None),
+    (lambda *a, **k: _Proc(1, "false\n"), None),
+    (lambda *a, **k: _Proc(0, "running\n"), None),
+    (lambda *a, **k: _Proc(0, ""), None),
+    (_raises(OSError("no docker")), None),
+    (_raises(subprocess.TimeoutExpired(["docker"], 20)), None),
+], ids=["paused", "running", "no-such-container", "did-not-answer-0", "another-answer", "no-answer",
+        "could-not-run", "timed-out"])
+def test_container_paused_says_none_whenever_docker_cannot_tell(run, paused):
+    assert dv.container_paused("vault-db", run=run) is paused
 
 
 def test_container_mounts_lists_named_volumes_and_fails_soft():
@@ -1612,7 +1676,7 @@ def test_restore_refuses_missing_archive(tmp_path, monkeypatch):
         tool._do_restore(argparse.Namespace(non_interactive=True, bundle_dir=str(bundle), force=False))
 
 
-def test_backup_aborts_and_removes_partial_on_tar_failure(tmp_path, monkeypatch):
+def test_backup_aborts_and_removes_partial_on_tar_failure(tmp_path, monkeypatch, capsys):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(
         dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-fail", deployment_id="f"))) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
@@ -1621,6 +1685,8 @@ def test_backup_aborts_and_removes_partial_on_tar_failure(tmp_path, monkeypatch)
     with pytest.raises(SystemExit):
         tool._do_backup(dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8")),
                         argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
+    # it stopped at the archive, not before it
+    assert "failed to archive volume dockvault-vault-fail_vault_pg_data" in " ".join(capsys.readouterr().out.split())
     # the partial, secret-bearing bundle (it holds a copy of .env) must be gone - no manifest left behind
     assert not list((tmp_path / "backups").glob("dockvault-*")), "a failed backup must leave no partial bundle"
 
@@ -1646,7 +1712,7 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     # operator's behalf and proceeds with an irreversible change on the strength of it.
     monkeypatch.setattr(dv, "volume_exists",
                         lambda name, **k: not name.endswith("_vault_brand"))
-    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
     env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     tool._do_backup(env, argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups")))
     bundles = list((tmp_path / "backups").glob("dockvault-dockvault-vault-b9-*"))
@@ -1661,6 +1727,101 @@ def test_backup_writes_env_600_and_manifest_without_secret(tmp_path, monkeypatch
     if os.name != "nt":
         assert (os.stat(bundle / "env").st_mode & 0o077) == 0, "the backup .env must be mode-600"
         assert (os.stat(bundle).st_mode & 0o077) == 0, "the bundle dir must be owner-only (0700)"
+
+
+# A `docker` that answers as a host where the deployment is up answers for its containers (each of them runs, none is
+# paused), and refuses everything else, `docker compose pause` included: there is no compose file in a test's folder.
+# Each call is a line in the log.
+_DOCKER_OF_A_HOST_WHERE_THE_DEPLOYMENT_RUNS = """#!/bin/sh
+echo "$*" >> {log}
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+    {names})
+        case "$*" in
+            *State.Running*) echo true; exit 0;;
+            *State.Paused*) echo false; exit 0;;
+        esac;;
+esac
+echo "not answered here" >&2
+exit 1
+"""
+
+
+def _docker_of_a_host_where_the_deployment_runs(tmp_path, monkeypatch):
+    """Put that stand-in first on PATH, check that it is the docker this test's processes run, and return its log
+    (no calls in it yet)."""
+    bin_dir, log = tmp_path / "bin", tmp_path / "docker-calls.log"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(_DOCKER_OF_A_HOST_WHERE_THE_DEPLOYMENT_RUNS.format(
+        log=shlex.quote(str(log)), names="|".join(dv.BACKUP_PAUSED_SERVICES)), encoding="utf-8")
+    (bin_dir / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    for name in dv.BACKUP_PAUSED_SERVICES:
+        answer = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name], capture_output=True,
+                                text=True, timeout=20)
+        assert (answer.returncode, answer.stdout.strip()) == (0, "true")
+    log.unlink()
+    return log
+
+
+def _calls_naming_the_deployment(log):
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return [c for c in calls if set(c.split()) & set(dv.BACKUP_PAUSED_SERVICES)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the stand-in docker is a shell script")
+@pytest.mark.parametrize("call", [
+    ("container_running", ("vault-db",), False),
+    ("container_paused", ("vault-db",), None),
+    ("container_exists", ("vault-db",), False),
+    ("admin_bootstrap_done", ("vault-db", dv.PG_USER, dv.PG_DB, "a-test-password"), None),
+    ("read_key_canary", ("vault-db", dv.PG_USER, dv.PG_DB, "a-test-password"), None),
+], ids=lambda call: call[0])
+def test_a_unit_test_asks_no_docker_about_the_deployments_containers(tmp_path, monkeypatch, call):
+    """What the tool asks Docker about the deployment's containers by their fixed names is answered "nothing runs" in
+    a unit test (conftest.py), never by the Docker of the host the test runs on."""
+    log = _docker_of_a_host_where_the_deployment_runs(tmp_path, monkeypatch)
+    name, args, nothing_runs = call
+    assert getattr(dv, name)(*args) == nothing_runs
+    assert _calls_naming_the_deployment(log) == []
+
+
+@pytest.mark.docker
+def test_a_test_marked_docker_asks_the_real_docker():
+    """The "nothing runs" answers are for unit tests: one marked docker drives a real engine and keeps its answers."""
+    assert {name: getattr(dv, name) for name in _ASKS_DOCKER_ABOUT_THE_DEPLOYMENT} == _ASKS_DOCKER_ABOUT_THE_DEPLOYMENT
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the stand-in docker is a shell script")
+@pytest.mark.parametrize("case", ["written", "an-archive-fails", "no-volume-found"])
+def test_a_unit_backup_takes_nothing_from_a_host_where_the_deployment_runs(tmp_path, monkeypatch, capsys, case):
+    """The full suite runs every test, unit ones too, on a host where a deployment is up. A unit backup there reaches
+    the step it tests: it does not find that deployment running, pause it, or stop because the pause failed."""
+    log = _docker_of_a_host_where_the_deployment_runs(tmp_path, monkeypatch)
+    root = tmp_path / "deployment"
+    root.mkdir()
+    (root / ".env").write_text("\n".join(dv.build_env_lines(
+        dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-g1", deployment_id="g1"))) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    found = {"written": lambda name: not name.endswith("_vault_brand"),
+             "an-archive-fails": lambda name: name.endswith("_vault_pg_data"),
+             "no-volume-found": lambda name: False}[case]
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: found(name))
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: case != "an-archive-fails"
+                        and _tgz(Path(bundle) / archive) and True)
+    args = argparse.Namespace(non_interactive=True, backup_dir=str(tmp_path / "backups"))
+    env = dv.parse_env((root / ".env").read_text(encoding="utf-8"))
+    if case == "written":
+        tool._do_backup(env, args)
+        assert len(list((tmp_path / "backups").glob("dockvault-dockvault-vault-g1-*"))) == 1
+    else:
+        with pytest.raises(SystemExit):
+            tool._do_backup(env, args)
+        said = " ".join(capsys.readouterr().out.split())
+        assert {"an-archive-fails": "failed to archive volume dockvault-vault-g1_vault_pg_data",
+                "no-volume-found": "no archive was made"}[case] in said
+    assert _calls_naming_the_deployment(log) == []
 
 
 @pytest.mark.docker
@@ -1808,7 +1969,7 @@ def test_restore_stops_before_replacing_and_starts_after(tmp_path, monkeypatch):
     cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-ord", deployment_id="ord")
     entries = [{"role": "pg", "name": "dockvault-vault-ord_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="bord")
-    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")     # pre-flight archive-existence check
+    _tgz(bundle / "vault_pg_data.tar.gz")     # the pre-flight archive check reads it through
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     order = []
@@ -1832,7 +1993,7 @@ def test_restore_interactive_over_existing_requires_typed_confirm(tmp_path, monk
     cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-cfm", deployment_id="cfm")
     entries = [{"role": "pg", "name": "dockvault-vault-cfm_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="bcfm")
-    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    _tgz(bundle / "vault_pg_data.tar.gz")
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     touched = []
@@ -1853,7 +2014,7 @@ def test_restore_aborts_if_database_still_running_after_stop(tmp_path, monkeypat
     cfg = dict(_reusable_env_cfg(), volume_prefix="dockvault-vault-live", deployment_id="live")
     entries = [{"role": "pg", "name": "dockvault-vault-live_vault_pg_data", "archive": "vault_pg_data.tar.gz"}]
     bundle = _write_bundle(tmp_path, cfg, entries, name="blive")
-    (bundle / "vault_pg_data.tar.gz").write_bytes(b"dummy")
+    _tgz(bundle / "vault_pg_data.tar.gz")
     (tmp_path / ".env").write_text("x=1\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     touched = []
@@ -1909,6 +2070,32 @@ def test_backup_root_explicit_list_picks_first_writable(tmp_path):
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     args = argparse.Namespace(backup_dir=os.pathsep.join([str(tmp_path / "b1file" / "sub"), str(good)]))
     assert tool._backup_root(args) == str(good) and good.is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+def test_a_backup_folder_that_was_already_there_keeps_its_mode(tmp_path, monkeypatch):
+    """Probing a --backup-dir made every one of them 0700, an existing folder too: under sudo, a shared folder
+    (/srv/backups, a mount point) was taken away from everyone else. Only a folder the tool makes is made 0700;
+    each backup inside is 0700 anyway."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o755)
+    made = tmp_path / "made" / "backups"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    assert tool._backup_root(argparse.Namespace(backup_dir=str(shared))) == str(shared)
+    assert dv._writable_dir(str(shared)) is True
+    assert (os.stat(shared).st_mode & 0o777) == 0o755, "an existing folder keeps its mode"
+    assert tool._backup_root(argparse.Namespace(backup_dir=str(made))) == str(made)
+    assert (os.stat(made).st_mode & 0o777) == 0o700, "a folder the tool makes is 0700"
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: _tgz(Path(bundle) / archive) and True)
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(dict(_reusable_env_cfg(), volume_prefix="dvmode",
+                                                                     deployment_id="m"))) + "\n", encoding="utf-8")
+    tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=str(shared)))
+    assert (os.stat(shared).st_mode & 0o777) == 0o755
+    bundle = next(shared.iterdir())
+    assert (os.stat(bundle).st_mode & 0o777) == 0o700, "the backup itself is 0700"
 
 
 def test_backup_search_roots_includes_legacy(tmp_path, monkeypatch):
@@ -2132,11 +2319,12 @@ def test_update_from_source_checks_out_and_recreates(tmp_path, monkeypatch):
     # asserted and the work is skipped.
     backups = []
     monkeypatch.setattr(tool, "_do_backup", lambda env, args: backups.append(True))
-    # a downgrade, explicitly confirmed via --yes, built from source
-    tool.update(argparse.Namespace(non_interactive=True, tag="v0.5.0", source=True, yes=True))
-    assert any(("checkout" in c and "v0.5.0" in c) for c in calls), "must git checkout the chosen tag"
+    # a change confirmed via --yes, built from source (going back from a guessed origin is refused
+    # unless forced; that is pinned in tests/test_data_requirements.py)
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.7.0", source=True, yes=True))
+    assert any(("checkout" in c and "v0.7.0" in c) for c in calls), "must git checkout the chosen tag"
     assert started == [1]
-    assert backups, "a downgrade proceeded without demanding a backup"
+    assert backups, "a change from a guessed origin proceeded without demanding a backup"
 
 
 def test_update_pull_path_sets_image_and_recreates_without_build(tmp_path, monkeypatch):
@@ -2299,6 +2487,56 @@ def test_resolve_rerun_image_source_release_unpublished_keeps_env(tmp_path, monk
     assert "not published" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("choice, pinned", [
+    ("release", "ghcr.io/dockvault/vault:v0.34.0"),
+    ("build", "ghcr.io/dockvault/vault:v0.34.0"),
+    (None, dv.LOCAL_IMAGE),
+], ids=["pull-the-release", "build-this-checkout", "keep-a-local-build"])
+def test_a_setup_rerun_never_goes_back_to_an_older_version(tmp_path, monkeypatch, capsys, choice, pinned):
+    """'Pull the published release image' pinned this checkout's VERSION, which an update by pull leaves behind
+    (0.33.6 here, under a deployment that runs 0.34.0); building, or rebuilding a kept local build, starts the same
+    older version. Setup went back over the data with none of update's checks: it now refuses, before .env or the
+    stack is changed, and names the update command that checks first."""
+    (tmp_path / "VERSION").write_text("0.33.6\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.34.0", "v0.33.6"])
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=%s\n" % pinned, encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.34.0", "the running container"))
+    with pytest.raises(SystemExit):
+        tool._resolve_rerun_image_source(str(env_path), argparse.Namespace(image_source=choice), interactive=False)
+    assert env_path.read_text(encoding="utf-8") == "DOCKVAULT_IMAGE=%s\n" % pinned
+    said = " ".join(capsys.readouterr().out.split())
+    assert "0.33.6, which is older than 0.34.0, the version this deployment has run" in said
+    assert "python dockvault.py update --tag v0.33.6" in said
+
+
+def test_a_setup_rerun_with_nothing_running_is_held_back_by_the_release_env_pins(tmp_path, monkeypatch, capsys):
+    """Nothing running and no container: the release .env pins (0.34.0) is the version the data was last on, and
+    pulling the checkout's older release over it is refused just the same."""
+    (tmp_path / "VERSION").write_text("0.33.6\n", encoding="utf-8")
+    monkeypatch.setattr(dv, "fetch_release_tags", lambda *a, **k: ["v0.34.0", "v0.33.6"])
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(1, b"" if "cp" in cmd else "", "no container"))
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.34.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    with pytest.raises(SystemExit):
+        tool._resolve_rerun_image_source(str(env_path), argparse.Namespace(image_source="release"), interactive=False)
+    assert env_path.read_text(encoding="utf-8") == "DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.34.0\n"
+    assert "the release image .env names (nothing is running to ask)" in " ".join(capsys.readouterr().out.split())
+
+
+@pytest.mark.parametrize("version", ["0.34.0", "0.34.1"])
+def test_a_setup_rerun_to_the_same_or_a_newer_version_goes_on(tmp_path, monkeypatch, version):
+    (tmp_path / "VERSION").write_text(version + "\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("DOCKVAULT_IMAGE=ghcr.io/dockvault/vault:v0.34.0\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.34.0", "the running container"))
+    tool._resolve_rerun_image_source(str(env_path), argparse.Namespace(image_source="build"), interactive=False)
+    assert dv.parse_env(env_path.read_text(encoding="utf-8"))["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
+
+
 def test_resolve_rerun_image_source_interactive_build_choice_repoints(tmp_path, monkeypatch):
     # Interactive re-run, operator picks "2) Build from this checkout" -> repoints to local build.
     (tmp_path / "VERSION").write_text("0.15.0\n", encoding="utf-8")
@@ -2338,6 +2576,19 @@ def test_authored_env_pins_the_image_only_when_a_release_was_chosen():
     assert pinned["DOCKVAULT_IMAGE"] == "ghcr.io/dockvault/vault:v0.9.0"
 
 
+def _docker(calls, image_here, pull_ok=True):
+    """subprocess.run as Docker answers it: `docker image inspect` finds the image only when `image_here`; a pull
+    succeeds when `pull_ok`; everything else succeeds. Every command is recorded in `calls`."""
+    def run(cmd, **k):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return _Proc(0 if image_here else 1, "sha256:abc\n" if image_here else "")
+        if "pull" in cmd:
+            return _Proc(0 if pull_ok else 1, "")
+        return _Proc(0, "")
+    return run
+
+
 def test_start_pulls_and_never_builds_over_a_release_image(tmp_path, monkeypatch):
     # The gap this closes: `setup` is the documented idempotent upgrade path, so a re-run over a
     # release-image deployment used to rebuild — replacing the published image with a local build
@@ -2347,11 +2598,186 @@ def test_start_pulls_and_never_builds_over_a_release_image(tmp_path, monkeypatch
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     calls = []
-    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Proc(0, ""))
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=False))
     assert tool._start_secure_stack() is True
-    assert any("pull" in c for c in calls), "a release-image deployment must pull"
+    assert any("pull" in c for c in calls), "a release-image deployment pulls an image it does not have"
     ups = [c for c in calls if "up" in c]
     assert ups and all("--build" not in c for c in ups), "and must never rebuild over the release"
+    assert calls.index([c for c in calls if "pull" in c][0]) < calls.index(ups[0])
+
+
+def test_start_uses_a_release_image_already_here_without_the_registry(tmp_path, monkeypatch, capsys):
+    """Each start pulled the pinned tag again: offline (or with the registry down) the vault could not start from the
+    image it already had, and a tag moved on the registry reached the deployment with none of update's gates."""
+    cfg = _reusable_env_cfg()
+    cfg["dockvault_image"] = "ghcr.io/dockvault/vault:v0.9.0"
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=True, pull_ok=False))
+    assert tool._start_secure_stack() is True
+    assert not [c for c in calls if "pull" in c], "an image already here is not pulled again"
+    assert ["docker", "image", "inspect", "--format", "{{.Id}}", "ghcr.io/dockvault/vault:v0.9.0"] in calls
+    ups = [c for c in calls if "up" in c]
+    assert ups and all("--build" not in c for c in ups)
+    assert "Using ghcr.io/dockvault/vault:v0.9.0, already on this host (no pull)" in capsys.readouterr().out
+
+
+def _restarting(tmp_path, monkeypatch, image_here, pull_ok, image="ghcr.io/dockvault/vault:v0.9.0"):
+    cfg = _reusable_env_cfg()
+    cfg["dockvault_image"] = image
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=image_here, pull_ok=pull_ok))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_print_status", lambda *a, **k: None)
+    return tool, calls
+
+
+def _compose_verb(calls, verb):
+    return [i for i, c in enumerate(calls) if c[:2] == ["docker", "compose"] and verb in c]
+
+
+def test_restart_takes_nothing_down_when_the_release_image_is_neither_here_nor_pullable(tmp_path, monkeypatch,
+                                                                                       capsys):
+    """restart used to take the containers down and only then need the registry: offline, the vault stayed down."""
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=False, pull_ok=False)
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert _compose_verb(calls, "pull") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    assert "Nothing was taken down" in capsys.readouterr().out
+
+
+def test_restart_pulls_a_missing_release_image_before_it_takes_anything_down(tmp_path, monkeypatch):
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=False, pull_ok=True)
+    tool.restart()
+    pulls, downs, ups = (_compose_verb(calls, v) for v in ("pull", "down", "up"))
+    assert pulls and downs and ups and pulls[0] < downs[0] < ups[0]
+
+
+def test_restart_with_the_release_image_here_needs_no_registry(tmp_path, monkeypatch):
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False)
+    tool.restart()
+    downs, ups = _compose_verb(calls, "down"), _compose_verb(calls, "up")
+    assert not _compose_verb(calls, "pull") and downs and ups and downs[0] < ups[0]
+
+
+def _restarting_a_build(tmp_path, monkeypatch, build_ok=True, checkout="0.34.0", running="0.34.0"):
+    """restart of a deployment that builds from source (DOCKVAULT_IMAGE the local build), this checkout's VERSION
+    `checkout`, the deployment running `running`; `docker compose build` succeeds when `build_ok`."""
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False, image=dv.LOCAL_IMAGE)
+    (tmp_path / "VERSION").write_text(checkout + "\n", encoding="utf-8")
+    answer = dv.subprocess.run
+
+    def run(cmd, **k):
+        r = answer(cmd, **k)
+        if cmd[:2] == ["docker", "compose"] and "build" in cmd and not build_ok:
+            return _Proc(1, "")
+        return r
+
+    monkeypatch.setattr(dv.subprocess, "run", run)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: (running, "the running container"))
+    return tool, calls
+
+
+def test_restart_of_a_deployment_that_builds_from_source_builds_before_it_takes_anything_down(tmp_path,
+                                                                                            monkeypatch):
+    """restart took the stack down and only then built it (start's up --build): a build that failed left nothing
+    running. It now builds first."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch)
+    tool.restart()
+    builds, downs, ups = (_compose_verb(calls, v) for v in ("build", "down", "up"))
+    assert builds and downs and ups and builds[0] < downs[0] < ups[0]
+
+
+def test_restart_of_a_deployment_that_builds_from_source_takes_nothing_down_when_its_build_fails(
+        tmp_path, monkeypatch, capsys):
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, build_ok=False)
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert _compose_verb(calls, "build") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert "The build failed" in said and "Nothing was taken down: the deployment keeps running as it is." in said
+
+
+@pytest.mark.parametrize("failure", [OSError(2, "No such file or directory"),
+                                     subprocess.TimeoutExpired(["docker", "compose", "build"], 1800)],
+                         ids=["cannot-run", "timed-out"])
+def test_restart_of_a_deployment_that_builds_from_source_takes_nothing_down_when_its_build_cannot_finish(
+        tmp_path, monkeypatch, capsys, failure):
+    """A build that could not be run, or ran out of time, is no build: the deployment keeps running as it is (a build
+    that timed out and was counted as done would be followed by the teardown)."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch)
+    answer = dv.subprocess.run
+
+    def run(cmd, **k):
+        if cmd[:2] == ["docker", "compose"] and "build" in cmd:
+            calls.append(cmd)
+            raise failure
+        return answer(cmd, **k)
+
+    monkeypatch.setattr(dv.subprocess, "run", run)
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert _compose_verb(calls, "build") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert "docker compose build failed" in said
+    assert "Nothing was taken down: the deployment keeps running as it is." in said
+
+
+def test_restart_never_builds_a_checkout_older_than_the_version_the_deployment_runs(tmp_path, monkeypatch, capsys):
+    """A checkout moved back (an older tag checked out) would be built and started over data a newer version wrote:
+    the image refuses to start on it, and nothing would run. Refused before anything is built or taken down."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout="0.33.6", running="0.34.0")
+    with pytest.raises(SystemExit):
+        tool.restart()
+    assert not _compose_verb(calls, "build") and not _compose_verb(calls, "down") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert ("restart would build and start this checkout at 0.33.6, which is older than 0.34.0, the version this "
+            "deployment has run (from the running container)") in said
+    assert "python dockvault.py update --tag v0.33.6 does" in said and "Nothing was built or taken down." in said
+
+
+def test_restart_builds_a_checkout_newer_than_the_version_the_deployment_runs(tmp_path, monkeypatch):
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout="0.34.1", running="0.34.0")
+    tool.restart()
+    assert _compose_verb(calls, "build") and _compose_verb(calls, "up")
+
+
+def test_start_never_builds_a_checkout_older_than_the_version_the_deployment_runs(tmp_path, monkeypatch, capsys):
+    """start alone built a deployment that builds from source from the checkout as it is (up --build), an older one
+    too: its image refuses to start on the newer data, and the deployment was left with nothing running. Refused, as
+    restart and setup refuse it, before anything is built."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout="0.33.6", running="0.34.0")
+    with pytest.raises(SystemExit):
+        tool.start()
+    assert not _compose_verb(calls, "build") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert ("start would build and start this checkout at 0.33.6, which is older than 0.34.0, the version this "
+            "deployment has run (from the running container)") in said
+    assert "Nothing was built or taken down." in said
+
+
+@pytest.mark.parametrize("checkout", ["0.34.0", "0.34.1"])
+def test_start_builds_a_checkout_as_new_as_the_version_the_deployment_runs(tmp_path, monkeypatch, checkout):
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout=checkout, running="0.34.0")
+    tool.start()
+    ups = _compose_verb(calls, "up")
+    assert ups and "--build" in calls[ups[0]]
+
+
+def test_start_of_a_release_image_deployment_does_not_ask_the_version_it_runs(tmp_path, monkeypatch):
+    """A release image is the version it names: start uses it as it is, and the checkout is not what runs. An update
+    by pull leaves the checkout's VERSION behind the release it pulled (here 0.33.6 under a 0.34.0 deployment), and
+    start must not take that for an older checkout to build."""
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False,
+                              image="ghcr.io/dockvault/vault:v0.34.0")
+    (tmp_path / "VERSION").write_text("0.33.6\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: pytest.fail("the running version was asked"))
+    tool.start()
+    assert _compose_verb(calls, "up")
 
 
 def test_start_builds_when_no_release_image_is_pinned(tmp_path, monkeypatch):
@@ -2371,8 +2797,7 @@ def test_start_reports_the_remedy_when_the_release_cannot_be_pulled(tmp_path, mo
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     calls = []
-    monkeypatch.setattr(dv.subprocess, "run",
-                        lambda cmd, **k: calls.append(cmd) or _Proc(0 if "pull" not in cmd else 1, ""))
+    monkeypatch.setattr(dv.subprocess, "run", _docker(calls, image_here=False, pull_ok=False))
     assert tool._start_secure_stack() is False
     assert not [c for c in calls if "up" in c], "a failed pull must not go on to start anything"
     assert "--image-source build" in capsys.readouterr().out
@@ -2390,15 +2815,15 @@ def test_update_from_source_stops_pointing_at_the_release_it_replaces(tmp_path, 
     monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, ""))
     monkeypatch.setattr(tool, "_start_secure_stack", lambda: True)
     monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
-    # This is a downgrade (0.9.0 -> 0.8.0) and the origin comes from the file, so the update gates
-    # on a backup. Recorded rather than taken: against faked docker there are no volumes to
-    # archive, and this test is about the image reference the build inherits.
+    # The origin comes from a guess (nothing runs), so the update gates on a backup. Recorded rather
+    # than taken: against faked docker there are no volumes to archive, and this test is about the
+    # image reference the build inherits.
     backups = []
     monkeypatch.setattr(tool, "_do_backup", lambda env, args: backups.append(True))
-    tool.update(argparse.Namespace(non_interactive=True, tag="v0.8.0", source=True, yes=True))
+    tool.update(argparse.Namespace(non_interactive=True, tag="v0.9.1", source=True, yes=True))
     env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
     assert env["DOCKVAULT_IMAGE"] == dv.LOCAL_IMAGE
-    assert backups, "a downgrade proceeded without demanding a backup"
+    assert backups, "a change from a guessed origin proceeded without demanding a backup"
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs host openssl for a BYO pair")
@@ -2414,7 +2839,15 @@ def test_setup_byo_cert_mode_installs_pair(tmp_path):
         env=env, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "BEGIN CERTIFICATE" in (root / "certs" / "cert.pem").read_text(encoding="utf-8", errors="ignore")
-    assert dv.cert_key_match(str(root / "certs" / "cert.pem"), str(root / "certs" / "key.pem")) is True
+    installed_key = root / "certs" / "key.pem"
+    if os.access(str(installed_key), os.R_OK):
+        assert dv.cert_key_match(str(root / "certs" / "cert.pem"), str(installed_key)) is True
+    else:
+        # Not run as root, with Docker on this host: a container handed the key to the app's user and kept it 600
+        # (rather than making it world-readable), so this user no longer reads it.
+        assert os.stat(installed_key).st_uid == dv.APP_UID
+        assert (os.stat(installed_key).st_mode & 0o777) == 0o600
+        assert "re-owned to uid %d" % dv.APP_UID in r.stdout
     assert "bring-your-own" in r.stdout
 
 
@@ -2723,14 +3156,46 @@ def test_coupling_marker_verdict_confirms_only():
     env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
     salt = dv.gen_salt()
     good = {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}
-    assert dv.coupling_marker_verdict({"coupling": good}, env) == "ok"
+    stamp = {"dockvault_coupling": dv.COUPLING_STAMP_VERSION}
+    assert dv.coupling_marker_verdict(dict(stamp, coupling=good), env) == "ok"
     # a stale/absent/garbled stamp is "unknown" (None) - never a refusal, because a rotated DB
     # password would otherwise lock the operator out of their own data.
     assert dv.coupling_marker_verdict(None, env) is None
     assert dv.coupling_marker_verdict({}, env) is None
-    assert dv.coupling_marker_verdict({"coupling": {"salt": salt, "sha256": "0" * 64}}, env) is None
+    assert dv.coupling_marker_verdict(dict(stamp, coupling={"salt": salt, "sha256": "0" * 64}), env) is None
     other = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
-    assert dv.coupling_marker_verdict({"coupling": good}, other) is None
+    assert dv.coupling_marker_verdict(dict(stamp, coupling=good), other) is None
+
+
+@pytest.mark.parametrize("version", [None, 1, True, "2", 2.0], ids=["none", "one", "a-bool", "a-text", "a-float"])
+def test_a_stamp_written_before_the_key_was_checked_vouches_for_nothing(version):
+    """A stamp vouches for the exact .env it was written for. Earlier versions wrote it after the database password
+    alone had opened the database (version 1, or none), so it can vouch for a .env that shares the password and
+    has another ENCRYPTION_KEY: such a stamp is not taken, only one written once the key check was read too."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    marker = dv.build_coupling_marker(env)
+    assert marker["dockvault_coupling"] == dv.COUPLING_STAMP_VERSION == 2
+    assert dv.coupling_marker_verdict(marker, env) == "ok"
+    if version is None:
+        del marker["dockvault_coupling"]
+    else:
+        marker["dockvault_coupling"] = version
+    assert dv.coupling_marker_verdict(marker, env) is None
+
+
+def test_an_earlier_versions_stamp_sends_the_guard_to_the_database_and_its_key_check(tmp_path):
+    """The stamp an earlier version wrote for a .env whose password opens the database and whose ENCRYPTION_KEY is
+    not the data's (never checked then) answered every later check: the .env went through. Now the guard starts the
+    database, reads the key check, refuses that .env, and stamps nothing."""
+    env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    old = dict(dv.build_coupling_marker(env), dockvault_coupling=1)
+    starts, stamped = [], []
+    ok = tool._guard_db_secret(env, exists_fn=lambda v: True, start_fn=lambda: starts.append(1) or True,
+                               wait_fn=lambda: True, probe_fn=lambda *a: "ok", stop_fn=lambda: None,
+                               marker_fn=lambda vol: old, stamp_fn=lambda vol, e: stamped.append(vol),
+                               canary_fn=lambda e: "mismatch")
+    assert ok is False and starts == [1] and stamped == []
 
 
 def test_coupling_marker_carries_no_secret():
@@ -2770,7 +3235,8 @@ def test_stamped_volume_verifies_without_starting_the_database(tmp_path, capsys)
     env = dv.parse_env("\n".join(dv.build_env_lines(_reusable_env_cfg())))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     salt = dv.gen_salt()
-    marker = {"coupling": {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}}
+    marker = {"dockvault_coupling": dv.COUPLING_STAMP_VERSION,
+              "coupling": {"salt": salt, "sha256": dv.compute_coupling_fingerprint(env, salt)}}
     started = []
     ok = tool._guard_db_secret(
         env, exists_fn=lambda v: True,
@@ -2895,6 +3361,281 @@ def test_docker_absent_leaves_certs_undetermined_not_denied(monkeypatch):
     monkeypatch.setattr(dv.shutil, "which", lambda *_a: None)     # no docker at all
     ok, msg = dv.apply_cert_owner("/certs")
     assert ok is False and "did not answer" in msg and "delete" not in msg.lower()
+
+
+def _cert_pair(tmp_path):
+    certs = tmp_path / "certs"
+    certs.mkdir()
+    (certs / "cert.pem").write_text("cert", encoding="utf-8")
+    (certs / "key.pem").write_text("key", encoding="utf-8")
+    return certs
+
+
+def _engine(engine, calls, chown_works=True):
+    """`docker` as a POSIX host answers: `docker info` names the engine; the container's chown succeeds when
+    `chown_works`; the app user's read succeeds once a chown has run."""
+    def run(cmd, **kw):
+        calls.append(cmd)
+        joined = " ".join(cmd)
+        if cmd[:2] == ["docker", "info"]:
+            return _Proc(0, "name=seccomp,rootless" if engine == "rootless" else "name=seccomp")
+        if "chown" in joined:
+            return _Proc(0 if chown_works else 1)
+        repaired = chown_works and any("chown" in " ".join(c) for c in calls[:-1])
+        return _Proc(0) if repaired else _Proc(1)
+    return run
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and modes")
+@pytest.mark.parametrize("engine", ["rootful", "rootless"])
+def test_a_setup_not_run_as_root_re_owns_the_key_from_a_container_keeping_it_600(tmp_path, monkeypatch, engine):
+    """The host's chown fails for a user who is not root (and is no use on a rootless engine): the key was made
+    world-readable (644) at once, although a container, as Docker's root, could hand it to the app user and keep it
+    600, as Windows already does. That is now tried first, and verified."""
+    certs = _cert_pair(tmp_path)
+
+    def no_chown(*a, **k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(dv.os, "chown", no_chown)
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    calls = []
+    ok, msg = dv.apply_cert_owner(str(certs), run=_engine(engine, calls))
+    assert ok is True and "not world-readable" in msg
+    assert (os.stat(certs / "key.pem").st_mode & 0o777) == 0o600, "the key stays 600"
+    assert (os.stat(certs).st_mode & 0o777) == 0o755, "the folder lets the container's user reach the files"
+    assert any("chown 10001:10001" in " ".join(c) for c in calls)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and modes")
+def test_the_key_is_made_world_readable_only_when_a_container_cannot_re_own_it_either(tmp_path, monkeypatch):
+    certs = _cert_pair(tmp_path)
+
+    def no_chown(*a, **k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(dv.os, "chown", no_chown)
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    ok, msg = dv.apply_cert_owner(str(certs), run=_engine("rootful", [], chown_works=False))
+    assert ok is False and "world-readable (644)" in msg
+    assert (os.stat(certs / "key.pem").st_mode & 0o777) == 0o644
+
+
+_SID = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+
+
+def _whoami_answers(cmd, sid=_SID):
+    """What whoami /user /fo csv /nh prints (None for any other command)."""
+    if cmd[0].endswith("whoami.exe") and cmd[1:] == ["/user", "/fo", "csv", "/nh"]:
+        return _Proc(0, '"corp\\operator","%s"\r\n' % sid if sid else "", "")
+    return None
+
+
+def _windows_backup(tmp_path, monkeypatch, icacls_ok=True):
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setenv("USERNAME", "operator")
+    events = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: events.append(("run", cmd)) or _whoami_answers(cmd)
+                        or _Proc(0 if icacls_ok or cmd[0] != dv.windows_system_tool("icacls.exe") else 5, "",
+                                 "Access is denied." if not icacls_ok else ""))
+    real_copy = dv._copy_secret
+    monkeypatch.setattr(dv, "_copy_secret", lambda src, dst: events.append(("copy", os.path.basename(dst)))
+                        or real_copy(src, dst))
+    monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    # os.name is "nt" here: no Path() (it would make a WindowsPath), plain strings only.
+    monkeypatch.setattr(dv, "tar_volume", lambda vol, bundle, archive, **k: events.append(("tar", archive))
+                        or _tgz(os.path.join(bundle, archive)) and True)
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(dict(_reusable_env_cfg(), volume_prefix="dvwin",
+                                                                     deployment_id="w"))) + "\n", encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    return tool, events
+
+
+def test_a_windows_backup_folder_is_restricted_to_the_user_before_anything_is_written(tmp_path, monkeypatch):
+    """Only the bundle's env was restricted on Windows: on a folder outside the profile (a second drive), whose
+    inherited ACL commonly lets every signed-in user read and change it, the database and keys archives were open
+    to them. The folder is now restricted, inheritance off, before the env or any archive is written."""
+    tool, events = _windows_backup(tmp_path, monkeypatch)
+    backups = str(tmp_path / "b")
+    tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=backups))
+    bundle = os.path.join(backups, os.listdir(backups)[0])
+    icacls = dv.windows_system_tool("icacls.exe")
+    acl = [i for i, e in enumerate(events) if e[0] == "run" and e[1][0] == icacls and e[1][1] == bundle]
+    assert acl, events
+    cmd = events[acl[0]][1]
+    assert "/inheritance:r" in cmd and "*%s:(OI)(CI)F" % _SID in cmd
+    assert "BUILTIN\\Administrators:(OI)(CI)F" in cmd and "NT AUTHORITY\\SYSTEM:(OI)(CI)F" in cmd
+    first_write = min(i for i, e in enumerate(events) if e[0] in ("copy", "tar"))
+    assert acl[0] < first_write, "restricted before the env or any archive is written"
+
+
+@pytest.mark.parametrize("who", ["a-domain-user", "the-system-account"])
+def test_windows_access_is_granted_to_the_users_sid_never_to_a_bare_name(monkeypatch, who):
+    """icacls looks a bare name up among the computer's own accounts first: a domain user with a same-named local
+    account granted that account, and a run as SYSTEM has USERNAME set to the computer's account (COMPUTER$), so the
+    backup failed or opened the folder to another account. The secrets file and the backup folder are granted to
+    the SID whoami gives, which names the one account the process runs as."""
+    monkeypatch.setattr(dv.os, "name", "nt")
+    sid = _SID if who == "a-domain-user" else "S-1-5-18"
+    monkeypatch.setenv("USERNAME", "operator" if who == "a-domain-user" else "HOST01$")
+    monkeypatch.setenv("USERDOMAIN", "CORP" if who == "a-domain-user" else "WORKGROUP")
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _whoami_answers(cmd, sid)
+                        or _Proc(0, "", ""))
+    assert dv.windows_user_grantee() == "*" + sid
+    assert dv.restrict_folder_to_owner("D:\\backups\\b") is True
+    assert _TIGHTEN_SECRET_FILE("C:\\vault\\.env") is True
+    grants = [c[c.index("/grant:r") + 1] for c in calls if c[0] == dv.windows_system_tool("icacls.exe")]
+    assert grants == ["*%s:(OI)(CI)F" % sid, "*%s:(R,W)" % sid]
+
+
+def test_icacls_and_whoami_run_from_system32_never_by_their_bare_names(monkeypatch):
+    """Windows looks a bare program name up in the folder of the program that starts it and in the current folder
+    before System32, so an icacls.exe in the folder the tool is run from (a checkout, a download folder) would run
+    in its place, with the folder and the file it is asked to restrict. Both tools run by their System32 path."""
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setenv("SystemRoot", "D:\\WinRoot")
+    calls = []
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _whoami_answers(cmd)
+                        or _Proc(0, "", ""))
+    assert dv.restrict_folder_to_owner("D:\\backups\\b") is True
+    assert _TIGHTEN_SECRET_FILE("C:\\vault\\.env") is True
+    system32 = os.path.join("D:\\WinRoot", "System32")
+    assert [c[0] for c in calls] == [os.path.join(system32, "whoami.exe"), os.path.join(system32, "icacls.exe")] * 2
+
+
+# --- on a real Windows host (the Windows lane runs these; elsewhere they are skipped) --------------------------
+_ON_WINDOWS = pytest.mark.skipif(os.name != "nt", reason="needs a real Windows host")
+
+
+def _acl_entries(path):
+    """The access entries icacls lists for `path` (by its System32 path), one per line, as icacls prints them."""
+    r = subprocess.run([dv.windows_system_tool("icacls.exe"), str(path)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    lines = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    first = lines[0][len(str(path)):].strip() if lines and lines[0].startswith(str(path)) else None
+    return [e for e in ([first] if first else []) + lines[1:-1] if e]
+
+
+@_ON_WINDOWS
+def test_on_windows_icacls_and_whoami_are_the_ones_in_system32():
+    for name in ("icacls.exe", "whoami.exe"):
+        assert os.path.isfile(dv.windows_system_tool(name)), name
+    assert dv.windows_user_grantee().startswith("*S-1-"), "the grant names the account by its SID"
+
+
+@_ON_WINDOWS
+def test_on_windows_a_restricted_folder_and_a_tightened_file_leave_only_the_user_system_and_administrators(tmp_path):
+    folder = tmp_path / "bundle"
+    folder.mkdir()
+    assert dv.restrict_folder_to_owner(str(folder)) is True
+    (folder / "inside.txt").write_text("x", encoding="utf-8")
+    secret = tmp_path / "secret.env"
+    secret.write_text("A=1\n", encoding="utf-8")
+    assert _TIGHTEN_SECRET_FILE(str(secret)) is True
+    for path, count in ((folder, 3), (folder / "inside.txt", 3), (secret, 3)):
+        entries = _acl_entries(path)
+        assert len(entries) == count, entries
+        text = " ".join(entries).lower()
+        assert "everyone" not in text and "\\users:" not in text and "authenticated users" not in text, entries
+
+
+@_ON_WINDOWS
+def test_on_windows_secret_files_are_written_byte_for_byte(tmp_path):
+    """The secret files are written through file descriptors opened with os.open: a text-mode write would turn each
+    line end into CR LF, and a .env copied or restored would grow a CR on every line. Each comes back as written."""
+    data = b"ENCRYPTION_KEY=k\nVAULT_DB_PASSWORD=p\n"
+    (tmp_path / ".env").write_bytes(data)
+    dv._copy_secret(str(tmp_path / ".env"), str(tmp_path / "env"))
+    assert (tmp_path / "env").read_bytes() == data
+    dv.write_kept_key(str(tmp_path / "kept"), "a-key")
+    assert (tmp_path / "kept").read_bytes() == b"a-key\n"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    kept = tool._keep_env_copy("dvwinbytes", data)
+    assert Path(kept).read_bytes() == data
+    tool._atomic_write_secret(str(tmp_path / "atomic"), "A=1\nB=2\n")
+    assert (tmp_path / "atomic").read_bytes() == b"A=1\nB=2\n"
+
+
+def test_on_windows_a_file_is_synced_through_a_handle_that_may_write(tmp_path, monkeypatch):
+    """Windows' fsync refuses a handle opened read-only (EBADF): the old AUDIT_CHAIN_KEY that a key change, or a
+    restore of a backup taken during one, keeps beside .env could not be written there at all (write_kept_key removed
+    it again and failed). It is synced through a handle opened for writing; nothing is written through it."""
+    path = str(tmp_path / "kept")
+    with open(path, "wb") as f:
+        f.write(b"a-key\n")
+    want = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    real_open, opened = os.open, []
+    monkeypatch.setattr(dv.os, "name", "nt")
+    monkeypatch.setattr(dv.os, "open", lambda p, flags, *a: opened.append((p, flags)) or real_open(p, flags, *a))
+    dv.sync_to_disk(path)
+    assert opened == [(path, want)]
+    with open(path, "rb") as f:
+        assert f.read() == b"a-key\n"
+
+
+@_ON_WINDOWS
+def test_on_windows_a_docker_child_starts_in_a_group_of_its_own_with_no_console():
+    r = subprocess.run([sys.executable, "-c", "print('ran')"], capture_output=True, text=True, timeout=60,
+                       stdin=subprocess.DEVNULL, **dv.own_session_kwargs())
+    assert (r.returncode, r.stdout.strip()) == (0, "ran")
+
+
+# --- the Let's Encrypt renewal hook is Linux's --------------------------------------------------------------
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14", "win32"])
+def test_lets_encrypt_automation_is_refused_off_linux_before_certbot_runs(tmp_path, monkeypatch, platform):
+    """The renewal hook needs the stat -c and mv -T of GNU coreutils or BusyBox: on macOS (and the BSDs) it would
+    stop at each renewal before it deployed the certificate, which would then expire. Refused there, before certbot
+    runs, saying what to use instead."""
+    monkeypatch.setattr(dv.sys, "platform", platform)
+    ok, msg = dv.obtain_letsencrypt_cert(str(tmp_path / "certs"), "vault.example.test", "ops@example.test",
+                                         str(tmp_path), "vault", run=lambda *a, **k: pytest.fail("certbot ran"))
+    assert ok is False
+    assert "Let's Encrypt automation is Linux-only here" in msg and "the stat -c and mv -T" in msg
+    assert "--cert-mode byo" in msg
+    assert not (tmp_path / "certs").exists()
+
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14"])
+def test_a_renewal_hook_off_linux_is_left_as_it_is(tmp_path, monkeypatch, platform):
+    """Rewriting an earlier version's hook there would put in the hook that stops at each renewal."""
+    monkeypatch.setattr(dv.sys, "platform", platform)
+    hook = tmp_path / "dockvault-vault.sh"
+    old = '#!/bin/bash\nCD=%s\nLIVE=/etc/letsencrypt/live/x\ndocker compose up -d\n' % (tmp_path / "certs")
+    hook.write_text(old, encoding="utf-8")
+    outcome, said = dv.refresh_renewal_hook(str(tmp_path), str(tmp_path / "certs"), "vault", owners=(0,),
+                                            hook=str(hook), is_root=True)
+    assert outcome == "unsupported" and hook.read_text(encoding="utf-8") == old
+    assert "was left as it is: this version writes it on Linux only" in said
+
+
+@pytest.mark.parametrize("answer, env, grantee", [
+    ("", {"USERNAME": "operator", "USERDOMAIN": "CORP"}, "CORP\\operator"),
+    ("", {"USERNAME": "operator"}, "operator"),
+    ("", {}, None),
+    ('"corp\\operator","not a sid"', {"USERNAME": "operator", "USERDOMAIN": "CORP"}, "CORP\\operator"),
+])
+def test_without_a_sid_from_whoami_the_grant_names_the_domain_too(monkeypatch, answer, env, grantee):
+    monkeypatch.setattr(dv.os, "name", "nt")
+    for name in ("USERNAME", "USERDOMAIN"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(dv.subprocess, "run", lambda cmd, **k: _Proc(0, answer, ""))
+    assert dv.windows_user_grantee() == grantee
+    assert dv.restrict_folder_to_owner("D:\\backups\\b") is (grantee is not None)
+
+
+def test_a_windows_backup_whose_folder_cannot_be_restricted_writes_nothing(tmp_path, monkeypatch, capsys):
+    tool, events = _windows_backup(tmp_path, monkeypatch, icacls_ok=False)
+    backups = str(tmp_path / "b")
+    with pytest.raises(SystemExit):
+        tool._do_backup(tool._load_env(), argparse.Namespace(non_interactive=True, backup_dir=backups))
+    assert not [e for e in events if e[0] in ("copy", "tar")]
+    assert os.listdir(backups) == [], "no bundle is left behind"
+    assert "could not restrict the backup folder" in " ".join(capsys.readouterr().out.split())
 
 
 def test_tail_logs_reports_whether_anything_was_shown(tmp_path, monkeypatch, capsys):

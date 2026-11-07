@@ -562,6 +562,45 @@ def _recording_levels_start_afresh():
         module._reset_for_tests()
 
 
+# ---------------------------------------------------------------------------
+# The host tool's unit tests see no running deployment.
+# ---------------------------------------------------------------------------
+# dockvault.py asks Docker about the deployment's containers by their fixed names (vault, vault-api,
+# vault-sftp, vault-db): whether they run, whether they are paused, whether they exist, and what their
+# database holds. A unit test that does not answer those itself would get the answers of the host it
+# runs on, and the full suite runs on a host where a deployment is up: a unit backup there finds it
+# running and pauses it. So each unit test (not one marked docker) gets "nothing runs" from them: the
+# answer of a host where no such container is. A test that passes its own `run=` (its own Docker) is
+# answered by it, and one that sets its own stand-in replaces this one.
+_NOTHING_RUNS = {
+    "container_running": False,
+    "container_paused": None,
+    "container_exists": False,
+    "admin_bootstrap_done": None,
+    "read_key_canary": None,
+}
+
+
+def _nothing_runs(real, answer):
+    def stand_in(*args, **kwargs):
+        return real(*args, **kwargs) if "run" in kwargs else answer
+    return stand_in
+
+
+@pytest.fixture(autouse=True)
+def _host_tool_unit_tests_see_no_running_deployment(request, monkeypatch):
+    if request.node.get_closest_marker("unit") is None or request.node.get_closest_marker("docker") is not None:
+        return
+    import types
+    for module in vars(request.module).values():     # `import dockvault as dv`, or a copy loaded from its file
+        if not isinstance(module, types.ModuleType):
+            continue
+        if os.path.basename(getattr(module, "__file__", None) or "") != "dockvault.py":
+            continue
+        for name, answer in _NOTHING_RUNS.items():
+            monkeypatch.setattr(module, name, _nothing_runs(getattr(module, name), answer))
+
+
 def pytest_collection_modifyitems(items):
     """Give every test exactly one execution-environment classification."""
     for item in items:
