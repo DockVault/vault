@@ -129,8 +129,12 @@ SUMMARY = {
         "From 0.34.0 the storage volume keeps free space: an upload, an SFTP write or a copy that would leave less "
         "is refused (507). MIN_FREE_SPACE_GB sets it in GB; unset, it is the larger of 2 GB and 5% of the volume, "
         "never more than half of it nor more than 20 GB; 0 turns it off. A volume that already has less free refuses "
-        "them all from the first start: python dockvault.py update says so before the upgrade. Free some space, grow "
-        "the volume or lower MIN_FREE_SPACE_GB in .env first."),
+        "them all from the first start: free some space, grow the volume or lower MIN_FREE_SPACE_GB in .env first. "
+        "python dockvault.py update checks the volume before the upgrade only when the tool itself is 0.34.0 or later "
+        "(update the checkout first: git pull, or git fetch --tags and git checkout v0.34.0; an older tool does not "
+        "check). To check by hand: docker exec vault df -h /app/storage (the container is vault-api in the split "
+        "layout and the local trial) shows the volume's Size and Available, and Available must be more than the floor "
+        "its Size gives."),
     "alert-names-and-addresses-cleared-after-30-days": (
         "From 0.34.0 each failed sign-in is kept in full in the security record for SECURITY_RECORD_DAYS (30 by "
         "default, 7 to 365), and security alerts lose the name and the address that raised them after the same "

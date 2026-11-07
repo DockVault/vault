@@ -504,9 +504,12 @@ able to do.
   last change. `ZK_ENVELOPE_HOLD_DAYS=0` in `.env` turns it off.
 - **Free space on the storage volume:** an upload, an SFTP write or a copy that would leave the volume less free than
   `MIN_FREE_SPACE_GB` (unset: the larger of 2 GB and 5% of the volume, never more than half of it nor more than
-  20 GB) is refused with a 507. A volume that already has less free refuses them all from the first start, and
-  `python dockvault.py update` says so before the upgrade: free some space, grow the volume, or set
-  `MIN_FREE_SPACE_GB` lower in `.env` first (`0` turns it off).
+  20 GB) is refused with a 507. A volume that already has less free refuses them all from the first start: free
+  some space, grow the volume, or set `MIN_FREE_SPACE_GB` lower in `.env` first (`0` turns it off).
+  `python dockvault.py update` checks the volume before the upgrade only when the tool itself is 0.34.0 or later, so
+  update the checkout first (`git pull`, or `git fetch --tags` and `git checkout v0.34.0`); an older tool does not
+  check. To check by hand, `docker exec vault df -h /app/storage` (`vault-api` in the split layout and the local
+  trial) shows the volume's `Size` and `Available`: `Available` must be more than the floor its `Size` gives.
 - **Going back:** while a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones)
   waits for its purge, a release before 0.34.0 refuses to start (from 0.33.1 on) and `dockvault.py update` refuses
   the rollback. Release the holds, wait for the purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more,

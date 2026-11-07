@@ -484,7 +484,35 @@ def test_the_free_space_text_says_what_the_floor_and_the_tool_do():
     spec.loader.exec_module(tool)
     assert tool.gains_free_space_floor("0.33.6", "v" + rc.INTO)
     assert tool.free_space_floor_note(None, (98 * gib, 2 * gib, 100 * gib)) is not None
-    assert "python dockvault.py update says so before the upgrade" in text
+    # Only the tool of 0.34.0 or later checks it (an earlier one shows this text and nothing more), so the text and
+    # the README say to update the checkout first, and how to check by hand: the volume the tool reads, where the
+    # compose files mount it, in the containers they name.
+    assert ("python dockvault.py update checks the volume before the upgrade only when the tool itself is 0.34.0 or "
+            "later (update the checkout first: git pull, or git fetch --tags and git checkout v0.34.0; an older tool "
+            "does not check).") in text
+    assert ("To check by hand: docker exec vault df -h /app/storage (the container is vault-api in the split layout "
+            "and the local trial) shows the volume's Size and Available, and Available must be more than the floor "
+            "its Size gives.") in text
+    source = (ROOT / "dockvault.py").read_text(encoding="utf-8")
+    assert source.count('"exec", "-T", "vault", "df", "-kP", "/app/storage"') == 1
+    assert source.count('"exec", "-T", "vault-api", "df", "-kP", "/app/storage"') == 1
+    secure = (ROOT / "deploy" / "docker-compose.secure.yml").read_text(encoding="utf-8")
+    trial = (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "container_name: vault\n" in secure and "container_name: vault-api\n" in secure
+    assert "container_name: vault\n" not in trial and "container_name: vault-api\n" in trial
+    assert "vault_storage:/app/storage\n" in secure and "vault_storage:/app/storage\n" in trial
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    start = readme.index("### Upgrading to 0.34.0")
+    section = " ".join(readme[start:readme.index("\n### ", start + 1)].split())
+    item = section[section.index("**Free space on the storage volume:**"):]
+    item = item[:item.index(" - **")]
+    assert item.count("`python dockvault.py update` checks the volume before the upgrade only when the tool itself is "
+                      "0.34.0 or later, so update the checkout first (`git pull`, or `git fetch --tags` and `git "
+                      "checkout v0.34.0`); an older tool does not check.") == 1
+    assert item.count("To check by hand, `docker exec vault df -h /app/storage` (`vault-api` in the split layout and "
+                      "the local trial) shows the volume's `Size` and `Available`: `Available` must be more than the "
+                      "floor its `Size` gives.") == 1
+    assert "says so before the upgrade" not in text + item
 
 
 def test_the_security_alert_text_says_what_the_pruner_does():
