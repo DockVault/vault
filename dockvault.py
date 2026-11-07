@@ -4532,6 +4532,16 @@ class DockVault:
             recording = recording_preset_config(preset or "full", lock_levels)
         except ValueError as exc:
             self._fail(str(exc))
+        # The free space the storage volume keeps (MIN_FREE_SPACE_GB). Asked when no flag gave it; left blank, the
+        # application's own default applies and nothing is written.
+        min_free = a("min_free_space_gb")
+        if interactive and min_free is None:
+            while True:
+                min_free = ask("Free space the storage volume keeps, in GB (blank = the default: the larger of 2 GB "
+                               "and 5% of the volume, at most 20 GB; 0 = off)", pal, "").strip() or None
+                if min_free is None or parse_min_free_space_gb(min_free) is not None:
+                    break
+                print(pal.paint("  enter a number of GB, 0 to turn it off, or leave it blank", "red"))
 
         if sftp_public_host and not validate_server_name(sftp_public_host):
             self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
@@ -4565,8 +4575,7 @@ class DockVault:
             "audit_fingerprint_key": gen_hex(32),
             "audit_chain_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
-            "min_free_space_gb": parse_min_free_space_gb(
-                getattr(args, "min_free_space_gb", None) if args else None),
+            "min_free_space_gb": parse_min_free_space_gb(min_free),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.
             "max_concurrent_transfers": parse_transfer_limit(

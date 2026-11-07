@@ -3100,6 +3100,59 @@ def test_setup_writes_the_free_space_floor_only_when_asked_and_a_fresh_set_keeps
     assert Settings.model_fields["min_free_space_gb"].default == -1
 
 
+FLOOR_PROMPT = "Free space the storage volume keeps, in GB"
+
+
+def _interactive_setup(tmp_path, monkeypatch, floor_answers, **flags):
+    """Interactive setup's config with every other question at its default; the floor's question answered from
+    ``floor_answers``. Returns the config, how often the floor was asked, and the MIN_FREE_SPACE_GB lines written."""
+    answers, asked = iter(floor_answers), []
+
+    def ask(prompt, pal, default=None):
+        if prompt.startswith(FLOOR_PROMPT):
+            asked.append(prompt)
+            return next(answers)
+        return "vault.example.com" if prompt.startswith("Public DNS name") else (default or "")
+
+    monkeypatch.setattr(dv, "ask", ask)
+    monkeypatch.setattr(dv, "ask_secret", lambda prompt, pal: "Strong-Pass-1234")
+    monkeypatch.setattr(dv, "confirm", lambda prompt, pal, default=True: False)
+    monkeypatch.setattr(dv, "prompt_free_port", lambda pal, label, default: default)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "dockvault-vault:latest")
+    cfg = tool._collect_setup_config(argparse.Namespace(non_interactive=False, **flags))
+    return cfg, len(asked), [ln for ln in dv.build_env_lines(cfg) if ln.startswith("MIN_FREE_SPACE_GB")]
+
+
+@pytest.mark.parametrize("answers, value, lines", [
+    ([""], None, []),                                        # the application's default, nothing written
+    (["0"], 0.0, ["MIN_FREE_SPACE_GB=0"]),                  # off
+    (["abc", "inf", "12.5"], 12.5, ["MIN_FREE_SPACE_GB=12.5"]),
+    (["nan", "ten", "40"], 40.0, ["MIN_FREE_SPACE_GB=40"]),
+    (["abc", ""], None, []),
+])
+def test_interactive_setup_asks_for_the_free_space_floor_until_it_gets_one(tmp_path, monkeypatch, answers, value,
+                                                                          lines):
+    """Setup asks how much free space the storage volume keeps, as it asks for the other settings a deployment starts
+    with, and again until it is given a number of GB or nothing (a blank leaves the application's default, and
+    nothing is written). inf and nan are no answer: the application would read them as its default, and they cannot
+    be written."""
+    cfg, asked, written = _interactive_setup(tmp_path, monkeypatch, answers)
+    assert asked == len(answers)
+    assert cfg["min_free_space_gb"] == value and written == lines
+
+
+def test_the_free_space_floor_is_not_asked_when_a_flag_gives_it_or_setup_runs_unattended(tmp_path, monkeypatch):
+    cfg, asked, written = _interactive_setup(tmp_path, monkeypatch, [], min_free_space_gb=30.0)
+    assert asked == 0 and written == ["MIN_FREE_SPACE_GB=30"]
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: pytest.fail("an unattended setup asked something"))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "dockvault-vault:latest")
+    cfg = tool._collect_setup_config(argparse.Namespace(non_interactive=True, server_name="vault.example.com",
+                                                        admin_password="Strong-Pass-1234"))
+    assert cfg["min_free_space_gb"] is None
+
+
 @pytest.mark.parametrize("given", ["inf", "-inf", "nan", "Infinity"])
 def test_a_free_space_floor_that_is_not_a_finite_number_is_not_written(tmp_path, monkeypatch, given):
     """argparse's float takes 'inf' and 'nan', and an .env may carry them: writing either raised in format_gb_value,
