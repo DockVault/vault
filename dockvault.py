@@ -2524,15 +2524,16 @@ CHAIN_KEY_LOCK = ".audit-chain-key.lock"
 # .env is installed, so it stays after a restore that stopped part way, after Ctrl-C, after a crash. While it is
 # there, nothing starts that set, whose volumes hold part of a backup: every command that would (restore_incomplete_
 # refusers) refuses before it changes anything, and says the way back (run the restore again, or Reset); the stack's
-# start and the database's own start for a check of .env refuse it too, whatever asked for them. Reset of that set
-# removes it. It holds no secret.
+# start and the database's own start for a check of .env refuse it too, whatever asked for them. Nor does backup take
+# those volumes for a whole set. Reset of that set removes it. It holds no secret.
 RESTORE_INCOMPLETE = ".restore-incomplete."
 
 
 def restore_incomplete_refusers(what):
     """The commands that refuse set `what` (its name in quotes, or "it") while a restore of it that began to replace
     its volumes has not finished (RESTORE_INCOMPLETE), as the messages and the README say them."""
-    return "start, restart, setup, update, storage, logs and audit change-key refuse to start %s" % what
+    return ("start, restart, setup, update, storage, logs and audit change-key refuse to start %s, and backup refuses "
+            "to back it up" % what)
 
 
 def restore_incomplete_path(root, prefix):
@@ -6426,11 +6427,20 @@ class DockVault:
         """Dump the current set into ONE bundle dir: the paired .env (mode-600), a tar.gz per data
         volume, and a manifest with a NON-secret coupling fingerprint. Skips a volume that doesn't
         exist (e.g. brand). The running deployment is paused (not stopped) for as long as its volumes are
-        archived (_pause_for_backup), so the database and the stored files are copies of one moment."""
+        archived (_pause_for_backup), so the database and the stored files are copies of one moment.
+
+        Refused, with nothing written, while a restore of the set began to replace its volumes and did not finish
+        (RESTORE_INCOMPLETE): they hold part of a backup, and a bundle of them would pass for a whole one, which a
+        restore would put back, its marker gone, and start."""
         pal = self.pal
         prefix = volume_prefix(env)
         if not env:
             self._fail("no .env found - nothing to back up (run Setup first)")
+        found = self._incomplete_restores()
+        if prefix in found:
+            self._fail("set '%s' is not backed up: %s A backup of its volumes now would hold that part of a backup as "
+                       "if it were the whole set. Nothing was written."
+                       % (prefix, self._incomplete_restore_text(prefix, found[prefix])))
         names = set_volume_names(prefix)
         ts = _timestamp()
         # Absolute: the archives are written by a container through `-v <bundle>:/dest`, and Docker takes a source

@@ -718,7 +718,7 @@ def test_a_restore_that_stopped_part_way_leaves_a_marker_and_start_refuses_that_
     assert doc["volumes"] == ([names["keys"]] if fail == "mark" else [names["keys"], names["pg"]])
     assert doc["backup_changed"] is (fail == "changed")
     assert ("Until set 'dvarchstop' is restored, start, restart, setup, update, storage, logs and audit change-key "
-            "refuse to start it") in said
+            "refuse to start it, and backup refuses to back it up") in said
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     started = []
     _starting(tool, monkeypatch, started)
@@ -1031,6 +1031,39 @@ def test_reset_of_a_set_removes_the_mark_its_restore_left(tmp_path, monkeypatch)
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: _Ran())
     tool.reset(argparse.Namespace(non_interactive=True, confirm=True))
     assert not marker.exists() and other.exists(), "another set's mark is that set's"
+
+
+@pytest.mark.parametrize("how", ["backup-command", "backup-itself"])
+def test_a_backup_of_a_set_whose_restore_did_not_finish_is_refused_with_nothing_written(tmp_path, monkeypatch, capsys,
+                                                                                       how):
+    """A backup of the volumes a restore half replaced was taken as an ordinary one (format 2, checksums, no word of
+    the marker): restored later, it put them back, removed the marker and started the set. Refused before anything
+    is written, paused or archived."""
+    env = _env(tmp_path, "dvarchbak")
+    _marker(tmp_path, "dvarchbak").write_text(json.dumps({"volume_prefix": "dvarchbak", "bundle": "/b/x"}),
+                                              encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(dv, "volume_exists", lambda *a, **k: pytest.fail("a volume was looked at"))
+    monkeypatch.setattr(dv, "tar_volume", lambda *a, **k: pytest.fail("a volume was archived"))
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: pytest.fail("compose ran (a pause)"))
+    args = argparse.Namespace(non_interactive=True, backup_action="backup", backup_dir=str(tmp_path / "backups"))
+    with pytest.raises(SystemExit):
+        if how == "backup-command":
+            tool.backup(args)
+        else:
+            tool._do_backup(env, args)
+    assert not (tmp_path / "backups").exists(), "no bundle folder was made"
+    said = _said(capsys)
+    assert "set 'dvarchbak' is not backed up: a restore of set 'dvarchbak' from /b/x began" in said
+    assert "would hold that part of a backup as if it were the whole set. Nothing was written." in said
+
+
+def test_a_restore_of_another_set_that_did_not_finish_does_not_keep_the_host_set_from_its_backup(tmp_path,
+                                                                                                 monkeypatch):
+    _marker(tmp_path, "dvarchother").write_text(json.dumps({"volume_prefix": "dvarchother"}), encoding="utf-8")
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchhostbak")
+    assert json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))["volume_prefix"] == "dvarchhostbak"
 
 
 def _deployment_in(tmp_path, folder, prefix="dvarchglob", marked=True):
