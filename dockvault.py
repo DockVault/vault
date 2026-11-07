@@ -2553,8 +2553,9 @@ def kept_chain_key_path(root, prefix):
 
 def kept_chain_key_files(root):
     """Every old AUDIT_CHAIN_KEY kept in plain text in `root`: each set's, and those Reset moved aside."""
-    return sorted(set(glob.glob(os.path.join(root, KEPT_CHAIN_KEY + "*")) +
-                      glob.glob(os.path.join(root, KEPT_CHAIN_KEY_REMOVED + "*"))))
+    here = glob.escape(root)            # the folder's own name may hold [, ], * or ?
+    return sorted(set(glob.glob(os.path.join(here, KEPT_CHAIN_KEY + "*")) +
+                      glob.glob(os.path.join(here, KEPT_CHAIN_KEY_REMOVED + "*"))))
 
 
 class LockBusy(Exception):
@@ -5543,7 +5544,7 @@ class DockVault:
         sealed lock file. These are set aside by 'new set' / repoint / remove and still hold an
         ENCRYPTION_KEY; 'lock' does not manage them, so the tool surfaces them instead."""
         out = []
-        for p in glob.glob(os.path.join(self.root, ".env.*")):
+        for p in glob.glob(os.path.join(glob.escape(self.root), ".env.*")):
             base = os.path.basename(p)
             if base in (".env.example", ".env.enc") or not os.path.isfile(p):
                 continue
@@ -6358,7 +6359,7 @@ class DockVault:
         disappears mid-scan is skipped rather than crashing the sort."""
         found, seen = [], set()
         for root in self._backup_search_roots(args):
-            for c in glob.glob(os.path.join(root, "dockvault-*")):
+            for c in glob.glob(os.path.join(glob.escape(root), "dockvault-*")):
                 if not os.path.isdir(c):
                     continue
                 ap = os.path.abspath(c)
@@ -7302,7 +7303,8 @@ class DockVault:
         """{set prefix: its marker's document ({} when it cannot be read)} of each restore here that began to replace a
         set's volumes and did not finish (RESTORE_INCOMPLETE)."""
         found = {}
-        for path in sorted(glob.glob(os.path.join(self.root, RESTORE_INCOMPLETE + "*"))):
+        # The folder is escaped: its own name may hold [, ], * or ? (vault[1]), and then no marker would be found.
+        for path in sorted(glob.glob(os.path.join(glob.escape(self.root), RESTORE_INCOMPLETE + "*"))):
             prefix = os.path.basename(path)[len(RESTORE_INCOMPLETE):]
             try:
                 with open(path, encoding="utf-8") as f:

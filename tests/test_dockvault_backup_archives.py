@@ -1033,6 +1033,67 @@ def test_reset_of_a_set_removes_the_mark_its_restore_left(tmp_path, monkeypatch)
     assert not marker.exists() and other.exists(), "another set's mark is that set's"
 
 
+def _deployment_in(tmp_path, folder, prefix="dvarchglob", marked=True):
+    """A deployment folder named `folder` under tmp_path, with set `prefix`'s .env and (when `marked`) the marker of a
+    restore of that set that did not finish."""
+    root = tmp_path / folder
+    root.mkdir()
+    _env(root, prefix)
+    if marked:
+        _marker(root, prefix).write_text(json.dumps({"volume_prefix": prefix, "bundle": "/b/x"}), encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize("folder", ["vault[1]", "dv-[ab]-set"])
+def test_a_restore_marker_is_found_in_a_folder_whose_name_holds_brackets(tmp_path, monkeypatch, capsys, folder):
+    """The markers were looked for with the folder's own path read as a pattern: in vault[1] (brackets are ordinary in
+    folder names) no marker was ever found, start started the set, and the next restore did not know an earlier one
+    had not finished."""
+    root = _deployment_in(tmp_path, folder)
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    assert set(tool._incomplete_restores()) == {"dvarchglob"}
+    started = []
+    _starting(tool, monkeypatch, started)
+    with pytest.raises(SystemExit):
+        tool.start()
+    assert started == []
+    assert "start would start set 'dvarchglob', but a restore of set 'dvarchglob' from /b/x" in _said(capsys)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="* and ? cannot be in a folder's name on Windows")
+@pytest.mark.parametrize("folder,beside", [("vault?", "vaultX"), ("vault*", "vault-old")])
+def test_a_marker_of_another_folder_that_the_folders_name_would_match_is_not_this_ones(tmp_path, monkeypatch, folder,
+                                                                                      beside):
+    """Read as a pattern, vault? or vault* matched the folders beside it too: a marker of another deployment there,
+    for a set of the same name, refused this one's start."""
+    root = _deployment_in(tmp_path, folder, marked=False)
+    _deployment_in(tmp_path, beside)
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    assert tool._incomplete_restores() == {}
+    started = []
+    _starting(tool, monkeypatch, started)
+    tool.start()
+    assert started == [1]
+
+
+def test_the_listings_of_a_folder_whose_name_holds_brackets_find_what_is_there(tmp_path):
+    """The kept chain keys lock warns about, the plain-text .env copies status and lock name, and the backups a
+    restore offers were looked for with the folder read as a pattern too: in a folder named with brackets none was
+    found."""
+    root = tmp_path / "vault[1]"
+    root.mkdir()
+    kept = root / (dv.KEPT_CHAIN_KEY + ".dvarchglob")
+    kept.write_text("ab" * 32 + "\n", encoding="utf-8")
+    (root / ".env.dvarchglob").write_text("X=1\n", encoding="utf-8")
+    backups = tmp_path / "backups[1]"
+    bundle = backups / "dockvault-dvarchglob-20261107-010203"
+    bundle.mkdir(parents=True)
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    assert dv.kept_chain_key_files(str(root)) == [str(kept)]
+    assert tool._env_archives() == [str(root / ".env.dvarchglob")]
+    assert tool._list_bundles(argparse.Namespace(backup_dir=str(backups))) == [str(bundle)]
+
+
 # --------------------------------------------------------------------------- the extraction reads what was checked
 
 def test_an_extraction_extracts_only_a_copy_whose_checksum_is_the_one_checked(tmp_path):
