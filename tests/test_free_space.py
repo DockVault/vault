@@ -333,14 +333,31 @@ def test_a_folder_copy_the_volume_has_no_room_for_is_refused_before_it_makes_a_f
 
 
 def test_a_folder_copy_past_the_vaults_limit_or_the_item_limit_makes_nothing(monkeypatch, volume):
-    """The vault's size limit and the item limit refused part-way too, keeping what had been made: both are asked
-    before the first folder now."""
+    """The vault's size limit, the deployment's storage limit and the item limit refused part-way too, keeping what
+    had been made: all three are asked before the first folder now, the two limits with the bytes of the whole tree."""
     import app.services.vault_service as vs
+    from app.core import storage_quota
     copy, made, _svc = _folder_copy(monkeypatch, [("top", 10, False), ("sub", 10, False)], under=[("sub", "top")],
                                     size_limit=100, stored=81)
     with pytest.raises(vs.FileTooLargeError) as refused:
         copy()
     assert str(refused.value) == "The copy would exceed the destination vault's size limit" and made == []
+    asked = []
+
+    def deployment(cap):
+        def would_exceed(db, add_bytes):                    # 81 bytes of the deployment's limit already stored
+            asked.append(add_bytes)
+            return storage_quota.would_exceed_deployment(81, add_bytes, cap), 81, cap
+        return would_exceed
+    copy, made, _svc = _folder_copy(monkeypatch, [("top", 10, False), ("sub", 10, False)], under=[("sub", "top")])
+    monkeypatch.setattr(vs, "would_exceed_deployment_storage", deployment(100))
+    with pytest.raises(vs.FileTooLargeError) as refused:
+        copy()                                              # the tree's 20 bytes are one past the limit
+    assert str(refused.value) == "The destination is out of storage" and made == [] and asked == [20]
+    copy, made, _svc = _folder_copy(monkeypatch, [("top", 10, False), ("sub", 10, False)], under=[("sub", "top")])
+    monkeypatch.setattr(vs, "would_exceed_deployment_storage", deployment(101))
+    copy()                                                  # they reach it exactly
+    assert made == ["top"] and asked == [20, 20]
     tree = dict(files=[("top", 10, False), ("a", 10, False)], under=[("a", "top"), ("b", "top")])
     copy, made, svc = _folder_copy(monkeypatch, **tree)
     svc._COPY_MAX_ITEMS = 4                                 # three folders and two files: five items
