@@ -371,7 +371,8 @@ the recipients' mailboxes.
 - **One-time secrets** `python dockvault.py` shows (a generated admin password, a recovery key, a password
   reset link) go to the controlling terminal. With no terminal (cloud-init, a CI job), and on Windows always
   (a console may have no window), each is written to a file of its own, mode 600, under `secrets/` in the
-  DockVault folder of the user's application data (beside the default backups): the tool never deletes it. Read it, keep the secret, then delete the file.
+  DockVault folder of the user's application data (beside the default backups): the tool never deletes it.
+  Read it, keep the secret, then delete the file.
 - **`python dockvault.py accounts`** on the host: the server's operator can look an account up (its
   email and last sign-in are printed on the host's terminal, and the lookup is not audited, since the
   operator can read the database anyway) and change it (audited as the host operator). **New in
