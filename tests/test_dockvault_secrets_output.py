@@ -25,6 +25,7 @@ _spec.loader.exec_module(dv)
 
 SECRET = "Gen-Admin-Pass-7f3a9c"
 _real_open = open
+_real_os_name = os.name
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +93,61 @@ def test_setup_with_a_terminal_shows_the_generated_password_there_and_not_on_sta
     _summary(dv.DockVault(dv.Palette(False), root=str(tmp_path)))
     assert SECRET not in capsys.readouterr().out
     assert SECRET in seen.getvalue()
-    assert _secret_files(tmp_path) == []
+    if os.name == "nt":                   # a console may have no window: a file of its own as well (below)
+        (path,) = _secret_files(tmp_path)
+        assert SECRET in path.read_text(encoding="utf-8")
+    else:
+        assert _secret_files(tmp_path) == []
+
+
+def test_on_windows_a_secret_shown_on_the_console_is_also_written_to_a_file_of_its_own(tmp_path, monkeypatch,
+                                                                                       capsys):
+    """CON opens, and takes the secret, for a console nobody sees as well (a scheduled task, a service's child, any
+    program started with no window), and the secret was lost: nothing on standard output, no file. On Windows it
+    also goes to a mode-600 file of its own, which standard output names; the secret itself stays off it."""
+    seen = _a_terminal(monkeypatch)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv.os, "name", "nt")
+    tool._emit_secret("pw " + SECRET, label="admin-password")
+    monkeypatch.setattr(dv.os, "name", _real_os_name)
+    out = " ".join(capsys.readouterr().out.split())
+    assert SECRET in seen.getvalue() and SECRET not in out
+    (path,) = _secret_files(tmp_path)
+    assert path.read_text(encoding="utf-8").strip() == "pw %s" % SECRET and path.name.startswith("admin-password-")
+    assert "The admin password is also in %s, which only you can read" % path in out
+
+
+def test_on_windows_a_secret_with_no_file_for_it_is_said_to_be_on_the_console_only(tmp_path, monkeypatch, capsys):
+    seen = _a_terminal(monkeypatch)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_write_secret_file", lambda label, text: None)
+    monkeypatch.setattr(dv.os, "name", "nt")
+    tool._emit_secret("pw " + SECRET, label="admin-password")
+    monkeypatch.setattr(dv.os, "name", _real_os_name)
+    out = " ".join(capsys.readouterr().out.split())
+    assert SECRET in seen.getvalue() and SECRET not in out
+    assert "The admin password was shown on the console only: no file could be written to keep it as well." in out
+
+
+def test_on_windows_a_recovery_key_kept_in_recovery_out_gets_no_second_file(tmp_path, monkeypatch, capsys):
+    """--recovery-out already holds it (and the command says so): no second copy."""
+    seen = _a_terminal(monkeypatch)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv.os, "name", "nt")
+    tool._emit_secret("key " + SECRET, label="recovery-key", kept_in=str(tmp_path / "recovery.txt"))
+    monkeypatch.setattr(dv.os, "name", _real_os_name)
+    assert SECRET in seen.getvalue() and _secret_files(tmp_path) == []
+    assert SECRET not in capsys.readouterr().out
+
+
+def test_off_windows_a_secret_shown_on_the_terminal_goes_to_no_file(tmp_path, monkeypatch, capsys):
+    seen = _a_terminal(monkeypatch)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(dv.os, "name", "posix")
+    tool._emit_secret("pw " + SECRET, label="admin-password")
+    monkeypatch.setattr(dv.os, "name", _real_os_name)
+    assert SECRET in seen.getvalue() and _secret_files(tmp_path) == []
+    assert capsys.readouterr().out == ""
 
 
 def test_a_second_secret_in_the_same_second_gets_a_file_of_its_own(tmp_path, monkeypatch):

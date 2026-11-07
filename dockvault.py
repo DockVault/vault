@@ -4516,15 +4516,30 @@ class DockVault:
         controlling terminal (cloud-init, a CI job, a service) it goes to a new file only this user can read
         (_write_secret_file), and stdout names only that file - or, with `kept_in` (a file the caller writes the
         secret to anyway, as --recovery-out), only that one. stdout carries the secret only when no file can be
-        written either, and says so."""
+        written either, and says so.
+
+        On Windows, CON opens, and takes the secret, for a console nobody sees as well (a program started with no
+        window: a scheduled task, a service's child), and the secret would be lost. There it is shown on the console
+        and also written to such a file, which stdout names (unless `kept_in` holds it already)."""
         dev = "CON" if os.name == "nt" else "/dev/tty"
         try:
             with open(dev, "w", encoding="utf-8") as tty:
                 tty.write(text + "\n")
-                return
+            shown = True
         except OSError:
-            pass
+            shown = False
         what = label.replace("-", " ")
+        if shown:
+            if os.name == "nt" and not kept_in:
+                path = self._write_secret_file(label, text)
+                if path:
+                    print(self.pal.paint("  The %s is also in %s, which only you can read (a console window may not "
+                                         "show it). Keep it somewhere safe, then delete that file." % (what, path),
+                                         "yellow"))
+                else:
+                    print(self.pal.paint("  The %s was shown on the console only: no file could be written to keep "
+                                         "it as well." % what, "yellow"))
+            return
         if kept_in:
             print(self.pal.paint("  No terminal to show the %s on: it is written to %s only." % (what, kept_in),
                                  "yellow"))

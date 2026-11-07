@@ -101,7 +101,9 @@ A one-time secret the tool shows (a generated admin password, a recovery key, a 
 goes to the controlling terminal, never to standard output, which a log of the run keeps. With no
 terminal (cloud-init, a CI job) it goes to a new file only you can read, under the DockVault folder of
 your user's application data (beside the default backups, never in the checkout), and the output
-names only that file: read it, keep the secret, then delete the file. For an unattended setup, give
+names only that file: read it, keep the secret, then delete the file. On Windows it is shown on the
+console and also written to such a file, which the output names, since a console started without a
+window takes the secret and shows it to nobody. For an unattended setup, give
 the admin password with `--admin-password-file <file>` (its first line) or `--admin-password-stdin`;
 `--admin-password <value>` still works but warns, as other users of the host can read a command line
 and the shell keeps it in its history.
