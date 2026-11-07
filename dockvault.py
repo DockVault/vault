@@ -4826,6 +4826,10 @@ class DockVault:
         if not ok:
             print(pal.paint("  Docker is not available: %s" % msg, "red"))
             raise SystemExit(2)
+        # A deployment that builds from source is built from the checkout as it is (up --build): never one older than
+        # the version the deployment has run, whose image would not start on the newer data (as restart and setup).
+        if not uses_release_image(self._load_env()):
+            self._refuse_older_build("start")
         profiles = self._load_env().get("COMPOSE_PROFILES", "combined")
         print(pal.paint("  Starting the deployment ...", "cyan"))
         if not self._start_secure_stack():

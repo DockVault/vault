@@ -2736,6 +2736,36 @@ def test_restart_builds_a_checkout_newer_than_the_version_the_deployment_runs(tm
     assert _compose_verb(calls, "build") and _compose_verb(calls, "up")
 
 
+def test_start_never_builds_a_checkout_older_than_the_version_the_deployment_runs(tmp_path, monkeypatch, capsys):
+    """start alone built a deployment that builds from source from the checkout as it is (up --build), an older one
+    too: its image refuses to start on the newer data, and the deployment was left with nothing running. Refused, as
+    restart and setup refuse it, before anything is built."""
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout="0.33.6", running="0.34.0")
+    with pytest.raises(SystemExit):
+        tool.start()
+    assert not _compose_verb(calls, "build") and not _compose_verb(calls, "up")
+    said = " ".join(capsys.readouterr().out.split())
+    assert ("start would build and start this checkout at 0.33.6, which is older than 0.34.0, the version this "
+            "deployment has run (from the running container)") in said
+    assert "Nothing was built or taken down." in said
+
+
+@pytest.mark.parametrize("checkout", ["0.34.0", "0.34.1"])
+def test_start_builds_a_checkout_as_new_as_the_version_the_deployment_runs(tmp_path, monkeypatch, checkout):
+    tool, calls = _restarting_a_build(tmp_path, monkeypatch, checkout=checkout, running="0.34.0")
+    tool.start()
+    ups = _compose_verb(calls, "up")
+    assert ups and "--build" in calls[ups[0]]
+
+
+def test_start_of_a_release_image_deployment_does_not_ask_the_version_it_runs(tmp_path, monkeypatch):
+    """A release image is the version it names: start uses it as it is, and there is no checkout to compare."""
+    tool, calls = _restarting(tmp_path, monkeypatch, image_here=True, pull_ok=False)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: pytest.fail("the running version was asked"))
+    tool.start()
+    assert _compose_verb(calls, "up")
+
+
 def test_start_builds_when_no_release_image_is_pinned(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(_reusable_env_cfg())) + "\n", encoding="utf-8")
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))

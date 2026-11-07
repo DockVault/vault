@@ -84,13 +84,13 @@ when it is missing; `restart` does that before it takes anything down, so a host
 the registry keeps its running deployment. Start and restart keep a release-image deployment on its
 image. A deployment that builds from source is built again from the checkout as it is now by start
 and restart too; `restart` builds it before it takes anything down, so a build that fails leaves the
-deployment running, and it refuses a checkout older than the version the deployment has run.
+deployment running, and both refuse a checkout older than the version the deployment has run.
 `update` moves a deployment to another image; so does a restore, to the image the backup's `.env`
 names (the one its data was made with), and a setup re-run that starts this checkout's version: one
 where you switch to the published release (it pulls the release of this checkout's `VERSION`) or to
 building from source, and any re-run of a deployment that builds from source (it is built again from
-the checkout as it is now). Setup and restart never go back to an older version than the deployment
-has run; `update --tag` does, after its checks.
+the checkout as it is now). Setup, start and restart never go back to an older version than the
+deployment has run; `update --tag` does, after its checks.
 
 Setup creates the first admin account from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` it writes to
 `.env` (a blank password auto-generates a strong one, shown once). Then open
