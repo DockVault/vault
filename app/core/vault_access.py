@@ -31,8 +31,9 @@ So the stored time is at most about a minute behind the vault's most recent open
   within ``EXIT_SECONDS`` (its row held, the database away) is lost;
 - a crash (the process killed without its exit handlers: SIGKILL, out of memory, a power cut) loses every write
   still waiting: at most one opening per vault, the latest that was not written yet;
-- while writes fail (the database away), the stored time falls behind for as long as it lasts, and catches up
-  once the database takes them.
+- while writes fail (the database away), the stored time falls behind for as long as it lasts, and catches up at
+  the next attempt once the database takes writes again: up to ``MAX_RETRY_SECONDS`` (five minutes) after it is
+  back, the wait between attempts having grown that long.
 
 A write that was lost leaves the stored time more than a minute behind until the vault is opened again.
 

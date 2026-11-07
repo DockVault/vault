@@ -263,6 +263,15 @@ only turned away once the queue (`MAX_QUEUED_TRANSFERS`, 32) is also full or the
 (`TRANSFER_QUEUE_WAIT_SECONDS`, 20) expires. A refusal is a `503` with `Retry-After`, deliberately
 distinct from a failure, so a client can tell "come back shortly" from "this file is broken".
 
+**One account's copies hold at most a quarter of the slots.** A copy, a move to another vault and a
+folder copy need no slow client to last: one account's folder copies of a large tree held every slot
+for minutes. So one account holds at most a quarter of the ceiling with them (at least one: 4 at the
+default ceiling). One more waits for one of the account's own to end, in a waiting room of the
+account's own, as large as the deployment's, so it takes no place in the deployment's room either. It
+is turned away once that room is full or the wait expires, with a `429` and `Retry-After`: the
+deployment may have slots free, and the account's own copies are what it waits for. The Activity
+page's "Now" panel and the metrics count those waiting copies with the waiting transfers.
+
 **A transfer also holds a database connection while it runs.** Upload assembly, a copy and a move
 run in threads of their own, each on its request's connection, and a download holds one while it
 streams; a transfer waiting for a slot holds none (a download, a preview or a public link's download

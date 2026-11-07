@@ -23585,15 +23585,16 @@ async def _admitted_holding_no_connection(db, *, account=None):
 
     With an ``account`` (a copy, a move to another vault, a folder copy), that account holds at most its share of
     the slots with them (copy_share: a quarter of the ceiling, at least one); one past it waits for one of its own
-    to end. A copy needs no slow client to last, and one account's folder copies of a large tree held every slot
-    while everyone else waited.
+    to end, in a waiting room of the account's own (a 429 when that is full or the wait runs out). A copy needs no
+    slow client to last, and one account's folder copies of a large tree held every slot while everyone else waited.
 
     Each of them holds the request's database connection while it runs: a download while it streams, a copy in a
     thread (app/core/off_loop.py) that reads, decrypts, encrypts and syncs a whole file, a folder copy every file in
     the tree. The ceilings bound how many run, and the pool is sized beyond that (app/core/database.py). A request
-    waiting for its slot must hold none: waiting requests are bounded by the queue (32 by default), not by the
-    ceiling, and when downloads waited holding their read transaction, 16 streaming and 32 waiting held the whole
-    pool, and the server stopped answering anyone.
+    waiting for its slot must hold none: the ceiling does not bound how many wait (the queue, 32 by default, bounds
+    those waiting for a slot, and each account's own room, as large, its copies waiting for its share: with many
+    accounts, many times the queue), and when downloads waited holding their read transaction, 16 streaming and 32
+    waiting held the whole pool, and the server stopped answering anyone.
 
     Called after the checks that cost nothing to answer, so a caller told 403 or 404 is not first made to queue.
     The request's read transaction ends first (nothing is pending: the checks only read, and get_vault commits),
