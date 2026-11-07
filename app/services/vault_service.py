@@ -252,9 +252,11 @@ class FileTooLargeError(FileServiceError):
 
 class StorageLimitExceeded(FileTooLargeError):
     """No room for a file: storing it would pass the vault's size limit (``kind`` 'vault') or the
-    deployment's storage limit (``kind`` 'deployment'). ``used`` is what is stored and ``cap`` the
-    limit, both in bytes. Raised by finalize_streaming_upload, which decides it under locks held until
-    the file's row commits; the new file is removed before it is raised."""
+    deployment's storage limit (``kind`` 'deployment'), or leave the storage volume less than the free
+    space it keeps (``kind`` 'disk', app/core/free_space.py: ``used`` is then the free space and ``cap``
+    the floor). ``used`` is what is stored and ``cap`` the limit, both in bytes. Raised by
+    finalize_streaming_upload, which decides it under locks held until the file's row commits; the new
+    file is removed before it is raised."""
 
     def __init__(self, message, *, kind, used, cap):
         super().__init__(message)
@@ -307,6 +309,14 @@ _COPY_REFUSALS = {
     'vault': "The copy would exceed the destination vault's size limit",
     'deployment': "The destination is out of storage",
 }
+
+
+def _disk_refusal(room) -> "StorageLimitExceeded":
+    """The refusal of a file that would leave the storage volume less than the free space it keeps
+    (app/core/free_space.py): ``used`` is the free space, ``cap`` the floor."""
+    from app.core import free_space
+    return StorageLimitExceeded(free_space.refusal_text(room), kind='disk', used=room.free, cap=room.floor)
+
 
 # The transaction-level advisory lock that takes the deployment's stored total in turns
 # (VaultService.take_storage_turn). Stable and arbitrary, distinct from every other advisory lock class.
@@ -1448,10 +1458,17 @@ class VaultService:
         codec = IdentityChunkCodec() if is_zk else GcmChunkStreamCodecV2(vault_id, file_id)
 
         # Create streaming context
+        # The storage volume keeps a floor of free space (app/core/free_space.py): looked at as the bytes are
+        # written, so one transfer of any size cannot run the disk to its end. A refusal removes the file.
+        from app.core import free_space
+
+        def _no_more_room(room):
+            raise _disk_refusal(room)
         context = StreamingUploadContext(
             file_id=file_id,
             storage_path=storage_path,
             codec=codec,
+            guard=free_space.WriteGuard(storage_path.parent, _no_more_room),
         )
         
         # File object will be created after upload completes with actual size
@@ -1765,6 +1782,12 @@ class VaultService:
             self._give_up(file_info, StorageLimitExceeded(
                 "The file would exceed the vault's size limit",
                 kind='vault', used=stored, cap=limit))
+        # The free space the storage volume keeps, with this file's bytes on it already (app/core/free_space.py).
+        # The disk counts every file finishing at once, so this needs no turn.
+        from app.core import free_space
+        short = free_space.short_of(0, self.storage_path)
+        if short is not None:
+            self._give_up(file_info, _disk_refusal(short))
         if cap is None:
             return
         used = deployment_storage_used(self.db)
@@ -2749,6 +2772,22 @@ class VaultService:
             node = (self.db.query(Folder).filter(Folder.id == node.parent_folder_id).first()
                     if node.parent_folder_id else None)
 
+    def _refuse_a_copy_without_room(self, dest_vault_id, add_bytes: int) -> None:
+        """Refuse, before anything of it is written, a copy of ``add_bytes`` into ``dest_vault_id`` that the
+        destination vault's size limit, the deployment's storage limit or the free space the storage volume keeps
+        (app/core/free_space.py) has no room for."""
+        dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
+        if (dest_vault is not None and dest_vault.size_limit
+                and (dest_vault.total_size_bytes or 0) + add_bytes > dest_vault.size_limit):
+            raise FileTooLargeError(_COPY_REFUSALS['vault'])
+        exceeds, _used, _cap = would_exceed_deployment_storage(self.db, add_bytes)
+        if exceeds:
+            raise FileTooLargeError(_COPY_REFUSALS['deployment'])
+        from app.core import free_space
+        short = free_space.short_of(add_bytes, self.storage_path)
+        if short is not None:
+            raise _disk_refusal(short)
+
     def _stream_copy_file_record(self, source_file, user, dest_vault_id, dest_folder_id, *,
                                  source_file_password=None, replace_same_name=False):
         """Re-encrypt one file's content + name into dest as a NEW file; returns the new File.
@@ -2766,14 +2805,7 @@ class VaultService:
         # so none can bypass a limit the normal upload honours. This is the early answer, before the
         # whole file is re-encrypted; finalize checks both again under lock as the row is written, which
         # is what holds when several copies finish at once.
-        add_bytes = source_file.size_bytes or 0
-        dest_vault = self.db.query(Vault).filter(Vault.id == dest_vault_id).first()
-        if (dest_vault is not None and dest_vault.size_limit
-                and (dest_vault.total_size_bytes or 0) + add_bytes > dest_vault.size_limit):
-            raise FileTooLargeError(_COPY_REFUSALS['vault'])
-        exceeds, _used, _cap = would_exceed_deployment_storage(self.db, add_bytes)
-        if exceeds:
-            raise FileTooLargeError(_COPY_REFUSALS['deployment'])
+        self._refuse_a_copy_without_room(dest_vault_id, source_file.size_bytes or 0)
         name = source_file.original_name or source_file.name
         mime = source_file.mime_type
         # Open the decrypting reader first: this authorizes READ on the source vault and enforces any
@@ -2798,6 +2830,8 @@ class VaultService:
             )
         except StorageLimitExceeded as refused:
             # Another file took the room since the check above; the copy is removed already.
+            if refused.kind == 'disk':
+                raise
             raise StorageLimitExceeded(_COPY_REFUSALS[refused.kind], kind=refused.kind,
                                        used=refused.used, cap=refused.cap) from None
         # Preserve a file-level password on the copy (same hash → same protection). The reader above
@@ -2912,8 +2946,34 @@ class VaultService:
         self._require_standard(vault, "source")
         self._dest_folder_or_raise(dest_vault_id, dest_parent_folder_id)
         self._assert_not_into_self_or_descendant(folder_id, dest_parent_folder_id)
+        # The whole tree is measured before its first folder is made: each file is checked again as it is copied,
+        # but a copy refused there (the item limit, the vault's or the deployment's storage limit, the free space
+        # the volume keeps) kept the folders and files it had made, and the refusal said nothing of them.
+        folders, files, size = self._folder_tree_size(folder)
+        if folders + files > self._COPY_MAX_ITEMS:
+            raise FileServiceError("Folder is too large to copy (item limit reached).")
+        if files:
+            # As the first file's own check would ask, with the bytes of them all. A tree of folders alone copies
+            # no bytes, and is not asked, as before.
+            self._refuse_a_copy_without_room(dest_vault_id, size)
         counter = [0]
         return self._copy_folder_recursive(folder, user, dest_vault_id, dest_parent_folder_id, counter)
+
+    def _folder_tree_size(self, folder):
+        """(folders, files, bytes) of the copy of ``folder`` that _copy_folder_recursive makes: the folder and every
+        folder under it, and the files in them that have not expired, with their bytes. Stops counting once past
+        _COPY_MAX_ITEMS: no level reads more rows than that."""
+        past = self._COPY_MAX_ITEMS + 1
+        folders, files, size, level = 0, 0, 0, [folder.id]
+        while level and folders + files <= self._COPY_MAX_ITEMS:
+            folders += len(level)
+            sizes = self.db.query(File.size_bytes).filter(
+                File.vault_id == folder.vault_id, File.folder_id.in_(level), file_expiry.live_clause()).limit(past).all()
+            files += len(sizes)
+            size += sum(int(row[0] or 0) for row in sizes)
+            level = [row[0] for row in self.db.query(Folder.id).filter(
+                Folder.vault_id == folder.vault_id, Folder.parent_folder_id.in_(level)).limit(past).all()]
+        return folders, files, size
 
     def _copy_folder_recursive(self, folder, user, dest_vault_id, dest_parent_folder_id, counter):
         counter[0] += 1

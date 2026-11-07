@@ -7,7 +7,7 @@ on a throwaway SQLite database with a chain of its own (tests/_audit_chain_env.p
   passes, verified before the rows go (a corrupt block or a changed row keeps the rows), an hour another
   writer's unacknowledged seal holds left as rows (an hour an erase changed is archived like any:
   tests/test_audit_chain_erase.py), a crash between the steps, the data marker with the
-  first block and gone with the last;
+  first block and gone with the last, kept by a check that looked before a block was written;
 - the chain: the archive seal's rules, audit verify over blocks (altered, missing, unsealed, moved, a row put
   back), the daily check reading blocks in turn, an anchor checked without the key;
 - changes to archived rows through the block-rewrite primitive (the audit job's deletions), the size cap's count
@@ -592,6 +592,39 @@ def test_the_daily_check_puts_the_marker_back(env):
     arc._marker_checked.clear()
     _archive(env)
     assert _marker(env) is not None
+
+
+def test_a_check_that_found_no_block_before_one_was_written_keeps_the_marker_the_writer_left(env):
+    """The once-a-day check runs outside the audit chain's lock: it can look for blocks, find none, and then reach
+    its removal after an archiving pass wrote the first block and the marker and committed. The removal looks for the
+    blocks again itself, so the marker stays (test_audit_archive_live.py runs the same on Postgres, with the
+    pass still open while the check looks)."""
+    _sealed_day(env)
+    _archive(env)
+    since = _since(env)
+    with env.session() as db:
+        assert arc.sync_marker(db, env.clock(), present=False) is True, "the check said the marker was gone"
+        db.commit()
+    assert _marker(env) is not None and _blocks(env)
+    assert _since(env) == since
+
+
+def test_writing_the_marker_again_keeps_one_row_and_when_it_was_first_written(env):
+    _sealed_day(env)
+    _archive(env)
+    since = _since(env)
+    with env.session() as db:
+        assert arc.sync_marker(db, env.clock() + timedelta(days=3), present=True) is True
+        db.commit()
+    with env.session() as db:
+        assert db.execute(text("SELECT count(*) FROM data_requirements WHERE key = :k"),
+                          {"k": arc.MARKER_KEY}).scalar() == 1
+    assert _since(env) == since
+
+
+def _since(env):
+    with env.session() as db:
+        return db.execute(text("SELECT since FROM data_requirements WHERE key = :k"), {"k": arc.MARKER_KEY}).scalar()
 
 
 

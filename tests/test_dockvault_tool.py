@@ -636,6 +636,8 @@ def test_list_managed_volumes_live_roundtrip():
                                 "--label", "com.dockvault.role=%s" % role,
                                 "--label", "com.dockvault.bundle=dvmanagedbundle", name],
                                check=True, capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:   # binary present but daemon down -> skip, not error
             pytest.skip("docker daemon unavailable: %s" % exc)
         recs = [r for r in dv.list_managed_volumes() if r["bundle"] == "dvmanagedbundle"]
@@ -1130,6 +1132,8 @@ def test_probe_pg_password_live_distinguishes_secrets():
                             "-e", "POSTGRES_USER=sftp_user", "-e", "POSTGRES_PASSWORD=passA_1234",
                             "-e", "POSTGRES_DB=sftp_db", "-v", "%s:/var/lib/postgresql/data" % vol,
                             "postgres:15-alpine"], check=True, capture_output=True, timeout=90)
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker daemon/image unavailable: %s" % exc)
         # Ready the way the probe connects: over the container's own address. On its first start the image
@@ -1487,6 +1491,8 @@ def test_volume_sets_coexist_and_down_v_removes_only_current_live(tmp_path):
         try:
             up_a = dc("dvvolsets-a", "up", "-d")
             up_b = dc("dvvolsets-b", "up", "-d")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         # The image is local by now, so a failure here is compose or the daemon refusing to do
@@ -1689,6 +1695,8 @@ def test_backup_restore_round_trip_live(tmp_path, monkeypatch):
                        "sh", "-c", "echo SECRET-DATA-42 > /d/marker.txt")
             if seed.returncode != 0:
                 pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         backup_dir = tmp_path / "backups"
@@ -1753,6 +1761,8 @@ def test_backup_lock_restore_round_trip_live(tmp_path, monkeypatch):
                        "sh", "-c", "echo SEALED-DATA-7 > /d/marker.txt")
             if seed.returncode != 0:
                 pytest.skip("docker run unavailable: %s" % seed.stderr[:120])
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         backup_dir = tmp_path / "backups"
@@ -3068,6 +3078,103 @@ def test_a_fresh_volume_set_keeps_the_configured_ceiling():
     cfg = dv.new_set_config({"MAX_STORAGE_GB": "64"}, "prefix-1", "dep-1")
     assert cfg["max_storage_gb"] == 64.0
     assert "MAX_STORAGE_GB=64" in dv.build_env_lines({**cfg, "server_name": "localhost"})
+
+
+def test_setup_writes_the_free_space_floor_only_when_asked_and_a_fresh_set_keeps_it():
+    """MIN_FREE_SPACE_GB: the app's own default (the larger of 2 GB and 5% of the volume, never more than half of it
+    nor more than 20 GB) unless the operator chose a value at setup (--min-free-space-gb), and kept across a fresh
+    volume set of the same deployment."""
+    from app.core.config import Settings
+    cfg = _reusable_env_cfg()
+    assert not [ln for ln in dv.build_env_lines(cfg) if ln.startswith("MIN_FREE_SPACE_GB")]
+    for given, written in ((0, "MIN_FREE_SPACE_GB=0"), (25, "MIN_FREE_SPACE_GB=25"), (2.5, "MIN_FREE_SPACE_GB=2.5")):
+        assert written in dv.build_env_lines(dict(cfg, min_free_space_gb=given))
+        assert Settings(min_free_space_gb=written.split("=", 1)[1]).min_free_space_gb == float(given)
+    args = dv.build_parser().parse_args(["setup", "--non-interactive", "--min-free-space-gb", "10"])
+    assert args.min_free_space_gb == 10.0
+    assert dv.build_parser().parse_args(["setup", "--non-interactive"]).min_free_space_gb is None
+    kept = dv.new_set_config({"MIN_FREE_SPACE_GB": "0"}, "prefix-1", "dep-1")
+    assert kept["min_free_space_gb"] == 0.0
+    assert "MIN_FREE_SPACE_GB=0" in dv.build_env_lines({**kept, "server_name": "localhost"})
+    assert dv.new_set_config({}, "prefix-1", "dep-1")["min_free_space_gb"] is None
+    assert Settings.model_fields["min_free_space_gb"].default == -1
+
+
+FLOOR_PROMPT = "Free space the storage volume keeps, in GB"
+
+
+def _interactive_setup(tmp_path, monkeypatch, floor_answers, **flags):
+    """Interactive setup's config with every other question at its default; the floor's question answered from
+    ``floor_answers``. Returns the config, how often the floor was asked, and the MIN_FREE_SPACE_GB lines written."""
+    answers, asked = iter(floor_answers), []
+
+    def ask(prompt, pal, default=None):
+        if prompt.startswith(FLOOR_PROMPT):
+            asked.append(prompt)
+            return next(answers)
+        return "vault.example.com" if prompt.startswith("Public DNS name") else (default or "")
+
+    monkeypatch.setattr(dv, "ask", ask)
+    monkeypatch.setattr(dv, "ask_secret", lambda prompt, pal: "Strong-Pass-1234")
+    monkeypatch.setattr(dv, "confirm", lambda prompt, pal, default=True: False)
+    monkeypatch.setattr(dv, "prompt_free_port", lambda pal, label, default: default)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "dockvault-vault:latest")
+    cfg = tool._collect_setup_config(argparse.Namespace(non_interactive=False, **flags))
+    return cfg, len(asked), [ln for ln in dv.build_env_lines(cfg) if ln.startswith("MIN_FREE_SPACE_GB")]
+
+
+@pytest.mark.parametrize("answers, value, lines", [
+    ([""], None, []),                                        # the application's default, nothing written
+    (["0"], 0.0, ["MIN_FREE_SPACE_GB=0"]),                  # off
+    (["abc", "inf", "12.5"], 12.5, ["MIN_FREE_SPACE_GB=12.5"]),
+    (["nan", "ten", "40"], 40.0, ["MIN_FREE_SPACE_GB=40"]),
+    (["abc", ""], None, []),
+])
+def test_interactive_setup_asks_for_the_free_space_floor_until_it_gets_one(tmp_path, monkeypatch, answers, value,
+                                                                          lines):
+    """Setup asks how much free space the storage volume keeps, as it asks for the other settings a deployment starts
+    with, and again until it is given a number of GB or nothing (a blank leaves the application's default, and
+    nothing is written). inf and nan are no answer: the application would read them as its default, and they cannot
+    be written."""
+    cfg, asked, written = _interactive_setup(tmp_path, monkeypatch, answers)
+    assert asked == len(answers)
+    assert cfg["min_free_space_gb"] == value and written == lines
+
+
+def test_the_free_space_floor_is_not_asked_when_a_flag_gives_it_or_setup_runs_unattended(tmp_path, monkeypatch):
+    cfg, asked, written = _interactive_setup(tmp_path, monkeypatch, [], min_free_space_gb=30.0)
+    assert asked == 0 and written == ["MIN_FREE_SPACE_GB=30"]
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: pytest.fail("an unattended setup asked something"))
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "dockvault-vault:latest")
+    cfg = tool._collect_setup_config(argparse.Namespace(non_interactive=True, server_name="vault.example.com",
+                                                        admin_password="Strong-Pass-1234"))
+    assert cfg["min_free_space_gb"] is None
+
+
+@pytest.mark.parametrize("given", ["inf", "-inf", "nan", "Infinity"])
+def test_a_free_space_floor_that_is_not_a_finite_number_is_not_written(tmp_path, monkeypatch, given):
+    """argparse's float takes 'inf' and 'nan', and an .env may carry them: writing either raised in format_gb_value,
+    so setup (or a fresh volume set) stopped with a traceback. Neither is written: the application reads both as its
+    default, and that default then applies."""
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "dockvault-vault:latest")
+    parsed = dv.build_parser().parse_args(["setup", "--non-interactive", "--min-free-space-gb=" + given])
+    args = argparse.Namespace(non_interactive=True, server_name="vault.example.com",
+                              admin_password="Strong-Pass-1234", min_free_space_gb=parsed.min_free_space_gb)
+    cfg = tool._collect_setup_config(args)
+    assert cfg["min_free_space_gb"] is None
+    assert not [ln for ln in dv.build_env_lines(cfg) if ln.startswith("MIN_FREE_SPACE_GB")]
+    fresh = dv.new_set_config({"MIN_FREE_SPACE_GB": given}, "prefix-1", "dep-1")
+    assert fresh["min_free_space_gb"] is None
+    assert not [ln for ln in dv.build_env_lines({**fresh, "server_name": "localhost"})
+                if ln.startswith("MIN_FREE_SPACE_GB")]
+    # A number is still written as it was given, 0 (off) included.
+    for value, line in (("0", "MIN_FREE_SPACE_GB=0"), ("'7.5'", "MIN_FREE_SPACE_GB=7.5"),
+                        ("-1", "MIN_FREE_SPACE_GB=-1")):
+        kept = dv.new_set_config({"MIN_FREE_SPACE_GB": value}, "prefix-1", "dep-1")
+        assert line in dv.build_env_lines({**kept, "server_name": "localhost"})
 
 
 # The transfer ceiling (MAX_CONCURRENT_TRANSFERS and the two queue settings beside it). It is a

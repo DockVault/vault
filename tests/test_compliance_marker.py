@@ -394,3 +394,42 @@ def test_dockvault_refuses_to_go_back_over_the_records_unless_forced(db, monkeyp
     assert deployment.image() == deployment.dv.LOCAL_IMAGE, "it did not go back"
     deployment.update("v0.33.6", force_downgrade=True)
     assert deployment.image().endswith(":v0.33.6")
+
+
+def test_downgrade_blockers_names_the_records_a_counted_row_keeps_though_its_marker_was_never_written(db):
+    """A step of compliance access writes the marker in the transaction that writes its row, and a write that gave up
+    (its lock held past the connection's lock_timeout) left the row committed and no marker until the pruner's next
+    pass, up to hours later. downgrade-blockers, which dockvault.py update reads before a rollback, brings the marker
+    in line first, in a transaction of its own: it names the records, and the marker is written."""
+    from app.core import host_compliance
+    _row(db, 1)
+    db.execute(text("DELETE FROM data_requirements"))
+    db.commit()
+    assert _rows(db.factory()) == [], "the row's marker was written after all"
+    (blocker,) = host_compliance.downgrade_blockers(db, "0.33.5")
+    assert (blocker["key"], blocker["requires_at_least"]) == ("compliance-records", "0.34.0")
+    assert blocker["reason"].startswith("Compliance cases are open") and blocker["undo"]
+    assert [r[0] for r in _rows(db.factory())] == ["compliance-records"], "the marker was not written"
+    assert host_compliance.downgrade_blockers(db, "0.34.0") == []
+
+
+def test_downgrade_blockers_names_the_records_when_the_marker_cannot_be_written_either(db, monkeypatch, capsys):
+    from sqlalchemy.exc import OperationalError
+    from app.core import host_compliance
+    _row(db, 1)
+    db.execute(text("DELETE FROM data_requirements"))
+    db.commit()
+
+    def held(session, **kw):
+        raise OperationalError("INSERT INTO data_requirements", {}, Exception("lock timeout"))
+    monkeypatch.setattr(marker, "sync", held)
+    (blocker,) = host_compliance.downgrade_blockers(db, "0.33.5")
+    assert (blocker["key"], blocker["requires_at_least"]) == ("compliance-records", "0.34.0")
+    assert "was not brought in line (OperationalError)" in capsys.readouterr().err
+
+
+def test_downgrade_blockers_name_nothing_of_the_records_when_nothing_must_be_kept(db):
+    from app.core import host_compliance
+    _row(db, 1, status="failure")                           # a refusal, which any account can cause
+    assert host_compliance.downgrade_blockers(db, "0.33.5") == []
+    assert _rows(db.factory()) == []

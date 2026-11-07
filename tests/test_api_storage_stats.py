@@ -15,14 +15,16 @@ def test_storage_stats_shape(admin):
     # enforced against that limit), the live limit, and the deployment's own ceiling.
     # What legal holds keep after a deletion is on the disk too, in no vault's counters: shown beside it, with
     # what the vaults' files take on the disk altogether.
-    assert set(body) == {"total", "used", "available", "kept_for_cases", "on_disk_bytes",
-                         "allocated_bytes", "limit_bytes", "max_bytes", "vault_count"}
-    for key in ("total", "used", "available", "on_disk_bytes", "allocated_bytes", "vault_count"):
+    assert set(body) == {"total", "used", "available", "kept_for_cases", "on_disk_bytes", "limit_counts_bytes",
+                         "free_space_floor_bytes", "allocated_bytes", "limit_bytes", "max_bytes", "vault_count"}
+    for key in ("total", "used", "available", "on_disk_bytes", "limit_counts_bytes", "free_space_floor_bytes",
+                "allocated_bytes", "vault_count"):
         assert isinstance(body[key], int) and body[key] >= 0
     kept = body["kept_for_cases"]
     assert set(kept) == {"files", "folders", "bytes"}
     assert all(isinstance(kept[k], int) and kept[k] >= 0 for k in kept)
-    assert body["on_disk_bytes"] == body["used"] + kept["bytes"]
+    # `used` is the vaults' bytes alone; the deployment's limit counts the kept ones too, and says so by name.
+    assert body["on_disk_bytes"] == body["limit_counts_bytes"] == body["used"] + kept["bytes"]
     # A null limit/ceiling means "unlimited", which is the shipped default.
     for key in ("limit_bytes", "max_bytes"):
         assert body[key] is None or (isinstance(body[key], int) and body[key] >= 0)
@@ -47,3 +49,26 @@ def test_the_routes_of_the_removed_pages_are_gone(admin):
     # What replaced them answers.
     assert admin.get("/activity/summary").status_code == 200
     assert admin.get("/activity/export", params={"q": "no-such-event-text"}).status_code == 200
+
+
+def test_the_storage_panel_reports_the_free_space_the_volume_keeps(admin):
+    """MIN_FREE_SPACE_GB unset (the shipped .env leaves it commented): the larger of 2 GB and 5% of the volume, never
+    more than half of it nor more than 20 GB; set to a value that is not a finite number (inf), the same."""
+    import math
+    import subprocess
+    import os
+    api = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+    try:
+        set_to = subprocess.run(["docker", "exec", api, "printenv", "MIN_FREE_SPACE_GB"], capture_output=True,
+                                text=True, timeout=30)
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("docker is not available to read the deployment's setting")
+    body = admin.get("/storage/stats").json()
+    automatic = min(max(2 * 1024 ** 3, int(body["total"] * 0.05)), int(body["total"] * 0.5), 20 * 1024 ** 3)
+    if set_to.returncode != 0 and body["total"]:
+        assert body["free_space_floor_bytes"] == automatic, body
+    elif set_to.returncode == 0:
+        configured = float(set_to.stdout.strip())
+        expected = automatic if (configured < 0 or not math.isfinite(configured)) else int(configured * 1024 ** 3)
+        assert body["free_space_floor_bytes"] == expected, body

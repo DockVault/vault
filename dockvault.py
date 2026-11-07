@@ -768,6 +768,11 @@ def build_env_lines(cfg):
     # .env it always did.
     if cfg.get("max_storage_gb") not in (None, ""):
         bare("MAX_STORAGE_GB", format_gb_value(cfg["max_storage_gb"]))
+    # The free space the storage volume keeps. Same rule: written only when the operator chose one, so the app's
+    # default (-1: the larger of 2 GB and 5% of the volume, never more than half of it nor more than 20 GB) applies
+    # otherwise.
+    if cfg.get("min_free_space_gb") not in (None, ""):
+        bare("MIN_FREE_SPACE_GB", format_gb_value(cfg["min_free_space_gb"]))
     # Transfer ceiling. The one that costs memory is MAX_CONCURRENT_TRANSFERS; the other two only
     # shape what happens to callers who arrive at a full deployment. Same rule as storage: written
     # only when this deployment has a value, so an install that never mentions them authors the
@@ -1467,6 +1472,13 @@ def parse_single_request_upload_mb(raw):
     return None if value is None else max(0, int(value))
 
 
+def parse_min_free_space_gb(raw):
+    """MIN_FREE_SPACE_GB (a setup flag or an .env value) -> GB to write, or None, so nothing is written and the
+    application's default applies. 'inf' and 'nan' come back None: the application reads them as its default, and
+    format_gb_value cannot write them."""
+    return _finite_float(raw)
+
+
 def format_gb_value(gb):
     """A GB number as an .env value. Deliberately not '%g': that renders large numbers in
     exponent notation ('1e+06'), and a whole number should read as '64', not '64.0'."""
@@ -1739,6 +1751,8 @@ def new_set_config(current_env, new_prefix, new_id):
         # operator had configured rather than silently reverting it to unlimited.
         "max_storage_gb": parse_max_storage_gb(
             current_env.get("MAX_STORAGE_GB") or current_env.get("PLAN_MAX_STORAGE_GB")),
+        # And the free space the storage volume keeps.
+        "min_free_space_gb": parse_min_free_space_gb(current_env.get("MIN_FREE_SPACE_GB")),
         # Likewise for the transfer ceiling: an operator who lowered it to fit the machine's
         # memory should not find it back at the default because they took a fresh volume set.
         "max_concurrent_transfers": parse_transfer_limit(
@@ -2570,6 +2584,69 @@ def gateway_trust_note(trusted, gateways, current, target):
             "images keeps its own, so publish the web port as 127.0.0.1:<port>:8000 there by hand). A proxy "
             "container on the vault's network is unaffected: list its address."
             % ((trusted or "").strip(), where))
+
+
+# From 0.34.0 the storage volume keeps a floor of free space (MIN_FREE_SPACE_GB, app/core/free_space.py): an upload, an
+# SFTP write or a copy that would leave less is refused. The automatic floor is computed here as the application
+# computes it (tests/test_upgrade_gate.py holds the two to one rule), so update can say before the upgrade whether the
+# volume already has less free than the new version keeps.
+FREE_SPACE_FLOOR_FROM = (0, 34, 0)
+FREE_SPACE_FLOOR_RULE = ("by default the larger of 2 GB and 5% of the volume, never more than half of it nor more "
+                         "than 20 GB")
+
+
+def gains_free_space_floor(current, target):
+    """Whether moving from ``current`` to ``target`` starts a version that keeps the free-space floor where the
+    running one does not (taken as so when the running version is not known)."""
+    cur, tgt = parse_semver(current), parse_semver(target)
+    return tgt is not None and tgt >= FREE_SPACE_FLOOR_FROM and (cur is None or cur < FREE_SPACE_FLOOR_FROM)
+
+
+def free_space_floor_bytes(raw, total):
+    """The free space in bytes a volume of ``total`` bytes keeps, for MIN_FREE_SPACE_GB set to ``raw`` in .env, as the
+    application reads it: 0 when it is off; unset, negative, inf or nan: the automatic floor; a value too large to be
+    bytes: 4 EiB, more than any volume."""
+    value = _finite_float(raw)
+    if value is None or value < 0:
+        return min(max(2 * GIB, int(total * 0.05)), int(total * 0.5), 20 * GIB)
+    return int(min(value * GIB, float(2 ** 62)))
+
+
+def free_space_floor_note(raw, capacity):
+    """The sentence to show before an upgrade onto the free-space floor (see gains_free_space_floor), or None.
+    ``raw`` is MIN_FREE_SPACE_GB from .env (None when absent), ``capacity`` the storage volume's (used, available,
+    total) bytes, or None when it could not be read. Said when the volume already has less free than the new version
+    keeps (it would refuse every upload, SFTP write and copy from its first start), when its free space could not be
+    read, and when the setting is not a number at all (the new version would not start). Pure."""
+    text = _unquoted(raw)
+    if text:
+        try:
+            float(text)
+        except ValueError:
+            return ("MIN_FREE_SPACE_GB=%s in .env is not a number: from 0.34.0 the server reads it, and does not "
+                    "start with it. Set a number of GB (0 turns the floor off) or remove the line before the "
+                    "upgrade." % text)
+    value = _finite_float(text)
+    if value == 0:
+        return None                                             # the floor is off
+    which = (("MIN_FREE_SPACE_GB=%s in .env" % text) if value is not None and value > 0
+             else ("MIN_FREE_SPACE_GB: %s" % FREE_SPACE_FLOOR_RULE))
+    said = ("From 0.34.0 the storage volume keeps a floor of free space (%s): an upload, an SFTP write or a copy "
+            "that would leave less is refused." % which)
+    if capacity is None:
+        return (said + " The free space of the storage volume could not be read here (is the deployment running?): "
+                "check that it has more than that free before the upgrade, or set MIN_FREE_SPACE_GB lower in .env "
+                "(0 turns it off).")
+    _used, available, total = capacity
+    if not total:
+        return None                                             # a volume that says no size is not judged
+    floor = free_space_floor_bytes(text, total)
+    if available >= floor:
+        return None
+    return (said + " This volume has %s free of %s, less than the %s it will keep, so 0.34.0 refuses every upload, "
+            "SFTP write and copy from its first start. Free some space or grow the volume first, or set "
+            "MIN_FREE_SPACE_GB lower in .env (0 turns it off)." % (format_bytes(available), format_bytes(total),
+                                                                  format_bytes(floor)))
 
 
 def backup_reason(plan, down=False):
@@ -4455,6 +4532,16 @@ class DockVault:
             recording = recording_preset_config(preset or "full", lock_levels)
         except ValueError as exc:
             self._fail(str(exc))
+        # The free space the storage volume keeps (MIN_FREE_SPACE_GB). Asked when no flag gave it; left blank, the
+        # application's own default applies and nothing is written.
+        min_free = a("min_free_space_gb")
+        if interactive and min_free is None:
+            while True:
+                min_free = ask("Free space the storage volume keeps, in GB (blank = the default: the larger of 2 GB "
+                               "and 5% of the volume, at most 20 GB; 0 = off)", pal, "").strip() or None
+                if min_free is None or parse_min_free_space_gb(min_free) is not None:
+                    break
+                print(pal.paint("  enter a number of GB, 0 to turn it off, or leave it blank", "red"))
 
         if sftp_public_host and not validate_server_name(sftp_public_host):
             self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
@@ -4488,6 +4575,7 @@ class DockVault:
             "audit_fingerprint_key": gen_hex(32),
             "audit_chain_key": gen_hex(32),
             "max_storage_gb": (getattr(args, "max_storage_gb", None) if args else None),
+            "min_free_space_gb": parse_min_free_space_gb(min_free),
             # Flags only at install time, as the storage ceiling beside them is. The Limits menu
             # is where these are shown and changed, with the memory each one implies.
             "max_concurrent_transfers": parse_transfer_limit(
@@ -6440,6 +6528,11 @@ class DockVault:
         gateway_note = gateway_trust_note(env.get("TRUSTED_PROXIES"), self._network_gateways(), current, tag)
         if gateway_note:
             print(pal.paint("  Note: " + gateway_note, "yellow"))
+        # The storage volume read only for an upgrade onto the free-space floor: the read execs into the container.
+        floor_note = (free_space_floor_note(env.get("MIN_FREE_SPACE_GB"), self._volume_capacity())
+                      if gains_free_space_floor(current, tag) else None)
+        if floor_note:
+            print(pal.paint("  Note: " + floor_note, "yellow"))
 
         # Refuse an end-of-life target outright -- it is neither offered in the list nor a place to
         # move to. Read the lifecycle from THIS checkout's matrix (the newest view), since a version
@@ -7980,6 +8073,10 @@ def build_parser():
                          "a fresh install; interactive setup asks)")
     sp.add_argument("--max-storage-gb", dest="max_storage_gb", type=float,
                     help="deployment storage ceiling in GB (-1 = unlimited, the default)")
+    sp.add_argument("--min-free-space-gb", dest="min_free_space_gb", type=float,
+                    help="the free space in GB the storage volume keeps: uploads that would leave less are "
+                         "refused (-1, the default: the larger of 2 GB and 5%% of the volume, never more than "
+                         "half of it nor more than 20 GB; 0 = off)")
     sp.add_argument("--max-concurrent-transfers", dest="max_concurrent_transfers", type=int,
                     help="how many uploads and downloads may run at once (16 by default). Each "
                          "costs a fixed amount of memory whatever the file weighs, so lower this "

@@ -323,9 +323,9 @@ def _run(args, api) -> int:
 
         if args.action == "downgrade-blockers":
             # What stops this deployment going back to an older version (dockvault.py update asks before a
-            # downgrade): the records of data that version cannot read. Read-only. Refused with this module's
-            # own answer: run as a program, this module is __main__, and another module's refusal would not be
-            # the answer it catches.
+            # downgrade): the records of data that version cannot read, the compliance records' marker brought in
+            # line first (host_compliance.downgrade_blockers). Refused with this module's own answer: run as a
+            # program, this module is __main__, and another module's refusal would not be the answer it catches.
             from app.core import data_requirements, host_compliance
             target = (args.target or "").strip().lstrip("vV")
             if data_requirements._parse(target) is None:

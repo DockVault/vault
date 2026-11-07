@@ -101,6 +101,10 @@ def test_the_kept_tables_have_every_column_of_the_live_ones_and_no_key_to_anythi
         # Every column may be NULL but the id: a row deleted under an older column set is kept too.
         assert psql("SELECT string_agg(column_name, ',') FROM information_schema.columns WHERE table_schema = "
                     f"current_schema() AND table_name = '{kept}' AND is_nullable = 'NO'") == "id"
+    # The sum of the kept bytes, on every upload's finish under a storage limit, is read from an index of its own.
+    assert psql("SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = "
+                "'idx_held_files_size'") == ("CREATE INDEX idx_held_files_size ON public.held_files USING btree "
+                                             "(size_bytes)")
 
 
 def test_every_hold_trigger_is_there_and_enable_always():

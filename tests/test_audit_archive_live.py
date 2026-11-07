@@ -4,8 +4,8 @@ run as scripts whose clock can be set, and the host's commands as ``python -m ap
 process of their own, in their two phases:
 
 - a sealed day older than the row window moves into a block: stored without Postgres's compression once the
-  background step has run (its length read without reading it), the data marker kept while a block exists, the
-  chain clean; ``audit unarchive`` puts back rows identical in every column, JSON text and JSONB included, and the
+  background step has run (its length read without reading it), the data marker kept while a block exists (also
+  by the once-a-day check beside a pass writing the first block), the chain clean; ``audit unarchive`` puts back rows identical in every column, JSON text and JSONB included, and the
   marker goes with the last block;
 - the audit job deletes archived rows through the block-rewrite primitive (the conditions run over a temporary
   table shaped like audit_logs), keeping the protected ones; the size cap counts an archived part by its bound
@@ -266,6 +266,63 @@ def test_compact_runs_and_unarchive_with_nothing_archived_is_refused(throwaway):
     assert all(isinstance(t["before_bytes"], int) and isinstance(t["after_bytes"], int) for t in answer["tables"])
     code, refused, _err = _cli(throwaway, "unarchive", "--read")
     assert code == 2 and "no archived day" in refused["error"], refused
+
+
+MARKER_RACE = PREAMBLE + r'''
+import threading, time
+from app.core import audit_archive as arc
+out = {}
+BLOCK = ("INSERT INTO audit_archive_blocks (day, part, first_hour, last_hour, row_count, codec, format, payload, "
+         "raw_bytes, aggregates, created_at) VALUES (:day, 1, :t, :t, 0, 'none', 1, '\\x00', 0, '{}', :t)")
+
+
+def marked():
+    with engine.connect() as c:
+        return c.execute(text("SELECT count(*) FROM data_requirements WHERE key = :k"), {"k": arc.MARKER_KEY}).scalar()
+
+
+# The marker a block wrote earlier is there, and no block is: the last one went (an unarchive) a moment ago.
+with SessionLocal() as s:
+    arc.sync_marker(s, now, True)
+    s.commit()
+out["before"] = marked()
+# An archiving pass writes the first block of a day and the marker, and is still open.
+writer = SessionLocal()
+writer.execute(text(BLOCK), {"day": (now - timedelta(days=100)).date(), "t": now})
+out["writer_said"] = arc.sync_marker(writer, now, True)
+# Meanwhile the once-a-day check, outside the chain's lock, brings the marker in line in a transaction of its own.
+said = {}
+
+
+def daily():
+    with SessionLocal() as s:
+        said["there"] = arc.sync_marker(s, now)
+        s.commit()
+
+
+check = threading.Thread(target=daily)
+check.start()
+time.sleep(1.5)
+writer.commit()
+writer.close()
+check.join(30)
+out["check_said"] = said.get("there")
+out["after"] = marked()
+with engine.connect() as c:
+    out["blocks"] = c.execute(text("SELECT count(*) FROM audit_archive_blocks")).scalar()
+print(json.dumps(out, default=str))
+'''
+
+
+def test_the_daily_marker_check_beside_a_pass_writing_the_first_block_keeps_the_marker_on_postgres(throwaway):
+    """The once-a-day marker check runs outside the audit chain's lock, beside an archiving pass that writes the first
+    block and the marker and has not committed yet. The check locks the marker's row before it looks for blocks, so it
+    waits for the pass and then sees its block. Looking first, it found none, waited for the row at its removal, and
+    removed the marker the pass had just committed: a block an earlier release cannot read, and nothing to stop that
+    release starting."""
+    done = run_in(throwaway, MARKER_RACE)
+    assert done["before"] == 1 and done["writer_said"] is True, done
+    assert done["check_said"] is True and done["after"] == 1 and done["blocks"] == 1, done
 
 
 def test_the_database_containers_free_space_is_read_as_dockvault_reads_it():

@@ -642,6 +642,8 @@ def test_the_volumes_of_the_set_the_host_was_on_open_again_from_the_kept_env(tmp
     try:
         try:
             seed = _run("docker", "run", "--rm", "busybox", "true")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail("the command did not finish within %s s" % exc.timeout)
         except (subprocess.SubprocessError, OSError) as exc:
             pytest.skip("docker unavailable: %s" % exc)
         if seed.returncode != 0:

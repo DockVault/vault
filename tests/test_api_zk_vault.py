@@ -548,8 +548,10 @@ def _zk_db_scalar(sql):
             ["docker", "exec", container, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
-    except (FileNotFoundError, _subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except _subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     assert proc.returncode == 0, f"psql failed: {proc.stderr}"
     return proc.stdout.strip()
 

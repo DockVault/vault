@@ -46,6 +46,14 @@ def db(monkeypatch):
             one.close()
 
 
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    """The clock the SFTP processes are looked for on: NOW, unless a test moves it."""
+    at = [NOW]
+    monkeypatch.setattr(SV, "_utcnow", lambda: at[0])
+    return at
+
+
 @pytest.fixture
 def told(monkeypatch):
     out = []
@@ -125,14 +133,16 @@ def test_every_sftp_server_on_this_version_is_quiet(db, told):
     assert legal_holds.sftp_while_held(db, NOW).ok is True and told == []
 
 
-def test_the_administrators_hear_once_a_day_while_it_lasts(db, told):
+def test_the_administrators_hear_once_a_day_while_it_lasts(db, told, clock):
     """The notice's dedup key is the answer and the day: the same answer later the same day writes no second
     notice; the next day, or another answer, does (app/api/api_server.py, _notify_users)."""
     _hold(db)
     _sftp(db, "0.33.5", 0)
     legal_holds.sftp_while_held(db, NOW)
+    clock[0] = NOW + timedelta(seconds=30)
     legal_holds.sftp_while_held(db, NOW + timedelta(seconds=30))
     _sftp(db, "0.33.5", -86400 + 5)
+    clock[0] = NOW + timedelta(days=1)
     legal_holds.sftp_while_held(db, NOW + timedelta(days=1))
     keys = [d for _t, _b, d in told]
     assert keys[0] == keys[1] != keys[2] and keys[2].endswith("2026-11-06")
@@ -166,3 +176,15 @@ def test_a_check_that_fails_leaves_the_rest_of_the_pass(db, told, monkeypatch, c
     assert lapsed == 1 and purged == [True] and told == []
     assert ("the SFTP servers' versions were not checked while legal holds keep files (OperationalError)"
             in capsys.readouterr().out)
+
+
+def test_the_processes_are_looked_for_on_the_clock_not_at_the_passs_start(db, told):
+    """The pass's time is taken before the runner's turn, the settings' refresh and the jobs before this one (sealing
+    among them). Measured back from it, the window took in a row whose process stopped refreshing it that long ago,
+    and the warning was not given for that pass. The pass's time dates the notice only."""
+    _hold(db)
+    _sftp(db, SV.code_version(), 70)            # its process was killed 70 seconds ago
+    check = legal_holds.sftp_while_held(db, NOW - timedelta(minutes=5))      # a pass that began 5 minutes ago
+    assert (check.ok, check.reason) == (False, SV.NONE_LIVE)
+    ((_title, _body, dedup),) = told
+    assert dedup == "sftp-version-none_live--2026-11-05"

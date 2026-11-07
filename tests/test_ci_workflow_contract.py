@@ -48,6 +48,7 @@ def _job_text(name: str, next_name: str | None) -> str:
 _SIZE_WITHOUT_A_CEILING = "Exercise the size accounting with no storage ceiling"
 _SCENARIO_STEPS = (
     "Exercise the transfer ceiling on a deployment that refuses",
+    "Exercise the free-space floor set above the disk's size",
     "Exercise the log-pull endpoint with its ceiling on",
     "Exercise the vault-type allowlist against a forbidden type",
     _SIZE_WITHOUT_A_CEILING,
@@ -171,13 +172,53 @@ def test_the_size_accounting_runs_once_more_without_the_storage_ceiling():
     recreated = run.index("docker compose up -d --force-recreate vault-api\n", removed)
     checked, report = _heredocs(run)
     assert recreated < run.index(checked) < run.index("python -m pytest")
-    assert 'body.get("deployment_storage_max_gb") is not None' in checked
-    assert 'body.get("deployment_storage_limit_bytes") is not None' in checked and "sys.exit(" in checked
     (pytest_line,) = [ln for ln in run.splitlines() if "python -m pytest" in ln]
     assert pytest_line.split() == ["python", "-m", "pytest", "tests/test_vault_size_accounting.py",
                                    "--maxfail=1", "--junitxml=size-junit.xml"]
     restored = run.index("echo 'MAX_STORAGE_GB=64' >> .env\n")
     assert run.index(report) < restored < run.index("docker compose up -d --force-recreate vault-api\n", restored)
+
+
+# A stand-in for requests, for the step's check run on its own: /auth/login gives a token, and /settings answers
+# what the test puts in SETTINGS_ANSWER.
+_FAKE_REQUESTS = '''
+import json, os
+class _Reply:
+    def __init__(self, body):
+        self.body = body
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return self.body
+def post(*a, **k):
+    return _Reply({"access_token": "t"})
+def get(*a, **k):
+    return _Reply(json.loads(os.environ["SETTINGS_ANSWER"]))
+'''
+
+
+@pytest.mark.parametrize("answered, goes_on", [
+    ({"deployment_storage_max_gb": None, "deployment_storage_limit_bytes": None}, True),
+    ({"deployment_storage_max_gb": 64, "deployment_storage_limit_bytes": None}, False),
+    ({"deployment_storage_max_gb": None, "deployment_storage_limit_bytes": 10 ** 9}, False),
+    ({"deployment_storage_max_gb": None}, False),
+    ({"deployment_storage_limit_bytes": None}, False),
+    ({}, False),
+], ids=["no-limit", "a-maximum", "a-live-limit", "no-live-limit-key", "no-maximum-key", "neither-key"])
+def test_the_no_ceiling_check_goes_on_only_when_both_keys_say_there_is_no_limit(tmp_path, answered, goes_on):
+    """The step's check, run on what /settings answers: a key missing read as no limit, and the step would have gone
+    on to test what it does not."""
+    import json
+    checked, _report = _heredocs(_size_step_run())
+    (tmp_path / "requests.py").write_text(_FAKE_REQUESTS, encoding="utf-8")
+    env = dict(os.environ, SETTINGS_ANSWER=json.dumps(answered), VAULT_ADMIN_USER="admin",
+               VAULT_ADMIN_PASS="not-a-real-password", PYTHONPATH=str(tmp_path))
+    ran = subprocess.run([sys.executable, "-c", checked], cwd=str(tmp_path), env=env, capture_output=True,
+                         text=True, timeout=60)
+    if goes_on:
+        assert ran.returncode == 0 and ran.stdout.strip() == "no storage ceiling and no live limit", ran.stderr
+    else:
+        assert ran.returncode != 0 and ran.stderr.startswith("::error::"), (ran.returncode, ran.stderr)
 
 
 def _junit(path, cases):

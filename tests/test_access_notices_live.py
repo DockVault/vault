@@ -20,7 +20,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from _account_change_helpers import DB, in_api_container, notifications, psql, signed_in
+from _account_change_helpers import API, DB, in_api_container, notifications, psql, signed_in
 from _owner_notice_helpers import mail_to, owner_with_vault, sender_held, sending_to_sink, wait_for
 from conftest import ADMIN_USER, unique
 
@@ -201,21 +201,31 @@ def test_a_grant_by_someone_other_than_the_owner_never_writes_the_compliance_rec
     but are none: they may not stop every rollback below 0.34.0 for COMPLIANCE_RECORD_MIN_DAYS. While another
     session holds the marker's lock alone, a manager's grant and an administrator's complete and the administrator's
     notice is emailed, so none of their transactions went to write the marker (whether or not an earlier step wrote
-    it), and the running image counts none of the rows they wrote."""
+    it), and the running image counts none of the rows they wrote. Each answers well inside the connection's
+    lock_timeout (5 s), and the server's log says of none that the marker was not written: one that went to write it
+    would have waited out the lock and given up, and said so."""
     owner, owner_c, vid = _owner(admin, made)
     mona, x, y = _person(admin, made), _person(admin, made), _person(admin, made)
     r = owner_c.post(f"/vaults/{vid}/permissions", json={"user_id": mona["id"], "level": "manage"})
     assert r.status_code == 200, r.text
     mona_c = signed_in(mona)
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 1))
+    took = []
     with sending_to_sink(admin):
         with marker_lock_held():
-            r = mona_c.post(f"/vaults/{vid}/permissions", json={"user_id": x["id"], "level": "read"})
-            assert r.status_code == 200, r.text
-            r = admin.post(f"/vaults/{vid}/permissions", json={"user_id": y["id"], "level": "read"})
-            assert r.status_code == 200, r.text
+            for client, who in ((mona_c, x), (admin, y)):
+                started = time.monotonic()
+                r = client.post(f"/vaults/{vid}/permissions", json={"user_id": who["id"], "level": "read"})
+                took.append(time.monotonic() - started)
+                assert r.status_code == 200, r.text
             sent = wait_for(lambda: psql("SELECT count(*) FROM audit_logs WHERE action = 'owner_notice_email_sent' "
                                          f"AND resource_id = '{owner['id']}'") == "1")
             assert sent, "the notice's email was not recorded as sent while the marker's lock was held"
+    assert max(took) < 4.0, f"a grant waited for the marker's lock: {took}"
+    logged = subprocess.run(["docker", "logs", "--since", since, API], capture_output=True, text=True, timeout=60,
+                            encoding="utf-8", errors="replace")
+    assert "rollback marker was not written" not in logged.stdout + logged.stderr, (
+        "a grant or its notice's email went to write the marker and gave up on its lock")
     ids = psql("SELECT string_agg(id::text, ',') FROM audit_logs WHERE action LIKE 'owner_notice%' "
                f"AND resource_id = '{owner['id']}'").split(",")
     out = json.loads(in_api_container(_COUNTED % {"ids": ids}).stdout.strip().splitlines()[-1])

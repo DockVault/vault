@@ -95,7 +95,8 @@ def test_the_flags_answer_setup_without_a_prompt(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("lock", [False, True])
 def test_setup_asks_until_it_gets_a_preset_then_whether_to_lock(tmp_path, monkeypatch, lock):
-    answers = iter(["vault.example.com", "admin", "admin@example.com", "everything", "Minimal"])
+    # The last answers the free space the storage volume keeps, asked after the preset: blank, the default.
+    answers = iter(["vault.example.com", "admin", "admin@example.com", "everything", "Minimal", ""])
     asked, confirmed = [], []
 
     def ask(prompt, pal, default=None):
@@ -113,5 +114,7 @@ def test_setup_asks_until_it_gets_a_preset_then_whether_to_lock(tmp_path, monkey
     got = _tool(tmp_path, monkeypatch)._collect_setup_config(argparse.Namespace(non_interactive=False))
     assert [p for p in asked if p.startswith("Recording preset")] == ["Recording preset (full / standard / minimal)"] * 2
     assert len([p for p in confirmed if "no one can record less" in p]) == 1
+    assert asked[-1].startswith("Free space the storage volume keeps") and next(answers, None) is None
+    assert got["min_free_space_gb"] is None
     assert got["audit_max_names"] == "none"
     assert got["settings_locked_keys"] == ("audit_levels" if lock else None)

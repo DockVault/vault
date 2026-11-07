@@ -25,7 +25,9 @@ Licensed under **AGPL-3.0** — self-host it freely.
 - **Storage limits at three levels** — a deployment ceiling (`MAX_STORAGE_GB`, which an
   administrator can lower from the panel but never raise), a per-account quota users spend by
   allocating storage to vaults, and a per-vault size that the owner *and* vault managers can each
-  top up from their own quota and reclaim again.
+  top up from their own quota and reclaim again. Below them all, the storage volume always keeps some free space
+  (`MIN_FREE_SPACE_GB`, by default the larger of 2 GB and 5% of the disk, never more than half of it nor more than
+  20 GB): an upload that would leave less is refused rather than fill the disk the database shares.
 - **Login rate-limiting** and durable session revocation.
 - **Single standalone image** — needs only its bundled PostgreSQL + Redis; no external
   services required.
@@ -460,6 +462,11 @@ able to do.
   address before that change, or anyone on a deployment without mail: release them with
   `python dockvault.py accounts --action release-key-hold`, or the hold ends `ZK_ENVELOPE_HOLD_DAYS` days after the
   last change. `ZK_ENVELOPE_HOLD_DAYS=0` in `.env` turns it off.
+- **Free space on the storage volume:** an upload, an SFTP write or a copy that would leave the volume less free than
+  `MIN_FREE_SPACE_GB` (unset: the larger of 2 GB and 5% of the volume, never more than half of it nor more than
+  20 GB) is refused with a 507. A volume that already has less free refuses them all from the first start, and
+  `python dockvault.py update` says so before the upgrade: free some space, grow the volume, or set
+  `MIN_FREE_SPACE_GB` lower in `.env` first (`0` turns it off).
 - **Going back:** while a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones)
   waits for its purge, a release before 0.34.0 refuses to start (from 0.33.1 on) and `dockvault.py update` refuses
   the rollback. Release the holds, wait for the purge (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS`), start 0.34.0 once more,

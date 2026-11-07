@@ -228,6 +228,8 @@ def test_install_builds_missing_kept_tables_like_the_live_ones_then_the_function
         for statement in t.ddl():
             assert statement in sql
     assert "CREATE INDEX IF NOT EXISTS idx_held_files_storage_path ON held_files (storage_path)" in sql
+    # The sum of what is kept, read on every upload's finish under a storage limit, from the index alone.
+    assert "CREATE INDEX IF NOT EXISTS idx_held_files_size ON held_files (size_bytes)" in sql
 
 
 def test_install_gives_a_kept_table_its_primary_key_once():

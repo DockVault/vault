@@ -562,6 +562,56 @@ jobs:
             sleep 3
           done
 
+      # The free space the storage volume keeps (MIN_FREE_SPACE_GB) refuses an upload, an SFTP write or a copy that
+      # would leave less. No runner's disk is that full, so the floor is set above the volume's size: every write
+      # would leave less than it. Both servers read it, so both are recreated; the report must show every test of
+      # the file ran, and the shipped value is put back after.
+      - name: Exercise the free-space floor set above the disk's size
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '/^MIN_FREE_SPACE_GB=/d' .env
+          echo 'MIN_FREE_SPACE_GB=1000000' >> .env
+          docker compose up -d --force-recreate vault-api vault-sftp
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1 \
+                && docker compose exec -T vault-sftp python -c "import socket; socket.create_connection(('127.0.0.1', 2222), 3)" >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::the servers did not come back with the free-space floor applied"
+              exit 1
+            fi
+            sleep 3
+          done
+          VAULT_FREE_SPACE_FLOOR_ABOVE_THE_DISK=1 python -m pytest tests/test_free_space_floor_live.py --maxfail=1 \
+            --junitxml=floor-junit.xml
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          cases = [c for c in ET.parse("floor-junit.xml").getroot().iter("testcase")
+                   if c.get("classname", "").endswith("test_free_space_floor_live")]
+          ran = [c.get("name") for c in cases
+                 if c.find("skipped") is None and c.find("failure") is None and c.find("error") is None]
+          print(f"free-space floor: {len(ran)} of {len(cases)} ran and passed")
+          if len(cases) < 8 or len(ran) != len(cases):
+              sys.exit("::error::the free-space floor tests did not all run")
+          PY
+          sed -i '/^MIN_FREE_SPACE_GB=/d' .env
+          docker compose up -d --force-recreate vault-api vault-sftp
+          for attempt in $(seq 1 40); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8200/health >/dev/null 2>&1 \
+                && docker compose exec -T vault-sftp python -c "import socket; socket.create_connection(('127.0.0.1', 2222), 3)" >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::the servers did not return after restoring the shipped free-space floor"
+              exit 1
+            fi
+            sleep 3
+          done
+
       # The log-pull endpoint sits behind a process-start ceiling that defaults off and is
       # set in no workflow, so seven checks across four files -- including the ones asserting
       # that a web-scoped token is refused on sftp -- have never run with it on. Same shape
@@ -709,11 +759,17 @@ jobs:
           )
           settings.raise_for_status()
           body = settings.json()
-          if body.get("deployment_storage_max_gb") is not None or body.get("deployment_storage_limit_bytes") is not None:
+          # Both keys answered first: a key missing would read as no limit, and the step would pass unchecked.
+          missing = [key for key in ("deployment_storage_max_gb", "deployment_storage_limit_bytes")
+                     if key not in body]
+          if missing:
+              sys.exit("::error::/settings does not answer " + ", ".join(missing)
+                       + ", so whether the deployment has a storage limit cannot be told")
+          if body["deployment_storage_max_gb"] is not None or body["deployment_storage_limit_bytes"] is not None:
               sys.exit(
                   "::error::the deployment still has a storage limit "
-                  f"(maximum {body.get('deployment_storage_max_gb')!r} GB, limit "
-                  f"{body.get('deployment_storage_limit_bytes')!r} bytes), so the tests below would "
+                  f"(maximum {body['deployment_storage_max_gb']!r} GB, limit "
+                  f"{body['deployment_storage_limit_bytes']!r} bytes), so the tests below would "
                   "not check the vault's row lock on its own"
               )
           print("no storage ceiling and no live limit")

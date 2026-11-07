@@ -80,6 +80,7 @@ from app.core.upload_attempt_header import HeadPeek, header_token_mismatch
 from app.core import durable_write
 from app.core import off_loop
 from app.core import vault_access
+from app.core import after_commit as _after_commit_work
 from app.services.download_stream import (
     ChecksumMismatch, UNSATISFIABLE, parse_byte_range,
 )
@@ -131,7 +132,7 @@ def get_active_operations_count() -> int:
 # every operation for the activity feed and cancellation, while admission governs the things that
 # hold memory, and a database connection, for a duration -- serving a download, assembling an
 # upload, and copying or moving a file or a folder.
-from app.core.transfer_admission import TransferAdmission, TransferBusy, copy_share, link_ceiling  # noqa: E402
+from app.core.transfer_admission import TransferAdmission, TransferBusy, ShareBusy, copy_share, link_ceiling  # noqa: E402
 
 transfer_admission = TransferAdmission(
     limit=settings.max_concurrent_transfers,
@@ -155,7 +156,19 @@ def _busy_response(exc: TransferBusy) -> HTTPException:
     503 with Retry-After, not 500: the deployment is working correctly and is momentarily full,
     which is a different thing from the file being unreadable. A client that cannot tell those
     apart either retries something hopeless or gives up on something that would have worked.
+
+    An account past its own share of the slots (a copy, a move to another vault, a folder copy: ShareBusy) is told
+    that, with 429: the deployment may have slots free, and the account's own transfers are what it waits for.
     """
+    if isinstance(exc, ShareBusy):
+        # Others of the account's own waiting are named only when there are some: a queue of 0 has none.
+        others = f", and {exc.waiting} more waiting for one of them to finish" if exc.waiting else ""
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(f"This account already has {exc.share} {'copy or move' if exc.share == 1 else 'copies or moves'} "
+                    f"running at once, the most one account may run{others}. Try again when one has finished."),
+            headers={"Retry-After": str(exc.retry_after)},
+        )
     return HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail=(f"The server is already handling {exc.limit} transfers. "
@@ -192,6 +205,9 @@ async def _file_service_error_handler(request: StarletteRequest, exc: FileServic
         status_code = status.HTTP_404_NOT_FOUND
     elif isinstance(exc, RateLimitExceededError):
         status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    elif isinstance(exc, StorageLimitExceeded) and exc.kind == 'disk':
+        # The storage volume keeps a floor of free space (app/core/free_space.py).
+        status_code = status.HTTP_507_INSUFFICIENT_STORAGE
     elif isinstance(exc, FileTooLargeError):
         status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
     elif isinstance(exc, DestinationGoneError):
@@ -3128,7 +3144,7 @@ def _activity_transfers() -> dict:
     waiting for it, with the gate's limit. SFTP transfers are in another process and not counted."""
     stats = transfer_admission.stats()
     return {"in_progress": get_active_operations_count(), "in_flight": stats["in_flight"],
-            "waiting": stats["waiting"], "limit": stats["limit"]}
+            "waiting": stats["waiting"] + stats["waiting_for_share"], "limit": stats["limit"]}
 
 
 @app.get("/activity/now")
@@ -4728,14 +4744,14 @@ async def send_test_email(
     except (ValueError, UnicodeError) as e:
         # Malformed From name/address (control chars) or SMTP host (bad IDNA) — a configuration
         # problem, returned cleanly instead of propagating as an unhandled 500.
-        print(f"test-email config invalid: {type(e).__name__}: {e}")
+        _email_send.log_send_failure("test-email config invalid", e)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The SMTP configuration is invalid — check the server address and the From name/address.",
         )
     except (smtplib.SMTPException, OSError) as e:
-        # Log the detail server-side; never surface it (or the password) to the client.
-        print(f"test-email send failed: {type(e).__name__}: {e}")
+        # Log the class server-side; never surface the detail (or the password) to the client.
+        _email_send.log_send_failure("test-email send failed", e)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Could not send the test email — check the SMTP server, port, and TLS settings.",
@@ -8754,6 +8770,40 @@ def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
         )
 
 
+# The force-close signals a session's transaction sends once it commits (_force_close_after_commit), handed over
+# by the one after-commit dispatcher (app/core/after_commit.py), which drops them when the transaction does not
+# commit.
+_FORCE_CLOSE_WORK = "sftp_force_close"
+
+
+def _force_close_after_commit(db, message: dict, actor_username: str) -> None:
+    """Send the SFTP server the force-close signal ``message`` (one session's) once ``db``'s transaction commits,
+    and none when it rolls back. The signal tears down a live transport at once; sent before the commit, a change
+    that then rolled back (a reset whose transaction failed, answered "nothing changed") had already cut the
+    person's live SFTP transfers. Sent after it, the session's row is ended by the time a client that reconnects
+    is checked again."""
+    _after_commit_work.later(db, _FORCE_CLOSE_WORK, (message, actor_username))
+
+
+def _send_force_closes(items) -> None:
+    """After a commit: the force-close signals its transaction gathered. Never raises (the change is committed)."""
+    for message, actor_username in items:
+        try:
+            sent = _guarded_publish_force('session_terminations', json.dumps(message))
+            if sent:
+                print(f"📢 Force-closed session {message['session_token'][:8]}... ({actor_username})")
+            else:
+                # Durable revocation is committed; only the live teardown signal was skipped while a
+                # cache failure sits inside its cooldown.
+                print(f"↩ Revoked session {message['session_token'][:8]}... ({actor_username}); live signal "
+                      f"skipped (cache guard), teardown falls to the session's own recheck")
+        except Exception as e:  # noqa: BLE001
+            print(f"❌ Failed to publish termination signal ({type(e).__name__})")
+
+
+_after_commit_work.handler(_FORCE_CLOSE_WORK, _send_force_closes)
+
+
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
                      durable=True, except_session_token=None):
     """Deactivate the matching active sessions AND publish a force-close signal to
@@ -8761,6 +8811,8 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
     transport immediately — not just at the connection's next operation. This is
     the active counterpart to the per-request is_active/is_locked/cred-active
     re-checks on the web and SFTP paths. Returns the number of sessions revoked.
+    The signals are sent once the caller's transaction commits (_force_close_after_commit), and not at all when
+    it rolls back.
 
     durable=True (logout / lock / deactivate) ALSO sets ActiveSession.revoked so a regular-user
     web JWT is rejected per request even during a Redis outage. durable=False (e.g. disabling
@@ -8813,21 +8865,11 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             s.revoked = True  # durable revocation (web tokens rejected even if Redis is down)
         count += 1
         handled_ids.append(s.id)
-        try:
-            sent = _guarded_publish_force('session_terminations', json.dumps({
-                'session_token': s.session_token,
-                'session_id': str(s.id),
-                'terminated_by': actor_username,
-            }))
-            if sent:
-                print(f"📢 Force-closed session {s.session_token[:8]}... ({actor_username})")
-            else:
-                # Durable revocation is committed; only the live teardown signal was skipped while a
-                # cache failure sits inside its cooldown.
-                print(f"↩ Revoked session {s.session_token[:8]}... ({actor_username}); live signal "
-                      f"skipped (cache guard), teardown falls to the session's own recheck")
-        except Exception as e:  # noqa: BLE001
-            print(f"❌ Failed to publish termination signal: {e}")
+        _force_close_after_commit(db, {
+            'session_token': s.session_token,
+            'session_id': str(s.id),
+            'terminated_by': actor_username,
+        }, actor_username)
     if durable and temp_credential_id is None:
         # The regular sessions already inactive but never revoked (see the docstring), in one
         # statement: an account can hold a month of them. A temporary credential's token is refused
@@ -9522,30 +9564,19 @@ async def terminate_temp_credential_sessions(
     
     terminated_count = 0
     audit_logger = AuditLogger(db)
-    
-    # Get Redis connection for publishing termination signals
-    from app.core.database import redis_client
-    
+
     for session in active_sessions:
         session.is_active = False
         terminated_count += 1
-        
-        # Publish termination signal to Redis for the SFTP server to close the transport.
-        try:
-            sent = _guarded_publish_force('session_terminations', json.dumps({
-                'session_token': session.session_token,
-                'session_id': str(session.id),
-                'temp_username': temp_username,
-                'terminated_by': current_user.username
-            }))
-            if sent:
-                print(f"📢 Published termination signal for session {session.session_token[:8]}...")
-            else:
-                print(f"↩ Revoked session {session.session_token[:8]}...; live signal skipped "
-                      f"(cache guard), teardown falls to the session's own recheck")
-        except Exception as e:
-            print(f"❌ Failed to publish termination signal: {e}")
-        
+
+        # The SFTP server closes the transport once the end of the session is committed.
+        _force_close_after_commit(db, {
+            'session_token': session.session_token,
+            'session_id': str(session.id),
+            'temp_username': temp_username,
+            'terminated_by': current_user.username
+        }, current_user.username)
+
         # Log the termination
         audit_logger.log_action(
             action="terminate_session",
@@ -9587,7 +9618,11 @@ async def storage_stats(
     the deployment's hard ceiling from MAX_STORAGE_GB, which the panel shows as the top of the
     range an admin may choose from. `allocated_bytes` is the sum of every active vault's declared
     limit — reported so an operator can see how much has been promised, NOT enforced against this
-    limit: an empty vault costs nothing until files land in it."""
+    limit: an empty vault costs nothing until files land in it.
+
+    `used` is the vaults' stored bytes; `limit_bytes` limits those and what legal holds keep after a deletion
+    together, `limit_counts_bytes` (the same as `on_disk_bytes`). `free_space_floor_bytes` is the free space the
+    volume keeps (MIN_FREE_SPACE_GB): an upload, an SFTP write or a copy that would leave less is refused."""
     from sqlalchemy import func as _f
     from app.services.vault_service import vaults_stored_bytes, deployment_storage_limit_bytes
     used = vaults_stored_bytes(db)
@@ -9604,14 +9639,23 @@ async def storage_stats(
     # Files a legal hold keeps after their deletion: on this disk, in no vault's counters.
     from app.core import kept_tables
     kept = kept_tables.totals(db)
+    # The free space the storage volume keeps (app/core/free_space.py): 0 when it is off or cannot be judged.
+    from app.core import free_space
+    room = free_space.room()
     return {
         "total": total,
+        # The vaults' stored bytes. The deployment's storage limit (limit_bytes) counts these and the kept ones
+        # together: compare it with limit_counts_bytes, not with this.
         "used": used,
         "kept_for_cases": kept,
         # What the vaults' files take on the disk: their counted bytes and the kept ones. The
         # deployment's storage limit counts both (vault_service.deployment_storage_used).
         "on_disk_bytes": used + kept["bytes"],
+        # What limit_bytes is measured against: the same sum, by name.
+        "limit_counts_bytes": used + kept["bytes"],
         "available": available,
+        # Uploads, SFTP writes and copies are refused once they would leave less than this free (MIN_FREE_SPACE_GB).
+        "free_space_floor_bytes": room.floor if room is not None else 0,
         "allocated_bytes": allocated,
         "limit_bytes": limit,
         "max_bytes": storage_quota.env_ceiling_bytes(settings.max_storage_gb),
@@ -15380,6 +15424,7 @@ async def open_receiver_upload_session(
         raise HTTPException(status_code=413,
                             detail=f"File exceeds the maximum size of {per_file_cap // (1024 * 1024)} MB.")
     _enforce_deployment_storage_quota(db, size)
+    _enforce_free_space(size)
 
     # Bound concurrent open anon sessions per receiver (transient-buffer DoS bound).
     now = datetime.utcnow()
@@ -15521,6 +15566,8 @@ async def receiver_upload_chunk(
             clen = None
         if clen is not None and clen > remaining:
             raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+    # A chunk is staged on the storage volume: refused while it would leave less than the free space the volume keeps.
+    _enforce_free_space(remaining)
 
     tmp_path = sdir / f".chunk_{chunk_index:06d}.{uuid.uuid4().hex}.part"
     # ---- THE BOUNDARY: no connection is held while the client sends. ----
@@ -15633,6 +15680,12 @@ async def receiver_complete_upload(
         raise _busy_response(busy)
 
     try:
+        # Asked again once it has its slot: the link revoked or expired, the links switched off, its owner locked
+        # or deactivated, or the session cancelled while it waited for one.
+        resolved = _receiver_resolve_session(db, token, session_id)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="This upload is not available.")
+        receiver, session, vault, owner = resolved
         sdir = _upload_session_dir(vault_service, str(session.id))
         present = _received_chunk_indices(sdir)
         missing = [i for i in range(session.total_chunks) if i not in present]
@@ -15664,12 +15717,16 @@ async def receiver_complete_upload(
             file_info, stream_ctx = vault_service.upload_file_streaming(
                 vault_id=vault.id, file_name=fname, user=owner, folder_id=None,
                 mime_type=session.mime_type, file_id=None)
-            with stream_ctx as ctx:
-                for i in range(session.total_chunks):
-                    for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
-                        if buf:
-                            ctx.write_chunk(buf)
-                return ctx.get_checksum(), ctx.get_total_size()
+            try:
+                with stream_ctx as ctx:
+                    for i in range(session.total_chunks):
+                        for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                            if buf:
+                                ctx.write_chunk(buf)
+                    return ctx.get_checksum(), ctx.get_total_size()
+            except StorageLimitExceeded as refused:
+                # The storage volume reached the free space it keeps as the file was written.
+                raise _no_room(refused, "This upload would exceed the link's space.") from None
 
         def _record(final_checksum, final_size):
             if final_size != session.total_size:
@@ -17163,6 +17220,21 @@ def _enforce_deployment_storage_quota(db, additional_bytes: int) -> None:
         raise _deployment_storage_refusal(used, cap_bytes)
 
 
+def _enforce_free_space(additional_bytes: int) -> None:
+    """Refuse, before it starts, a transfer whose ``additional_bytes`` would leave the storage volume less than the
+    free space it keeps (MIN_FREE_SPACE_GB, app/core/free_space.py): 507, with the free space and the floor. Asked
+    before a byte is written: once they are on the disk, the volume's own free space counts them (the guard as they
+    are written, and the check as the row is written)."""
+    from app.core import free_space
+    short = free_space.short_of(additional_bytes)
+    if short is not None:
+        raise _disk_full_refusal(free_space.refusal_text(short))
+
+
+def _disk_full_refusal(text: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=text)
+
+
 def _deployment_storage_refusal(used: int, cap_bytes: int) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -17174,7 +17246,10 @@ def _deployment_storage_refusal(used: int, cap_bytes: int) -> HTTPException:
 
 def _no_room(refused: StorageLimitExceeded, vault_detail: str) -> HTTPException:
     """The 413 for a file finalize_streaming_upload found no room for: the deployment's answer, or
-    `vault_detail` for the vault's size limit (each upload path words its own)."""
+    `vault_detail` for the vault's size limit (each upload path words its own); a 507 for a storage volume left
+    with less than the free space it keeps (refused as the file was written or stored)."""
+    if refused.kind == 'disk':
+        return _disk_full_refusal(str(refused))
     if refused.kind == 'deployment':
         return _deployment_storage_refusal(refused.used, refused.cap)
     return HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=vault_detail)
@@ -18095,8 +18170,8 @@ async def delete_vault(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=hold_refusals.vault_text(keeping))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete vault: {str(e)}"
-        )
+            detail="Failed to delete vault"
+        ) from e
 
 
 @app.patch("/vaults/{vault_id}")
@@ -18300,8 +18375,8 @@ async def update_vault_info(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update vault information: {str(e)}"
-        )
+            detail="Failed to update vault information"
+        ) from e
 
 
 @app.put("/vaults/{vault_id}/password")
@@ -18386,8 +18461,8 @@ async def change_vault_password(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to change password: {str(e)}"
-        )
+            detail="Failed to change password"
+        ) from e
 
 
 @app.patch("/vaults/{vault_id}/settings")
@@ -18527,8 +18602,8 @@ async def update_vault_settings(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update settings: {str(e)}"
-        )
+            detail="Failed to update settings"
+        ) from e
 
 
 class VaultStorageUpdate(BaseModel):
@@ -18939,8 +19014,8 @@ async def list_vault_permissions(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list permissions: {str(e)}"
-        )
+            detail="Failed to list permissions"
+        ) from e
 
 
 @app.post("/vaults/{vault_id}/permissions")
@@ -19102,8 +19177,8 @@ async def grant_vault_permission(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to grant permission: {str(e)}"
-        )
+            detail="Failed to grant permission"
+        ) from e
 
 
 @app.delete("/vaults/{vault_id}/permissions/{user_id}")
@@ -19240,8 +19315,8 @@ async def revoke_vault_permission(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to revoke permission: {str(e)}"
-        )
+            detail="Failed to revoke permission"
+        ) from e
 
 
 # ----------------------------------------------------------------------------
@@ -19820,8 +19895,8 @@ async def list_vault_files(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list files: {str(e)}"
-        )
+            detail="Failed to list files"
+        ) from e
 
 
 def _member_grade_principal(user, vault_id) -> bool:
@@ -20029,6 +20104,10 @@ async def upload_file(
     vault_size_limit = 0
 
     try:
+        # The vault's password hash, to compare with once the upload has its slot (_admitted_again). Read before the
+        # door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
         # Verify vault access and password (from header for security)
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
         # A path-scoped temp credential may only upload INTO a folder within its scope
@@ -20058,6 +20137,7 @@ async def upload_file(
         # before the per-vault reservation so a customer can't exceed their plan by
         # spreading data across many vaults.
         _enforce_deployment_storage_quota(db, estimated_upload_size)
+        _enforce_free_space(estimated_upload_size)
 
         # the per-file ceiling is enforced IN-STREAM inside the per-file loop below (see the
         # bytes_uploaded check) — matching chunked-init — so an oversized single file is aborted
@@ -20187,7 +20267,14 @@ async def upload_file(
         # above, the one thing that does precede admission. The read transaction ends first, so a
         # request waiting for a slot holds no database connection meanwhile.
         if files:
+            token = _bearer_credentials(request).credentials
             transfer_slot = await _admitted_holding_no_connection(db)
+            # What let it in, asked again once it has its slot, as a download asks it (_admitted_again): the session
+            # signed out, the account locked, a temporary credential switched off or its scope narrowed, a capability
+            # withdrawn, the vault's password changed while it waited.
+            current_user, vault = _admitted_again(db, token, vault_id, password_hash_before, "FILE_UPLOAD",
+                                                  "file.upload")
+            require_folder_scope(db, current_user, vault_id, folder_id)
 
         for upload_file in files:
             # Validate filename
@@ -20577,7 +20664,7 @@ async def upload_file(
                 "event": {
                     "type": "error",
                     "title": "Upload failed",
-                    "description": f"Upload error: {str(e)[:100]}",
+                    "description": f"Upload error ({type(e).__name__})",
                     "user": current_user.username if current_user else "unknown",
                     "ip": get_client_ip(request),
                     "timestamp": datetime.now(timezone.utc).isoformat()
@@ -20587,8 +20674,8 @@ async def upload_file(
             pass  # Don't fail the error handler
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to upload file: {str(e)}"
-        )
+            detail="Failed to upload file"
+        ) from e
     finally:
         # Every path out of the request returns the slot, including the ones that raise before a
         # single file is read (where there is nothing to return and this is a no-op). A slot lost
@@ -21197,6 +21284,7 @@ async def init_chunked_upload(
     if vault.size_limit and (vault.total_size_bytes or 0) + body.total_size > vault.size_limit:
         raise HTTPException(status_code=413, detail="File would exceed the vault size limit")
     _enforce_deployment_storage_quota(db, body.total_size)   # deployment-wide stored-bytes limit
+    _enforce_free_space(body.total_size)                     # the free space the storage volume keeps
 
     folder_uuid = None
     if body.folder_id:
@@ -21497,6 +21585,10 @@ async def upload_chunk(
     """Store a single chunk. Idempotent: re-sending a chunk overwrites it."""
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
+    # The vault's password CREDENTIAL, to compare with after the body -- see _reauthorize_after_body for what that
+    # comparison proves and what it does not. Read before the door checks the password: a change committed between
+    # the two then fails the comparison, rather than becoming the value the request is compared with.
+    _vault_password_hash = _vault_credential_fingerprint(db, vault_id)
     vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
 
     session = db.query(ChunkedUploadSession).filter(
@@ -21510,9 +21602,6 @@ async def upload_chunk(
     # A scoped credential may only write to a session whose target folder is in scope
     # (the session was created by the same shared user id, so re-check per surface).
     require_folder_scope(db, current_user, vault_id, session.folder_id)
-    # The vault's password CREDENTIAL as it stands now, to compare with after the body -- see
-    # _reauthorize_after_body for what that comparison proves and what it does not.
-    _vault_password_hash = _vault_credential_fingerprint(db, vault_id)
     if session.status != 'active':
         raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
     if session.expires_at and session.expires_at <= datetime.utcnow():
@@ -21569,6 +21658,9 @@ async def upload_chunk(
             clen = None
         if clen is not None and clen > remaining:
             raise HTTPException(status_code=413, detail="Chunk data exceeds the declared upload size")
+    # A chunk is staged on the storage volume: refused while it would leave less than the free space the volume keeps
+    # (MIN_FREE_SPACE_GB), before anything of it is read.
+    _enforce_free_space(remaining)
 
     # Staged under a name unique to this REQUEST, not to the chunk index. The body is streamed
     # into this file across the whole transfer rather than written to it in one call at the end,
@@ -21767,18 +21859,26 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
+    # The vault's password hash, to compare with once the completion has its slot (_admitted_again). Read before the
+    # door checks the password: a change committed between the two then fails that comparison, rather than becoming
+    # the value the request is compared with.
+    password_hash_before = _vault_credential_fingerprint(db, vault_id)
     vault = vault_service.get_vault(vault_id, current_user, x_vault_password, require_password=True)
 
-    session = db.query(ChunkedUploadSession).filter(
-        ChunkedUploadSession.id == session_id,
-        ChunkedUploadSession.vault_id == vault_id,
-        ChunkedUploadSession.user_id == current_user.id,
-        _session_principal(current_user),
-    ).first()
-    if session is None:
-        raise HTTPException(status_code=404, detail="Upload session not found")
-    # A scoped credential may only finalize a session whose target folder is in scope.
-    require_folder_scope(db, current_user, vault_id, session.folder_id)
+    def _the_session(user):
+        found = db.query(ChunkedUploadSession).filter(
+            ChunkedUploadSession.id == session_id,
+            ChunkedUploadSession.vault_id == vault_id,
+            ChunkedUploadSession.user_id == user.id,
+            _session_principal(user),
+        ).first()
+        if found is None:
+            raise HTTPException(status_code=404, detail="Upload session not found")
+        # A scoped credential may only finalize a session whose target folder is in scope.
+        require_folder_scope(db, user, vault_id, found.folder_id)
+        return found
+
+    session = _the_session(current_user)
     # Unreachable: nothing writes `file_id` (see the column), and a session is deleted once it
     # completes. Left in place rather than removed with an unrelated change.
     if session.status == 'completed' and session.file_id:
@@ -21803,7 +21903,15 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
     # request reads the staged chunks and encrypts them, which is what the ceiling governs -- so
     # this is where it is applied, and a caller who is going to be told 403, 404, 409 or 410 is
     # told that instead of being made to queue for a slot they were never going to use.
+    token = _bearer_credentials(request).credentials
     await admit()
+    # What let it in, asked again once it has its slot, as a download asks it (_admitted_again): the session signed
+    # out, the account locked, a temporary credential switched off or its scope narrowed, a capability withdrawn, the
+    # vault's password changed while it waited. Then its upload session again, which may have been cancelled.
+    current_user, vault = _admitted_again(db, token, vault_id, password_hash_before, "FILE_UPLOAD", "file.upload")
+    session = _the_session(current_user)
+    if session.status != 'active':
+        raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
 
     sdir = _upload_session_dir(vault_service, str(session.id))
     present = _received_chunk_indices(sdir)
@@ -21929,15 +22037,20 @@ async def _complete_chunked_upload(vault_id, session_id, request, current_user, 
             mime_type=session.mime_type,
             file_id=client_file_id,
         )
-        with stream_ctx as ctx:
-            for i in range(session.total_chunks):
-                # Each staged chunk was sealed on arrival; unseal it in order (memory-bounded,
-                # one record at a time) and hand the plaintext to the at-rest codec. A chunk
-                # staged as plaintext by a pre-upgrade release streams through verbatim.
-                for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
-                    if buf:
-                        ctx.write_chunk(buf)
-            return ctx.get_checksum(), ctx.get_total_size()
+        try:
+            with stream_ctx as ctx:
+                for i in range(session.total_chunks):
+                    # Each staged chunk was sealed on arrival; unseal it in order (memory-bounded,
+                    # one record at a time) and hand the plaintext to the at-rest codec. A chunk
+                    # staged as plaintext by a pre-upgrade release streams through verbatim.
+                    for buf in open_staged_chunk(sdir / f"chunk_{i:06d}", session.id, i):
+                        if buf:
+                            ctx.write_chunk(buf)
+                return ctx.get_checksum(), ctx.get_total_size()
+        except StorageLimitExceeded as refused:
+            # The storage volume reached the free space it keeps as the file was written (the context has
+            # removed it): answered as a refusal at the finish is. The staged chunks stay, for a retry.
+            raise _no_room(refused, "File would exceed the vault size limit") from None
 
     def _record(final_checksum, final_size):
         # A short delivery must not commit. Every other size check in this path is a one-sided
@@ -22378,6 +22491,10 @@ async def download_file(
     burned_share_claim_ids = []
 
     try:
+        # The vault's password hash, to compare with once the transfer has its slot (_admitted_again). Read before
+        # the door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
         # Verify vault access and password. allow_share=True: a recipient with an active
         # whole-vault share claim may open + download from the vault (read-only). SFTP
         # downloads never pass this flag.
@@ -22408,7 +22525,6 @@ async def download_file(
 
         _the_file()
         token = _bearer_credentials(request).credentials
-        password_hash_before = _vault_credential_fingerprint(db, vault_id)
 
         operation_id = f"download_{uuid.uuid4()}"
         # Waits holding no connection, then asks again what let it in, and reads the file's row again: the file
@@ -22951,7 +23067,7 @@ async def download_file(
                 "event": {
                     "type": "error",
                     "title": "Download failed",
-                    "description": f"Download error: {str(e)[:100]}",
+                    "description": f"Download error ({type(e).__name__})",
                     "user": current_user.username if current_user else "unknown",
                     "ip": get_client_ip(request),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -23068,8 +23184,8 @@ async def delete_file(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete file: {str(e)}"
-        )
+            detail="Failed to delete file"
+        ) from e
 
 
 @app.get("/vaults/{vault_id}/files/{file_id}/info")
@@ -23209,6 +23325,10 @@ async def preview_render_file(
     audit_logger = AuditLogger(db)
     transfer_slot = None
     try:
+        # The vault's password hash, to compare with once the transfer has its slot (_admitted_again). Read before
+        # the door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password_hash_before = _vault_credential_fingerprint(db, vault_id)
         vault = vault_service.get_vault(vault_id, current_user, x_vault_password,
                                         require_password=True, allow_share=False)
         # Rendering exposes the content: gate it with the download scopes, not merely see_files.
@@ -23231,7 +23351,6 @@ async def preview_render_file(
 
         _the_file()
         token = _bearer_credentials(request).credentials
-        password_hash_before = _vault_credential_fingerprint(db, vault_id)
 
         # Load-shed like /download: refuse under pressure rather than queue a CPU-bound render onto
         # the event loop. Taken AFTER the cheap 404/413 answers so a rejected caller never queues, and
@@ -23420,8 +23539,8 @@ async def rename_file(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to rename file: {str(e)}"
-        )
+            detail="Failed to rename file"
+        ) from e
 
 
 class ItemMoveCopy(BaseModel):
@@ -23466,15 +23585,16 @@ async def _admitted_holding_no_connection(db, *, account=None):
 
     With an ``account`` (a copy, a move to another vault, a folder copy), that account holds at most its share of
     the slots with them (copy_share: a quarter of the ceiling, at least one); one past it waits for one of its own
-    to end. A copy needs no slow client to last, and one account's folder copies of a large tree held every slot
-    while everyone else waited.
+    to end, in a waiting room of the account's own (a 429 when that is full or the wait runs out). A copy needs no
+    slow client to last, and one account's folder copies of a large tree held every slot while everyone else waited.
 
     Each of them holds the request's database connection while it runs: a download while it streams, a copy in a
     thread (app/core/off_loop.py) that reads, decrypts, encrypts and syncs a whole file, a folder copy every file in
     the tree. The ceilings bound how many run, and the pool is sized beyond that (app/core/database.py). A request
-    waiting for its slot must hold none: waiting requests are bounded by the queue (32 by default), not by the
-    ceiling, and when downloads waited holding their read transaction, 16 streaming and 32 waiting held the whole
-    pool, and the server stopped answering anyone.
+    waiting for its slot must hold none: the ceiling does not bound how many wait (the queue, 32 by default, bounds
+    those waiting for a slot, and each account's own room, as large, its copies waiting for its share: with many
+    accounts, many times the queue), and when downloads waited holding their read transaction, 16 streaming and 32
+    waiting held the whole pool, and the server stopped answering anyone.
 
     Called after the checks that cost nothing to answer, so a caller told 403 or 404 is not first made to queue.
     The request's read transaction ends first (nothing is pending: the checks only read, and get_vault commits),
@@ -23575,10 +23695,13 @@ async def copy_file_endpoint(
             # another user's file (same rule as every other replace path, _principal_can_replace_file).
             return user, body.replace_same_name and _principal_can_replace_file(db, user, body.dest_vault_id)
 
-        _admitted(current_user)
-        token = _bearer_credentials(request).credentials
+        # Each vault's password hash, to compare with once the copy has its slot (_admitted_again). Read before the
+        # door checks the passwords: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
         source_password = _vault_credential_fingerprint(db, vault_id)
         dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
+        _admitted(current_user)
+        token = _bearer_credentials(request).credentials
         account = current_user.id
         client_ip = get_client_ip(request)
 
@@ -23657,10 +23780,13 @@ async def move_file_endpoint(
             # there, not just the client flag.
             return user, body.replace_same_name and _principal_can_replace_file(db, user, body.dest_vault_id)
 
-        at_the_door = _admitted(current_user)
-        token = _bearer_credentials(request).credentials
+        # Each vault's password hash, to compare with once the move has its slot (_admitted_again). Read before the
+        # door checks the passwords: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
         source_password = _vault_credential_fingerprint(db, vault_id)
         dest_password = _vault_credential_fingerprint(db, body.dest_vault_id)
+        at_the_door = _admitted(current_user)
+        token = _bearer_credentials(request).credentials
         account = current_user.id
         client_ip = get_client_ip(request)
 
@@ -23785,9 +23911,12 @@ async def copy_folder_endpoint(
             require_cap(user, vault_id, "file.upload")
             return user
 
+        # The vault's password hash, to compare with once the copy has its slot (_admitted_again). Read before the
+        # door checks the password: a change committed between the two then fails that comparison, rather than
+        # becoming the value the request is compared with.
+        password = _vault_credential_fingerprint(db, vault_id)
         _admitted(current_user)
         token = _bearer_credentials(request).credentials
-        password = _vault_credential_fingerprint(db, vault_id)
         account = current_user.id
         client_ip = get_client_ip(request)
 
@@ -24005,8 +24134,8 @@ async def create_folder(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create folder: {str(e)}"
-        )
+            detail="Failed to create folder"
+        ) from e
 
 
 @app.post("/vaults/{vault_id}/folders/{folder_id}/delete")
@@ -24474,11 +24603,14 @@ async def get_monitoring_metrics(
             "downloadTraffic": download_traffic,
             "activeOperations": active_operations,
             "transfersInFlight": transfers["in_flight"],
-            "transfersWaiting": transfers["waiting"],
+            # Waiting for a slot, or for their account's share of the slots (each in a room of its own).
+            "transfersWaiting": transfers["waiting"] + transfers["waiting_for_share"],
+            "transfersWaitingForShare": transfers["waiting_for_share"],
             "transferLimit": transfers["limit"],
             "transfersPeak": transfers["peak_in_flight"],
             "transfersAdmitted": transfers["admitted"],
             "transfersRefused": transfers["refused"],
+            "transfersRefusedOverShare": transfers["refused_over_share"],
             "totalFiles": total_files
             # Timestamp removed: Including timestamp prevents ETag caching since it changes every request
             # Frontend can add timestamp when displaying if needed
@@ -26443,6 +26575,9 @@ async def lifespan(app: FastAPI):
     _check_data_requirements("web")
     init_db()
     print("Database initialized")
+    # Whether the database lets this role open what the pools may open at the transfer ceiling (said, never refused).
+    from app.core.database import report_connection_room
+    report_connection_room()
     recorded = _run_lightweight_migrations()
     # After the replay, so the remembered value describes what this boot actually achieved.
     from app.core.health import refresh_schema_state

@@ -88,6 +88,8 @@ def test_the_older_schema_listed_is_0_33_2s():
     try:
         out = subprocess.run(["git", "show", "v0.33.2:app/core/models.py"], cwd=ROOT, capture_output=True, text=True,
                              timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"git show did not finish within {exc.timeout} s")
     except (OSError, subprocess.SubprocessError) as exc:
         pytest.skip(f"git is not available: {exc}")
     if out.returncode != 0:
@@ -191,7 +193,7 @@ def test_the_condition_ids_are_ones_the_matrix_accepts_and_the_rollback_one_has_
 def test_every_condition_is_listed_once_and_each_set_is_drawn_from_them():
     assert len(rc.CONDITIONS) == len(set(rc.CONDITIONS))
     assert set(rc.CONDITIONS) == set(rc.DETECT) | set(rc.WITHOUT_DETECT)
-    assert set(rc.SUMMARY) <= set(rc.CONDITIONS)
+    assert set(rc.SUMMARY) == set(rc.CONDITIONS), "every condition's text is kept here, none only elsewhere"
     assert rc.BLOCKS_ROLLBACK <= rc.ON_UPGRADED <= set(rc.DETECT)
 
 
@@ -403,3 +405,125 @@ def test_the_archive_texts_say_when_archiving_starts_again():
         assert rc.SUMMARY[cid].count(said) == 1, cid
     assert f"{arc.RESTORE_LOW} to {arc.RESTORE_HIGH} times their compressed size" in (
         rc.SUMMARY["archived-audit-history-hidden"])
+
+
+# --------------------------------------------------------------------------- the texts of the retention conditions
+
+def _settings_default(name):
+    from app.core.config import Settings
+    return Settings.model_fields[name].default
+
+
+def _tool():
+    return (ROOT / "dockvault.py").read_text(encoding="utf-8")
+
+
+def test_the_audit_retention_timer_text_says_what_the_code_does():
+    """The first pass after the upgrade turns a positive AUDIT_LOG_RETENTION_DAYS into a waiting change (it waits the
+    reduction delay, the administrators are told, any of them may cancel it); administration and security rows are
+    kept the protected minimum; the host tool shows the values; the query counts the rows and the oldest."""
+    from app.core import audit_retention as ar
+    from app.core import setting_changes
+    text, sql = rc.SUMMARY["audit-retention-runs-on-a-timer"], rc.DETECT["audit-retention-runs-on-a-timer"]
+    assert _settings_default("retention_reduction_delay_days") == 7
+    assert "RETENTION_REDUCTION_DELAY_DAYS (7 by default)" in text
+    assert _settings_default("audit_protected_min_days") == 365 and _settings_default("audit_log_retention_days") == 0
+    assert "kept at least 365 days whatever the value (AUDIT_PROTECTED_MIN_DAYS)" in text
+    assert callable(ar.schedule_env_retention_once) and ar.SERVER.endswith("(AUDIT_LOG_RETENTION_DAYS in .env)")
+    assert callable(setting_changes.cancel)
+    assert set(ar.PROTECTED_CATEGORIES) == {"administration", "security"}
+    assert '("retention", "Retention - how long records are kept, and change a .env limit")' in _tool()
+    assert "python dockvault.py audit retention shows the values in force" in text
+    assert "count(*) AS audit_rows, min(timestamp) AS oldest" in sql
+    assert text.endswith("The check shows the number of audit rows and the oldest.")
+
+
+def test_the_protected_minimum_text_says_what_the_start_refuses():
+    from types import SimpleNamespace
+    from app.core import audit_retention as ar
+    text = rc.SUMMARY["audit-protected-minimum-365-days"]
+    assert "AUDIT_PROTECTED_MIN_DAYS (365 by default)" in text and _settings_default("audit_protected_min_days") == 365
+    ok = dict(plan_log_max_days=-1, audit_protected_min_days=365, audit_min_retention_days=0,
+              audit_log_retention_days=0)
+    assert ar._contract(SimpleNamespace(**ok)) == []
+    for changed in (dict(plan_log_max_days=300), dict(plan_log_max_days=400, audit_min_retention_days=500),
+                    dict(audit_min_retention_days=30, audit_log_retention_days=20)):
+        assert ar._contract(SimpleNamespace(**dict(ok, **changed))), changed
+    assert ("The server refuses to start when AUDIT_PROTECTED_MIN_DAYS or AUDIT_MIN_RETENTION_DAYS is longer than "
+            "PLAN_LOG_MAX_DAYS, or AUDIT_LOG_RETENTION_DAYS is shorter than AUDIT_MIN_RETENTION_DAYS.") in text
+    assert "only .env lowers the minimum" in text and "the size cap never deletes them" in text
+
+
+def test_the_container_output_text_says_what_the_compose_files_do():
+    text = rc.SUMMARY["container-output-rotates"]
+    for compose in ("docker-compose.yml", "docker-compose.secure.yml"):
+        body = (ROOT / "deploy" / compose).read_text(encoding="utf-8")
+        assert 'max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"' in body and 'max-file: "${DOCKER_LOG_MAX_FILE:-5}"' in body
+        assert "driver: json-file" in body, compose
+    assert "DOCKER_LOG_MAX_FILE files (5 by default) of DOCKER_LOG_MAX_SIZE (10m by default)" in text
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "\n## Container logs\n" in readme and "journald" in readme.split("## Container logs", 1)[1]
+    assert "(README, Container logs)" in text
+
+
+def test_the_free_space_text_says_what_the_floor_and_the_tool_do():
+    from app.api.api_server import _disk_full_refusal
+    from app.core import free_space
+    gib = 1024 ** 3
+    text = rc.SUMMARY["storage-volume-keeps-free-space"]
+    assert ("MIN_FREE_SPACE_GB sets it in GB; unset, it is the larger of 2 GB and 5% of the volume, never more than "
+            "half of it nor more than 20 GB; 0 turns it off.") in text
+    assert _settings_default("min_free_space_gb") == -1
+    for total, floor in ((10 * gib, 2 * gib), (100 * gib, 5 * gib), (3 * gib, 3 * gib // 2), (1024 * gib, 20 * gib)):
+        assert free_space.floor_bytes(total, configured=-1) == floor, total
+    assert free_space.floor_bytes(100 * gib, configured=0) == 0
+    assert free_space.floor_bytes(100 * gib, configured=25) == 25 * gib
+    assert "is refused (507)" in text and _disk_full_refusal("x").status_code == 507
+    spec = importlib.util.spec_from_file_location("dockvault_conditions", ROOT / "dockvault.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    assert tool.gains_free_space_floor("0.33.6", "v" + rc.INTO)
+    assert tool.free_space_floor_note(None, (98 * gib, 2 * gib, 100 * gib)) is not None
+    assert "python dockvault.py update says so before the upgrade" in text
+
+
+def test_the_security_alert_text_says_what_the_pruner_does():
+    from app.core import retention
+    from app.core import security_records as sr
+    text, sql = (rc.SUMMARY["alert-names-and-addresses-cleared-after-30-days"],
+                 rc.DETECT["alert-names-and-addresses-cleared-after-30-days"])
+    assert (_settings_default("security_record_days"), _settings_default("security_record_min_days"),
+            _settings_default("security_record_max_days"), _settings_default("security_alert_retention_days")) == (
+        30, 7, 365, 90)
+    assert "SECURITY_RECORD_DAYS (30 by default, 7 to 365)" in text
+    assert "SECURITY_ALERT_RETENTION_DAYS (90 by default) on a timer" in text
+    assert (sr.NAME_TOKEN, sr.ADDRESS_TOKEN) == ("{username}", "{ip_address}")
+    jobs = {job.name for job in retention.JOBS}
+    assert "security_alerts" in jobs
+    assert "interval '30 days'" in sql and "(username IS NOT NULL OR ip_address IS NOT NULL)" in sql
+
+
+def test_the_working_records_text_says_what_the_pruner_deletes():
+    from app.core import retention
+    from app.core import settings_registry as reg
+    from app.core import working_records as wr
+    text, sql = (rc.SUMMARY["ended-invitations-and-codes-deleted-after-30-days"],
+                 rc.DETECT["ended-invitations-and-codes-deleted-after-30-days"])
+    assert reg.spec_for(wr.INVITATION_DAYS_KEY).default == reg.spec_for(wr.ONE_TIME_DAYS_KEY).default == 30
+    assert sql.count("interval '30 days'") == 9
+    assert {"invitations", "one_time_proofs"} <= {job.name for job in retention.JOBS}
+    assert reg.spec_for(wr.NOTIFICATION_DAYS_KEY).default == 0 == _settings_default("notification_retention_days")
+    assert ("Notifications stay until the person dismisses them unless NOTIFICATION_RETENTION_DAYS (or Settings, "
+            "Activity and records) gives them a window.") in text
+    assert "invitations are deleted 30 days after they are accepted, revoked or expire" in text
+
+
+def test_the_panel_retention_text_names_a_command_the_tool_has():
+    text, sql = rc.SUMMARY["panel-retention-not-read"], rc.DETECT["panel-retention-not-read"]
+    tool = _tool()
+    assert 'au.add_argument("--before"' in tool and 'au.add_argument("--retention-days"' in tool
+    assert '"acknowledge-removed-before"' in tool
+    assert ("python dockvault.py audit acknowledge-removed-before --before <time> --retention-days <days>"
+            in text)
+    assert "Set AUDIT_LOG_RETENTION_DAYS=0 before going back" in text
+    assert "FROM managed_settings" in sql and text.endswith("The check lists the values set in the panel.")

@@ -98,10 +98,14 @@ class VersionCheck:
         return "Every SFTP server runs this version." if self.reason == SAME else "This deployment runs no SFTP server."
 
 
+def _utcnow() -> datetime:
+    return datetime.utcnow()
+
+
 def sftp_same_version(db, *, now: Optional[datetime] = None, environ=None, version: Optional[str] = None) -> VersionCheck:
     """Whether SFTP is off, or every live SFTP process runs this version (see the module's docstring)."""
     from app.core.models import SftpProcess
-    now = now or datetime.utcnow()
+    now = now or _utcnow()
     version = version or code_version()
     since = now - timedelta(seconds=LIVE_WITHIN_SECONDS)
     live = sorted({v for (v,) in db.query(SftpProcess.version).filter(SftpProcess.seen_at >= since).all()})

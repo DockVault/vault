@@ -22,8 +22,10 @@ def _psql(sql):
         return subprocess.run(
             ["docker", "exec", _DB, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
             capture_output=True, text=True, timeout=20)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
 
 
 def test_admin_can_list_and_resolve_a_security_alert(admin, admin_creds):

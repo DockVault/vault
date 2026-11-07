@@ -43,6 +43,8 @@ def _psql(sql):
         return subprocess.run(
             ["docker", "exec", _DB_CONTAINER, "psql", "-U", u.stdout.strip(), "-d", d.stdout.strip(),
              "-t", "-A", "-c", sql], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except Exception:  # noqa: BLE001
         return None
 

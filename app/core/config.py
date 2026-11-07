@@ -311,6 +311,13 @@ class Settings(BaseSettings):
         default=-1,
         validation_alias=AliasChoices("max_storage_gb", "plan_max_storage_gb"),
     )
+    # The free space, in GB, the storage volume keeps: an upload, an SFTP write or a copy that would leave less is
+    # refused, before it starts when its size is known and as its bytes are written (app/core/free_space.py). -1,
+    # the default, is the larger of 2 GB and 5% of the volume, never more than half of it nor more than 20 GB; 0 turns
+    # it off; any other value is that many GB, more than 20 GB too; inf or nan reads as -1 (a value that is not a
+    # number, or an empty one, fails this model, so the server does not start, as for any other setting). Nothing
+    # else bounds the disk while MAX_STORAGE_GB is unlimited, and the database usually shares it.
+    min_free_space_gb: float = Field(default=-1)
     transfer_speed_limit_kb: int = Field(default=0)  # 0 = no limit, otherwise KB/s
     # Hours a resumable chunked-upload session may live before it is considered
     # abandoned and its buffered chunks under _uploads/<sid>/ become eligible for
@@ -542,8 +549,9 @@ class Settings(BaseSettings):
     # compressed into daily blocks, each checked against the seals before its rows are removed; nothing is
     # deleted, and `dockvault.py audit unarchive` restores them. The panel can change the window within those
     # bounds. Archiving starts AUDIT_ARCHIVE_START_AFTER_DAYS (0-90) after this release first ran here (the
-    # chain's genesis), and again that long after it runs once more following time on an earlier release (or a
-    # stop of more than 3 days), so going back to an earlier release meanwhile needs no unarchive.
+    # chain's genesis), and again that long after it runs once more following more than 12 hours on an earlier
+    # release that wrote to the audit log, or more than 3 days on one or stopped, so going back to an earlier
+    # release meanwhile needs no unarchive.
     audit_hot_days: int = Field(default=90)
     audit_archive_start_after_days: int = Field(default=14)
     

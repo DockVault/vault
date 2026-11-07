@@ -9,7 +9,8 @@ read transaction before it waits. And the decisions made at the door are about a
 wait: the session signed out or ended by an administrator, a temporary credential's scope narrowed, a vault's
 password changed, the file deleted. Once a request has its slot it asks them again, in the order the door asks
 them: the principal (the same decision as at the door, from its bearer token), the endpoint permission, the vault
-capability, the vault's access check with its password compared (not verified again), the item's scope and its
+capability, the vault's access check with its password compared (not verified again) with the hash read before the
+door checked it, each vault with its own, the item's scope and its
 row, and for a copy or a move the destination's access, password, capability and folder scope, and whether a
 same-name file there may be replaced. A copy, a move and a folder copy ask them in the thread their work runs in.
 
@@ -78,9 +79,13 @@ class _World:
     """The checks a transfer passes, each recording when it is asked, with which principal and on which thread.
     `refuse` names the check that refuses when it is asked after the wait."""
 
-    def __init__(self, monkeypatch, gate, source, dest, refuse=None):
+    def __init__(self, monkeypatch, gate, source, dest, refuse=None, change_at_door=None):
         self.gate = gate
         self.refuse = refuse
+        # Each vault's own password hash. `change_at_door` names a vault whose password changes while the door
+        # checks it: the request's password was checked against the old hash, and the new one is committed then.
+        self.hashes = {source: "the source hash", dest: "the dest hash"}
+        self.change_at_door = change_at_door
         self.log = []
         self.threads = []
         self.db = _Session(self)
@@ -104,6 +109,8 @@ class _World:
             def get_vault(self, vault_id, user, password, require_password=False, allow_share=False):
                 world.db.checked_out()
                 which = world.which[vault_id]
+                if world.change_at_door == which and not world.waited:
+                    world.hashes[vault_id] = f"a new {which} hash"
                 if ask(f"{which} vault", user):
                     raise S.PermissionDeniedError("no longer a member")
                 world.log.append(("vault asked with", which, password, require_password, allow_share))
@@ -145,8 +152,9 @@ class _World:
 
         def fingerprint(db, vault_id):
             world.db.checked_out()
-            changed = ask(f"{world.which[vault_id]} password")
-            return "a new hash" if changed else "the hash"
+            which = world.which[vault_id]
+            changed = ask(f"{which} password")
+            return f"a new {which} hash" if changed else world.hashes[vault_id]
 
         def endpoint_permission(db, user, group, kwargs):
             if ask(f"permission {group}", user):
@@ -217,13 +225,13 @@ def _call(kind, world, source, dest):
                           x_dest_vault_password="the destination's password", x_file_password=None, **common)
 
 
-def _run(monkeypatch, kind, refuse=None):
+def _run(monkeypatch, kind, refuse=None, change_at_door=None):
     """Send `kind` while another transfer holds the only slot; return the world, what was seen while it waited,
     its answer (an HTTPException, or what it returned) and the gate's statistics after."""
     async def go():
         source, dest = uuid.uuid4(), uuid.uuid4()
         gate = TransferAdmission(limit=1, max_waiting=4, wait_seconds=30)
-        world = _World(monkeypatch, gate, source, dest, refuse)
+        world = _World(monkeypatch, gate, source, dest, refuse, change_at_door)
         other = await gate.acquire()
         task = asyncio.ensure_future(_call(kind, world, source, dest))
         for _ in range(200):
@@ -248,16 +256,17 @@ def _asks(log):
                                                                                         "audited")]
 
 
+# Each vault's password hash is read first, before the door checks the password: a change committed between the two
+# then fails the comparison after the wait (test_a_password_changed_while_the_door_checked_it_...).
 AT_THE_DOOR = {
-    "download": [("source vault", "at-the-door"), ("file scope", "at-the-door"), ("download scope", "at-the-door"),
-                 ("item row", None), ("source password", None)],
-    "copy": [("source vault", "at-the-door"), ("item row", None), ("item scope", "at-the-door"),
-             ("dest vault", "at-the-door"), ("capability file.upload", "at-the-door"),
-             ("folder scope", "at-the-door"), ("replace", "at-the-door"), ("source password", None),
-             ("dest password", None)],
-    "folder copy": [("source vault", "at-the-door"), ("item row", None), ("item scope", "at-the-door"),
-                    ("folder scope", "at-the-door"), ("capability file.download", "at-the-door"),
-                    ("capability file.upload", "at-the-door"), ("source password", None)],
+    "download": [("source password", None), ("source vault", "at-the-door"), ("file scope", "at-the-door"),
+                 ("download scope", "at-the-door"), ("item row", None)],
+    "copy": [("source password", None), ("dest password", None), ("source vault", "at-the-door"),
+             ("item row", None), ("item scope", "at-the-door"), ("dest vault", "at-the-door"),
+             ("capability file.upload", "at-the-door"), ("folder scope", "at-the-door"), ("replace", "at-the-door")],
+    "folder copy": [("source password", None), ("source vault", "at-the-door"), ("item row", None),
+                    ("item scope", "at-the-door"), ("folder scope", "at-the-door"),
+                    ("capability file.download", "at-the-door"), ("capability file.upload", "at-the-door")],
 }
 AT_THE_DOOR["preview"] = AT_THE_DOOR["download"]
 AT_THE_DOOR["move"] = AT_THE_DOOR["copy"]
@@ -403,3 +412,51 @@ def test_a_replace_withdrawn_while_it_waited_is_not_made(monkeypatch, kind):
     assert answer["id"]
     ((_name, _thread, replace),) = world.worked
     assert replace is False
+
+
+@pytest.mark.parametrize("kind, vault", [("download", "source"), ("preview", "source"), ("copy", "source"),
+                                         ("copy", "dest"), ("move", "source"), ("move", "dest"),
+                                         ("folder copy", "source")])
+def test_a_password_changed_while_the_door_checked_it_refuses_the_transfer_after_its_wait(monkeypatch, kind, vault):
+    """A password change committed while the door checked the request's password (against the old hash): the hash
+    read before the door is the old one, so the comparison after the wait fails, and the transfer is refused, asking
+    for the password again. Read after the door, the new hash became the value compared with, and a request that
+    proved only the old password went through."""
+    world, waiting, answer, stats = _run(monkeypatch, kind, change_at_door=vault)
+    assert waiting[0] == 1
+    assert _status(answer) == 401 and "password" in str(getattr(answer, "detail", answer)), answer
+    assert world.worked == [] and "start" not in world.log and "render" not in world.log, world.log
+    assert stats["in_flight"] == 0, "its slot was not given back"
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_a_password_changed_while_the_door_checked_it_refuses_the_chunk_sent_after(monkeypatch, tmp_path, changed):
+    """The same for a chunk of a chunked upload, which waits for no slot but for its body, sent at the client's pace:
+    the vault's password hash is read before the door checks the request's password and compared once the body has
+    arrived. A change committed while the door checked it refuses the chunk (409, start again) and stages nothing.
+    Read after the door, the new hash was the one compared with, and the chunk was staged. Unchanged, it is staged."""
+    from _chunk_endpoints import ChunkWorld, send_chunk
+    monkeypatch.setattr(S, "_enforce_free_space", lambda additional: None)     # the volume's floor is not asked here
+    world = ChunkWorld(monkeypatch, tmp_path, change_password_at_door=changed)
+    answer, body = send_chunk(world, "signed in")
+    assert body.read and world.doors == 2, "the door and the check after the body were not both asked"
+    if changed:
+        assert isinstance(answer, HTTPException) and answer.status_code == 409, answer
+        assert "password changed while the chunk was being sent" in answer.detail, answer.detail
+        assert world.staged() == []
+    else:
+        assert not isinstance(answer, HTTPException), answer
+        assert answer["received"] == 1 and world.staged() == ["chunk_000000", "hash_000000"]
+
+
+@pytest.mark.parametrize("kind", ["copy", "move"])
+def test_each_vault_is_compared_with_its_own_hash_after_the_wait(monkeypatch, kind):
+    """The source's password hash and the destination's differ: each is compared with its own after the wait, so a
+    copy or a move between two vaults with their own passwords goes through, and only the vault whose password
+    changed refuses it."""
+    world, _waiting, answer, _stats = _run(monkeypatch, kind)
+    assert len(set(world.hashes.values())) == 2, world.hashes
+    assert answer["id"], answer
+    for refused in ("source password", "dest password"):
+        world, _waiting, answer, _stats = _run(monkeypatch, kind, refuse=refused)
+        assert _status(answer) == 401 and world.worked == [], (refused, answer)

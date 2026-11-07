@@ -443,6 +443,97 @@ def test_what_the_env_changes_in_the_upgrade_is_said_before_it(tmp_path, monkeyp
     assert out.index("  Note: " + gateway) < out.index("--dry-run: nothing was changed.")
 
 
+# --- the free space the storage volume keeps from 0.34.0 ----------------------------------------
+
+GIB = 1024 ** 3
+
+
+@pytest.mark.parametrize("raw", [None, "", "-1", "-7", "0", "25", "2.5", "'40'", "inf", "nan", "1e300"])
+@pytest.mark.parametrize("total", [GIB, 3 * GIB, 6 * GIB, 100 * GIB, 400 * GIB, 1024 * GIB, 20 * 1024 * GIB])
+def test_the_tool_reads_the_floor_as_the_application_does(raw, total):
+    """update says what 0.34.0 will keep free before it is running, so it computes the floor itself: from the same
+    setting, the same number as app/core/free_space.py, whatever the volume."""
+    from app.core import free_space
+    configured = dv._finite_float(raw)
+    assert dv.free_space_floor_bytes(raw, total) == free_space.floor_bytes(
+        total, configured=-1 if configured is None else configured)
+
+
+@pytest.mark.parametrize("current, target, gains", [
+    ("0.33.6", "v0.34.0", True), ("0.33.6", "v0.35.1", True), ("0.34.0", "v0.34.1", False),
+    ("0.33.5", "v0.33.6", False), ("0.34.0", "v0.33.6", False), (None, "v0.34.0", True), ("0.33.6", None, False),
+])
+def test_only_an_upgrade_onto_the_floor_is_asked_about_it(current, target, gains):
+    assert dv.gains_free_space_floor(current, target) is gains
+
+
+def test_a_volume_already_below_the_floor_is_said_with_its_figures():
+    assert dv.free_space_floor_note(None, (96 * GIB, 4 * GIB, 100 * GIB)) == (
+        "From 0.34.0 the storage volume keeps a floor of free space (MIN_FREE_SPACE_GB: by default the larger of 2 GB "
+        "and 5% of the volume, never more than half of it nor more than 20 GB): an upload, an SFTP write or a copy "
+        "that would leave less is refused. This volume has 4.00 GB free of 100 GB, less than the 5.00 GB it will "
+        "keep, so 0.34.0 refuses every upload, SFTP write and copy from its first start. Free some space or grow "
+        "the volume first, or set MIN_FREE_SPACE_GB lower in .env (0 turns it off).")
+    assert dv.free_space_floor_note(None, (95 * GIB, 5 * GIB, 100 * GIB)) is None, "exactly the floor is room"
+    assert dv.free_space_floor_note(None, (95 * GIB, 5 * GIB - 1, 100 * GIB)) is not None
+    big = 20 * 1024 * GIB
+    below = dv.free_space_floor_note(None, (big - 19 * GIB, 19 * GIB, big))
+    assert "This volume has 19 GB free of 20480 GB, less than the 20 GB it will keep" in below
+    assert dv.free_space_floor_note(None, (big - 21 * GIB, 21 * GIB, big)) is None, "5% of it would be a terabyte"
+    set_high = dv.free_space_floor_note("50", (100 * GIB, 30 * GIB, 130 * GIB))
+    assert "(MIN_FREE_SPACE_GB=50 in .env)" in set_high and "less than the 50 GB it will keep" in set_high
+    assert dv.free_space_floor_note("0", (100 * GIB, 0, 100 * GIB)) is None, "the floor is off"
+    assert dv.free_space_floor_note(None, (0, 0, 0)) is None, "a volume that says no size is not judged"
+
+
+def test_a_volume_whose_free_space_cannot_be_read_and_a_setting_that_is_no_number_are_said():
+    unread = dv.free_space_floor_note(None, None)
+    assert "could not be read here" in unread and "check that it has more than that free" in unread
+    assert dv.free_space_floor_note("0", None) is None
+    for text in ("abc", "'ten'", "5GB"):
+        said = dv.free_space_floor_note(text, (0, 100 * GIB, 200 * GIB))
+        assert said.startswith("MIN_FREE_SPACE_GB=%s in .env is not a number: from 0.34.0 the server reads it, and "
+                               "does not start with it." % text.strip("'")), said
+
+
+def _upgrade_onto_the_floor(tmp_path, monkeypatch, capacity, running="0.33.6"):
+    matrix = _matrix()
+    matrix["versions"] = {"0.33.6": {"released": "2026-01-01", "notes": "a"},
+                          "0.34.0": {"released": "2026-01-02", "notes": "b"}}
+    matrix["edges"][0].update({"from": "0.33.6", "to": "0.34.0"})
+    tool = _deployment(tmp_path, version=running, matrix=matrix)
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(dv, "fetch_main_lifecycle_matrix", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: (running, "the running container"))
+    monkeypatch.setattr(tool, "_network_gateways", lambda: [])
+    read = []
+    monkeypatch.setattr(tool, "_volume_capacity", lambda: read.append(1) or capacity)
+    return tool, read
+
+
+def test_an_upgrade_onto_the_floor_says_before_it_that_the_volume_is_already_below_it(tmp_path, monkeypatch,
+                                                                                    capsys):
+    """The volume read and the note printed by the update itself, once, before anything changes; none when the
+    volume has room; and the volume not read at all for an upgrade that does not reach the floor."""
+    tool, read = _upgrade_onto_the_floor(tmp_path, monkeypatch, (98 * GIB, 2 * GIB, 100 * GIB))
+    _update(tool, tag="v0.34.0", dry_run=True)
+    out = capsys.readouterr().out
+    note = dv.free_space_floor_note(None, (98 * GIB, 2 * GIB, 100 * GIB))
+    assert read == [1] and out.count("  Note: " + note) == 1, out
+    assert out.index("  Note: " + note) < out.index("--dry-run: nothing was changed.")
+    tool, read = _upgrade_onto_the_floor(tmp_path, monkeypatch, (50 * GIB, 50 * GIB, 100 * GIB))
+    _update(tool, tag="v0.34.0", dry_run=True)
+    assert read == [1] and "floor of free space" not in capsys.readouterr().out
+    tool, read = _upgrade_onto_the_floor(tmp_path, monkeypatch, (98 * GIB, 2 * GIB, 100 * GIB), running="0.34.0")
+    matrix = _matrix()
+    matrix["versions"] = {"0.34.0": {"released": "2026-01-01", "notes": "a"},
+                          "0.34.1": {"released": "2026-01-02", "notes": "b"}}
+    matrix["edges"][0].update({"from": "0.34.0", "to": "0.34.1"})
+    (tmp_path / "docs" / "upgrade-matrix.json").write_text(json.dumps(matrix), encoding="utf-8", newline="")
+    _update(tool, tag="v0.34.1", dry_run=True)
+    assert read == [] and "floor of free space" not in capsys.readouterr().out
+
+
 # --- which version is running -----------------------------------------------------------------
 
 def test_the_running_version_comes_from_the_container(tmp_path, monkeypatch):
@@ -493,6 +584,8 @@ def test_the_running_version_is_read_from_a_real_container():
     try:
         reachable = sp.run(["docker", "exec", container, "true"],
                            capture_output=True, text=True, timeout=60)
+    except sp.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except (OSError, sp.SubprocessError) as exc:
         pytest.skip(f"cannot run docker to reach {container}: {exc}")
     skip_if_container_absent(reachable, container)

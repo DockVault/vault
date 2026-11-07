@@ -39,6 +39,16 @@ def _one_line(value, limit: int = 200) -> str:
     return "".join(ch if ch.isprintable() else " " for ch in str(value or "")).strip()[:limit]
 
 
+def log_send_failure(what: str, exc: BaseException) -> None:
+    """Say, for the operator, that sending mail failed at ``what``: the error's class, and the mail server's reply
+    code or the system's error number when there is one; never the error's text. A mail server's reply names what it
+    refused, a recipient's address among them, and a message is not ours to vouch for (app/core/safe_log.py)."""
+    code = getattr(exc, "smtp_code", None)
+    number = getattr(exc, "errno", None)
+    said = (f" (reply {code})" if isinstance(code, int) else f" (errno {number})" if isinstance(number, int) else "")
+    print(f"[email] {what}: {type(exc).__name__}{said}")
+
+
 def certificate_not_verified(exc: "ssl.SSLCertVerificationError", host: str, port) -> EmailSendError:
     """The error for a mail server whose certificate the vault could not verify, logged like the other
     send failures. It has its own category and says what happened, with OpenSSL's reason, rather than
@@ -165,8 +175,8 @@ def build_message(cfg: dict, *, to_addr: str, subject: str, text_body: str,
                                           subtype=subtype or "png", cid=f"<{img.cid}>")
         return msg
     except (ValueError, UnicodeError) as e:
-        # Log the detail server-side; return a generic message (never the exception class/detail).
-        print(f"[email] message build failed: {type(e).__name__}: {e}")
+        # Log the class server-side; return a generic message (never the exception class/detail).
+        log_send_failure("message build failed", e)
         raise EmailSendError(
             "config", "The email could not be built — check the From name and address.")
 
@@ -226,14 +236,14 @@ def smtp_send(cfg: dict, msg: EmailMessage) -> None:
         # Before the ValueError branch below: this error is also a ValueError.
         raise certificate_not_verified(e, host, port)
     except (ValueError, UnicodeError) as e:
-        print(f"[email] send config invalid: {type(e).__name__}: {e}")
+        log_send_failure("send config invalid", e)
         raise EmailSendError(
             "config", "The SMTP configuration is invalid — check the server address and the From name/address.")
     except (smtplib.SMTPException, OSError) as e:
-        # Log the detail server-side; return ONE generic message for every transport outcome so the
+        # Log the class server-side; return ONE generic message for every transport outcome so the
         # response cannot be used to distinguish a closed port / filtered host / non-SMTP service
         # (an internal-network probe oracle).
-        print(f"[email] send failed: {type(e).__name__}: {e}")
+        log_send_failure("send failed", e)
         raise EmailSendError(
             "transport",
             f"Could not reach the SMTP server at {host}:{port}. Check the address, port, and TLS "
@@ -283,7 +293,7 @@ def smtp_send_batch(cfg: dict, messages: list) -> list:
                     server.send_message(msg)
                     results[i] = {"ok": True, "error": None}
                 except (smtplib.SMTPException, OSError, ValueError, UnicodeError) as e:
-                    print(f"[email] per-recipient send failed: {type(e).__name__}: {e}")
+                    log_send_failure("per-recipient send failed", e)
                     results[i] = {"ok": False, "error": "delivery failed"}
     except EmailSendError:
         raise
@@ -293,11 +303,11 @@ def smtp_send_batch(cfg: dict, messages: list) -> list:
         # Before the ValueError branch below: this error is also a ValueError.
         raise certificate_not_verified(e, host, port)
     except (ValueError, UnicodeError) as e:
-        print(f"[email] batch config invalid: {type(e).__name__}: {e}")
+        log_send_failure("batch config invalid", e)
         raise EmailSendError(
             "config", "The SMTP configuration is invalid — check the server address and the From name/address.")
     except (smtplib.SMTPException, OSError) as e:
-        print(f"[email] batch connect failed: {type(e).__name__}: {e}")
+        log_send_failure("batch connect failed", e)
         raise EmailSendError(
             "transport",
             f"Could not reach the SMTP server at {host}:{port}. Check the address, port, and TLS "

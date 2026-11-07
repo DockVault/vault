@@ -59,11 +59,15 @@ def _require_stack_or_skip():
     try:
         if _psql("SELECT 1").returncode != 0:
             problems.append("Postgres via `docker exec %s psql -U sftp_user -d sftp_db`" % _DB_CONTAINER)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail("Postgres via `docker exec %s` did not answer within %s s" % (_DB_CONTAINER, exc.timeout))
     except Exception as exc:  # noqa: BLE001
         problems.append("Postgres (%s: %s)" % (_DB_CONTAINER, exc.__class__.__name__))
     try:
         if _redis_cli("PING").stdout.strip().upper() != "PONG":
             problems.append("Redis via `docker exec %s redis-cli`" % _REDIS_CONTAINER)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail("Redis via `docker exec %s` did not answer within %s s" % (_REDIS_CONTAINER, exc.timeout))
     except Exception as exc:  # noqa: BLE001
         problems.append("Redis (%s: %s)" % (_REDIS_CONTAINER, exc.__class__.__name__))
     if problems:

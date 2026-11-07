@@ -205,6 +205,8 @@ def _pg_ident():
                            capture_output=True, text=True, timeout=10)
         d = subprocess.run(["docker", "exec", _DB_CONTAINER, "printenv", "POSTGRES_DB"],
                            capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except Exception:  # noqa: BLE001
         return None
     if u.returncode != 0 or d.returncode != 0:
@@ -230,8 +232,8 @@ def _backdate_deactivate_at(temp_username):
              "UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '5 minutes' "
              f"WHERE temp_username = '{temp_username}';"],
             capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        return False
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(r, _DB_CONTAINER)
     assert r.returncode == 0 and "UPDATE 1" in r.stdout, (
         "did not close the validity window on exactly one credential, so the checks below "

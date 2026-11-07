@@ -130,7 +130,10 @@ retire is told only that a legal hold keeps it. A per-person erase waits while a
 case is open, and says which case it waits for. A hold nobody has confirmed yet keeps what is deleted from its
 vaults, which counts toward the deployment's storage limit (`MAX_STORAGE_GB`, or the lower limit set on the
 Settings page), but holds no erase back: one person places it alone. One person can have at most five hold-only
-cases waiting for confirmation at once.
+cases waiting for confirmation at once. Without a storage limit (the default), what holds keep is bounded by the
+free space the storage volume keeps (`MIN_FREE_SPACE_GB`: by default the larger of 2 GB and 5% of the volume,
+never more than half of it nor more than 20 GB): uploads, SFTP writes and copies that would leave less are
+refused, so deleting and uploading in turn in a held vault cannot fill the disk.
 
 ### Upgrading with SFTP in its own container
 
@@ -144,8 +147,9 @@ together with the web container, then place holds.
 While a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones) waits for its purge,
 a release before 0.34.0 would destroy it. From 0.33.1 on, an older release refuses to start on such data, and
 `dockvault.py update` refuses the rollback. To roll back: release every hold on the Compliance page
-(`dockvault.py cases` cannot release one), wait until what they kept is purged (`COMPLIANCE_HOLD_PURGE_DELAY_DAYS` after the release),
-then start 0.34.0 or later once more so it removes the marker. A release before 0.33.1 does not read the marker: never roll back that far while holds exist.
+(`dockvault.py cases` cannot release one), wait until what they kept is purged
+(`COMPLIANCE_HOLD_PURGE_DELAY_DAYS` after the release), then start 0.34.0 or later once more so it removes the
+marker. A release before 0.33.1 does not read the marker: never roll back that far while holds exist.
 
 ### Someone else giving access
 

@@ -176,3 +176,41 @@ def test_the_certificate_is_checked_as_system_mail_checks_it_for_the_same_settin
             profile, to_addr="someone@example.test", subject="s", text_body="b"))
     assert [s["tls"] for s in server.sessions] == ["refused", "refused", "ok"], server.sessions
     assert [s["auth"] is None for s in server.sessions] == [True, True, False]
+
+
+def test_a_test_send_the_mail_server_refuses_logs_its_class_and_reply_code_never_its_text(db, admin, monkeypatch,
+                                                                                         capsys):
+    """The mail server's reply names what it refused, the administrator's address here: the log has the error's
+    class and the reply code, never the text, and the answer says nothing of either."""
+    text = b"5.7.1 <admin@example.test>: Relay access denied"
+
+    class Refusing:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def ehlo(self):
+            pass
+
+        def has_extn(self, name):
+            return False
+
+        def send_message(self, msg):
+            raise smtplib.SMTPDataError(554, text)
+
+    monkeypatch.setattr(smtplib, "SMTP", Refusing)
+    db.add(SystemSetting(key="global", value={"smtp_server": "127.0.0.1", "smtp_port": 2525,
+                                              "from_email": "vault@example.test"}))
+    db.commit()
+    capsys.readouterr()
+    with pytest.raises(HTTPException) as refused:
+        _send(db, admin)
+    assert refused.value.status_code == 502 and "admin@example.test" not in str(refused.value.detail)
+    logged = capsys.readouterr().out
+    assert "[email] test-email send failed: SMTPDataError (reply 554)" in logged
+    assert "Relay access" not in logged and "admin@example.test" not in logged

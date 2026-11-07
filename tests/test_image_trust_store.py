@@ -207,8 +207,10 @@ def in_the_image():
     try:
         ran = subprocess.run(["docker", "exec", "-i", container, "python", "-c", script],
                              capture_output=True, text=True, timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     skip_if_container_absent(ran, container)
     assert ran.returncode == 0, (ran.stderr or ran.stdout)[-1500:]
     return json.loads(ran.stdout.strip().splitlines()[-1])

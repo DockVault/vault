@@ -365,8 +365,8 @@ def test_the_ceiling_is_visible_to_an_operator(admin):
     assert metrics.status_code == 200, metrics.text
     body = metrics.json()
 
-    for key in ("transferLimit", "transfersInFlight", "transfersWaiting",
-                "transfersPeak", "transfersRefused"):
+    for key in ("transferLimit", "transfersInFlight", "transfersWaiting", "transfersWaitingForShare",
+                "transfersPeak", "transfersRefused", "transfersRefusedOverShare"):
         assert key in body, f"the monitor does not report {key}"
         assert isinstance(body[key], (int, float)), f"{key} is not a number: {body[key]!r}"
 

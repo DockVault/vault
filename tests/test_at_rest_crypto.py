@@ -134,8 +134,10 @@ def _db_scalar(sql):
             ["docker", "exec", container, "psql", "-U", "sftp_user", "-d", "sftp_db", "-tAc", sql],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     assert proc.returncode == 0, f"psql failed: {proc.stderr}"
     return proc.stdout.strip()
 
@@ -150,8 +152,10 @@ def _db_run(sql):
              "-v", "ON_ERROR_STOP=1", "-tAc", sql],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker/psql unavailable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
 
 
 def test_filename_not_plaintext_at_rest(admin, temp_vault):
@@ -242,8 +246,10 @@ def test_at_rest_crypto_layer():
             # with replacement so Windows' default cp1252 codec can't crash the read.
             encoding="utf-8", errors="replace", timeout=60,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         pytest.skip(f"docker unavailable for in-container crypto test: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     assert "ALL_OK" in proc.stdout, (
         f"crypto self-test failed (rc={proc.returncode})\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     )
@@ -450,8 +456,10 @@ def test_cross_vault_move_guard_layer(admin):
                 input=script, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=60,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        except FileNotFoundError as exc:
             pytest.skip(f"docker unavailable for in-container guard test: {exc}")
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail(f"the command did not finish within {exc.timeout} s")
         assert "GUARD_OK" in proc.stdout, (
             f"cross-vault move guard did not fire\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )

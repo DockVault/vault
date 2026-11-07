@@ -43,6 +43,8 @@ def _anon_bytes():
     try:
         out = subprocess.run(["docker", "exec", container, "sh", "-c", script],
                              capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the command did not finish within {exc.timeout} s")
     except (OSError, subprocess.SubprocessError) as exc:
         pytest.skip(f"cannot reach the API container to read its cgroup: {exc}")
     if out.returncode != 0 or not out.stdout.strip().isdigit():

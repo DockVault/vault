@@ -440,13 +440,18 @@ def sftp_while_held(db, now: Optional[datetime] = None):
     kept waits for its purge (legal_hold_marker.holds_or_kept): the SFTP container can be replaced after a hold was
     placed, and one older than the triggers' release deletes a held file's bytes (the trigger keeps its row). When
     one may run, the log says so at each pass and every active administrator is told, once a day while the answer
-    stays the same. Returns the answer, or None when nothing is held or kept."""
+    stays the same. Returns the answer, or None when nothing is held or kept.
+
+    ``now`` (the pass's time) dates the notice only. The SFTP processes are looked for on the clock as it is when
+    they are: the pass's time was taken before the runner's turn, the settings' refresh and the jobs before this one
+    (sealing among them), and a window measured back from it took in a row its process stopped refreshing that long
+    ago, which then hid the warning for a pass."""
     from app.core import legal_hold_marker
     from app.core.sftp_versions import sftp_same_version
     now = now or utcnow()
     if not legal_hold_marker.holds_or_kept(db):
         return None
-    check = sftp_same_version(db, now=now)
+    check = sftp_same_version(db)
     if check.ok:
         return check
     print(f"Warning: an SFTP server of another version may run while legal holds keep files: {check.explain()}")

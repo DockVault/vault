@@ -705,8 +705,11 @@ def configured_int_setting(name, container=None):
     try:
         probe = subprocess.run(["docker", "exec", target, "printenv", name],
                                capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError:
         return None
+    except subprocess.TimeoutExpired as exc:
+        # A deployment that does not answer in time is not one whose setting is unset.
+        pytest.fail(f"the deployment did not say its {name} within {exc.timeout} s")
     if probe.returncode != 0:
         return None
     try:

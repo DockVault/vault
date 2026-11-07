@@ -1698,7 +1698,10 @@ def seal_pass(session_factory, *, engine=None, st: Optional[ChainState] = None, 
     except ChainBusy:
         result.stopped = "busy"
     except Exception as exc:  # noqa: BLE001 -- the next pass tries again
-        _say(f"Warning: the audit chain's sealer failed ({type(exc).__name__}: {exc})")
+        # An error id, its class and where it was raised, never its text: a database error's carries the values
+        # of the rows the sealer read (app/core/safe_log.py).
+        from app.core.safe_log import log_failure
+        log_failure("the audit chain's sealer failed; the next pass tries again", exc)
         result.stopped = "error"
     try:
         every_pass_checks(session_factory, st, now or st.clock())
