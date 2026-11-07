@@ -906,6 +906,23 @@ def test_storage_with_no_restart_still_writes_the_limit_of_a_set_whose_restore_d
     assert not [c for c in composed if "up" in c]
 
 
+@pytest.mark.parametrize("change", ["nothing", "transfers-only"])
+def test_storage_that_recreates_nothing_is_not_refused_for_a_set_whose_restore_did_not_finish(tmp_path, monkeypatch,
+                                                                                            capsys, change):
+    """Only a new limit recreates the stack: storage that only reports, or only writes the transfer ceiling (which
+    takes effect at the next start), is not refused."""
+    tool, composed, env_before = _marked_tool(tmp_path, monkeypatch)
+    tool.storage(argparse.Namespace(non_interactive=True, set_gb=None, no_restart=False,
+                                    set_transfers="4" if change == "transfers-only" else None))
+    env = dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))
+    if change == "nothing":
+        assert (tmp_path / ".env").read_bytes() == env_before
+    else:
+        assert env["MAX_CONCURRENT_TRANSFERS"] == "4"
+    assert not [c for c in composed if "up" in c]
+    assert "would start set" not in _said(capsys)
+
+
 @pytest.mark.parametrize("how", ["recreate", "recreate-with-build", "secure-start"])
 def test_the_stack_of_a_set_whose_restore_did_not_finish_is_never_started_whatever_asks(tmp_path, monkeypatch, capsys,
                                                                                        how):
