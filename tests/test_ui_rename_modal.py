@@ -71,7 +71,7 @@ def test_rename_fields_caret_and_extension_warning(page: Page, admin, admin_cred
                              files=[{"name": "doc.txt", "mimeType": "text/plain", "buffer": b"x"}])
         row = page.locator("#vault-files-table-body tr").first
         expect(row).to_be_visible(timeout=15000)
-        # Rename lives in the hover cluster / context menu now; open it via the "more" button.
+        # Rename lives in the row's menu now; open it via the "more" button.
         row.locator('button[data-action="more"]').click()
         page.locator('#file-context-menu button[data-action="rename-file"]').click()
 

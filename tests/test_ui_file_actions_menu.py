@@ -1,8 +1,9 @@
-"""Per-row multi-action hover cluster + right-click context menu + tile-overflow fix.
+"""One way to act on a file: the row shows its most used actions and a More button that opens the one menu,
+which a right click opens too, in the same order in the table and the grid.
 
-  * unit — the refactor is wired in (hover-cluster markup + the context-menu functions + icons).
-  * ui   — a real browser: the resting row is collapsed (cluster hidden), hovering reveals the
-           edit/copy/move/delete cluster, and right-click opens a gated context menu.
+  * unit — the menu and its dispatcher are wired, and the old hover cluster is gone for good.
+  * ui   — a real browser: the resting row shows [More][Share][Download] for a file and [More][Share] for a
+           folder in both views; More and a right click open the one gated menu.
 """
 from pathlib import Path
 
@@ -13,25 +14,23 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.mark.unit
-def test_action_cluster_and_context_menu_are_wired():
+def test_the_one_menu_is_wired_and_the_hover_cluster_is_gone():
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     idx = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     css = (ROOT / "static" / "css" / "components.css").read_text(encoding="utf-8")
 
-    # resting row collapses edit/copy/move/delete into a hover cluster behind a "more" button.
-    assert "action-more-wrap" in app
-    assert "action-cluster" in app
     assert "data-action=\"more\"" in app
-    # the right-click menu + shared dispatcher + hash copy.
     assert "function openContextMenu(" in app
     assert "function runFileAction(" in app
     assert "function copyFileHash(" in app
     assert "'contextmenu'" in app  # right-click wiring
-    # new sprite icons.
     assert 'id="i-more"' in idx and 'id="i-hash"' in idx
-    # CSS for the cluster (hover reveal) + the context menu, in the shared base.
-    assert ".action-more-wrap:hover .action-cluster" in css
     assert ".context-menu-item" in css
+    # The row offers its actions one way: no second, hover-revealed set of the same actions.
+    for text, name in ((app, "app.js"), (css, "components.css")):
+        assert "action-cluster" not in text, name
+        assert "action-more-wrap" not in text, name
+        assert "ctx-menu-open" not in text, name
 
 
 def _login(page: Page, username: str, password: str):
@@ -55,33 +54,45 @@ def _upload(page: Page, name="doc.txt"):
                          files=[{"name": name, "mimeType": "text/plain", "buffer": b"x"}])
 
 
+def _actions(row):
+    return row.locator(".file-actions button[data-action]").evaluate_all(
+        "els => els.map(b => b.getAttribute('data-action'))")
+
+
 @pytest.mark.ui
-def test_hover_cluster_hidden_at_rest_and_revealed_on_hover(page: Page, admin, admin_creds):
-    """The edit/copy/move/delete cluster is hidden at rest (so a tile does not overflow with
-    five-plus icons) and slides out when the "more" area is hovered."""
-    v = admin.create_vault(name="cluster")
+def test_the_row_shows_the_same_actions_in_the_table_and_the_grid(page: Page, admin, admin_creds):
+    v = admin.create_vault(name="oneway")
+    admin.post(f"/vaults/{v['id']}/folders", json={"name": "papers"}).raise_for_status()
     try:
         _login(page, admin_creds["username"], admin_creds["password"])
-        _open_vault(page, v["id"], "grid")
+        _open_vault(page, v["id"], "table")
         _upload(page)
-        tile = page.locator("#vault-files-grid .file-tile").first
-        expect(tile).to_be_visible(timeout=15000)
-
-        cluster = tile.locator(".action-cluster")
-        expect(cluster).to_have_count(1)
-        # hidden at rest -> the resting row is just [more][share][download].
-        assert cluster.evaluate("el => getComputedStyle(el).visibility") == "hidden"
-        # the rename button lives in the cluster (still in the DOM, just hidden).
-        expect(tile.locator('.action-cluster button[data-action="rename-file"]')).to_have_count(1)
-
-        # hover the more-wrap -> the cluster becomes visible.
-        tile.locator(".action-more-wrap").hover()
-        expect(cluster).to_have_css("visibility", "visible")
-        # its buttons are present (their click dispatches the same runFileAction as the row buttons /
-        # the context menu, which are driven elsewhere; clicking a hover-revealed button is flaky in
-        # headless Chromium, so assert presence + reveal rather than driving it here).
-        expect(tile.locator('.action-cluster button[data-action="rename-file"]')).to_have_count(1)
-        expect(tile.locator('.action-cluster button[data-action="delete-file"]')).to_have_count(1)
+        file_row = page.locator("#vault-files-table-body tr:has(.file-name[data-file-id])").first
+        folder_row = page.locator("#vault-files-table-body tr:has(.file-name[data-folder-id])").first
+        expect(file_row).to_be_visible(timeout=15000)
+        assert _actions(file_row) == ["more", "share-file", "download"]
+        assert _actions(folder_row) == ["more", "share-folder"]
+        # Every button is on screen at rest: nothing waits for a hover.
+        for b in file_row.locator(".file-actions button").all():
+            assert b.evaluate("el => getComputedStyle(el).visibility") == "visible"
+        page.click('[data-files-view="grid"]')
+        file_tile = page.locator("#vault-files-grid .file-tile:has(.file-name[data-file-id])").first
+        folder_tile = page.locator("#vault-files-grid .file-tile:has(.file-name[data-folder-id])").first
+        expect(file_tile).to_be_visible()
+        assert _actions(file_tile) == ["more", "share-file", "download"]
+        assert _actions(folder_tile) == ["more", "share-folder"]
+        assert page.locator(".action-cluster").count() == 0
+        # The menu lists the rest, Rename and Delete among them, in one order for both views.
+        file_tile.locator('button[data-action="more"]').click()
+        menu = page.locator("#file-context-menu")
+        expect(menu).to_be_visible()
+        grid_order = menu.locator("button[data-action]").evaluate_all("els => els.map(b => b.getAttribute('data-action'))")
+        assert "rename-file" in grid_order and "delete-file" in grid_order
+        page.keyboard.press("Escape")
+        page.click('[data-files-view="table"]')
+        page.locator("#vault-files-table-body tr:has(.file-name[data-file-id])").first.locator('button[data-action="more"]').click()
+        table_order = menu.locator("button[data-action]").evaluate_all("els => els.map(b => b.getAttribute('data-action'))")
+        assert table_order == grid_order
     finally:
         admin.delete_vault(v["id"])
 
@@ -126,7 +137,7 @@ def test_right_click_opens_a_gated_context_menu(page: Page, admin, admin_creds):
 
 @pytest.mark.ui
 def test_more_button_opens_the_context_menu(page: Page, admin, admin_creds):
-    """The "more" button is the touch/keyboard path to the same menu the hover cluster mirrors."""
+    """The "more" button is the touch/keyboard path to the same menu a right click opens."""
     v = admin.create_vault(name="morebtn")
     try:
         _login(page, admin_creds["username"], admin_creds["password"])

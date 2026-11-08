@@ -363,7 +363,10 @@ function vaultCapAllowed(cap) {
 function bulkDownloadAllowed() { return vaultCapAllowed('file.download'); }
 function bulkDeleteAllowed() { return state.canWriteCurrentVault !== false && vaultCapAllowed('file.delete'); }
 // Show file-selection checkboxes only when at least one bulk action is available.
-function allowBulkSelect() { return bulkDownloadAllowed() || bulkDeleteAllowed(); }
+function allowBulkSelect() {
+    return bulkDownloadAllowed() || bulkDeleteAllowed()
+        || (state.canWriteCurrentVault !== false && (vaultCapAllowed('folder.create') || vaultCapAllowed('folder.delete')));
+}
 
 // Update navigation items based on permissions
 function updateNavigationPermissions() {
@@ -912,7 +915,11 @@ async function _apiRequestNow(endpoint, options = {}) {
                 showWarning(errorDetail);
                 console.warn('Rate limited:', endpoint);
             }
-            throw new Error(errorDetail);
+            // A caller may wait and try again (pasteMoveCopy does): the status, and the wait the server asks for.
+            const limited = new Error(errorDetail);
+            limited.status = 429;
+            limited.retryAfterMs = _retryAfterMs(response.headers.get('Retry-After'));
+            throw limited;
         }
         
         // Handle other errors
@@ -11841,8 +11848,8 @@ function renderVaultFiles() {
 
     // Drop any selected ids that are no longer present (e.g. after navigation). In-flight upload
     // rows are synthetic (no real file id) and never selectable, so they are excluded here.
-    const fileIds = new Set(items.filter(i => i.type !== 'folder' && !i.in_progress).map(i => i.id));
-    state.selectedFileIds.forEach(id => { if (!fileIds.has(id)) state.selectedFileIds.delete(id); });
+    const listedIds = new Set(items.filter(i => !i.in_progress).map(i => i.id));
+    state.selectedFileIds.forEach(id => { if (!listedIds.has(id)) state.selectedFileIds.delete(id); });
 
     const tableWrap = document.getElementById('vault-files-table-wrap');
     const grid = document.getElementById('vault-files-grid');
@@ -11876,13 +11883,9 @@ function filesEmptyStateHtml(grid) {
         : `<tr><td colspan="7" style="text-align:center;padding:40px;"><div class="empty-state">${inner}</div></td></tr>`;
 }
 
-// Build the inline action buttons for a file/folder row or tile. Keeps the
-// .action-btn + data-action hooks the e2e tests rely on; only the look changes.
-// opts.slot splits the grid tile's controls into two positioned clusters:
-//   'primary'   -> the left cluster (Download for files; nothing for folders),
-//   'secondary' -> the right cluster (Rename + Delete for both),
-// so a file gets an Edit affordance in grid too. Undefined slot (the table view)
-// returns every button in one cluster, as before.
+// Build the inline action buttons for a file/folder row or tile (.action-btn + data-action hooks).
+// opts.slot splits a grid tile's controls: 'primary' is the left cluster (only the checkbox, added by
+// the caller), 'secondary' the right one (the buttons). Undefined slot (the table view) returns them all.
 function fileActionButtons(item, canWrite, opts) {
     const isFolder = item.type === 'folder';
     const id = item.id;
@@ -11890,51 +11893,19 @@ function fileActionButtons(item, canWrite, opts) {
     const slot = opts && opts.slot;
     // The left cluster of a grid tile holds only the checkbox (added by the caller).
     if (slot === 'primary') return '';
-    const btn = (action, icon, label, danger) =>
-        `<button type="button" class="action-btn${danger ? ' action-btn-danger' : ''}" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
-    // vaultCapAllowed() is a no-op (true) for non-scoped sessions; for a scoped temp credential it
-    // gates each action by the cap its scope grants on this vault, matching require_vault_cap
-    // server-side. The resting row shows at most [more][share][download]; edit/copy/move/delete live
-    // in a hover cluster behind the "more" button (Info + Show-hash live in the right-click menu),
-    // which keeps a tile from overflowing with five-plus icons.
-    const cluster = [];   // revealed on hovering "more"
-    const trailing = [];  // always-visible: share, then download (far right)
-    if (isFolder) {
-        const canRename = canWrite && vaultCapAllowed('file.rename');
-        const canDelete = canWrite && vaultCapAllowed('folder.delete');
-        // Copy/Move a folder needs folder.create (the structural cap); a recursive copy also reads +
-        // writes files, gated server-side. Mirrors require_vault_cap on the endpoints.
-        const canStructure = canWrite && vaultCapAllowed('folder.create');
-        if (canRename) cluster.push(btn('rename-folder', 'edit', 'Rename'));
-        if (canStructure) cluster.push(btn('copy-folder', 'copy', 'Copy'));
-        if (canStructure) cluster.push(btn('move-folder', 'move', 'Move'));
-        if (canDelete) cluster.push(btn('delete-folder', 'trash', 'Delete', true));
-        if (state._pflEnabled && vaultShareable()) cluster.push(btn('publiclink-folder', 'globe', 'Public link'));
-        if (vaultShareable()) trailing.push(btn('share-folder', 'link', 'Share'));
-    } else {
-        const canDownload = vaultCapAllowed('file.download');
-        const canRename = canWrite && vaultCapAllowed('file.rename');
-        const canDelete = canWrite && vaultCapAllowed('file.delete');
-        if (canRename) cluster.push(btn('rename-file', 'edit', 'Rename'));
-        // Copy needs read (file.download); Move removes from the source (file.delete).
-        if (canDownload) cluster.push(btn('copy-file', 'copy', 'Copy'));
-        if (canDelete) cluster.push(btn('move-file', 'move', 'Move'));
-        if (canDelete) cluster.push(btn('delete-file', 'trash', 'Delete', true));
-        if (state._pflEnabled && vaultShareable()) cluster.push(btn('publiclink-file', 'globe', 'Public link'));
-        if (vaultShareable()) trailing.push(btn('share-file', 'link', 'Share'));
-        // Download last so it renders on the far RIGHT of the action row (grid + table).
-        if (canDownload) trailing.push(btn('download', 'download', 'Download'));
-    }
-    let html = '';
-    if (cluster.length) {
-        html += '<div class="action-more-wrap">'
-            + `<div class="action-cluster" role="group" aria-label="More actions">${cluster.join('')}</div>`
-            + `<button type="button" class="action-btn action-more" data-action="more" aria-haspopup="true" aria-label="More actions" title="More actions">${iconSvg('more', 'icon-sm')}</button>`
-            + '</div>';
-    }
-    html += trailing.join('');
-    if (!html && !slot && (!opts || !opts.grid)) html = '<span class="text-tertiary text-sm">—</span>';
-    return html;
+    const btn = (action, icon, label) =>
+        `<button type="button" class="action-btn" data-action="${action}" data-id="${id}" data-name="${nm}" title="${label}" aria-label="${label}">${iconSvg(icon, 'icon-sm')}</button>`;
+    // One way to act on an item, the same in the table and the grid: the row shows its most used actions
+    // (Share, then Download on the far right) and a More button that opens the one menu a right click
+    // opens too (openContextMenu), where every permitted action is listed in one order. vaultCapAllowed()
+    // is a no-op (true) for non-scoped sessions; for a scoped temporary credential it gates each action
+    // by the cap its scope grants on this vault, matching require_vault_cap server-side.
+    const buttons = [
+        `<button type="button" class="action-btn action-more" data-action="more" aria-haspopup="true" aria-label="More actions" title="More actions">${iconSvg('more', 'icon-sm')}</button>`,
+    ];
+    if (vaultShareable()) buttons.push(btn(isFolder ? 'share-folder' : 'share-file', 'link', 'Share'));
+    if (!isFolder && vaultCapAllowed('file.download')) buttons.push(btn('download', 'download', 'Download'));
+    return buttons.join('');
 }
 
 function renderFilesTable(items, canWrite, tbody) {
@@ -11970,7 +11941,7 @@ function renderFilesTable(items, canWrite, tbody) {
         const nameAttrs = isFolder
             ? `data-folder-id="${item.id}" data-folder-name="${escapeHtml(item.name)}" style="cursor:pointer;"`
             : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" style="cursor:pointer;" title="Click to preview"`;
-        const check = (isFolder || !allowBulkSelect()) ? ''
+        const check = !allowBulkSelect() ? ''
             : `<input type="checkbox" class="files-check file-check" data-id="${item.id}" ${selected ? 'checked' : ''} aria-label="Select ${escapeHtml(item.name)}">`;
         return `
             <tr class="${selected ? 'is-selected' : ''}">
@@ -12013,7 +11984,7 @@ function renderFilesGrid(items, canWrite, grid) {
         const nameAttrs = isFolder
             ? `data-folder-id="${item.id}" data-folder-name="${escapeHtml(item.name)}"`
             : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" title="Click to preview"`;
-        const check = (isFolder || !allowBulkSelect()) ? ''
+        const check = !allowBulkSelect() ? ''
             : `<input type="checkbox" class="files-check file-check" data-id="${item.id}" ${selected ? 'checked' : ''} aria-label="Select ${escapeHtml(item.name)}">`;
         const primary = fileActionButtons(item, canWrite, { grid: true, slot: 'primary' });
         const secondary = fileActionButtons(item, canWrite, { grid: true, slot: 'secondary' });
@@ -12082,8 +12053,6 @@ function _ctxOutside(e) { if (_ctxMenuEl && !_ctxMenuEl.contains(e.target)) clos
 function _ctxKey(e) { if (e.key === 'Escape') closeContextMenu(); }
 function closeContextMenu() {
     if (_ctxMenuEl) { _ctxMenuEl.hidden = true; _ctxMenuEl.replaceChildren(); }
-    // Let the hover cluster work again — see openContextMenu for why it was suppressed.
-    document.body.classList.remove('ctx-menu-open');
     document.removeEventListener('click', _ctxOutside, true);
     document.removeEventListener('keydown', _ctxKey, true);
     window.removeEventListener('scroll', closeContextMenu, true);
@@ -12180,14 +12149,6 @@ function openContextMenu(item, x, y) {
     }
     const firstItem = menu.querySelector('.context-menu-item:not([disabled])');
     if (firstItem) firstItem.focus({ preventScroll: true });
-    // The two menus are alternatives, not layers. The horizontal cluster is revealed by CSS alone
-    // (`.action-more-wrap:hover`), and the cursor is by definition still on the wrap at the moment
-    // the button is clicked — so opening this menu used to leave BOTH on screen, the same actions
-    // twice, one of them overlapping the other. `:focus-within` made it outlast the cursor too: the
-    // clicked button keeps focus, so the cluster stayed open even after the pointer left the row.
-    // Marking the document is what lets one line of CSS answer both, since neither is a state the
-    // cluster's own element carries.
-    document.body.classList.add('ctx-menu-open');
     document.addEventListener('click', _ctxOutside, true);
     document.addEventListener('keydown', _ctxKey, true);
     window.addEventListener('scroll', closeContextMenu, true);
@@ -12229,8 +12190,7 @@ function wireFileItemHandlers(container) {
             e.stopPropagation();
             const action = btn.getAttribute('data-action');
             if (action === 'more') {
-                // The "more" button opens the full context menu -- a touch/keyboard path to the same
-                // actions the hover cluster reveals. Anchor it to the button.
+                // The "more" button opens the one menu a right click opens too. Anchor it to the button.
                 const row = btn.closest('tr, .file-tile');
                 const fn = row && row.querySelector('.file-name');
                 const fid = fn && (fn.getAttribute('data-file-id') || fn.getAttribute('data-folder-id'));
@@ -12239,19 +12199,6 @@ function wireFileItemHandlers(container) {
                 return;
             }
             runFileAction(action, btn.getAttribute('data-id'), btn.getAttribute('data-name'));
-        });
-    });
-    // The hover cluster opens to the LEFT of the "more" button. Near the left edge of the file area
-    // (a left-column grid tile) that would clip it -- so flip it to open RIGHT there, keeping every
-    // option (rename included) on screen. Decided on hover, since positions shift with scroll/resize.
-    container.querySelectorAll('.action-more-wrap').forEach(wrap => {
-        wrap.addEventListener('mouseenter', () => {
-            const r = wrap.getBoundingClientRect();
-            const host = wrap.closest('#vault-files-grid, #vault-files-table-body, .files-scroll') || document.body;
-            const hostLeft = host.getBoundingClientRect().left;
-            const CLUSTER_EST = 200;   // generous width of the 4-icon cluster + padding
-            // Flip right when opening left would cross the file-area's left edge.
-            wrap.classList.toggle('cluster-right', (r.left - CLUSTER_EST) < hostLeft + 4);
         });
     });
     // Right-click a row/tile -> the context menu with every permitted action. Delegated + wired ONCE
@@ -12298,18 +12245,55 @@ function updateFilesBulkBar() {
         const toolbar = bar.parentElement;
         if (toolbar) Array.from(toolbar.children).forEach((el) => { if (el !== bar) el.inert = count > 0; });
     }
-    // Cap-gate the bulk actions (matches the per-row buttons + require_vault_cap).
-    const dl = document.getElementById('files-bulk-download');
-    if (dl) dl.style.display = bulkDownloadAllowed() ? '' : 'none';
-    const del = document.getElementById('files-bulk-delete');
-    if (del) del.style.display = bulkDeleteAllowed() ? '' : 'none';
+    // Each action shows when the selection holds something it may act on, gated as the row's own menu
+    // gates it (and as require_vault_cap does server-side). Copy stays out of a zero-knowledge vault.
+    const selected = _selectedItems();
+    const files = selected.filter(i => i.type !== 'folder');
+    const folders = selected.filter(i => i.type === 'folder');
+    const canWrite = state.canWriteCurrentVault !== false;
+    const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+    show('files-bulk-download', files.length > 0 && bulkDownloadAllowed());
+    show('files-bulk-delete', canWrite && ((files.length > 0 && vaultCapAllowed('file.delete'))
+        || (folders.length > 0 && vaultCapAllowed('folder.delete'))));
+    show('files-bulk-copy', !isZkVault(state.currentVault) && selected.some(i => _mayStage(i, 'copy')));
+    show('files-bulk-cut', selected.some(i => _mayStage(i, 'move')));
     const all = document.getElementById('files-select-all');
     if (all && all.parentElement) all.parentElement.style.display = allowBulkSelect() ? '' : 'none';
     if (all) {
-        const selectable = (state.currentFiles || []).filter(i => i.type !== 'folder').length;
+        const selectable = (state.currentFiles || []).filter(i => !i.in_progress).length;
         all.checked = selectable > 0 && count >= selectable;
         all.indeterminate = count > 0 && count < selectable;
     }
+}
+
+// The listed items that are selected (an id of something no longer listed counts for nothing).
+function _selectedItems() {
+    const ids = state.selectedFileIds instanceof Set ? state.selectedFileIds : new Set();
+    return (state.currentFiles || []).filter(i => ids.has(i.id));
+}
+
+// Whether Copy or Cut may stage this item from here: the gates the row's own menu applies (openContextMenu).
+function _mayStage(item, action) {
+    const canWrite = state.canWriteCurrentVault !== false;
+    if (item.type === 'folder') return canWrite && vaultCapAllowed('folder.create');
+    return action === 'copy' ? vaultCapAllowed('file.download') : (canWrite && vaultCapAllowed('file.delete'));
+}
+
+// Copy or Cut everything selected into the staging list (stageForMoveCopy), with one notice for all of it;
+// what may not be staged from here is left out and counted.
+function bulkStageSelected(action) {
+    const selected = _selectedItems();
+    if (!selected.length) return;
+    const allowed = selected.filter(i => _mayStage(i, action));
+    allowed.forEach(i => stageForMoveCopy(i.id, i.name, i.type, action, { quiet: true }));
+    const n = allowed.length;
+    const skipped = selected.length - n;
+    if (!n) { showWarning(`Nothing selected may be ${action === 'move' ? 'cut' : 'copied'} from here.`); return; }
+    let msg = `${action === 'move' ? 'Cut' : 'Copied'} ${n} item${n === 1 ? '' : 's'}. Open "Copied Items" to paste.`;
+    if (skipped) msg += ` ${skipped} not allowed from here, left out.`;
+    showInfo(msg);
+    state.selectedFileIds.clear();
+    renderVaultFiles();
 }
 
 // ---- Move / Copy clipboard --------------------------------------------------------------------
@@ -12327,7 +12311,7 @@ function _ciCurrentPath() {
     return ['Root'].concat((state.currentPath || []).map(f => f.name || '…')).join(' / ');
 }
 
-function stageForMoveCopy(id, name, type, action) {
+function stageForMoveCopy(id, name, type, action, opts) {
     const clip = _moveCopyClip();
     const src = (state.currentFiles || []).find(e => e.id === id) || {};
     const meta = {
@@ -12345,7 +12329,7 @@ function stageForMoveCopy(id, name, type, action) {
     else clip.push(Object.assign(meta, { keepAfter: action === 'copy', selected: false }));
     updateCopiedItemsButton();
     if (_ciPanelOpen()) renderCopiedItems();
-    showToast(`${action === 'move' ? 'Cut' : 'Copied'}: ${name}. Open "Copied Items" to paste.`, 'info');
+    if (!(opts && opts.quiet)) showToast(`${action === 'move' ? 'Cut' : 'Copied'}: ${name}. Open "Copied Items" to paste.`, 'info');
 }
 
 function clearMoveCopy() {
@@ -12530,6 +12514,22 @@ function _vaultPasswordFor(vaultId) {
 // (every staged item, ignoring selection). Each entry either stays staged (keepAfter) or leaves
 // after it succeeds -- so a KEPT copy can be pasted into many folders, and a single item can be
 // removed from the list without clearing the rest.
+// One paste request. A 429 means the account's own copies or moves are ahead of this one, and the server says
+// how long to wait (Retry-After): this waits that long and tries again, up to PASTE_RETRIES times, saying so once.
+const PASTE_RETRIES = 3;
+async function _pasteOne(name, base, body, headers) {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
+        } catch (e) {
+            const wait = e && e.status === 429 ? e.retryAfterMs : null;
+            if (!wait || attempt >= PASTE_RETRIES) throw e;
+            if (attempt === 0) showInfo(`${name}: waiting ${Math.ceil(wait / 1000)}s for an earlier copy or move to finish…`);
+            await new Promise(r => setTimeout(r, wait));
+        }
+    }
+}
+
 async function pasteMoveCopy(verb) {
     verb = verb || 'both';
     const clip = _moveCopyClip();
@@ -12563,7 +12563,7 @@ async function pasteMoveCopy(verb) {
         if (srcPw) headers['X-Vault-Password'] = srcPw;
         if (destPassword) headers['X-Dest-Vault-Password'] = destPassword;
         try {
-            const resp = await apiRequest(base, { method: 'POST', body: JSON.stringify(body), headers, silent: true });
+            const resp = await _pasteOne(entry.name, base, body, headers);
             ok++;
             if (entry.keepAfter) {
                 // A KEPT move relocated the file, so re-point the entry at its new home for the next
@@ -12604,8 +12604,8 @@ function setupFilesViewControls() {
     const all = document.getElementById('files-select-all');
     if (all) all.addEventListener('change', () => {
         if (!(state.selectedFileIds instanceof Set)) state.selectedFileIds = new Set();
-        const files = (state.currentFiles || []).filter(i => i.type !== 'folder' && !i.in_progress);
-        if (all.checked) files.forEach(i => state.selectedFileIds.add(i.id));
+        const items = (state.currentFiles || []).filter(i => !i.in_progress);
+        if (all.checked) items.forEach(i => state.selectedFileIds.add(i.id));
         else state.selectedFileIds.clear();
         renderVaultFiles();
     });
@@ -12613,6 +12613,10 @@ function setupFilesViewControls() {
     if (dl) dl.addEventListener('click', bulkDownloadFiles);
     const del = document.getElementById('files-bulk-delete');
     if (del) del.addEventListener('click', bulkDeleteFiles);
+    const cp = document.getElementById('files-bulk-copy');
+    if (cp) cp.addEventListener('click', () => bulkStageSelected('copy'));
+    const cut = document.getElementById('files-bulk-cut');
+    if (cut) cut.addEventListener('click', () => bulkStageSelected('move'));
     const clear = document.getElementById('files-bulk-clear');
     if (clear) clear.addEventListener('click', () => { if (state.selectedFileIds) state.selectedFileIds.clear(); renderVaultFiles(); });
     // Copied Items staging panel.
@@ -12636,27 +12640,30 @@ async function bulkDownloadFiles() {
     const byId = new Map((state.currentFiles || []).map(i => [i.id, i]));
     for (const id of ids) {
         const item = byId.get(id);
-        if (item) { await downloadFile(id, item.name); await new Promise(r => setTimeout(r, 300)); }
+        if (item && item.type !== 'folder') { await downloadFile(id, item.name); await new Promise(r => setTimeout(r, 300)); }
     }
 }
 
 async function bulkDeleteFiles() {
-    const ids = Array.from(state.selectedFileIds || []);
-    if (!ids.length) return;
+    const items = _selectedItems();
+    if (!items.length) return;
+    const folders = items.filter(i => i.type === 'folder').length;
+    const what = folders ? `item${items.length > 1 ? 's' : ''}` : `file${items.length > 1 ? 's' : ''}`;
     const ok = await showConfirm(
-        `Delete ${ids.length} selected file${ids.length > 1 ? 's' : ''}? This cannot be undone.`,
+        `Delete ${items.length} selected ${what}?${folders ? ' A folder goes with everything in it.' : ''} This cannot be undone.`,
         'Confirm Delete');
     if (!ok) return;
     const headers = {};
     if (state.currentVault && state.currentVault.has_password && state.vaultPassword) headers['X-Vault-Password'] = state.vaultPassword;
-    showInfo(`Deleting ${ids.length} file${ids.length > 1 ? 's' : ''}…`);
+    showInfo(`Deleting ${items.length} ${what}…`);
     let failed = 0;
-    for (const id of ids) {
-        try { await apiRequest(`/vaults/${state.currentVault.id}/files/${id}/delete`, { method: 'POST', headers }); }
+    for (const item of items) {
+        const kind = item.type === 'folder' ? 'folders' : 'files';
+        try { await apiRequest(`/vaults/${state.currentVault.id}/${kind}/${item.id}/delete`, { method: 'POST', headers }); }
         catch (_) { failed++; }
     }
     state.selectedFileIds.clear();
-    if (failed) showError(`${failed} file(s) could not be deleted`); else showSuccess('Deleted selected files');
+    if (failed) showError(`${failed} ${what.replace(/s$/, '')}(s) could not be deleted`); else showSuccess(`Deleted selected ${what}`);
     await loadVaultFiles();
 }
 

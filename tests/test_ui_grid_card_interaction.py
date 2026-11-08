@@ -40,10 +40,10 @@ def test_grid_file_edit_and_split_clusters(page: Page, admin, admin_creds):
         _login(page, admin_creds["username"], admin_creds["password"])
         _open_vault_grid_with_file(page, v["id"])
         tile = page.locator("#vault-files-grid .file-tile").first
-        # a file now has an Edit(rename) affordance in grid, in the RIGHT cluster
-        expect(tile.locator('.tile-tr button[data-action="rename-file"]')).to_have_count(1)
-        expect(tile.locator('.tile-tr button[data-action="delete-file"]')).to_have_count(1)
-        # Download moved to the RIGHT cluster (far right); the checkbox stays in the LEFT cluster
+        # a file's Rename and Delete live in the one menu, behind More in the RIGHT cluster
+        expect(tile.locator('.tile-tr button[data-action="more"]')).to_have_count(1)
+        expect(tile.locator('.tile-tr button[data-action="rename-file"]')).to_have_count(0)
+        # Download is in the RIGHT cluster (far right); the checkbox stays in the LEFT cluster
         expect(tile.locator('.tile-tr button[data-action="download"]')).to_have_count(1)
         expect(tile.locator('.tile-tl input.file-check')).to_have_count(1)
         expect(tile.locator('.tile-tl button[data-action="download"]')).to_have_count(0)
@@ -76,8 +76,8 @@ def test_grid_action_row_below_icon_and_download_far_right(page: Page, admin, ad
         expect(dl).to_have_count(1)
         assert tile.locator('.tile-tr .action-btn').last.get_attribute("data-action") == "download"
         dlb = dl.bounding_box()
-        rnb = tile.locator('.tile-tr button[data-action="rename-file"]').bounding_box()
-        assert dlb and rnb and dlb["x"] > rnb["x"], f"Download not right of Rename: {dlb} vs {rnb}"
+        rnb = tile.locator('.tile-tr button[data-action="more"]').bounding_box()
+        assert dlb and rnb and dlb["x"] > rnb["x"], f"Download not right of More: {dlb} vs {rnb}"
     finally:
         admin.delete_vault(v["id"])
 

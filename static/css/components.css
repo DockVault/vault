@@ -1973,82 +1973,9 @@ details summary:hover {
 .rename-ext-row .form-control { flex: 1 1 auto; min-width: 0; }
 
 /* ============================================================================
-   File-row action hover cluster + right-click context menu (shared by both skins)
-   Resting state shows [more][share][download]; hovering "more" slides the
-   edit/copy/move/delete cluster out to the LEFT. This keeps a grid tile from
-   overflowing with five-plus action icons.
+   File-row context menu (shared by both skins): the one menu a row's More button
+   and a right click open, every permitted action in one order.
    ============================================================================ */
-.action-more-wrap { position: relative; display: inline-flex; align-items: center; padding: 3px; }
-.action-cluster {
-    position: absolute;
-    right: 100%;                                   /* to the LEFT of the "more" button */
-    top: 50%;
-    transform: translateY(-50%) translateX(8px);   /* start nudged right -> slides left into place */
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 5px 7px;
-    background: var(--surface-1);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-md);
-    opacity: 0;
-    visibility: hidden;
-    pointer-events: none;
-    transition: opacity .12s ease, transform .12s ease, visibility .12s;
-    z-index: 5;
-    white-space: nowrap;
-}
-/* Bridge the gap between the cluster and the "more" button. Without it, moving the cursor from the
-   button toward the revealed options crosses a strip belonging to neither element, :hover is lost,
-   and the cluster hides before the cursor reaches it. The bridge is a child of the cluster (so a
-   descendant of .action-more-wrap), so hovering it keeps the wrap :hover -- it inherits the cluster's
-   visibility/pointer-events, so it is inert until the cluster is shown. */
-.action-cluster::after {
-    content: '';
-    position: absolute;
-    left: 100%;
-    top: -4px;
-    bottom: -4px;
-    width: 12px;
-}
-.action-more-wrap:hover .action-cluster,
-.action-more-wrap:focus-within .action-cluster {
-    opacity: 1;
-    visibility: visible;
-    pointer-events: auto;
-    transform: translateY(-50%) translateX(0);
-}
-/* Left-column tiles: open the cluster to the RIGHT of the "more" button so it is not clipped at the
-   file-area's left edge (the .cluster-right class is toggled on hover from JS). */
-.action-more-wrap.cluster-right .action-cluster {
-    right: auto;
-    left: 100%;
-    transform: translateY(-50%) translateX(-8px);
-}
-.action-more-wrap.cluster-right .action-cluster::after {
-    left: auto;
-    right: 100%;
-}
-.action-more-wrap.cluster-right:hover .action-cluster,
-.action-more-wrap.cluster-right:focus-within .action-cluster {
-    transform: translateY(-50%) translateX(0);
-}
-
-/* The cluster and the "more" MENU are alternatives, never both at once. Clicking the button opens
-   the menu with the cursor still on the wrap, so :hover was necessarily still true and the same
-   actions showed twice, overlapping; :focus-within then kept the cluster up even after the pointer
-   left, because the clicked button holds focus. app.js marks the document while the menu is open
-   (openContextMenu / closeContextMenu) and these rules answer both cases at once. They must stay
-   AFTER the reveal rules above -- they win on specificity, but order is what makes that obvious. */
-body.ctx-menu-open .action-more-wrap:hover .action-cluster,
-body.ctx-menu-open .action-more-wrap:focus-within .action-cluster,
-body.ctx-menu-open .action-more-wrap.cluster-right:hover .action-cluster,
-body.ctx-menu-open .action-more-wrap.cluster-right:focus-within .action-cluster {
-    opacity: 0;
-    visibility: hidden;
-    pointer-events: none;
-}
-
 .context-menu {
     position: fixed;
     min-width: 190px;

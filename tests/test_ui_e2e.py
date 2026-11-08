@@ -254,7 +254,7 @@ def test_vault_file_preview_rename_delete(logged_in: Page, admin):
         # Rename via the row action (uses the dedicated rename modal: separate name + extension fields)
         new_base = _u("renamed")
         new_name = new_base + ".txt"
-        # Rename lives in the hover cluster / context menu; open it via the "more" button.
+        # Rename lives in the row's menu; open it via the "more" button.
         page.locator("#vault-files-table-body tr").first.locator('button[data-action="more"]').click()
         page.locator('#file-context-menu button[data-action="rename-file"]').click()
         expect(page.locator("#rename-modal")).to_be_visible(timeout=8000)
