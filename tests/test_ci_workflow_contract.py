@@ -84,7 +84,7 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
     - both jobs need only preflight (in parallel, not one after the other) and neither can be
       skipped, because a release publishes only when every job of this workflow succeeded;
     - each job keeps its own logs, teardown and uniquely named failure pictures;
-    - the suite's cap is 150 minutes.
+    - the suite's cap is 240 minutes.
     """
     import yaml
 
@@ -95,7 +95,7 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
         assert job["needs"] == "preflight"
         assert "if" not in job                   # a skipped job counts as passed for publication
         assert job["runs-on"] == "ubuntu-latest"
-    assert suite["timeout-minutes"] == 150
+    assert suite["timeout-minutes"] == 240
     assert 15 <= scenarios["timeout-minutes"] <= 45
 
     def names(job):
