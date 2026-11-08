@@ -33,14 +33,12 @@ GUARDED: set = set()
 def requirement(db, user, action):
     """(requirement, has_active_enrollment) for ``user`` and the fixed ``action``: what its policy demands of
     the enrollment the account has now. The matrix is never read."""
-    from app.core.models import SecondFactorEnrollment
+    from app.core.active_factors import active_factors
     policy = acts.fixed_policy(action)
     if policy is None:
         raise LookupError(f"{action} is not a fixed step-up")
-    enrollment = db.query(SecondFactorEnrollment).filter(
-        SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
-    method = enrollment.method if enrollment is not None else None
-    return pol.resolve_fixed_requirement(policy, active_method=method), enrollment is not None
+    factors = active_factors(db, user.id)
+    return pol.resolve_fixed_requirement(policy, active_method=factors.code_method), factors.any
 
 
 def enforce(db, user, request, action) -> None:

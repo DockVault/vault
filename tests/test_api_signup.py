@@ -163,9 +163,17 @@ def test_auth_policy_minimal_keys_and_no_leak(admin, restore_settings):
     # EXACT key-set (not just a denylist): any future key added to the response — sensitive or not —
     # trips this and forces a review of the public surface.
     assert set(body) == {"signup_enabled", "password_reset_enabled", "login_identifier",
-                         "email_requirement", "password_policy"}
+                         "email_requirement", "password_policy", "methods"}
     assert set(pp) == {"min_length", "require_uppercase", "require_lowercase",
                        "require_numbers", "require_special"}
+    # What the sign-in page may offer: the form, the passkey button, the provider buttons; nothing else, and
+    # each provider entry (when there are any) only its id, label, kind, icon and order.
+    methods = body["methods"]
+    assert set(methods) == {"password", "passkeys", "providers"}
+    assert methods["password"] in ("visible", "link", "hidden") and isinstance(methods["passkeys"], bool)
+    assert isinstance(methods["providers"], list)
+    for provider in methods["providers"]:
+        assert set(provider) == {"id", "label", "kind", "icon", "order"}
 
     # NEGATIVE (belt-and-braces): none of the leak-sensitive keys may ride along.
     for leaked in ("invite_enabled", "invite_ttl_hours", "signup_email_domain_mode",

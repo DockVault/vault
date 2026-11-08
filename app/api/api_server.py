@@ -4585,10 +4585,9 @@ def _sf_requirement_for(db, user, action):
     if acts.fixed_policy(action) is not None:
         from app.core import fixed_step_up
         return fixed_step_up.requirement(db, user, action)
+    from app.core.active_factors import active_factors
     require_otp, require_password = _sf_action_toggles(db, action)
-    has_active = db.query(SecondFactorEnrollment.id).filter(
-        SecondFactorEnrollment.user_id == user.id,
-        SecondFactorEnrollment.status == "active").first() is not None
+    has_active = active_factors(db, user.id).any
     req = pol.resolve_action_requirement(require_otp=require_otp, require_password=require_password,
                                          has_active_enrollment=has_active,
                                          is_admin_action=acts.is_admin_action(action))
@@ -4596,16 +4595,12 @@ def _sf_requirement_for(db, user, action):
 
 
 def _sf_step_up_methods(db, user, req, has_active) -> list:
-    methods = []
-    if req["otp"] and has_active:
-        enr = db.query(SecondFactorEnrollment).filter(
-            SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
-        if enr:
-            methods.append(enr.method)
-        methods.append("recovery")
-    if req["password"]:
-        methods.append("password")
-    return methods
+    """The methods to offer for a step-up requirement, from the table (app/core/step_up_methods.py) and
+    what the account holds (app/core/active_factors.py). ``has_active`` is what the caller already
+    resolved; the table reads the factors itself."""
+    from app.core import step_up_methods
+    from app.core.active_factors import active_factors
+    return step_up_methods.offered(req, active_factors(db, user.id))
 
 
 def _refuse_unenrolled(action, req):
@@ -5975,7 +5970,18 @@ async def auth_policy(db: Session = Depends(get_db)):
         "login_identifier": pol.get("login_identifier"),
         "email_requirement": pol.get("email_requirement"),
         "password_policy": _password_policy_view(db),
+        "methods": _sign_in_methods(db),
     }
+
+
+def _sign_in_methods(db) -> dict:
+    """What the sign-in page may offer, from the administrator's configuration, as an allow-listed object:
+    ``password`` (``visible`` | ``link`` | ``hidden``: the form, the form behind "sign in with a local
+    account", or neither), ``passkeys`` (a passkey button), ``providers`` (the single sign-on buttons, each
+    ``{id, label, kind, icon, order}``: never a secret, never an issuer). Nothing else rides along: the page
+    renders from this object and from nothing in the settings blob. The passkey and provider settings fill it
+    in as they land; today the form alone."""
+    return {"password": "visible", "passkeys": False, "providers": []}
 
 
 def _email_has_pending_invite(db: Session, email: str) -> bool:
@@ -8288,10 +8294,9 @@ def _sf_user_group_ids(db, user) -> list:
 def _second_factor_effective(db, user) -> dict:
     """The user's effective second-factor state from the current policy + their enrollment + groups."""
     from app.core import second_factor_policy as pol
+    from app.core.active_factors import active_factors
     p = pol.effective_policy(_global_settings_blob(db))
-    has_active = db.query(SecondFactorEnrollment.id).filter(
-        SecondFactorEnrollment.user_id == user.id,
-        SecondFactorEnrollment.status == "active").first() is not None
+    has_active = active_factors(db, user.id).any
     return pol.effective_second_factor(
         mode=p["mfa_mode"], required_group_ids=p["mfa_required_group_ids"],
         required_user_ids=p["mfa_required_user_ids"], user_group_ids=_sf_user_group_ids(db, user),
@@ -8317,9 +8322,11 @@ def _login_second_factor_in_effect(db, user) -> bool:
 
 
 def _sf_login_methods(db, user) -> list:
-    enr = db.query(SecondFactorEnrollment).filter(
-        SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first()
-    return [enr.method, "recovery"] if enr else []
+    """The second factors the sign-in's second step offers: the account's code and a recovery code in its
+    place (the passkey joins when the passkey store lands)."""
+    from app.core.active_factors import active_factors
+    factors = active_factors(db, user.id)
+    return [factors.code_method, "recovery"] if factors.code else []
 
 
 def _delete_session_by_token(db, session_token):
@@ -8598,7 +8605,8 @@ async def second_factor_step_up(
         # Allowlist the method against the genuine OTP methods this action offers (enrolled method +
         # recovery, + email when allowed) — never the account password, which is the first factor. The
         # separate `require_password` re-auth below is what reads body.password.
-        otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if m != "password"}
+        from app.core import step_up_methods as _sum
+        otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if _sum.meets_factor(m)}
         if (body.method or "").lower() not in otp_methods or not sf.check_second_factor(
                 db, user=current_user, action=body.action, method=body.method, code=body.code):
             try:
