@@ -241,7 +241,7 @@ def test_a_pdf_preview_without_a_pdf_viewer_points_at_download(page: Page, phone
     client.login(phone_admin["_username"], phone_admin["_password"])
     v = client.create_vault(name=unique("pdfphone"))
     downloads = []
-    page.on("request", lambda r: downloads.append(r.url) if "/download" in r.url else None)
+    page.on("request", lambda r: downloads.append(r.url) if "/preview" in r.url or "/download" in r.url else None)
     try:
         _login(page, phone_admin, "v2")
         _go(page, "vaults")
@@ -249,7 +249,7 @@ def test_a_pdf_preview_without_a_pdf_viewer_points_at_download(page: Page, phone
         expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
         body = page.locator("#file-preview-body")
         if pdf_viewer:
-            with page.expect_request(lambda r: "/download" in r.url, timeout=8000):
+            with page.expect_request(lambda r: "/preview" in r.url, timeout=8000):
                 _open_synthetic_pdf(page, pdf_viewer)
             expect(body).not_to_contain_text("can't show PDFs")
         else:

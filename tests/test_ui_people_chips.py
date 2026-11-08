@@ -185,7 +185,8 @@ def test_the_link_tables_name_owners_with_the_chip(page: Page, admin, admin_cred
     enabled = admin.get("/settings").json().get("public_file_links_enabled")
     admin.put("/settings", json={"public_file_links_enabled": True, "public_note_links_enabled": True})
     try:
-        tag = admin.post("/note-link-tags", json={"name": unique("nlt"), "allowed_audiences": ["users"]})
+        tag = admin.post("/note-link-tags", json={"name": unique("nlt"), "auto_enroll_new_users": True,
+                                                  "allowed_user_ids": [a["id"]]})
         note = world["ca"].post("/notes", json={"title": unique("linked"), "body": "x"}).json()
         body = {"note_id": note["id"]}
         if tag.status_code == 200:
