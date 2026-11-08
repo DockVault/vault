@@ -108,9 +108,10 @@ def resolve_action_requirement(*, require_otp, require_password, has_active_enro
 
 # The policies of the step-ups whose requirement is fixed in code (second_factor_actions.FIXED_STEP_UP_ACTIONS).
 # Nothing an administrator sets in the matrix changes them.
-#   compliance        -- the account password AND a TOTP code or one of its recovery codes. An email code never
-#                        counts (an administrator can change the address, and so where the code goes), and an
-#                        account with no active TOTP enrollment is refused outright: it must enroll first.
+#   compliance        -- the account password AND a TOTP code, one of its recovery codes, or a user-verified passkey
+#                        that is not provisional. An email code never counts (an administrator can change the
+#                        address, and so where the code goes), and an account with neither a TOTP enrollment nor a
+#                        passkey is refused outright: it must enroll first.
 #   password_always   -- the account password, every time, plus whatever second factor the account has
 #                        enrolled (an email code included). An account with none gives the password alone, so an
 #                        installation whose only administrator has no second factor can still act.
@@ -121,18 +122,20 @@ POLICY_FACTOR_WHEN_ENROLLED = "factor_when_enrolled"
 FIXED_POLICIES = (POLICY_COMPLIANCE, POLICY_PASSWORD_ALWAYS, POLICY_FACTOR_WHEN_ENROLLED)
 
 
-def resolve_fixed_requirement(policy: str, *, active_method: Optional[str]) -> dict:
+def resolve_fixed_requirement(policy: str, *, active_method: Optional[str], has_passkey: bool = False) -> dict:
     """What a fixed step-up policy demands of an account whose active enrollment uses ``active_method``
-    ('totp', 'email', or None when it has none). Returns {password, otp, must_enroll} like
-    resolve_action_requirement; the caller lists and checks the methods of the enrollment it has, so an
-    account the compliance policy accepts can only ever offer TOTP and its recovery codes."""
+    ('totp', 'email', or None when it has none) and that holds a passkey or not. Returns {password, otp,
+    must_enroll} like resolve_action_requirement; the caller lists and checks the methods of the factors it
+    has, so an account the compliance policy accepts offers TOTP and its recovery codes, or a passkey (the
+    step-up route holds a passkey to the compliance rules: user-verified, not provisional, approved for the
+    auditor's grant)."""
     if policy == POLICY_COMPLIANCE:
-        totp = active_method == "totp"
-        return {"password": True, "otp": totp, "must_enroll": not totp}
+        strong = active_method == "totp" or has_passkey
+        return {"password": True, "otp": strong, "must_enroll": not strong}
     if policy == POLICY_PASSWORD_ALWAYS:
-        return {"password": True, "otp": active_method is not None, "must_enroll": False}
+        return {"password": True, "otp": active_method is not None or has_passkey, "must_enroll": False}
     if policy == POLICY_FACTOR_WHEN_ENROLLED:
-        return {"password": False, "otp": active_method is not None, "must_enroll": False}
+        return {"password": False, "otp": active_method is not None or has_passkey, "must_enroll": False}
     raise ValueError(f"unknown step-up policy {policy!r}")
 
 

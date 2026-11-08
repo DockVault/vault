@@ -219,3 +219,52 @@ def test_an_administrators_passkey_leads_to_the_password_step(admin):
         assert admin.get(f"/users/{other['id']}/passkeys").json()["passkeys"] == []
     finally:
         admin.delete_user(other["id"])
+
+
+def test_a_passkey_is_the_second_step_after_the_password_and_proves_a_step_up(person, admin):
+    """The account holds a passkey, so a password sign-in is held for the second step, which the passkey meets
+    (amr pwd + hwk, mfa_at); then the signed-in session proves the account.second_factor step-up with the passkey
+    and the receipt opens the guarded removal. The real receipt path, end to end."""
+    client, uid = person
+    r, auth = _register(client, "second factor")
+    assert r.status_code == 201, r.text
+    anon = ApiClient()
+    r = anon.session.post(f"{anon.base_url}/auth/login", json={"username": client.username, "password": client.password}, timeout=15)
+    assert r.status_code == 200, r.text
+    pending = r.json()
+    if not pending.get("second_factor_required"):
+        pytest.skip("the stack's login switch does not ask for the second factor")
+    assert "passkey" in pending["methods"], pending
+    headers = {"Authorization": f"Bearer {pending['pre_auth_token']}"}
+    r = anon.session.post(f"{anon.base_url}/auth/second-factor/passkey/options", headers=headers, timeout=15)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["options"]["publicKey"]["allowCredentials"]) == 1
+    credential = auth.get_assertion(body["options"], _public_url(), sign_count=2)
+    r = anon.session.post(f"{anon.base_url}/auth/second-factor/passkey/verify",
+                          json={"challenge_id": body["challenge_id"], "credential": credential}, headers=headers, timeout=15)
+    assert r.status_code == 200, r.text
+    token = r.json()["access_token"]
+    claims = _claims(token)
+    assert claims["amr"] == ["pwd", "hwk"] and "mfa_at" in claims
+    # The step-up with the passkey, through the real receipt.
+    me = ApiClient()
+    me.token = token
+    me.session.headers["Authorization"] = f"Bearer {token}"
+    r = me.post("/auth/second-factor/challenge", json={"action": "account.second_factor"})
+    assert r.status_code == 200 and "passkey" in r.json()["methods"], r.text
+    r = me.post("/auth/passkeys/step-up/options")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    credential = auth.get_assertion(body["options"], _public_url(), sign_count=3)
+    r = me.post("/auth/second-factor/step-up", json={"action": "account.second_factor", "method": "passkey",
+                                                     "challenge_id": body["challenge_id"], "credential": credential})
+    assert r.status_code == 200, r.text
+    receipt = r.json()["receipt"]
+    key_id = me.get("/users/me/passkeys").json()["passkeys"][0]["id"]
+    r = me.delete(f"/users/me/passkeys/{key_id}", headers={"X-Second-Factor": receipt})
+    assert r.status_code == 200, r.text
+    assert me.get("/users/me/passkeys").json()["passkeys"] == []
+    # The receipt was spent with that call.
+    r = me.delete(f"/users/me/passkeys/{key_id}", headers={"X-Second-Factor": receipt})
+    assert r.status_code in (403, 404)

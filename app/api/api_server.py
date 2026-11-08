@@ -4624,7 +4624,10 @@ def _sf_step_up_methods(db, user, req, has_active) -> list:
     resolved; the table reads the factors itself."""
     from app.core import step_up_methods
     from app.core.active_factors import active_factors
-    return step_up_methods.offered(req, active_factors(db, user.id))
+    factors = active_factors(db, user.id)
+    # A passkey may meet the factor part when the account holds one (the passkey settings item adds the
+    # administrator's switch to this context).
+    return step_up_methods.offered(req, factors, step_up_methods.Context(passkey_step_up=factors.passkeys > 0))
 
 
 def _refuse_unenrolled(action, req):
@@ -8400,10 +8403,13 @@ def _login_second_factor_in_effect(db, user) -> bool:
 
 def _sf_login_methods(db, user) -> list:
     """The second factors the sign-in's second step offers: the account's code and a recovery code in its
-    place (the passkey joins when the passkey store lands)."""
+    place, and a passkey when the account holds one."""
     from app.core.active_factors import active_factors
     factors = active_factors(db, user.id)
-    return [factors.code_method, "recovery"] if factors.code else []
+    methods = [factors.code_method, "recovery"] if factors.code else []
+    if factors.passkeys > 0:
+        methods.append("passkey")
+    return methods
 
 
 def _delete_session_by_token(db, session_token):
@@ -8644,6 +8650,9 @@ class SecondFactorStepUpRequest(BaseModel):
     method: str = ""
     code: str = ""
     password: Optional[str] = None
+    # A passkey as the factor part: the challenge POST /auth/passkeys/step-up/options issued, and the assertion.
+    challenge_id: Optional[str] = Field(default=None, max_length=64)
+    credential: Optional[dict] = None
 
 
 @app.post("/auth/second-factor/challenge")
@@ -8700,13 +8709,19 @@ async def second_factor_step_up(
     if req["must_enroll"]:
         raise HTTPException(status_code=403, detail={
             "second_factor_required": True, "action": body.action, "reason": "enroll_required", "methods": []})
+    factor_marker = ""
     if req["otp"]:
-        # Allowlist the method against the genuine OTP methods this action offers (enrolled method +
-        # recovery, + email when allowed) — never the account password, which is the first factor. The
-        # separate `require_password` re-auth below is what reads body.password.
+        # Allowlist the method against the genuine factor methods this action offers (enrolled method +
+        # recovery, + email when allowed, + a passkey when the account holds one) — never the account
+        # password, which is the first factor. The separate `require_password` re-auth below is what
+        # reads body.password.
         from app.core import step_up_methods as _sum
         otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if _sum.meets_factor(m)}
-        if (body.method or "").lower() not in otp_methods or not sf.check_second_factor(
+        method = (body.method or "").lower()
+        if method == "passkey" and method in otp_methods:
+            # The assertion is the factor part; the compliance policy adds its own rules on the key.
+            factor_marker = _passkey_step_up_factor(db, current_user, request, body)
+        elif method not in otp_methods or not sf.check_second_factor(
                 db, user=current_user, action=body.action, method=body.method, code=body.code):
             try:
                 AuditLogger(db).log_second_factor_failure(
@@ -8715,6 +8730,8 @@ async def second_factor_step_up(
                 print(f"⚠ audit write skipped for second_factor_failed: {type(audit_err).__name__}")
                 db.rollback()
             raise HTTPException(status_code=403, detail="That code is not valid.")
+        else:
+            factor_marker = method
     if req["password"]:
         pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
         if not (pw and current_user.password_hash and verify_password(pw, current_user.password_hash)):
@@ -8723,7 +8740,7 @@ async def second_factor_step_up(
             raise HTTPException(status_code=403, detail="Your account password is required and must be correct.")
     session_hash = _current_session_hash(request)
     return {"receipt": sf.issue_step_up_receipt(db, user_id=current_user.id, action=body.action,
-                                                session_hash=session_hash)}
+                                                session_hash=session_hash, method=factor_marker)}
 
 
 _login_bearer = HTTPBearer(auto_error=False)
@@ -11713,7 +11730,6 @@ async def remove_my_passkey(
 
 
 @app.post("/users/me/passkeys/{passkey_id}/confirm")
-@require_step_up("account.second_factor")
 async def confirm_my_passkey(
     passkey_id: uuid.UUID,
     request: Request,
@@ -11722,13 +11738,30 @@ async def confirm_my_passkey(
 ):
     """The owner confirms a provisional passkey, in a session that proved the account.second_factor step-up with
     a factor older than it (an authenticator app, a recovery code, or an older passkey): it becomes ordinary.
-    Refused (409) when the account holds nothing older to confirm it with."""
+    The receipt says which factor vouched; the provisional key itself never does. Refused (409) when the
+    account holds nothing older to confirm it with."""
+    from app.core import second_factor as sf
     from app.core.active_factors import active_factors
     _passkey_refuse_temp(current_user)
     row = _passkey_of(db, current_user.id, passkey_id)
     now = datetime.utcnow()
     if not (row.provisional_until and row.provisional_until > now):
         return _passkey_public(row, now)
+    req, has_active = _sf_requirement_for(db, current_user, "account.second_factor")
+    if req["must_enroll"]:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": "account.second_factor", "reason": "enroll_required", "methods": []})
+    marker = sf.consume_step_up_receipt_detail(
+        db, user=current_user, action="account.second_factor", receipt=request.headers.get("X-Second-Factor") or "",
+        session_hash=_current_session_hash(request))
+    if marker is None:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": "account.second_factor", "reason": "step_up_required",
+            "methods": _sf_step_up_methods(db, current_user, req, has_active)})
+    if marker == f"passkey:{row.id}":
+        raise HTTPException(status_code=409, detail=(
+            "A provisional passkey cannot confirm itself. Prove the step-up with an authenticator app, a recovery "
+            "code or an older passkey."))
     factors = active_factors(db, current_user.id)
     older = [k for k in _passkeys_of(db, current_user.id)
              if k.id != row.id and k.created_at and k.created_at < row.created_at
@@ -12000,6 +12033,196 @@ async def passkey_sign_in_verify(
         return JSONResponse(status_code=200, content=outcome.body)
     return LoginResponse(access_token=outcome.access_token, user=UserResponse.model_validate(user),
                          is_temporary=False, is_scoped_temp=False)
+
+
+# --- Passkeys: the second factor and the step-up ------------------------------------------------------
+# A passkey proves the factor part of a sign-in's second step (under the pre-auth token, with the pending
+# login's attempt cap) and of a step-up (inside POST /auth/second-factor/step-up as method "passkey"). The
+# compliance policy adds its rules on the key: user-verified, not provisional, and for an auditor's own
+# actions one of the keys the grant was approved with; a device-bound requirement comes with the settings.
+
+PASSKEY_SESSION_CHALLENGE_LIMIT = 30     # signed-in challenge requests per address per PASSKEY_CHALLENGE_WINDOW
+AUDITOR_OWN_ACTIONS = ("compliance.grant.reconfirm", "compliance.case.request", "compliance.case.export")
+
+
+class PasskeyAssertionRequest(BaseModel):
+    challenge_id: str = Field(min_length=1, max_length=64)
+    credential: dict
+
+
+def _passkey_assert(db, user, *, purpose: str, challenge_id, credential, policy):
+    """Spend the challenge (made for ``purpose`` and this account), find the key the assertion names among the
+    account's own, and verify it. Returns (row, assertion). Raises :class:`webauthn_service.Refused` for a
+    refused assertion; HTTPException 400 for an unusable challenge; 503 without the store. The key's counter,
+    synced flag and last use are recorded on success."""
+    from app.core import webauthn_challenges
+    from app.services import webauthn_service as ws
+    try:
+        challenge = webauthn_challenges.take(challenge_id, purpose=purpose)
+    except webauthn_challenges.Unavailable:
+        raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
+    if challenge is None or challenge.user_id != str(user.id):
+        raise HTTPException(status_code=400, detail={
+            "reason": "challenge_unknown", "message": "That passkey request is unknown or has expired. Start again."})
+    rp = _passkey_relying_party(db)
+    raw_id = _passkey_raw_id(credential)
+    row = next((k for k in _passkeys_of(db, user.id) if raw_id and k.credential_id == raw_id), None)
+    if row is None:
+        raise ws.Refused("credential_not_offered", "not one of the account's keys")
+    known = ws.KnownKey(credential_id=row.credential_id, public_key_cose=row.public_key_cose, cose_alg=row.cose_alg,
+                        sign_count=int(row.sign_count or 0), backup_eligible=bool(row.backup_eligible),
+                        user_id=ws.user_handle_for(row.user_id), transports=tuple(row.transports or ()))
+    allow_ids = [decoded for decoded in (_passkey_b64url_decode(e) for e in challenge.allow_ids) if decoded]
+    assertion = ws.verify_authentication(rp, policy, challenge=challenge.challenge_bytes, credential=credential,
+                                         key=known, allow_ids=allow_ids)
+    row.sign_count = assertion.sign_count
+    row.backup_state = assertion.bs
+    row.last_used_at = datetime.utcnow()
+    db.commit()
+    return row, assertion
+
+
+def _passkey_challenge_for(db, user, *, purpose: str, request) -> dict:
+    """A challenge for the signed-in (or pending) account's own keys, under the session challenge limiter."""
+    from app.core import sign_in_lockout, webauthn_challenges
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from app.services import webauthn_service as ws
+    client_ip = get_client_ip(request)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=sign_in_lockout.source_of(client_ip),
+                                                 limit=PASSKEY_SESSION_CHALLENGE_LIMIT, window=PASSKEY_CHALLENGE_WINDOW,
+                                                 prefix="passkey_challenge_session", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many requests. Try again later.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, PASSKEY_CHALLENGE_WINDOW))})
+    keys = _passkeys_of(db, user.id)
+    if not keys:
+        raise HTTPException(status_code=400, detail="This account has no passkey.")
+    rp = _passkey_relying_party(db)
+    allow = [(k.credential_id, tuple(k.transports or ())) for k in keys]
+    try:
+        challenge = webauthn_challenges.issue(purpose, user_id=str(user.id), allow_ids=[ws.b64url(cid) for cid, _t in allow])
+    except webauthn_challenges.Unavailable:
+        raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
+    options = ws.authentication_options(rp, _passkey_policy(db), challenge=challenge.challenge_bytes, allow=allow)
+    return {"challenge_id": challenge.id, "options": options, "expires_in": webauthn_challenges.TTL_SECONDS}
+
+
+def _passkey_step_up_factor(db, user, request, body) -> str:
+    """The factor part of a step-up met by a passkey: the assertion verified, and for a compliance action the
+    key held to the compliance rules. Returns the receipt's method marker; raises 403 with the audit row."""
+    from app.core import auditor_rights
+    from app.core import second_factor_actions as acts
+    from app.core import second_factor_policy as pol
+    from app.services import webauthn_service as ws
+    compliance = acts.fixed_policy(body.action) == pol.POLICY_COMPLIANCE
+    policy = _passkey_policy(db)
+    if compliance:
+        policy = ws.PasskeyPolicy(require_uv=True, allowed_algs=policy.allowed_algs, attestation=policy.attestation,
+                                  allowed_aaguids=policy.allowed_aaguids, trust_anchors=policy.trust_anchors)
+
+    def _refuse(reason: str, message: str):
+        try:
+            AuditLogger(db).log_second_factor_failure(
+                user, ip_address=get_client_ip(request), details={"method": "passkey", "step_up": body.action, "reason": reason})
+        except Exception as audit_err:  # noqa: BLE001
+            print(f"⚠ audit write skipped for second_factor_failed: {type(audit_err).__name__}")
+            db.rollback()
+        return HTTPException(status_code=403, detail=message)
+
+    if not body.challenge_id or not isinstance(body.credential, dict):
+        raise _refuse("malformed", "A passkey step-up needs the challenge and the assertion.")
+    try:
+        row, assertion = _passkey_assert(db, user, purpose="step_up", challenge_id=body.challenge_id,
+                                         credential=body.credential, policy=policy)
+    except ws.Refused as refused:
+        raise _refuse(refused.code, "That passkey was not accepted.")
+    if compliance:
+        now = datetime.utcnow()
+        if row.provisional_until and row.provisional_until > now:
+            raise _refuse("provisional", "A passkey added soon after an administrator changed your sign-in details "
+                                         "cannot prove a compliance step-up until you confirm it.")
+        if body.action in AUDITOR_OWN_ACTIONS:
+            grant = auditor_rights.open_grant(db, user.id)
+            approved = list(getattr(grant, "approved_credential_ids", None) or []) if grant is not None else []
+            if str(row.id) not in approved:
+                raise _refuse("not_approved", "Only a passkey your auditor right was approved with can prove this "
+                                              "step-up. Reconfirm the right, or use your authenticator app.")
+    return f"passkey:{row.id}"
+
+
+@app.post("/auth/passkeys/step-up/options")
+async def passkey_step_up_options(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """A challenge for proving a step-up with one of the caller's passkeys; the assertion goes to
+    POST /auth/second-factor/step-up as method ``passkey`` with ``challenge_id`` and ``credential``."""
+    _passkey_refuse_temp(current_user)
+    return _passkey_challenge_for(db, current_user, purpose="step_up", request=request)
+
+
+@app.post("/auth/second-factor/passkey/options")
+async def passkey_second_factor_options(
+    request: Request,
+    principal=Depends(get_pre_auth_principal),
+    db: Session = Depends(get_db),
+):
+    """A challenge for the sign-in's second step with a passkey, under the pre-auth token: the pending account's
+    keys are offered."""
+    user, pending = principal
+    sign_in.too_many_attempts(db, pending)
+    return _passkey_challenge_for(db, user, purpose="second_factor", request=request)
+
+
+@app.post("/auth/second-factor/passkey/verify")
+async def passkey_second_factor_verify(
+    body: PasskeyAssertionRequest,
+    request: Request,
+    principal=Depends(get_pre_auth_principal),
+    db: Session = Depends(get_db),
+):
+    """The sign-in's second step met by a passkey: the assertion verified against the pending account's key, then
+    the pipeline asks its table with the passkey added (``amr`` ``[pwd, hwk|swk]``, ``mfa_at``). A wrong answer
+    counts against the pending login as a wrong code does."""
+    from app.core import sign_in_lockout
+    from app.core.rate_limiter import rate_limiter as _rl
+    from app.services import webauthn_service as ws
+    user, pending = principal
+    client_ip = get_client_ip(request)
+    allowed, _, reset = _rl.check_rate_limit(identifier=f"{sign_in_lockout.source_of(client_ip)}:{user.id}",
+                                             limit=10, window=300, prefix="sf_login_verify", fail_open=False)
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
+    sign_in.too_many_attempts(db, pending)
+    if "passkey" not in _sf_login_methods(db, user):
+        sign_in.count_failed_attempt(db, pending)
+        raise HTTPException(status_code=401, detail="That passkey was not accepted.")
+    try:
+        row, assertion = _passkey_assert(db, user, purpose="second_factor", challenge_id=body.challenge_id,
+                                         credential=body.credential, policy=_passkey_policy(db))
+    except ws.Refused as refused:
+        sign_in.count_failed_attempt(db, pending)
+        try:
+            AuditLogger(db).log_second_factor_failure(user, ip_address=client_ip,
+                                                      details={"method": "passkey", "reason": refused.code})
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=401, detail="That passkey was not accepted.")
+    method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
+    outcome = sign_in.finish(db, sign_in.SignInResult(
+        user, sign_in.methods_so_far(pending) + [method], client_ip, pending=pending,
+        provider_id=sign_in.provider_of(pending), provider_mfa_trusted=sign_in.provider_mfa_of(pending),
+        user_verified=assertion.uv))
+    if isinstance(outcome, sign_in.PendingStep):
+        return JSONResponse(status_code=200, content=outcome.body)
+    return {"access_token": outcome.access_token, "token_type": "bearer", "recovery_code_used": False,
+            "recovery_codes_remaining": _sf_recovery_remaining(db, user.id)}
 
 
 # --- Second factor: admin policy matrix ------------------------------------------------------------
@@ -16253,7 +16476,7 @@ def _audit_access_change(db, actor, action, resource_type, resource_id, details=
         print(f"⚠ audit write skipped for {action}: {type(e).__name__}")
 
 
-_SF_METHOD_NAMES = ("totp", "recovery", "email", "password")
+_SF_METHOD_NAMES = ("totp", "recovery", "email", "password", "passkey")
 
 
 def _sf_method_name(method) -> str:

@@ -38,7 +38,8 @@ def requirement(db, user, action):
     if policy is None:
         raise LookupError(f"{action} is not a fixed step-up")
     factors = active_factors(db, user.id)
-    return pol.resolve_fixed_requirement(policy, active_method=factors.code_method), factors.any
+    return (pol.resolve_fixed_requirement(policy, active_method=factors.code_method, has_passkey=factors.passkeys > 0),
+            factors.any)
 
 
 def enforce(db, user, request, action) -> None:

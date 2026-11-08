@@ -188,11 +188,18 @@ def _verify_recovery(db, user, code: str) -> bool:
     return False
 
 
-def issue_step_up_receipt(db, *, user_id, action: str, session_hash: str, redis=None) -> str:
+RECEIPT_METHOD_SEPARATOR = "|"
+
+
+def issue_step_up_receipt(db, *, user_id, action: str, session_hash: str, redis=None, method: str = "") -> str:
     """Mint the session-bound step-up receipt (an otp_service code). destination carries the session
-    hash so consume_step_up_receipt can refuse a receipt earned in a different session."""
+    hash so consume_step_up_receipt can refuse a receipt earned in a different session, and, after a
+    separator, how the factor part was met (``totp``, ``recovery``, ``email``, ``passkey:<key id>``) so a
+    route that cares which factor vouched can read it (a provisional passkey must not vouch for itself)."""
+    marker = (method or "").replace(RECEIPT_METHOD_SEPARATOR, "")
+    destination = session_hash if not marker else f"{session_hash}{RECEIPT_METHOD_SEPARATOR}{marker}"
     return otp_service.issue(db, purpose=f"stepup:{action}", user_id=user_id,
-                             destination=session_hash, ttl_minutes=RECEIPT_TTL_MINUTES, redis=redis)
+                             destination=destination, ttl_minutes=RECEIPT_TTL_MINUTES, redis=redis)
 
 
 def check_second_factor(db, *, user, action: str, method: str, code: str, redis=None) -> bool:
@@ -227,11 +234,25 @@ def verify_second_factor(db, *, user, action: str, method: str, code: str,
     return SecondFactorResult(True, receipt=receipt)
 
 
+def consume_step_up_receipt_detail(db, *, user, action: str, receipt: str,
+                                   session_hash: str, redis=None):
+    """Verify + consume a step-up receipt for (user, action) and say how its factor part was met: the
+    method marker issue_step_up_receipt stored ("" when none was recorded), or None when the receipt is
+    refused. Accepts ONLY a receipt earned by THIS session. Single-use — covers exactly one call."""
+    if not receipt or not session_hash:
+        return None
+    result = otp_service.verify(db, purpose=f"stepup:{action}", user_id=user.id, code=receipt, redis=redis)
+    if not result.ok or not isinstance(result.destination, str):
+        return None
+    stored_session, _sep, marker = result.destination.partition(RECEIPT_METHOD_SEPARATOR)
+    if stored_session != session_hash:
+        return None
+    return marker
+
+
 def consume_step_up_receipt(db, *, user, action: str, receipt: str,
                             session_hash: str, redis=None) -> bool:
     """Verify + consume a step-up receipt for (user, action). Accepts ONLY when the receipt is valid AND
-    was earned by THIS session (destination == session_hash). Single-use — covers exactly one call."""
-    if not receipt:
-        return False
-    result = otp_service.verify(db, purpose=f"stepup:{action}", user_id=user.id, code=receipt, redis=redis)
-    return bool(result.ok and result.destination == session_hash)
+    was earned by THIS session. Single-use — covers exactly one call."""
+    return consume_step_up_receipt_detail(db, user=user, action=action, receipt=receipt,
+                                          session_hash=session_hash, redis=redis) is not None

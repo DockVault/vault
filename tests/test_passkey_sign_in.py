@@ -133,6 +133,9 @@ class Harness:
 
             def log_action(_self, **kw):
                 self.audits.append(("action", kw.get("action")))
+
+            def log_second_factor_failure(_self, user, ip_address=None, details=None):
+                self.audits.append(("action", "second_factor_failed"))
         monkeypatch.setattr(S, "AuditLogger", _Audit)
         monkeypatch.setattr(AuthService, "_record_failed_login", lambda _self, name, ip, user=None: self.counted.append(name))
         monkeypatch.setattr(S, "_record_failed_login_bg", lambda *a, **k: self.monitor.append(a[:3]))

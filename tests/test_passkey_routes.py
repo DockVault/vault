@@ -116,6 +116,10 @@ class Harness:
         monkeypatch.setattr(sf, "consume_step_up_receipt",
                             lambda db, *, user, action, receipt, session_hash, redis=None: (
                                 self.receipts.append((action, receipt)) or receipt == "ok"))
+        # The confirm route reads which factor vouched: "ok" was earned with an authenticator code here.
+        monkeypatch.setattr(sf, "consume_step_up_receipt_detail",
+                            lambda db, *, user, action, receipt, session_hash, redis=None: (
+                                self.receipts.append((action, receipt)) or ("totp" if receipt == "ok" else None)))
         monkeypatch.setattr(S, "_sf_user_group_ids", lambda db, u: [])
         self.notices, self.emails, self.audits = [], [], []
         monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
@@ -356,8 +360,8 @@ def test_rename_cleans_the_label_and_remove_needs_the_step_up(monkeypatch):
     # Remove: the step-up first; then gone, told, audited; sessions untouched (nothing here revokes).
     status, out = _call(h.S, "DELETE", f"/users/me/passkeys/{row.id}")
     assert status == 403 and out["detail"]["reason"] == "step_up_required"
-    # The table offers no method yet: a passkey-only account proves this step-up once the passkey step-up lands.
-    assert out["detail"]["methods"] == []
+    # A passkey-only account proves this step-up with its passkey.
+    assert out["detail"]["methods"] == ["passkey"]
     status, out = _call(h.S, "DELETE", f"/users/me/passkeys/{row.id}", None, {"X-Second-Factor": "ok"})
     assert status == 200 and out == {"removed": True} and h.rows() == []
     assert [a["action"] for a in h.audits][-1] == "passkey_removed"
