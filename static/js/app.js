@@ -474,6 +474,8 @@ function showToast(message, type = 'info', duration = 5000) {
     
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
+    // Announced: an error interrupts (alert), the rest wait their turn (status).
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
     
     const icons = {
         success: '✓',
@@ -11974,7 +11976,7 @@ function renderFilesTable(items, canWrite, tbody) {
             <tr class="${selected ? 'is-selected' : ''}">
                 <td class="col-check">${check}</td>
                 <td>
-                    <div class="file-name" ${nameAttrs}>
+                    <div class="file-name" ${nameAttrs} role="button" tabindex="0">
                         <span class="file-icon">${icon}</span>
                         <span>${escapeHtml(item.name)}${lockIcon}</span>
                     </div>
@@ -12161,6 +12163,23 @@ function openContextMenu(item, x, y) {
     top = Math.max(pad, Math.min(top, vh - r.height - pad));
     menu.style.left = left + 'px';
     menu.style.top = top + 'px';
+    // Keyboard: the first item takes focus; arrows, Home and End move between items; Escape closes (above).
+    if (!menu.dataset.keysWired) {
+        menu.dataset.keysWired = '1';
+        menu.addEventListener('keydown', (e) => {
+            const items = Array.from(menu.querySelectorAll('.context-menu-item:not([disabled])'));
+            if (!items.length) return;
+            const at = items.indexOf(document.activeElement);
+            let next = null;
+            if (e.key === 'ArrowDown') next = items[(at + 1) % items.length];
+            else if (e.key === 'ArrowUp') next = items[(at - 1 + items.length) % items.length];
+            else if (e.key === 'Home') next = items[0];
+            else if (e.key === 'End') next = items[items.length - 1];
+            if (next) { e.preventDefault(); next.focus(); }
+        });
+    }
+    const firstItem = menu.querySelector('.context-menu-item:not([disabled])');
+    if (firstItem) firstItem.focus({ preventScroll: true });
     // The two menus are alternatives, not layers. The horizontal cluster is revealed by CSS alone
     // (`.action-more-wrap:hover`), and the cursor is by definition still on the wrap at the moment
     // the button is clicked — so opening this menu used to leave BOTH on screen, the same actions
@@ -19496,6 +19515,7 @@ async function loadVaultPermissions() {
             </tr>
         `;
         }).join('');
+        if (window.Tables) Tables.enhance(tbody.closest('table'), { key: 'vault-members', search: true });
 
         // Add event listeners for revoke buttons
         tbody.querySelectorAll('button[data-action="revoke-permission"]').forEach(btn => {

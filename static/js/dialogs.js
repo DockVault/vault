@@ -1,5 +1,10 @@
 // How the page's dialogs (.modal elements) open and close, the same way for all of them.
 //
+// Every dialog is a dialog to assistive technology: role="dialog", aria-modal, and a name taken from its
+// heading. Focus moves into a dialog when it opens (the first field, else the first button, else the
+// dialog itself) and back to the control that opened it when it closes; Tab and Shift+Tab stay inside the
+// top dialog while one is open.
+//
 // A dialog opens scrolled to the top. Escape closes the top dialog only. A press on a dialog's backdrop
 // that is released on the same backdrop closes that dialog only, and only when it is the top one and
 // its form holds nothing typed since it opened; a press that began inside the dialog (a text selection
@@ -15,6 +20,53 @@
 
     const openedAt = new WeakMap();   // dialog -> the order it opened in (a counter)
     const snapshots = new WeakMap();  // dialog -> its fields' values when it opened
+    const openers = new WeakMap();    // dialog -> the element that had focus when it opened
+    let labelCounter = 0;
+
+    const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), '
+        + 'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+    function visible(el) {
+        return !!(el && el.offsetParent !== null || (el && getComputedStyle(el).position === 'fixed' && getComputedStyle(el).display !== 'none'));
+    }
+
+    function focusables(dialog) {
+        return Array.from(dialog.querySelectorAll(FOCUSABLE)).filter((el) => visible(el) && !el.closest('[hidden]'));
+    }
+
+    // The dialog's name for assistive technology: its heading, given an id when it has none.
+    function label(dialog) {
+        if (!dialog.getAttribute('role')) dialog.setAttribute('role', 'dialog');
+        if (!dialog.getAttribute('aria-modal')) dialog.setAttribute('aria-modal', 'true');
+        if (dialog.getAttribute('aria-labelledby') || dialog.getAttribute('aria-label')) return;
+        const heading = dialog.querySelector('.modal-header h1, .modal-header h2, .modal-header h3, h1, h2, h3');
+        if (heading) {
+            if (!heading.id) heading.id = (dialog.id || 'dialog') + '-title-' + (++labelCounter);
+            dialog.setAttribute('aria-labelledby', heading.id);
+        } else {
+            dialog.setAttribute('aria-label', 'Dialog');
+        }
+    }
+
+    function focusInto(dialog) {
+        const list = focusables(dialog);
+        const preferred = dialog.querySelector('[autofocus]')
+            || list.find((el) => /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName))
+            || list.find((el) => !el.classList.contains('modal-close') && !el.classList.contains('close-modal-btn'))
+            || list[0];
+        if (preferred) { preferred.focus({ preventScroll: true }); return; }
+        const box = dialog.querySelector('.modal-content') || dialog;
+        if (!box.hasAttribute('tabindex')) box.setAttribute('tabindex', '-1');
+        box.focus({ preventScroll: true });
+    }
+
+    function focusBack(dialog) {
+        const opener = openers.get(dialog);
+        openers.delete(dialog);
+        if (!opener || !document.contains(opener) || !visible(opener)) return;
+        if (opener.closest('.modal') && !isOpen(opener.closest('.modal'))) return;
+        try { opener.focus({ preventScroll: true }); } catch (_) {}
+    }
     let counter = 0;
     let pressedOn = null;             // the dialog whose backdrop the last mouse press began on
 
@@ -55,8 +107,33 @@
     function opened(dialog) {
         openedAt.set(dialog, ++counter);
         snapshot(dialog);
+        label(dialog);
         // Scrolled to the top: the scroller is the dialog's body where it has one, else its content box.
         dialog.querySelectorAll('.modal-content, .modal-body').forEach((box) => { box.scrollTop = 0; });
+        // Focus: remembered from where it was, moved in. A dialog that opens its own field (the shared
+        // prompt focuses its input a moment later) keeps that; this only fills in when nothing did.
+        const active = document.activeElement;
+        if (active && active !== document.body && !dialog.contains(active)) openers.set(dialog, active);
+        if (!dialog.contains(document.activeElement)) focusInto(dialog);
+    }
+
+    function closed(dialog) {
+        focusBack(dialog);
+    }
+
+    // Tab and Shift+Tab stay inside the top dialog.
+    function trapTab(e) {
+        if (e.key !== 'Tab') return;
+        const dialog = top();
+        if (!dialog) return;
+        const list = focusables(dialog);
+        if (!list.length) { e.preventDefault(); return; }
+        const first = list[0];
+        const last = list[list.length - 1];
+        const inside = dialog.contains(document.activeElement);
+        if (!inside) { e.preventDefault(); (e.shiftKey ? last : first).focus(); return; }
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     }
 
     function open() {
@@ -117,6 +194,7 @@
 
     document.addEventListener('mousedown', (e) => { pressedOn = isDialog(e.target) ? e.target : null; }, true);
     document.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab') { trapTab(e); return; }
         if (e.key !== 'Escape' || e.defaultPrevented) return;
         if (!top()) return;
         if (closeTop()) e.preventDefault();
@@ -127,17 +205,20 @@
     function look(dialog) {
         const now = isOpen(dialog);
         if (now && !seen.get(dialog)) opened(dialog);
+        else if (!now && seen.get(dialog)) closed(dialog);
         seen.set(dialog, now);
     }
     function start() {
+        // Every dialog on the page is named before any of them opens.
+        document.querySelectorAll('.modal').forEach(label);
         document.querySelectorAll('.modal').forEach(look);
         new MutationObserver((records) => {
             records.forEach((r) => {
                 if (r.type === 'attributes' && isDialog(r.target)) look(r.target);
                 if (r.type === 'childList') {
                     r.addedNodes.forEach((n) => {
-                        if (isDialog(n)) look(n);
-                        if (n.querySelectorAll) n.querySelectorAll('.modal').forEach(look);
+                        if (isDialog(n)) { label(n); look(n); }
+                        if (n.querySelectorAll) n.querySelectorAll('.modal').forEach((d) => { label(d); look(d); });
                     });
                 }
             });
@@ -146,5 +227,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
     else start();
 
-    window.Dialogs = { top, closeTop, backdropClick, backdropRelease, hasEdits };
+    window.Dialogs = { top, closeTop, backdropClick, backdropRelease, hasEdits, focusables, label };
 })();
