@@ -26,6 +26,17 @@ def _login(page: Page, username: str, password: str):
 
 
 @pytest.fixture
+def no_saved_sort(admin):
+    """The account starts with no remembered sort (a reused account may have left one), and gets its own back."""
+    before = admin.get("/users/me/preferences").json().get("tables")
+    admin.put("/users/me/preferences", json={"tables": "{}"})
+    try:
+        yield
+    finally:
+        admin.put("/users/me/preferences", json={"tables": before if isinstance(before, str) and before else "{}"})
+
+
+@pytest.fixture
 def two_users(admin):
     a = admin.create_user(username="aaa" + unique("")[1:9], role="user")
     z = admin.create_user(username="zzz" + unique("")[1:9], role="user")
@@ -36,7 +47,7 @@ def two_users(admin):
         admin.delete_user(z["id"])
 
 
-def test_users_table_has_the_new_columns_sorts_and_remembers_the_sort(page: Page, admin, admin_creds, two_users):
+def test_users_table_has_the_new_columns_sorts_and_remembers_the_sort(page: Page, admin, admin_creds, two_users, no_saved_sort):
     a, z = two_users
     _login(page, admin_creds["username"], admin_creds["password"])
     page.click('.sidebar-item[data-section="users"]')
@@ -171,7 +182,7 @@ def test_shared_cards_say_who_shared_when_and_until_when(page: Page, shared_worl
     expect(mine.locator(".shared-expires time.when")).to_have_count(1)
 
 
-def test_link_tables_have_created_and_last_used_and_sort(page: Page, admin, admin_creds):
+def test_link_tables_have_created_and_last_used_and_sort(page: Page, admin, admin_creds, no_saved_sort):
     enabled = admin.get("/settings").json()
     admin.put("/settings", json={"public_note_links_enabled": True})
     tag = admin.post("/note-link-tags", json={"name": unique("nlt"), "auto_enroll_new_users": True})
