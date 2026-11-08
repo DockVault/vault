@@ -11812,7 +11812,13 @@ function updateFilesBulkBar() {
     const bar = document.getElementById('files-bulk-bar');
     const countEl = document.getElementById('files-bulk-count');
     if (countEl) countEl.textContent = count;
-    if (bar) bar.hidden = count === 0;
+    if (bar) {
+        bar.hidden = count === 0;
+        // The bar lies over the toolbar's own controls while it shows; they are out of reach for the
+        // keyboard too (inert), or Tab would land on buttons that cannot be seen.
+        const toolbar = bar.parentElement;
+        if (toolbar) Array.from(toolbar.children).forEach((el) => { if (el !== bar) el.inert = count > 0; });
+    }
     // Cap-gate the bulk actions (matches the per-row buttons + require_vault_cap).
     const dl = document.getElementById('files-bulk-download');
     if (dl) dl.style.display = bulkDownloadAllowed() ? '' : 'none';

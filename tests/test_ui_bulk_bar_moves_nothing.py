@@ -93,6 +93,8 @@ def test_selecting_and_clearing_moves_no_row(page: Page, vault_with_files, skin,
     expect(page.locator("#files-bulk-count")).to_have_text("1")
     assert _row_boxes(page) == before, "a row moved when the first file was selected"
 
+    # The covered toolbar controls are out of the keyboard's reach while the bar shows, and back after.
+    assert page.evaluate("() => document.getElementById('upload-file-btn').closest('[inert]') !== null")
     # Delete sits where no row's own controls are.
     delete = page.locator("#files-bulk-delete").bounding_box()
     for row in page.locator(ROWS).all():
@@ -102,3 +104,4 @@ def test_selecting_and_clearing_moves_no_row(page: Page, vault_with_files, skin,
     page.click("#files-bulk-clear")
     expect(page.locator("#files-bulk-bar")).to_be_hidden()
     assert _row_boxes(page) == before, "a row moved when the selection was undone"
+    assert page.evaluate("() => document.getElementById('upload-file-btn').closest('[inert]') === null")
