@@ -653,17 +653,18 @@
                                 <button id="public-links-btn" class="btn btn-secondary btn-sm" style="display:none;"><svg class="icon icon-sm"><use href="#i-globe"/></svg> Public links</button>
                                 <button id="copied-items-btn" class="btn btn-secondary btn-sm" type="button" hidden aria-haspopup="true"><svg class="icon icon-sm"><use href="#i-copy"/></svg> Copied Items <span class="ci-badge-count" id="copied-items-count">0</span></button>
                             </div>
-                        </div>
-
-                        <!-- Bulk action bar (shown when files are selected) -->
-                        <div id="files-bulk-bar" class="bulk-bar" hidden>
-                            <span class="bulk-bar-count"><strong id="files-bulk-count">0</strong> selected</span>
-                            <div class="bulk-bar-actions">
-                                <button id="files-bulk-download" class="btn btn-sm btn-secondary" type="button"><svg class="icon icon-sm"><use href="#i-download"/></svg> Download</button>
-                                <button id="files-bulk-delete" class="btn btn-sm btn-danger" type="button"><svg class="icon icon-sm"><use href="#i-trash"/></svg> Delete</button>
-                                <button id="files-bulk-clear" class="btn btn-sm btn-ghost" type="button">Clear</button>
+                            <!-- Selection actions: laid over the toolbar row while files are selected, so the
+                                 table below never moves, and Delete sits where no row's own controls are. -->
+                            <div id="files-bulk-bar" class="bulk-bar" hidden>
+                                <span class="bulk-bar-count"><strong id="files-bulk-count">0</strong> selected</span>
+                                <div class="bulk-bar-actions">
+                                    <button id="files-bulk-download" class="btn btn-sm btn-secondary" type="button"><svg class="icon icon-sm"><use href="#i-download"/></svg> Download</button>
+                                    <button id="files-bulk-delete" class="btn btn-sm btn-danger" type="button"><svg class="icon icon-sm"><use href="#i-trash"/></svg> Delete</button>
+                                    <button id="files-bulk-clear" class="btn btn-sm btn-ghost" type="button">Clear</button>
+                                </div>
                             </div>
                         </div>
+
 
                         <!-- Copied Items staging panel. Opened from the "Copied Items" toolbar button.
                              Lists each staged file/folder (source location, size, date), lets you
