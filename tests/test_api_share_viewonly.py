@@ -1,7 +1,8 @@
 """View-only shares: see-but-not-download.
 
-A view-only share grants the recipient VISIBILITY (open + list + preview) but denies download on the
-download path. A normal (read+download) share still downloads. When a recipient holds BOTH a view-only
+A view-only share grants the recipient VISIBILITY (open the vault, list its items, see names and sizes) but
+denies the download path, which the preview reads through as well: the recipient cannot open the files. A
+normal (read+download) share still downloads. When a recipient holds BOTH a view-only
 and a downloadable share on the same vault, download is resolved PER FILE (downloadable only where a
 non-view-only claim covers it). Share downloads are audited as share_downloaded.
 """

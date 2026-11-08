@@ -230,8 +230,9 @@ def test_a_temporary_credential_is_told_no_usernames_by_the_listing_or_info(admi
 
 
 def test_view_only_share_recipient_gets_no_hash(admin, temp_user_client):
-    """A view-only share can list/preview but NOT download. The content hash is a fingerprint they
-    could not compute themselves, so /info must withhold it (and the usernames)."""
+    """A view-only share can list the items, not download them (nor open them: the preview reads through
+    the download path). The content hash is a fingerprint they could not compute themselves, so /info
+    must withhold it (and the usernames)."""
     _enable_sharing(admin, True)
     v = admin.create_vault(name=unique("vohash"))
     try:

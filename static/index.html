@@ -2571,7 +2571,7 @@
                                 <button type="button" id="nl-tag-add-btn" class="btn btn-secondary">Add tag</button>
                             </div>
                             <div class="p-lg">
-                                <p class="text-secondary text-sm mb-md">A tag is a security <strong>floor</strong> for a link (token length, expiry, whether a password/PIN is required, how many views) and controls <strong>what it can link to</strong> (notes, files, and/or folders). A user creating a link may only make it <em>stronger</em> than its tag, never weaker. Deactivating a tag stops new links under it; existing links keep the policy they were created with. Granular per-user/per-department allowlists are managed via the API for now.</p>
+                                <p class="text-secondary text-sm mb-md">A tag is a security <strong>floor</strong> for a link (token length, expiry, whether a password/PIN is required, how many views) and controls <strong>what it can link to</strong> (notes, files, and/or folders). A user creating a link may only make it <em>stronger</em> than its tag, never weaker. Deactivating a tag stops new links under it; existing links keep the policy they were created with. Per-user and per-department allow-lists are set through the tag's API, not on this page.</p>
                                 <div id="nl-tags-list"></div>
 
                                 <div id="nl-tag-editor" class="card mt-lg" style="display:none;">
@@ -3192,7 +3192,7 @@
                                     <div id="share-dept-picker"></div>
                                 </div>
                                 <div class="form-group" id="share-viewonly-group" style="display:none;">
-                                    <label class="checkbox-label"><input type="checkbox" id="share-view-only" /> View only (recipients can preview but not download)</label>
+                                    <label class="checkbox-label"><input type="checkbox" id="share-view-only" /> View only (recipients see the item's name and size; they cannot open or download it)</label>
                                 </div>
                                 <div id="share-limits-group" style="display:none;">
                                     <div class="form-group"><label for="share-lifetime-days">Expires after (days, optional)</label><input id="share-lifetime-days" type="text" inputmode="numeric" maxlength="7" autocomplete="off" class="input" aria-describedby="share-lifetime-hint" /><small class="form-help" id="share-lifetime-hint"></small></div>

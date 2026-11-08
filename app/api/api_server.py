@@ -25324,7 +25324,7 @@ _DEFAULT_SHARE_TAGS = [
     },
     {
         "name": "Confidential (Read)", "color": "rose",
-        "description": "Sensitive, view-only — recipients can read but not download.",
+        "description": "Sensitive, view-only — recipients see names and sizes; they cannot open or download the files.",
         "allowed_audiences": ["users", "departments"],
         "allow_view_only": True, "default_view_only": True, "force_view_only": True,
         "allow_custom": True, "auto_enroll_new_users": True,

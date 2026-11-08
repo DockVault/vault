@@ -5,10 +5,8 @@ Monitors security events and detects suspicious patterns:
 - Failed login attempts (brute force)
 - Bulk file deletions
 
-Provides alerts through multiple channels:
-- Logging (always enabled)
-- Email notifications (configurable)
-- Webhook notifications (configurable)
+An alert is written to the container log and sent on the live broadcast (the web app's monitor). It is
+not delivered anywhere else: there is no email or webhook delivery of alerts.
 """
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
@@ -576,8 +574,7 @@ class SecurityMonitor:
         
         log_method(f"SECURITY ALERT [{severity.upper()}] {event_type}: {message}")
         
-        # TODO: Send email notification if configured
-        # TODO: Send webhook notification if configured
+        # No delivery beyond the log and the broadcast: there is no email or webhook sending of alerts.
         
         # Broadcast to monitoring dashboard via Redis pub/sub
         if broadcast:

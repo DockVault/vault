@@ -7891,8 +7891,10 @@ function renderLogFlags(data) {
     const host = document.getElementById('log-flags');
     if (!host) return;
     host.textContent = '';
+    // Only the components this deployment serves are offered: a flag for one it cannot serve would be a
+    // promise, and a token minted for it would fetch nothing.
     const serveable = data.serveable || [];
-    (data.components || []).forEach(c => {
+    (data.components || []).filter(c => serveable.includes(c)).forEach(c => {
         const row = document.createElement('label');
         row.className = 'flex items-center gap-sm mb-sm';
         const cb = document.createElement('input');
@@ -7903,12 +7905,6 @@ function renderLogFlags(data) {
         const span = document.createElement('span');
         span.textContent = LOG_COMPONENT_LABELS[c] || c;
         row.append(cb, span);
-        if (!serveable.includes(c)) {
-            const badge = document.createElement('span');
-            badge.className = 'badge badge-secondary';
-            badge.textContent = 'coming soon';
-            row.append(badge);
-        }
         host.appendChild(row);
     });
 }
@@ -20052,7 +20048,7 @@ async function loadUsersForPermission() {
 // ---- Note-link tags manager (admin Settings -> Note Links) --------------------------------------
 // Admin CRUD for the public-note-link policy tags (GET/POST/PATCH/DELETE /note-link-tags). A tag is a
 // security FLOOR. This editor covers the policy + the "everyone may use" auto-enroll switch; granular
-// per-user/department allowlists are API-managed for now. All controls build via DOM (no innerHTML).
+// per-user/department allow-lists are set through the API, not here. All controls build via DOM (no innerHTML).
 let noteLinkTagsCache = [];
 let noteLinkTagsUIWired = false;
 
