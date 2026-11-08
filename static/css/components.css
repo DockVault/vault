@@ -884,6 +884,36 @@ button.vault-sort-dir {
 }
 
 /* Dashboard personal lanes (What's waiting / Favourites / Most recent). Shared by both skins. */
+/* Settings pages (static/index.html, the .settings-nav strip). On a narrow screen the groups are not drawn
+   (display: contents) and the buttons stay the one-row strip; from 1024px the section is a grid: the list of
+   pages at the left under its headings, the open page beside it. Every page is a .tab-btn with its data-tab,
+   so the switching code and the search are the same on both. */
+.settings-nav .settings-nav-group { display: contents; }
+.settings-nav .settings-nav-title { display: none; }
+.settings-nav .settings-nav-group[hidden] { display: none; }
+@media (min-width: 1024px) {
+    #settings-section.active { display: grid; grid-template-columns: 220px minmax(0, 1fr); column-gap: var(--space-xl); align-items: start; }
+    #settings-section > :not(.settings-nav):not(.settings-tab-content) { grid-column: 1 / -1; }
+    #settings-section > .settings-nav { grid-column: 1; grid-row: 3; position: sticky; top: var(--space-md); display: block;
+        border-bottom: 0; overflow: visible; margin-bottom: 0; padding-right: var(--space-sm); }
+    #settings-section > .settings-tab-content { grid-column: 2; grid-row: 3; min-width: 0; }
+    .settings-nav .settings-nav-group { display: block; margin-bottom: var(--space-md); }
+    .settings-nav .settings-nav-group[hidden] { display: none; }
+    .settings-nav .settings-nav-title { display: block; font-size: .72rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+        color: var(--text-tertiary); padding: 0 var(--space-sm); margin: 0 0 .3rem; }
+    #settings-section .settings-nav .tab-btn { display: block; width: 100%; text-align: left; border-bottom: 0; bottom: 0; white-space: normal;
+        border-left: 3px solid transparent; border-radius: var(--radius-sm); padding: .45rem .6rem; font-size: var(--text-sm, .88rem); }
+    #settings-section .settings-nav .tab-btn:hover { background: var(--surface-1); }
+    #settings-section .settings-nav .tab-btn.active { border-left-color: var(--primary, var(--brand-secondary)); background: var(--surface-1);
+        border-bottom-color: transparent; }
+}
+/* A long help text: one sentence, the rest under "More" (static/js/settings-help.js). */
+.form-help .help-more, p.text-secondary .help-more { display: inline; }
+.help-more > summary { display: inline; cursor: pointer; color: var(--primary, var(--brand-secondary)); list-style: none; font-weight: 600; }
+.help-more > summary::-webkit-details-marker { display: none; }
+.help-more[open] > summary { display: none; }
+.help-more > .help-more-text { display: inline; }
+
 /* The stay-or-sign-out warning (static/js/session-watch.js): a ring that empties as the seconds run out. */
 .session-expiry-body { display: flex; flex-direction: column; align-items: center; text-align: center; gap: var(--space-md); }
 .session-ring { position: relative; width: 120px; height: 120px; }

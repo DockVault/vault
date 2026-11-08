@@ -1742,20 +1742,41 @@
                         <button type="button" id="settings-load-retry" class="btn btn-secondary btn-sm">Retry</button>
                     </div>
 
-                    <!-- Settings Tabs -->
-                    <div class="tabs mb-lg">
-                        <button class="tab-btn active" data-tab="general">General</button>
-                        <button class="tab-btn" data-tab="branding">Branding</button>
-                        <button class="tab-btn" data-tab="security">Security</button>
-                        <button class="tab-btn" data-tab="storage">Storage</button>
-                        <button class="tab-btn" data-tab="email">Email</button>
-                        <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
-                        <button class="tab-btn" data-tab="sharing">Sharing</button>
-                        <button class="tab-btn" data-tab="notelinks">Public Links</button>
-                        <button class="tab-btn" data-tab="uploadlinks">Upload Links</button>
-                        <button class="tab-btn" data-tab="accounts">Accounts &amp; Access</button>
-                        <button class="tab-btn" data-tab="logs">Log access</button>
-                        <button class="tab-btn" data-tab="records">Activity and records</button>
+                    <!-- The Settings pages: on a wide screen a list at the left, grouped under five headings
+                         (and a sixth, Sign-in, kept hidden until it has a page); on a phone the same buttons as a
+                         strip, the headings hidden. The groups are CSS only, so every page keeps its data-tab. -->
+                    <div class="tabs mb-lg settings-nav" role="tablist" aria-label="Settings pages">
+                        <div class="settings-nav-group" data-settings-group="organisation">
+                            <span class="settings-nav-title">Organisation</span>
+                            <button class="tab-btn active" data-tab="general">General</button>
+                            <button class="tab-btn" data-tab="branding">Branding</button>
+                            <button class="tab-btn" data-tab="storage">Storage</button>
+                        </div>
+                        <div class="settings-nav-group" data-settings-group="security">
+                            <span class="settings-nav-title">Security and access</span>
+                            <button class="tab-btn" data-tab="security">Security</button>
+                            <button class="tab-btn" data-tab="accounts">Accounts &amp; Access</button>
+                            <button class="tab-btn" data-tab="sftp">SFTP &amp; Encryption</button>
+                        </div>
+                        <div class="settings-nav-group" data-settings-group="sharing">
+                            <span class="settings-nav-title">Sharing and links</span>
+                            <button class="tab-btn" data-tab="sharing">Sharing</button>
+                            <button class="tab-btn" data-tab="notelinks">Public Links</button>
+                            <button class="tab-btn" data-tab="uploadlinks">Upload Links</button>
+                        </div>
+                        <div class="settings-nav-group" data-settings-group="email">
+                            <span class="settings-nav-title">Email</span>
+                            <button class="tab-btn" data-tab="email">Email</button>
+                        </div>
+                        <div class="settings-nav-group" data-settings-group="records">
+                            <span class="settings-nav-title">Records</span>
+                            <button class="tab-btn" data-tab="records">Activity and records</button>
+                            <button class="tab-btn" data-tab="logs">Log access</button>
+                        </div>
+                        <!-- Sign-in providers: filled by their own pages when they exist; hidden until then. -->
+                        <div class="settings-nav-group" data-settings-group="signin" hidden>
+                            <span class="settings-nav-title">Sign-in</span>
+                        </div>
                     </div>
 
                     <!-- General Settings Tab -->
@@ -4354,6 +4375,7 @@
     <script src="/static/js/app.js?v=20261116a"></script>
     <script src="/static/js/dashboard-actions.js?v=20261108a"></script>
     <script src="/static/js/session-watch.js?v=20261108a"></script>
+    <script src="/static/js/settings-help.js?v=20261108a"></script>
     <script src="/static/js/activity.js?v=20261116a"></script>
     <script src="/static/js/audit-integrity.js?v=20261108a"></script>
     <script src="/static/js/activity-archive.js?v=20261108a"></script>

@@ -8295,6 +8295,8 @@ function wireBrandAssetUploads() {
 // pages have tab bars of their own, and a handler of this page on their buttons would clear this page's
 // open tab. Each button is wired once (initSettings() runs on every visit).
 function setupSettingsTabs() {
+    // Long help texts say one sentence, with the rest under "More" (static/js/settings-help.js).
+    if (window.SettingsHelp) { try { SettingsHelp.shorten(); } catch (_) {} }
     const tabButtons = document.querySelectorAll('#settings-section .tabs .tab-btn');
     const tabContents = document.querySelectorAll('.settings-tab-content');
 
