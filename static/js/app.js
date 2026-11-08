@@ -1664,6 +1664,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
         // Store token with storage helper (handles private mode)
         storage.setItem('authToken', authToken);
+        if (window.SessionWatch) SessionWatch.armFromToken(authToken);   // the stay-or-sign-out warning
         
         // FIXED: Use user data from login response (login endpoint returns user object)
         currentUser = data.user;
@@ -1834,6 +1835,7 @@ async function finishSecondFactorLogin(accessToken) {
         _replaceAfterSignIn();
         return;
     }
+    if (window.SessionWatch) SessionWatch.armFromToken(accessToken);
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
     _openOnlyTheHashThePageCameWith();
@@ -2547,6 +2549,7 @@ function logout(how, reason) {
     }
     // Then the session is ended on the server (see above), after that save.
     if (mode === 'end') signOutOver = _endServerSession(endingToken);
+    if (window.SessionWatch) SessionWatch.disarm();
     authToken = null;
     currentUser = null;
     userPermissions = [];
@@ -23033,6 +23036,7 @@ async function _refusesTheSession(resp) {
 async function enterAuthedSession() {
     // A session ended while this waited (a sign-out in another tab, a refusal): its answers write nothing back.
     const asked = _sessionsEnded;
+    if (window.SessionWatch && authToken) SessionWatch.armFromToken(authToken);
     try {
         const resp = await fetch(`${API_BASE}/users/me`, {
             headers: { 'Authorization': `Bearer ${authToken}` }

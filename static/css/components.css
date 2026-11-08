@@ -884,6 +884,17 @@ button.vault-sort-dir {
 }
 
 /* Dashboard personal lanes (What's waiting / Favourites / Most recent). Shared by both skins. */
+/* The stay-or-sign-out warning (static/js/session-watch.js): a ring that empties as the seconds run out. */
+.session-expiry-body { display: flex; flex-direction: column; align-items: center; text-align: center; gap: var(--space-md); }
+.session-ring { position: relative; width: 120px; height: 120px; }
+.session-ring svg { width: 120px; height: 120px; transform: rotate(-90deg); }
+.session-ring .ring-track { fill: none; stroke: var(--border); stroke-width: 8; }
+.session-ring .ring-fill { fill: none; stroke: var(--brand-accent, var(--primary)); stroke-width: 8; stroke-linecap: round;
+    transition: stroke-dashoffset .25s linear; }
+.session-ring .ring-number { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.session-expiry:focus { outline: none; }
+
 /* The dashboard as a place work starts (static/js/dashboard-actions.js). */
 .quick-actions { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-bottom: var(--space-lg); }
 .quick-actions[hidden] { display: none; }

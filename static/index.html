@@ -1151,6 +1151,54 @@
                     </div>
                 </div>
 
+                <!-- A minute before the session ends: stay or sign out (static/js/session-watch.js). No button takes
+                     focus when it opens (data-no-autofocus), so a key pressed by accident chooses nothing. -->
+                <div id="session-expiry-modal" class="modal" data-no-autofocus>
+                    <div class="modal-content session-expiry" style="max-width: 420px;" tabindex="-1">
+                        <div class="modal-header">
+                            <h3>Still there?</h3>
+                            <button class="close-modal-btn modal-close" type="button" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body session-expiry-body">
+                            <div class="session-ring" role="timer" aria-live="off" aria-label="Seconds left">
+                                <svg viewBox="0 0 120 120" aria-hidden="true" focusable="false">
+                                    <circle class="ring-track" cx="60" cy="60" r="52"></circle>
+                                    <circle class="ring-fill" id="session-ring-fill" cx="60" cy="60" r="52"></circle>
+                                </svg>
+                                <div class="ring-number" id="session-expiry-seconds">60</div>
+                            </div>
+                            <p class="text-secondary" id="session-expiry-text">Your session ends in a minute. Stay signed in, or sign out now. If you do nothing, you are signed out when the count reaches zero.</p>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" id="session-signout">Sign out</button>
+                            <button type="button" class="btn btn-primary" id="session-stay">Stay signed in</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Move to vault: files received on an upload link, moved into a vault of the owner's choosing. -->
+                <div id="move-to-vault-modal" class="modal">
+                    <div class="modal-content" style="max-width: 480px;">
+                        <div class="modal-header">
+                            <h3>Move to vault</h3>
+                            <button class="close-modal-btn modal-close" type="button" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p id="mtv-summary" class="text-secondary mb-md"></p>
+                            <div class="form-group">
+                                <label for="mtv-dest">Destination vault</label>
+                                <select id="mtv-dest" class="form-control"></select>
+                                <small class="form-help">Only vaults you can write to. The files leave this drop vault.</small>
+                            </div>
+                            <p id="mtv-error" class="text-sm" style="color:var(--danger,#dc2626);" hidden></p>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                            <button type="button" class="btn btn-primary" id="mtv-move">Move</button>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Note create/edit modal -->
                 <div id="note-editor-modal" class="modal" role="dialog" aria-modal="true">
                     <div class="modal-overlay" data-note-close></div>
@@ -4265,6 +4313,7 @@
     <script src="/static/js/tables.js?v=20261108a"></script>
     <script src="/static/js/app.js?v=20261116a"></script>
     <script src="/static/js/dashboard-actions.js?v=20261108a"></script>
+    <script src="/static/js/session-watch.js?v=20261108a"></script>
     <script src="/static/js/activity.js?v=20261116a"></script>
     <script src="/static/js/audit-integrity.js?v=20261108a"></script>
     <script src="/static/js/activity-archive.js?v=20261108a"></script>

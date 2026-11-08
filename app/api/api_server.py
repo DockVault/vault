@@ -24814,6 +24814,49 @@ def _end_web_session(db, session_token: str, user_id=None):
     return session, ended
 
 
+@app.post("/auth/session/extend")
+async def extend_session(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Stay signed in: a new token for the same account, with the same lifetime a sign-in gets, and the
+    session behind the old token ended at once (its row revoked, its token denylisted for the rest of its
+    life), so the request that asked cannot be replayed: the old token is refused everywhere from here on,
+    and only the browser that asked holds the new one. A temporary credential's session is not extended."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    payload = verify_access_token(token) or {}
+    old_session = payload.get("session_token")
+    if not old_session or payload.get("is_temporary") or getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="This session cannot be extended; sign in again when it ends.")
+    client_ip = get_client_ip(request)
+    auth_service = AuthService(db)
+    session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
+    new_session = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at,
+                                               channel=auth_service.WEB)
+    _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+    claims = {"sub": str(current_user.id), "username": current_user.username, "session_token": new_session,
+              "is_temporary": False}
+    for carried in ("amr", "mfa_at"):   # how this person signed in travels with the session
+        if carried in payload:
+            claims[carried] = payload[carried]
+    access_token = create_access_token(data=claims, expires_delta=_expires)
+    # The old session ends now, durably and at once: a replay of this request carries a dead token.
+    _end_web_session(db, old_session, user_id=current_user.id)
+    import time as _time
+    from app.services.auth_service import denylist_token
+    _ttl = int(payload.get("exp", 0) - _time.time())
+    denylist_token(old_session, _ttl if _ttl > 0 else 1800)
+    try:
+        AuditLogger(db).log_action(action="session_extended", status="success", user=current_user,
+                                   ip_address=client_ip, details={})
+    except Exception:  # noqa: BLE001
+        pass
+    expires_at = (datetime.now(timezone.utc) + _expires).replace(microsecond=0)
+    return {"access_token": access_token, "token_type": "bearer",
+            "expires_at": expires_at.isoformat().replace("+00:00", "Z")}
+
+
 @app.post("/api/logout")
 async def logout(
     request: Request,

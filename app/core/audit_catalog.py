@@ -60,6 +60,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     # A user said they had read the notice of what this vault records, after a change (reading, not consent).
     AuditAction("privacy_notice_seen", "sign_in", "Recording notice read", "info"),
     AuditAction("logout", "sign_in", "Signed out", "info"),
+    AuditAction("session_extended", "sign_in", "Signed-in session extended", "info"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),
     # By an administrator or by the server's operator on the host: the label names neither.

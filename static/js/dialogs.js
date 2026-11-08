@@ -114,7 +114,15 @@
         // prompt focuses its input a moment later) keeps that; this only fills in when nothing did.
         const active = document.activeElement;
         if (active && active !== document.body && !dialog.contains(active)) openers.set(dialog, active);
-        if (!dialog.contains(document.activeElement)) focusInto(dialog);
+        if (!dialog.contains(document.activeElement)) {
+            // A dialog that must not take a choice by accident (data-no-autofocus) gets focus on its box,
+            // not on a button: Tab still stays inside it, Enter and Space choose nothing.
+            if (dialog.hasAttribute('data-no-autofocus')) {
+                const box = dialog.querySelector('.modal-content') || dialog;
+                if (!box.hasAttribute('tabindex')) box.setAttribute('tabindex', '-1');
+                box.focus({ preventScroll: true });
+            } else focusInto(dialog);
+        }
     }
 
     function closed(dialog) {
