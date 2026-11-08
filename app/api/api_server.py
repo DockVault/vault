@@ -28569,6 +28569,9 @@ def _run_lightweight_migrations():
             RETIRE_PASSKEYS_FROM_BEFORE_A_RESET as _RETIRE_PASSKEYS_FROM_BEFORE_A_RESET)
         statements = _retire_ddl + [
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS unlock_remember_minutes INTEGER",
+            # The account signs in only through its identity provider (see User.sso_only). Nullable, so an
+            # older release reads the table without it and every existing account reads as false.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS sso_only BOOLEAN",
             # Per-vault confidentiality tier; 'standard' = today's server-encrypted,
             # SFTP-capable vault (zero-knowledge slots in later, web-only).
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS type VARCHAR(20) NOT NULL DEFAULT 'standard'",

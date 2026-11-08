@@ -213,6 +213,12 @@ class User(Base):
     # Nullable and added by the boot DDL, so an earlier release reads the table without them.
     passkey_required_since = Column(DateTime, nullable=True)
     passkey_requirement_cleared_at = Column(DateTime, nullable=True)
+    # The account signs in only through its linked identity provider: it has no usable password (the
+    # stored hash is of random bytes, never given out) and the password form, SFTP password sign-in and
+    # self-service reset refuse it. Set for an account created at its first provider sign-in, or when
+    # an administrator or the person chooses it; cleared by a reset the account gets a password with.
+    # NULL = false. Nullable and added by the boot DDL, so an earlier release reads the table without it.
+    sso_only = Column(Boolean, nullable=True)
     # The revision of the role defaults this account has been given (app/core/api_catalog.py,
     # FunctionalityGroup.default_since). At each start an account that is not an administrator is given
     # the defaults of its role that are newer than this, once, and it is then set to the current
@@ -3802,6 +3808,176 @@ class WebAuthnCredential(Base):
 
     __table_args__ = (
         Index('idx_webauthn_credential_user', 'user_id'),
+    )
+
+
+# --- Single sign-on -------------------------------------------------------------------------------
+
+class SsoProvider(Base):
+    """An identity provider an administrator configured: an OpenID Connect provider, or a SAML 2.0 one.
+
+    The row is made when the wizard opens (state ``draft``), so the addresses the provider asks for
+    (the redirect URI, the back-channel logout URL; the SAML entity id and ACS) exist before anything
+    is filled in; it becomes ``tested`` after a test sign-in, ``enabled`` when the administrator turns
+    it on, ``disabled`` when turned off (its identities and mappings stay). The client secret is stored
+    encrypted and never returned by any route. ``claims`` maps the vault's names (username, email, name,
+    groups, tenant, email_verified) to the provider's claim names; ``policy`` holds the per-provider
+    settings (restrictions, account creation, linking, groups, MFA trust, sessions), validated by a
+    schema at save. The ``saml_*`` columns are NULL for an OpenID Connect provider. ``last_test`` is the
+    summary of the last test sign-in: the outcome, the claim names seen, whether ``auth_time`` was
+    present, the ``amr``/``acr`` values, ``email_verified``, the group names, and what the vault would
+    do; the tester's own identifiers only, cleared when the tester is erased.
+
+    A NEW table, so create_all builds it on an existing deployment and a release that does not know it
+    simply ignores it."""
+    __tablename__ = 'sso_providers'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    state = Column(String(8), nullable=False, default='draft', server_default='draft')
+    kind = Column(String(8), nullable=False)                         # oidc | saml
+    name = Column(String(60), nullable=False, unique=True)
+    label = Column(String(60), nullable=True)                        # the button text
+    icon = Column(String(20), nullable=True)                         # one of a fixed set shipped with the app
+    sort_order = Column(Integer, nullable=False, default=0, server_default='0')
+    show_on_sign_in = Column(Boolean, nullable=False, default=False, server_default='false')
+    issuer = Column(String(255), nullable=True)                      # what the tokens say; exact string
+    discovery_url = Column(String(255), nullable=True)               # default: <issuer>/.well-known/openid-configuration
+    private_network = Column(Boolean, nullable=False, default=False, server_default='false')
+    client_id = Column(String(255), nullable=True)
+    client_secret_enc = Column(Text, nullable=True)                  # encrypt_secret; never returned
+    token_auth = Column(String(24), nullable=False, default='client_secret_basic',
+                        server_default='client_secret_basic')
+    scopes = Column(String(255), nullable=False, default='openid profile email',
+                    server_default='openid profile email')
+    claims = Column(JSON(none_as_null=True), nullable=True)
+    policy = Column(JSON(none_as_null=True), nullable=True)
+    # SAML 2.0 (NULL for an OpenID Connect provider)
+    saml_idp_entity_id = Column(String(255), nullable=True)
+    saml_sso_url = Column(String(255), nullable=True)
+    saml_idp_certs = Column(JSON(none_as_null=True), nullable=True)  # the provider's signing certificates, PEM
+    saml_name_id_format = Column(String(120), nullable=True)
+    saml_identity_source = Column(String(120), nullable=True)
+    saml_attr_username = Column(String(120), nullable=True)
+    saml_attr_email = Column(String(120), nullable=True)
+    saml_attr_name = Column(String(120), nullable=True)
+    saml_attr_groups = Column(String(120), nullable=True)
+    saml_sign_authn_request = Column(Boolean, nullable=True)
+    saml_want_assertions_encrypted = Column(Boolean, nullable=True)
+    saml_require_signed_response = Column(Boolean, nullable=True)
+    saml_idp_initiated = Column(String(16), nullable=True)           # bounce | refuse
+    saml_clock_skew_seconds = Column(Integer, nullable=True)
+    saml_metadata_url = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Who made it: the account while it exists, and its username after.
+    created_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_by_name = Column(String(255), nullable=True)
+    last_test = Column(JSON(none_as_null=True), nullable=True)
+
+    __table_args__ = (
+        Index('idx_sso_provider_state', 'state'),
+    )
+
+
+class ExternalIdentity(Base):
+    """A link between an account and who a provider says the person is: the provider, the issuer and the
+    subject (an OpenID Connect ``sub``, or a SAML name identifier or attribute: ``subject_source`` says
+    which). One account per subject at a provider, one subject per account at a provider. The email
+    address and display name are those the provider sent when the link was made; ``linked_by`` says how
+    the link came to be (the person, an invitation, account creation at first sign-in, an
+    administrator). ``last_sign_in_at`` is what the freshness rule reads.
+
+    A NEW table; rows cascade with the account and with the provider."""
+    __tablename__ = 'external_identities'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    provider_id = Column(UUID(as_uuid=True), ForeignKey('sso_providers.id', ondelete='CASCADE'), nullable=False)
+    issuer = Column(String(255), nullable=False)
+    subject = Column(Text, nullable=False)                           # a SAML identity may be 256 characters
+    subject_source = Column(String(120), nullable=False)             # oidc:sub | saml:name_id:<format> | saml:attr:<name>
+    tenant_id = Column(String(255), nullable=True)
+    email_at_link = Column(String(320), nullable=True)
+    display_name = Column(String(255), nullable=True)
+    linked_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    linked_by = Column(String(16), nullable=False)                   # self | invitation | jit | admin
+    last_sign_in_at = Column(DateTime, nullable=True)
+
+    user = relationship('User', backref=backref('external_identities', cascade='all, delete-orphan',
+                                                passive_deletes=True))
+    provider = relationship('SsoProvider', backref=backref('identities', cascade='all, delete-orphan',
+                                                           passive_deletes=True))
+
+    __table_args__ = (
+        UniqueConstraint('provider_id', 'subject', name='uq_external_identity_subject'),
+        UniqueConstraint('provider_id', 'user_id', name='uq_external_identity_user'),
+        Index('idx_external_identity_user', 'user_id'),
+    )
+
+
+class SsoSession(Base):
+    """What a session signed in through a provider remembers of that sign-in: the provider, the provider's
+    session id (what a back-channel logout names) and subject, the provider's ``auth_time``, and the ID
+    token, encrypted, only when the provider logout option is on (it is the ``id_token_hint``); NULL
+    otherwise. Goes with the session.
+
+    A NEW table."""
+    __tablename__ = 'sso_sessions'
+
+    session_id = Column(UUID(as_uuid=True), ForeignKey('active_sessions.id', ondelete='CASCADE'), primary_key=True)
+    provider_id = Column(UUID(as_uuid=True), ForeignKey('sso_providers.id', ondelete='CASCADE'), nullable=False)
+    idp_sid = Column(String(255), nullable=True)
+    idp_sub = Column(Text, nullable=True)
+    auth_time = Column(DateTime, nullable=True)
+    id_token_enc = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index('idx_sso_session_sid', 'provider_id', 'idp_sid'),
+        Index('idx_sso_session_sub', 'provider_id', 'idp_sub'),
+    )
+
+
+class SsoGroupMapping(Base):
+    """A provider's group, as the provider sends it (an id or a name), mapped to a department and/or a
+    role. The administrator role is allowed only when the provider's policy says so, and is then applied
+    through a held request (SsoAdminRequest), never at sign-in.
+
+    A NEW table; rows cascade with the provider and with the department."""
+    __tablename__ = 'sso_group_mappings'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider_id = Column(UUID(as_uuid=True), ForeignKey('sso_providers.id', ondelete='CASCADE'), nullable=False)
+    provider_group = Column(String(255), nullable=False)
+    department_id = Column(UUID(as_uuid=True), ForeignKey('groups.id', ondelete='CASCADE'), nullable=True)
+    role = Column(String(16), nullable=True)                         # user | external | admin
+
+    __table_args__ = (
+        UniqueConstraint('provider_id', 'provider_group', name='uq_sso_group_mapping'),
+    )
+
+
+class SsoAdminRequest(Base):
+    """A sign-in found the person in a provider group mapped to the administrator role: the promotion
+    waits here for another administrator's approval (the two-administrator rule), for 7 days. Applied
+    through the same path as a promotion an administrator makes, so the grant records who approved it.
+
+    A NEW table; rows cascade with the account and with the provider; the deciding administrator's
+    username stays after their account is deleted."""
+    __tablename__ = 'sso_admin_requests'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    provider_id = Column(UUID(as_uuid=True), ForeignKey('sso_providers.id', ondelete='CASCADE'), nullable=False)
+    provider_group = Column(String(255), nullable=False)
+    requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    state = Column(String(8), nullable=False, default='held', server_default='held')   # held | approved | denied | expired
+    decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_by_name = Column(String(255), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index('idx_sso_admin_request_user', 'user_id', 'state'),
     )
 
 

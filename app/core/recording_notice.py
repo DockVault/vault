@@ -117,6 +117,20 @@ STORES = (
           "made and last used, and a hash of the session that made it.",
           lambda: "Until you remove it; a passkey an administrator's reset retired, 30 days.",
           table="webauthn_credentials"),
+    Store("external_identities", "Your link to an identity provider: who the provider says you are (its identifier "
+          "for you), the email address and name it sent when the link was made, and when you last signed in through "
+          "it.", lambda: "Until you or an administrator unlink it, or your account is deleted.",
+          table="external_identities"),
+    Store("sso_sessions", "For a session signed in through an identity provider: the provider's session identifier "
+          "and its identifier for you, when the provider signed you in, and, when the provider sign-out option is "
+          "on, the provider's token for that sign-in, encrypted.",
+          _sessions_kept, table="sso_sessions"),
+    Store("sso_providers", "The identity providers administrators configured, who configured each, and the summary "
+          "of its last test sign-in (the tester's own identifiers).",
+          lambda: "Until an administrator removes the provider.", table="sso_providers"),
+    Store("sso_admin_requests", "A sign-in that found you in a provider group mapped to the administrator role: the "
+          "request waiting for another administrator, and who decided it.",
+          lambda: "7 days unless decided; a decided one with the audit log.", table="sso_admin_requests"),
     Store("sign_in_lockouts", "The address of failed sign-ins counted towards a lock.",
           lambda: "Until the lock ends: a day at most.", table="sign_in_lockouts"),
     Store("sign_in_phantoms", "While the cache is down, the address of failed sign-ins for a name that is no "

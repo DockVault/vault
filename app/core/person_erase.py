@@ -617,6 +617,9 @@ STORES: List[Store] = [
                   ("requested_by_name", "decided_by_name")),
     _simple_store("audit_value_removals", "Removals of recorded values they asked for or cancelled",
                   "AuditValueRemoval", ("requested_by_name", "decided_by_name")),
+    _simple_store("sso_providers", "Identity providers they configured", "SsoProvider", ("created_by_name",)),
+    _simple_store("sso_admin_requests", "Administrator requests from a provider group they decided",
+                  "SsoAdminRequest", ("decided_by_name",)),
 ]
 STORE_KEYS = {s.key: s for s in STORES}
 
