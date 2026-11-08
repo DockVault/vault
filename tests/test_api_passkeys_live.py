@@ -121,3 +121,101 @@ def test_a_second_factor_reset_retires_every_passkey(person, admin):
     assert body.get("enrollment_required") is True or body.get("second_factor_required") is True
     # The retired key is gone from the administrator's list too.
     assert admin.get(f"/users/{uid}/passkeys").json()["passkeys"] == []
+
+
+def _claims(token):
+    import base64
+    import json
+    part = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+
+
+def test_a_passkey_signs_a_user_in_and_an_administrator_goes_on_to_the_password(person, admin):
+    client, uid = person
+    r, auth = _register(client, "sign-in key")
+    assert r.status_code == 201, r.text
+    anon = ApiClient()
+    # The challenge, with the account's key offered by name; the assertion; a session with amr hwk and mfa_at.
+    r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/options", json={"username": client.username}, timeout=15)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["options"]["publicKey"]["allowCredentials"]) == 1
+    credential = auth.get_assertion(body["options"], _public_url(), sign_count=1)
+    r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/verify",
+                          json={"challenge_id": body["challenge_id"], "credential": credential}, timeout=15)
+    assert r.status_code == 200, r.text
+    signed = r.json()
+    assert signed["user"]["username"] == client.username and signed["is_temporary"] is False
+    claims = _claims(signed["access_token"])
+    assert claims["amr"] == ["hwk"] and "mfa_at" in claims
+    # The token works, and the key remembers the sign-in.
+    me = ApiClient()
+    me.token = signed["access_token"]
+    me.session.headers["Authorization"] = f"Bearer {signed['access_token']}"
+    listed = me.get("/users/me/passkeys").json()["passkeys"]
+    assert listed[0]["last_used_at"] is not None
+    # The same assertion again: the challenge is spent.
+    r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/verify",
+                          json={"challenge_id": body["challenge_id"], "credential": credential}, timeout=15)
+    assert r.status_code == 401
+    # A replayed counter on a device-bound key is refused and counted against the account.
+    r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/options", json={}, timeout=15)
+    body = r.json()
+    assert body["options"]["publicKey"]["allowCredentials"] == []
+    credential = auth.get_assertion(body["options"], _public_url(), sign_count=1)
+    r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/verify",
+                          json={"challenge_id": body["challenge_id"], "credential": credential}, timeout=15)
+    assert r.status_code == 401 and r.json()["detail"] == "That passkey was not accepted."
+    # An unknown name and a name without keys get the same shape as a known one.
+    for name in ("nobody-" + uid[:8], admin.user["username"] if getattr(admin, "user", None) else "admin"):
+        r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/options", json={"username": name}, timeout=15)
+        assert r.status_code == 200 and r.json()["options"]["publicKey"]["allowCredentials"] == []
+    # The sign-in page may show the passkey button.
+    assert anon.session.get(f"{anon.base_url}/auth/policy", timeout=15).json()["methods"]["passkeys"] is True
+
+
+def test_an_administrators_passkey_leads_to_the_password_step(admin):
+    """A second administrator (made for this test, so the stack's own stays untouched) registers a key with the
+    password, signs in with it, lands on the password step, and finishes with the password: both kinds in amr, no
+    code asked. The stack's administrator then resets that account's second factor, which retires the key."""
+    other = admin.create_user(role="admin")
+    try:
+        client = ApiClient()
+        client.login(other["_username"], other["_password"])
+        r = client.post("/users/me/passkeys/register/options", json={"current_password": other["_password"]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        auth = SoftAuthenticator()
+        r = client.post("/users/me/passkeys/register/verify",
+                        json={"challenge_id": body["challenge_id"],
+                              "credential": auth.make_credential(body["options"], _public_url()), "label": "admin key"})
+        assert r.status_code == 201, r.text
+        anon = ApiClient()
+        r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/options", json={}, timeout=15)
+        body = r.json()
+        credential = auth.get_assertion(body["options"], _public_url(), sign_count=1)
+        r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/verify",
+                              json={"challenge_id": body["challenge_id"], "credential": credential}, timeout=15)
+        assert r.status_code == 200, r.text
+        pending = r.json()
+        assert pending["stage"] == "password" and pending["second_factor_required"] is True
+        assert pending["access_token"] is None and pending["username"] == other["_username"]
+        # The password finishes it: amr carries both kinds, mfa_at is set, no code is asked.
+        r = anon.session.post(f"{anon.base_url}/auth/login",
+                              json={"username": other["_username"], "password": other["_password"]},
+                              headers={"Authorization": f"Bearer {pending['pre_auth_token']}"}, timeout=15)
+        assert r.status_code == 200, r.text
+        claims = _claims(r.json()["access_token"])
+        assert sorted(claims["amr"]) == ["hwk", "pwd"] and "mfa_at" in claims
+        # A wrong password at that step is refused and the pre-auth token is spent after its cap, as at the form.
+        r = anon.session.post(f"{anon.base_url}/auth/login",
+                              json={"username": other["_username"], "password": "not-it"},
+                              headers={"Authorization": f"Bearer {pending['pre_auth_token']}"}, timeout=15)
+        assert r.status_code == 401
+        # The stack's administrator resets the second factor: the key is retired, the account signs in with the
+        # password and must set a factor up again.
+        r = admin.post(f"/users/{other['id']}/second-factor/reset")
+        assert r.status_code == 200, r.text
+        assert admin.get(f"/users/{other['id']}/passkeys").json()["passkeys"] == []
+    finally:
+        admin.delete_user(other["id"])

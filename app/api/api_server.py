@@ -6004,8 +6004,9 @@ def _sign_in_methods(db) -> dict:
     account", or neither), ``passkeys`` (a passkey button), ``providers`` (the single sign-on buttons, each
     ``{id, label, kind, icon, order}``: never a secret, never an issuer). Nothing else rides along: the page
     renders from this object and from nothing in the settings blob. The passkey and provider settings fill it
-    in as they land; today the form alone."""
-    return {"password": "visible", "passkeys": False, "providers": []}
+    in as they land; the passkey button shows when the deployment can take a passkey sign-in (a usable
+    public address), the provider buttons when their items land."""
+    return {"password": "visible", "passkeys": _passkey_sign_in_ready(db), "providers": []}
 
 
 def _email_has_pending_invite(db: Session, email: str) -> bool:
@@ -11795,6 +11796,210 @@ async def admin_remove_passkey(
         pass
     _notify_credential_change(db, cc.PASSKEY, target, outcome.result, by_name=current_user.username)
     return {"removed": True}
+
+
+# --- Passkeys: signing in ------------------------------------------------------------------------
+# Public: a challenge (with the account's keys offered when a name is given and the account has keys, an
+# empty list otherwise, one shape for every case), then the browser's assertion verified against the stored
+# key and handed to the sign-in pipeline, which applies the account state and the lockouts and decides what
+# follows: the whole sign-in (a user-verified passkey of a user the policy lets in without a password), or
+# the password step (administrators always, auditors, a key without user verification).
+
+PASSKEY_CHALLENGE_LIMIT = 60            # public challenge requests per address per PASSKEY_CHALLENGE_WINDOW
+PASSKEY_CHALLENGE_WINDOW = 600
+PASSKEY_SIGN_IN_ROLES = (RoleEnum.USER, RoleEnum.EXTERNAL)    # until the passkey settings land (never admin)
+
+
+class PasskeySignInOptionsRequest(BaseModel):
+    username: Optional[str] = Field(default=None, max_length=320)
+
+
+class PasskeySignInVerifyRequest(BaseModel):
+    challenge_id: str = Field(min_length=1, max_length=64)
+    credential: dict
+
+
+def _passkey_sign_in_ready(db) -> bool:
+    """Whether this deployment can take a passkey sign-in at all: a usable public address."""
+    from app.services import webauthn_service as ws
+    return ws.relying_party("") is not None
+
+
+def _passkey_limit_challenge(client_ip: str) -> None:
+    """Issuing a challenge has its own limiter, not the login throttle: the sign-in page asks for one on every
+    load, and an office behind one address must not lock itself out of the form. Fails closed."""
+    from app.core import sign_in_lockout
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=sign_in_lockout.source_of(client_ip),
+                                                 limit=PASSKEY_CHALLENGE_LIMIT, window=PASSKEY_CHALLENGE_WINDOW,
+                                                 prefix="passkey_challenge", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many requests. Try again later.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, PASSKEY_CHALLENGE_WINDOW))})
+
+
+def _passkey_account_for(db, username):
+    """The account a sign-in names, by the deployment's identifier policy (username, email, or either), or None.
+    Never raises and never tells the caller which case it was."""
+    if not isinstance(username, str) or not username.strip():
+        return None
+    from app.core.email_identity import find_user_by_email
+    policy = _login_identifier(db)
+    if policy == "email":
+        return find_user_by_email(db, username)
+    user = db.query(User).filter(User.username == username).first()
+    if user is None and policy == "either":
+        user = find_user_by_email(db, username)
+    return user
+
+
+def _passkey_passwordless_allowed(db, user) -> bool:
+    """Whether a user-verified passkey may be the whole sign-in for ``user``: a user or external account whose
+    role the policy lets in without a password, holding no auditor right in force. Administrators (and so
+    every case approver) always add the password; the table in app/services/sign_in.py applies the rest."""
+    from app.core import auditor_rights
+    if getattr(user, "role", None) not in PASSKEY_SIGN_IN_ROLES:
+        return False
+    return not auditor_rights.auditor_live(db, user).live
+
+
+def _passkey_b64url_decode(text) -> Optional[bytes]:
+    """The bytes behind a base64url text the browser (or the challenge store) sent, or None when it is not one."""
+    import base64
+    if not isinstance(text, str) or not text or len(text) > 2048:
+        return None
+    try:
+        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (ValueError, TypeError):
+        return None
+
+
+def _passkey_raw_id(credential) -> Optional[bytes]:
+    return _passkey_b64url_decode(credential.get("rawId")) if isinstance(credential, dict) else None
+
+
+def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, record: bool = True):
+    """The generic refusal of a passkey sign-in: an audit row (naming the account only when a known key named
+    it), the security monitor's counter, and for a known account the lockouts' count. 401, one message."""
+    audit_logger = AuditLogger(db)
+    username = user.username if user is not None else ""
+    try:
+        record_id = audit_logger.log_login_failure(username, client_ip, reason, account=user,
+                                                   login_identifier="passkey")
+    except Exception:      # noqa: BLE001
+        record_id = None
+    if user is not None and record:
+        try:
+            AuthService(db)._record_failed_login(user.username, client_ip, user)
+        except Exception:      # noqa: BLE001 -- the count is best-effort; the refusal stands
+            db.rollback()
+    _fire_offloop(_record_failed_login_bg, username, client_ip, reason, record_id)
+    return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="That passkey was not accepted.")
+
+
+@app.post("/auth/passkeys/sign-in/options")
+async def passkey_sign_in_options(
+    body: PasskeySignInOptionsRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """A challenge for signing in with a passkey. With a username, ``allowCredentials`` lists that account's
+    keys when the account exists and has keys; in every other case (no name, an unknown name, a name without
+    keys) it is an empty list and the browser offers the person's discoverable keys. The three cases are
+    indistinguishable to the caller."""
+    from app.core import webauthn_challenges
+    from app.services import webauthn_service as ws
+    client_ip = get_client_ip(request)
+    _passkey_limit_challenge(client_ip)
+    rp = ws.relying_party("")
+    if rp is None:
+        raise HTTPException(status_code=409, detail="Passkeys are not available on this deployment.")
+    policy = _passkey_policy(db)
+    allow = []
+    user = _passkey_account_for(db, body.username)
+    if user is not None:
+        allow = [(c.credential_id, tuple(c.transports or ())) for c in _passkeys_of(db, user.id)]
+    try:
+        challenge = webauthn_challenges.issue(
+            webauthn_challenges.SIGN_IN, user_id=str(user.id) if user is not None and allow else None,
+            allow_ids=[ws.b64url(cid) for cid, _t in allow])
+    except webauthn_challenges.Unavailable:
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
+    options = ws.authentication_options(rp, policy, challenge=challenge.challenge_bytes, allow=allow)
+    return {"challenge_id": challenge.id, "options": options, "expires_in": webauthn_challenges.TTL_SECONDS}
+
+
+@app.post("/auth/passkeys/sign-in/verify")
+async def passkey_sign_in_verify(
+    body: PasskeySignInVerifyRequest,
+    request: Request,
+    _offload_slot: None = Depends(auth_offload_slot),
+    db: Session = Depends(get_db),
+):
+    """Finish a passkey sign-in: spend the challenge, find the key by its id, refuse an account whose lockout
+    is in force, verify the assertion, update the key's counter and flags, and hand the result to the sign-in
+    pipeline, which answers as ``/auth/login`` does: a session, a pending password step, or a pending second
+    factor. Every refusal is one message; an unknown key counts against the address, a known key's failure
+    against its account as a wrong password does."""
+    from app.core import sign_in_lockout, webauthn_challenges
+    from app.core.models import WebAuthnCredential
+    from app.services import webauthn_service as ws
+    from app.services.auth_service import admin_locked
+    client_ip = get_client_ip(request)
+    try:
+        challenge = webauthn_challenges.take(body.challenge_id, purpose=webauthn_challenges.SIGN_IN)
+    except webauthn_challenges.Unavailable:
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
+    if challenge is None:
+        raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="passkey challenge unknown or expired")
+    rp = ws.relying_party("")
+    if rp is None:
+        raise HTTPException(status_code=409, detail="Passkeys are not available on this deployment.")
+    raw_id = _passkey_raw_id(body.credential)
+    row = (db.query(WebAuthnCredential).filter(WebAuthnCredential.credential_id == raw_id).first()
+           if raw_id else None)
+    if row is None or row.retired_at is not None:
+        raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
+    user = db.query(User).filter(User.id == row.user_id).first()
+    if user is None:
+        raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
+    if challenge.user_id is not None and challenge.user_id != str(user.id):
+        raise _passkey_sign_in_refused(db, request, client_ip, user=user, reason="passkey of another account")
+    # The lockouts, before the signature is checked, as the password path does (a locked account's guesses
+    # stay bounded; an administrator's lock is reported after the proof, by the pipeline).
+    lock = sign_in_lockout.lock_in_force(db, user.id, client_ip)
+    if lock is None and admin_locked(user):
+        lock = sign_in_lockout.count_at_limit(db, user.id, client_ip,
+                                              administrator=sign_in_lockout.is_administrator(user))
+    if lock is not None:
+        raise _sign_in_lock_refusal(AccountLockedError("locked", locked_until=lock.locked_until, scope=lock.scope))
+    known = ws.KnownKey(credential_id=row.credential_id, public_key_cose=row.public_key_cose, cose_alg=row.cose_alg,
+                        sign_count=int(row.sign_count or 0), backup_eligible=bool(row.backup_eligible),
+                        user_id=ws.user_handle_for(row.user_id), transports=tuple(row.transports or ()))
+    allow_ids = [decoded for decoded in (_passkey_b64url_decode(e) for e in challenge.allow_ids) if decoded]
+    try:
+        assertion = ws.verify_authentication(rp, _passkey_policy(db), challenge=challenge.challenge_bytes,
+                                             credential=body.credential, key=known, allow_ids=allow_ids)
+    except ws.Refused as refused:
+        raise _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}")
+    row.sign_count = assertion.sign_count
+    row.backup_state = assertion.bs
+    row.last_used_at = datetime.utcnow()
+    db.commit()
+    method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
+    result = sign_in.SignInResult(user, [method], client_ip, user_verified=assertion.uv,
+                                  passwordless_allowed=_passkey_passwordless_allowed(db, user))
+    try:
+        outcome = sign_in.finish(db, result)
+    except AccountLockedError as locked:
+        raise _sign_in_lock_refusal(locked)
+    if isinstance(outcome, sign_in.PendingStep):
+        return JSONResponse(status_code=200, content=outcome.body)
+    return LoginResponse(access_token=outcome.access_token, user=UserResponse.model_validate(user),
+                         is_temporary=False, is_scoped_temp=False)
 
 
 # --- Second factor: admin policy matrix ------------------------------------------------------------
