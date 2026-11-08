@@ -353,9 +353,12 @@ class ChainState:
 
     @view_read.setter
     def view_read(self, value: bool) -> None:
+        # A clear writes the flag before it moves the epoch, and view_mark() reads the epoch before the flag: a mark
+        # taken while a clear is under way is None, and one taken before it holds an epoch the clear moves on. So no
+        # mark taken across a clear can match the epoch again once a check has set the flag back.
+        self._view_read = bool(value)
         if not value:
             self.view_epoch += 1
-        self._view_read = bool(value)
 
     def view_mark(self) -> Optional[int]:
         """What a reader outside the chain lock takes before it reads the view: None while the view is not read

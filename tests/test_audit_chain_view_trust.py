@@ -5,15 +5,15 @@ still_read and trusted), offline, on a throwaway SQLite database with a chain of
   yet, and sets it again only once it has read the chain through: held between accepting such a seal and the next
   step, no reader answers from the view;
 - a reader that began before a check cleared the flag, and finishes after the check set it again, does not answer
-  from what it read either (the flag's mark moved);
+  from what it read either (the flag's mark moved), nor does one whose mark was taken during the clear;
 - a check that ends before the record's link has verified the seals it accepted (a database error while the seals
   are read, a record that does not match, later put right) starts the view again, so the next check reads them from
   the first seal and meets a break of the key sequence among them itself: the pass reports it;
 - while the view is not read through, nothing that comes from it is shown or acted on: the settings page's values,
   its list of waiting changes and what it says of the chain, the lists' delay, whether the install ran before, the
   chain's hold and numbers, the warnings an administrator acknowledges, the changes and cancels saved while sealing
-  is stopped, the checks against the genesis seal, and the pruner's jobs that read the view outside the chain
-  lock;
+  is stopped, the checks against the genesis seal, the erase and removal lists' entries, and the pruner's jobs that
+  read the view outside the chain lock;
 - while sealing is stopped and the view is not read through, a change of a setting the chain records is refused
   saying so (never that it deletes records sooner), except turning the hold on, told by its spec: it is saved from
   the database's value and sealed from the database once a check reads the chain through; with sealing running, a
@@ -168,6 +168,62 @@ def test_a_reader_that_fails_on_a_view_a_check_is_changing_is_told_the_view_is_n
             archive.archives(st)
     finally:
         st.view = real
+
+
+def test_a_mark_taken_while_a_check_clears_the_flag_never_trusts_what_was_read_during_the_check(env):
+    """A reader outside the chain lock may take its mark (the epoch, then the flag) at any instant, the instants
+    inside a check's clear of the flag among them, and then read the view while the check holds seals below the head
+    record's that the record's link has not verified yet (a part of the chain only). Whatever the instant, the mark
+    never lets it trust what it read: not while the check holds such a seal, and not once the check has read the
+    chain through either (a clear writes the flag before it moves the epoch, so a mark taken during it is none)."""
+    _archived(env)
+    st = env.st
+    before, after = _sealed_elsewhere(env)
+    marks, held = [], []
+
+    class Hooked(type(st)):
+        @property
+        def _view_read(self):
+            return self.__dict__["_vr"]
+
+        @_view_read.setter
+        def _view_read(self, value):
+            self.__dict__["_vr"] = value
+            if self.__dict__.get("_armed") and not value:
+                marks.append(self.view_mark())       # a reader switched in right after the flag was written
+
+        @property
+        def view_epoch(self):
+            return self.__dict__["_ve"]
+
+        @view_epoch.setter
+        def view_epoch(self, value):
+            self.__dict__["_ve"] = value
+            if self.__dict__.get("_armed"):
+                marks.append(self.view_mark())       # ... or right after the epoch moved
+
+    st.__dict__["_vr"] = st.__dict__.pop("_view_read")
+    st.__dict__["_ve"] = st.__dict__.pop("view_epoch")
+    st.__class__ = Hooked
+    st.__dict__["_armed"] = True
+    real = st.view.accept
+
+    def accept(seal, link):
+        real(seal, link)
+        if seal.seq < after:
+            # Below the record's seal: the view holds a seal the record's link has not verified, and a reader reads.
+            held.append([st.still_read(m) for m in marks])
+    st.view.accept = accept
+    try:
+        with ai.ChainWriter(env.engine, st, check_key=False, writer="reader"):
+            pass
+    finally:
+        del st.view.accept
+        st.__dict__["_armed"] = False
+    assert st.view_read is True and st.view.position == after
+    assert marks and len(held) == after - before - 1
+    assert not any(any(trusted) for trusted in held)
+    assert [m for m in marks if st.still_read(m)] == []
 
 
 # --------------------------------------------------------------------------- a check that ends before the record's link
@@ -549,6 +605,35 @@ def test_with_the_view_not_read_through_and_sealing_running_a_change_is_judged_b
     assert out["status"] == "pending" and out["change"]["setting"] == 400
     assert [s.kind for s in env.seals()[seals + 1:]] == ["request"]
     assert seen == [("logs_hold", True, seals), ("audit_max_days", True, seals + 1)]
+
+
+def test_while_the_view_is_not_read_through_a_listed_erase_or_removal_holds_nothing_from_it(env, monkeypatch):
+    """The erase and removal lists build their entries from no view while it is not read through: a request the unread
+    view holds waiting (its seals not verified) gives no seq, no run date from its seal and no cancel, only the row's
+    copies and the status unread. Read through, the same request in the view gives them."""
+    from app.core import audit_value_removal as removal
+    from app.core import person_erase as pe
+    _archived(env)
+    rid = uuid.uuid4()
+    when = T0 + timedelta(days=7)
+    row = SimpleNamespace(id=rid, status="pending", placeholder="erased-0000abcd", requested_by_name="alice",
+                          requested_at=T0, effective_at=when, started_at=None, completed_at=None, decided_by_name=None,
+                          decided_at=None, waiting=None, counts=None, levels=["full"], before=T0)
+    sealed = {"request": str(rid), "not_before": "2027-01-01T00:00:00Z", "placeholder": "erased-1111abcd",
+              "new": {"levels": ["minimal"], "before": "2026-01-01T00:00:00Z"}}
+    first = env.st
+    unread = _not_read_through(env)
+    for module, what in ((pe, "erase"), (removal, "removal")):
+        for st in (first, unread):
+            monkeypatch.setitem(st.view.requests, 9999, dict(sealed, what=what))
+        (read,) = pe._listed([row], first, module.entry_of)
+        assert (read["status"], read["request_seq"], read["effective_at"], read["cancellable"]) == (
+            module.PENDING, 9999, "2027-01-01T00:00:00Z", True), what
+        (e,) = pe._listed([row], unread, module.entry_of)
+        assert (e["status"], e["request_seq"], e["effective_at"], e["cancellable"]) == (
+            pe.UNREAD, None, module._iso(when), False), what
+        assert e.get("through") is None and e.get("placeholder", row.placeholder) == row.placeholder
+        assert e.get("levels", row.levels) == row.levels
 
 
 def test_a_cancel_while_sealing_is_stopped_is_refused_when_the_view_was_cleared_while_it_was_judged(env):
