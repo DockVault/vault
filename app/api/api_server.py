@@ -8271,9 +8271,13 @@ async def refresh_device_secret_endpoint(
 # Authentication Endpoints
 
 # --- Second factor: the two-step login (no session until the second factor) -----------------------
+# How a sign-in is finished, whatever proved the person, lives in app/services/sign_in.py; the routes here
+# verify a proof and hand it over.
 
-PRE_AUTH_TTL_MINUTES = 5
-_SF_LOGIN_MAX_ATTEMPTS = 5
+from app.services import sign_in  # noqa: E402  (after the models and security imports it reads)
+
+PRE_AUTH_TTL_MINUTES = sign_in.PRE_AUTH_TTL_MINUTES
+_SF_LOGIN_MAX_ATTEMPTS = sign_in.MAX_PENDING_ATTEMPTS
 
 
 def _sf_user_group_ids(db, user) -> list:
@@ -8321,50 +8325,19 @@ def _sf_login_methods(db, user) -> list:
 def _delete_session_by_token(db, session_token):
     """Delete the ActiveSession the password step just created, so an MFA login leaves no usable session
     before the second factor. The stored value is the token's SHA-256 hash."""
-    if not session_token:
-        return
-    from app.core.models import ActiveSession
-    db.query(ActiveSession).filter(
-        ActiveSession.session_token == hash_session_token(session_token)).delete(synchronize_session=False)
-    db.commit()
-
-
-def _begin_pending_login(db, user, client_ip, *, enrollment_required: bool) -> str:
-    """Insert a pending_logins row and mint the pre-auth token: stage=second_factor, pre_auth=<id>, and
-    crucially NO session_token, with a 5-minute exp. The missing session_token is the confinement —
-    get_current_user, the /ws/monitor handshake and POST /api/logout each refuse a token without one."""
-    pending = PendingLogin(user_id=user.id, client_ip=client_ip, enrollment_required=enrollment_required,
-                           expires_at=datetime.now(timezone.utc) + timedelta(minutes=PRE_AUTH_TTL_MINUTES))
-    db.add(pending)
-    db.commit()
-    return create_access_token(
-        data={"sub": str(user.id), "username": user.username, "stage": "second_factor",
-              "pre_auth": str(pending.id)},
-        expires_delta=timedelta(minutes=PRE_AUTH_TTL_MINUTES))
-
-
-def _sf_pending_response(db, user, client_ip):
-    """The pre-authenticated login response for an in-effect user: enrolled -> present a factor; required
-    but not enrolled (pending) -> enrollment_required."""
-    eff = _second_factor_effective(db, user)
-    enrollment_required = (eff["state"] == "pending")
-    token = _begin_pending_login(db, user, client_ip, enrollment_required=enrollment_required)
-    return JSONResponse(status_code=200, content={
-        "access_token": None, "second_factor_required": True,
-        "enrollment_required": enrollment_required,
-        "methods": [] if enrollment_required else _sf_login_methods(db, user),
-        "pre_auth_token": token,
-    })
+    sign_in.delete_session_by_token(db, session_token)
 
 
 async def get_pre_auth_principal(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db),
 ):
-    """Resolve a pre-authenticated (password-verified, second-factor-pending) principal from a pre-auth
-    token. Rejects a normal session token (no `stage`), a bad signature, and an expired/consumed row."""
+    """Resolve a pre-authenticated (second-factor-pending) principal from a pre-auth token. Rejects a
+    normal session token (no `stage`), a password-stage token (POST /auth/login reads those), a bad
+    signature, an expired/consumed row, and a second-factor stage a passkey reached without the password
+    (sign_in.read_pre_auth). The proofs so far ride on the pending row for the route."""
     payload = verify_access_token(credentials.credentials)
-    if not payload or payload.get("stage") != "second_factor" or not payload.get("pre_auth"):
+    if not payload or payload.get("stage") != sign_in.STAGE_SECOND_FACTOR or not payload.get("pre_auth"):
         raise HTTPException(status_code=401, detail="A valid pre-authentication token is required.")
     pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
     exp = pending.expires_at if pending else None
@@ -8375,6 +8348,7 @@ async def get_pre_auth_principal(
     user = db.query(User).filter(User.id == pending.user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid pre-authentication token.")
+    sign_in.read_pre_auth(payload, pending)
     return user, pending
 
 
@@ -8389,7 +8363,7 @@ async def get_enrolling_principal(
     real session once activation succeeds. A pre-auth token whose pending row is NOT enrollment_required
     is refused here — an already-enrolled user finishing login uses /auth/second-factor/verify."""
     payload = verify_access_token(credentials.credentials)
-    if payload and payload.get("stage") == "second_factor" and payload.get("pre_auth"):
+    if payload and payload.get("stage") == sign_in.STAGE_SECOND_FACTOR and payload.get("pre_auth"):
         pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
         exp = pending.expires_at if pending else None
         if exp is not None and exp.tzinfo is None:
@@ -8401,6 +8375,7 @@ async def get_enrolling_principal(
         user = db.query(User).filter(User.id == pending.user_id).first()
         if not user:
             raise HTTPException(status_code=401, detail="Invalid pre-authentication token.")
+        sign_in.read_pre_auth(payload, pending)
         return user, pending
     # Normal session token: delegate to the hardened session dependency.
     user = await get_current_user(credentials, db)
@@ -8436,20 +8411,14 @@ async def second_factor_login_verify(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
                             headers={"Retry-After": str(retry_after_seconds(reset, 300))})
-    if (pending.attempts or 0) >= _SF_LOGIN_MAX_ATTEMPTS:
-        pending.consumed_at = datetime.now(timezone.utc)
-        db.commit()
-        raise HTTPException(status_code=401, detail="Too many attempts on this login; start again.")
+    sign_in.too_many_attempts(db, pending)
     # Allowlist the method against what login actually offers this account (the enrolled method +
     # recovery) — defense in depth so only a genuine second factor is ever presented at login. The
     # account password is the FIRST factor and is never a login second factor.
     login_methods = set(_sf_login_methods(db, user))
     if (body.method or "").lower() not in login_methods or not sf.check_second_factor(
             db, user=user, action="login", method=body.method, code=body.code):
-        pending.attempts = (pending.attempts or 0) + 1
-        if pending.attempts >= _SF_LOGIN_MAX_ATTEMPTS:
-            pending.consumed_at = datetime.now(timezone.utc)
-        db.commit()
+        sign_in.count_failed_attempt(db, pending)
         # A wrong login second factor was previously invisible in both the audit log and the live
         # monitor. Record it as a failed action and push it to the monitor as a security event.
         try:
@@ -8470,25 +8439,14 @@ async def second_factor_login_verify(
         except Exception:  # noqa: BLE001
             pass
         raise HTTPException(status_code=401, detail="That code is not valid.")
-    # Consume the pending row (single winner) before minting the session.
-    if db.query(PendingLogin).filter(PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
-            {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False) != 1:
-        db.commit()
-        raise HTTPException(status_code=401, detail="This login attempt was already completed.")
-    db.commit()
-    auth_service = AuthService(db)
-    session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-    session_token = auth_service._create_session(user, None, client_ip, expires_at=session_expires_at,
-                                                 channel=auth_service.WEB)
-    _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
-    access_token = create_access_token(
-        data={"sub": str(user.id), "username": user.username, "session_token": session_token,
-              "is_temporary": False, "amr": ["pwd", (body.method or "").lower()],
-              "mfa_at": int(datetime.now(timezone.utc).timestamp()), "sign_in_id": _new_sign_in_id()},
-        expires_delta=_expires)
+    # The factor is right: the pipeline spends the pending row (single winner), makes the session and the
+    # token (amr = the proofs so far plus this factor) and the records of a finished sign-in.
+    signed = sign_in.complete_sign_in(db, sign_in.SignInResult(
+        user, sign_in.methods_so_far(pending) + [(body.method or "").lower()], client_ip,
+        pending=pending, provider_id=sign_in.provider_of(pending)))
+    access_token = signed.access_token
     recovery_used = (body.method or "").lower() == "recovery"
     try:
-        AuditLogger(db).log_login_success(user, client_ip, is_temporary=False)
         if recovery_used:
             AuditLogger(db).log_action(action="second_factor_recovery_used", status="success", user=user,
                                        ip_address=client_ip, details={})
@@ -8608,6 +8566,9 @@ async def second_factor_step_up(
                                                 session_hash=session_hash)}
 
 
+_login_bearer = HTTPBearer(auto_error=False)
+
+
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
     login_request: LoginRequest,
@@ -8619,10 +8580,18 @@ async def login(
     # off the loop. See app/core/auth_offload.py.
     _offload_slot: None = Depends(auth_offload_slot),
     db: Session = Depends(get_db),
+    # A password-stage pre-authentication token (a sign-in that proved a passkey or a provider identity
+    # and must add the password): absent at the sign-in form, so nothing is required here.
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_login_bearer),
 ):
     """
     Authenticate user and return access token.
     Supports both regular users and temporary credentials.
+
+    With a password-stage pre-authentication token (``stage: password``, from a sign-in that proved who
+    the person is another way and must add the account password), the password is checked for the
+    account that sign-in named, under the same lockouts and counts as at the form, plus the pending
+    login's own cap on wrong answers; a right password continues that sign-in (app/services/sign_in.py).
     """
     auth_service = AuthService(db)
     audit_logger = AuditLogger(db)
@@ -8630,10 +8599,15 @@ async def login(
     # The sign-in method this attempt is resolved under, which a failed attempt's audit row follows too (an
     # account is named there only when the name could have signed in to it).
     login_identifier = "username"
-    
+    pending = None
+
     try:
+        pending = sign_in.read_password_stage(
+            verify_access_token(credentials.credentials) if credentials is not None else None, db)
         # Check if this is a temporary credential (starts with "temp_")
         if login_request.username.startswith("temp_"):
+            if pending is not None:
+                raise InvalidCredentialsError("Invalid username or password")
             # Authenticate as temporary credential
             user, session_token = await run_offloaded(
                 auth_service.authenticate_temporary_credential,
@@ -8644,12 +8618,22 @@ async def login(
                 # wrong credential, and it is not spent) — it belongs at the SFTP door only.
                 allow_device_credential=False,
             )
-            is_temporary = True
+            result = sign_in.SignInResult(user, [sign_in.PASSWORD], client_ip, session_token=session_token,
+                                          is_temporary=True, temp_username=login_request.username)
         else:
-            # Regular user authentication. The org policy decides whether the submitted value is
-            # resolved as a username, an email, or either — the temp_ branch above stays first and
-            # policy-independent (temp usernames are their own namespace, never an email).
-            login_identifier = _login_identifier(db)
+            if pending is not None:
+                # The password stage: the account is the one the pending login names, by its exact
+                # username; another name is refused like a wrong password and counts against the pending
+                # login, so a token cannot be turned on a different account.
+                sign_in.too_many_attempts(db, pending)
+                staged_user = db.query(User).filter(User.id == pending.user_id).first()
+                if staged_user is None or login_request.username != staged_user.username:
+                    raise InvalidCredentialsError("Invalid username or password")
+            else:
+                # Regular user authentication. The org policy decides whether the submitted value is
+                # resolved as a username, an email, or either — the temp_ branch above stays first and
+                # policy-independent (temp usernames are their own namespace, never an email).
+                login_identifier = _login_identifier(db)
             user, session_token = await run_offloaded(
                 auth_service.authenticate_user,
                 login_request.username,
@@ -8657,88 +8641,31 @@ async def login(
                 client_ip,
                 login_identifier=login_identifier,
             )
-            is_temporary = False
-            # Two-step login: if the second factor is in effect for this account, hand out NO session
-            # yet. Delete the session authenticate_user just created, stand up a pending_login, and
-            # return a pre-auth response; the real session is minted by /auth/second-factor/verify.
-            # Honours the `login` action's require_otp master switch (off -> no factor at login).
-            if _login_second_factor_in_effect(db, user):
-                _delete_session_by_token(db, session_token)
-                try:
-                    audit_logger.log_action(action="login_password_ok", status="success", user=user,
-                                            ip_address=client_ip, details={})
-                except Exception:  # noqa: BLE001
-                    pass
-                return _sf_pending_response(db, user, client_ip)
+            result = sign_in.SignInResult(user, sign_in.methods_so_far(pending) + [sign_in.PASSWORD], client_ip,
+                                          session_token=session_token, pending=pending,
+                                          provider_id=sign_in.provider_of(pending))
 
-        # Create JWT token (include session_token for session validation). A REGULAR session honours
-        # the admin 'Session Timeout' setting (falling back to the env default); a temp credential
-        # keeps the default token life — its own validity window is enforced separately.
-        _expires = None
-        if not is_temporary:
-            _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
-        access_token = create_access_token(
-            data={
-                "sub": str(user.id),
-                "username": user.username,
-                "session_token": session_token if session_token else None,
-                "is_temporary": is_temporary,
-                "sign_in_id": _new_sign_in_id(),
-            },
-            expires_delta=_expires,
-        )
-        
-        audit_logger.log_login_success(user, client_ip, is_temporary=is_temporary)
-        
-        # Broadcast login event to monitoring. For a temp login, tag the event with
-        # the owning account so its session can be notified (and so non-admins only
-        # receive their own temp-login events — see the /ws/monitor filter).
-        login_event = {
-            "type": "login",
-            "title": "User logged in",
-            "description": f"{user.username} logged in" + (" (temporary)" if is_temporary else ""),
-            "user": user.username,
-            "ip": client_ip,
-            "is_temporary": is_temporary,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        if is_temporary:
-            login_event["temp_username"] = login_request.username
-            login_event["owner_user_id"] = str(user.id)
-        # OFF the event loop: during a Redis outage this publish stalls a socket timeout on a cold
-        # breaker, and on the loop that freezes every concurrent request. Fire-and-forget — a login
-        # must not wait on its own telemetry. include_metrics=False: a login event does not need the
-        # six COUNT queries (a full count(File.id) among them) that metrics enrichment runs.
-        _fire_offloop(broadcast_event, {"event": login_event}, include_metrics=False)
-
-        # Persist the owner-facing "your temporary credential just signed in" as an in-app
-        # notification too (the WS toast is transient; this is the durable bell/history record). No
-        # dedup key — every temp-credential sign-in is a distinct, notable event. Best-effort.
-        if is_temporary:
-            # INLINE: the durable notification ROW must exist within the login response, so it is not
-            # queued (and never shed). _notify_users writes the row on its own DB session and fires
-            # only its live WS nudge off the loop as a droppable broadcast — the row is durable, the
-            # nudge is best-effort.
-            _notify_users(
-                [str(user.id)], "temp_login",
-                title="Temporary credential signed in",
-                body=f"{login_request.username} signed in" + (f" from {client_ip}" if client_ip else ""),
-                target="#temp-creds",
-            )
-        else:
-            # A real account sign-in optionally emails the owner a "New sign-in alert" (opt-in; the
-            # default template uses {{current_datetime}}, so no action_context is required). Best-effort.
-            _fire_action_email(db, "login_alert", email=user.email, username=user.username)
+        # The pipeline decides whether a step follows (the second factor, its enrollment) and holds the
+        # sign-in in a pending login with no session if so; otherwise it makes the session, the token
+        # (amr, auth_time, mfa_at) and the records every sign-in makes (the audit row, the live-monitor
+        # event, the sign-in alert, the owner's notice of a temporary credential's sign-in).
+        outcome = sign_in.finish(db, result)
+        if isinstance(outcome, sign_in.PendingStep):
+            return JSONResponse(status_code=200, content=outcome.body)
 
         from app.core.temp_scope import is_scoped as _is_scoped
         return LoginResponse(
-            access_token=access_token,
+            access_token=outcome.access_token,
             user=UserResponse.model_validate(user),
-            is_temporary=is_temporary,
+            is_temporary=outcome.is_temporary,
             is_scoped_temp=_is_scoped(user),
         )
-    
+
     except (InvalidCredentialsError, AccountLockedError, SessionLimitExceededError) as e:
+        if pending is not None:
+            # A wrong answer at the password stage counts against the pending login too (the lockouts
+            # already counted it as a failed sign-in to the account, as at the form).
+            sign_in.count_failed_attempt(db, pending)
         # SessionLimitExceededError joins here so a temp credential that already has a live session
         # gets the SAME generic 401 as a wrong credential, never an uncaught 500 -- a 500 on the login
         # door is a "this credential is live and in use" oracle. Only AccountLockedError branches to a
@@ -11126,28 +11053,15 @@ async def acknowledge_recovery_codes(
     db.commit()
 
     if pending is not None:
-        # Forced-enrollment login: consume the pending row (single winner) and mint the real session.
-        # There are no older sessions to revoke — a required-but-unenrolled user never held one.
+        # Forced-enrollment login: the pipeline spends the pending row (single winner) and mints the real
+        # session, the factor just enrolled counting as this sign-in's second proof. There are no older
+        # sessions to revoke — a required-but-unenrolled user never held one.
         client_ip = get_client_ip(request)
-        if db.query(PendingLogin).filter(
-                PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
-                {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False) != 1:
-            db.commit()
-            raise HTTPException(status_code=401, detail="This login attempt was already completed.")
-        db.commit()
-        auth_service = AuthService(db)
-        session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-        session_token = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at,
-                                                     channel=auth_service.WEB)
-        _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
-        access_token = create_access_token(
-            data={"sub": str(current_user.id), "username": current_user.username,
-                  "session_token": session_token, "is_temporary": False,
-                  "amr": ["pwd", "totp"], "mfa_at": int(datetime.now(timezone.utc).timestamp()),
-                  "sign_in_id": _new_sign_in_id()},
-            expires_delta=_expires)
+        signed = sign_in.complete_sign_in(db, sign_in.SignInResult(
+            current_user, sign_in.methods_so_far(pending) + [sign_in.TOTP], client_ip,
+            pending=pending, provider_id=sign_in.provider_of(pending)))
+        access_token = signed.access_token
         try:
-            AuditLogger(db).log_login_success(current_user, client_ip, is_temporary=False)
             AuditLogger(db).log_action(action="second_factor_enrolled", status="success", user=current_user,
                                        ip_address=client_ip, details={"method": "totp", "forced": True})
         except Exception:      # noqa: BLE001

@@ -226,6 +226,8 @@ _IDENTIFIER_KEYS = (
     "repeat_count", "last_repeat", "change",
     "password_set_at", "sign_in_locks_cleared", "from_revision", "to_revision", "dek_epoch", "team_epoch",
     "proof_rows_deleted",
+    # how a sign-in proved who the person is: the session's amr values (pwd, totp, a passkey, ...)
+    "methods",
     # an administrator's clean-up of unfinished uploads
     "scanned_dirs", "dirs_removed", "bytes_reclaimed", "rows_pruned", "active_sessions_kept", "idle_minutes",
     # a vault's settings after a change

@@ -296,18 +296,23 @@ class AuditLogger:
         self,
         user: User,
         ip_address: str,
-        is_temporary: bool = False
+        is_temporary: bool = False,
+        methods: Optional[list] = None,
     ):
-        """Log successful login."""
+        """Log successful login. ``methods`` names how the person proved who they are (the session's
+        ``amr`` values: ``pwd``, ``totp``, a passkey, ...), when the caller knows."""
+        details = {
+            'is_temporary': is_temporary,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        if methods:
+            details['methods'] = list(methods)
         self.log_action(
             action="login_success",
             status="success",
             user=user,
             ip_address=ip_address,
-            details={
-                'is_temporary': is_temporary,
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
+            details=details,
         )
     
     def log_login_failure(
