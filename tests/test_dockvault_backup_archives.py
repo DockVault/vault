@@ -156,6 +156,44 @@ def test_a_backup_records_each_archives_checksum_and_size(tmp_path, monkeypatch)
         assert e["sha256"] == _sha(archive) and e["size"] == archive.stat().st_size
 
 
+def test_a_backups_manifest_is_the_same_bytes_wherever_the_backup_is_made(tmp_path, monkeypatch):
+    """manifest.json, whose bytes a sealed backup authenticates, ends its lines with a line feed alone: on Windows
+    too, where a file written as text ends each line with a carriage return as well."""
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchlf")
+    raw = (bundle / "manifest.json").read_bytes()
+    assert raw.count(b"\n") > 10 and b"\r" not in raw
+    assert raw == json.dumps(json.loads(raw.decode("utf-8")), indent=2).encode("utf-8")
+
+
+@pytest.mark.parametrize("bundle_kind", ["plain", "sealed-before-manifests-were-authenticated",
+                                         "sealed-with-its-manifest-authenticated"])
+def test_a_backup_whose_manifest_has_windows_line_ends_restores(tmp_path, monkeypatch, bundle_kind):
+    """Earlier versions wrote manifest.json as text, so a backup made with them on Windows ends each of its lines
+    with a carriage return as well (and one sealed with its manifest authenticated has the MAC of those bytes). Read
+    as it is, it restores."""
+    if bundle_kind != "plain":
+        pytest.importorskip("cryptography")
+    if bundle_kind == "sealed-with-its-manifest-authenticated":
+        bundle = _backed_up(tmp_path, monkeypatch, "dvarchwin", lock=True)
+    else:
+        bundle = _old_backup(tmp_path, "dvarchwin", sealed=bundle_kind != "plain")
+    man = bundle / "manifest.json"
+    raw = json.dumps(json.loads(man.read_bytes().decode("utf-8")), indent=2).replace("\n", "\r\n").encode("utf-8")
+    man.write_bytes(raw)
+    assert raw.count(b"\r\n") > 10
+    if bundle_kind == "sealed-with-its-manifest-authenticated":
+        _payload, dek = _sealed_payload(bundle)
+        (bundle / dv.BUNDLE_MANIFEST_MAC).write_bytes(json.dumps(
+            {"dockvault_manifest_mac": 1, "hmac_sha256": dv.manifest_mac(dek, raw)}).encode("utf-8") + b"\n")
+    host_env = (tmp_path / ".env").read_bytes()
+    (tmp_path / ".env").unlink()
+    steps = []
+    _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(
+        _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt") if bundle_kind != "plain" else None))
+    assert steps[0] == ("stop",) and ("start",) in steps
+    assert (tmp_path / ".env").read_bytes() == host_env
+
+
 @pytest.mark.parametrize("written", ["nothing", "empty", "truncated", "not-an-archive"])
 def test_a_backup_whose_archive_did_not_reach_the_host_folder_whole_fails(tmp_path, monkeypatch, capsys, written):
     """The container's tar exited 0, but what reached the bundle (nothing, when Docker writes to a folder of its own;

@@ -6668,7 +6668,9 @@ class DockVault:
         manifest = build_backup_manifest(prefix, env.get("DEPLOYMENT_ID", "default"), entries,
                                           gen_salt(), env, created=ts)
         try:
-            with open(os.path.join(bundle, "manifest.json"), "w", encoding="utf-8") as f:
+            # Its lines end with a line feed alone wherever the backup is made (text written on Windows would end
+            # each with a carriage return as well): a sealed backup authenticates these very bytes (manifest_mac).
+            with open(os.path.join(bundle, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(manifest, f, indent=2)
         except OSError as exc:
             self._fail_backup(bundle, "failed to write the manifest: %s" % exc)
