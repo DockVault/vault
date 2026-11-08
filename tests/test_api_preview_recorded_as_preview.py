@@ -82,14 +82,14 @@ def test_a_preview_keeps_every_gate(admin, a_file, temp_user_client):
     assert _actions(file_id) == before
 
 
-def test_a_capped_shares_preview_spends_a_download_as_before(admin, temp_user_client, temp_user):
-    """Counting is unchanged for now: a preview of a shared file spends one of the recipient's downloads and
-    is recorded as a shared file downloaded, with the preview rows instead of the download rows."""
+def test_a_capped_shares_preview_is_counted_as_a_preview(admin, temp_user_client, temp_user):
+    """A share recipient's preview through the download route (purpose=preview) is recorded as a shared file
+    previewed and counted apart from downloads: the one download the share allows is still there after it."""
     sharing_before = admin.get("/settings").json().get("sharing_enabled")
     admin.put("/settings", json={"sharing_enabled": True})
     vault = admin.create_vault(name=unique("capped"))
     try:
-        file_id = _upload(admin, vault["id"], unique("deck") + ".txt", b"the deck\n" * 10)
+        file_id = _upload(admin, vault["id"], unique("deck") + ".txt", b"the deck" * 10)
         tag = admin.post("/share-tags", json={"name": unique("once"), "allowed_audiences": ["anyone_internal"],
                                               "max_downloads_cap": 5, "max_recipients_cap": 10,
                                               "auto_enroll_new_users": True})
@@ -102,10 +102,11 @@ def test_a_capped_shares_preview_spends_a_download_as_before(admin, temp_user_cl
         r = temp_user_client.get(f"/vaults/{vault['id']}/files/{file_id}/download", params={"purpose": "preview"})
         assert r.status_code == 200, r.text
         new = _actions(file_id)[len(before):]
-        assert new == ["file_previewed:authorized", "share_downloaded:success", "file_preview_completed:success"], new
-        # The one download the share allowed is spent.
+        assert new == ["file_previewed:authorized", "share_previewed:success", "file_preview_completed:success"], new
+        # The preview allowance is spent; the one download is not.
         again = temp_user_client.get(f"/vaults/{vault['id']}/files/{file_id}/download", params={"purpose": "preview"})
-        assert again.status_code == 403 and "limit" in again.text, again.text
+        assert again.status_code == 403 and "preview limit" in again.text, again.text
+        assert temp_user_client.get(f"/vaults/{vault['id']}/files/{file_id}/download").status_code == 200
     finally:
         admin.delete_vault(vault["id"])
         admin.put("/settings", json={"sharing_enabled": sharing_before})

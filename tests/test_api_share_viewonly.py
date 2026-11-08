@@ -1,8 +1,9 @@
-"""View-only shares: see-but-not-download.
+"""View-only shares: view in the browser, never download.
 
-A view-only share grants the recipient VISIBILITY (open the vault, list its items, see names and sizes) but
-denies the download path, which the preview reads through as well: the recipient cannot open the files. A
-normal (read+download) share still downloads. When a recipient holds BOTH a view-only
+A view-only share grants the recipient VISIBILITY (open the vault, list its items, see names and sizes) and the
+preview route (the file's bytes served inline, never cached, recorded as a preview and counted apart from
+downloads against the same cap), but denies the download path: the recipient cannot download. A normal
+(read+download) share still downloads. When a recipient holds BOTH a view-only
 and a downloadable share on the same vault, download is resolved PER FILE (downloadable only where a
 non-view-only claim covers it). Share downloads are audited as share_downloaded.
 """
@@ -84,6 +85,11 @@ def test_view_only_whole_vault_sees_all_but_no_download(admin, temp_user_client)
         assert {"a.txt", "b.txt"} <= _names(temp_user_client, v["id"])
         # ...but cannot download anything
         assert temp_user_client.get(f"/vaults/{v['id']}/files/{a}/download").status_code == 403
+        # ...while the preview route shows it, inline and uncached
+        p = temp_user_client.get(f"/vaults/{v['id']}/files/{a}/preview")
+        assert p.status_code == 200 and p.content == b"aaa", p.text
+        assert p.headers["Content-Disposition"].startswith("inline;")
+        assert "no-store" in p.headers["Cache-Control"]
     finally:
         admin.delete_vault(v["id"])
 

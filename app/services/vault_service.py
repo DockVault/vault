@@ -2008,6 +2008,7 @@ class VaultService:
         user: User,
         file_password: Optional[str],
         allow_share: bool,
+        view_only_ok: bool = False,
     ):
         """Authorize a download and return `(file, vault)`.
 
@@ -2039,7 +2040,10 @@ class VaultService:
             require_file_scope(self.db, user, file.vault_id, file_id)
             # View-only shares grant visibility but not download: the file may be in the visible scope
             # yet outside the downloadable scope.
-            require_download_scope(self.db, user, file.vault_id, file_id)
+            # A preview (view_only_ok) needs the file in the VISIBLE scope only: a view-only share claim
+            # grants exactly that. A download needs the DOWNLOADABLE scope too.
+            if not view_only_ok:
+                require_download_scope(self.db, user, file.vault_id, file_id)
 
         # Check file password if set
         if file.password_hash:
@@ -2059,6 +2063,7 @@ class VaultService:
         user: User,
         file_password: Optional[str] = None,
         allow_share: bool = False,
+        view_only_ok: bool = False,
     ):
         """The same download, opened for streaming instead of returned whole.
 
@@ -2068,7 +2073,7 @@ class VaultService:
 
         Returns a :class:`BoundedDownload`. The caller owns it and must close it.
         """
-        file, vault = self._resolve_download(file_id, user, file_password, allow_share)
+        file, vault = self._resolve_download(file_id, user, file_password, allow_share, view_only_ok=view_only_ok)
         return self._open_stored_file(file, vault, file_id, whole=False)
 
     def open_random_reader(

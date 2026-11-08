@@ -3557,7 +3557,7 @@ function _sharedCard(it) {
 
     const meta = _el('div', 'vault-meta');
     if (it.view_only) {
-        const s = _el('span'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only'));
+        const s = _el('span'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only (preview in the browser, no download)'));
         meta.appendChild(s);
     }
     if (it.max_downloads != null) {
@@ -16061,9 +16061,9 @@ function _renderPdfNotInline(bodyEl) {
 async function _renderTextWindow(bodyEl, fileId, fileName, fsize, headers) {
     const win = TEXT_WINDOW_FETCH_BYTES;
     const h = { ...headers, 'Range': `bytes=0-${win - 1}` };
-    // Asked for as a preview: the server records that the content was sent to the browser to be shown, not
-    // downloaded. Every gate and count is a download's.
-    const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download?purpose=preview`, { headers: h });
+    // The preview route: served inline and never cached, recorded as a preview, and open to a view-only
+    // share's recipient; otherwise every gate is a download's.
+    const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/preview`, { headers: h });
     if (!resp.ok && resp.status !== 206) throw new Error('Could not load file (status ' + resp.status + ')');
     let got = 0;
     const chunks = [];
@@ -16215,8 +16215,9 @@ async function openFilePreview(fileId, fileName, mime) {
             return;
         }
 
-        // Asked for as a preview: recorded as content sent to the browser to be shown, not as a download.
-        const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download?purpose=preview`, { headers });
+        // The preview route: served inline and never cached, recorded as a preview, and open to a view-only
+        // share's recipient; otherwise every gate is a download's.
+        const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/preview`, { headers });
         if (!resp.ok) throw new Error('Could not load file (status ' + resp.status + ')');
         // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering, reading from
         // the body rather than a materialised copy. Preview needs the whole plaintext in the end

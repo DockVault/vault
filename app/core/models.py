@@ -686,6 +686,9 @@ class ShareClaim(Base):
     claimed_at = Column(DateTime, default=datetime.utcnow)
     last_access_at = Column(DateTime, nullable=True)
     download_count = Column(Integer, nullable=False, default=0)
+    # Previews in the browser, counted apart from downloads against the same per-recipient cap: a
+    # view-only share's recipient may preview, never download.
+    preview_count = Column(Integer, nullable=False, default=0, server_default='0')
     revoked = Column(Boolean, nullable=False, default=False)  # single-recipient kick
 
     __table_args__ = (

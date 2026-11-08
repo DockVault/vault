@@ -484,6 +484,16 @@ class PermissionService:
         smap[str(vault_id)] = scope
 
     def burn_share_download(self, user: User, vault: Vault, file, ancestor_folder_ids):
+        """Consume one download; see :meth:`burn_share_access`."""
+        return self.burn_share_access(user, vault, file, ancestor_folder_ids, kind='download')
+
+    def burn_share_preview(self, user: User, vault: Vault, file, ancestor_folder_ids):
+        """Consume one preview. A preview is counted apart from downloads, against the same
+        per-recipient ``max_downloads`` cap, and a view-only claim counts here (a view-only recipient may
+        preview, never download); see :meth:`burn_share_access`."""
+        return self.burn_share_access(user, vault, file, ancestor_folder_ids, kind='preview')
+
+    def burn_share_access(self, user: User, vault: Vault, file, ancestor_folder_ids, kind='download'):
         """Consume ONE download against the per-recipient ``max_downloads`` of the SHARE claims that
         cover this file (each recipient gets their own per-share download budget). Returns
         ``(allowed, burned_claim_ids)``: ``allowed`` is True to allow / False to deny (a covering LIMITED
@@ -511,20 +521,26 @@ class PermissionService:
         now = datetime.utcnow()
         anc = {str(a) for a in (ancestor_folder_ids or [])}
         fid = str(file.id)
+        # ``kind`` says which counter: a download consumes download_count and only a non-view-only claim
+        # covers it; a preview consumes preview_count and every claim covers it (a view-only share grants
+        # exactly that). Each is a separate budget against the same cap.
+        counter = ShareClaim.preview_count if kind == 'preview' else ShareClaim.download_count
+        filters = [
+            ShareClaim.user_id == user.id,
+            ShareClaim.revoked.is_(False),
+            Share.vault_id == vault.id,
+            Share.status == 'active',
+            Share.expires_at > now,
+        ]
+        if kind != 'preview':
+            filters.append(Share.view_only.is_(False))
         rows = (
             self.db.query(ShareClaim.id, Share.max_downloads, Share.target_type,
                           Share.target_folder_id, Share.target_file_id,
                           Share.claim_audience, Share.audience_user_ids,
                           Share.audience_department_ids)
             .join(Share, Share.id == ShareClaim.share_id)
-            .filter(
-                ShareClaim.user_id == user.id,
-                ShareClaim.revoked.is_(False),
-                Share.vault_id == vault.id,
-                Share.view_only.is_(False),
-                Share.status == 'active',
-                Share.expires_at > now,
-            )
+            .filter(*filters)
             .all()
         )
         gids = self._current_group_ids(user)
@@ -559,8 +575,8 @@ class PermissionService:
         for claim_id, max_dl in covering:
             res = self.db.execute(
                 update(ShareClaim)
-                .where(ShareClaim.id == claim_id, ShareClaim.download_count < max_dl)
-                .values(download_count=ShareClaim.download_count + 1)
+                .where(ShareClaim.id == claim_id, counter < max_dl)
+                .values({counter.key: counter + 1})
             )
             if res.rowcount == 0:
                 self.db.rollback()
@@ -568,6 +584,11 @@ class PermissionService:
             burned.append(claim_id)
         self.db.commit()
         return True, burned
+
+    def refund_share_preview(self, claim_ids) -> int:
+        """Return previews :meth:`burn_share_preview` consumed when the server then failed to serve the
+        file; the same contract as :meth:`refund_share_download`."""
+        return self._refund_share(claim_ids, ShareClaim.preview_count)
 
     def refund_share_download(self, claim_ids) -> int:
         """Return downloads that :meth:`burn_share_download` consumed when the SERVER then failed to
@@ -582,14 +603,17 @@ class PermissionService:
         a capped share uncapped by disconnecting. Commits the request session (mirroring the burn's
         transaction ownership); a no-op returning 0 on an empty list (an unlimited share or a non-share
         download burned nothing)."""
+        return self._refund_share(claim_ids, ShareClaim.download_count)
+
+    def _refund_share(self, claim_ids, counter) -> int:
         if not claim_ids:
             return 0
         refunded = 0
         for claim_id in claim_ids:
             res = self.db.execute(
                 update(ShareClaim)
-                .where(ShareClaim.id == claim_id, ShareClaim.download_count > 0)
-                .values(download_count=ShareClaim.download_count - 1)
+                .where(ShareClaim.id == claim_id, counter > 0)
+                .values({counter.key: counter - 1})
             )
             refunded += res.rowcount
         self.db.commit()

@@ -160,6 +160,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("share_claimed", "shares", "Share accepted", "info"),
     AuditAction("share_created", "shares", "Share created", "notice"),
     AuditAction("share_downloaded", "shares", "Shared file downloaded", "info"),
+    AuditAction("share_previewed", "shares", "Shared file sent to the browser for a preview", "info"),
     AuditAction("share_expired", "shares", "Share expired", "info"),
     AuditAction("share_opened", "shares", "Shared vault opened", "info"),
     AuditAction("share_revoked", "shares", "Share revoked", "notice"),

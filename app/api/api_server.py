@@ -16362,6 +16362,7 @@ async def list_share_claims(
         "user_id": str(c.user_id),
         "username": username,
         "download_count": c.download_count,
+        "preview_count": c.preview_count or 0,
         "revoked": bool(c.revoked),
         "claimed_at": c.claimed_at.isoformat() if c.claimed_at else None,
         "last_access_at": c.last_access_at.isoformat() if c.last_access_at else None,
@@ -16560,6 +16561,7 @@ def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         "max_downloads": share.max_downloads,
         "download_count": claim.download_count,
+        "preview_count": claim.preview_count or 0,
         "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
     }
 
@@ -20203,8 +20205,9 @@ def _download_media_type(value: Optional[str]) -> str:
     return "application/octet-stream" if _browser_runs(safe) else safe
 
 
-def _content_disposition(file_name: str) -> str:
-    """Build an RFC 6266 Content-Disposition for a download. Includes an ASCII-only
+def _content_disposition(file_name: str, inline: bool = False) -> str:
+    """Build an RFC 6266 Content-Disposition for a download (``inline`` for a preview the browser shows
+    rather than saves; the name is kept so a Save from the viewer has it). Includes an ASCII-only
     filename= fallback AND a UTF-8 filename* so non-Latin-1 names (any unicode name —
     now common since filenames round-trip through at-rest encryption) download correctly
     instead of raising a header-encoding error (the raw f'filename=\"{name}\"' form 500s
@@ -20225,7 +20228,8 @@ def _content_disposition(file_name: str) -> str:
     ).strip() or 'download'
     # RFC 5987 ext-value: percent-encode everything outside attr-char (safe='' -- the default safe='/'
     # would leave a separator raw). The name is already separator-free; quote handles control chars.
-    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
+    kind = 'inline' if inline else 'attachment'
+    return f"{kind}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
 
@@ -22645,14 +22649,43 @@ async def download_file(
 ):
     """Download a file while exposing a cancellable, principal-bound operation.
 
-    ``purpose=preview`` is how the web app asks for the bytes it shows in its preview and text window.
-    It changes only what the audit rows say: the content was sent to the browser for a preview
-    (file_previewed, file_preview_completed) rather than downloaded. Every gate, the transfer slot and a
-    share's download count are exactly what a download gets: a preview discloses the content as a
-    download does, and a word from the client is a label for the record, never a key to anything."""
+    ``purpose=preview`` (an older web app's way of asking) records the transfer as a preview; it changes
+    nothing else. The preview route below is what the web app uses now."""
+    return await _serve_file(vault_id, file_id, request, file_password, current_user, db, x_vault_password,
+                             as_preview=(purpose == 'preview'), view_only_ok=False)
+
+
+@app.get("/vaults/{vault_id}/files/{file_id}/preview")
+@require_endpoint_permission("FILE_DOWNLOAD")
+@require_vault_cap("file.download")
+async def preview_file(
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    request: Request,
+    file_password: Optional[str] = Header(None, alias="X-File-Password"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    x_vault_password: Optional[str] = Header(None),
+):
+    """The file's bytes for the browser to show, not to save: served inline and never cached, recorded
+    as a preview (file_previewed, file_preview_completed, share_previewed), and for a share recipient
+    counted apart from downloads against the same per-recipient cap.
+
+    Every gate of the download route applies (the endpoint permission, the file.download capability of a
+    temporary credential, the vault password, a file's password, the file scope, the transfer slot), with
+    one difference: a view-only share claim, which grants visibility and not download, may read through
+    here. A preview discloses the content as a download does and cannot stop copying; what the share's
+    maker is told says so. A zero-knowledge vault's file is ciphertext either way."""
+    return await _serve_file(vault_id, file_id, request, file_password, current_user, db, x_vault_password,
+                             as_preview=True, view_only_ok=True)
+
+
+async def _serve_file(vault_id, file_id, request, file_password, current_user, db, x_vault_password,
+                      *, as_preview: bool, view_only_ok: bool):
+    """Serve a file's bytes as a download or a preview (the two routes above)."""
     from app.services.activity_monitor import ProgressTracker
 
-    is_preview = purpose == 'preview'
+    is_preview = as_preview
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
@@ -22682,7 +22715,10 @@ async def download_file(
             allow_share=True,
         )
         require_file_scope(db, current_user, vault_id, file_id)
-        require_download_scope(db, current_user, vault_id, file_id)
+        # A view-only share claim covers a preview and not a download: only a download asks for the
+        # downloadable scope (here at the door, and again after the wait for a slot).
+        if not view_only_ok:
+            require_download_scope(db, current_user, vault_id, file_id)
 
         # The file must belong to the vault used for the access/password gate. Resolved before the
         # transfer slot is taken: naming a file that is not there costs nothing to answer, and a
@@ -22710,7 +22746,10 @@ async def download_file(
         current_user, vault = _admitted_again(db, token, vault_id, password_hash_before, "FILE_DOWNLOAD",
                                               "file.download", allow_share=True)
         require_file_scope(db, current_user, vault_id, file_id)
-        require_download_scope(db, current_user, vault_id, file_id)
+        # A view-only share claim covers a preview and not a download: only the download route asks
+        # for the downloadable scope.
+        if not view_only_ok:
+            require_download_scope(db, current_user, vault_id, file_id)
         file_record = _the_file()
         start_operation(operation_id)
 
@@ -22720,7 +22759,8 @@ async def download_file(
         share_authorized = str(vault_id) in (
             getattr(current_user, '_share_vault_scope', None) or {})
         if share_authorized:
-            allowed, burned_share_claim_ids = permission_service.burn_share_download(
+            burn = permission_service.burn_share_preview if is_preview else permission_service.burn_share_download
+            allowed, burned_share_claim_ids = burn(
                 current_user,
                 vault,
                 file_record,
@@ -22729,7 +22769,8 @@ async def download_file(
             if not allowed:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="This share has reached its download limit.",
+                    detail=("This share has reached its preview limit." if is_preview
+                            else "This share has reached its download limit."),
                 )
 
         # Opened, not read. The walk inside this authenticates the terminal and settles
@@ -22740,6 +22781,7 @@ async def download_file(
             user=current_user,
             file_password=file_password,
             allow_share=True,
+            view_only_ok=view_only_ok,
         )
         file_name, mime_type = download.name, download.mime_type
 
@@ -22801,15 +22843,26 @@ async def download_file(
 
         if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
             try:
-                audit_logger.log_action(
-                    action='share_downloaded',
-                    status='success',
-                    user=current_user,
-                    resource_type='file',
-                    resource_id=str(file_id),
-                    details={'vault_id': str(vault_id)},
-                    ip_address=get_client_ip(request),
-                )
+                if is_preview:
+                    audit_logger.log_action(
+                        action='share_previewed',
+                        status='success',
+                        user=current_user,
+                        resource_type='file',
+                        resource_id=str(file_id),
+                        details={'vault_id': str(vault_id)},
+                        ip_address=get_client_ip(request),
+                    )
+                else:
+                    audit_logger.log_action(
+                        action='share_downloaded',
+                        status='success',
+                        user=current_user,
+                        resource_type='file',
+                        resource_id=str(file_id),
+                        details={'vault_id': str(vault_id)},
+                        ip_address=get_client_ip(request),
+                    )
             except Exception:
                 db.rollback()
 
@@ -22938,7 +22991,7 @@ async def download_file(
                 # a corrupt blob, and a colluding writer could otherwise trigger refunds at will.
                 if burned_share_claim_ids and is_refundable_serve_failure(failure):
                     try:
-                        permission_service.refund_share_download(burned_share_claim_ids)
+                        (permission_service.refund_share_preview if is_preview else permission_service.refund_share_download)(burned_share_claim_ids)
                     except Exception:      # noqa: BLE001 - a failed refund must not mask the transfer
                         try:
                             db.rollback()
@@ -23179,11 +23232,12 @@ async def download_file(
             # not on the slot -- so a response held in any other variable would be torn down
             # while the generator serving it was still running.
             range_headers = {
-                'Content-Disposition': _content_disposition(disp_name),
+                'Content-Disposition': _content_disposition(disp_name, inline=is_preview),
                 'Content-Length': str(wanted.length),
                 'Content-Range': wanted.content_range(),
                 'Accept-Ranges': 'bytes',
-                'Cache-Control': 'no-cache',
+                # A preview is for the screen, never for a cache (a shared browser, a proxy).
+                'Cache-Control': 'no-store' if is_preview else 'no-cache',
                 'X-Operation-ID': operation_id,
             }
             if etag:
@@ -23205,11 +23259,12 @@ async def download_file(
             return streaming_response
 
         headers = {
-            'Content-Disposition': _content_disposition(disp_name),
+            'Content-Disposition': _content_disposition(disp_name, inline=is_preview),
             # From the terminal the walk authenticated, so a stream that stops
             # early is a short body the client can detect.
             'Content-Length': str(download.total_length),
-            'Cache-Control': 'no-cache',
+            # A preview is for the screen, never for a cache (a shared browser, a proxy).
+            'Cache-Control': 'no-store' if is_preview else 'no-cache',
             'X-Operation-ID': operation_id,
         }
         if rangeable:
@@ -23239,7 +23294,7 @@ async def download_file(
         # here or the `except Exception` below re-wraps them as a 500.
         if burned_share_claim_ids:
             try:
-                permission_service.refund_share_download(burned_share_claim_ids)
+                (permission_service.refund_share_preview if is_preview else permission_service.refund_share_download)(burned_share_claim_ids)
                 burned_share_claim_ids = []
             except Exception:      # noqa: BLE001 - a failed refund must not mask the 404
                 try:
@@ -23267,7 +23322,7 @@ async def download_file(
         # have been served and a delete/replacement race must NOT refund.
         if burned_share_claim_ids:
             try:
-                permission_service.refund_share_download(burned_share_claim_ids)
+                (permission_service.refund_share_preview if is_preview else permission_service.refund_share_download)(burned_share_claim_ids)
                 burned_share_claim_ids = []
             except Exception:      # noqa: BLE001 - a failed refund must not mask the download error
                 try:
@@ -25432,7 +25487,7 @@ _DEFAULT_SHARE_TAGS = [
     },
     {
         "name": "Confidential (Read)", "color": "rose",
-        "description": "Sensitive, view-only — recipients see names and sizes; they cannot open or download the files.",
+        "description": "Sensitive, view-only — recipients can view the files in the browser but not download them.",
         "allowed_audiences": ["users", "departments"],
         "allow_view_only": True, "default_view_only": True, "force_view_only": True,
         "allow_custom": True, "auto_enroll_new_users": True,
@@ -26281,6 +26336,8 @@ END $$;""",
             # a change's hold. Nullable, no default; an older release ignores both.
             "ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS zk_envelope_released_at TIMESTAMP",
             "ALTER TABLE credential_changes ADD COLUMN IF NOT EXISTS envelope_released_at TIMESTAMP",
+            # Previews of shared files, counted apart from downloads (the model declares NOT NULL DEFAULT 0).
+            "ALTER TABLE share_claims ADD COLUMN IF NOT EXISTS preview_count INTEGER NOT NULL DEFAULT 0",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

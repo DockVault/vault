@@ -1,8 +1,8 @@
 """The interface and the code say what is true today.
 
 Three promises had outlived what was built. The share dialog's "view only" option said recipients could preview
-but not download; a view-only share's recipient sees the item's name and size and cannot open it, because the
-preview reads through the download path. The seeded "Confidential (Read)" tag said recipients could read. The log
+but not download while the preview read through the download path, so a view-only recipient could open nothing;
+the preview route has since made the words true again, and they now also say what a preview cannot stop. The log
 access page listed two log components with a "coming soon" badge that the server cannot serve, and a help text
 said allow-lists were "managed via the API for now". The security monitor's docstring promised email and webhook
 delivery of alerts, which does not exist.
@@ -21,21 +21,23 @@ def _read(rel):
 
 
 def test_the_view_only_option_says_what_a_recipient_can_do():
+    """With the preview route a view-only recipient can view in the browser; the option says so, and
+    says what a preview cannot stop."""
     html = _read("static/index.html")
-    assert "recipients can preview but not download" not in html
-    assert "View only (recipients see the item's name and size; they cannot open or download it)" in html
+    assert "recipients see the item's name and size" not in html
+    assert "View only (recipients can view files in the browser but not download them)" in html
+    assert "cannot stop copying" in html
 
 
 def test_the_seeded_confidential_tag_says_what_a_recipient_can_do():
     src = _read("app/api/api_server.py")
     assert "recipients can read but not download" not in src
-    assert "recipients see names and sizes; they cannot open or download the files" in src
+    assert "recipients can view the files in the browser but not download them" in src
 
 
 def test_the_view_only_test_describes_the_behaviour_it_tests():
     doc = _read("tests/test_api_share_viewonly.py").split('"""')[1]
-    assert "preview" not in doc.split("denies")[0], doc
-    assert "cannot open the files" in doc
+    assert "preview route" in doc and "cannot download" in doc
 
 
 def test_log_access_offers_only_what_the_deployment_serves():
