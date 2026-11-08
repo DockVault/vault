@@ -10485,6 +10485,8 @@ _PREF_ALLOWED = {
     "vault_sort": {"name", "size", "files", "created", "viewed"},
     "vault_sort_dir": {"asc", "desc"},
     "vault_fav_group": {"first", "last", "mixed"},
+    # How tightly the tables are drawn (static/js/tables.js).
+    "density": {"comfortable", "compact"},
     # Where this user's decrypted downloads are written, when the organisation delegates the
     # choice. Consulted only then -- see app/core/download_sink.py for the precedence.
     "download_sink": {"buffered", "streaming"},
@@ -10507,7 +10509,10 @@ _PREF_NOT_FOR_TEMP_SESSIONS = frozenset({"hide_note_text", "activity_page_size",
 # Preferences the app writes itself rather than picks from a list, each kept only when its value has the shape
 # given: the release at which an administrator last opened the Settings pages (written only by
 # POST /settings/catalogue/seen, app/api/settings_catalogue_router.py; PUT /users/me/preferences cannot set it).
-_PREF_PATTERNS = {"settings_seen": re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")}
+_PREF_PATTERNS = {"settings_seen": re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}"),
+                  # The sort each table was left in (static/js/tables.js): a small JSON object the web app
+                  # writes and reads back for the same account; the server stores it and nothing else.
+                  "tables": re.compile(r"\{[^{}]{0,2000}\}")}
 
 
 def _sanitize_preferences(data) -> dict:
@@ -10540,6 +10545,8 @@ class PreferencesUpdate(BaseModel):
     activity_page_size: Optional[str] = None
     activity_live: Optional[str] = None
     activity_range: Optional[str] = None
+    density: Optional[str] = None
+    tables: Optional[str] = None
 
 
 def _current_session_hash(request) -> Optional[str]:

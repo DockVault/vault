@@ -2649,6 +2649,8 @@ function logout(how, reason) {
     // The previous person's preferences, the notes screen among them: the next person's come from
     // their own account when they sign in.
     state.userPreferences = null;
+    try { localStorage.removeItem('dv_tables'); localStorage.removeItem('dv_density'); } catch (_) {}
+    if (window.Tables) Tables.setDensity('comfortable', { quiet: true });
     state.notesHideText = undefined;
     state.notesRevealed = new Set();
 
@@ -5408,6 +5410,11 @@ function renderTempCreds() {
     const moreBtn = document.getElementById('tc-show-more');
     if (moreBtn) moreBtn.addEventListener('click', () => { tempCredsLimit += 50; renderTempCreds(); });
     attachTempCredListeners();
+    if (window.Tables) {
+        const shared = document.getElementById('tc-shared-table');
+        if (shared) Tables.enhance(shared, { key: 'temp-creds', search: true });
+        container.querySelectorAll('table.data-table').forEach((t) => { if (t !== shared) Tables.enhance(t, { key: 'temp-creds-devices' }); });
+    }
 }
 
 // Bulk-delete expired / used / both.
@@ -22969,6 +22976,8 @@ async function applyServerPreferences() {
     } catch (_) { return false; }
     if (asked !== _sessionsEnded) return false;     // the session ended meanwhile
     if (!prefs || typeof prefs !== 'object') return false;
+    // The tables' remembered sort and the density this account chose (static/js/tables.js).
+    if (window.Tables) Tables.applyPreferences(prefs);
 
     // Vault-list ordering. Applied before any early-return below so the list is ordered the
     // account's way on first paint rather than jumping after a later refresh.

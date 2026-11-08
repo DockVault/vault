@@ -28,6 +28,7 @@
     <link rel="stylesheet" href="/static/css/compliance.css?v=20261108a">
     <link rel="stylesheet" href="/static/css/settings-levels.css?v=20261108a">
     <link rel="stylesheet" href="/static/css/people.css?v=20261108a">
+    <link rel="stylesheet" href="/static/css/tables.css?v=20261108a">
     <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
     <link rel="stylesheet" href="/static/css/mobile.css?v=20260929a">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
@@ -310,6 +311,13 @@
                             <div class="ui-switch" role="group" aria-label="Interface style">
                                 <button type="button" class="ui-choice" data-ui-choice="v1" title="Classic — the original interface">Classic</button>
                                 <button type="button" class="ui-choice" data-ui-choice="v2" title="Console — the new enterprise interface">Console</button>
+                            </div>
+                        </div>
+                        <div class="accent-picker ui-picker">
+                            <span class="accent-picker-label">Density</span>
+                            <div class="ui-switch" role="group" aria-label="Table density">
+                                <button type="button" class="ui-choice density-choice" data-density="comfortable" title="Roomier rows">Comfortable</button>
+                                <button type="button" class="ui-choice density-choice" data-density="compact" title="More rows on the screen">Compact</button>
                             </div>
                         </div>
                         <div class="profile-dropdown-divider"></div>
@@ -4222,6 +4230,7 @@
     <script src="/static/js/password-policy.js?v=20261113a"></script>
     <script src="/static/js/dialogs.js?v=20261113a"></script>
     <script src="/static/js/people.js?v=20261108a"></script>
+    <script src="/static/js/tables.js?v=20261108a"></script>
     <script src="/static/js/app.js?v=20261116a"></script>
     <script src="/static/js/activity.js?v=20261116a"></script>
     <script src="/static/js/audit-integrity.js?v=20261108a"></script>
