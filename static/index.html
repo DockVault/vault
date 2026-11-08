@@ -3225,7 +3225,8 @@
                             <div class="modal-body">
                                 <!-- The type comes first, so the form below it is laid out before anything is
                                      typed: switching the type changes only what follows the size field, and
-                                     never moves or renames a field that already holds text. -->
+                                     never moves a field that already holds text (the name's label says whether
+                                     the name is encrypted). -->
                                 <div class="form-group" id="vault-type-group" style="display:none;">
                                     <!-- The interactive chooser: shown when both types are creatable. -->
                                     <div id="vault-type-choice">
@@ -3249,7 +3250,7 @@
                                     <input type="text" id="vault-name" class="form-control" required>
                                     <!-- Always one line, so a type switch moves nothing below it; the text says
                                          where the name is readable for the chosen type. -->
-                                    <small class="form-help" id="vault-name-zk-help">Stored encrypted on the server, which can read it to show it to members.</small>
+                                    <small class="form-help" id="vault-name-zk-help">Readable by the server, which shows it to members.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-desc">Description</label>

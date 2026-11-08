@@ -72,10 +72,12 @@ def _top(page: Page, sel: str) -> float:
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
-def test_the_type_comes_first_and_a_switch_moves_or_changes_nothing_typed(page: Page, fresh_user, skin):
+@pytest.mark.parametrize("width", [1280, 390])
+def test_the_type_comes_first_and_a_switch_moves_or_changes_nothing_typed(page: Page, fresh_user, skin, width):
     # Tall enough for the dialog's body not to scroll in any state: a scrollbar that comes and goes
     # changes the fields' width and so the rounding of every line's height, which is not a field moving.
-    page.set_viewport_size({"width": 1280, "height": 960})
+    # At the phone width the help lines must stay one line each, or the fields below them move.
+    page.set_viewport_size({"width": width, "height": 960})
     page.goto("/")
     page.evaluate("ui => localStorage.setItem('ui', ui)", skin)
     _login(page, fresh_user)

@@ -3714,8 +3714,8 @@ function syncCreateVaultForm() {
     const nameLabel = document.getElementById('vault-name-label');
     if (labelGroup) labelGroup.style.display = isZk ? '' : 'none';
     if (zkNameHelp) zkNameHelp.textContent = isZk
-        ? 'Encrypted in your browser; the server never sees it.'
-        : 'Stored encrypted on the server, which can read it to show it to members.';
+        ? 'Encrypted in your browser; unseen by the server.'
+        : 'Readable by the server, which shows it to members.';
     if (nameLabel) nameLabel.textContent = isZk ? 'Vault Name (encrypted)' : 'Vault Name';
 }
 
