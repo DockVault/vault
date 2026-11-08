@@ -88,9 +88,10 @@ def test_change_user_password_shows_the_rule_and_refuses_what_it_forbids(page: P
         expect(page.locator(".toast-error", has_text="include a number")).to_be_visible(timeout=10000)
         page.wait_for_timeout(500)
         assert not sent, "a password the rule refuses was sent"
-        # One that the rule allows goes through.
-        page.fill("#change-password-new", "Abcdefghijklmno1")
-        page.fill("#change-password-confirm", "Abcdefghijklmno1")
+        # One that the rule allows goes through: its uppercase letter is not an ASCII one, and the form
+        # judges it as the server does.
+        page.fill("#change-password-new", "Éabcdefghijklmno1")
+        page.fill("#change-password-confirm", "Éabcdefghijklmno1")
         page.click("#change-password-form button[type=submit]")
         expect(page.locator("#change-password-modal.active")).to_be_hidden(timeout=15000)
         assert len(sent) == 1, sent

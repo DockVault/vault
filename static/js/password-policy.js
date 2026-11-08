@@ -60,16 +60,19 @@
         return text + '.';
     }
 
-    // The requirements `password` misses, worded as the server words them.
+    // The requirements `password` misses, worded as the server words them. The classes are Unicode, as
+    // the server's are (an uppercase letter is any letter in uppercase, a number any decimal digit, a
+    // special character anything that is neither a letter, a digit nor a space), so the form and the
+    // server agree outside ASCII too.
     function failures(password, policy) {
         const p = normalise(policy);
         const pw = password || '';
         const out = [];
         if (pw.length < p.min_length) out.push(`be at least ${p.min_length} characters long`);
-        if (p.require_uppercase && !/[A-Z]/.test(pw)) out.push('include an uppercase letter');
-        if (p.require_lowercase && !/[a-z]/.test(pw)) out.push('include a lowercase letter');
-        if (p.require_numbers && !/[0-9]/.test(pw)) out.push('include a number');
-        if (p.require_special && !/[^A-Za-z0-9\s]/.test(pw)) out.push('include a special character');
+        if (p.require_uppercase && !/\p{Lu}/u.test(pw)) out.push('include an uppercase letter');
+        if (p.require_lowercase && !/\p{Ll}/u.test(pw)) out.push('include a lowercase letter');
+        if (p.require_numbers && !/\p{Nd}/u.test(pw)) out.push('include a number');
+        if (p.require_special && !/[^\p{L}\p{N}\s]/u.test(pw)) out.push('include a special character');
         return out;
     }
 
