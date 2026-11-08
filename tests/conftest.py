@@ -601,6 +601,43 @@ def _host_tool_unit_tests_see_no_running_deployment(request, monkeypatch):
             monkeypatch.setattr(module, name, _nothing_runs(getattr(module, name), answer))
 
 
+# ---------------------------------------------------------------------------
+# A test's SQLite database is not forced to the disk at each commit.
+# ---------------------------------------------------------------------------
+# Many unit tests run the app's code on a throwaway SQLite file, and some commit hundreds of times. By
+# default SQLite forces every commit to the disk (synchronous=FULL), with a journal file beside the
+# database that it creates, syncs and deletes for each one. A forced write takes milliseconds on a CI
+# runner's disk, and tens of them on a busy one: a commit took 40 ms where it takes 0.06 ms without the
+# syncs, and the syncs took a large part of the offline lane's time. On Windows, creating and removing the
+# journal file took five times as long as the commit without it. What the syncs protect is a database a
+# power cut interrupted, and a test's database is deleted when the test ends: no test can see them. So
+# each SQLite connection a test opens through SQLAlchemy commits without forcing the disk and keeps its
+# rollback journal in memory. Nothing else changes: a transaction still rolls back, a second connection
+# still waits for the lock, and a database a test put in WAL mode stays in it. The app's code is untouched
+# (the vault runs on Postgres), and a process a test starts (python -c ...) opens its database with
+# SQLite's defaults.
+def _sqlite_commits_without_syncing(dbapi_connection, _connection_record):
+    if type(dbapi_connection).__module__ != "sqlite3":      # Postgres in the live suite: nothing to do
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA synchronous=OFF")
+        (mode,) = cursor.execute("PRAGMA journal_mode").fetchone()
+        if mode.lower() == "delete":                        # SQLite's default for a file; WAL stays WAL
+            cursor.execute("PRAGMA journal_mode=MEMORY")
+    finally:
+        cursor.close()
+
+
+def _install_sqlite_hook():
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+    event.listen(Engine, "connect", _sqlite_commits_without_syncing)
+
+
+_install_sqlite_hook()
+
+
 def pytest_collection_modifyitems(items):
     """Give every test exactly one execution-environment classification."""
     for item in items:

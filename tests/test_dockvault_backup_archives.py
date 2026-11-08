@@ -57,10 +57,13 @@ def _sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _backed_up(tmp_path, monkeypatch, prefix, lock=False, write=None):
+def _backed_up(tmp_path, monkeypatch, prefix, lock=False, write=None, env_bytes=None):
     """A backup of set `prefix` with Docker stubbed: each volume's archive written by `write` (a real tar.gz by
-    default). Returns the bundle."""
+    default). `env_bytes`, when given, is the host's .env, written as it is. Returns the bundle."""
     env = _env(tmp_path, prefix)
+    if env_bytes is not None:
+        (tmp_path / ".env").write_bytes(env_bytes)
+        env = dv.parse_env(env_bytes.decode("utf-8"))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
@@ -151,6 +154,44 @@ def test_a_backup_records_each_archives_checksum_and_size(tmp_path, monkeypatch)
     for e in man["volumes"]:
         archive = bundle / e["archive"]
         assert e["sha256"] == _sha(archive) and e["size"] == archive.stat().st_size
+
+
+def test_a_backups_manifest_is_the_same_bytes_wherever_the_backup_is_made(tmp_path, monkeypatch):
+    """manifest.json, whose bytes a sealed backup authenticates, ends its lines with a line feed alone: on Windows
+    too, where a file written as text ends each line with a carriage return as well."""
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchlf")
+    raw = (bundle / "manifest.json").read_bytes()
+    assert raw.count(b"\n") > 10 and b"\r" not in raw
+    assert raw == json.dumps(json.loads(raw.decode("utf-8")), indent=2).encode("utf-8")
+
+
+@pytest.mark.parametrize("bundle_kind", ["plain", "sealed-before-manifests-were-authenticated",
+                                         "sealed-with-its-manifest-authenticated"])
+def test_a_backup_whose_manifest_has_windows_line_ends_restores(tmp_path, monkeypatch, bundle_kind):
+    """Earlier versions wrote manifest.json as text, so a backup made with them on Windows ends each of its lines
+    with a carriage return as well (and one sealed with its manifest authenticated has the MAC of those bytes). Read
+    as it is, it restores."""
+    if bundle_kind != "plain":
+        pytest.importorskip("cryptography")
+    if bundle_kind == "sealed-with-its-manifest-authenticated":
+        bundle = _backed_up(tmp_path, monkeypatch, "dvarchwin", lock=True)
+    else:
+        bundle = _old_backup(tmp_path, "dvarchwin", sealed=bundle_kind != "plain")
+    man = bundle / "manifest.json"
+    raw = json.dumps(json.loads(man.read_bytes().decode("utf-8")), indent=2).replace("\n", "\r\n").encode("utf-8")
+    man.write_bytes(raw)
+    assert raw.count(b"\r\n") > 10
+    if bundle_kind == "sealed-with-its-manifest-authenticated":
+        _payload, dek = _sealed_payload(bundle)
+        (bundle / dv.BUNDLE_MANIFEST_MAC).write_bytes(json.dumps(
+            {"dockvault_manifest_mac": 1, "hmac_sha256": dv.manifest_mac(dek, raw)}).encode("utf-8") + b"\n")
+    host_env = (tmp_path / ".env").read_bytes()
+    (tmp_path / ".env").unlink()
+    steps = []
+    _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(
+        _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt") if bundle_kind != "plain" else None))
+    assert steps[0] == ("stop",) and ("start",) in steps
+    assert (tmp_path / ".env").read_bytes() == host_env
 
 
 @pytest.mark.parametrize("written", ["nothing", "empty", "truncated", "not-an-archive"])
@@ -272,6 +313,28 @@ def test_a_sealed_backup_with_its_manifest_as_sealed_restores(tmp_path, monkeypa
         _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt")))
     assert steps[0] == ("stop",) and ("start",) in steps
     assert (tmp_path / ".env").read_bytes() == host_env, "the .env installed is the one backed up, byte for byte"
+
+
+@pytest.mark.parametrize("lock", [False, True], ids=["plain", "sealed"])
+def test_a_backup_and_its_restore_keep_a_env_with_windows_line_ends_byte_for_byte(tmp_path, monkeypatch, lock):
+    """The host's .env saved with Windows line ends (by an editor on Windows, say): the backup carries it, plain or
+    sealed, byte for byte, and its restore puts back those very bytes."""
+    if lock:
+        pytest.importorskip("cryptography")
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dvarchcrlf", deployment_id="dvarchcrlf")
+    host_env = ("\r\n".join(dv.build_env_lines(cfg)) + "\r\n").encode("utf-8")
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchcrlf", lock=lock, env_bytes=host_env)
+    if lock:
+        payload, dek = _sealed_payload(bundle)
+        assert dv.split_sealed_bundle_payload(payload, dek) == (host_env, True)
+    else:
+        assert (bundle / "env").read_bytes() == host_env
+    (tmp_path / ".env").unlink()
+    steps = []
+    _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(
+        _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt") if lock else None))
+    assert ("start",) in steps
+    assert (tmp_path / ".env").read_bytes() == host_env
 
 
 def _sealed_payload(bundle, passphrase="seal-passphrase-1"):

@@ -201,6 +201,19 @@ def test_a_discard_whose_saved_seals_cannot_be_synced_deletes_nothing(env, disk,
     assert env.st.head_store().load()["discards"] == 0
 
 
+def test_a_recorder_set_before_the_environment_sees_the_saved_seals_synced_for_real(disk, env, tmp_path):
+    """os.fsync wrapped before the test's environment is built keeps its wrapper, so the saved seals' file goes
+    through the real os.fsync: on Windows that refuses a handle opened only for reading."""
+    env.row(T0 - timedelta(hours=3))
+    env.run_until_sealed()
+    disk.events.clear()
+    with env.session() as db:
+        target = recovery._save_discarded(str(tmp_path / "audit-chain-head.json"), db, 1, env.clock())
+    assert ("file", os.stat(target).st_ino) in disk.events, disk.events
+    with open(target, encoding="utf-8") as fh:
+        assert json.load(fh)
+
+
 # --------------------------------------------------------------------------- the SFTP host key
 
 def test_a_host_key_that_cannot_be_synced_is_not_left_at_its_path(disk, tmp_path):

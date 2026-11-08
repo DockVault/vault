@@ -251,21 +251,23 @@ def test_a_repoint_whose_copy_holds_the_key_the_database_was_sealed_with_goes_on
 
 # --------------------------------------------------------------------------- setup's 'point me at a .env'
 
-def _pointing(tmp_path, monkeypatch, env_is_fresh=False, answers=None):
-    """Setup's existing-volume menu: option 2 with another set's .env, which verifies."""
-    current = _env_text("dvcurrent")
-    (tmp_path / ".env").write_text(current, encoding="utf-8")
+def _pointing(tmp_path, monkeypatch, env_is_fresh=False, answers=None, line_end="\n"):
+    """Setup's existing-volume menu: option 2 with another set's .env, which verifies. Both files are written as
+    bytes, each line ended by `line_end`, so what the tool keeps and installs is compared with exactly what was there
+    (Path.write_text would end the lines the platform's way)."""
+    current = _env_text("dvcurrent").replace("\n", line_end).encode("utf-8")
+    (tmp_path / ".env").write_bytes(current)
     src = tmp_path / "provided.env"
-    src.write_text(_env_text("dvprovided"), encoding="utf-8")
+    src.write_bytes(_env_text("dvprovided").replace("\n", line_end).encode("utf-8"))
     replies = iter(answers or ["2", str(src)])
     monkeypatch.setattr(dv, "ask", lambda *a, **k: next(replies))
     monkeypatch.setattr(dv, "flush_stdin", lambda: None)
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(tool, "_normalize_compose_profile", lambda: "combined")
     monkeypatch.setattr(tool, "_try_verify", lambda env, vol, hooks: True)
-    assert tool._resolve_existing_volume(dv.parse_env(current), "dvcurrent_vault_pg_data", (None,) * 6,
-                                         env_is_fresh=env_is_fresh) is True
-    return current.encode("utf-8"), src.read_bytes()
+    assert tool._resolve_existing_volume(dv.parse_env(current.decode("utf-8")), "dvcurrent_vault_pg_data",
+                                         (None,) * 6, env_is_fresh=env_is_fresh) is True
+    return current, src.read_bytes()
 
 
 def test_pointing_setup_at_another_env_keeps_the_current_one_first(tmp_path, monkeypatch, capsys):
@@ -274,6 +276,17 @@ def test_pointing_setup_at_another_env_keeps_the_current_one_first(tmp_path, mon
     kept = tmp_path / ".env.dvcurrent"
     assert kept.read_bytes() == current, "the .env the host had is kept, under its set's name"
     assert "Kept the current .env as %s" % kept in " ".join(capsys.readouterr().out.split())
+
+
+def test_pointing_setup_at_another_env_keeps_and_installs_env_files_with_windows_line_ends_as_they_are(
+        tmp_path, monkeypatch):
+    """Both files saved with Windows line ends (by an editor on Windows, say): the current one is kept, and the one
+    pointed at installed, each exactly as it was."""
+    current, provided = _pointing(tmp_path, monkeypatch, line_end="\r\n")
+    assert current.count(b"\r\n") == current.count(b"\n") > 10
+    assert provided.count(b"\r\n") == provided.count(b"\n") > 10
+    assert (tmp_path / ".env").read_bytes() == provided
+    assert (tmp_path / ".env.dvcurrent").read_bytes() == current
 
 
 def test_pointing_setup_at_another_env_keeps_nothing_of_a_env_this_run_just_wrote(tmp_path, monkeypatch):
@@ -289,9 +302,9 @@ def test_a_current_env_that_cannot_be_kept_is_not_replaced(tmp_path, monkeypatch
 
     src_answers = []
     current = _env_text("dvcurrent")
-    (tmp_path / ".env").write_text(current, encoding="utf-8")
+    (tmp_path / ".env").write_bytes(current.encode("utf-8"))
     src = tmp_path / "provided.env"
-    src.write_text(_env_text("dvprovided"), encoding="utf-8")
+    src.write_bytes(_env_text("dvprovided").encode("utf-8"))
     replies = iter(["2", str(src), "5"])
     monkeypatch.setattr(dv, "ask", lambda *a, **k: src_answers.append(1) or next(replies))
     monkeypatch.setattr(dv, "flush_stdin", lambda: None)
@@ -299,7 +312,7 @@ def test_a_current_env_that_cannot_be_kept_is_not_replaced(tmp_path, monkeypatch
     monkeypatch.setattr(tool, "_keep_env_copy", cannot)
     monkeypatch.setattr(tool, "_try_verify", lambda env, vol, hooks: pytest.fail("an unkept .env was replaced"))
     assert tool._resolve_existing_volume(dv.parse_env(current), "dvcurrent_vault_pg_data", (None,) * 6) is False
-    assert (tmp_path / ".env").read_text(encoding="utf-8") == current
+    assert (tmp_path / ".env").read_bytes() == current.encode("utf-8")
     assert "Could not keep the current .env" in " ".join(capsys.readouterr().out.split())
 
 

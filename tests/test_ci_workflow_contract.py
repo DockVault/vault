@@ -269,8 +269,13 @@ def test_a_candidate_or_release_tests_run_includes_the_fast_lanes():
         assert own in triggers                              # it still runs on its own as well
     lane = fast["jobs"]["fast"]
     assert sorted(lane["strategy"]["matrix"]["os"]) == ["ubuntu-latest", "windows-latest"]
-    # Windows has taken 13 to 15 minutes; a 15-minute limit cancelled a lane with nothing failing.
-    assert lane["timeout-minutes"] == 25
+    # The offline lane takes about 17 minutes on Linux and about an hour on Windows; a 25-minute limit
+    # cancelled the Windows lane with nothing failing. Windows has about twice a run there; Linux keeps 25,
+    # so a hang there still ends soon.
+    assert lane["timeout-minutes"] == "${{ matrix.os == 'windows-latest' && 120 || 25 }}"
+    # The preflight job runs the same lane on Linux after installing and refreshing the locks; 15 minutes
+    # cancelled it with nothing failing.
+    assert yaml.safe_load(_PREFLIGHT)["jobs"]["preflight"]["timeout-minutes"] == 30
     checkout = [s for s in lane["steps"] if s.get("uses", "").startswith("actions/checkout@")]
     assert len(checkout) == 1
     assert checkout[0]["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"

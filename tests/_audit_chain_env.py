@@ -1,5 +1,6 @@
 """A throwaway SQLite database and a chain state of its own, for the offline tests of the audit integrity
 chain (app/core/audit_integrity.py)."""
+import os
 import tempfile
 import uuid
 from datetime import datetime, timedelta
@@ -46,6 +47,29 @@ def settings(tmp: Path, **kw):
     return SimpleNamespace(**base)
 
 
+_REAL_FSYNC = os.fsync
+
+
+def writes_without_forcing_the_disk(monkeypatch):
+    """The chain's files are written as the app writes them, and not forced to the disk.
+
+    The sealer rewrites its head record, synced along with its directory, whenever it seals: hundreds of
+    times in one of these tests, and a forced write takes milliseconds on a CI runner (tens of them on a busy
+    one). A sync matters only to a host that loses power, and a test's files are deleted when it ends. A
+    descriptor that is not open is still refused, as os.fsync refuses it. The tests of what is synced, and in
+    which order, wrap os.fsync after this and see every call the app makes
+    (test_audit_chain_durable_writes.py). A test that wrapped os.fsync before this keeps its wrapper: it is
+    not replaced, so it too sees every call, and the calls reach the real os.fsync (which on Windows refuses
+    a handle opened only for reading, where this does not)."""
+    if os.fsync is not _REAL_FSYNC:
+        return
+    real_fstat = os.fstat
+
+    def fsync(fd):
+        real_fstat(fd if isinstance(fd, int) else fd.fileno())
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
 class Clock:
     def __init__(self, at: datetime):
         self.at = at
@@ -64,6 +88,7 @@ class Env:
     def __init__(self, monkeypatch, tmp: Path, **kw):
         self.tmp = tmp
         self.monkeypatch = monkeypatch
+        writes_without_forcing_the_disk(monkeypatch)
         for name in INPUT_ENV:
             monkeypatch.delenv(name, raising=False)
         self.settings = settings(tmp, **kw)
@@ -186,6 +211,7 @@ class Chain:
     audit_seals): a chain state of its own, a clock, and the rows the app writes dated by that clock."""
 
     def __init__(self, monkeypatch, tmp: Path, settings, factory, now: datetime):
+        writes_without_forcing_the_disk(monkeypatch)
         for name in INPUT_ENV:
             monkeypatch.delenv(name, raising=False)
         for attr, value in CHAIN_SETTINGS.items():

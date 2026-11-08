@@ -20,7 +20,10 @@ jobs:
   preflight:
     name: Strict collection and offline tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The limit ends a hang; it is not a budget for a normal run. The offline lane (about 11,000 tests) takes
+    # about 17 minutes, after about two minutes installing and checking the locks, and the lock refresh below
+    # may take up to five more. A limit of 15 minutes cancelled the job with no test failing.
+    timeout-minutes: 30
     outputs:
       test-count: ${{ steps.collection.outputs.test_count }}
 
