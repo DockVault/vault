@@ -3527,16 +3527,35 @@ def test_on_windows_icacls_and_whoami_are_the_ones_in_system32():
 
 @_ON_WINDOWS
 def test_on_windows_a_restricted_folder_and_a_tightened_file_leave_only_the_user_system_and_administrators(tmp_path):
-    folder = tmp_path / "bundle"
+    """A backup folder made where every signed-in user may read and change what is made (a second drive, a share) is
+    restricted to this user, SYSTEM and Administrators, and so is what is written inside it and a secret file
+    tightened there: nothing from where they were made stays. OWNER RIGHTS may stay on the folder where Windows put
+    it there when the folder was made (as it does on a folder Python makes private): it grants the folder's owner,
+    this user or Administrators, and nobody else."""
+    icacls = dv.windows_system_tool("icacls.exe")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    r = subprocess.run([icacls, str(shared), "/grant", "*S-1-5-32-545:(OI)(CI)M", "*S-1-1-0:(OI)(CI)RX",
+                        "*S-1-5-11:(OI)(CI)RX"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    wide = " ".join(_acl_entries(shared)).lower()
+    assert "\\users:" in wide and "everyone" in wide and "authenticated users" in wide, wide
+    me = subprocess.run([dv.windows_system_tool("whoami.exe")], capture_output=True, text=True,
+                        timeout=15).stdout.strip().lower()
+    assert "\\" in me, me
+    folder = shared / "bundle"
     folder.mkdir()
     assert dv.restrict_folder_to_owner(str(folder)) is True
     (folder / "inside.txt").write_text("x", encoding="utf-8")
-    secret = tmp_path / "secret.env"
+    secret = shared / "secret.env"
     secret.write_text("A=1\n", encoding="utf-8")
     assert _TIGHTEN_SECRET_FILE(str(secret)) is True
-    for path, count in ((folder, 3), (folder / "inside.txt", 3), (secret, 3)):
+    for path in (folder, folder / "inside.txt", secret):
         entries = _acl_entries(path)
-        assert len(entries) == count, entries
+        names = [e.split(":(")[0].lower() for e in entries]
+        assert len(names) == len(set(names)), entries
+        assert {me, "nt authority\\system", "builtin\\administrators"} <= set(names), (me, entries)
+        assert set(names) <= {me, "nt authority\\system", "builtin\\administrators", "owner rights"}, (me, entries)
         text = " ".join(entries).lower()
         assert "everyone" not in text and "\\users:" not in text and "authenticated users" not in text, entries
 
