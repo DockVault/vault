@@ -47,6 +47,9 @@ def settings(tmp: Path, **kw):
     return SimpleNamespace(**base)
 
 
+_REAL_FSYNC = os.fsync
+
+
 def writes_without_forcing_the_disk(monkeypatch):
     """The chain's files are written as the app writes them, and not forced to the disk.
 
@@ -55,7 +58,11 @@ def writes_without_forcing_the_disk(monkeypatch):
     one). A sync matters only to a host that loses power, and a test's files are deleted when it ends. A
     descriptor that is not open is still refused, as os.fsync refuses it. The tests of what is synced, and in
     which order, wrap os.fsync after this and see every call the app makes
-    (test_audit_chain_durable_writes.py)."""
+    (test_audit_chain_durable_writes.py). A test that wrapped os.fsync before this keeps its wrapper: it is
+    not replaced, so it too sees every call, and the calls reach the real os.fsync (which on Windows refuses
+    a handle opened only for reading, where this does not)."""
+    if os.fsync is not _REAL_FSYNC:
+        return
     real_fstat = os.fstat
 
     def fsync(fd):
