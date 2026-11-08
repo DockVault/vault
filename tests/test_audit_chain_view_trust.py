@@ -12,7 +12,12 @@ still_read and trusted), offline, on a throwaway SQLite database with a chain of
 - while the view is not read through, nothing that comes from it is shown or acted on: the settings page's values,
   its list of waiting changes and what it says of the chain, the lists' delay, whether the install ran before, the
   chain's hold and numbers, the warnings an administrator acknowledges, the changes and cancels saved while sealing
-  is stopped, the checks against the genesis seal, and the pruner's jobs that read the view outside the chain lock.
+  is stopped, the checks against the genesis seal, and the pruner's jobs that read the view outside the chain
+  lock;
+- while sealing is stopped and the view is not read through, a change of a setting the chain records is refused
+  saying so (never that it deletes records sooner), except turning the hold on, told by its spec: it is saved from
+  the database's value and sealed from the database once a check reads the chain through; with sealing running, a
+  change is judged by the chain writer's own read of the chain.
 
 test_activity_archive_unread.py covers the readers of the archived days; test_activity_archive_unread_live.py the same
 through a web process on Postgres.
@@ -379,9 +384,21 @@ def test_a_change_or_a_cancel_while_sealing_is_stopped_is_not_judged_from_a_view
     with env.session() as db:
         # A change that keeps more is saved while sealing is stopped, judged from a view read through.
         assert ps.refuses_while_stopped(db, "logs_hold", True, st=env.st) is False
+        assert ps.refuses_while_stopped(db, "audit_max_days", 0, st=env.st) is False      # for ever keeps more
+        assert ps.while_stopped(db, "audit_max_days", 0, st=env.st)[1] is not None        # judged by the chain
     st = _not_read_through(env)
     with env.session() as db:
-        assert ps.refuses_while_stopped(db, "logs_hold", True, st=st) is True
+        # What the chain last gave is not known: only turning the hold on, the strongest value whatever is in force,
+        # is taken, judged from the database's value and never from the view; every other change of a setting the
+        # chain records is refused, saying the chain is not read through.
+        assert ps.refuses_while_stopped(db, "logs_hold", True, st=st) is False
+        assert ps.while_stopped(db, "logs_hold", True, st=st) == (None, None)
+        assert ps.judge_now("logs_hold", st) is None and ps.judge_now("audit_max_days", st) is None
+        for key, value in (("logs_hold", False), ("logs_hold", None), ("audit_max_days", 400),
+                           ("audit_max_days", 0)):
+            assert ps.while_stopped(db, key, value, st=st) == (ps.UNREAD, None), (key, value)
+            assert ps.refuses_while_stopped(db, key, value, st=st) is True, (key, value)
+        assert ps.while_stopped(db, "log_prune_interval_minutes", 30, st=st) == (None, None)  # not the chain's
         assert ps.refuses_while_stopped(db, "greeting_days", 5, st=st) is False      # a setting the chain does not hold
         with pytest.raises(registry.SettingRefused, match="cannot be told just now"):
             ps.cancel_while_stopped(db, change, ADMIN, st)
@@ -394,6 +411,144 @@ def test_a_change_or_a_cancel_while_sealing_is_stopped_is_not_judged_from_a_view
         pe.cancel_while_stopped(_NoRows(), uuid.uuid4(), ADMIN, st)
     with pytest.raises(removal.Refused, match="Whether this removal is still waiting cannot be told just now"):
         removal.cancel_while_stopped(_NoRows(), uuid.uuid4(), ADMIN, st)
+
+
+def test_the_hold_taken_while_the_view_is_not_read_through_is_told_by_its_spec_never_by_its_key(env, monkeypatch):
+    """Only a switch whose turning off deletes sooner (kind bool, reduction lower), turned on, is taken while the view
+    is not read through: the hold's own key with another reduction is refused, another key with the hold's spec is
+    taken, and no other value of either is."""
+    import dataclasses
+    from app.core import audit_chain_policy as pol
+    from app.core import audit_chain_policy_seals as ps
+    from app.core import settings_registry as registry
+    hold = registry.spec_for("logs_hold")
+    assert ps.only_adds_a_hold(hold, True) is True
+    for value in (False, None, 1, "true"):
+        assert ps.only_adds_a_hold(hold, value) is False, value
+    assert ps.only_adds_a_hold(dataclasses.replace(hold, reduction=registry.HIGHER), True) is False
+    assert ps.only_adds_a_hold(dataclasses.replace(hold, reduction=None), True) is False
+    assert ps.only_adds_a_hold(dataclasses.replace(hold, kind="int"), True) is False
+    assert ps.only_adds_a_hold(None, True) is False
+    _archived(env)
+    st = _not_read_through(env)
+    specs = {"logs_hold": dataclasses.replace(hold, reduction=registry.HIGHER),
+             "keep_everything": dataclasses.replace(hold, key="keep_everything")}
+    real_spec, real_keys = registry.spec_for, pol.chain_setting_keys
+    monkeypatch.setattr(registry, "spec_for", lambda key: specs.get(key) or real_spec(key))
+    monkeypatch.setattr(pol, "chain_setting_keys", lambda: real_keys() + ("keep_everything",))
+    with env.session() as db:
+        assert ps.while_stopped(db, "logs_hold", True, st=st) == (ps.UNREAD, None)
+        assert ps.while_stopped(db, "keep_everything", True, st=st) == (None, None)
+        for value in (False, None):
+            assert ps.while_stopped(db, "keep_everything", value, st=st) == (ps.UNREAD, None)
+
+
+def _route(env):
+    """The managed-settings routes, the step-up passed."""
+    from app.api import managed_settings_router as routes
+    env.monkeypatch.setattr(routes, "_step_up", lambda db, user, request: None)
+    return routes
+
+
+def _put(routes, env, key, value):
+    with env.session() as db:
+        return routes.put_managed_setting(key, routes.ManagedValue(value=value), request=None, current_user=ADMIN,
+                                          db=db)
+
+
+UNREAD_TEXT = ("The value in force is not known yet, so this change cannot be made: the audit log's integrity chain "
+               "does not check out (head-record-mismatch), so this server has not read it through; the integrity "
+               "status on the Activity page says what to do. Nothing was changed; try again later.")
+
+
+def test_while_sealing_is_stopped_and_the_view_is_not_read_through_only_turning_the_hold_on_is_saved(env):
+    """A process started while the chain does not check out (a seal before the head record's changed): no seal can be
+    written, and this process has not read the chain through. Turning the hold on is saved at once (it keeps more
+    whatever the chain holds), judged from the database's value, and sealed from the database once a check reads the
+    chain through; turning it off, or setting a number the chain holds, longer or shorter, is refused (409) saying the
+    chain is not read through and why, never that the change deletes records sooner; so is a cancel."""
+    from fastapi import HTTPException
+    from app.core import setting_changes as sc
+    from app.core.models import AuditLog, ManagedSetting, ManagedSettingChange
+    routes = _route(env)
+    _archived(env)
+    change = _waiting_change(env)
+    _tamper_one_seal(env)
+    seals = len(env.seals())
+    # A process whose own start read has not run: the stop its change's check just met is named all the same.
+    bare = env.fresh_process()
+    with pytest.raises(HTTPException) as refused:
+        _put(routes, env, "audit_max_days", 400)
+    assert (refused.value.status_code, refused.value.detail) == (409, UNREAD_TEXT)
+    assert (bare.view_read, bare.read_stopped, bare.stopped) == (False, None, None)
+    assert ai.unread_reason(bare) == ("this server has not finished reading the audit log's integrity chain since "
+                                      "it started")
+    st = env.fresh_process()
+    assert ai.read_at_start(env.engine, st, timeout=10) is False
+    assert (st.view_read, st.read_stopped, st.stopped, st.view.position) == (False, "head-record-mismatch", None, 0)
+    for key, value in (("audit_max_days", 400), ("audit_max_days", 0), ("audit_max_days", 30), ("logs_hold", False)):
+        with pytest.raises(HTTPException) as refused:
+            _put(routes, env, key, value)
+        assert (refused.value.status_code, refused.value.detail) == (409, UNREAD_TEXT), (key, value)
+        assert "sooner" not in refused.value.detail
+    with env.session() as db:
+        with pytest.raises(HTTPException) as refused:
+            routes.cancel_managed_setting_change(change, current_user=ADMIN, db=db)
+    assert refused.value.status_code == 409 and "sooner" not in refused.value.detail
+    assert refused.value.detail == ("Whether this change is still waiting cannot be told just now: the audit log's "
+                                    "integrity chain does not check out (head-record-mismatch), so this server has "
+                                    "not read it through; the integrity status on the Activity page says what to do. "
+                                    "Nothing was cancelled; try again later.")
+    with env.session() as db:
+        assert db.query(ManagedSetting).count() == 0
+        assert db.query(AuditLog).filter(AuditLog.action.in_((sc.CHANGED, sc.CANCELLED_ACTION))).count() == 0
+    out = _put(routes, env, "logs_hold", True)
+    assert (out["status"], out["change"]) == ("applied", None)
+    # The answer shows nothing of the view either: the value in force is still the chain's, not known yet.
+    assert (out["setting"]["chain_read"], out["setting"]["value"]) == (False, None)
+    with env.session() as db:
+        assert db.get(ManagedSetting, "logs_hold").value is True
+        (row,) = db.query(AuditLog).filter(AuditLog.action == sc.CHANGED).all()
+        assert (row.details["key"], row.details["old"], row.details["new"]) == ("logs_hold", False, True)
+        assert db.get(ManagedSettingChange, change).status == sc.PENDING       # the waiting change is untouched
+    assert retention.hold_in_force() is True and len(env.seals()) == seals
+    # The seal put right: a check reads the chain through, and the pass seals the hold from the database.
+    with env.engine.begin() as c:
+        c.exec_driver_sql("UPDATE audit_seals SET row_bytes = row_bytes - 1 WHERE seq = 2")
+    assert ai.read_view(env.engine, st) is True
+    retention.apply_waiting_changes(retention.Pass(env.session, now=env.clock()))
+    added = env.seals()[seals:]
+    assert [(s.kind, s.detail["cause"]) for s in added] == [("policy", "database")]
+    assert added[0].detail["state"]["logs_hold"]["value"] is True
+
+
+def test_with_the_view_not_read_through_and_sealing_running_a_change_is_judged_by_the_writer_s_own_read(env,
+                                                                                                         monkeypatch):
+    """A process that has just started, the chain checking out: a change goes through the chain writer, whose check
+    reads the chain through before the change is judged, so nothing is judged from the view as it was. Turning the
+    hold on is saved and sealed at once; a number the chain holds is judged by the chain (a reduction waits)."""
+    from app.core import audit_chain_policy_seals as ps
+    routes = _route(env)
+    _archived(env)
+    st = env.fresh_process()
+    assert (st.view_read, st.view.position, st.stopped) == (False, 0, None)
+    seen = []
+    real = ps.judge
+
+    def judge(view, record, key, now=None):
+        seen.append((key, st.view_read, view.position))
+        return real(view, record, key, now)
+    monkeypatch.setattr(ps, "judge", judge)
+    seals = len(env.seals())
+    out = _put(routes, env, "logs_hold", True)
+    assert out["status"] == "applied" and "chain_read" not in out["setting"] and out["setting"]["value"] is True
+    added = env.seals()[seals:]
+    assert [(s.kind, s.detail["cause"]) for s in added] == [("policy", "request")]
+    assert added[0].detail["state"]["logs_hold"]["value"] is True
+    out = _put(routes, env, "audit_max_days", 400)
+    assert out["status"] == "pending" and out["change"]["setting"] == 400
+    assert [s.kind for s in env.seals()[seals + 1:]] == ["request"]
+    assert seen == [("logs_hold", True, seals), ("audit_max_days", True, seals + 1)]
 
 
 def test_a_cancel_while_sealing_is_stopped_is_refused_when_the_view_was_cleared_while_it_was_judged(env):

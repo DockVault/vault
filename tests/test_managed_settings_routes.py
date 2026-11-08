@@ -595,3 +595,32 @@ def test_while_sealing_is_stopped_a_change_is_judged_against_the_chain_not_the_s
     out = _put(db, user, "keep_days", 500)
     assert out["status"] == "applied" and out["change"] is None
     assert db.get(ManagedSetting, "keep_days").value == 500
+
+
+def test_a_longer_value_in_a_process_that_has_not_read_the_chain_through_is_refused_saying_why(env, db, chain,
+                                                                                               monkeypatch):
+    """Sealing stops (the chain's newest seal cut). The process that read the chain before the stop saves a longer
+    value, judged against the chain. A process started during the stop has not read the chain through: what the
+    chain last gave is not known, so whether a value keeps longer cannot be told (the database's may not be the
+    chain's), and a longer value is refused like a shorter one (409), saying the chain is not read through and why,
+    never that the change deletes records sooner. Nothing is written."""
+    from app.core import audit_integrity as ai
+    alice = _admin(db)
+    db.query(AuditSeal).filter(AuditSeal.seq == db.query(sa.func.max(AuditSeal.seq)).scalar()).delete()
+    db.commit()
+    assert _put(db, alice, "keep_days", 400)["status"] == "applied"
+    fresh = ai.ChainState(settings=chain.st.settings, clock=chain.clock)
+    monkeypatch.setattr(ai, "_state", fresh)
+    assert ai.read_at_start(db.get_bind(), fresh, timeout=5) is False
+    assert fresh.read_stopped == "head-record-mismatch"
+    rows, seals = db.query(AuditLog).count(), db.query(AuditSeal).count()
+    for value in (500, 10):
+        with refused(409) as caught:
+            _put(db, alice, "keep_days", value)
+        assert "sooner" not in caught.value.detail
+        assert caught.value.detail == (
+            "The value in force is not known yet, so this change cannot be made: the audit log's integrity chain does "
+            "not check out (head-record-mismatch), so this server has not read it through; the integrity status on "
+            "the Activity page says what to do. Nothing was changed; try again later.")
+    assert db.get(ManagedSetting, "keep_days").value == 400
+    assert (db.query(AuditLog).count(), db.query(AuditSeal).count()) == (rows, seals)

@@ -28,7 +28,10 @@ Each change and each cancel also writes its seal in the audit log's integrity ch
 (app/core/audit_chain_policy_seals.py): the pruner acts on those seals, never on the database's values alone.
 Another writer of seals holding the chain's lock gives 409 (busy, retry). While sealing is stopped, or before
 the chain's first seal, a change that deletes sooner is refused with the reason; a change that keeps data
-longer, and a cancel, are saved and sealed from the database once sealing runs again.
+longer, and a cancel, are saved and sealed from the database once sealing runs again. While sealing is stopped
+and this process has not read the chain through, whether a change deletes sooner cannot be told: a change of a
+setting the chain records is refused (409, saying the chain has not been read through and why), unless it only
+turns a hold on; a cancel is refused the same way.
 """
 from __future__ import annotations
 
@@ -195,6 +198,17 @@ def refusal(spec: registry.SettingSpec, value) -> Optional[str]:
     return None
 
 
+def stopped_refusal(why: str, stopped: audit_integrity.ChainStopped) -> str:
+    """The 409's text for a change refused while sealing is stopped (chain_seals.while_stopped): it says the change
+    deletes records sooner only when that is known; while this process has not read the chain through, it says so
+    and why, as the integrity status names it."""
+    if why == chain_seals.UNREAD:
+        return ("The value in force is not known yet, so this change cannot be made: "
+                f"{audit_integrity.unread_reason(met=stopped.kind)}. Nothing was changed; try again later.")
+    return ("This change deletes records sooner, and the audit log's integrity chain is not sealing "
+            f"just now ({stopped.kind}), so it cannot be recorded. Nothing was changed; try again later.")
+
+
 @router.put("/settings/managed/{key}")
 def put_managed_setting(key: str, body: ManagedValue, request: Request,
                         current_user: User = Depends(require_interactive_admin),
@@ -216,14 +230,14 @@ def put_managed_setting(key: str, body: ManagedValue, request: Request,
                 change = change_dict(outcome.change)
         except audit_integrity.ChainStopped as stopped:
             # No seal can be written: a change that deletes sooner waits for sealing; any other is saved, and
-            # sealed from the database once sealing runs again.
-            if chain_seals.refuses_while_stopped(db, key, body.value):
+            # sealed from the database once sealing runs again. While this process has not read the chain
+            # through, only turning a hold on is taken (chain_seals.while_stopped); it is judged by the one judge
+            # that decided it, or from the database's value.
+            why, judge = chain_seals.while_stopped(db, key, body.value)
+            if why is not None:
                 db.rollback()
-                raise HTTPException(status_code=409, detail=(
-                    "This change deletes records sooner, and the audit log's integrity chain is not sealing "
-                    f"just now ({stopped.kind}), so it cannot be recorded. Nothing was changed; try again later."))
-            outcome = setting_changes.request(db, key, body.value, actor=current_user,
-                                              judge=chain_seals.judge_now(key))
+                raise HTTPException(status_code=409, detail=stopped_refusal(why, stopped))
+            outcome = setting_changes.request(db, key, body.value, actor=current_user, judge=judge)
             change = change_dict(outcome.change)
             db.commit()
     except audit_integrity.ChainBusy:

@@ -1115,10 +1115,11 @@ def read_at_start(engine, st: Optional[ChainState] = None, *, timeout: float = S
     return st.view_read
 
 
-def unread_reason(st: Optional[ChainState] = None) -> str:
-    """Why this process's view is not read through, as a clause for a page."""
+def unread_reason(st: Optional[ChainState] = None, met: Optional[str] = None) -> str:
+    """Why this process's view is not read through, as a clause for a page. ``met``: the kind of stop the caller's own
+    check just met, named when the state names none."""
     st = st or state()
-    kind = st.stopped.kind if st.stopped is not None else st.read_stopped
+    kind = st.stopped.kind if st.stopped is not None else (st.read_stopped or met)
     if kind:
         return (f"the audit log's integrity chain does not check out ({kind}), so this server has not read it "
                 "through; the integrity status on the Activity page says what to do")

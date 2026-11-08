@@ -18,7 +18,10 @@ reads the state from seals this process authenticated (the verified view), and t
 deletion back. Only .env sets the delay: no request, change or veto may name it.
 
 While sealing is stopped, or before the first seal, a change that deletes sooner is refused with the reason;
-one that deletes later, and a cancel, are saved, and the next pass seals them from the database.
+one that deletes later, and a cancel, are saved, and the next pass seals them from the database. While this
+process has not read the chain through, what the chain last gave is not known: a change of a setting the chain
+records is refused saying so, unless it only turns a hold on, which keeps more whatever is in force
+(while_stopped); a cancel is refused the same way (cancel_while_stopped).
 """
 from __future__ import annotations
 
@@ -428,31 +431,73 @@ def request_seq_for(view, change_id) -> Optional[int]:
     return None
 
 
+def _trusted_judge(key: str, st) -> Optional[Judge]:
+    """judge() from this process's view while it is read through and stays so while the judge is made
+    (ChainState.trusted); raises ViewUnread otherwise. The judge keeps copies of what it read."""
+    record = st.known_record()
+    return st.trusted(lambda view: judge(view, record, key, st.clock()))
+
+
 def judge_now(key: str, st=None) -> Optional[Judge]:
     """The judge of a change of ``key`` from this process's view as it stands, without the chain lock: for a
-    change made while sealing is stopped, which writes no seal."""
+    change made while sealing is stopped, which writes no seal. None for a setting the chain does not record,
+    before the chain's first policy seal, and while this process has not read the chain through (or a check
+    cleared the view while the judge was made): nothing is judged from a view that is not read through, and
+    setting_changes.request() then judges the change from the database's value."""
     st = st or _ai().state()
-    return judge(st.view, st.known_record(), key, st.clock())
+    try:
+        return _trusted_judge(key, st)
+    except _ai().ViewUnread:
+        return None
 
 
-def refuses_while_stopped(db, key: str, requested, st=None) -> bool:
-    """Whether a change must be refused because sealing is stopped: one that deletes sooner than what the chain
-    last gave (the database's value before the chain's first policy seal). A setting the chain records is refused
-    whatever the change while this process has not read the chain through (ChainState.view_read): what the chain
-    last gave is then not known."""
+def only_adds_a_hold(spec, requested) -> bool:
+    """Whether setting ``spec`` to ``requested`` can only keep records longer, whatever value is in force: a switch
+    whose turning off deletes sooner (kind bool, reduction LOWER), turned on. That is the strongest value the
+    setting has, so it needs no knowledge of the value in force. Decided by the spec, never by its key."""
+    return spec is not None and spec.kind == "bool" and spec.reduction == registry.LOWER and requested is True
+
+
+# Why while_stopped() refuses a change.
+SOONER = "sooner"      # it deletes sooner than what the chain last gave (or the database, for the rest)
+UNREAD = "unread"      # this process has not read the chain through: whether it deletes sooner cannot be told
+
+
+def while_stopped(db, key: str, requested, st=None) -> tuple:
+    """How a change made while sealing is stopped, which writes no seal, is taken: (why it is refused, SOONER or
+    UNREAD, or None; the judge setting_changes.request() takes, or None to judge it from the database's value).
+
+    - A setting the chain records, from this process's view while it is read through and stays so while the judge
+      is made: refused (SOONER) when it deletes sooner than what the chain last gave.
+    - The same while this process has not read the chain through: what the chain last gave is not known, so whether
+      the change deletes sooner cannot be told (the database's value may not be the chain's), and it is refused
+      (UNREAD); only a change that can only add a hold (only_adds_a_hold) is taken, judged from the database's value
+      (it never waits), and sealed from the database once sealing runs again.
+    - A setting the chain does not record, or one before the chain's first policy seal: judged from the database's
+      value, refused (SOONER) when it deletes sooner."""
     from app.core import setting_changes
     spec = registry.spec_for(key)
     if spec is None:
-        return False
+        return None, None
     st = st or _ai().state()
-    if key in pol.chain_setting_keys() and not st.view_read:
-        return True
-    j = judge_now(key, st)
-    if j is not None:
-        return j.deletes_sooner(requested)
+    if key in pol.chain_setting_keys():
+        try:
+            j = _trusted_judge(key, st)
+        except _ai().ViewUnread:
+            return (None if only_adds_a_hold(spec, requested) else UNREAD), None
+        if j is not None:
+            return (SOONER if j.deletes_sooner(requested) else None), j
     _stored, old_setting, _old_value = setting_changes.in_force(db, spec)
     new_setting = requested if requested is not None else registry.deployment_value(spec)[0]
-    return setting_changes.deletes_sooner(spec, old_setting, new_setting)
+    return (SOONER if setting_changes.deletes_sooner(spec, old_setting, new_setting) else None), None
+
+
+def refuses_while_stopped(db, key: str, requested, st=None) -> bool:
+    """Whether a change must be refused because sealing is stopped (while_stopped): one that deletes sooner than
+    what the chain last gave (the database's value for a setting the chain does not record, or before the chain's
+    first policy seal), and, while this process has not read the chain through, any change of a setting the chain
+    records but one that can only add a hold."""
+    return while_stopped(db, key, requested, st)[0] is not None
 
 
 # --------------------------------------------------------------------------- applying due requests
