@@ -44,6 +44,11 @@ bcrypt==5.0.0
 # RecursionError out of jwt.decode (GHSA-8wjv-2p76-3863), so every signed-in route answered a crafted
 # Authorization header with a 500 instead of a 401. tests/test_access_token_nesting.py pins that.
 PyJWT==2.15.1
+# Passkeys (WebAuthn Level 3): the relying-party side, pure Python on cryptography. The vault's own checks
+# (the exact origin, the allow list, the sign count, the backup flags, the algorithm list, attestation
+# anchors) sit in app/services/webauthn_service.py; the library parses CBOR, COSE and attestation
+# statements and checks the signature, the relying-party id hash and the flags it is asked about.
+fido2==2.2.1
 keyring==25.7.0
 
 # HTML sanitization for admin-authored email templates. nh3 is a Rust ammonia binding: an

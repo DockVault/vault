@@ -45,6 +45,7 @@ colorama==0.4.6
 cryptography==50.0.0
     # via
     #   -r tests/requirements-test.txt
+    #   fido2
     #   paramiko
 cyclonedx-python-lib==11.11.0
     # via pip-audit
@@ -55,6 +56,8 @@ dnspython==2.9.2
 email-validator==2.3.0
     # via -r tests/requirements-test.txt
 fastapi==0.141.1
+    # via -r tests/requirements-test.txt
+fido2==2.2.1
     # via -r tests/requirements-test.txt
 filelock==3.32.0
     # via cachecontrol

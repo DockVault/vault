@@ -275,6 +275,7 @@ cryptography==50.0.0 \
     --hash=sha256:fd9192b7b70c573d7f214eb1ae35e00d359f6f5e4b27c7e21e30de1fc6204645
     # via
     #   -r requirements.txt
+    #   fido2
     #   paramiko
     #   secretstorage
 dnspython==2.9.2 \
@@ -288,6 +289,10 @@ email-validator==2.3.0 \
 fastapi==0.141.1 \
     --hash=sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3 \
     --hash=sha256:e8822fc40db1e1858054d7a949a888695bc9bdce70139178e33bd2871a453ca1
+    # via -r requirements.txt
+fido2==2.2.1 \
+    --hash=sha256:85787428a94c3f8eaf72f0ff30afba983b559a1b1b795c93318c81b4ad4062c4 \
+    --hash=sha256:ed397da981b9ab133da6ead7309e41f924b566b749956129efe286fae097749f
     # via -r requirements.txt
 greenlet==3.5.4 \
     --hash=sha256:0232ae1de90a8e07867bb127d7a6ba2301e859145489f25cda8a6096dabe1d20 \
