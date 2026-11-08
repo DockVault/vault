@@ -32,8 +32,8 @@ jobs:
     # takes about 17 minutes on Linux and 53 to 69 on Windows, where the audit chain's tests spend most of
     # their time on file opens, renames and lookups, and SQLite looks on the disk for a journal file at each
     # statement. A limit of 25 minutes cancelled the Windows lane with no test failing, so Windows has 120,
-    # about twice a run there.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 25 }}
+    # about twice a run there. A Linux run takes about 23 minutes with installing, so Linux has 45.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 45 }}
     strategy:
       fail-fast: false
       matrix:

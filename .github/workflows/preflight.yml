@@ -22,8 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     # The limit ends a hang; it is not a budget for a normal run. The offline lane (about 11,000 tests) takes
     # about 17 minutes, after about two minutes installing and checking the locks, and the lock refresh below
-    # may take up to five more. A limit of 15 minutes cancelled the job with no test failing.
-    timeout-minutes: 30
+    # may take up to five more. A limit of 15 minutes cancelled the job with no test failing, and a run took
+    # 25 of the next limit's 30.
+    timeout-minutes: 45
     outputs:
       test-count: ${{ steps.collection.outputs.test_count }}
 

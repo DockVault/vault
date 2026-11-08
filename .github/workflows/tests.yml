@@ -89,10 +89,11 @@ jobs:
     name: Full suite (API + browser + SFTP)
     needs: preflight
     runs-on: ubuntu-latest
-    # The suite alone is expected at about 51-57 minutes with this release's tests. 75 is a
-    # safety margin for a slow runner, not a budget to grow into: past about 60, split the suite
-    # itself (browser and API tests in two jobs whose JUnit reports are audited together).
-    timeout-minutes: 75
+    # The suite holds about 15,000 tests and takes about 100 minutes; 75 cancelled it halfway
+    # with nothing failing. 150 is a safety margin for a slow runner, not a budget to grow into:
+    # the suite is to be split (browser and API tests in two jobs whose JUnit reports are audited
+    # together) so that each part fits in about an hour again.
+    timeout-minutes: 150
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

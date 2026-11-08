@@ -84,7 +84,7 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
     - both jobs need only preflight (in parallel, not one after the other) and neither can be
       skipped, because a release publishes only when every job of this workflow succeeded;
     - each job keeps its own logs, teardown and uniquely named failure pictures;
-    - the suite's cap is 75 minutes.
+    - the suite's cap is 150 minutes.
     """
     import yaml
 
@@ -95,7 +95,7 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
         assert job["needs"] == "preflight"
         assert "if" not in job                   # a skipped job counts as passed for publication
         assert job["runs-on"] == "ubuntu-latest"
-    assert suite["timeout-minutes"] == 75
+    assert suite["timeout-minutes"] == 150
     assert 15 <= scenarios["timeout-minutes"] <= 45
 
     def names(job):
@@ -269,13 +269,13 @@ def test_a_candidate_or_release_tests_run_includes_the_fast_lanes():
         assert own in triggers                              # it still runs on its own as well
     lane = fast["jobs"]["fast"]
     assert sorted(lane["strategy"]["matrix"]["os"]) == ["ubuntu-latest", "windows-latest"]
-    # The offline lane takes about 17 minutes on Linux and about an hour on Windows; a 25-minute limit
-    # cancelled the Windows lane with nothing failing. Windows has about twice a run there; Linux keeps 25,
-    # so a hang there still ends soon.
-    assert lane["timeout-minutes"] == "${{ matrix.os == 'windows-latest' && 120 || 25 }}"
+    # The offline lane takes about 23 minutes on Linux with installing and about an hour on Windows; a
+    # 25-minute limit cancelled the Windows lane with nothing failing and left Linux two minutes. Windows has
+    # about twice a run there; Linux has 45, so a hang there still ends within the hour.
+    assert lane["timeout-minutes"] == "${{ matrix.os == 'windows-latest' && 120 || 45 }}"
     # The preflight job runs the same lane on Linux after installing and refreshing the locks; 15 minutes
-    # cancelled it with nothing failing.
-    assert yaml.safe_load(_PREFLIGHT)["jobs"]["preflight"]["timeout-minutes"] == 30
+    # cancelled it with nothing failing, and a run took 25 of 30.
+    assert yaml.safe_load(_PREFLIGHT)["jobs"]["preflight"]["timeout-minutes"] == 45
     checkout = [s for s in lane["steps"] if s.get("uses", "").startswith("actions/checkout@")]
     assert len(checkout) == 1
     assert checkout[0]["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"
