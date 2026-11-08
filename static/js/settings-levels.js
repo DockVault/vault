@@ -281,7 +281,14 @@
 
     // ------------------------------------------------------------------ the catalogue
 
+    // The catalogue is the administrators': its read is refused, and recorded, for anyone else.
+    function administrator() {
+        const user = typeof currentUser !== 'undefined' ? currentUser : null;
+        return !!(user && user.role === 'admin');
+    }
+
     async function load() {
+        if (!administrator()) return;
         if (S.loading) return S.loading;
         S.loading = (async () => {
             try {

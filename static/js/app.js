@@ -5243,6 +5243,8 @@ const usersView = { users: [], groups: [], expanded: new Set() };
 
 // Load Users (Admin Only)
 async function loadUsers() {
+    // The users list is the administrators': refused, and recorded, for anyone else.
+    if (!currentUser || currentUser.role !== 'admin') return;
     const container = document.getElementById('users-list');
     if (!container) return;
 
@@ -6655,6 +6657,8 @@ async function toggleUserStatus(userId, activate) {
 const groupsView = { groups: [], users: [], selectedId: null };
 
 async function loadGroups() {
+    // The departments page is the administrators': refused, and recorded, for anyone else.
+    if (!currentUser || currentUser.role !== 'admin') return;
     try {
         const [groups, users] = await Promise.all([
             apiRequest('/groups', { silent: true }).catch(() => []),
@@ -7511,8 +7515,10 @@ let settingsGroupsLoaded = false;    // did GET /groups succeed? guards against 
 
 // Initialize Settings
 async function initSettings() {
+    // Settings is the administrators' page: its reads are refused for anyone else, and recorded.
+    if (!currentUser || currentUser.role !== 'admin') return;
     console.log('⚙️ Initializing Settings...');
-    
+
     // Setup tab switching
     setupSettingsTabs();
     setupLogAccess();  // log-access tab wiring
@@ -19022,9 +19028,14 @@ async function loadVaultGroupAccess() {
         return;
     }
     try {
+        // The departments the caller may add. An administrator may add any, from the administrators'
+        // own /groups list. An owner or manager may add the departments they belong to (the server
+        // honours no other), read from their own account, as the grant dialog does: asking /groups
+        // would be refused, and every refusal is recorded as a refused administrator action.
+        const isAdmin = currentUser && currentUser.role === 'admin';
         const [access, groups] = await Promise.all([
             apiRequest(`/vaults/${state.currentVault.id}/group-access`, { silent: true }).catch(() => []),
-            apiRequest('/groups', { silent: true }).catch(() => [])
+            isAdmin ? apiRequest('/groups', { silent: true }).catch(() => []) : callerDepartments()
         ]);
         const accessList = Array.isArray(access) ? access : [];
         const accessIds = new Set(accessList.map(a => a.group_id));
@@ -19085,6 +19096,15 @@ async function loadVaultGroupAccess() {
     } catch (e) {
         el.innerHTML = `<div class="alert alert-error">Failed to load department access: ${escapeHtml(e.message)}</div>`;
     }
+}
+
+// The departments the signed-in account belongs to: from the account as signed in, else from /users/me.
+async function callerDepartments() {
+    if (Array.isArray(currentUser && currentUser.groups) && currentUser.groups.length) return currentUser.groups;
+    try {
+        const me = await apiRequest('/users/me', { silent: true });
+        return Array.isArray(me && me.groups) ? me.groups : [];
+    } catch (_) { return []; }
 }
 
 async function addVaultGroupAccess(groupId, permission) {

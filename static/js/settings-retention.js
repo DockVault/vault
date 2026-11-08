@@ -493,6 +493,9 @@
 
     async function load() {
         if (!byId('retention-groups')) return;
+        // These settings are the administrators': their reads are refused, and recorded, for anyone else.
+        const user = typeof currentUser !== 'undefined' ? currentUser : null;
+        if (!user || user.role !== 'admin') return;
         try {
             S.data = await apiRequest('/settings/managed', { silent: true });
         } catch (e) {
