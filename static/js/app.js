@@ -19486,6 +19486,10 @@ function setupFileDragDrop() {
         console.warn('Files tab not found for drag-drop setup');
         return;
     }
+    // Wired once: the files tab and the body persist across vault opens, and this ran on every open, so
+    // each open added another set of listeners and a dropped file was uploaded once per open so far.
+    if (filesTab.dataset.dropWired) return;
+    filesTab.dataset.dropWired = '1';
     
     // Prevent default drag behaviors
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
