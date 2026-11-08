@@ -133,6 +133,10 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("file_download_range", "files", "Part of a file downloaded", "info"),
     AuditAction("file_expired", "files", "File deleted at its expiry", "info", automatic=True),
     AuditAction("file_move", "files", "File moved", "info"),
+    # A preview: the file's content sent to the browser to be shown there (the preview, the text window). It
+    # discloses the content as a download does and is gated and counted as one; the record says which it was.
+    AuditAction("file_previewed", "files", "File sent to the browser for a preview", "info"),
+    AuditAction("file_preview_completed", "files", "File preview finished", "info"),
     AuditAction("file_preview_rendered", "files", "File preview shown", "info"),
     AuditAction("file_rename", "files", "File renamed", "info"),
     AuditAction("file_upload", "files", "File uploaded", "info", ("file_uploaded",)),

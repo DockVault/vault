@@ -22532,11 +22532,19 @@ async def download_file(
     file_password: Optional[str] = Header(None, alias="X-File-Password"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    x_vault_password: Optional[str] = Header(None)
+    x_vault_password: Optional[str] = Header(None),
+    purpose: Optional[str] = Query(None),
 ):
-    """Download a file while exposing a cancellable, principal-bound operation."""
+    """Download a file while exposing a cancellable, principal-bound operation.
+
+    ``purpose=preview`` is how the web app asks for the bytes it shows in its preview and text window.
+    It changes only what the audit rows say: the content was sent to the browser for a preview
+    (file_previewed, file_preview_completed) rather than downloaded. Every gate, the transfer slot and a
+    share's download count are exactly what a download gets: a preview discloses the content as a
+    download does, and a word from the client is a label for the record, never a key to anything."""
     from app.services.activity_monitor import ProgressTracker
 
+    is_preview = purpose == 'preview'
     permission_service = PermissionService(db)
     vault_service = VaultService(db, permission_service)
     audit_logger = AuditLogger(db)
@@ -22662,15 +22670,26 @@ async def download_file(
         # transfer then completed is a different fact, recorded at the end of the response by
         # `file_streamer`. Writing 'success' here was how a failed or cancelled download came to be
         # logged as a successful one.
-        audit_logger.log_action(
-            action='file_download',
-            status='authorized',
-            user=current_user,
-            resource_type='file',
-            resource_id=str(file_id),
-            details={'vault_id': str(vault_id), 'file_name': audit_name},
-            ip_address=get_client_ip(request),
-        )
+        if is_preview:
+            audit_logger.log_action(
+                action='file_previewed',
+                status='authorized',
+                user=current_user,
+                resource_type='file',
+                resource_id=str(file_id),
+                details={'vault_id': str(vault_id), 'file_name': audit_name},
+                ip_address=get_client_ip(request),
+            )
+        else:
+            audit_logger.log_action(
+                action='file_download',
+                status='authorized',
+                user=current_user,
+                resource_type='file',
+                resource_id=str(file_id),
+                details={'vault_id': str(vault_id), 'file_name': audit_name},
+                ip_address=get_client_ip(request),
+            )
 
         if str(vault_id) in (getattr(current_user, '_share_vault_scope', None) or {}):
             try:
@@ -22690,7 +22709,7 @@ async def download_file(
         broadcast_event({
             "event": {
                 "type": "download",
-                "title": "Download in progress",
+                "title": "Preview in progress" if is_preview else "Download in progress",
                 "description": f"{disp_name} ({file_record.size_bytes:,} bytes)",
                 "user": current_user.username,
                 "ip": request_ip,
@@ -22760,28 +22779,40 @@ async def download_file(
                 # The completion record, written here rather than before the first byte. What the
                 # audit row above states is that access was granted; what this one states is what
                 # the transfer actually did.
+                finished = {
+                    'vault_id': str(vault_id),
+                    'file_name': audit_name,
+                    'bytes_sent': served,
+                    'total_bytes': total_size,
+                    'outcome': (
+                        'completed' if terminal_success
+                        else 'cancelled' if cancellation_observed
+                        else 'disconnected' if disconnected
+                        else type(failure).__name__ if failure is not None
+                        else 'incomplete'
+                    ),
+                }
                 try:
-                    audit_logger.log_action(
-                        action='file_download_completed',
-                        status='success' if terminal_success else 'failed',
-                        user=current_user,
-                        resource_type='file',
-                        resource_id=str(file_id),
-                        details={
-                            'vault_id': str(vault_id),
-                            'file_name': audit_name,
-                            'bytes_sent': served,
-                            'total_bytes': total_size,
-                            'outcome': (
-                                'completed' if terminal_success
-                                else 'cancelled' if cancellation_observed
-                                else 'disconnected' if disconnected
-                                else type(failure).__name__ if failure is not None
-                                else 'incomplete'
-                            ),
-                        },
-                        ip_address=request_ip,
-                    )
+                    if is_preview:
+                        audit_logger.log_action(
+                            action='file_preview_completed',
+                            status='success' if terminal_success else 'failed',
+                            user=current_user,
+                            resource_type='file',
+                            resource_id=str(file_id),
+                            details=finished,
+                            ip_address=request_ip,
+                        )
+                    else:
+                        audit_logger.log_action(
+                            action='file_download_completed',
+                            status='success' if terminal_success else 'failed',
+                            user=current_user,
+                            resource_type='file',
+                            resource_id=str(file_id),
+                            details=finished,
+                            ip_address=request_ip,
+                        )
                 except Exception:      # noqa: BLE001 - a lost audit row must not mask the transfer
                     try:
                         db.rollback()
@@ -23000,25 +23031,38 @@ async def download_file(
                         except Exception:      # noqa: BLE001 - telemetry must not kill a response
                             pass
 
+                    # A status is required, and the details are a dict with no file name: a
+                    # string here carried the name past the audit log's name stripping.
+                    ranged = {
+                        "vault_id": str(vault.id),
+                        "range_start": span.start,
+                        "range_end": span.last,
+                        "size": span.total,
+                        "served_bytes": served_bytes,
+                        "completed": served_bytes == span.length,
+                    }
                     try:
-                        # A status is required, and the details are a dict with no file name: a
-                        # string here carried the name past the audit log's name stripping.
-                        audit_logger.log_action(
-                            user=current_user,
-                            action="file_download_range",
-                            status="success",
-                            resource_type="file",
-                            resource_id=str(file_id),
-                            details={
-                                "vault_id": str(vault.id),
-                                "range_start": span.start,
-                                "range_end": span.last,
-                                "size": span.total,
-                                "served_bytes": served_bytes,
-                                "completed": served_bytes == span.length,
-                            },
-                            ip_address=request_ip,
-                        )
+                        if is_preview:
+                            # The text window reads the first part of a large file for its preview.
+                            audit_logger.log_action(
+                                user=current_user,
+                                action="file_previewed",
+                                status="success",
+                                resource_type="file",
+                                resource_id=str(file_id),
+                                details=ranged,
+                                ip_address=request_ip,
+                            )
+                        else:
+                            audit_logger.log_action(
+                                user=current_user,
+                                action="file_download_range",
+                                status="success",
+                                resource_type="file",
+                                resource_id=str(file_id),
+                                details=ranged,
+                                ip_address=request_ip,
+                            )
                     except Exception:      # noqa: BLE001 - an audit write must not kill a response
                         pass
                     end_operation(operation_id)

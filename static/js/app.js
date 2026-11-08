@@ -15567,7 +15567,9 @@ function _renderPdfNotInline(bodyEl) {
 async function _renderTextWindow(bodyEl, fileId, fileName, fsize, headers) {
     const win = TEXT_WINDOW_FETCH_BYTES;
     const h = { ...headers, 'Range': `bytes=0-${win - 1}` };
-    const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers: h });
+    // Asked for as a preview: the server records that the content was sent to the browser to be shown, not
+    // downloaded. Every gate and count is a download's.
+    const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download?purpose=preview`, { headers: h });
     if (!resp.ok && resp.status !== 206) throw new Error('Could not load file (status ' + resp.status + ')');
     let got = 0;
     const chunks = [];
@@ -15718,7 +15720,8 @@ async function openFilePreview(fileId, fileName, mime) {
             return;
         }
 
-        const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers });
+        // Asked for as a preview: recorded as content sent to the browser to be shown, not as a download.
+        const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download?purpose=preview`, { headers });
         if (!resp.ok) throw new Error('Could not load file (status ' + resp.status + ')');
         // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering, reading from
         // the body rather than a materialised copy. Preview needs the whole plaintext in the end
