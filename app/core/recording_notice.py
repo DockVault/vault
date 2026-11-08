@@ -113,6 +113,10 @@ STORES = (
           _sessions_kept, table="active_sessions"),
     Store("pending_logins", "A sign-in waiting for its second factor: its address.",
           lambda: "Minutes: until the sign-in finishes or expires, then with the sessions.", table="pending_logins"),
+    Store("webauthn_credentials", "Your passkeys: each key's public part and the name you gave it, when it was "
+          "made and last used, and a hash of the session that made it.",
+          lambda: "Until you remove it; a passkey an administrator's reset retired, 30 days.",
+          table="webauthn_credentials"),
     Store("sign_in_lockouts", "The address of failed sign-ins counted towards a lock.",
           lambda: "Until the lock ends: a day at most.", table="sign_in_lockouts"),
     Store("sign_in_phantoms", "While the cache is down, the address of failed sign-ins for a name that is no "

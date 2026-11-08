@@ -40,6 +40,9 @@ def active_factors(db, user_id) -> ActiveFactors:
 
 
 def _passkey_count(db, user_id) -> int:
-    """How many usable passkeys the account holds: registered, not retired, not waiting on an approval. The
-    passkey store does not exist yet, so none."""
-    return 0
+    """How many usable passkeys the account holds: registered and not retired by an administrator's reset. A
+    provisional one (registered soon after an administrator changed the account's sign-in details) counts
+    here, as a factor for signing in; the compliance step-ups ask about it separately."""
+    from app.core.models import WebAuthnCredential
+    return db.query(WebAuthnCredential.id).filter(
+        WebAuthnCredential.user_id == user_id, WebAuthnCredential.retired_at.is_(None)).count()

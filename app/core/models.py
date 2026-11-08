@@ -3736,6 +3736,52 @@ class HeldFolder(KeptBase):
     purge_after = Column(DateTime, nullable=True)
 
 
+class WebAuthnCredential(Base):
+    """A passkey registered to an account: the public key the authenticator made, and what the vault must
+    remember to accept its assertions (app/services/webauthn_service.py).
+
+    A passkey is a second factor like the authenticator app (``second_factor_enrollments``, one per account,
+    TOTP only), and for a user the policy allows it can be the whole sign-in when the authenticator verified
+    the person. Several per account; ``credential_id`` is the authenticator's own id, unique across accounts.
+    The public key and the id are stored as the authenticator sent them, never a private part. ``label`` is
+    the person's own text. ``provisional_until`` is set when the key was registered within 14 days after an
+    administrator changed the account's sign-in details, and cleared when the owner confirms it with a
+    pre-existing factor; a provisional key signs in but does not meet the compliance step-ups.
+    ``retired_at`` is set by an administrator's second-factor reset: a retired key is never accepted and the
+    pruner deletes it after 30 days.
+
+    A NEW table, so create_all builds it on an existing deployment and a release that does not know it
+    simply ignores it. Rows cascade with the account."""
+    __tablename__ = 'webauthn_credentials'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    credential_id = Column(LargeBinary, nullable=False, unique=True)
+    public_key_cose = Column(LargeBinary, nullable=False)
+    cose_alg = Column(Integer, nullable=False)              # -7 ES256, -257 RS256, -8 EdDSA
+    sign_count = Column(BigInteger, nullable=False, default=0, server_default='0')   # 0: the authenticator does not count
+    transports = Column(JSON(none_as_null=True), nullable=True)   # internal, hybrid, usb, nfc, ble, as reported
+    aaguid = Column(UUID(as_uuid=True), nullable=True)      # as received; unverified under attestation 'none'
+    backup_eligible = Column(Boolean, nullable=False, default=False, server_default='false')   # BE at registration, pinned
+    backup_state = Column(Boolean, nullable=False, default=False, server_default='false')      # BS as last seen
+    uv_initialized = Column(Boolean, nullable=False, default=False, server_default='false')    # UV at registration
+    discoverable = Column(Boolean, nullable=True)           # credProps.rk when the browser reports it
+    label = Column(String(100), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    created_by_session = Column(String(64), nullable=True)  # hash of the session that registered it
+    provisional_until = Column(DateTime, nullable=True)
+    retired_at = Column(DateTime, nullable=True)
+    prf_slot_id = Column(UUID(as_uuid=True), nullable=True)  # always NULL in this release
+
+    user = relationship('User', backref=backref('webauthn_credentials', cascade='all, delete-orphan',
+                                                passive_deletes=True))
+
+    __table_args__ = (
+        Index('idx_webauthn_credential_user', 'user_id'),
+    )
+
+
 def _decrypt_held_name(target, *_args):
     """An old name kept in held_name_history opens with the vault and the renamed object's id, as the
     object's own name did (a zero-knowledge name stays opaque)."""
