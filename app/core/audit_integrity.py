@@ -322,13 +322,19 @@ class ChainState:
         self.erase_scans: Dict[tuple, Any] = {}
         # Whether the view holds the database's chain read through by a check (ChainWriter.check): set once a check
         # has read every seal (or found no chain at all); cleared when a check starts the view again (a new
-        # generation), and when one stops while the view holds seals up to the head record whose link it has not
-        # reached. Until then the view is empty, or partial, or not verified, and what it lacks (an archived day)
-        # would read as if it did not exist: the readers of the view read the chain first (read_view), and say so
-        # when they cannot.
+        # generation), and when one stops while the view holds seals up to the head record that it accepted before
+        # it reached the record's link, or that break the key sequence. Until then the view is empty, or partial,
+        # or not verified, and what it lacks (an archived day) would read as if it did not exist: the readers of the
+        # view read the chain first (read_view), and say so when they cannot.
         self.view_read = False
-        # The kind of stop the last read for a reader met (read_view), or None.
+        # The kind of stop the last read for a reader met (read_view), or None; cleared when a check reads the view
+        # through.
         self.read_stopped: Optional[str] = None
+        # A break of the key sequence among the seals up to the head record, found once the record's link checked
+        # out (ChainWriter.check). The seals before the record's stay in the view, and a later check reads on from
+        # the view's position, past them: it raises this again instead, so that every check meets this stop, as it
+        # meets every other, until a check starts the view again (a new generation).
+        self.view_stop: Optional[ChainStopped] = None
 
     def cfg(self):
         return self.settings or _settings()
@@ -683,12 +689,14 @@ class ChainWriter:
         if record is not None and (int(record.get("generation", 1)), int(record.get("discards", 0))) > \
                 (view.generation, view.discards):
             st.view_read = False
+            st.view_stop = None
             view.reset(int(record.get("generation", 1)), int(record.get("discards", 0)))
             st.own.clear()
         newest = newest_seq(db)
         if record is None:
             if newest == 0:
                 st.view_read = True
+                st.read_stopped = None
                 return            # only now may genesis run
             raise ChainStopped("head-record-missing",
                                f"the audit chain has {newest} seals but no head record at {store.path}; "
@@ -705,9 +713,15 @@ class ChainWriter:
             if seal is None or fmt.link(view.link_at(view.position - 1), seal.body()) != view.link_at(view.position):
                 raise ChainStopped("head-record-mismatch",
                                    f"seal {view.position} changed or went after this process accepted it")
+        if st.view_stop is not None:
+            # A break of the key sequence among the seals the view holds, which a check reading on from the view's
+            # position would not meet again: met again here.
+            stop = st.view_stop
+            raise ChainStopped(stop.kind, str(stop), stop.seq)
         held = st.keys_held()
         early: Optional[ChainStopped] = None
-        # Whether the view holds seals up to the record that this check accepted before reaching the record's link.
+        # Whether the view holds seals up to the record that this check accepted and that the record's link has
+        # not yet been found to hold without a break of the key sequence.
         unverified = False
         try:
             for seal in read_seals(db, view.position):
@@ -725,9 +739,13 @@ class ChainWriter:
                         if link != rec_link:
                             raise ChainStopped("head-record-mismatch",
                                                f"seal {rec_seq} is not the one the head record holds")
-                        unverified = False
                         if early is not None:
+                            # The view keeps the seals before the record's, the break among them: every later
+                            # check meets this stop again (view_stop), and the view is not read through when this
+                            # check accepted any of them (``unverified``).
+                            st.view_stop = early
                             raise early
+                        unverified = False
                     view.accept(seal, link)
                     unverified = seal.seq < rec_seq
                     continue
@@ -742,6 +760,7 @@ class ChainWriter:
             raise
         view.record_seq = rec_seq
         st.view_read = True
+        st.read_stopped = None
         if self.check_key:
             self._check_current_key(held)
 

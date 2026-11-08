@@ -9,9 +9,13 @@ database with a chain of its own (tests/_audit_chain_env.py):
   rows: a range younger than the shortest row window, a read of rows that are all rows; the readers of rows only
   send the unread header instead; a block in the table after a range's start makes the range one that could reach;
 - a check that stops while the view holds seals up to the head record it has not verified leaves the view unread;
+- a break of the key sequence among the seals up to the head record stops every check that comes after the one that
+  found it, the pruner's pass too, which reports it, whoever's check found it first (the start's read, a reader's);
+- a stop a reader's read met is forgotten once a check reads the view through;
 - the start's read, bounded, and what it says; the web process runs it before it serves;
 - the routes: the Events list, the summary band and the export answer 503 with Retry-After (the export before it
-  records or sends anything), the previews 503, and the erase and removal lists say a request is not known yet.
+  records or sends anything), the Events list's read of rows that are all rows is answered, the previews 503, and the
+  erase and removal lists say a request is not known yet.
 
 The same through a web process that has just started, on Postgres: tests/test_activity_archive_unread_live.py.
 """
@@ -197,6 +201,25 @@ def test_a_block_after_the_start_of_a_range_makes_it_one_that_could_reach_an_arc
         assert archive.could_reach(None, at(ARCHIVED, 0), None, early) is False     # with no table, the date only
 
 
+def test_a_range_could_reach_an_archived_day_when_the_blocks_table_cannot_be_read(env, monkeypatch):
+    """The table may only make a read refuse: a range younger than the shortest row window, whose blocks cannot be
+    read, could reach an archived day, so it is refused while the chain is not read, never answered from rows."""
+    _archived(env)
+    hot = at(HOT, 0)
+    with env.session() as db:
+        assert archive.could_reach(db, hot, None, env.clock()) is False            # the control: the table is read
+    with env.engine.begin() as c:
+        c.exec_driver_sql("ALTER TABLE audit_archive_blocks RENAME TO audit_archive_blocks_away")
+    st = env.fresh_process()
+    with env.session() as db:
+        assert archive.could_reach(db, hot, None, env.clock()) is True
+        with _Held(st, monkeypatch):
+            with pytest.raises(archive.Unread):
+                with archive.source(db, hot, None, st):
+                    pass
+            assert archive.headers_for(hot, None, st, db=db) == {archive.UNREAD_HEADER: "1"}
+
+
 def test_the_shortest_row_window_bounds_the_archived_days(env):
     assert arc.HOT_DAYS_LEAST == 31
     from app.core import settings_registry as reg
@@ -308,6 +331,139 @@ def test_a_check_that_starts_the_view_again_leaves_it_unread_until_it_has_read_i
     assert st.view.position == 0 and st.view_read is False
 
 
+def _break_key_sequence(env, after=1):
+    """The first seal after seal ``after`` and before the head record's that is neither a key seal nor genesis, put
+    under another key id, as a writer that holds the key and the head record could: the links from it on, their MACs
+    under the key, and the head record's link follow, so the record's link checks out and only the key sequence
+    breaks. Returns (that seal's seq, the record's)."""
+    import json
+    from app.core import audit_chain_format as fmt
+    from app.core.models import AuditSeal
+    other = "kc1:" + "f" * 16
+    key = env.st.current_key().key
+    path = env.st.head_store().path
+    with open(path, encoding="utf-8") as fh:
+        record = json.load(fh)
+    rec_seq = int(record["seq"])
+    with env.session() as db:
+        seals = list(ai.read_seals(db, 0))
+    k = next(s.seq for s in seals if after < s.seq < rec_seq and s.kind not in ("key", "genesis"))
+    prev, links = fmt.LINK_0, {}
+    for s in seals:
+        if s.seq == k:
+            s.key_id = other
+        prev = fmt.link(prev, s.body())
+        links[s.seq] = prev
+    with env.session() as db:
+        db.query(AuditSeal).filter(AuditSeal.seq == k).update({"key_id": other}, synchronize_session=False)
+        for seq, link in links.items():
+            fields = {"link": link}
+            if seq >= k:
+                fields["mac"] = fmt.mac(key, link)
+            db.query(AuditSeal).filter(AuditSeal.seq == seq).update(fields, synchronize_session=False)
+        db.commit()
+    record["link"] = links[rec_seq].hex()
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(record, fh)
+    return k, rec_seq
+
+
+def _reported(env, st, kind):
+    """Whether ``kind`` is an open failure in the head record and announced in an audit row."""
+    from app.core.models import AuditLog
+    st.store = None
+    with env.session() as db:
+        rows = [r.details for r in db.query(AuditLog).filter(AuditLog.action == ai.FAILED_ACTION).all()]
+    return kind in ai.open_failures(st.head_store().load()) and any(kind in (d or {}).get("kinds", []) for d in rows)
+
+
+def test_a_break_of_the_key_sequence_under_the_head_record_that_the_start_s_read_meets_is_reported_by_the_pass(env):
+    """The start's read accepts the seals before the record's and stops at the record's seal: the pass that comes
+    next meets the same stop, and reports it, as it did when it was the process's first check."""
+    _archived(env)
+    k, rec_seq = _break_key_sequence(env)
+    st = env.fresh_process()
+    assert ai.read_at_start(env.engine, st, timeout=10) is False
+    assert (st.read_stopped, st.view_read, st.view.position) == ("key-sequence", False, rec_seq - 1)
+    assert not _reported(env, st, "key-sequence")             # a reader's read records nothing
+    env.clock.advance(minutes=30)
+    r = env.seal()
+    assert r.stopped == "key-sequence" and st.stopped.kind == "key-sequence" and st.stopped.seq == k
+    assert _reported(env, st, "key-sequence")
+    # Every check after it meets it too: a reader's read, and the next pass.
+    assert ai.read_view(env.engine, st) is False and st.read_stopped == "key-sequence"
+    env.clock.advance(hours=1)
+    assert env.seal().stopped == "key-sequence"
+    with env.session() as db:
+        with pytest.raises(archive.Unread) as refused:
+            with archive.source(db, at(ARCHIVED, 0), None, st):
+                pass
+    assert "does not check out (key-sequence)" in str(refused.value)
+
+
+def test_a_break_of_the_key_sequence_in_seals_another_writer_recorded_stops_every_check_after_it(env):
+    """A process that has read the chain through, then reads seals another writer appended and recorded: a break of
+    the key sequence among them stops the check that finds it, leaves the view unread (it holds the seals that
+    carry the break), and stops every check after it, the pass too, which reports it."""
+    _archived(env)
+    first = env.st
+    assert first.view_read is True
+    before, after = _sealed_elsewhere(env)
+    k, rec_seq = _break_key_sequence(env, after=before)
+    assert rec_seq == after and before < k < after
+    with pytest.raises(ai.ChainStopped) as stop:
+        with ai.ChainWriter(env.engine, first, check_key=False, writer="admin"):
+            pass
+    assert stop.value.kind == "key-sequence"
+    assert first.view_read is False and first.view.position == after - 1
+    env.clock.advance(minutes=30)
+    assert env.seal().stopped == "key-sequence"
+    assert _reported(env, first, "key-sequence")
+    assert ai.read_view(env.engine, first) is False and first.read_stopped == "key-sequence"
+
+
+def test_a_break_of_the_key_sequence_is_met_again_from_the_first_seal_when_the_view_starts_again(env):
+    """The stop is kept with the view: a view started again (a new generation of the head record) reads from the
+    first seal, and meets the break itself."""
+    import json
+    _archived(env)
+    k, rec_seq = _break_key_sequence(env)
+    st = env.fresh_process()
+    assert ai.read_view(env.engine, st) is False and st.view_stop is not None
+    path = st.head_store().path
+    with open(path, encoding="utf-8") as fh:
+        record = json.load(fh)
+    record["discards"] = int(record.get("discards") or 0) + 1
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(record, fh)
+    with pytest.raises(ai.ChainStopped) as stop:
+        with ai.ChainWriter(env.engine, st, check_key=False, writer="admin"):
+            pass
+    assert stop.value.kind == "key-sequence" and stop.value.seq == k
+    assert st.view.discards == record["discards"] and st.view.position == rec_seq - 1
+
+
+def test_a_stop_a_read_met_is_forgotten_once_a_check_reads_the_view_through(env, monkeypatch):
+    """A reader's read met a stop (the head record gone), and the pruner's pass then read the chain through (the
+    record put back): the stop is not kept, so a view not read through later (a new generation not read yet) is
+    refused as one being read, with a time to try again, not as a chain that does not check out."""
+    import os
+    _archived(env)
+    st = env.fresh_process()
+    path = st.head_store().path
+    os.replace(path, path + ".away")
+    assert ai.read_view(env.engine, st) is False and st.read_stopped == "head-record-missing"
+    os.replace(path + ".away", path)
+    env.clock.advance(minutes=30)
+    assert env.seal().stopped is None
+    assert st.view_read is True and st.read_stopped is None
+    st.view_read = False
+    with _Held(st, monkeypatch):
+        assert ai.read_view(env.engine, st) is False
+    text = archive.unread_message(st)
+    assert "Try again in a minute" in text and "does not check out" not in text
+
+
 def test_the_status_takes_the_seals_warnings_from_the_record_while_the_view_is_not_read(env):
     env.row(T0 - timedelta(hours=3, minutes=10))
     env.run_until_sealed()
@@ -356,6 +512,34 @@ def test_a_start_whose_read_does_not_finish_in_time_goes_on_and_says_so(env, cap
     out = capsys.readouterr().out
     assert "was not read within 0 s of the start" in out or "could not be read at the start;" in out
     assert ai.read_view(env.engine, st) is True
+
+
+def test_the_start_waits_for_its_read_no_longer_than_its_bound(env, monkeypatch, capsys):
+    """A read that takes longer than the bound (here 3 s against 0.3 s) goes on on a thread of its own; the start
+    goes on once the bound has run, and says so."""
+    import threading
+    import time as _time
+    _archived(env)
+    st = env.fresh_process()
+    real = ai.read_view
+    done = threading.Event()
+    threads = []
+
+    def slow(engine, st_=None, *, wait=None):
+        threads.append(threading.current_thread())
+        _time.sleep(3)
+        try:
+            return real(engine, st_, wait=wait)
+        finally:
+            done.set()
+    monkeypatch.setattr(ai, "read_view", slow)
+    began = _time.monotonic()
+    assert ai.read_at_start(env.engine, st, timeout=0.3) is False
+    took = _time.monotonic() - began
+    assert took < 1.5, took
+    assert threads and threads[0] is not threading.current_thread()
+    assert "was not read within 0 s of the start; the read goes on" in capsys.readouterr().out
+    assert done.wait(10) and st.view_read is True                 # it went on, and read the chain through
 
 
 def test_a_start_whose_chain_does_not_check_out_goes_on_and_says_why(env, capsys):
@@ -450,6 +634,34 @@ def test_an_export_that_could_reach_an_archived_day_is_refused_before_it_is_reco
         r.export_events(body=r.ExportSearch(), request=None, current_user=ADMIN, db=_Db())
     assert refused.value.status_code == 503 and refused.value.headers == {"Retry-After": "60"}
     assert written == []
+
+
+def test_the_events_list_reads_rows_that_are_all_rows_while_the_archived_days_cannot_be_told(env, monkeypatch):
+    """The live list's reads of its new rows (by id, with no start): ids that are all rows of audit_logs are read
+    from the rows while the chain is not read; an id that is no row could be an archived one, and is refused."""
+    from app.api import api_server as api
+    from app.core.models import AuditLog
+    _archived(env)
+    kept = env.row(T0 - timedelta(minutes=5))
+    st = env.fresh_process()
+    read = []
+
+    def page(rdb, entity, *args, **_kw):
+        read.append((rdb, entity))
+        return {"events": [], "next_cursor": None, "total": None}
+    monkeypatch.setattr(api, "_activity_events_page", page)
+    events = dict(category=[], channel=[], status=[], action=[], user=None, user_match="contains", no_account=False,
+                  ip=None, q=None, temp_credential_id=None, temp_credential=None, vault_id=None, from_date=None,
+                  to_date=None, cursor=None, page=None, after=None, overlap=0, count_only=False, limit=50, case=None,
+                  request=None, current_user=ADMIN)
+    with _Held(st, monkeypatch), env.session() as db:
+        out = api.activity_events(ids=[str(kept)], db=db, **events)
+        assert out == {"events": [], "next_cursor": None, "total": None} and read == [(db, AuditLog)]
+        with pytest.raises(HTTPException) as refused:
+            api.activity_events(ids=[str(kept), str(uuid.uuid4())], db=db, **events)
+        assert refused.value.status_code == 503 and refused.value.headers == {"Retry-After": "60"}
+        assert len(read) == 1
+    assert st.view_read is False
 
 
 def test_the_previews_answer_503_while_the_chain_cannot_be_read(unread):
