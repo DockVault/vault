@@ -650,6 +650,10 @@
                             <div id="vault-breadcrumb" class="breadcrumb">
                                 <span class="breadcrumb-item active" data-path="">Root</span>
                             </div>
+                            <!-- Find in this folder: narrows the loaded listing by name as you type (in the browser, so it
+                                 works in a zero-knowledge vault too, whose names are decrypted here). Empty again on leaving. -->
+                            <input type="search" id="files-filter" class="form-control files-filter" placeholder="Find in this folder"
+                                   aria-label="Find in this folder" autocomplete="off" spellcheck="false">
                             <div class="files-toolbar-actions">
                                 <div class="seg-filter" role="group" aria-label="File view">
                                     <button id="files-view-table" class="seg-btn active" type="button" data-files-view="table" title="Table view" aria-label="Table view"><svg class="icon icon-sm"><use href="#i-list"/></svg> Table</button>

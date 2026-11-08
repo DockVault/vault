@@ -11633,6 +11633,14 @@ async function loadVaultFiles() {
             return a.name.localeCompare(b.name);
         });
         state.currentFiles = items;
+        // Find in this folder belongs to the folder it was typed in: another folder or vault starts clear.
+        const listingKey = `${state.currentVault.id}/${state.currentFolderId || ''}`;
+        if (state._filesFilterKey !== listingKey) {
+            state._filesFilterKey = listingKey;
+            state.filesFilter = '';
+            const box = document.getElementById('files-filter');
+            if (box) box.value = '';
+        }
         renderVaultFiles();
         
         // Surface any incomplete (resumable) uploads for this vault in the tray.
@@ -11842,13 +11850,18 @@ function renderVaultFiles() {
     }
     if (!(state.selectedFileIds instanceof Set)) state.selectedFileIds = new Set();
 
-    const items = sortFilesForRender(state.currentFiles || []);
+    const all = sortFilesForRender(state.currentFiles || []);
+    // Find in this folder: the rows whose name holds the typed text, matched without regard to case.
+    const needle = (state.filesFilter || '').trim().toLowerCase();
+    const items = needle ? all.filter(i => String(i.name || '').toLowerCase().includes(needle)) : all;
+    state.visibleFiles = items;
     const view = state.filesView === 'grid' ? 'grid' : 'table';
     const canWrite = state.canWriteCurrentVault !== false;
 
     // Drop any selected ids that are no longer present (e.g. after navigation). In-flight upload
-    // rows are synthetic (no real file id) and never selectable, so they are excluded here.
-    const listedIds = new Set(items.filter(i => !i.in_progress).map(i => i.id));
+    // rows are synthetic (no real file id) and never selectable, so they are excluded here. A row
+    // the filter hides stays selected: it is still in this folder.
+    const listedIds = new Set(all.filter(i => !i.in_progress).map(i => i.id));
     state.selectedFileIds.forEach(id => { if (!listedIds.has(id)) state.selectedFileIds.delete(id); });
 
     const tableWrap = document.getElementById('vault-files-table-wrap');
@@ -11861,11 +11874,11 @@ function renderVaultFiles() {
         b.classList.toggle('active', b.getAttribute('data-files-view') === view));
 
     if (view === 'table') {
-        renderFilesTable(items, canWrite, tbody);
+        renderFilesTable(items, canWrite, tbody, needle);
         wireFileItemHandlers(tbody);
         applySortHeaderUI();
     } else {
-        renderFilesGrid(items, canWrite, grid);
+        renderFilesGrid(items, canWrite, grid, needle);
         wireFileItemHandlers(grid);
     }
 
@@ -11874,8 +11887,12 @@ function renderVaultFiles() {
     updateMoveCopyBar();
 }
 
-function filesEmptyStateHtml(grid) {
-    const inner = `<p style="font-size:48px;margin:0;">${iconSvg('folder', 'icon-lg')}</p>
+function filesEmptyStateHtml(grid, needle) {
+    const inner = needle
+        ? `<p style="font-size:48px;margin:0;">${iconSvg('search', 'icon-lg')}</p>
+        <h3 style="margin:16px 0 8px 0;">Nothing here matches “${escapeHtml(needle)}”</h3>
+        <p style="color:var(--text-secondary);" class="files-filter-empty">Only this folder is searched. Clear the box to see everything in it.</p>`
+        : `<p style="font-size:48px;margin:0;">${iconSvg('folder', 'icon-lg')}</p>
         <h3 style="margin:16px 0 8px 0;">No files yet</h3>
         <p style="color:var(--text-secondary);">Upload files or create folders to get started</p>`;
     return grid
@@ -11908,9 +11925,9 @@ function fileActionButtons(item, canWrite, opts) {
     return buttons.join('');
 }
 
-function renderFilesTable(items, canWrite, tbody) {
+function renderFilesTable(items, canWrite, tbody, needle) {
     if (!tbody) return;
-    if (!items.length) { tbody.innerHTML = filesEmptyStateHtml(false); return; }
+    if (!items.length) { tbody.innerHTML = filesEmptyStateHtml(false, needle); return; }
     tbody.innerHTML = items.map(item => {
         // An in-flight SFTP upload: a disabled row (no select, no preview, no actions) that shows
         // the FINAL name and, to a member-grade viewer, who is uploading it. Removed when the marker
@@ -11961,9 +11978,9 @@ function renderFilesTable(items, canWrite, tbody) {
     }).join('');
 }
 
-function renderFilesGrid(items, canWrite, grid) {
+function renderFilesGrid(items, canWrite, grid, needle) {
     if (!grid) return;
-    if (!items.length) { grid.innerHTML = filesEmptyStateHtml(true); return; }
+    if (!items.length) { grid.innerHTML = filesEmptyStateHtml(true, needle); return; }
     grid.innerHTML = items.map(item => {
         // In-flight SFTP upload: a disabled tile (no select/preview/actions) naming the final file
         // and, for a member-grade viewer, its uploader. Gone when the uploader's marker clears.
@@ -12260,7 +12277,7 @@ function updateFilesBulkBar() {
     const all = document.getElementById('files-select-all');
     if (all && all.parentElement) all.parentElement.style.display = allowBulkSelect() ? '' : 'none';
     if (all) {
-        const selectable = (state.currentFiles || []).filter(i => !i.in_progress).length;
+        const selectable = (state.visibleFiles || state.currentFiles || []).filter(i => !i.in_progress).length;
         all.checked = selectable > 0 && count >= selectable;
         all.indeterminate = count > 0 && count < selectable;
     }
@@ -12604,7 +12621,7 @@ function setupFilesViewControls() {
     const all = document.getElementById('files-select-all');
     if (all) all.addEventListener('change', () => {
         if (!(state.selectedFileIds instanceof Set)) state.selectedFileIds = new Set();
-        const items = (state.currentFiles || []).filter(i => !i.in_progress);
+        const items = (state.visibleFiles || state.currentFiles || []).filter(i => !i.in_progress);
         if (all.checked) items.forEach(i => state.selectedFileIds.add(i.id));
         else state.selectedFileIds.clear();
         renderVaultFiles();
@@ -12619,6 +12636,14 @@ function setupFilesViewControls() {
     if (cut) cut.addEventListener('click', () => bulkStageSelected('move'));
     const clear = document.getElementById('files-bulk-clear');
     if (clear) clear.addEventListener('click', () => { if (state.selectedFileIds) state.selectedFileIds.clear(); renderVaultFiles(); });
+    // Find in this folder: re-rendered on every keystroke (the listing is already loaded); Escape clears.
+    const filter = document.getElementById('files-filter');
+    if (filter) {
+        filter.addEventListener('input', () => { state.filesFilter = filter.value; renderVaultFiles(); });
+        filter.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && filter.value) { e.stopPropagation(); filter.value = ''; state.filesFilter = ''; renderVaultFiles(); }
+        });
+    }
     // Copied Items staging panel.
     const ciBtn = document.getElementById('copied-items-btn');
     if (ciBtn) ciBtn.addEventListener('click', toggleCopiedItems);

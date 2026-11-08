@@ -48,7 +48,14 @@ def _row_boxes(page: Page) -> list:
     page.mouse.move(0, 0)
     return page.evaluate(
         "() => [...document.querySelectorAll('#vault-files-table-body tr')]"
-        "  .map(r => { const b = r.getBoundingClientRect(); return [Math.round(b.top), Math.round(b.height)]; })")
+        "  .map(r => { const b = r.getBoundingClientRect(); return [b.top, b.height]; })")
+
+
+def _same_place(a: list, b: list) -> bool:
+    """The same boxes, to well under a pixel: a row sits on a fraction of a pixel (its cells' padding is in
+    rem), so a rounded position could flip by one between two readings of an unmoved row. A move is a pixel
+    or more (the toolbar's own height is tens of them)."""
+    return len(a) == len(b) and all(abs(x - y) < 0.6 for ra, rb in zip(a, b) for x, y in zip(ra, rb))
 
 
 def _settled_rows(page: Page) -> list:
@@ -58,7 +65,7 @@ def _settled_rows(page: Page) -> list:
     for _ in range(25):
         page.wait_for_timeout(400)
         now = _row_boxes(page)
-        if now == last:
+        if _same_place(now, last):
             return now
         last = now
     raise AssertionError(f"the rows never settled: {last}")
@@ -91,7 +98,7 @@ def test_selecting_and_clearing_moves_no_row(page: Page, vault_with_files, skin,
     page.locator(f"{ROWS} .files-check").first.check()
     expect(page.locator("#files-bulk-bar")).to_be_visible()
     expect(page.locator("#files-bulk-count")).to_have_text("1")
-    assert _row_boxes(page) == before, "a row moved when the first file was selected"
+    assert _same_place(_row_boxes(page), before), "a row moved when the first file was selected"
 
     # The covered toolbar controls are out of the keyboard's reach while the bar shows, and back after.
     assert page.evaluate("() => document.getElementById('upload-file-btn').closest('[inert]') !== null")
@@ -103,5 +110,5 @@ def test_selecting_and_clearing_moves_no_row(page: Page, vault_with_files, skin,
 
     page.click("#files-bulk-clear")
     expect(page.locator("#files-bulk-bar")).to_be_hidden()
-    assert _row_boxes(page) == before, "a row moved when the selection was undone"
+    assert _same_place(_row_boxes(page), before), "a row moved when the selection was undone"
     assert page.evaluate("() => document.getElementById('upload-file-btn').closest('[inert]') === null")
