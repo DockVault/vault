@@ -226,6 +226,52 @@ def test_a_mark_taken_while_a_check_clears_the_flag_never_trusts_what_was_read_d
     assert [m for m in marks if st.still_read(m)] == []
 
 
+def test_a_mark_whose_two_reads_a_clear_runs_between_never_trusts_the_view_once_the_flag_is_set_again():
+    """view_mark() reads two things, the epoch and the flag, and a check's clear can run between those two reads from
+    another thread. Whichever the mark reads first, a mark taken across a clear never matches once the check sets the
+    flag again: the reader read the view during the check."""
+    st = ai.ChainState()
+    st.view_read = True                       # read through once (a set does not move the epoch)
+    reads = []
+
+    class Hooked(type(st)):
+        def _clear_if_second(self, name):
+            if self.__dict__.get("_armed") and reads and reads[-1] != name:
+                # A check clears the flag right here, between the mark's two reads, as the setter does it.
+                self.__dict__["_armed"] = False
+                type(st).view_read.fset(self, False)
+            reads.append(name)
+
+        @property
+        def _view_read(self):
+            self._clear_if_second("flag")
+            return self.__dict__["_vr"]
+
+        @_view_read.setter
+        def _view_read(self, value):
+            self.__dict__["_vr"] = value
+
+        @property
+        def view_epoch(self):
+            self._clear_if_second("epoch")
+            return self.__dict__["_ve"]
+
+        @view_epoch.setter
+        def view_epoch(self, value):
+            self.__dict__["_ve"] = value
+
+    st.__dict__["_vr"] = st.__dict__.pop("_view_read")
+    st.__dict__["_ve"] = st.__dict__.pop("view_epoch")
+    st.__class__ = Hooked
+    st.__dict__["_armed"] = True
+    mark = st.view_mark()
+    assert st.__dict__["_armed"] is False, reads           # the clear ran inside view_mark
+    # The reader reads the view while the check accepts seals the record's link has not verified; then the check reads
+    # the chain through and sets the flag again.
+    st.view_read = True
+    assert not st.still_read(mark), (mark, reads, st.view_epoch)
+
+
 # --------------------------------------------------------------------------- a check that ends before the record's link
 
 def _seals_that_fail_once(monkeypatch, after):
@@ -499,6 +545,29 @@ def test_the_hold_taken_while_the_view_is_not_read_through_is_told_by_its_spec_n
             assert ps.while_stopped(db, "keep_everything", value, st=st) == (ps.UNREAD, None)
 
 
+def test_a_change_judged_while_a_check_clears_the_view_is_refused_as_not_known(env, monkeypatch):
+    """A change made while sealing is stopped is judged from the view in one trusted read. When a check clears the view
+    while that judge is made (one that began to accept seals the head record's link has not verified), the judge is
+    not used: the change is refused as one whose value in force is not known, and judge_now gives none."""
+    from app.core import audit_chain_policy_seals as ps
+    _archived(env)
+    st = env.st
+    assert st.view_read is True
+    real = ps.judge
+    calls = []
+
+    def judge(view, record, key, now=None):
+        calls.append(key)
+        st.view_read = False          # a check clears the view while the judge reads it
+        return real(view, record, key, now)
+    monkeypatch.setattr(ps, "judge", judge)
+    with env.session() as db:
+        assert ps.while_stopped(db, "audit_max_days", 500, st=st) == (ps.UNREAD, None)
+    st.view_read = True
+    assert ps.judge_now("audit_max_days", st) is None
+    assert calls == ["audit_max_days", "audit_max_days"]
+
+
 def _route(env):
     """The managed-settings routes, the step-up passed."""
     from app.api import managed_settings_router as routes
@@ -605,6 +674,38 @@ def test_with_the_view_not_read_through_and_sealing_running_a_change_is_judged_b
     assert out["status"] == "pending" and out["change"]["setting"] == 400
     assert [s.kind for s in env.seals()[seals + 1:]] == ["request"]
     assert seen == [("logs_hold", True, seals), ("audit_max_days", True, seals + 1)]
+
+
+def test_the_hold_turned_on_while_the_view_is_not_read_through_is_judged_from_the_database_not_from_the_view(env):
+    """A process whose view holds seals but is not read through (a break of the key sequence under the head record):
+    the chain holds the hold on, the database, edited, holds it off. Turning the hold on through the route is judged
+    from the database's value: its audit row says the hold was off, and nothing of the unread view reaches it."""
+    from app.core import setting_changes as sc
+    from app.core.models import AuditLog, ManagedSetting
+    from test_activity_archive_unread import HOT
+    routes = _route(env)
+    _archived(env)
+    out = _put(routes, env, "logs_hold", True)                 # sealing runs: sealed at once, the chain holds it on
+    assert out["status"] == "applied"
+    for h in (1, 2, 3):
+        env.row(at(HOT, 20, h) + timedelta(hours=h))
+    env.run_until_sealed()                                     # the head record moves past the hold's seal
+    with env.session() as db:
+        db.get(ManagedSetting, "logs_hold").value = False      # the database edited: the hold off
+        db.commit()
+    st = _not_read_through(env)
+    assert st.view.newest_policy()[1]["state"]["logs_hold"]["value"] is True
+    with env.session() as db:
+        before = db.query(AuditLog).filter(AuditLog.action == sc.CHANGED).count()
+    out = _put(routes, env, "logs_hold", True)
+    assert out["status"] == "applied" and out["setting"]["chain_read"] is False
+    with env.session() as db:
+        rows = db.query(AuditLog).filter(AuditLog.action == sc.CHANGED).all()
+        assert len(rows) == before + 1 == 2
+        # The first from no stored value (the default, off), the second from the database's edited value (off); a
+        # row saying the hold was on would come from the unread view.
+        assert sorted((r.details["old"], r.details["new"]) for r in rows) == [(False, True), (False, True)]
+        assert db.get(ManagedSetting, "logs_hold").value is True
 
 
 def test_while_the_view_is_not_read_through_a_listed_erase_or_removal_holds_nothing_from_it(env, monkeypatch):
