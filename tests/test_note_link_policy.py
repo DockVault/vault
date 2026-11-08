@@ -60,7 +60,7 @@ def test_user_cap_reader_defaults_and_clamps():
 
 def test_default_catalog_shape():
     names = [t["name"] for t in nlp.DEFAULT_NOTE_LINK_TAGS]
-    assert names == ["Open", "Restricted", "Confidential"]
+    assert names == ["Open", "Restricted", "Client delivery", "Confidential"]
     conf = next(t for t in nlp.DEFAULT_NOTE_LINK_TAGS if t["name"] == "Confidential")
     assert conf["require_secret"] == "password" and conf["max_uses_cap"] == 1
     opent = next(t for t in nlp.DEFAULT_NOTE_LINK_TAGS if t["name"] == "Open")

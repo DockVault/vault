@@ -65,5 +65,7 @@ def test_the_spa_renders_an_in_flight_row_disabled_and_unselectable():
     assert "item.uploading_by" in js
     # In-flight rows are excluded wherever a real file id is wanted (the id is synthetic): selection
     # (two sites, no checkbox) and the drop-time map of names to files that "replace" deletes.
-    assert js.count("!i.in_progress") == 3
+    # ...and every list of the listing's rows leaves an in-flight one out: the two sorts for Copied Items, the
+    # selected-id reconcile, Select all, and the selection bar's count.
+    assert js.count("!i.in_progress") == 5
     assert "i.type !== 'folder' && !i.in_progress)\n        .map(i => [i.name, i.id])" in js

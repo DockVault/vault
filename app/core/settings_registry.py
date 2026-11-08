@@ -115,8 +115,10 @@ ADVANCED = "advanced"
 LEVELS = (ESSENTIAL, ADVANCED)
 
 # The Settings pages, by the name of their tab in the web app.
-PAGES = ("general", "branding", "security", "storage", "email", "sftp", "sharing", "notelinks", "uploadlinks",
-         "accounts", "logs", "records")
+# In the order the Settings section lists them (static/index.html): grouped as Organisation, Security and access,
+# Sharing and links, Email, Records.
+PAGES = ("general", "branding", "storage", "security", "accounts", "sftp", "sharing", "notelinks", "uploadlinks",
+         "email", "records", "logs")
 # The page that shows the settings this registry resolves (the managed settings).
 MANAGED_PAGE = "records"
 

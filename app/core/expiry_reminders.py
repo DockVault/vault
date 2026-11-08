@@ -106,9 +106,9 @@ def sweep_once(tell: Callable[[dict], bool], now: Optional[datetime] = None) -> 
             if tell(item):
                 written += 1
         except Exception as e:  # noqa: BLE001
-            safe_event("expiry-reminders.tell.failed", e, kind=item.get("kind"))
+            safe_event("expiry-reminders.tell.failed", e)
     if written:
-        safe_event("expiry-reminders.sent", count=written)
+        safe_event("expiry-reminders.sent", sent=written)
     return written
 
 

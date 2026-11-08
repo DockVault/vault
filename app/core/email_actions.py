@@ -132,9 +132,8 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         "body_html": (
             "<h2>Files arrived on your upload link</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>Someone uploaded <strong>{{action.file}}</strong> through your upload link "
-            "<strong>{{action.label}}</strong> on {{vault.name}}. More files sent within the hour are not "
-            "announced again; they are all in the link's vault.</p>"
+            "<p>{{action.change}} More files sent within the hour are not announced again; they are all in the "
+            "link's vault.</p>"
             "<p><a href=\"{{action.link}}\">Open your upload links</a></p>"
             "<hr>"
             "<p><small>Sent by {{vault.name}}.</small></p>"
@@ -142,12 +141,11 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
     },
     "expiry_reminder": {
         "name": "Something you shared is about to expire",
-        "subject": "{{action.item}} expires {{action.expires}}",
+        "subject": "Something you shared expires {{action.expires}}",
         "body_html": (
             "<h2>Something you shared is about to expire</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>{{action.item}} on {{vault.name}} expires {{action.expires}}. If people still need it, extend it; "
-            "otherwise nothing needs doing.</p>"
+            "<p>{{action.change}} If people still need it, extend it; otherwise nothing needs doing.</p>"
             "<p><a href=\"{{action.link}}\">Open {{vault.name}}</a></p>"
             "<hr>"
             "<p><small>Sent by {{vault.name}}.</small></p>"

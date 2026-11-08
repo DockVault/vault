@@ -12965,7 +12965,7 @@ def _notelink_public_dict(link, tag=None) -> dict:
         "last_viewed_at": link.last_viewed_at.isoformat() if link.last_viewed_at else None,
         "revoked": bool(link.revoked),
         "has_token_copy": link.token_enc is not None,   # presence flag only; the blob is never listed
-        "message": link.message or None,
+        "message": getattr(link, "message", None) or None,
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
     }
@@ -13202,7 +13202,7 @@ def _tell_about_expiry(item: dict) -> bool:
                 base = _public_base_url(None)
                 send_action_email(db, "expiry_reminder", recipient={"email": owner.email, "username": owner.username},
                                   action_context={"link": f"{base}/{item['target']}" if base else item["target"],
-                                                  "item": item["title"], "expires": when})
+                                                  "change": f"{item['title']} expires {when}.", "expires": when})
     except Exception:  # noqa: BLE001 - the notice is written; mail is best-effort
         pass
     return True
@@ -13675,7 +13675,7 @@ async def redeem_note_link(
         # A link with no secret, peeked at: the page shows its "Show note" button, nothing is spent.
         _audit("success", reason="peek", link_id=link.id)
         return {"available": True, "secret_kind": link.secret_kind,
-                "message": link.message or None, "brand": _brand_name(db)}
+                "message": getattr(link, "message", None) or None, "brand": _brand_name(db)}
 
     # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced.
     now = datetime.utcnow()
@@ -13692,7 +13692,7 @@ async def redeem_note_link(
         raise HTTPException(status_code=404, detail="This link is not available.")
     _audit("success", link_id=link.id)
     return {"title": link.title_snapshot or "", "body": link.body_snapshot or "",
-            "secret_kind": link.secret_kind, "message": link.message or None, "brand": _brand_name(db)}
+            "secret_kind": link.secret_kind, "message": getattr(link, "message", None) or None, "brand": _brand_name(db)}
 
 
 # ---------------------------------------------------------------------------
@@ -14069,7 +14069,7 @@ def _publiclink_public_dict(link, tag=None) -> dict:
         "bytes_served": link.bytes_served,
         "revoked": bool(link.revoked),
         "has_token_copy": link.token_enc is not None,   # presence flag only; the blob is never listed
-        "message": link.message or None,
+        "message": getattr(link, "message", None) or None,
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
         "last_used_at": link.last_used_at.isoformat() if link.last_used_at else None,
@@ -14701,7 +14701,7 @@ async def redeem_public_link(
     if bool(getattr(payload, "peek", False)):
         # A visit is not a download: return metadata only, consuming no use and minting no grant.
         _audit("success", reason="peek", link_id=link.id)
-        return {**meta, "message": link.message or None, "brand": _brand_name(db), "grant": None}
+        return {**meta, "message": getattr(link, "message", None) or None, "brand": _brand_name(db), "grant": None}
 
     # Mint the single-use download grant BEFORE consuming a use, so a Redis outage (→ 503) can never
     # burn a use: nothing is consumed until the grant is safely stored. Fail-closed — a grant that
@@ -14736,7 +14736,7 @@ async def redeem_public_link(
 
     # Names are the Standard vault's in-memory-decrypted plaintext (the ORM load event restores it).
     _audit("success", link_id=link.id)
-    return {**meta, "message": link.message or None, "brand": _brand_name(db), "grant": grant}
+    return {**meta, "message": getattr(link, "message", None) or None, "brand": _brand_name(db), "grant": grant}
 
 
 def _publiclink_is_speculative(request) -> bool:
@@ -15183,7 +15183,7 @@ def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
         "expires_at": r.expires_at.isoformat() if r.expires_at else None,
         "max_uploads": r.max_uploads,
         "upload_count": r.upload_count,
-        "message": r.message or None,
+        "message": getattr(r, "message", None) or None,
         "has_token_copy": r.token_enc is not None,   # presence flag only; the blob is never listed
         "max_file_bytes": r.max_file_bytes,
         "max_total_bytes": r.max_total_bytes,
@@ -15901,8 +15901,9 @@ def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
             base = _public_base_url(request) if request is not None else ""
             send_action_email(db, "receiver_upload_received",
                               recipient={"email": owner.email, "username": owner.username},
-                              action_context={"link": f"{base}/#uploadlinks", "label": label,
-                                              "file": file.original_name or "a file"})
+                              action_context={"link": f"{base}/#uploadlinks",
+                                              "change": f"Someone uploaded {file.original_name or 'a file'} through "
+                                                        f"your upload link {label} on {_brand_name(db) or 'the vault'}."})
     except Exception:  # noqa: BLE001 - telling the owner never fails the upload
         pass
 

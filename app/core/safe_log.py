@@ -27,7 +27,7 @@ import re
 # invited exactly the free text this module exists to keep out.
 _SAFE_FIELDS = frozenset({
     "vault", "file", "session", "user",     # identifiers (UUIDs, or an 8-char session prefix)
-    "bytes", "limit", "removed", "port",    # magnitudes
+    "bytes", "limit", "removed", "port", "sent",   # magnitudes (sent: notices written by a sweep)
     "window_seconds", "floor_bytes", "accepted_bytes",   # the write-progress watchdog's numbers
     "peer", "signal",                       # network / process facts
 })

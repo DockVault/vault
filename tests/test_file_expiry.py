@@ -611,7 +611,7 @@ SERVICE = _code((ROOT / "app" / "services" / "vault_service.py").read_text(encod
 # (source, function head, how many times it must consult the rule)
 _READ_PATHS = [
     (API, "async def list_vault_files(", 1),
-    (API, "async def download_file(", 1),
+    (API, "async def _serve_file(", 1),             # the body of both the download and the preview route
     (API, "async def get_file_info(", 1),
     (API, "async def preview_render_file(", 1),
     (API, "async def copy_file_endpoint(", 1),
@@ -645,11 +645,11 @@ def test_each_read_path_consults_the_rule(src, head, times):
 def test_the_download_lookups_answer_404_before_any_bytes_or_budget():
     """The web download refuses an expired file where it refuses a missing one: before a transfer
     slot is taken (and again once it has one) and before a share download is burned."""
-    body = _function(API, "async def download_file(")
+    body = _function(API, "async def _serve_file(")
     lookup = body.index("File.id == file_id, File.vault_id == vault_id, file_expiry.live_clause()")
     at_the_door = body.index("\n        _the_file()\n")
     assert lookup < at_the_door < body.index("transfer_slot = await _admitted_holding_no_connection(db)")
-    assert lookup < body.index("burn_share_download(")
+    assert lookup < body.index("burn_share_download")   # the burn picked for a download or a preview
 
 
 def test_the_web_process_starts_the_sweep_and_the_sftp_process_does_not():

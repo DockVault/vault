@@ -97,13 +97,13 @@ def redeem(monkeypatch):
 
 def test_a_peek_at_a_link_with_no_secret_spends_nothing_and_shows_nothing(redeem):
     out = redeem(peek=True)
-    assert out.body == {"available": True, "secret_kind": "none"}
+    assert {k: out.body[k] for k in ("available", "secret_kind")} == {"available": True, "secret_kind": "none"}
     assert "the note" not in str(out.body) and out.db.updates == 0
 
 
 def test_the_click_spends_one_view_and_shows_the_note(redeem):
     out = redeem()
-    assert out.body == {"title": "T", "body": "the note", "secret_kind": "none"}
+    assert {k: out.body[k] for k in ("title", "body", "secret_kind")} == {"title": "T", "body": "the note", "secret_kind": "none"}
     assert out.db.updates == 1
 
 
@@ -142,7 +142,7 @@ def test_a_peek_at_a_link_whose_owner_is_out_answers_like_a_missing_link(redeem,
 def test_a_peek_still_answers_while_the_timed_lock_holds(redeem, kind, answer):
     out = redeem(secret_kind=kind, owner_state="locked for a while", peek=True)
     if answer is None:
-        assert out.body == {"available": True, "secret_kind": "none"}
+        assert {k: out.body[k] for k in ("available", "secret_kind")} == {"available": True, "secret_kind": "none"}
     else:
         assert out.refused.status_code == answer
     assert out.db.updates == 0
@@ -168,6 +168,6 @@ def test_the_page_peeks_on_load_and_redeems_only_on_a_click():
     assert reveal.count("redeem(null, false)") == 1
     assert code.count('$("reveal-btn").addEventListener("click", reveal);') == 1
     # A peek's answer offers the button, and only a redeem's answer (which carries the note) renders it.
-    assert 'if (data && data.available === true && !("body" in data)) { offerReveal(); return; }' in code
+    assert 'if (data && data.available === true && !("body" in data)) { offerReveal(data); return; }' in code
     html = (ROOT / "static" / "note-link.html").read_text(encoding="utf-8")
     assert re.search(r'<button id="reveal-btn" type="button">Show note</button>', html)

@@ -12612,6 +12612,16 @@ function _vaultPasswordFor(vaultId) {
 const _EXTEND_PATHS = { share: '/shares/', public: '/public-links/', note: '/note-links/', receiver: '/receivers/' };
 let _extendPending = null;
 
+// A datetime-local value ("2026-11-20T14:30") is local time by definition; read it field by field.
+function _fromLocalInputValue(value) {
+    const m = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+    if (!m) return null;
+    const d = new Date();
+    d.setFullYear(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    d.setHours(Number(m[4]), Number(m[5]), 0, 0);
+    return d;
+}
+
 function _toLocalInputValue(d) {
     const pad = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -12621,7 +12631,8 @@ function openExtendExpiry(kind, id, currentIso, label, onDone) {
     _extendPending = { kind, id, onDone };
     const current = parseServerTime(currentIso);
     const base = current && !isNaN(current) && current > new Date() ? current : new Date();
-    const suggested = new Date(base.getTime() + 7 * 86400000);
+    const suggested = new Date();
+    suggested.setTime(base.getTime() + 7 * 86400000);   // a week later than now or than the current expiry
     const title = document.getElementById('extend-expiry-title');
     if (title) title.textContent = 'Extend ' + (label || 'this');
     const cur = document.getElementById('extend-expiry-current');
@@ -12641,7 +12652,7 @@ async function saveExtendExpiry() {
     if (!_extendPending) return;
     const input = document.getElementById('extend-expiry-until');
     const err = document.getElementById('extend-expiry-error');
-    const picked = input && input.value ? new Date(input.value) : null;
+    const picked = input && input.value ? _fromLocalInputValue(input.value) : null;
     if (!picked || isNaN(picked)) { if (err) { err.textContent = 'Pick a date and time.'; err.hidden = false; } return; }
     const btn = document.getElementById('extend-expiry-save');
     btn.disabled = true;
