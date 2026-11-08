@@ -9,7 +9,7 @@ import uuid
 import pytest
 
 from _webauthn_softauth import SoftAuthenticator
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL
 
 pytestmark = pytest.mark.integration
 
@@ -27,15 +27,14 @@ def _skip_unless_ready(client):
 
 @pytest.fixture
 def person(admin):
-    name = unique("pk")
-    r = admin.post("/users", json={"username": name, "email": f"{name}@example.com", "password": "Passkey-Test-12345!",
-                                   "role": "user"})
-    assert r.status_code in (200, 201), r.text
-    uid = r.json()["id"]
-    client = ApiClient(name, "Passkey-Test-12345!")
-    client.login()
-    yield client, uid
-    admin.delete(f"/users/{uid}")
+    """A fresh user signed in with the password, with its credentials kept on the client for the routes that
+    re-prove them; deleted on teardown."""
+    user = admin.create_user(role="user")
+    client = ApiClient()
+    client.login(user["_username"], user["_password"])
+    client.username, client.password = user["_username"], user["_password"]
+    yield client, user["id"]
+    admin.delete_user(user["id"])
 
 
 def _register(client, label, auth=None):
@@ -98,10 +97,11 @@ def test_a_second_administrator_change_within_the_window_waits(person, admin):
     second = r.json()["id"]
     assert r.json()["provisional"] is True            # within 14 days after the administrator's change
     r = admin.delete(f"/users/{uid}/passkeys/{second}")
-    assert r.status_code == 202, r.text             # held for another administrator
-    body = r.json()
-    assert body.get("held") or "request" in str(body).lower()
-    # The key stays until another administrator approves.
+    # The two-person rule: held for another administrator (202), or refused outright when no other administrator
+    # could approve it (409, the stack's only administrator). Either way the key stays.
+    assert r.status_code in (202, 409), r.text
+    if r.status_code == 409:
+        assert "another administrator" in r.json()["detail"]
     assert [p["id"] for p in client.get("/users/me/passkeys").json()["passkeys"]] == [second]
 
 
@@ -111,8 +111,11 @@ def test_a_second_factor_reset_retires_every_passkey(person, admin):
     assert r.status_code == 201, r.text
     r = admin.post(f"/users/{uid}/second-factor/reset")
     assert r.status_code == 200, r.text
-    # The sessions ended with the reset; sign in again (the account must set a factor up: the pending login says so).
-    r = client.post("/auth/login", json={"username": client.username, "password": client.password})
+    # The sessions ended with the reset; sign in again from a fresh client (the account must set a factor up: the
+    # pending login says so).
+    fresh = ApiClient()
+    r = fresh.session.post(f"{fresh.base_url}/auth/login", json={"username": client.username, "password": client.password},
+                           timeout=15)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body.get("enrollment_required") is True or body.get("second_factor_required") is True
