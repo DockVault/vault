@@ -658,6 +658,7 @@ COVERAGE: Dict[str, str] = {
     "rate_limit_records": "kept an hour: gone long before an erase runs (it waits the reduction delay)",
     "active_sessions": DELETED, "pending_logins": DELETED, "devices": DELETED, "device_grants": DELETED,
     "second_factor_enrollments": DELETED, "second_factor_recovery_codes": DELETED, "otp_codes": DELETED,
+    "webauthn_credentials": DELETED,
     "password_reset_tokens": DELETED, "email_change_codes": DELETED, "sign_in_lockouts": DELETED,
     "sign_in_phantoms": "a name typed at sign-in only as a keyed stand-in, with an address; each row is gone a day "
                         "after its last failure or its lock's end (a lock with no end: 30 days), as from the cache",
