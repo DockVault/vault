@@ -1075,6 +1075,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
 /* A whole-pixel height (the toolbar's buttons are 32px too): a fractional toolbar would put every row
    below it on a fraction of a pixel, and a row's rounded position would then flicker by one. */
 .files-toolbar .files-filter { flex: 0 1 220px; min-width: 140px; margin: 0; height: 32px; padding-top: 0; padding-bottom: 0; font-size: var(--text-sm, .82rem); }
+#notes-section .notes-search { width: 220px; max-width: 45vw; margin: 0; height: 32px; padding-top: 0; padding-bottom: 0; font-size: var(--text-sm, .82rem); }
 .files-toolbar .breadcrumb { margin: 0; padding: .1rem .1rem; background: transparent; border: 0; }
 .files-toolbar .breadcrumb-item { padding: .12rem .4rem; font-size: var(--text-sm); }
 .files-toolbar-actions { display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap; }

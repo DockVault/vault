@@ -21237,33 +21237,59 @@ function renderNotes() {
         sharedBadge.textContent = String(activeLinks);
         sharedBadge.hidden = activeLinks === 0;
     }
+    // Search by title: the typed text, matched without regard to case, on every tab; a list the search
+    // empties says so instead of looking like a list with nothing in it.
+    const needle = (state.notesQuery || '').trim().toLowerCase();
+    const byTitle = (title) => !needle || String(title || 'Untitled note').toLowerCase().includes(needle);
+    const nothingMatches = () => _el('p', 'text-secondary p-md notes-search-empty', `No note title holds \u201c${state.notesQuery.trim()}\u201d.`);
     // Shared (by me)
     const shared = document.getElementById('notes-shared-list');
     if (shared) {
+        const shownLinks = links.filter(l => byTitle(l.title));
         if (!links.length) {
             shared.replaceChildren(_el('p', 'text-secondary p-md', 'No public links yet. Use Share → Public link on a note to create one.'));
+        } else if (!shownLinks.length) {
+            shared.replaceChildren(nothingMatches());
         } else {
-            shared.replaceChildren(...links.map(_noteLinkCard));
+            shared.replaceChildren(...shownLinks.map(_noteLinkCard));
         }
     }
     // My notes
     const mine = document.getElementById('notes-list');
     if (mine) {
+        const shownMine = state.notes.filter(n => byTitle(n.title));
         if (!state.notes.length) {
             mine.replaceChildren(_el('p', 'text-secondary p-md', 'No notes yet. Create one to get started.'));
+        } else if (!shownMine.length) {
+            mine.replaceChildren(nothingMatches());
         } else {
-            mine.replaceChildren(...state.notes.map(n => _noteCard(n, false)));
+            mine.replaceChildren(...shownMine.map(n => _noteCard(n, false)));
         }
     }
     // Received
     const recv = document.getElementById('notes-received-list');
     if (recv) {
+        const shownRecv = state.notesReceived.filter(n => byTitle(n.title));
         if (!state.notesReceived.length) {
             recv.replaceChildren(_el('p', 'text-secondary p-md', 'Notes other people send you will appear here.'));
+        } else if (!shownRecv.length) {
+            recv.replaceChildren(nothingMatches());
         } else {
-            recv.replaceChildren(...state.notesReceived.map(n => _noteCard(n, true)));
+            recv.replaceChildren(...shownRecv.map(n => _noteCard(n, true)));
         }
     }
+    setupNotesSearch();
+}
+
+// The notes search box, wired once: every keystroke redraws the lists from what is already loaded.
+function setupNotesSearch() {
+    const box = document.getElementById('notes-search');
+    if (!box || box.dataset.wired) return;
+    box.dataset.wired = '1';
+    box.addEventListener('input', () => { state.notesQuery = box.value; renderNotes(); });
+    box.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && box.value) { e.stopPropagation(); box.value = ''; state.notesQuery = ''; renderNotes(); }
+    });
 }
 
 function _noteCard(n, received) {

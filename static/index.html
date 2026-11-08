@@ -1027,6 +1027,9 @@
                     <div class="flex justify-between items-center mb-lg">
                         <h2 class="text-2xl font-bold">Notes</h2>
                         <div class="flex items-center gap-sm">
+                            <!-- Searches the loaded notes by title, in the browser, on every tab. -->
+                            <input type="search" id="notes-search" class="form-control notes-search" placeholder="Search notes by title"
+                                   aria-label="Search notes by title" autocomplete="off" spellcheck="false">
                             <label class="checkbox-label" style="margin:0;">
                                 <input type="checkbox" id="notes-hide-toggle">
                                 <span>Hide note text</span>
