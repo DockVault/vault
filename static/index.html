@@ -3490,8 +3490,9 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="new-password">Password</label>
-                                    <input type="password" id="new-password" class="form-control" required minlength="12">
-                                    <small class="form-help">Minimum 12 characters</small>
+                                    <input type="password" id="new-password" class="form-control" required minlength="8" autocomplete="new-password">
+                                    <!-- The rule is the deployment's (Settings > Security), read when the dialog opens. -->
+                                    <small class="form-help" id="new-password-hint">At least 8 characters.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="new-role">Role</label>
@@ -3622,12 +3623,13 @@
                                 <input type="hidden" id="change-password-user-id">
                                 <div class="form-group">
                                     <label for="change-password-new">New Password</label>
-                                    <input type="password" id="change-password-new" class="form-control" required minlength="12">
-                                    <small class="form-help">Minimum 12 characters</small>
+                                    <input type="password" id="change-password-new" class="form-control" required minlength="8" autocomplete="new-password">
+                                    <!-- The rule is the deployment's (Settings > Security), read when the dialog opens. -->
+                                    <small class="form-help" id="change-password-hint">At least 8 characters.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="change-password-confirm">Confirm Password</label>
-                                    <input type="password" id="change-password-confirm" class="form-control" required minlength="12">
+                                    <input type="password" id="change-password-confirm" class="form-control" required minlength="8" autocomplete="new-password">
                                 </div>
                             </div>
                             <div class="modal-footer">
@@ -4213,6 +4215,7 @@
     <script src="/static/js/zk-background.js?v=20261108a"></script>
     <script src="/static/js/zk_key_checks.js?v=20261108a"></script>
     <script src="/static/js/zk_passphrase.js?v=20261108a"></script>
+    <script src="/static/js/password-policy.js?v=20261108a"></script>
     <script src="/static/js/app.js?v=20261108a"></script>
     <script src="/static/js/activity.js?v=20261108a"></script>
     <script src="/static/js/audit-integrity.js?v=20261108a"></script>

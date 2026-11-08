@@ -6592,6 +6592,10 @@ function showChangePasswordModal(userId) {
     document.getElementById('change-password-new').value = '';
     document.getElementById('change-password-confirm').value = '';
     document.getElementById('change-password-modal').classList.add('active');
+    // The password rule is the deployment's, read when the dialog opens (static/js/password-policy.js).
+    if (window.PasswordPolicy) {
+        PasswordPolicy.applyTo(['change-password-new', 'change-password-confirm'], 'change-password-hint').catch(() => {});
+    }
 }
 
 // Delete user
@@ -6625,6 +6629,8 @@ async function deleteUser(userId, username) {
 // Create User Modal
 function showCreateUser() {
     document.getElementById('create-user-modal').classList.add('active');
+    // The password rule is the deployment's, read when the dialog opens (static/js/password-policy.js).
+    if (window.PasswordPolicy) PasswordPolicy.applyTo(['new-password'], 'new-password-hint').catch(() => {});
 }
 
 document.getElementById('create-user-form').addEventListener('submit', async (e) => {
@@ -23094,10 +23100,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            // Validate minimum length
-            if (newPassword.length < 12) {
-                showError('Password must be at least 12 characters long');
-                return;
+            // The deployment's rule, as the server will apply it (the dialog shows the same one).
+            if (window.PasswordPolicy) {
+                const missing = PasswordPolicy.failures(newPassword, await PasswordPolicy.load());
+                if (missing.length) {
+                    showError('The password must ' + missing.join(', ') + '.');
+                    return;
+                }
             }
 
             try {
