@@ -1162,7 +1162,11 @@
         const whoTd = el('td', 'act-c-who');
         const who = whoText(ev);
         const whoWrap = el('div', 'act-who');
-        const name = el('span', 'act-who-name' + (who.quiet ? ' is-quiet' : ''), who.text);
+        // An account's name as the chip every list uses (static/js/people.js), coloured by the account.
+        const name = (ev.user_id && !who.quiet && window.People)
+            ? People.chip({ id: ev.user_id, username: who.text }, { small: true })
+            : el('span', 'act-who-name' + (who.quiet ? ' is-quiet' : ''), who.text);
+        name.classList.add('act-who-name');
         name.title = who.title || who.text;
         whoWrap.appendChild(name);
         if (ev.temp_credential_id) whoWrap.appendChild(tempBadge(ev));

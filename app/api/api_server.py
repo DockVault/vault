@@ -16884,6 +16884,7 @@ def _note_dict(n) -> dict:
         "is_favorite": bool(n.is_favorite),
         "adopted": bool(n.adopted),
         "sent_from": n.sent_from_name if n.sent_from_user_id else None,
+        "sent_from_user_id": str(n.sent_from_user_id) if n.sent_from_user_id else None,
         "created_at": n.created_at.isoformat() if n.created_at else None,
         "updated_at": n.updated_at.isoformat() if n.updated_at else None,
     }
@@ -19897,6 +19898,9 @@ async def list_vault_files(
                 # Last-modifier username for the list column (None for scoped/share principals).
                 'modified_by_name': (_actor_names.get(file.modified_by or file.uploaded_by)
                                      if _show_actor else None),
+                # The same account's id, for the chip's colour (the list keys on it, never on the name).
+                'modified_by_id': (str(file.modified_by or file.uploaded_by)
+                                   if _show_actor and (file.modified_by or file.uploaded_by) else None),
             }
             if is_zk:
                 entry['enc_name'] = file.enc_name

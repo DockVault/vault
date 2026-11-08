@@ -3455,6 +3455,14 @@ function _svgIcon(name, cls) {
     svg.appendChild(use);
     return svg;
 }
+// A table cell naming a link's owner (static/js/people.js), or a dash for an owner the server did not name.
+function _ownerCell(link) {
+    const td = _el('td', '');
+    if (link && link.owner) td.appendChild(People.chip({ id: link.owner_id, username: link.owner }));
+    else td.textContent = '\u2014';
+    return td;
+}
+
 function _el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -3733,9 +3741,12 @@ async function loadShareClaims(shareId, wrap) {
 function renderShareClaims(shareId, claims, wrap) {
     if (!claims || claims.length === 0) { wrap.replaceChildren(_el('p', 'text-secondary text-sm', 'No recipients yet.')); return; }
     wrap.replaceChildren(...claims.map(c => {
-        const row = _el('div', 'flex items-center justify-between'); row.style.padding = '2px 0';
-        row.appendChild(_el('span', 'text-sm',
-            c.username + (c.revoked ? ' (removed)' : '') + ' · ' + (c.download_count || 0) + ' downloads'));
+        const row = _el('div', 'flex items-center justify-between share-claim-row'); row.style.padding = '2px 0';
+        const who = _el('span', 'text-sm flex items-center gap-sm');
+        who.appendChild(People.chip({ id: c.user_id, username: c.username }, { small: true }));
+        who.appendChild(_el('span', 'text-secondary', (c.revoked ? '(removed) · ' : '') + (c.download_count || 0) + ' downloads · '
+            + (c.preview_count || 0) + ' previews'));
+        row.appendChild(who);
         if (!c.revoked) {
             const kick = _el('button', 'btn btn-sm', 'Remove'); kick.type = 'button'; kick.style.color = '#dc2626';
             kick.addEventListener('click', () => kickShareRecipient(shareId, c.user_id, c.username, wrap));
@@ -5501,7 +5512,7 @@ function renderTempCredRow(cred) {
         <tr class="exp-row cred-row${open ? ' open' : ''}" data-id="${uname}" data-status="${dataStatus}">
             <td class="col-toggle"><button class="exp-toggle" aria-label="Toggle details">${iconSvg('chevron-right', 'icon-sm')}</button></td>
             <td><span class="mono cred-name">${uname}</span></td>
-            <td>${escapeHtml(cred.username)}</td>
+            <td>${People.placeholder({ id: cred.user_id, username: cred.username })}</td>
             <td><span class="badge badge-${statusBadge}">${status}</span></td>
             <td><span class="mono cred-expires" id="countdown-${uname}">${formatServerTime(cred.expires_at)}</span></td>
         </tr>
@@ -6196,7 +6207,7 @@ function renderUserRow(u) {
             <td class="col-toggle"><button class="exp-toggle" aria-label="Toggle details">${iconSvg('chevron-right', 'icon-sm')}</button></td>
             <td>
                 <div class="cell-user">
-                    <span class="avatar-sm">${initials}</span>
+                    ${People.placeholder({ id: u.id, username: u.username }, { nameless: true })}
                     <div class="cell-user-text">
                         <span class="cell-user-name">${escapeHtml(u.username)}</span>
                         <span class="cell-user-sub">${escapeHtml(u.email || '')}</span>
@@ -6220,8 +6231,8 @@ function renderUserRow(u) {
 }
 
 function renderUserDetail(u) {
-    const lastLogin = formatServerTime(u.last_login, 'Never');
-    const created = formatServerTime(u.created_at);
+    const lastLogin = People.whenPlaceholder(u.last_login, { fallback: 'Never' });
+    const created = People.whenPlaceholder(u.created_at);
     const inGroups = new Set((u.groups || []).map(g => g.id));
     const addable = usersView.groups.filter(g => !inGroups.has(g.id));
     return `
@@ -7223,7 +7234,7 @@ async function openGroupDetail(id) {
             <div class="member-list">
                 ${g.members.length ? g.members.map(m => `
                     <div class="member-row">
-                        <span class="avatar-sm">${(m.username || '?').substring(0, 2).toUpperCase()}</span>
+                        ${People.placeholder({ id: m.id, username: m.username }, { nameless: true })}
                         <div class="cell-user-text"><span class="cell-user-name">${escapeHtml(m.username)}</span><span class="cell-user-sub">${escapeHtml(m.email || '')}</span></div>
                         <span class="badge badge-${m.role}">${m.role}</span>
                         <button class="btn btn-sm btn-ghost member-remove" data-user-id="${m.id}" title="Remove from department">${iconSvg('x', 'icon-sm')}</button>
@@ -7287,7 +7298,7 @@ function renderAddMembersList(query) {
     listEl.innerHTML = addable.map(u => `
         <label class="pick-row">
             <input type="checkbox" value="${u.id}">
-            <span class="avatar-sm">${(u.username || '?').substring(0, 2).toUpperCase()}</span>
+            ${People.placeholder({ id: u.id, username: u.username }, { nameless: true })}
             <div class="cell-user-text"><span class="cell-user-name">${escapeHtml(u.username)}</span><span class="cell-user-sub">${escapeHtml(u.email || '')}</span></div>
             <span class="badge badge-${u.role}">${u.role}</span>
         </label>`).join('');
@@ -11939,8 +11950,8 @@ function renderFilesTable(items, canWrite, tbody) {
                 </td>
                 <td class="col-num"><span class="file-size">${size}</span></td>
                 <td class="col-meta"><span class="file-type">${escapeHtml(friendlyFileType(item))}</span></td>
-                <td class="col-meta"><span class="file-modified">${formatModified(item.modified)}</span></td>
-                <td class="col-meta"><span class="file-modified-by">${escapeHtml(isFolder ? '—' : (item.modified_by_name || '—'))}</span></td>
+                <td class="col-meta"><span class="file-modified">${People.whenPlaceholder(item.modified)}</span></td>
+                <td class="col-meta"><span class="file-modified-by">${(isFolder || !item.modified_by_name) ? '—' : People.placeholder({ id: item.modified_by_id, username: item.modified_by_name })}</span></td>
                 <td class="col-actions"><div class="file-actions">${fileActionButtons(item, canWrite, { grid: false })}</div></td>
             </tr>`;
     }).join('');
@@ -19422,8 +19433,7 @@ async function loadVaultPermissions() {
             const managerOpt = (isOwnerOrAdmin || isManagerRow)
                 ? `<option value="manage" ${level === 'manage' ? 'selected' : ''}>Manager</option>`
                 : '';
-            const addedDate = parseServerTime(perm.added_at);
-            const added = (addedDate && !isNaN(addedDate)) ? addedDate.toLocaleDateString() : '—';
+            const added = People.whenPlaceholder(perm.added_at);
             // ZK vaults: a member granted access before setting up their encryption key holds the
             // authz row but can't open the vault until they create their key. Flag it so the manager
             // knows the access is real but not yet usable by that member.
@@ -19432,7 +19442,7 @@ async function loadVaultPermissions() {
                 : '';
             return `
             <tr>
-                <td>${escapeHtml(perm.username)}${pendingBadge}</td>
+                <td>${People.placeholder({ id: perm.user_id, username: perm.username })}${pendingBadge}</td>
                 <td>${escapeHtml(perm.email || '-')}</td>
                 <td>
                     <select class="form-control form-control-sm perm-level-select" data-user-id="${perm.user_id}" style="max-width:170px" ${locked ? 'disabled' : ''}>
@@ -19858,9 +19868,7 @@ function renderVaultGrantList() {
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.value = u.id;
-        const avatar = document.createElement('span');
-        avatar.className = 'avatar-sm';
-        avatar.textContent = (u.username || '?').substring(0, 2).toUpperCase();
+        const avatar = People.chip({ id: u.id, username: u.username }, { nameless: true });
         const textWrap = document.createElement('div');
         textWrap.className = 'cell-user-text';
         const nameEl = document.createElement('span');
@@ -20629,7 +20637,7 @@ function renderAdminNoteLinks(data) {
     const tb = _el('tbody');
     links.forEach(l => {
         const tr = _el('tr');
-        tr.appendChild(_el('td', '', l.owner || '—'));
+        tr.appendChild(_ownerCell(l));
         const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
@@ -21010,7 +21018,9 @@ function _noteCard(n, received) {
     bodyWrap.appendChild(head);
 
     if (received && n.sent_from) {
-        bodyWrap.appendChild(_el('div', 'text-secondary text-sm', 'Sent from ' + n.sent_from));
+        const from = _el('div', 'text-secondary text-sm note-sent-from', 'Sent from ');
+        from.appendChild(People.chip({ id: n.sent_from_user_id, username: n.sent_from }, { small: true }));
+        bodyWrap.appendChild(from);
     }
 
     // Body — masked when the global hide is on and this note isn't individually revealed.
@@ -21925,7 +21935,7 @@ function renderAdminPublicLinks(data) {
     const tb = _el('tbody');
     links.forEach(l => {
         const tr = _el('tr');
-        tr.appendChild(_el('td', '', l.owner || '—'));
+        tr.appendChild(_ownerCell(l));
         const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
@@ -22658,7 +22668,7 @@ function renderAdminReceivers(data) {
     const tb = _el('tbody');
     receivers.forEach(r => {
         const tr = _el('tr');
-        tr.appendChild(_el('td', '', r.owner || '—'));
+        tr.appendChild(_ownerCell(r));
         tr.appendChild(_el('td', '', r.label || '—'));
         tr.appendChild(_el('td', '', r.tag_name || '—'));
         tr.appendChild(_el('td', '', _RC_STATUS_LABEL[r.status] || r.status));

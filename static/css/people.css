@@ -1,0 +1,81 @@
+/* People you can tell apart (static/js/people.js): one chip for a person wherever a list names one.
+ *
+ * The avatar's colour comes from a hash of the account's stable id into twelve colours, so the same
+ * person has the same colour in every list and two people seldom share one; the initials come from
+ * the first graphemes of the display name or username. Every background/text pair below reads at
+ * WCAG AA (4.5:1) or better in its theme; tests/test_people_palette.py checks the numbers.
+ *
+ * The initials are drawn from a data attribute, so a chip's text content is the person's name alone.
+ */
+:root {
+    --person-1-bg: #f9d2d2;  --person-1-fg: #711414;
+    --person-2-bg: #f9e6d2;  --person-2-fg: #714214;
+    --person-3-bg: #f9f5d2;  --person-3-fg: #716914;
+    --person-4-bg: #e6f9d2;  --person-4-fg: #427114;
+    --person-5-bg: #d2f9df;  --person-5-fg: #147133;
+    --person-6-bg: #d2f9ef;  --person-6-fg: #14715a;
+    --person-7-bg: #d2f2f9;  --person-7-fg: #146171;
+    --person-8-bg: #d2e2f9;  --person-8-fg: #143b71;
+    --person-9-bg: #d2d2f9;  --person-9-fg: #141471;
+    --person-10-bg: #e5d2f9; --person-10-fg: #421471;
+    --person-11-bg: #f9d2f9; --person-11-fg: #711471;
+    --person-12-bg: #f9d2e6; --person-12-fg: #711442;
+    --person-gone-bg: #e5e7eb; --person-gone-fg: #4b5563;
+}
+[data-theme="dark"] {
+    --person-1-bg: #592222;  --person-1-fg: #f5bcbc;
+    --person-2-bg: #593d22;  --person-2-fg: #f5d9bc;
+    --person-3-bg: #595422;  --person-3-fg: #f5f1bc;
+    --person-4-bg: #3d5922;  --person-4-fg: #d9f5bc;
+    --person-5-bg: #225934;  --person-5-fg: #bcf5cf;
+    --person-6-bg: #22594b;  --person-6-fg: #bcf5e7;
+    --person-7-bg: #225059;  --person-7-fg: #bcecf5;
+    --person-8-bg: #223959;  --person-8-fg: #bcd4f5;
+    --person-9-bg: #222259;  --person-9-fg: #bcbcf5;
+    --person-10-bg: #3d2259; --person-10-fg: #d9bcf5;
+    --person-11-bg: #592259; --person-11-fg: #f5bcf5;
+    --person-12-bg: #59223d; --person-12-fg: #f5bcd9;
+    --person-gone-bg: #374151; --person-gone-fg: #d1d5db;
+}
+
+.person-chip { display: inline-flex; align-items: center; gap: .45rem; max-width: 100%; vertical-align: middle; }
+.person-avatar {
+    width: 28px; height: 28px; flex: 0 0 auto; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: .7rem; font-weight: 700; font-family: var(--font-mono); letter-spacing: .02em;
+    background: var(--person-bg, var(--person-1-bg)); color: var(--person-fg, var(--person-1-fg));
+}
+.person-avatar::before { content: attr(data-initials); }
+.person-avatar.person-sm { width: 22px; height: 22px; font-size: .6rem; }
+.person-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person-chip.person-deleted .person-avatar { background: var(--person-gone-bg); color: var(--person-gone-fg); }
+.person-chip.person-deleted .person-name { color: var(--text-tertiary); text-decoration: line-through; }
+.person-c1 { --person-bg: var(--person-1-bg); --person-fg: var(--person-1-fg); }
+.person-c2 { --person-bg: var(--person-2-bg); --person-fg: var(--person-2-fg); }
+.person-c3 { --person-bg: var(--person-3-bg); --person-fg: var(--person-3-fg); }
+.person-c4 { --person-bg: var(--person-4-bg); --person-fg: var(--person-4-fg); }
+.person-c5 { --person-bg: var(--person-5-bg); --person-fg: var(--person-5-fg); }
+.person-c6 { --person-bg: var(--person-6-bg); --person-fg: var(--person-6-fg); }
+.person-c7 { --person-bg: var(--person-7-bg); --person-fg: var(--person-7-fg); }
+.person-c8 { --person-bg: var(--person-8-bg); --person-fg: var(--person-8-fg); }
+.person-c9 { --person-bg: var(--person-9-bg); --person-fg: var(--person-9-fg); }
+.person-c10 { --person-bg: var(--person-10-bg); --person-fg: var(--person-10-fg); }
+.person-c11 { --person-bg: var(--person-11-bg); --person-fg: var(--person-11-fg); }
+.person-c12 { --person-bg: var(--person-12-bg); --person-fg: var(--person-12-fg); }
+
+/* The Console skin draws people a little smaller and squarer, like its other badges. */
+html[data-ui="v2"] .person-avatar { width: 26px; height: 26px; border-radius: 8px; font-weight: 600; }
+html[data-ui="v2"] .person-avatar.person-sm { width: 20px; height: 20px; border-radius: 6px; }
+
+/* A moment in time (static/js/people.js: People.time): the text is relative within a week, a date after;
+   the exact local time and the UTC time are in the tooltip. */
+time.when { white-space: nowrap; cursor: default; border-bottom: 1px dotted transparent; }
+time.when:hover { border-bottom-color: var(--text-tertiary); }
+
+/* In the Activity list the chip sits in a fixed-height row: a block flex item (no inline baseline gap) with a
+   smaller avatar, so a row with a chip is the row height and not a pixel more. */
+.act-who .person-chip { display: flex; min-width: 0; line-height: 1; }
+.act-who .person-avatar, .act-who .person-avatar.person-sm,
+html[data-ui="v2"] .act-who .person-avatar, html[data-ui="v2"] .act-who .person-avatar.person-sm { width: 18px; height: 18px; font-size: .55rem; border-radius: 50%; }
+html[data-ui="v2"] .act-who .person-avatar { border-radius: 5px; }
+.act-who .person-name { line-height: 1.35; }

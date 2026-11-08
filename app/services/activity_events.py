@@ -473,6 +473,7 @@ def row_view(r) -> dict:
         "cursor": encode_cursor(r.timestamp, r.id) if r.timestamp is not None else None,
         "timestamp": ts.isoformat() if ts else None,
         "username": r.username,
+        "user_id": str(r.user_id) if getattr(r, "user_id", None) else None,
         # A name typed at a failed sign-in, recorded as its fingerprint (app/core/audit_fingerprints.py).
         "signin_fingerprint": recorded_value(r, "signin_name"),
         # Shown as "Server operator", not as its internal name.
