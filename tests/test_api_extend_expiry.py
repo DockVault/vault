@@ -127,10 +127,11 @@ def test_a_temporary_credential_cannot_extend(admin, sharing_on):
     try:
         share = admin.post("/shares", json={"vault_id": v["id"], "tag_id": tag["id"], "target_type": "vault",
                                             "claim_audience": "anyone_internal", "lifetime_minutes": 60}).json()
-        tc = admin.post("/temp-creds", json={"vault_id": v["id"], "duration_minutes": 30, "permissions": ["read"]})
-        if tc.status_code != 200:
-            pytest.skip(f"no temporary credential here: {tc.status_code}")
-        t = ApiClient(); t.login(tc.json()["username"], tc.json()["password"])
+        scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": ["vault.see_info", "vault.see_files"], "temp": {}}
+        tc = admin.post("/auth/temp-credentials", json={"validity_minutes": 30, "scope": scope,
+                                                        "vault_access_mode": "all", "selected_vaults": []})
+        assert tc.status_code == 200, tc.text   # the test is not optional: a credential is minted here
+        t = ApiClient(); t.login(tc.json()["temp_username"], tc.json()["credential"])
         assert t.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(datetime.utcnow() + timedelta(hours=2))}).status_code in (403, 404)
     finally:
         admin.delete_vault(v["id"])

@@ -27,7 +27,7 @@ def test_sorting_announces_itself_to_assistive_technology():
 
 def test_the_two_preferences_are_whitelisted_on_the_server():
     assert '"density": {"comfortable", "compact"}' in API
-    assert re.search(r'"tables": re\.compile\(r"\\\{\[\^\{\}\]\{0,2000\}\\\}"\)', API), "the tables key keeps a small JSON object"
+    assert '_PREF_CHECKS = {"tables": _tables_preference_ok}' in API, "the tables key is checked as the JSON its reader expects"
     assert "    density: Optional[str] = None\n    tables: Optional[str] = None" in API
 
 

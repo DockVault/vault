@@ -37,9 +37,17 @@
         disarm();
         deadline = Number(ms);
         if (!Number.isFinite(deadline)) { deadline = null; return false; }
-        const wait = Math.max(0, deadline - Date.now() - WARN_SECONDS * 1000);
-        timer = setTimeout(show, wait);
+        schedule();
         return true;
+    }
+
+    // A browser's timer takes at most 2^31-1 ms (24.8 days): a longer wait is taken in steps, re-armed from the
+    // deadline each time (a session may last up to 30 days).
+    const LONGEST_TIMER_MS = 2147483647;
+    function schedule() {
+        const wait = Math.max(0, deadline - Date.now() - WARN_SECONDS * 1000);
+        if (wait > LONGEST_TIMER_MS) { timer = setTimeout(schedule, LONGEST_TIMER_MS); return; }
+        timer = setTimeout(show, wait);
     }
 
     function disarm() {
@@ -113,9 +121,13 @@
         try {
             const res = await apiRequest('/auth/session/extend', { method: 'POST', silent: true });
             if (!res || !res.access_token) throw new Error('no token');
+            const previous = authToken;
             authToken = res.access_token;
             try { storage.setItem('authToken', authToken); } catch (_) {}
             armFromToken(authToken);   // hides the dialog and arms for the new expiry
+            // The other tabs of this browser hold the old token, which is dead now: told, they take the new
+            // one from the shared storage and carry on (static/js/app.js, the sign-out channel).
+            if (typeof _tellOtherTabsRenewed === 'function') _tellOtherTabsRenewed(previous);
             if (typeof showSuccess === 'function') showSuccess('You stay signed in.');
         } catch (e) {
             if (typeof showError === 'function') showError('Could not extend the session. Sign in again when it ends.');
@@ -142,5 +154,13 @@
         document.addEventListener('visibilitychange', () => { if (!document.hidden && deadline) tick(); });
     }
 
-    window.SessionWatch = { armFromToken, armAt, disarm, show, remaining, WARN_SECONDS };
+    // Another tab renewed the session this tab shares: take the new token from storage and arm for it.
+    function adopt(token) {
+        if (!token) return false;
+        authToken = token;
+        armFromToken(token);
+        return true;
+    }
+
+    window.SessionWatch = { armFromToken, armAt, disarm, show, remaining, adopt, WARN_SECONDS };
 })();

@@ -103,3 +103,17 @@ def test_a_user_cannot_resend(admin, invites_on):
     finally:
         admin.delete_user(u["id"])
         admin.delete(f"/invites/{inv['id']}")
+
+
+def test_an_invitation_whose_name_an_account_took_cannot_be_sent_again(admin, invites_on):
+    inv = admin.post("/invites", json={"username": unique("tk"), "role": "user"}).json()
+    try:
+        taken = admin.create_user(username=inv["username"], role="user")
+        try:
+            r = admin.post(f"/invites/{inv['id']}/resend")
+            assert r.status_code == 400 and "cannot be sent again" in r.text
+        finally:
+            admin.delete_user(taken["id"])
+    finally:
+        admin.delete(f"/invites/{inv['id']}")
+

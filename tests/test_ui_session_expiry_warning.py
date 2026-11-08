@@ -81,3 +81,27 @@ def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, per
     expect(page.locator("#login-screen")).to_be_visible(timeout=75000)
     expect(page.locator("#login-error")).to_contain_text("Your session ended")
     expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
+
+
+def test_another_tab_of_the_same_browser_carries_on_after_a_renewal(page: Page, person):
+    _login(page, person)
+    other = page.context.new_page()
+    other.goto("/")
+    expect(other.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    old = _stored_token(page)
+    other_token_before = other.evaluate("() => authToken")
+    assert other_token_before == old
+    # The first tab stays signed in; the second learns of it and takes the new token.
+    page.evaluate("() => SessionWatch.armAt(Date.now() + 62000)")
+    expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=10000)
+    page.click("#session-stay")
+    expect(page.locator("#session-expiry-modal.active")).to_be_hidden(timeout=10000)
+    new = _stored_token(page)
+    assert new != old
+    other.wait_for_function("t => authToken === t", arg=new, timeout=10000)
+    # And it still works there: a page that needs the token draws.
+    other.click('.sidebar-item[data-section="vaults"]')
+    expect(other.locator("#vaults-section")).to_be_visible()
+    expect(other.locator("#login-screen")).to_be_hidden()
+    other.close()
+

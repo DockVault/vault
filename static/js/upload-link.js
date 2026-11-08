@@ -188,7 +188,7 @@
       q.state = "sent";
       return "sent";
     }
-    if (fr.status === 409) { setState(q, "Could not be stored here", "error"); return "failed"; }
+    if (fr.status === 409) { setState(q, "Its name was taken at the same moment; try again", "error"); return "failed"; }
     setState(q, "Could not be finalized", "error"); return "failed";
   }
 
@@ -213,7 +213,10 @@
       return;
     }
     busy = false;
-    if (stopped) { notice("This upload link is not available."); return; }
+    if (stopped) {
+      if (delivered.length) { showReceipt("This link took no more files after these."); return; }
+      notice("This upload link is not available."); return;
+    }
     if (needSecret) { renderQueue(); return; }
     var sent = waiting.filter(function (q) { return q.state === "sent"; }).length;
     if (sent && !failed) { setProgress(100); showReceipt(); return; }
@@ -237,8 +240,10 @@
     return d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   }
 
-  function showReceipt() {
+  function showReceipt(note) {
     hide("form"); hide("notice");
+    var n = $("receipt-note");
+    if (n) { n.textContent = note || ""; n.classList.toggle("hidden", !note); }
     var rows = $("receipt-rows");
     rows.textContent = "";
     delivered.forEach(function (r) {

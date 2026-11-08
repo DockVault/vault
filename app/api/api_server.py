@@ -5415,6 +5415,11 @@ async def resend_invite(
     if not invitations.pepper_ok(pepper):
         raise HTTPException(status_code=503,
                             detail="Invitations are unavailable: the invite-token secret is not configured.")
+    # What its making checked is checked again: a link to a name or address an account took since would be dead.
+    if (db.query(User.id).filter(User.username == inv.username).first() or email_in_use(db, inv.username)
+            or (inv.email and email_in_use(db, inv.email))):
+        raise HTTPException(status_code=400, detail=(
+            "An account now uses this invitation's name or email address, so it cannot be sent again; revoke it."))
     old_prefix = inv.token_prefix
     plaintext, prefix = invitations.mint_invite()
     inv.token_prefix = prefix
@@ -10650,14 +10655,40 @@ _PREF_NOT_FOR_TEMP_SESSIONS = frozenset({"hide_note_text", "activity_page_size",
 # Preferences the app writes itself rather than picks from a list, each kept only when its value has the shape
 # given: the release at which an administrator last opened the Settings pages (written only by
 # POST /settings/catalogue/seen, app/api/settings_catalogue_router.py; PUT /users/me/preferences cannot set it).
-_PREF_PATTERNS = {"settings_seen": re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}"),
-                  # The sort each table was left in (static/js/tables.js): a small JSON object the web app
-                  # writes and reads back for the same account; the server stores it and nothing else.
-                  "tables": re.compile(r"\{[^{}]{0,2000}\}")}
+_PREF_PATTERNS = {"settings_seen": re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")}
+
+
+def _tables_preference_ok(value) -> bool:
+    """The sort each table was left in (static/js/tables.js): a JSON object of at most 2000 characters mapping a
+    table's key (a short name) to {"col": a column index, "dir": "asc" or "desc"}, nothing else. The server
+    stores it and reads nothing from it."""
+    if not isinstance(value, str) or len(value) > 2000:
+        return False
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return False
+    if not isinstance(parsed, dict) or len(parsed) > 50:
+        return False
+    for key, entry in parsed.items():
+        if not (isinstance(key, str) and 1 <= len(key) <= 64 and re.fullmatch(r"[A-Za-z0-9_.:-]+", key)):
+            return False
+        if not (isinstance(entry, dict) and set(entry) == {"col", "dir"}):
+            return False
+        if not (isinstance(entry["col"], int) and not isinstance(entry["col"], bool) and 0 <= entry["col"] <= 99):
+            return False
+        if entry["dir"] not in ("asc", "desc"):
+            return False
+    return True
+
+
+# Preferences checked by a function of their own, each with the shape its reader expects.
+_PREF_CHECKS = {"tables": _tables_preference_ok}
 
 
 def _sanitize_preferences(data) -> dict:
-    """Keep only known keys whose value is in that key's whitelist (or has its pattern's shape); drop the rest."""
+    """Keep only known keys whose value is in that key's whitelist (or has its pattern's shape, or passes its
+    check); drop the rest."""
     if not isinstance(data, dict):
         return {}
     kept = {
@@ -10667,6 +10698,7 @@ def _sanitize_preferences(data) -> dict:
     }
     kept.update({key: data[key] for key, pattern in _PREF_PATTERNS.items()
                  if isinstance(data.get(key), str) and pattern.fullmatch(data[key])})
+    kept.update({key: data[key] for key, check in _PREF_CHECKS.items() if check(data.get(key))})
     return kept
 
 
@@ -13057,7 +13089,7 @@ def _extend_expiry(db, request, current_user, *, item, kind, id_key, owner_id, b
     return details
 
 
-def _record_extension(db, request, current_user, action_call) -> None:
+def _record_extension(action_call) -> None:
     """Best-effort: the audit row of an extension (never fails the extension)."""
     try:
         action_call()
@@ -13090,7 +13122,7 @@ async def extend_share(share_id: uuid.UUID, body: ExtendExpiryBody, request: Req
     details = _extend_expiry(db, request, current_user, item=share, kind="share", id_key="share_id",
                              owner_id=share.creator_id, body=body, ceiling=ceiling,
                              extra={"vault_id": str(share.vault_id)})
-    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+    _record_extension(lambda: AuditLogger(db).log_action(
         action="share_extended", status="success", user=current_user, resource_type="share",
         resource_id=str(share.id), ip_address=get_client_ip(request), details=details))
     return {**_share_dict(db, share), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
@@ -13108,7 +13140,7 @@ async def extend_public_link(link_id: uuid.UUID, body: ExtendExpiryBody, request
     ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=link, kind="public link", id_key="link_id",
                              owner_id=link.owner_id, body=body, ceiling=ceiling)
-    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+    _record_extension(lambda: AuditLogger(db).log_action(
         action="public_link_extended", status="success", user=current_user, resource_type="public_link",
         resource_id=str(link.id), ip_address=get_client_ip(request), details=details))
     return {**_publiclink_public_dict(link, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
@@ -13126,7 +13158,7 @@ async def extend_note_link(link_id: uuid.UUID, body: ExtendExpiryBody, request: 
     ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=link, kind="note link", id_key="link_id",
                              owner_id=link.owner_id, body=body, ceiling=ceiling)
-    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+    _record_extension(lambda: AuditLogger(db).log_action(
         action="note_link_extended", status="success", user=current_user, resource_type="note_link",
         resource_id=str(link.id), ip_address=get_client_ip(request), details=details))
     return {**_notelink_public_dict(link, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
@@ -13144,7 +13176,7 @@ async def extend_receiver(receiver_id: uuid.UUID, body: ExtendExpiryBody, reques
     ceiling = _ceiling(r.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=r, kind="upload link", id_key="receiver_id",
                              owner_id=r.owner_id, body=body, ceiling=ceiling)
-    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+    _record_extension(lambda: AuditLogger(db).log_action(
         action="receiver_extended", status="success", user=current_user, resource_type="receiver",
         resource_id=str(r.id), ip_address=get_client_ip(request), details=details))
     return {**_receiver_public_dict(r, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
@@ -16307,9 +16339,11 @@ async def receiver_complete_upload(
                     "message": (f"This upload delivered {final_size} bytes but declared "
                                 f"{session.total_size}. Nothing has been stored.")})
 
-            # An anonymous drop never OVERWRITES an existing file (no delete authority): a same-name
-            # clash is a clean 409, not a silent replace. The vault's size limit and the deployment's
-            # storage limit are checked inside finalize, under lock, as the row is written.
+            # An anonymous drop never OVERWRITES an existing file (no delete authority): the name was
+            # moved off a clash above, so only two uploads of one name finishing in the same moment
+            # still meet here, and the second gets a clean 409 to try again, not a silent replace. The
+            # vault's size limit and the deployment's storage limit are checked inside finalize, under
+            # lock, as the row is written.
             try:
                 return vault_service.finalize_streaming_upload(
                     file_info=file_info, total_size=final_size, checksum=final_checksum,
@@ -25163,6 +25197,16 @@ async def extend_session(
     if not old_session or payload.get("is_temporary") or getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="This session cannot be extended; sign in again when it ends.")
     client_ip = get_client_ip(request)
+    # The old session ends first, durably and at once, and only the call that ended it mints the new one: two
+    # requests with the same token, however they are served, yield one new session, and a replay carries a
+    # dead token.
+    _row, ended = _end_web_session(db, old_session, user_id=current_user.id)
+    if not ended:
+        raise HTTPException(status_code=401, detail="This session has already ended.")
+    import time as _time
+    from app.services.auth_service import denylist_token
+    _ttl = int(payload.get("exp", 0) - _time.time())
+    denylist_token(old_session, _ttl if _ttl > 0 else 1800)
     auth_service = AuthService(db)
     session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
     new_session = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at,
@@ -25174,12 +25218,6 @@ async def extend_session(
         if carried in payload:
             claims[carried] = payload[carried]
     access_token = create_access_token(data=claims, expires_delta=_expires)
-    # The old session ends now, durably and at once: a replay of this request carries a dead token.
-    _end_web_session(db, old_session, user_id=current_user.id)
-    import time as _time
-    from app.services.auth_service import denylist_token
-    _ttl = int(payload.get("exp", 0) - _time.time())
-    denylist_token(old_session, _ttl if _ttl > 0 else 1800)
     try:
         AuditLogger(db).log_action(action="session_extended", status="success", user=current_user,
                                    ip_address=client_ip, details={})

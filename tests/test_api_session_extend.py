@@ -58,10 +58,11 @@ def test_extend_gives_a_new_token_and_kills_the_old_one(admin):
 def test_a_temporary_credentials_session_is_not_extended(admin):
     v = admin.create_vault(name="extend-temp")
     try:
-        tc = admin.post("/temp-creds", json={"vault_id": v["id"], "duration_minutes": 30, "permissions": ["read"]})
-        if tc.status_code != 200:
-            pytest.skip(f"no temporary credential here: {tc.status_code} {tc.text[:100]}")
-        t = ApiClient(); t.login(tc.json()["username"], tc.json()["password"])
+        scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": ["vault.see_info", "vault.see_files"], "temp": {}}
+        tc = admin.post("/auth/temp-credentials", json={"validity_minutes": 30, "scope": scope,
+                                                        "vault_access_mode": "all", "selected_vaults": []})
+        assert tc.status_code == 200, tc.text   # the test is not optional: a credential is minted here
+        t = ApiClient(); t.login(tc.json()["temp_username"], tc.json()["credential"])
         assert _extend(t.token).status_code == 403
         assert _me(t.token).status_code == 200   # and its own session still works
     finally:

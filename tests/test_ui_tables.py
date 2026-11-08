@@ -63,8 +63,15 @@ def test_users_table_has_the_new_columns_sorts_and_remembers_the_sort(page: Page
     expect(page.locator(f'.exp-detail[data-id="{z["id"]}"]')).to_be_visible()
     assert page.evaluate(
         "id => document.querySelector(`.exp-row[data-id='${id}']`).nextElementSibling.matches(`.exp-detail[data-id='${id}']`)", z["id"])
-    # The sort is remembered for the account: a reload comes back sorted the same way.
-    page.wait_for_timeout(600)  # the preference save
+    # The sort is remembered for the account, on the server: with the browser's own copy gone, a reload
+    # comes back sorted the same way.
+    import time as _time
+    for _ in range(40):   # the save goes out a moment after the click
+        if "users" in (admin.get("/users/me/preferences").json().get("tables") or ""):
+            break
+        _time.sleep(0.25)
+    assert "users" in (admin.get("/users/me/preferences").json().get("tables") or ""), "the sort was not saved to the account"
+    page.evaluate("() => { localStorage.removeItem('dv_tables'); }")
     page.reload()
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
     page.click('.sidebar-item[data-section="users"]')

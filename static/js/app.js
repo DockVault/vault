@@ -2300,10 +2300,23 @@ function _tellOtherTabsSignedOut(token) {
     try { if (_signOutChannel) _signOutChannel.postMessage({ type: 'signed-out', token: _tokenTail(token) }); } catch (_) {}
 }
 
+// A tab that stayed signed in (static/js/session-watch.js) tells the others which token it replaced; each tab
+// holding that token takes the new one from the storage they share. The message carries no token: only the tail
+// of the one that died.
+function _tellOtherTabsRenewed(previousToken) {
+    try { if (_signOutChannel) _signOutChannel.postMessage({ type: 'renewed', token: _tokenTail(previousToken) }); } catch (_) {}
+}
+
 if (_signOutChannel) {
     _signOutChannel.addEventListener('message', (event) => {
         const told = event && event.data;
-        if (!told || told.type !== 'signed-out' || !authToken || told.token !== _tokenTail(authToken)) return;
+        if (!told || !authToken || told.token !== _tokenTail(authToken)) return;
+        if (told.type === 'renewed') {
+            const renewed = storage.getItem('authToken');
+            if (renewed && renewed !== authToken && window.SessionWatch) SessionWatch.adopt(renewed);
+            return;
+        }
+        if (told.type !== 'signed-out') return;
         logout(SIGN_OUT_TOLD, 'Signed out in another tab.');
     });
 }

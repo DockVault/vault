@@ -45,6 +45,8 @@ NOT_RECORDED = {
         "stores the owner's sealed copy of a link address they already made; the link is recorded",
     ("app/api/api_server.py", "PUT /public-links/{link_id}/token-copy"):
         "stores the owner's sealed copy of a link address they already made; the link is recorded",
+    ("app/api/api_server.py", "PUT /receivers/{receiver_id}/token-copy"):
+        "stores the owner's sealed copy of an upload link address they already made; the link is recorded",
     ("app/api/api_server.py", "PUT /receivers/{token}/upload-session/{session_id}/chunks/{chunk_index}"):
         "one chunk of an upload; the upload is recorded when it opens and when it completes",
     ("app/api/api_server.py", "POST /vaults/{vault_id}/uploads"):
