@@ -13000,6 +13000,187 @@ def _notelink_clear_fails(token: str) -> None:
 
 _LINK_MESSAGE_MAX = 500
 
+# Extending the expiry of a share, a public link, a note link or an upload link: its maker, or an
+# administrator, within its type's ceiling; recorded; a second factor when the extension is long.
+_EXTEND_LONG_DAYS = 7
+from app.core import fixed_step_up as _fixed_step_up  # noqa: E402 - the guard registers at import
+_extend_long_step_up = _fixed_step_up.guard("link.extend_long")
+
+
+class ExtendExpiryBody(BaseModel):
+    expires_at: str
+
+
+def _parse_new_expiry(raw) -> datetime:
+    try:
+        text = str(raw or "").strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Give the new expiry as a date and time.")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.replace(microsecond=0)
+
+
+def _may_extend(db, current_user, owner_id) -> bool:
+    """The maker, or an administrator in their own session; never a temporary credential."""
+    from app.core.temp_scope import is_scoped
+    if is_scoped(current_user) or getattr(current_user, "_is_temp_session", False):
+        return False
+    role = getattr(current_user.role, "value", current_user.role)
+    return owner_id == current_user.id or str(role) == RoleEnum.ADMIN.value
+
+
+def _extend_expiry(db, request, current_user, *, item, kind, id_key, owner_id, body, ceiling,
+                   extra: dict = None) -> dict:
+    """Move ``item.expires_at`` later, within ``ceiling`` (None: no ceiling). A long extension (more than
+    _EXTEND_LONG_DAYS from now) is under the fixed step-up. Returns the details the caller records."""
+    if not _may_extend(db, current_user, owner_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    new = _parse_new_expiry(body.expires_at)
+    now = datetime.utcnow()
+    if new <= now:
+        raise HTTPException(status_code=400, detail="The new expiry must be in the future.")
+    current = item.expires_at
+    if current is not None and new <= current:
+        raise HTTPException(status_code=400, detail="The new expiry must be later than the current one.")
+    if ceiling is not None and new > ceiling:
+        raise HTTPException(status_code=400, detail=(
+            f"This {kind}'s type allows an expiry no later than {ceiling.replace(microsecond=0).isoformat()}Z."))
+    if new - now > timedelta(days=_EXTEND_LONG_DAYS):
+        _extend_long_step_up(db, current_user, request)
+    item.expires_at = new
+    db.commit()
+    details = {id_key: str(item.id), "previous_expiry": current.isoformat() + "Z" if current else None,
+               "new_expiry": new.isoformat() + "Z", "by_admin": owner_id != current_user.id}
+    details.update(extra or {})
+    return details
+
+
+def _record_extension(db, request, current_user, action_call) -> None:
+    """Best-effort: the audit row of an extension (never fails the extension)."""
+    try:
+        action_call()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ceiling(created_at, minutes=None, hours=None):
+    if created_at is None:
+        return None
+    if minutes is not None:
+        return created_at + timedelta(minutes=int(minutes))
+    if hours is not None:
+        return created_at + timedelta(hours=int(hours))
+    return None
+
+
+@app.post("/shares/{share_id}/extend")
+async def extend_share(share_id: uuid.UUID, body: ExtendExpiryBody, request: Request,
+                       current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Move a share's expiry later: its maker or an administrator, within the tag's ceiling counted from
+    the share's creation, recorded; more than a week from now needs the account's second factor."""
+    share = db.query(Share).filter(Share.id == share_id).first()
+    if share is None or not _may_extend(db, current_user, share.creator_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    if share.status != "active":
+        raise HTTPException(status_code=400, detail="Only an active share can be extended.")
+    tag = db.query(ShareTag).filter(ShareTag.id == share.tag_id).first()
+    ceiling = _ceiling(share.created_at, minutes=tag.max_lifetime_minutes) if tag else None
+    details = _extend_expiry(db, request, current_user, item=share, kind="share", id_key="share_id",
+                             owner_id=share.creator_id, body=body, ceiling=ceiling,
+                             extra={"vault_id": str(share.vault_id)})
+    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+        action="share_extended", status="success", user=current_user, resource_type="share",
+        resource_id=str(share.id), ip_address=get_client_ip(request), details=details))
+    return {**_share_dict(db, share), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+
+
+@app.post("/public-links/{link_id}/extend")
+async def extend_public_link(link_id: uuid.UUID, body: ExtendExpiryBody, request: Request,
+                             current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    link = db.query(PublicLink).filter(PublicLink.id == link_id).first()
+    if link is None or not _may_extend(db, current_user, link.owner_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    if link.revoked:
+        raise HTTPException(status_code=400, detail="A revoked link cannot be extended.")
+    tag = db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None
+    ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
+    details = _extend_expiry(db, request, current_user, item=link, kind="public link", id_key="link_id",
+                             owner_id=link.owner_id, body=body, ceiling=ceiling)
+    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+        action="public_link_extended", status="success", user=current_user, resource_type="public_link",
+        resource_id=str(link.id), ip_address=get_client_ip(request), details=details))
+    return {**_publiclink_public_dict(link, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+
+
+@app.post("/note-links/{link_id}/extend")
+async def extend_note_link(link_id: uuid.UUID, body: ExtendExpiryBody, request: Request,
+                           current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    link = db.query(NoteLink).filter(NoteLink.id == link_id).first()
+    if link is None or not _may_extend(db, current_user, link.owner_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    if link.revoked:
+        raise HTTPException(status_code=400, detail="A revoked link cannot be extended.")
+    tag = db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None
+    ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
+    details = _extend_expiry(db, request, current_user, item=link, kind="note link", id_key="link_id",
+                             owner_id=link.owner_id, body=body, ceiling=ceiling)
+    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+        action="note_link_extended", status="success", user=current_user, resource_type="note_link",
+        resource_id=str(link.id), ip_address=get_client_ip(request), details=details))
+    return {**_notelink_public_dict(link, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+
+
+@app.post("/receivers/{receiver_id}/extend")
+async def extend_receiver(receiver_id: uuid.UUID, body: ExtendExpiryBody, request: Request,
+                          current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    r = db.query(Receiver).filter(Receiver.id == receiver_id).first()
+    if r is None or not _may_extend(db, current_user, r.owner_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    if r.revoked:
+        raise HTTPException(status_code=400, detail="A revoked upload link cannot be extended.")
+    tag = db.query(ReceiverTag).filter(ReceiverTag.id == r.tag_id).first() if r.tag_id else None
+    ceiling = _ceiling(r.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
+    details = _extend_expiry(db, request, current_user, item=r, kind="upload link", id_key="receiver_id",
+                             owner_id=r.owner_id, body=body, ceiling=ceiling)
+    _record_extension(db, request, current_user, lambda: AuditLogger(db).log_action(
+        action="receiver_extended", status="success", user=current_user, resource_type="receiver",
+        resource_id=str(r.id), ip_address=get_client_ip(request), details=details))
+    return {**_receiver_public_dict(r, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+
+
+# ---- reminders before an expiry --------------------------------------------------------------------------------
+def _tell_about_expiry(item: dict) -> bool:
+    """One maker told about one thing about to expire: an in-app notice (once per thing and expiry date) and,
+    when that notice was new, the optional email. Returns whether the notice was new."""
+    from app.core import expiry_reminders
+    when = expiry_reminders.in_words(item["expires_at"])
+    notified = _notify_users([item["owner_id"]], "expiry_reminder", f"{item['title']} expires {when}",
+                             "Extend it if people still need it; otherwise nothing needs doing.",
+                             target=item["target"], dedup_prefix=expiry_reminders.dedup_key(item))
+    if not notified:
+        return False
+    try:
+        from app.core.database import get_db_context
+        from app.core.email_actions import send_action_email
+        with get_db_context() as db:
+            owner = db.query(User).filter(User.id == item["owner_id"]).first()
+            if owner is not None and owner.email:
+                base = _public_base_url(None)
+                send_action_email(db, "expiry_reminder", recipient={"email": owner.email, "username": owner.username},
+                                  action_context={"link": f"{base}/{item['target']}" if base else item["target"],
+                                                  "item": item["title"], "expires": when})
+    except Exception:  # noqa: BLE001 - the notice is written; mail is best-effort
+        pass
+    return True
+
+
+def _expiry_reminders_once() -> int:
+    """Run one reminder sweep now (the loop does this every expiry_reminders.INTERVAL_SECONDS)."""
+    from app.core import expiry_reminders
+    return expiry_reminders.sweep_once(_tell_about_expiry)
+
 
 def _link_message(raw) -> Optional[str]:
     """An owner's message for a public page: plain text (the pages write it with textContent), control
@@ -25817,12 +25998,15 @@ def _seed_admin_user(db=None):
 # admin can edit. Lifetime/cap fields fall to the model defaults (7-day ceiling, 1-day default, no
 # recipient/download cap). Colors are drawn from the UI's chip palette (unknown names fall back).
 _DEFAULT_SHARE_TAGS = [
+    # The everyday tags last long enough for real work: a 90-day ceiling and a 30-day default (a share can be
+    # extended within the ceiling later). The confidential tags keep the model's short defaults.
     {
         "name": "Normal", "color": "sky",
         "description": "Everyday sharing with the standard limits.",
         "allowed_audiences": ["anyone_internal", "users", "departments"],
         "allow_view_only": True, "default_view_only": False, "force_view_only": False,
         "allow_custom": True, "auto_enroll_new_users": True,
+        "max_lifetime_minutes": 90 * 24 * 60, "default_lifetime_minutes": 30 * 24 * 60,
     },
     {
         "name": "Internal", "color": "indigo",
@@ -25830,6 +26014,7 @@ _DEFAULT_SHARE_TAGS = [
         "allowed_audiences": ["anyone_internal", "users", "departments"],
         "allow_view_only": True, "default_view_only": False, "force_view_only": False,
         "allow_custom": True, "auto_enroll_new_users": True,
+        "max_lifetime_minutes": 90 * 24 * 60, "default_lifetime_minutes": 30 * 24 * 60,
     },
     {
         "name": "Confidential", "color": "amber",
@@ -27283,6 +27468,11 @@ async def lifespan(app: FastAPI):
     # start. Only this process runs it. See app/core/retention.py.
     from app.core import retention
     retention_task = asyncio.create_task(retention.run_forever())
+
+    # Reminders to the makers of shares and links two days before they expire, on a thread of their own.
+    # Only this process runs them. See app/core/expiry_reminders.py.
+    from app.core import expiry_reminders
+    reminders_task = asyncio.create_task(expiry_reminders.run_forever(_tell_about_expiry))
 
     # The sender of the email notices that tell vaults' owners about compliance access to their vaults: written
     # in the step's own transaction, sent from an outbox on a thread of its own, one process at a time, with

@@ -3716,6 +3716,9 @@ function _sharedByMeCard(sh) {
 
     const actions = _el('div', 'flex items-center gap-sm');
     if (active) {
+        const extendBtn = _el('button', 'btn btn-sm btn-secondary share-extend', 'Extend'); extendBtn.type = 'button';
+        extendBtn.addEventListener('click', () => openExtendExpiry('share', sh.id, sh.expires_at, 'the share of ' + title, () => loadSharedByMe()));
+        actions.appendChild(extendBtn);
         const revokeBtn = _el('button', 'btn btn-sm', 'Revoke'); revokeBtn.type = 'button'; revokeBtn.style.color = '#dc2626';
         revokeBtn.addEventListener('click', () => revokeShare(sh.id, title));
         actions.appendChild(revokeBtn);
@@ -7920,6 +7923,7 @@ let notifUnread = 0;
 // Map a server-supplied notification target to an in-app section. Targets are short server-controlled
 // tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
 const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes', '#users': 'users', '#uploadlinks': 'uploadlinks' };
+// (the expiry reminders use these targets too: #shared, #vaults, #notes, #uploadlinks)
 // Targets that open a dialog rather than a page: a notice about the reader's own account (a password,
 // an email address or a second factor an administrator changed) opens "Your account".
 const _NOTIF_TARGET_OPEN = { '#profile': () => openUserSettingsModal() };
@@ -12587,6 +12591,58 @@ function _vaultPasswordFor(vaultId) {
 // (every staged item, ignoring selection). Each entry either stays staged (keepAfter) or leaves
 // after it succeeds -- so a KEPT copy can be pasted into many folders, and a single item can be
 // removed from the list without clearing the rest.
+// ---- Extend an expiry ---------------------------------------------------------------------------------------
+// A share's, a public link's, a note link's or an upload link's: its maker (or an administrator) picks a later
+// date; the server keeps it within the type's ceiling and asks for a second factor when the extension is long.
+const _EXTEND_PATHS = { share: '/shares/', public: '/public-links/', note: '/note-links/', receiver: '/receivers/' };
+let _extendPending = null;
+
+function _toLocalInputValue(d) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function openExtendExpiry(kind, id, currentIso, label, onDone) {
+    _extendPending = { kind, id, onDone };
+    const current = parseServerTime(currentIso);
+    const base = current && !isNaN(current) && current > new Date() ? current : new Date();
+    const suggested = new Date(base.getTime() + 7 * 86400000);
+    const title = document.getElementById('extend-expiry-title');
+    if (title) title.textContent = 'Extend ' + (label || 'this');
+    const cur = document.getElementById('extend-expiry-current');
+    if (cur) cur.textContent = current && !isNaN(current) ? ('Expires now: ' + formatServerTime(currentIso) + '.') : 'No expiry is set now.';
+    const input = document.getElementById('extend-expiry-until');
+    if (input) { input.value = _toLocalInputValue(suggested); input.min = _toLocalInputValue(new Date()); }
+    const err = document.getElementById('extend-expiry-error');
+    if (err) err.hidden = true;
+    if (!state._extendWired) {
+        state._extendWired = true;
+        document.getElementById('extend-expiry-save').addEventListener('click', saveExtendExpiry);
+    }
+    openModal('extend-expiry-modal');
+}
+
+async function saveExtendExpiry() {
+    if (!_extendPending) return;
+    const input = document.getElementById('extend-expiry-until');
+    const err = document.getElementById('extend-expiry-error');
+    const picked = input && input.value ? new Date(input.value) : null;
+    if (!picked || isNaN(picked)) { if (err) { err.textContent = 'Pick a date and time.'; err.hidden = false; } return; }
+    const btn = document.getElementById('extend-expiry-save');
+    btn.disabled = true;
+    try {
+        const res = await apiRequest(_EXTEND_PATHS[_extendPending.kind] + encodeURIComponent(_extendPending.id) + '/extend',
+            { method: 'POST', body: JSON.stringify({ expires_at: picked.toISOString() }), silent: true });
+        closeModal();
+        showSuccess('Extended to ' + formatServerTime(res.expires_at));
+        if (typeof _extendPending.onDone === 'function') _extendPending.onDone(res);
+    } catch (e) {
+        if (err) { err.textContent = (e && e.message) || 'Could not extend it.'; err.hidden = false; }
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // ---- Move to vault: triage of a drop vault ---------------------------------------------------------------
 // The files selected in the drop vault (or, with nothing selected, every file listed here) move into a vault the
 // owner can write to, by the same move request the Copied Items list uses, one file at a time, waiting when the
@@ -21341,6 +21397,11 @@ function _noteLinkCard(l) {
             actions.appendChild(_el('span', 'text-tertiary text-xs link-recopy-hint',
                 'Set up your encryption key to be able to see links again.'));
         }
+        if (l.status === 'active' && l.expires_at) {
+            const extend = _el('button', 'btn btn-ghost btn-sm link-extend', 'Extend'); extend.type = 'button';
+            extend.addEventListener('click', () => openExtendExpiry('note', l.id, l.expires_at, 'this note link', () => loadNotes()));
+            actions.appendChild(extend);
+        }
         const revoke = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
         revoke.type = 'button';
         revoke.addEventListener('click', () => revokeNoteLink(l.id));
@@ -22106,6 +22167,11 @@ function renderMyPublicLinks(links) {
             actTd.appendChild(_el('span', 'text-tertiary text-xs link-recopy-hint',
                 'Set up your encryption key to be able to see links again.'));
         }
+        if (l.status === 'active' && l.expires_at) {
+            const extend = _el('button', 'btn btn-ghost btn-sm link-extend', 'Extend'); extend.type = 'button';
+            extend.addEventListener('click', () => openExtendExpiry('public', l.id, l.expires_at, 'this public link', () => loadMyPublicLinks()));
+            actTd.appendChild(extend);
+        }
         if (l.status === 'active') {
             const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';
             rv.addEventListener('click', () => revokeMyPublicLink(l.id));
@@ -22343,6 +22409,12 @@ function renderReceiverVaults(receivers) {
             replace.title = 'Mint a new URL for this drop vault. The old one stops working.';
             replace.addEventListener('click', () => rcReplaceLink(r));
             actions.appendChild(replace);
+        }
+        if ((r.status === 'active' || r.status === 'paused') && r.expires_at) {
+            const extend = _el('button', 'btn btn-secondary btn-sm link-extend', 'Extend'); extend.type = 'button';
+            extend.title = 'Move this upload link\u2019s expiry later';
+            extend.addEventListener('click', () => openExtendExpiry('receiver', r.id, r.expires_at, 'this upload link', () => loadMyReceivers()));
+            actions.appendChild(extend);
         }
         actions.appendChild(open); actions.appendChild(info); card.appendChild(actions);
         grid.appendChild(card);

@@ -166,6 +166,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("share_expired", "shares", "Share expired", "info"),
     AuditAction("share_opened", "shares", "Shared vault opened", "info"),
     AuditAction("share_revoked", "shares", "Share revoked", "notice"),
+    AuditAction("share_extended", "shares", "Share expiry extended", "notice"),
     # Public links
     AuditAction("note_link_admin_revoke", "public_links", "Note link revoked by an admin", "notice"),
     AuditAction("note_link_admin_revoke_all", "public_links", "All note links revoked by an admin", "warning"),
@@ -173,6 +174,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("note_link_delete", "public_links", "Note link deleted", "info"),
     AuditAction("note_link_redeem", "public_links", "Note link opened", "info"),
     AuditAction("note_link_revoke", "public_links", "Note link revoked", "info"),
+    AuditAction("note_link_extended", "public_links", "Note link expiry extended", "info"),
     AuditAction("public_link_admin_revoke", "public_links", "Public link revoked by an admin", "notice"),
     AuditAction("public_link_admin_revoke_all", "public_links", "All public links revoked by an admin", "warning"),
     AuditAction("public_link_create", "public_links", "Public link created", "notice"),
@@ -181,6 +183,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("public_link_download_completed", "public_links", "Public link download finished", "info"),
     AuditAction("public_link_redeem", "public_links", "Public link opened", "info"),
     AuditAction("public_link_revoke", "public_links", "Public link revoked", "info"),
+    AuditAction("public_link_extended", "public_links", "Public link expiry extended", "info"),
     # The server could not start a download it had granted (the stored file missing or unreadable, no
     # transfer slot free): the use the link's redeem spent was given back.
     AuditAction("public_link_use_refunded", "public_links", "Public link use given back after a failed download",
@@ -189,6 +192,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("receiver_admin_revoke", "upload_links", "Upload link revoked by an admin", "notice"),
     AuditAction("receiver_create", "upload_links", "Upload link created", "notice"),
     AuditAction("receiver_link_replaced", "upload_links", "Upload link address replaced", "notice"),
+    AuditAction("receiver_extended", "upload_links", "Upload link expiry extended", "notice"),
     AuditAction("receiver_pause", "upload_links", "Upload link paused", "info"),
     AuditAction("receiver_resume", "upload_links", "Upload link resumed", "info"),
     AuditAction("receiver_retention_changed", "upload_links", "Upload link retention changed", "notice"),

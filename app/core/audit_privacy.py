@@ -154,6 +154,8 @@ _IDENTIFIER_KEYS = (
     "password_set_by", "added_by",
     # labels an administrator gives or sees elsewhere: tokens, SSH keys, devices, groups, tags
     "name", "label", "tag", "fingerprint", "token_prefix", "replaced_token_prefix", "scope", "key", "keys", "setting",
+    # an expiry moved by its maker or an administrator: the dates, and whether an administrator did it
+    "previous_expiry", "new_expiry", "by_admin",
     # what happened, and how
     "action", "kind", "type", "mode", "method", "via", "reason", "reasons", "revoked_because",
     "withdrawn_because", "outcome", "status", "surface", "level", "posture", "message", "step_up",

@@ -75,6 +75,9 @@ FIXED_STEP_UP_ACTIONS: dict = {
     # The audit log's integrity warnings an administrator acknowledges (app/api/audit_integrity_router.py): late
     # rows and the values held from the database are seen and signed off, so the password every time.
     "admin.audit_integrity.acknowledge": ("Acknowledge the audit log's integrity warnings", "password_always"),
+    # Extending a share or a link by more than a week (app/api/api_server.py, the extend routes): whenever the
+    # account has a second factor enrolled, the extension needs it; an account without one is not asked.
+    "link.extend_long": ("Extend a share or a link by more than a week", "factor_when_enrolled"),
 }
 
 # The steps of compliance access (app/api/compliance_router.py), each under the compliance policy: the password

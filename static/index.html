@@ -1183,6 +1183,29 @@
                     </div>
                 </div>
 
+                <!-- Extend an expiry: a share's, a public link's, a note link's or an upload link's, within its type's ceiling. -->
+                <div id="extend-expiry-modal" class="modal">
+                    <div class="modal-content" style="max-width: 440px;">
+                        <div class="modal-header">
+                            <h3 id="extend-expiry-title">Extend</h3>
+                            <button class="close-modal-btn modal-close" type="button" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            <p id="extend-expiry-current" class="text-secondary mb-md"></p>
+                            <div class="form-group">
+                                <label for="extend-expiry-until">New expiry</label>
+                                <input type="datetime-local" id="extend-expiry-until" class="form-control">
+                                <small class="form-help">Later than now and than the current expiry, and within what the type allows. More than a week ahead asks for your second factor when you have one.</small>
+                            </div>
+                            <p id="extend-expiry-error" class="text-sm" style="color:var(--danger,#dc2626);" hidden></p>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
+                            <button type="button" class="btn btn-primary" id="extend-expiry-save">Extend</button>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Move to vault: files received on an upload link, moved into a vault of the owner's choosing. -->
                 <div id="move-to-vault-modal" class="modal">
                     <div class="modal-content" style="max-width: 480px;">
