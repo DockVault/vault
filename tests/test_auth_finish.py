@@ -79,7 +79,7 @@ def _user(role="user", username="alice"):
     from app.core.models import RoleEnum
     now = datetime.now(timezone.utc)
     return types.SimpleNamespace(id=uuid.uuid4(), username=username, email=f"{username}@example.test",
-                                 role=RoleEnum(role), is_active=True, is_locked=False, sftp_enabled=True,
+                                 role=RoleEnum(role), is_active=True, is_locked=False, locked_until=None, sftp_enabled=True,
                                  sftp_password_auth=True, storage_quota_bytes=None, created_at=now, last_login=None,
                                  groups=[], password_hash="x")
 
@@ -120,6 +120,8 @@ def finish(monkeypatch):
     monkeypatch.setattr(AuthService, "_create_session", _create_session)
     monkeypatch.setattr(S, "AuditLogger", _Audit)
     monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, user: False)
+    from app.core import sign_in_lockout
+    monkeypatch.setattr(sign_in_lockout, "lock_in_force", lambda db, user_id, address, **kw: None)
     monkeypatch.setattr(S, "_fire_offloop", lambda fn, *a, **kw: None)
     monkeypatch.setattr(S, "_fire_action_email", lambda *a, **kw: None)
     monkeypatch.setattr(S, "_notify_users", lambda *a, **kw: None)
@@ -198,6 +200,47 @@ def test_without_the_code_store_the_exchange_is_unavailable(finish):
     f.redis.broken = True
     status, body = _post(f.S, "/auth/finish", {"code": "x" * 43, "verifier": "v"})
     assert status == 503 and "unavailable" in body["detail"]
+
+
+def test_the_limiter_refuses_too_many_tries_and_fails_closed_when_the_cache_is_down(finish, monkeypatch):
+    f = finish
+    from app.core.rate_limiter import RateLimiterUnavailable, rate_limiter as _rl
+    code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    # Only the route's own bucket answers; the general limiter in the middleware keeps allowing.
+    def _refuse(*a, **kw):
+        return (False, 0, time.time() + 120) if kw.get("prefix") == "sign_in_finish" else (True, 0, 0)
+
+    monkeypatch.setattr(_rl, "check_rate_limit", _refuse)
+    status, body = _post(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 429 and f.redis.rows                   # refused before the code was spent
+
+    def _down(*a, **kw):
+        if kw.get("prefix") == "sign_in_finish":
+            raise RateLimiterUnavailable("cache down")
+        return (True, 0, 0)
+
+    monkeypatch.setattr(_rl, "check_rate_limit", _down)
+    status, body = _post(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 503 and "unavailable" in body["detail"] and f.redis.rows
+
+
+def test_a_code_does_not_finish_a_sign_in_for_a_locked_account(finish):
+    """A lock set after the proof and before the finish (an administrator's, a timed one, an automatic one from
+    this address) refuses the finish with the lock's own answer, as the sign-in form would."""
+    f = finish
+    from app.core import sign_in_lockout
+    from app.core.sign_in_lockout import Lock
+    f.alice.is_locked = True
+    code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    status, body = _post(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 403 and "locked" in body["detail"].lower() and f.made["sessions"] == []
+    f.alice.is_locked = False
+    lock = Lock(scope="address", locked_until=datetime.now(timezone.utc) + timedelta(minutes=5), source="x")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sign_in_lockout, "lock_in_force", lambda db, user_id, address, **kw: lock)
+        code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+        status, body = _post(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 403 and f.made["sessions"] == []
 
 
 def test_the_desktop_app_proves_itself_with_pkce(finish):

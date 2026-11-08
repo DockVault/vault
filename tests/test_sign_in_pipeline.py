@@ -40,7 +40,7 @@ def _claims(token):
 def _user(role="user"):
     from app.core.models import RoleEnum
     return types.SimpleNamespace(id=uuid.uuid4(), username="alice", email="alice@example.test",
-                                 role=RoleEnum(role), is_active=True, is_locked=False)
+                                 role=RoleEnum(role), is_active=True, is_locked=False, locked_until=None)
 
 
 # --- second_factor_due: the table -----------------------------------------------------------------
@@ -71,15 +71,16 @@ def test_the_password_and_a_second_kind_are_done():
     for second in ("totp", "recovery", "hwk", "swk"):
         assert _due(["pwd", second], factor_in_effect=True, enrollment_pending=True) == s.DONE, second
         assert _due([second, "pwd"], role="admin", factor_in_effect=True) == s.DONE, second
-    # ... and the password with a trusted provider MFA.
-    assert _due(["pwd"], factor_in_effect=True, provider_mfa_trusted=True) == s.DONE
+    # ... and the password with a trusted provider MFA, which counts only when a provider was there.
+    assert _due(["pwd"], factor_in_effect=True, provider_mfa_trusted=True, provider_id="p1") == s.DONE
+    assert _due(["pwd"], factor_in_effect=True, provider_mfa_trusted=True) == s.STAGE_SECOND_FACTOR
 
 
 def test_an_administrator_without_the_password_always_types_it():
     s = _sign_in()
     # Whatever proved them, however strong: a user-verified passkey allowed for users, a trusted provider.
     assert _due(["hwk"], role="admin", user_verified=True, passwordless_allowed=True) == s.STAGE_PASSWORD
-    assert _due([], role="admin", provider_mfa_trusted=True) == s.STAGE_PASSWORD
+    assert _due([], role="admin", provider_mfa_trusted=True, provider_id="p1") == s.STAGE_PASSWORD
     assert _due(["swk"], role="admin") == s.STAGE_PASSWORD
 
 
@@ -102,17 +103,33 @@ def test_a_user_verified_passkey_alone_is_the_whole_sign_in_when_allowed():
 
 def test_single_sign_on_takes_the_vaults_rule_unless_the_providers_mfa_is_trusted():
     s = _sign_in()
-    assert _due([]) == s.DONE
-    assert _due([], factor_in_effect=True) == s.STAGE_SECOND_FACTOR
-    assert _due([], factor_in_effect=True, enrollment_pending=True) == s.ENROLL
-    assert _due([], factor_in_effect=True, provider_mfa_trusted=True) == s.DONE
+    sso = {"provider_id": "p1"}
+    assert _due([], **sso) == s.DONE
+    assert _due([], factor_in_effect=True, **sso) == s.STAGE_SECOND_FACTOR
+    assert _due([], factor_in_effect=True, enrollment_pending=True, **sso) == s.ENROLL
+    assert _due([], factor_in_effect=True, provider_mfa_trusted=True, **sso) == s.DONE
     # The vault's own code after the provider finishes the sign-in: the second-factor stage is the last step.
-    assert _due(["totp"], factor_in_effect=True) == s.DONE
-    assert _due(["recovery"], factor_in_effect=True, enrollment_pending=True) == s.DONE
+    assert _due(["totp"], factor_in_effect=True, **sso) == s.DONE
+    assert _due(["recovery"], factor_in_effect=True, enrollment_pending=True, **sso) == s.DONE
     # ... unless the account became an administrator meanwhile: then the password still follows.
-    assert _due(["totp"], role="admin", factor_in_effect=True) == s.STAGE_PASSWORD
+    assert _due(["totp"], role="admin", factor_in_effect=True, **sso) == s.STAGE_PASSWORD
     # An administrator's password after a trusted provider MFA: done, no code on top.
-    assert _due(["pwd"], role="admin", factor_in_effect=True, provider_mfa_trusted=True) == s.DONE
+    assert _due(["pwd"], role="admin", factor_in_effect=True, provider_mfa_trusted=True, **sso) == s.DONE
+
+
+def test_a_sign_in_needs_a_first_proof():
+    """A code alone, or nothing at all, proves nothing about who the person is: the table refuses to answer,
+    and the pipeline turns that into a refusal, never a session."""
+    s = _sign_in()
+    for methods in ([], ["totp"], ["recovery"], ["totp", "recovery"]):
+        with pytest.raises(s.NoFirstProof):
+            _due(methods)
+        with pytest.raises(s.NoFirstProof):
+            _due(methods, factor_in_effect=True, provider_mfa_trusted=True)
+    # The password, a passkey or a provider is a first proof.
+    assert _due(["pwd"]) == s.DONE
+    assert _due(["hwk"]) == s.STAGE_PASSWORD
+    assert _due(["totp"], provider_id="p1") == s.DONE
 
 
 # --- the pre-authentication token's stage and proofs ------------------------------------------------
@@ -391,10 +408,48 @@ def _finish_db(user, *, session_token=None, pending=None, enrollment=None):
     return MemoryDB(rows)
 
 
-def _policy(monkeypatch, *, in_effect, state="setup"):
+def _policy(monkeypatch, *, in_effect, state="setup", lock=None):
     S = _api()
+    from app.core import sign_in_lockout
     monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, user: in_effect)
     monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {"state": state, "in_effect": in_effect})
+    monkeypatch.setattr(sign_in_lockout, "lock_in_force", lambda db, user_id, address, **kw: lock)
+
+
+def test_a_proof_does_not_finish_a_sign_in_for_an_account_that_may_not_sign_in(quiet_records, monkeypatch):
+    """The password check refuses an inactive or locked account before anything else; every other way in
+    (a passkey, a provider, a one-time code) is refused the same way when it reaches the pipeline."""
+    s = _sign_in()
+    from app.core.sign_in_lockout import Lock
+    user = _user()
+    _policy(monkeypatch, in_effect=False)
+    user.is_active = False
+    with pytest.raises(HTTPException) as e:
+        s.finish(_finish_db(user), s.SignInResult(user, ["hwk"], "10.0.0.1", user_verified=True, passwordless_allowed=True))
+    assert e.value.status_code == 401
+    user.is_active = True
+    # An administrator's lock (no end) and a timed lock.
+    user.is_locked = True
+    with pytest.raises(HTTPException) as e:
+        s.finish(_finish_db(user), s.SignInResult(user, [], "10.0.0.1", provider_id="p1"))
+    assert e.value.status_code == 403 and "locked" in str(e.value.detail).lower()
+    user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    with pytest.raises(HTTPException) as e:
+        s.finish(_finish_db(user), s.SignInResult(user, [], "10.0.0.1", provider_id="p1"))
+    assert e.value.status_code == 403
+    user.is_locked, user.locked_until = False, None
+    # An automatic sign-in lock from this address.
+    _policy(monkeypatch, in_effect=False,
+            lock=Lock(scope="address", locked_until=datetime.now(timezone.utc) + timedelta(minutes=5), source="x"))
+    with pytest.raises(HTTPException) as e:
+        s.finish(_finish_db(user), s.SignInResult(user, ["hwk"], "10.0.0.1", user_verified=True, passwordless_allowed=True))
+    assert e.value.status_code == 403
+    assert quiet_records["events"] == []       # nothing was finished
+    # A temporary credential has its own checks in the credential path and is not re-judged here.
+    _policy(monkeypatch, in_effect=False, lock=Lock(scope="address", locked_until=None, source="x"))
+    outcome = s.finish(_finish_db(user), s.SignInResult(user, ["pwd"], None, session_token="t", is_temporary=True,
+                                                        temp_username="temp_x"))
+    assert isinstance(outcome, s.SignedIn)
 
 
 def test_a_step_that_follows_deletes_the_session_the_password_made_and_records_the_password(quiet_records, monkeypatch):

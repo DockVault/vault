@@ -110,22 +110,30 @@ class PendingStep:
     body: dict
 
 
+class NoFirstProof(ValueError):
+    """A sign-in with no first proof (no password, no passkey, no identity provider) asked what follows: a
+    programming error, never a sign-in."""
+
+
 def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, enrollment_pending: bool,
                       passwordless_allowed: bool = False, user_verified: bool = False,
-                      provider_mfa_trusted: bool = False, is_temporary: bool = False) -> str:
+                      provider_mfa_trusted: bool = False, provider_id: Optional[str] = None,
+                      is_temporary: bool = False) -> str:
     """What follows the proofs in ``methods``: DONE, STAGE_PASSWORD, STAGE_SECOND_FACTOR or ENROLL.
 
     ``factor_in_effect`` and ``enrollment_pending`` are the account's second-factor state as the password
     route has always read it: the login switch, the policy, the enrollment, an administrator's reset.
-    The table, in the order the rows are checked:
+    ``provider_id`` says the person came through an identity provider. A sign-in must have a first proof:
+    the password, a passkey or a provider; without one this raises :class:`NoFirstProof` (a code alone
+    proves nothing about who the person is). The table, in the order the rows are checked:
 
     * a temporary credential: done (it has its own validity window and no factor);
     * no password yet, and the person is an administrator: the password, always;
     * no password yet, a passkey: done when the authenticator verified the person and the policy allows
       a passkey alone for them; otherwise the password (a possession factor needs a knowledge factor,
       never a second possession factor);
-    * no password yet, single sign-on: done when the provider's MFA is trusted and was present, or when
-      the vault's own code (an authenticator or recovery code) was already given after the provider;
+    * no password yet, an identity provider: done when the provider's MFA is trusted and was present, or
+      when the vault's own code (an authenticator or recovery code) was already given after the provider;
       otherwise the vault's own rule below;
     * the password and a second kind (a code, a recovery code, a passkey), or the password and a trusted
       provider MFA: done;
@@ -137,6 +145,8 @@ def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, e
         return DONE
     has_password = PASSWORD in methods
     has_passkey = bool(methods & PASSKEYS)
+    if not (has_password or has_passkey or provider_id):
+        raise NoFirstProof("a sign-in needs a first proof: the password, a passkey or an identity provider")
     if not has_password:
         if getattr(user, "role", None) == RoleEnum.ADMIN:
             return STAGE_PASSWORD
@@ -144,7 +154,7 @@ def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, e
             return DONE if (user_verified and passwordless_allowed) else STAGE_PASSWORD
         if provider_mfa_trusted or (methods & CODES):
             return DONE
-    elif (methods & SECOND_KINDS) or provider_mfa_trusted:
+    elif (methods & SECOND_KINDS) or (provider_id and provider_mfa_trusted):
         return DONE
     if not factor_in_effect:
         return DONE
@@ -303,13 +313,18 @@ def finish(db, result: SignInResult):
     if result.is_temporary:
         stage = DONE
     else:
+        refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
         in_effect = api._login_second_factor_in_effect(db, user)
         enrollment_pending = bool(in_effect) and api._second_factor_effective(db, user)["state"] == "pending"
-        stage = second_factor_due(user, result.methods, factor_in_effect=bool(in_effect),
-                                  enrollment_pending=enrollment_pending,
-                                  passwordless_allowed=result.passwordless_allowed,
-                                  user_verified=result.user_verified,
-                                  provider_mfa_trusted=result.provider_mfa_trusted)
+        try:
+            stage = second_factor_due(user, result.methods, factor_in_effect=bool(in_effect),
+                                      enrollment_pending=enrollment_pending,
+                                      passwordless_allowed=result.passwordless_allowed,
+                                      user_verified=result.user_verified,
+                                      provider_mfa_trusted=result.provider_mfa_trusted,
+                                      provider_id=result.provider_id)
+        except NoFirstProof:
+            raise HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")
     if stage == DONE:
         return complete_sign_in(db, result)
     if result.session_token:
@@ -324,6 +339,26 @@ def finish(db, result: SignInResult):
     if stage == ENROLL:
         return begin_pending(db, result, STAGE_SECOND_FACTOR, enrollment_required=True)
     return begin_pending(db, result, stage)
+
+
+def refuse_unless_the_account_may_sign_in(db, user, client_ip: Optional[str]) -> None:
+    """The account-state checks the password check makes, for every other way in: an inactive account is
+    refused like an unknown one; a locked account (an administrator's lock, a timed one) and an automatic
+    sign-in lock from this address or account-wide are refused with the lock's own answer, as at the form.
+    A proof made moments before a lock does not finish a sign-in after it."""
+    from app.api import api_server as api
+    from app.core import sign_in_lockout
+    from app.services.auth_service import AccountLockedError, account_locked
+    if not getattr(user, "is_active", True):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if account_locked(user):
+        raise api._sign_in_lock_refusal(AccountLockedError(
+            "Account is locked", locked_until=user.locked_until,
+            scope="administrator" if user.locked_until is None else "timed"))
+    lock = sign_in_lockout.lock_in_force(db, user.id, client_ip)
+    if lock is not None:
+        raise api._sign_in_lock_refusal(AccountLockedError(
+            "Account is locked", locked_until=lock.locked_until, scope=lock.scope))
 
 
 def complete_sign_in(db, result: SignInResult) -> SignedIn:

@@ -8346,7 +8346,11 @@ async def get_pre_auth_principal(
     payload = verify_access_token(credentials.credentials)
     if not payload or payload.get("stage") != sign_in.STAGE_SECOND_FACTOR or not payload.get("pre_auth"):
         raise HTTPException(status_code=401, detail="A valid pre-authentication token is required.")
-    pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
+    try:
+        pending_id = uuid.UUID(str(payload["pre_auth"]))
+    except ValueError:
+        raise HTTPException(status_code=401, detail="A valid pre-authentication token is required.")
+    pending = db.query(PendingLogin).filter(PendingLogin.id == pending_id).first()
     exp = pending.expires_at if pending else None
     if exp is not None and exp.tzinfo is None:
         exp = exp.replace(tzinfo=timezone.utc)
@@ -8371,7 +8375,11 @@ async def get_enrolling_principal(
     is refused here — an already-enrolled user finishing login uses /auth/second-factor/verify."""
     payload = verify_access_token(credentials.credentials)
     if payload and payload.get("stage") == sign_in.STAGE_SECOND_FACTOR and payload.get("pre_auth"):
-        pending = db.query(PendingLogin).filter(PendingLogin.id == payload["pre_auth"]).first()
+        try:
+            pending_id = uuid.UUID(str(payload["pre_auth"]))
+        except ValueError:
+            raise HTTPException(status_code=401, detail="A valid pre-authentication token is required.")
+        pending = db.query(PendingLogin).filter(PendingLogin.id == pending_id).first()
         exp = pending.expires_at if pending else None
         if exp is not None and exp.tzinfo is None:
             exp = exp.replace(tzinfo=timezone.utc)
@@ -8512,10 +8520,15 @@ async def finish_sign_in(
     the code store the exchange is unavailable, never guessed.
     """
     from app.core import sign_in_codes
-    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=source_of(client_ip), limit=30, window=300,
-                                             prefix="sign_in_finish", fail_open=False)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=source_of(client_ip), limit=30, window=300,
+                                                 prefix="sign_in_finish", fail_open=False)
+    except RateLimiterUnavailable:
+        # Fail closed, and say so: without the cache neither the limiter nor the code store can answer.
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Sign-in is temporarily unavailable; try again in a moment.")
     if not allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",

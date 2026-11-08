@@ -124,7 +124,7 @@ def test_a_code_lives_sixty_seconds():
     assert c.take(code, verifier=verifier, redis=r) is None
 
 
-def test_a_record_needs_exactly_one_proof_and_a_known_purpose():
+def test_a_record_needs_exactly_one_proof_and_a_known_purpose_and_a_first_proof():
     c = _codes()
     r = _Redis()
     with pytest.raises(ValueError):
@@ -133,6 +133,53 @@ def test_a_record_needs_exactly_one_proof_and_a_known_purpose():
         c.store(_handover(verifier_hash="h", code_challenge="c"), redis=r)
     with pytest.raises(ValueError):
         c.store(_handover(verifier_hash="h", purpose="link"), redis=r)
+    # A code alone is no first proof; a provider is.
+    with pytest.raises(ValueError):
+        c.store(_handover(verifier_hash="h", methods=[]), redis=r)
+    assert c.store(_handover(verifier_hash="h", methods=[], provider_id="p1"), redis=r)
+
+
+def test_a_record_read_back_must_be_plainly_typed():
+    """Flags are booleans, never a truthy word; hashes and ids are strings; a code alone is no first proof."""
+    c = _codes()
+    r = _Redis()
+    code = c.make_secret()
+    base = {"user_id": "u", "methods": ["hwk"], "verifier_hash": c.digest("v")}
+    for bad in ({**base, "provider_mfa_trusted": "yes"}, {**base, "user_verified": 1},
+                {**base, "passwordless_allowed": "true"}, {**base, "verifier_hash": 1},
+                {**base, "provider_id": 7}, {**base, "pending_id": ["x"]}, {**base, "created_at": "now"},
+                {**base, "methods": [], "provider_id": None}):
+        r.rows["signin:code:" + c.digest(code)] = (json.dumps(bad), None)
+        assert c.take(code, verifier="v", redis=r) is None, bad
+    good = {**base, "provider_mfa_trusted": True, "user_verified": False}
+    r.rows["signin:code:" + c.digest(code)] = (json.dumps(good), None)
+    got = c.take(code, verifier="v", redis=r)
+    assert got is not None and got.provider_mfa_trusted is True and got.user_verified is False
+    good = {**base, "methods": [], "provider_id": "p1"}
+    r.rows["signin:code:" + c.digest(code)] = (json.dumps(good), None)
+    assert c.take(code, verifier="v", redis=r).provider_id == "p1"
+
+
+def test_a_pkce_verifier_is_exactly_what_the_rfc_says():
+    c = _codes()
+    r = _Redis()
+    verifier = c.make_secret()                       # 43 unreserved characters
+    challenge = c.pkce_challenge(verifier)
+    # A verifier with a character outside ASCII has no challenge, so it matches nothing, even where a lax
+    # encoding would have dropped the character and matched.
+    assert c.pkce_challenge(verifier + "é") == ""
+    code = c.store(_handover(purpose="app", code_challenge=challenge), redis=r)
+    assert c.take(code, code_verifier=verifier + "é", redis=r) is None
+    # Too short, even when its challenge is the stored one.
+    short = "abc"
+    code = c.store(_handover(purpose="app", code_challenge=c.pkce_challenge(short)), redis=r)
+    assert c.take(code, code_verifier=short, redis=r) is None
+    # A character outside the unreserved set, even when the challenge matches.
+    odd = verifier[:-1] + "!"
+    code = c.store(_handover(purpose="app", code_challenge=c.pkce_challenge(odd)), redis=r)
+    assert c.take(code, code_verifier=odd, redis=r) is None
+    code = c.store(_handover(purpose="app", code_challenge=challenge), redis=r)
+    assert c.take(code, code_verifier=verifier, redis=r) is not None
 
 
 def test_garbage_in_the_store_is_no_code():

@@ -51,9 +51,19 @@ def digest(value: str) -> str:
 
 
 def pkce_challenge(code_verifier: str) -> str:
-    """The ``S256`` challenge of a PKCE verifier (RFC 7636 §4.2)."""
-    raw = hashlib.sha256((code_verifier or "").encode("ascii", "ignore")).digest()
+    """The ``S256`` challenge of a PKCE verifier (RFC 7636 §4.2). The verifier is ASCII by the RFC; anything
+    else has no challenge (an empty string, which no stored challenge equals)."""
+    try:
+        raw = hashlib.sha256((code_verifier or "").encode("ascii")).digest()
+    except UnicodeEncodeError:
+        return ""
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _is_pkce_verifier(value) -> bool:
+    """RFC 7636 §4.1: 43 to 128 characters from the unreserved set."""
+    return (isinstance(value, str) and _PKCE_MIN <= len(value) <= _PKCE_MAX
+            and all(ch.isalnum() or ch in "-._~" for ch in value) and value.isascii())
 
 
 def _key(code: str) -> str:
@@ -99,6 +109,20 @@ class Handover:
             return None
         if handover.purpose not in PURPOSES:
             return None
+        # Every proof is a plain value of its kind: a flag is a boolean (never a truthy word), a hash or an id
+        # a string or absent; anything else is not a record this module wrote.
+        for flag in ("provider_mfa_trusted", "user_verified", "passwordless_allowed"):
+            if type(getattr(handover, flag)) is not bool:
+                return None
+        for text_field in ("client_ip", "provider_id", "pending_id", "verifier_hash", "code_challenge"):
+            value = getattr(handover, text_field)
+            if value is not None and not isinstance(value, str):
+                return None
+        if not isinstance(handover.created_at, int):
+            return None
+        # A sign-in needs a first proof: the password, a passkey or an identity provider.
+        if not handover.methods and not handover.provider_id:
+            return None
         return handover
 
 
@@ -109,6 +133,8 @@ def store(handover: Handover, *, redis=None, ttl_seconds: int = CODE_TTL_SECONDS
         raise ValueError("a sign-in code needs exactly one of a verifier hash and a PKCE challenge")
     if handover.purpose not in PURPOSES:
         raise ValueError(f"not a sign-in code purpose: {handover.purpose!r}")
+    if not handover.methods and not handover.provider_id:
+        raise ValueError("a sign-in code needs a first proof: a method, or an identity provider")
     code = make_secret()
     payload = json.dumps(asdict(handover), separators=(",", ":"))
     try:
@@ -152,7 +178,7 @@ def take(code: str, *, verifier: Optional[str] = None, code_verifier: Optional[s
             return None
         return handover
     if handover.code_challenge:
-        if not isinstance(code_verifier, str) or not (_PKCE_MIN <= len(code_verifier) <= _PKCE_MAX):
+        if not _is_pkce_verifier(code_verifier):
             return None
         if not hmac.compare_digest(pkce_challenge(code_verifier), handover.code_challenge):
             return None

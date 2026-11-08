@@ -69,7 +69,7 @@ def _user(role="user", username="alice"):
     from app.core.models import RoleEnum
     now = datetime.now(timezone.utc)
     return types.SimpleNamespace(id=uuid.uuid4(), username=username, email=f"{username}@example.test",
-                                 role=RoleEnum(role), is_active=True, is_locked=False, sftp_enabled=True,
+                                 role=RoleEnum(role), is_active=True, is_locked=False, locked_until=None, sftp_enabled=True,
                                  sftp_password_auth=True, storage_quota_bytes=None, created_at=now, last_login=None,
                                  groups=[], password_hash="x")
 
@@ -122,6 +122,8 @@ def stage(monkeypatch):
     monkeypatch.setattr(S, "AuditLogger", _Audit)
     monkeypatch.setattr(S, "_login_identifier", lambda db: "username")
     monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, user: False)
+    from app.core import sign_in_lockout
+    monkeypatch.setattr(sign_in_lockout, "lock_in_force", lambda db, user_id, address, **kw: None)
     monkeypatch.setattr(S, "_record_failed_login_bg", lambda *a, **k: None)
     monkeypatch.setattr(S, "_fire_offloop", lambda fn, *a, **kw: None)
     monkeypatch.setattr(S, "_fire_action_email", lambda *a, **kw: None)
