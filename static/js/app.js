@@ -3707,12 +3707,15 @@ function syncCreateVaultForm() {
     if (pwInput) pwInput.disabled = isZk;
     if (hierWrap) hierWrap.style.display = isZk ? '' : 'none';
     // Zero-knowledge: the name is sealed in the browser, so surface the non-secret "label" field
-    // (shown while locked) and explain the name is encrypted. Standard vaults hide both.
+    // (shown while locked, in the password's place below the typed fields) and say so under the
+    // name. The name's help line is always one line, so the switch moves nothing that holds text.
     const labelGroup = document.getElementById('vault-label-group');
     const zkNameHelp = document.getElementById('vault-name-zk-help');
     const nameLabel = document.getElementById('vault-name-label');
     if (labelGroup) labelGroup.style.display = isZk ? '' : 'none';
-    if (zkNameHelp) zkNameHelp.style.display = isZk ? '' : 'none';
+    if (zkNameHelp) zkNameHelp.textContent = isZk
+        ? 'Encrypted in your browser; the server never sees it.'
+        : 'Stored encrypted on the server, which can read it to show it to members.';
     if (nameLabel) nameLabel.textContent = isZk ? 'Vault Name (encrypted)' : 'Vault Name';
 }
 

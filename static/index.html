@@ -3222,19 +3222,33 @@
                         </div>
                         <form id="create-vault-form" method="post">
                             <div class="modal-body">
+                                <!-- The type comes first, so the form below it is laid out before anything is
+                                     typed: switching the type changes only what follows the size field, and
+                                     never moves or renames a field that already holds text. -->
+                                <div class="form-group" id="vault-type-group" style="display:none;">
+                                    <!-- The interactive chooser: shown when both types are creatable. -->
+                                    <div id="vault-type-choice">
+                                        <label for="vault-type">Vault Type</label>
+                                        <select id="vault-type" class="form-control">
+                                            <option value="standard">Standard (server-encrypted)</option>
+                                            <option value="zero_knowledge">Zero-knowledge (encrypted in your browser)</option>
+                                        </select>
+                                        <small class="form-help">Zero-knowledge vaults are encrypted client-side with your passphrase — the server can never read them. Web-only (not available over SFTP).</small>
+                                    </div>
+                                    <!-- Shown instead of the chooser when this workspace requires
+                                         zero-knowledge (plan/admin force policy, or an allowlist that
+                                         omits standard) — clearer than a dead, disabled dropdown. -->
+                                    <div id="vault-type-forced-note" class="alert alert-info" style="display:none;">
+                                        This workspace requires <strong>zero-knowledge</strong> vaults — files are encrypted in your browser and the server can never read them.
+                                    </div>
+                                </div>
+                                <small class="form-help" id="zk-unavailable-note" style="display:none;"></small>
                                 <div class="form-group">
                                     <label for="vault-name" id="vault-name-label">Vault Name</label>
                                     <input type="text" id="vault-name" class="form-control" required>
-                                    <!-- Shown only for zero-knowledge vaults: explains the name is sealed. -->
-                                    <small class="form-help" id="vault-name-zk-help" style="display:none;">Encrypted in your browser — the server never sees it. Shown only after you unlock with your passphrase.</small>
-                                </div>
-                                <!-- Zero-knowledge only: a non-secret label the server CAN see, shown in the
-                                     vault list while locked so the vault is identifiable before you unlock.
-                                     Optional; leave empty to show a neutral placeholder. -->
-                                <div class="form-group" id="vault-label-group" style="display:none;">
-                                    <label for="vault-label">Label <span class="text-tertiary">(optional, shown while locked)</span></label>
-                                    <input type="text" id="vault-label" class="form-control" maxlength="120" autocomplete="off">
-                                    <small class="form-help">A non-secret hint (e.g. “Work”) visible before unlock. The real name stays encrypted. Leave empty for a neutral placeholder.</small>
+                                    <!-- Always one line, so a type switch moves nothing below it; the text says
+                                         where the name is readable for the chosen type. -->
+                                    <small class="form-help" id="vault-name-zk-help">Stored encrypted on the server, which can read it to show it to members.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="vault-desc">Description</label>
@@ -3261,31 +3275,21 @@
                                     <input type="password" id="vault-password" class="form-control" minlength="8" autocomplete="new-password">
                                     <small class="form-help">Leave empty for no password. If set (min 8 characters), it adds a web access prompt before files can be viewed — it is <strong>not encryption</strong> and does not restrict SFTP. For confidentiality the server itself cannot read, use a Zero-Knowledge vault.</small>
                                 </div>
-                                <div class="form-group" id="vault-type-group" style="display:none;">
-                                    <!-- The interactive chooser: shown when both types are creatable. -->
-                                    <div id="vault-type-choice">
-                                        <label for="vault-type">Vault Type</label>
-                                        <select id="vault-type" class="form-control">
-                                            <option value="standard">Standard (server-encrypted)</option>
-                                            <option value="zero_knowledge">Zero-knowledge (encrypted in your browser)</option>
-                                        </select>
-                                        <small class="form-help">Zero-knowledge vaults are encrypted client-side with your passphrase — the server can never read them. Web-only (not available over SFTP).</small>
-                                    </div>
-                                    <!-- Shown instead of the chooser when this workspace requires
-                                         zero-knowledge (plan/admin force policy, or an allowlist that
-                                         omits standard) — clearer than a dead, disabled dropdown. -->
-                                    <div id="vault-type-forced-note" class="alert alert-info" style="display:none;">
-                                        This workspace requires <strong>zero-knowledge</strong> vaults — files are encrypted in your browser and the server can never read them.
-                                    </div>
-                                    <!-- Team mode is a zero-knowledge-only option; hidden for standard. -->
-                                    <div id="vault-hierarchical-wrap">
-                                        <label class="checkbox-label" style="margin-top:8px;">
-                                            <input type="checkbox" id="vault-hierarchical"> Team mode (hierarchical key)
-                                        </label>
-                                        <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast. Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
-                                    </div>
+                                <!-- Zero-knowledge only, in the password's place: a non-secret label the server CAN
+                                     see, shown in the vault list while locked so the vault is identifiable before
+                                     you unlock. Optional; leave empty to show a neutral placeholder. -->
+                                <div class="form-group" id="vault-label-group" style="display:none;">
+                                    <label for="vault-label">Label <span class="text-tertiary">(optional, shown while locked)</span></label>
+                                    <input type="text" id="vault-label" class="form-control" maxlength="120" autocomplete="off">
+                                    <small class="form-help">A non-secret hint (e.g. “Work”) visible before unlock. The real name stays encrypted. Leave empty for a neutral placeholder.</small>
                                 </div>
-                                <small class="form-help" id="zk-unavailable-note" style="display:none;"></small>
+                                <!-- Team mode is a zero-knowledge-only option; hidden for standard. -->
+                                <div class="form-group" id="vault-hierarchical-wrap" style="display:none;">
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" id="vault-hierarchical"> Team mode (hierarchical key)
+                                    </label>
+                                    <small class="form-help">For large teams: the vault key is wrapped once to a shared team key, so adding members and routine key rotation stay fast. Removing a member still rotates the team key. Zero-knowledge — the server never sees the key.</small>
+                                </div>
                             </div>
                             <div class="modal-footer">
                                 <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>
