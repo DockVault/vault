@@ -6149,12 +6149,17 @@ function renderUsersTable() {
                         <th class="col-depts">Departments</th>
                         <th>Status</th>
                         <th>MFA</th>
+                        <th>Last sign-in</th>
+                        <th>Created</th>
                     </tr></thead>
                     <tbody>${list.map(renderUserRow).join('')}</tbody>
                 </table>
             </div>
         </div>`;
     attachUserListeners();
+    // Sortable headers, remembered for this account; the toggle column has no title and is skipped.
+    const usersTable = container.querySelector('table');
+    if (usersTable && window.Tables) Tables.enhance(usersTable, { key: 'users' });
 }
 
 // Show an admin-minted password-reset link ONCE in a copyable overlay. The link is a single-use secret
@@ -6231,9 +6236,11 @@ function renderUserRow(u) {
             <td>${u.second_factor_enabled
                     ? `<span class="badge badge-success">${iconSvg('shield', 'icon-sm')} On</span>`
                     : `<span class="text-tertiary text-xs">Off</span>`}</td>
+            <td class="col-time">${People.whenPlaceholder(u.last_login, { fallback: 'Never' })}</td>
+            <td class="col-time">${People.whenPlaceholder(u.created_at)}</td>
         </tr>
         <tr class="exp-detail${open ? ' is-open' : ''}" data-id="${u.id}">
-            <td colspan="6">${renderUserDetail(u)}</td>
+            <td colspan="8">${renderUserDetail(u)}</td>
         </tr>`;
 }
 
