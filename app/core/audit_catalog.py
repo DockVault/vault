@@ -75,6 +75,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("account_invitation_accept_failed", "accounts", "Invitation could not be accepted", "warning"),
     AuditAction("account_invitation_accepted", "accounts", "Account created from an invitation", "notice"),
     AuditAction("account_invitation_created", "accounts", "Invitation created", "notice"),
+    AuditAction("account_invitation_resent", "accounts", "Invitation sent again with a new link", "notice"),
     AuditAction("account_invitation_revoked", "accounts", "Invitation revoked", "notice"),
     AuditAction("account_self_signup", "accounts", "Account created by sign-up", "notice"),
     AuditAction("account_self_signup_failed", "accounts", "Sign-up refused", "warning"),

@@ -153,7 +153,7 @@ _IDENTIFIER_KEYS = (
     # who set an account's password, and who added an SSH key (a username, or the host operator's name)
     "password_set_by", "added_by",
     # labels an administrator gives or sees elsewhere: tokens, SSH keys, devices, groups, tags
-    "name", "label", "tag", "fingerprint", "token_prefix", "scope", "key", "keys", "setting",
+    "name", "label", "tag", "fingerprint", "token_prefix", "replaced_token_prefix", "scope", "key", "keys", "setting",
     # what happened, and how
     "action", "kind", "type", "mode", "method", "via", "reason", "reasons", "revoked_because",
     "withdrawn_because", "outcome", "status", "surface", "level", "posture", "message", "step_up",

@@ -5301,6 +5301,9 @@ async def list_invites(
     from app.core.models import AccountInvitation
     now = datetime.utcnow()
     rows = db.query(AccountInvitation).order_by(AccountInvitation.created_at.desc()).all()
+    # Who invited, by name, for the pending list (an administrator reads it; the names are other accounts').
+    inviter_ids = {i.created_by for i in rows if i.created_by}
+    inviters = dict(db.query(User.id, User.username).filter(User.id.in_(inviter_ids)).all()) if inviter_ids else {}
     return [{
         "id": str(i.id), "username": i.username, "email": i.email, "role": i.role,
         "token_prefix": i.token_prefix, "status": _invite_status(i, now),
@@ -5308,7 +5311,77 @@ async def list_invites(
         "accepted_at": i.accepted_at.isoformat() if i.accepted_at else None,
         "revoked_at": i.revoked_at.isoformat() if i.revoked_at else None,
         "created_at": i.created_at.isoformat() if i.created_at else None,
+        "created_by": str(i.created_by) if i.created_by else None,
+        "created_by_username": inviters.get(i.created_by) if i.created_by else None,
     } for i in rows]
+
+
+@app.post("/invites/{invite_id}/resend")
+@require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
+async def resend_invite(
+    invite_id: str,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    """Send a pending invitation again: a new link (the old one stops working at once), a fresh expiry from
+    the policy's lifetime, emailed when the invitation carries an address and mail is set up. The new link is
+    returned once, as at creation, for the administrator to copy. Only a pending invitation can be resent."""
+    from app.core.models import AccountInvitation
+    from app.core import invitations
+    try:
+        iid = uuid.UUID(str(invite_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    inv = db.query(AccountInvitation).filter(AccountInvitation.id == iid).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    now = datetime.utcnow()
+    if _invite_status(inv, now) != "pending":
+        raise HTTPException(status_code=400, detail="Only a pending invitation can be sent again.")
+    pol = _account_policy(db)
+    if not pol.get("invite_enabled"):
+        raise HTTPException(status_code=400, detail="Invitations are disabled for this deployment.")
+    pepper = _invite_pepper()
+    if not invitations.pepper_ok(pepper):
+        raise HTTPException(status_code=503,
+                            detail="Invitations are unavailable: the invite-token secret is not configured.")
+    old_prefix = inv.token_prefix
+    plaintext, prefix = invitations.mint_invite()
+    inv.token_prefix = prefix
+    inv.token_hash = invitations.hash_invite_token(plaintext, pepper)
+    _ttl_h = int(pol.get("invite_ttl_hours") or 24)
+    inv.expires_at = now + timedelta(hours=_ttl_h)
+    db.commit()
+    db.refresh(inv)
+    try:
+        AuditLogger(db).log_action(
+            action="account_invitation_resent", status="success", user=current_user,
+            ip_address=get_client_ip(request) if request is not None else None,
+            details={"username": inv.username, "email": inv.email, "role": inv.role,
+                     "token_prefix": prefix, "replaced_token_prefix": old_prefix})
+    except Exception:
+        pass
+    base = _public_base_url(request) if request is not None else ""
+    invite_url = f"{base}/?invite={plaintext}"
+    email_sent = False
+    if inv.email:
+        try:
+            from app.core.email_actions import send_action_email
+            email_sent = bool(send_action_email(
+                db, "account_invite", recipient={"email": inv.email, "username": inv.username},
+                action_context={"link": invite_url, "expires": f"in {_ttl_h} hours"}))
+        except Exception:  # noqa: BLE001 - the link is still returned; mail trouble never fails the resend
+            email_sent = False
+    return {
+        "id": str(inv.id), "username": inv.username, "email": inv.email, "role": inv.role,
+        "status": "pending", "expires_at": inv.expires_at.isoformat(), "token_prefix": prefix,
+        "token": plaintext,                       # shown ONCE, as at creation
+        "invite_url": invite_url,
+        "email_sent": email_sent,
+        "resent": True,
+    }
 
 
 @app.delete("/invites/{invite_id}")

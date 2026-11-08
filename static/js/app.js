@@ -5786,8 +5786,59 @@ function openInviteModal() {
         _inviteFormWired = true;
         document.getElementById('invite-user-form').addEventListener('submit', submitInvite);
         document.getElementById('invite-link-copy').addEventListener('click', copyInviteLink);
+        if (emailInput) emailInput.addEventListener('input', updateInviteSendNote);
     }
+    updateInviteSendNote();
     openModal('invite-user-modal');
+}
+
+// Before anything is sent: whether this invitation will be emailed, or must be copied and passed on.
+function updateInviteSendNote() {
+    const note = document.getElementById('invite-send-note');
+    if (!note) return;
+    const email = (document.getElementById('invite-email').value || '').trim();
+    if (!email) note.textContent = 'Without an email address, you copy the invitation link and send it yourself.';
+    else if (currentSettings.smtp_configured === true) note.textContent = `The invitation will be emailed to ${email}. You also get the link to copy.`;
+    else note.textContent = 'Email is not set up here, so you copy the invitation link and send it yourself.';
+}
+
+// Show a minted link (a new invitation's, or a resent one's) in the dialog's result step.
+function showInviteLink(res, intro) {
+    _lastInviteLink = res.invite_url || res.token;
+    document.getElementById('invite-link-value').textContent = _lastInviteLink;
+    let note = (intro ? intro + ' ' : '') + 'This link expires ' + formatServerTime(res.expires_at) + '.';
+    if (res.email) {
+        note += res.email_sent
+            ? ' We emailed the invitation to ' + res.email + '.'
+            : ' We couldn’t email it — copy the link above and send it yourself.';
+    }
+    document.getElementById('invite-link-expiry').textContent = note;
+    document.getElementById('invite-user-fields').style.display = 'none';
+    document.getElementById('invite-user-footer').style.display = 'none';
+    document.getElementById('invite-link-result').style.display = '';
+    document.getElementById('invite-done-footer').style.display = '';
+}
+
+// Send a pending invitation again: a new link, the old one dead, emailed when it can be.
+async function resendInvite(inv) {
+    const ok = await showConfirm(
+        `Send ${inv.username}'s invitation again? The link sent before stops working at once.`,
+        'Send invitation again', null, 'Send again');
+    if (!ok) return;
+    try {
+        const res = await apiRequest('/invites/' + encodeURIComponent(inv.id) + '/resend', { method: 'POST' });
+        if (!_inviteFormWired) {
+            _inviteFormWired = true;
+            document.getElementById('invite-user-form').addEventListener('submit', submitInvite);
+            document.getElementById('invite-link-copy').addEventListener('click', copyInviteLink);
+            document.getElementById('invite-email').addEventListener('input', updateInviteSendNote);
+        }
+        showInviteLink(res, 'A new link for ' + res.username + '; the one sent before no longer works.');
+        openModal('invite-user-modal');
+        loadInvites();
+    } catch (err) {
+        showError('Could not send the invitation again: ' + err.message);
+    }
 }
 
 async function submitInvite(e) {
@@ -5802,19 +5853,7 @@ async function submitInvite(e) {
     try {
         btn.disabled = true;
         const res = await apiRequest('/invites', { method: 'POST', body: JSON.stringify(payload) });
-        _lastInviteLink = res.invite_url || res.token;
-        document.getElementById('invite-link-value').textContent = _lastInviteLink;
-        let _inviteNote = 'This link expires ' + formatServerTime(res.expires_at) + '.';
-        if (email) {
-            _inviteNote += res.email_sent
-                ? ' We emailed the invitation to ' + email + '.'
-                : ' We couldn’t email it — copy the link above and send it yourself.';
-        }
-        document.getElementById('invite-link-expiry').textContent = _inviteNote;
-        document.getElementById('invite-user-fields').style.display = 'none';
-        document.getElementById('invite-user-footer').style.display = 'none';
-        document.getElementById('invite-link-result').style.display = '';
-        document.getElementById('invite-done-footer').style.display = '';
+        showInviteLink(res, '');
         loadInvites();
     } catch (err) {
         showError('Could not create the invitation: ' + err.message);
@@ -5868,11 +5907,19 @@ function renderInvites(invites) {
         row.appendChild(_el('strong', null, inv.username));
         if (inv.email) row.appendChild(_el('span', 'text-muted', inv.email));
         row.appendChild(_el('span', 'invite-status', inv.status));
+        if (inv.created_by_username) {
+            const by = _el('span', 'text-muted invite-by'); by.appendChild(document.createTextNode('invited by '));
+            by.appendChild(People.chip({ id: inv.created_by, username: inv.created_by_username }, { small: true }));
+            row.appendChild(by);
+        }
         if (inv.created_at) { const sent = _el('span', 'text-muted'); sent.appendChild(document.createTextNode('sent ')); sent.appendChild(People.time(inv.created_at)); row.appendChild(sent); }
         const exp = _el('span', 'text-muted'); exp.appendChild(document.createTextNode('expires ')); exp.appendChild(People.time(inv.expires_at)); row.appendChild(exp);
         if (canManage && inv.status === 'pending') {
+            const again = _el('button', 'btn btn-sm btn-secondary invite-resend', 'Send again');
+            again.style.marginLeft = 'auto';
+            again.addEventListener('click', () => resendInvite(inv));
+            row.appendChild(again);
             const revoke = _el('button', 'btn btn-sm btn-secondary', 'Revoke');
-            revoke.style.marginLeft = 'auto';
             revoke.addEventListener('click', () => revokeInvite(inv.id));
             row.appendChild(revoke);
         }
