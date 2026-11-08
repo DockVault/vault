@@ -29,10 +29,11 @@ jobs:
     name: Python 3.14 / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     # The limit is there to end a hang, not to budget a normal run. The offline lane (about 11,000 tests)
-    # takes about 17 minutes on Linux and 53 to 59 on Windows, where the audit chain's tests spend most of
+    # takes about 17 minutes on Linux and 53 to 69 on Windows, where the audit chain's tests spend most of
     # their time on file opens, renames and lookups, and SQLite looks on the disk for a journal file at each
-    # statement. A limit of 25 minutes cancelled the Windows lane with no test failing, so Windows has 75.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 75 || 25 }}
+    # statement. A limit of 25 minutes cancelled the Windows lane with no test failing, so Windows has 120,
+    # about twice a run there.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 25 }}
     strategy:
       fail-fast: false
       matrix:
