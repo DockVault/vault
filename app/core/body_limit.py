@@ -99,6 +99,8 @@ _PUBLIC_ROUTES: Sequence[Tuple[Tuple[str, ...], str]] = (
     (_POST, "/auth/login"),
     (_POST, "/auth/second-factor/verify"),
     (_POST, "/auth/second-factor/cancel"),
+    # A one-time sign-in code and the verifier that proves the tab or app that started the sign-in.
+    (_POST, "/auth/finish"),
     # Second-factor enrollment takes a session OR a pending sign-in token, resolved after the body.
     (_POST, "/users/me/second-factor/totp/enroll"),
     (_POST, "/users/me/second-factor/totp/confirm"),
