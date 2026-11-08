@@ -181,8 +181,11 @@ def test_the_events_the_event_and_the_export_go_through_the_gate():
     assert events.count("_activity_events_page(") == 1
     page = inspect.getsource(api_server._activity_events_page)
     assert page.count("recorded_names_for(db, current_user, rows, unlocked)") == 1
+    # One event, from audit_logs or the archive, is shown by one helper, which gives the names through the gate.
     one = inspect.getsource(api_server.activity_event)
-    assert one.count("recorded_names_for(db, current_user, [row], unlocked)[0]") == 1
+    assert one.count("_activity_event_view(") == 2 and "recorded_names_for" not in one
+    view = inspect.getsource(api_server._activity_event_view)
+    assert view.count("recorded_names_for(db, current_user, [row], unlocked)[0]") == 1
     # The export's batches, from the table or from an archive search, all go through views_of.
     export = inspect.getsource(api_server.activity_export)
     views = export[export.index("    def views_of(s, got):"):export.index("    def from_search(after):")]

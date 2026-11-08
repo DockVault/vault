@@ -200,7 +200,8 @@ def test_an_address_is_checked_before_anything_is_sent(value, ok):
 
 # ---- the URL hash ---------------------------------------------------------------------------------
 
-HASH = VOCABULARY + _fn("emptyFilters") + _fn("toDate") + _line("const list = ") + _fn("hashParams") + _fn("readHash")
+HASH = VOCABULARY + _fn("emptyFilters") + _fn("toDate") + _line("const list = ") + _fn("hashParams") + \
+    _fn("selectedTime") + _fn("readHash")
 
 
 def test_a_link_restores_the_state_it_was_copied_from():
@@ -237,6 +238,38 @@ console.log(JSON.stringify([
     assert no_start["range"] == {"kind": "all", "from": None, "to": "2026-09-27T00:00:00Z"}
     assert no_account["f"]["noAccount"] is True and no_account["f"]["user"] == ""
     assert other is None
+
+
+def test_a_link_to_an_event_carries_its_time():
+    """An event of a day the archive keeps is read by its id and its time (the server looks for it in that hour), so
+    a link to it, copied or in the address bar, carries the time the page has for it: from its details, its row, or
+    the link it was opened from. A hand-made time that is not one is dropped."""
+    out = _node(HASH + _fn("linkToEvent") + """
+const location = { origin: 'https://vault.example', pathname: '/' };
+const TS = '2026-07-30T03:17:00.123456+00:00';
+const base = { range: { kind: 'custom', from: '2026-07-01T00:00:00.000Z', to: null }, f: emptyFilters(), pageSize: '50',
+               page: 1, rows: [], detail: null, linkedAt: null };
+const read = (S_) => { S = S_; return readHash('#activity?' + hashParams(true).toString()); };
+let S;
+const fromDetail = read(Object.assign({}, base, { selectedId: 'ev-1', detail: { id: 'ev-1', timestamp: TS } }));
+const fromRow = read(Object.assign({}, base, { selectedId: 'ev-2', rows: [{ id: 'ev-2', timestamp: TS }] }));
+const fromLink = read(Object.assign({}, base, { selectedId: 'ev-3', linkedAt: { id: 'ev-3', at: TS } }));
+const unknown = read(Object.assign({}, base, { selectedId: 'ev-4', detail: { id: 'ev-1', timestamp: TS },
+                                               linkedAt: { id: 'ev-1', at: TS } }));
+S = base;
+const copied = linkToEvent('ev-5', TS);
+const back = readHash(copied.slice(copied.indexOf('#')));
+const odd = [readHash('#activity?ev=ev-6&at=soon'), readHash('#activity?ev=ev-6&at=' + '1'.repeat(65)),
+             readHash('#activity?ev=ev-6')];
+console.log(JSON.stringify({ fromDetail, fromRow, fromLink, unknown, copied, back, odd }));
+""")
+    ts = "2026-07-30T03:17:00.123456+00:00"
+    for name, ev in (("fromDetail", "ev-1"), ("fromRow", "ev-2"), ("fromLink", "ev-3")):
+        assert (out[name]["ev"], out[name]["at"]) == (ev, ts), name
+    assert (out["unknown"]["ev"], out["unknown"]["at"]) == ("ev-4", None)
+    assert out["copied"].startswith("https://vault.example/#activity?range=custom&")
+    assert (out["back"]["ev"], out["back"]["at"]) == ("ev-5", ts)
+    assert [(o["ev"], o["at"]) for o in out["odd"]] == [("ev-6", None)] * 3
 
 
 # ---- the filters as the API reads them ----------------------------------------------------------

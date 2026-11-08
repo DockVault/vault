@@ -70,6 +70,8 @@
             allLoading: false, newestCursor: null,
             // The detail.
             detail: null, detailWhere: null, detailEdge: { newer: false, older: false }, detailMissing: false,
+            // The event a link named and the time it gave for it, kept while that event is not read (selectedTime).
+            linkedAt: null,
             // The band.
             band: null, bandSeq: 0, bandBusy: false, bandError: null, bandHeld: null, bandFrom: null, bandDirty: false,
             now: null, nowError: false, nowSeq: 0,
@@ -328,7 +330,7 @@
             const caseId = S.caseId;
             let ev = null;
             try {
-                ev = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+                ev = await get(eventPath(id, selectedTime()));
             } catch (_) { /* the details stay as they were; reading the list again says what went wrong */ }
             if (S.selectedId !== id || S.caseId !== caseId) return;
             if (ev) S.detail = ev;
@@ -652,8 +654,33 @@
         if (f.time) p.set('t', `${f.time.from}~${f.time.to}`);
         if (f.q) p.set('q', f.q);
         if (S.pageSize !== 'all' && S.page > 1) p.set('page', String(S.page));
-        if (withEvent && S.selectedId) p.set('ev', S.selectedId);
+        if (withEvent && S.selectedId) {
+            p.set('ev', S.selectedId);
+            const at = selectedTime();
+            if (at) p.set('at', at);
+        }
         return p;
+    }
+
+    // The time of the event shown or chosen, when the page knows it (from its details, its row, or the link that named
+    // it): a link to the event carries it, and so does a read of the event on its own (eventPath).
+    function selectedTime() {
+        const id = S.selectedId;
+        if (!id) return null;
+        if (S.detail && S.detail.id === id && S.detail.timestamp) return S.detail.timestamp;
+        const row = (S.rows || []).find((r) => r.id === id);
+        if (row && row.timestamp) return row.timestamp;
+        return S.linkedAt && S.linkedAt.id === id ? S.linkedAt.at : null;
+    }
+
+    // The address of one event read on its own, with its time when known: an event of a day the archive keeps is no row
+    // of the audit log any more, and the server looks for it in the archived hour that time names.
+    function eventPath(id, at) {
+        const q = new URLSearchParams();
+        if (at) q.set('at', at);
+        if (S.caseId) q.set('case', S.caseId);
+        const qs = q.toString();
+        return '/activity/events/' + encodeURIComponent(id) + (qs ? '?' + qs : '');
     }
 
     function writeHash() {
@@ -668,9 +695,10 @@
         try { history.replaceState(history.state, '', location.pathname + location.search); } catch (_) { /* ignore */ }
     }
 
-    function linkToEvent(id) {
+    function linkToEvent(id, at) {
         const p = hashParams(false);
         p.set('ev', id);
+        if (at) p.set('at', at);
         return location.origin + location.pathname + '#activity?' + p.toString();
     }
 
@@ -706,7 +734,9 @@
         const t = (p.get('t') || '').split('~');
         if (t.length === 2 && toDate(t[0]) && toDate(t[1])) f.time = { from: t[0], to: t[1] };
         const page = parseInt(p.get('page') || '1', 10);
-        return { range, f, page: page > 0 ? page : 1, ev: p.get('ev') || null };
+        const at = p.get('at');
+        return { range, f, page: page > 0 ? page : 1, ev: p.get('ev') || null,
+                 at: at && at.length <= 64 && toDate(at) ? at : null };
     }
 
     // ---- preferences on the account ---------------------------------------------------------------
@@ -2041,7 +2071,7 @@
         tools.appendChild(el('span', 'act-d-pos', positionText()));
         const link = button('act-d-icon', null, { 'aria-label': 'Copy link to this event', title: 'Copy link to this event' });
         link.appendChild(icon('link'));
-        link.addEventListener('click', () => copyLink(ev.id));
+        link.addEventListener('click', () => copyLink(ev.id, ev.timestamp));
         const close = button('act-d-icon act-d-close', null, { 'aria-label': 'Close details', title: 'Close details' });
         close.appendChild(icon('x'));
         close.addEventListener('click', () => closeDetail(true));
@@ -2058,8 +2088,8 @@
         pane.appendChild(inner);
     }
 
-    async function copyLink(id) {
-        if (await copyText(linkToEvent(id))) showSuccess('Link copied.');
+    async function copyLink(id, at) {
+        if (await copyText(linkToEvent(id, at))) showSuccess('Link copied.');
         else showError('The link could not be copied.');
     }
 
@@ -2155,7 +2185,7 @@
             menu.setAttribute('role', 'menu');
             menu.hidden = true;
             const copy = button('', 'Copy link to this event', { role: 'menuitem' });
-            copy.addEventListener('click', () => { closeMenu(); copyLink(ev.id); });
+            copy.addEventListener('click', () => { closeMenu(); copyLink(ev.id, ev.timestamp); });
             const around = button('', 'Events around this time', { role: 'menuitem' });
             around.addEventListener('click', () => { closeMenu(); aroundThisTime(ev); });
             menu.append(copy, around);
@@ -2228,14 +2258,15 @@
 
     // Open an event named in the URL (a copied link): from the list when it is there, else on its own. When another
     // event or case is chosen while it is read, that choice stands and this one is not opened.
-    async function openLinkedEvent(id) {
+    async function openLinkedEvent(id, at) {
         if (S.rows.some((r) => r.id === id)) { select(id, { open: true, focus: false, scroll: true }); return; }
         S.selectedId = id;
         S.detail = null;
+        S.linkedAt = at ? { id, at } : null;
         const caseId = S.caseId;
         const moved = () => S.selectedId !== id || S.caseId !== caseId;
         try {
-            const ev = await get('/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : ''));
+            const ev = await get(eventPath(id, at));
             if (moved()) return;
             S.detail = ev;
             S.detailMissing = false;
@@ -5064,7 +5095,7 @@
             S.range = h.range;
             S.f = h.f;
             S.page = h.page;
-            return h.ev;
+            return h.ev ? { id: h.ev, at: h.at } : null;
         }
         await loadSaved();
         const def = S.saved && (S.saved.searches || []).find((s) => s.is_default);
@@ -5114,7 +5145,7 @@
             writeHash();
             startTimers();
             await Promise.all([reloadList(), loadBand(), loadNow(), S.saved ? null : loadSaved()]);
-            if (ev && S.active && !S.blocked) await openLinkedEvent(ev);
+            if (ev && S.active && !S.blocked) await openLinkedEvent(ev.id, ev.at);
             return;
         }
         // Back on the page: a hash names the state (a copied link opened in this tab); the rest is
@@ -5125,7 +5156,7 @@
             S.range = h.range;
             S.f = h.f;
             S.page = h.page;
-            ev = h.ev;
+            ev = h.ev ? { id: h.ev, at: h.at } : null;
             $('act-search').value = S.f.q;
         }
         renderControls();
@@ -5133,7 +5164,7 @@
         startTimers();
         clearKept();
         await Promise.all([reloadList({ keepDetail: !ev }), loadBand(), loadNow(), loadSaved()]);
-        if (ev && S.active && !S.blocked) await openLinkedEvent(ev);
+        if (ev && S.active && !S.blocked) await openLinkedEvent(ev.id, ev.at);
     };
 
     // Signing out forgets everything the page held: the next person on this tab starts afresh.

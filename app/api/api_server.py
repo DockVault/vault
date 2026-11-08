@@ -2806,24 +2806,64 @@ def _activity_events_page(rdb, AuditLog, request, current_user, db, wanted_ids, 
 
 @app.get("/activity/events/{event_id}")
 def activity_event(event_id: str,
+                   at: Optional[str] = Query(None, max_length=64),
                    case: Optional[str] = Query(None, max_length=64),
                    request: Request = None,
                    current_user: User = Depends(require_activity_viewer),
                    db: Session = Depends(get_db)):
-    """One event, as the Events list shows it (an administrator, or an auditor): for a copied link to an event.
-    With a case selected, only an event of the case, with the names the case lets its auditor read."""
+    """One event, as the Events list shows it (an administrator, or an auditor): for a copied link to an event, and
+    to read the event shown again. With a case selected, only an event of the case, with the names the case lets its
+    auditor read.
+
+    An event of a day the archive keeps as compressed blocks is no row of audit_logs any more: ``at``, the event's
+    time (its ``timestamp``, which the page's links and details carry), names the hour to look for it in, and that
+    hour is searched as the Events list searches a range (app/services/activity_archive.py). An id that is a row is
+    never looked for in the archive, and one that is no row is looked for only in that hour: without ``at`` it is
+    not found. While this server cannot tell which days are archived, a look in an hour that could be one is refused
+    with 503 and Retry-After, as the list's read."""
+    from app.core import audit_range
     from app.core.models import AuditLog
+    from app.services import activity_archive as archive
+    from app.services import activity_events as ev
+    missing = HTTPException(status_code=404, detail="That event is not in the log.")
+    selection = _activity_case(db, current_user, case, request)
+    try:
+        wanted = uuid.UUID(event_id)
+    except ValueError:
+        raise missing
+    row = ev.build_events_query(db.query(AuditLog), AuditLog, **_case_filters(selection)).filter(
+        AuditLog.id == wanted).first()
+    if row is not None:
+        return _activity_event_view(db, current_user, request, selection, row)
+    # A route called as a function (the tests call it so) may leave ``at`` as its Query default: no time.
+    when = audit_range.as_naive_utc(at) if isinstance(at, str) else None
+    if when is None or archive.ids_are_rows(db, [event_id]):
+        raise missing
+    hour = when.replace(minute=0, second=0, microsecond=0)
+    try:
+        end = hour + timedelta(hours=1)
+    except OverflowError:
+        raise missing
+    try:
+        with archive.source(db, hour, end) as src:
+            e = src.entity
+            row = ev.build_events_query(src.db.query(e), e, **_case_filters(selection)).filter(e.id == wanted).first()
+            if row is None:
+                raise missing
+            # Read while the search is open: its rows end with its transaction.
+            return _activity_event_view(db, current_user, request, selection, row)
+    except archive.TooBroad as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except archive.Unread as exc:
+        raise _archive_unread(exc)
+
+
+def _activity_event_view(db, current_user, request, selection, row) -> dict:
+    """One row (of audit_logs, or of an archive search) as the Events list shows it, its names read through the
+    request's session ``db``."""
     from app.services import activity_events as ev
     from app.services.activity_names import (names_for, recorded_names_for, show_unlocked, temp_credential_names,
                                              unlocked_vaults)
-    selection = _activity_case(db, current_user, case, request)
-    try:
-        row = ev.build_events_query(db.query(AuditLog), AuditLog, **_case_filters(selection)).filter(
-            AuditLog.id == uuid.UUID(event_id)).first()
-    except ValueError:
-        row = None
-    if row is None:
-        raise HTTPException(status_code=404, detail="That event is not in the log.")
     event = ev.row_view(row)
     unlocked = unlocked_vaults(db, current_user, request)
     event["names"] = names_for(db, current_user, [event])[0]

@@ -421,9 +421,12 @@ def test_the_routes_select_the_case_and_record_before_sending(monkeypatch):
     page = inspect.getsource(api._activity_events_page)
     names_at = page.index("_case_names(db, selection, current_user, events, rows)")
     assert names_at < page.index('out["events"] = events')
+    # One event, from audit_logs or the archive, under the case's filters either way, shown by one helper.
     one = inspect.getsource(api.activity_event)
-    assert "_case_names(db, selection, current_user, [event], [row])" in one
-    assert "**_case_filters(selection)" in one
+    assert one.count("**_case_filters(selection)") == 2
+    assert one.count("_activity_event_view(db, current_user, request, selection, row)") == 2
+    view = inspect.getsource(api._activity_event_view)
+    assert "_case_names(db, selection, current_user, [event], [row])" in view
     helper = inspect.getsource(api._case_names)
     assert helper.index("case_names(") < helper.index("note_names_viewed(")
     for fn in (api.activity_summary, api.activity_export):

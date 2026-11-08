@@ -9,7 +9,8 @@ rows over archived and kept days, sealed and archived by the server's own passes
   time zones) counts what it counted from the rows before archiving;
 - the routes: the Events list says what it read of the archive, pages across the boundary and refuses a range
   beyond its bound; the export holds the archived rows, records how many archived days it read, and says when it
-  left them out; the readers of rows only send the archive's span in their headers.
+  left them out; the readers of rows only send the archive's span in their headers; one archived event is read on
+  its own with its time (a copied link, the details read again).
 
 tests/test_activity_archive.py covers the rules offline.
 """
@@ -594,3 +595,74 @@ out["specials_seen"] = sorted(r["username"] for r in after.values()) == sorted(S
     assert got["rows"] == [12, 12], got
     assert got["differ"] == {} and got["text_differ"] == {}, got
     assert got["specials_seen"], got
+
+
+def test_one_archived_event_is_read_on_its_own_with_its_time_on_postgres(throwaway):
+    """A copied link to an event, or its details read again, once its day is archived: with its time the event is
+    found in the archived hour that time names, exactly as the Events list shows it (its names read as for any row);
+    without its time, or in another hour, it is not found. While the chain cannot be read (its lock held past the
+    wait, a process that has just started), the look is refused with 503 and Retry-After, and answered once it can."""
+    got = _script(throwaway, r'''
+from fastapi import HTTPException
+from app.api import api_server as api
+corpus()
+out["stopped"] = passes()
+admin_id = str(add_user("boss", RoleEnum.ADMIN))
+out["days"] = archive_all()
+
+
+def call(fn, **kw):
+    db = SessionLocal()
+    try:
+        admin = db.get(User, uuid.UUID(admin_id))
+        return fn(current_user=admin, db=db, **kw)
+    finally:
+        db.close()
+
+
+def one(event_id, at_):
+    try:
+        return call(api.activity_event, event_id=event_id, at=at_, case=None, request=None)
+    except HTTPException as exc:
+        return [exc.status_code, exc.detail, dict(exc.headers or {})]
+
+
+EVENTS = dict(category=[], channel=[], status=[], action=[], user=None, user_match="contains", no_account=False,
+              ip=None, q=None, temp_credential_id=None, temp_credential=None, vault_id=None, from_date=None,
+              to_date=None, cursor=None, page=None, after=None, overlap=0, ids=[], count_only=False, limit=200,
+              request=None, case=None)
+listed = call(api.activity_events, **dict(EVENTS, from_date=at(ARCHIVED[1], 0).isoformat(),
+                                          to_date=at(ARCHIVED[2], 0).isoformat()))
+out["listed_note"] = listed.get("archive")
+events = listed["events"]
+out["n"] = len(events)
+out["still_rows"] = q("SELECT count(*) FROM audit_logs WHERE id = ANY(CAST(:ids AS uuid[]))",
+                      ids=[e["id"] for e in events])[0][0]
+out["same"] = sum(1 for e in events if one(e["id"], e["timestamp"]) == e)
+first = events[0]
+out["no_time"] = one(first["id"], None)
+out["other_hour"] = one(first["id"], (datetime.fromisoformat(first["timestamp"]) + timedelta(hours=1)).isoformat())
+out["no_such"] = one(str(uuid.uuid4()), first["timestamp"])
+# A process that has just started, while another holds the chain's lock.
+ai.READ_WAIT_SECONDS = 0.5
+fresh = ai.ChainState()
+ai.set_state(fresh)
+holder = engine.connect()
+holder.execute(text("SELECT pg_advisory_lock(:c, :k)"), {"c": ai.CHAIN_LOCK[0], "k": ai.CHAIN_LOCK[1]})
+try:
+    out["held"] = one(first["id"], first["timestamp"])
+finally:
+    holder.execute(text("SELECT pg_advisory_unlock(:c, :k)"), {"c": ai.CHAIN_LOCK[0], "k": ai.CHAIN_LOCK[1]})
+    holder.close()
+out["after"] = one(first["id"], first["timestamp"]) == first
+out["read"] = fresh.view_read
+''')
+    assert got["stopped"] is None and len(got["days"]) == 4, got
+    assert got["listed_note"]["searched"] is True and got["n"] == 18 and got["still_rows"] == 0, got
+    assert got["same"] == got["n"], got
+    for key in ("no_time", "other_hour", "no_such"):
+        assert got[key] == [404, "That event is not in the log.", {}], (key, got[key])
+    held = got["held"]
+    assert held[0] == 503 and held[2] == {"Retry-After": "60"}, held
+    assert held[1].startswith("The archived days of the audit log cannot be read yet"), held
+    assert got["after"] is True and got["read"] is True, got

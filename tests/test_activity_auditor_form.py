@@ -84,7 +84,7 @@ const forms = (box) => box.children.filter((c) => c.tag === 'form');
 
 def _page() -> str:
     """The stand-ins, then the two shipped functions (read when a test runs, so a missing one fails that test)."""
-    return STUBS + _fn("reloadAfterUnlock") + _fn("auditorActions")
+    return STUBS + _fn("selectedTime") + _fn("eventPath") + _fn("reloadAfterUnlock") + _fn("auditorActions")
 
 
 def _offered(ev: dict, case="'case-1'", extra="") -> bool:
@@ -196,13 +196,13 @@ FAIL_GET = {'true' if fails else 'false'};
     assert out["detail"] == detail
 
 
-def _linked(state: str, during: str = "null", event: str = "ev-9") -> dict:
-    return _node(STUBS + _fn("openLinkedEvent") + f"""
+def _linked(state: str, during: str = "null", event: str = "ev-9", at=None) -> dict:
+    return _node(STUBS + _fn("selectedTime") + _fn("eventPath") + _fn("openLinkedEvent") + f"""
 S.rows = [{{ id: 'ev-2' }}];
 {state}
 DURING_GET = {during};
 (async () => {{
-    await openLinkedEvent({json.dumps(event)});
+    await openLinkedEvent({json.dumps(event)}, {json.dumps(at)});
     console.log(JSON.stringify({{ calls, detail: S.detail, selected: S.selectedId,
                                   missing: S.detailMissing === undefined ? null : S.detailMissing }}));
 }})();
@@ -243,6 +243,49 @@ def test_a_linked_event_is_not_opened_over_a_choice_made_while_it_is_read(state,
 def test_a_linked_event_is_read_by_its_id_under_the_selected_case(state, event, path):
     out = _linked(state, event=event)
     assert out["calls"] == [["get", path], ["openDetail", event]] and out["selected"] == event
+
+
+TS = "2026-07-30T03:17:00.123456+00:00"
+AT = "at=2026-07-30T03%3A17%3A00.123456%2B00%3A00"
+
+
+@pytest.mark.parametrize("state,path", [
+    ("", f"/activity/events/ev-9?{AT}&case=case-1"),
+    ("S.caseId = null;", f"/activity/events/ev-9?{AT}"),
+])
+def test_a_linked_event_is_read_with_the_time_its_link_gives(state, path):
+    """An event of a day the archive keeps is no row any more: the server finds it by its time. The link's time goes
+    with the read, and stays with the event while it is shown, for a link to it and for its next read."""
+    out = _node(STUBS + _fn("selectedTime") + _fn("eventPath") + _fn("openLinkedEvent") + f"""
+S.rows = [{{ id: 'ev-2' }}];
+{state}
+(async () => {{
+    await openLinkedEvent('ev-9', {json.dumps(TS)});
+    S.detail = null;
+    console.log(JSON.stringify({{ calls, at: selectedTime() }}));
+}})();
+""")
+    assert out == {"calls": [["get", path], ["openDetail", "ev-9"]], "at": TS}
+
+
+@pytest.mark.parametrize("state,path", [
+    # Opened from a link, read again after the unlock with the time its details show.
+    ("S.rows = []; S.detail = { id: 'ev-1', old: true, timestamp: TS };", f"/activity/events/ev-1?{AT}&case=case-1"),
+    # Its details not read (the link's read failed): the time the link gave.
+    ("S.rows = []; S.detail = null; S.linkedAt = { id: 'ev-1', at: TS };", f"/activity/events/ev-1?{AT}&case=case-1"),
+    # A link's time for another event is not this one's.
+    ("S.rows = []; S.detail = null; S.linkedAt = { id: 'ev-0', at: TS };", "/activity/events/ev-1?case=case-1"),
+])
+def test_after_an_unlock_the_event_is_read_again_with_its_time(state, path):
+    out = _node(_page() + f"""
+const TS = {json.dumps(TS)};
+{state}
+(async () => {{
+    await reloadAfterUnlock();
+    console.log(JSON.stringify({{ calls }}));
+}})();
+""")
+    assert out["calls"][:2] == [["reloadList", True], ["get", path]]
 
 
 def test_a_linked_event_on_the_page_is_selected_there_without_a_read():

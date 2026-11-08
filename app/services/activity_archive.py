@@ -16,7 +16,9 @@ A range with no start reads rows only, and says where the archive is (``archive`
 offers a range to search it. The live list's reads of newer rows start where they continue from, so they reach
 the archive only when that point is in it; its reads of specific rows (``ids``: the new rows the live signal names,
 an open event's re-check) look the ids up in audit_logs first and reach the archive only for an id that is no row
-at all (ids_are_rows), and the page narrows an open event's re-check to the event's own instant.
+at all (ids_are_rows), and the page narrows an open event's re-check to the event's own instant. One event read on
+its own (``/activity/events/{id}``: a copied link, the details read again) is looked up in audit_logs first; an id
+that is no row is looked for in the archived hour its time names (the link and the details carry it), nowhere else.
 
 The view and the transaction's snapshot are taken in that order: the snapshot first, then the view. A part the
 view names that the snapshot holds no block of was archived after the snapshot (its rows are then still rows in

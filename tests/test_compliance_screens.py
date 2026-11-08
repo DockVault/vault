@@ -66,8 +66,11 @@ def test_every_activity_read_carries_the_selected_case_and_its_receipts():
     filters = filters[:filters.index("\n    }\n")]
     assert "if (S.caseId) p.set('case', S.caseId);" in filters
     assert activity.count("unlockHeader(), caseHeader())") == 2
-    assert ("'/activity/events/' + encodeURIComponent(id) + (S.caseId ? '?case=' + encodeURIComponent(S.caseId) : '')"
-            in activity)
+    # One event read on its own (from a link, and after an unlock) goes through the one path that carries the case.
+    path = activity[activity.index("function eventPath(id, at) {"):]
+    path = path[:path.index("\n    }\n")]
+    assert "if (S.caseId) q.set('case', S.caseId);" in path
+    assert activity.count("await get(eventPath(") == 2 and activity.count("'/activity/events/' +") == 1
 
 
 def test_the_propose_sheet_says_who_the_accounts_creator_keeps_from_approving():
