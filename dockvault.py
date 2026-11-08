@@ -880,6 +880,11 @@ def build_env_lines(cfg):
     hold = parse_envelope_hold_days(cfg.get("zk_envelope_hold_days"))
     if hold is not None and hold != ENVELOPE_HOLD_DAYS_DEFAULT:
         bare("ZK_ENVELOPE_HOLD_DAYS", str(hold))
+    # Root certificates for direct passkey attestation: written only when the operator set a path, so a fresh
+    # volume set keeps it (the setting itself is turned on in the app's Settings -> Sign-in).
+    roots = str(cfg.get("webauthn_attestation_roots") or "").strip()
+    if roots:
+        bare("WEBAUTHN_ATTESTATION_ROOTS", roots)
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -2090,6 +2095,7 @@ def new_set_config(current_env, new_prefix, new_id):
         "zk_key_proof_enforce": (current_env.get("ZK_KEY_PROOF_ENFORCE") or "").strip() or None,
         # And a changed hold on the zero-knowledge key envelope after an administrator's change.
         "zk_envelope_hold_days": (current_env.get("ZK_ENVELOPE_HOLD_DAYS") or "").strip() or None,
+        "webauthn_attestation_roots": (current_env.get("WEBAUTHN_ATTESTATION_ROOTS") or "").strip() or None,
     }
     return cfg
 
@@ -4374,6 +4380,8 @@ def env_lock_open(fernet, enc_text, passphrase=None, recovery_key=None):
 ACCOUNT_ACTIONS = (
     ("reset-password", "Reset a password (a one-time reset link)"),
     ("reset-second-factor", "Reset a second factor (set up again at the next sign-in)"),
+    ("clear-passkey-requirement", "Let an account sign in without the passkey its role requires (a browser that "
+                                  "cannot make one)"),
     ("approve", "Approve a change waiting for a second administrator"),
     ("list", "List the changes waiting for approval"),
     ("user-managers", "List who may manage users without being an administrator"),
@@ -9529,7 +9537,8 @@ class DockVault:
                               % server_text(req.get("target_username")), "yellow")]))
             return
 
-        if action not in ("reset-password", "reset-second-factor", "unlock", "release-key-hold"):
+        if action not in ("reset-password", "reset-second-factor", "unlock", "release-key-hold",
+                          "clear-passkey-requirement"):
             self._fail("unknown action: %s" % action)
         username = (getattr(args, "username", None) if args else None) or (
             ask("Username", pal) if interactive else None)
@@ -9565,6 +9574,10 @@ class DockVault:
         if action == "reset-second-factor":
             print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, "
                             "with their own password, at the next sign-in." % username, "green"))
+            return
+        if action == "clear-passkey-requirement":
+            print(pal.paint("  Passkey requirement cleared for %s: the role's requirement no longer applies to this "
+                            "account. Recorded as the host operator's action." % username, "green"))
             return
         if answer.get("secret_kind") == "temporary_password":
             heading = "TEMPORARY PASSWORD (shown once)"
@@ -9959,8 +9972,8 @@ def build_parser():
 
     ac = parsers["accounts"]
     ac.add_argument("--action", dest="account_action", choices=[k for k, _ in ACCOUNT_ACTIONS],
-                    help="reset-password | reset-second-factor | approve | list | user-managers | "
-                         "regranted-defaults | unlock | release-key-hold")
+                    help="reset-password | reset-second-factor | clear-passkey-requirement | approve | list | "
+                         "user-managers | regranted-defaults | unlock | release-key-hold")
     ac.add_argument("--username", dest="username", help="the account to act on")
     ac.add_argument("--confirm-username", dest="confirm_username",
                     help="the account's username typed again; nothing changes unless it matches")

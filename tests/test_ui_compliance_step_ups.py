@@ -14,11 +14,12 @@ pytestmark = pytest.mark.ui
 COMPLIANCE_STEPS = ("Propose an auditor grant", "Approve or turn down an auditor grant", "Reconfirm your auditor right",
                     "Request a compliance case", "Approve, turn down or extend a compliance case",
                     "Export files from a compliance case", "Place a legal hold", "Confirm or release a legal hold")
-# The compliance steps and the six other fixed step-ups (app/core/second_factor_actions.py, FIXED_STEP_UP_ACTIONS).
-FIXED_ROWS = len(COMPLIANCE_STEPS) + 6
-# Two of those six, each with what the list says it asks for.
+# The compliance steps and the seven other fixed step-ups (app/core/second_factor_actions.py, FIXED_STEP_UP_ACTIONS).
+FIXED_ROWS = len(COMPLIANCE_STEPS) + 7
+# Three of those seven, each with what the list says it asks for.
 OTHER_STEPS = (("Extend a share or a link by more than a week", "Your second factor, when you have one"),
-               ("Let a sign-in last longer", "Always: your password, and your second factor when you have one"))
+               ("Let a sign-in last longer", "Always: your password, and your second factor when you have one"),
+               ("Change how people sign in", "Always: your password, and your second factor when you have one"))
 
 
 def _open_security(page: Page, admin_creds, width=1440, height=900):

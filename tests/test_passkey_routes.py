@@ -109,6 +109,7 @@ class Harness:
         self.db.query_groups = []
         S.app.dependency_overrides[S.get_db] = lambda: self.db
         S.app.dependency_overrides[S.get_current_user] = lambda: user
+        S.app.dependency_overrides[S.get_enrolling_principal] = lambda: (user, None)
         S.app.dependency_overrides[S.require_interactive_admin] = lambda: user
         monkeypatch.setattr(wc, "_redis", lambda redis: self.redis)
         monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(rp_id=RP_ID, origin=ORIGIN, name=name))

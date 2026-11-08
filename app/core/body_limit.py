@@ -110,6 +110,9 @@ _PUBLIC_ROUTES: Sequence[Tuple[Tuple[str, ...], str]] = (
     # Second-factor enrollment takes a session OR a pending sign-in token, resolved after the body.
     (_POST, "/users/me/second-factor/totp/enroll"),
     (_POST, "/users/me/second-factor/totp/confirm"),
+    # Passkey registration takes a session OR a forced-enrollment pre-auth token, resolved after the body.
+    (_POST, "/users/me/passkeys/register/options"),
+    (_POST, "/users/me/passkeys/register/verify"),
     (_POST, "/auth/signup"),
     (_POST, "/auth/forgot-password"),
     (_POST, "/invites/{token}/accept"),

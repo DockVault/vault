@@ -67,6 +67,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("passkey_confirmed", "sign_in", "Provisional passkey confirmed", "notice"),
     AuditAction("passkey_removed", "sign_in", "Passkey removed", "notice"),
     AuditAction("passkey_sign_count_regressed", "sign_in", "Passkey counter went backwards (a copy?)", "warning"),
+    AuditAction("passkey_requirement_cleared", "sign_in", "Passkey requirement cleared for an account", "warning"),
     # By an administrator (through the two-person rule) or by an approved request.
     AuditAction("passkey_admin_removed", "sign_in", "Passkey removed for another user", "warning"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),

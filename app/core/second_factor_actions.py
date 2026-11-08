@@ -81,6 +81,9 @@ FIXED_STEP_UP_ACTIONS: dict = {
     # Letting a sign-in last longer (PUT /settings: a longer session timeout or "Stay signed in" limit): the
     # password every time, plus any second factor the account has enrolled, as for how long records are kept.
     "admin.session_limits.write": ("Let a sign-in last longer", "password_always"),
+    # How people sign in (app/api/sign_in_settings_router.py): the passkey settings, and the single sign-on
+    # settings when they land; the password every time plus any second factor the account has enrolled.
+    "admin.auth_policy.write": ("Change how people sign in", "password_always"),
 }
 
 # The steps of compliance access (app/api/compliance_router.py), each under the compliance policy: the password

@@ -434,7 +434,8 @@ def count_failed_attempt(db, pending: PendingLogin) -> None:
     db.commit()
 
 
-def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: bool = False) -> PendingStep:
+def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: bool = False,
+                  enrollment_methods=None) -> PendingStep:
     """Hold ``result`` for one more step. The pre-authentication token carries ``stage``, the pending
     login's id, the proofs so far and the provider; it has no ``session_token``, which is the confinement
     (the session dependency, the monitor handshake and the sign-out route each refuse a token without
@@ -474,7 +475,8 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
         "access_token": None, "second_factor_required": True, "stage": stage,
         "enrollment_required": enrollment_required,
         "methods": methods,
-        "enrollment_methods": list(ENROLLMENT_METHODS) if enrollment_required else [],
+        "enrollment_methods": (list(enrollment_methods) if enrollment_methods is not None
+                               else list(ENROLLMENT_METHODS)) if enrollment_required else [],
         "pre_auth_token": token,
     }
     if stage == STAGE_PASSWORD:
@@ -491,12 +493,22 @@ def finish(db, result: SignInResult):
     """
     from app.api import api_server as api
     user = result.user
+    enrollment_methods = []
     if result.is_temporary:
         stage = DONE
     else:
         refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
         in_effect = api._login_second_factor_in_effect(db, user)
         enrollment_pending = bool(in_effect) and api._second_factor_effective(db, user)["state"] == "pending"
+        # A role that must hold a passkey: the grace runs from the first sign-in under the requirement; past it the
+        # sign-in stops at the enrollment (a user-verified passkey meets a pending authenticator enrollment too).
+        passkey = api._passkey_requirement(db, user)
+        enrollment_methods = list(ENROLLMENT_METHODS) if enrollment_pending else []
+        if passkey.required:
+            api._passkey_mark_required(user)
+            enrollment_methods.append("passkey")
+            if passkey.overdue:
+                in_effect, enrollment_pending = True, True
         try:
             stage = second_factor_due(user, result.methods, factor_in_effect=bool(in_effect),
                                       enrollment_pending=enrollment_pending,
@@ -518,7 +530,8 @@ def finish(db, result: SignInResult):
         except Exception:  # noqa: BLE001 -- the hold stands without its row
             pass
     if stage == ENROLL:
-        return begin_pending(db, result, STAGE_SECOND_FACTOR, enrollment_required=True)
+        return begin_pending(db, result, STAGE_SECOND_FACTOR, enrollment_required=True,
+                             enrollment_methods=enrollment_methods)
     return begin_pending(db, result, stage)
 
 

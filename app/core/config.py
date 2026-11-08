@@ -401,6 +401,9 @@ class Settings(BaseSettings):
     # the first entry that is not a wildcard is the base of every emailed link, so it is the address people open
     # (behind a proxy, the proxy's). An entry with no host name stops the start (app/core/allowed_hosts.py).
     allowed_hosts: str = Field(default="")
+    # A PEM bundle of root certificates for direct passkey attestation (app/core/webauthn_settings.py); empty: direct
+    # attestation cannot be turned on.
+    webauthn_attestation_roots: str = Field(default="")
     rate_limit_vault_attempts: int = Field(default=5)  # Regular users
     rate_limit_vault_attempts_admin: int = Field(default=20)  # Admins get higher limit
     rate_limit_vault_window_seconds: int = Field(default=300)  # 5 minutes

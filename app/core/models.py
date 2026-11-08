@@ -208,6 +208,11 @@ class User(Base):
     # password, whatever the deployment's second-factor policy; enrolling clears it. Nullable and
     # added by the boot DDL, so an earlier release reads the table without it.
     second_factor_reset_at = Column(DateTime, nullable=True)
+    # Passkeys required of this account's role (app/core/webauthn_settings.py): when the requirement first applied
+    # to the account (the grace runs from here), and when the server's operator cleared it for this account.
+    # Nullable and added by the boot DDL, so an earlier release reads the table without them.
+    passkey_required_since = Column(DateTime, nullable=True)
+    passkey_requirement_cleared_at = Column(DateTime, nullable=True)
     # The revision of the role defaults this account has been given (app/core/api_catalog.py,
     # FunctionalityGroup.default_since). At each start an account that is not an administrator is given
     # the defaults of its role that are newer than this, once, and it is then set to the current

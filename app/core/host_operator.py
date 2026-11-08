@@ -45,7 +45,8 @@ import types
 import uuid
 
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
-           "regranted-defaults", "unlock", "zk-status", "downgrade-blockers", "release-key-hold")
+           "regranted-defaults", "unlock", "zk-status", "downgrade-blockers", "release-key-hold",
+           "clear-passkey-requirement")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -104,6 +105,9 @@ def _describe(db, user):
     from app.core.models import SecondFactorEnrollment
     has_factor = db.query(SecondFactorEnrollment.id).filter(
         SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first() is not None
+    from app.core.models import WebAuthnCredential
+    passkeys = db.query(WebAuthnCredential.id).filter(WebAuthnCredential.user_id == user.id,
+                                                      WebAuthnCredential.retired_at.is_(None)).count()
     return {
         "username": user.username,
         "email": user.email,
@@ -112,6 +116,8 @@ def _describe(db, user):
         "locked_by_administrator": bool(user.is_locked) and user.locked_until is None,
         "last_login": user.last_login.isoformat() + "Z" if user.last_login else None,
         "second_factor": has_factor,
+        "passkeys": passkeys,
+        "passkey_requirement_cleared": getattr(user, "passkey_requirement_cleared_at", None) is not None,
     }
 
 
@@ -435,6 +441,18 @@ def _run(args, api) -> int:
                 zk_notices.envelope_released_by_host(db, user)
             return _answer({"ok": True, "account": user.username, "released": released})
 
+        if args.action == "clear-passkey-requirement":
+            # The break-glass for a person whose browser cannot make a passkey: the role's requirement no longer
+            # applies to this account. Not a credential change (nothing about how the account proves itself is
+            # set by someone else); recorded as the operator's action.
+            from datetime import datetime as _dt
+            user.passkey_requirement_cleared_at = _dt.utcnow()
+            db.commit()
+            AuditLogger(db).log_action(
+                action="passkey_requirement_cleared", status="success", username=cc.HOST_OPERATOR,
+                resource_type="user", resource_id=str(user.id),
+                details={"target_username": user.username, "by": "host operator"})
+            return _answer({"ok": True, "account": user.username})
         if args.action == "reset-second-factor":
             outcome = api._credential_change(db, None, user, cc.SECOND_FACTOR,
                                              summary="Second factor reset by the host operator", payload={})

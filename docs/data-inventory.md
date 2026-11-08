@@ -665,5 +665,8 @@ Passkeys and single sign-on:
   retired by an administrator's second-factor reset or removal and deleted 30 days later.
 - `auditor_grants.approved_credential_ids`: the ids of the passkeys an auditor held when the right was approved
   or last reconfirmed, so a passkey added later does not count for the compliance step-ups until then.
+- `users.passkey_required_since` and `users.passkey_requirement_cleared_at`: when a role's passkey requirement
+  first applied to the account (its grace runs from there) and when the server's operator cleared it for the
+  account; both go with the account.
 - `credential_changes` gained the kind `passkey` (an administrator removing someone's passkey), under the same
   two-person rule and 14-day retention as the other kinds.

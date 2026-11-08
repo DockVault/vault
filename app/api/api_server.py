@@ -844,6 +844,9 @@ app.include_router(activity_search_router)
 # Unlocking a password-protected vault's names on the Activity page, with the vault password once.
 from app.api.activity_unlock_router import router as activity_unlock_router  # noqa: E402
 app.include_router(activity_unlock_router)
+# Settings -> Sign-in: the passkey settings, under the fixed step-up admin.auth_policy.write.
+from app.api.sign_in_settings_router import router as sign_in_settings_router  # noqa: E402
+app.include_router(sign_in_settings_router)
 # Compliance access: the auditor right, cases, legal holds and their step-ups.
 from app.api.compliance_router import router as compliance_router  # noqa: E402
 app.include_router(compliance_router)
@@ -11426,10 +11429,43 @@ class PasskeyRenameRequest(BaseModel):
 
 
 def _passkey_policy(db):
-    """What the administrator's passkey settings say, as the service needs it: the service's defaults until the
-    settings item lands (user verification required, ES256/RS256/EdDSA, attestation none)."""
+    """What the administrator's passkey settings say, as the service needs it (app/core/webauthn_settings.py)."""
+    from app.core import webauthn_settings
+    return webauthn_settings.policy()
+
+
+def _passkeys_enabled(db) -> bool:
+    from app.core import webauthn_settings
+    return webauthn_settings.enabled()
+
+
+def _passkey_requirement(db, user):
+    """Whether ``user``'s role requires a passkey the account lacks, and where its grace stands."""
+    from app.core import webauthn_settings
+    return webauthn_settings.requirement(db, user)
+
+
+def _passkey_mark_required(user) -> bool:
+    from app.core import webauthn_settings
+    return webauthn_settings.mark_required(user)
+
+
+def _passkey_algorithm_check(db, user, row) -> None:
+    """A stored key whose algorithm left the allowed list: usable for 30 days with a notice to the owner, then
+    refused (webauthn_service.Refused, as any other refusal of the key)."""
+    from app.core import webauthn_settings
     from app.services import webauthn_service as ws
-    return ws.PasskeyPolicy()
+    usable, in_grace = webauthn_settings.algorithm_usable(db, row.cose_alg)
+    if not usable:
+        raise ws.Refused("algorithm_not_allowed", "the key's algorithm is no longer accepted")
+    if in_grace:
+        try:
+            _notify_users([str(user.id)], "security", title="One of your passkeys needs replacing",
+                          body=("The signature algorithm one of your passkeys uses is no longer accepted by this vault. "
+                                "It still signs you in for 30 days from the change; register a new passkey before then."),
+                          target="#profile", dedup_prefix=f"passkey_alg_grace:{row.id}")
+        except Exception as e:      # noqa: BLE001
+            print(f"⚠ passkey notice skipped: {type(e).__name__}")
 
 
 def _passkey_relying_party(db):
@@ -11567,21 +11603,27 @@ def _passkey_audit(db, user, request, action: str, details: dict, status: str = 
 async def passkey_register_options(
     body: PasskeyRegisterOptionsRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    principal=Depends(get_enrolling_principal),
     db: Session = Depends(get_db),
 ):
     """Start registering a passkey for the caller's own account: the proof the account owes (the step-up, or the
     password for a first factor), the account's limit, then a fresh challenge and the options the browser hands
     to ``navigator.credentials.create``. The answer says whether the key will be provisional (registered within
-    14 days after an administrator changed this account's sign-in details)."""
+    14 days after an administrator changed this account's sign-in details). Reachable with a normal session OR a
+    forced-enrollment pre-auth token (a role that must hold a passkey, past its grace): the password was given at
+    the form, so that sign-in is the proof."""
     from app.core import webauthn_challenges
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     from app.services import webauthn_service as ws
+    current_user, pending = principal
     _passkey_refuse_temp(current_user)
+    if not _passkeys_enabled(db):
+        raise HTTPException(status_code=409, detail="Passkeys are turned off on this deployment.")
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    _passkey_first_proof(db, user, request, body.current_password)
+    if pending is None:
+        _passkey_first_proof(db, user, request, body.current_password)
     try:
         allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=PASSKEY_OPTIONS_LIMIT,
                                                  window=PASSKEY_OPTIONS_WINDOW, prefix="passkey_register",
@@ -11612,16 +11654,21 @@ async def passkey_register_options(
 async def passkey_register_verify(
     body: PasskeyRegisterVerifyRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    principal=Depends(get_enrolling_principal),
     db: Session = Depends(get_db),
 ):
     """Finish registering a passkey: spend the challenge (one ceremony, this account), verify the browser's
     answer against the vault's origin and policy, store the key, and tell the owner. The row is provisional when
-    an administrator changed this account's sign-in details in the last 14 days."""
-    from app.core import webauthn_challenges
+    an administrator changed this account's sign-in details in the last 14 days. On the forced-enrollment path
+    (a pre-auth token) the pipeline then finishes the sign-in with the new key as its second proof, as the TOTP
+    enrollment does."""
+    from app.core import webauthn_challenges, webauthn_settings
     from app.core.models import WebAuthnCredential
     from app.services import webauthn_service as ws
+    current_user, pending = principal
     _passkey_refuse_temp(current_user)
+    if not _passkeys_enabled(db):
+        raise HTTPException(status_code=409, detail="Passkeys are turned off on this deployment.")
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
@@ -11649,6 +11696,11 @@ async def passkey_register_verify(
         # The same authenticator credential on another account (or retired on this one): one key, one account.
         raise HTTPException(status_code=409, detail={
             "reason": "already_registered", "message": "This passkey is already registered. Use another one."})
+    if key.backup_eligible and webauthn_settings.device_bound_for(user):
+        _passkey_audit(db, user, request, "passkey_registration_failed", {"reason": "synced_not_allowed"}, status="failure")
+        raise HTTPException(status_code=400, detail={
+            "reason": "synced_not_allowed",
+            "message": "Your role needs a passkey bound to one device: this one is synced between devices."})
     now = datetime.utcnow()
     row = WebAuthnCredential(
         id=uuid.uuid4(), user_id=user.id, credential_id=key.credential_id, public_key_cose=key.public_key_cose,
@@ -11668,6 +11720,22 @@ async def passkey_register_verify(
                    "provisional: it signs you in, but does not count for the actions that need your own factor "
                    f"until you confirm it with an older factor or until {row.provisional_until.date().isoformat()}.")
     _passkey_notice(db, user, "A passkey was added to your account", change)
+    # A factor set up again after an administrator's reset: the requirement that asked for it is met.
+    if getattr(user, "second_factor_reset_at", None) is not None:
+        user.second_factor_reset_at = None
+        db.commit()
+    if pending is not None:
+        # Forced enrollment: the pipeline spends the pending login and finishes the sign-in with the new key as
+        # the second proof (or holds it for another step the table asks for).
+        method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
+        outcome = sign_in.finish(db, sign_in.SignInResult(
+            user, sign_in.methods_so_far(pending) + [method], get_client_ip(request), pending=pending,
+            provider_id=sign_in.provider_of(pending), provider_mfa_trusted=sign_in.provider_mfa_of(pending),
+            user_verified=bool(row.uv_initialized)))
+        if isinstance(outcome, sign_in.PendingStep):
+            return JSONResponse(status_code=201, content={"passkey": shown, **outcome.body})
+        return JSONResponse(status_code=201, content={"passkey": shown, "access_token": outcome.access_token,
+                                                      "token_type": "bearer"})
     return shown
 
 
@@ -11676,10 +11744,14 @@ async def list_my_passkeys(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """The caller's own passkeys (never a retired one), oldest first, with the account's limit."""
+    """The caller's own passkeys (never a retired one), oldest first, with the account's limit, whether passkeys are
+    on here, and the role's requirement with its grace (the profile shows the date)."""
+    from app.core import webauthn_settings
     _passkey_refuse_temp(current_user)
     now = datetime.utcnow()
-    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT}
+    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
+            "enabled": _passkeys_enabled(db),
+            "requirement": webauthn_settings.requirement_public(webauthn_settings.requirement(db, current_user))}
 
 
 @app.patch("/users/me/passkeys/{passkey_id}")
@@ -11844,7 +11916,6 @@ async def admin_remove_passkey(
 
 PASSKEY_CHALLENGE_LIMIT = 60            # public challenge requests per address per PASSKEY_CHALLENGE_WINDOW
 PASSKEY_CHALLENGE_WINDOW = 600
-PASSKEY_SIGN_IN_ROLES = (RoleEnum.USER, RoleEnum.EXTERNAL)    # until the passkey settings land (never admin)
 
 
 class PasskeySignInOptionsRequest(BaseModel):
@@ -11857,9 +11928,9 @@ class PasskeySignInVerifyRequest(BaseModel):
 
 
 def _passkey_sign_in_ready(db) -> bool:
-    """Whether this deployment can take a passkey sign-in at all: a usable public address."""
+    """Whether this deployment can take a passkey sign-in at all: passkeys on, and a usable public address."""
     from app.services import webauthn_service as ws
-    return ws.relying_party("") is not None
+    return _passkeys_enabled(db) and ws.relying_party("") is not None
 
 
 def _passkey_limit_challenge(client_ip: str) -> None:
@@ -11897,8 +11968,8 @@ def _passkey_passwordless_allowed(db, user) -> bool:
     """Whether a user-verified passkey may be the whole sign-in for ``user``: a user or external account whose
     role the policy lets in without a password, holding no auditor right in force. Administrators (and so
     every case approver) always add the password; the table in app/services/sign_in.py applies the rest."""
-    from app.core import auditor_rights
-    if getattr(user, "role", None) not in PASSKEY_SIGN_IN_ROLES:
+    from app.core import auditor_rights, webauthn_settings
+    if webauthn_settings.role_name(user) not in webauthn_settings.sign_in_roles():
         return False
     # A holder of the auditor right, in force or suspended, always adds the password; a proposal is not a right.
     grant = auditor_rights.open_grant(db, user.id)
@@ -11967,7 +12038,7 @@ async def passkey_sign_in_options(
     from app.services import webauthn_service as ws
     client_ip = get_client_ip(request)
     _passkey_limit_challenge(client_ip)
-    rp = ws.relying_party("")
+    rp = ws.relying_party("") if _passkeys_enabled(db) else None
     if rp is None:
         raise HTTPException(status_code=409, detail="Passkeys are not available on this deployment.")
     policy = _passkey_policy(db)
@@ -12018,7 +12089,7 @@ async def passkey_sign_in_verify(
         raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
     if challenge is None:
         raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="passkey challenge unknown or expired")
-    rp = ws.relying_party("")
+    rp = ws.relying_party("") if _passkeys_enabled(db) else None
     if rp is None:
         raise HTTPException(status_code=409, detail="Passkeys are not available on this deployment.")
     row = (db.query(WebAuthnCredential).filter(WebAuthnCredential.credential_id == raw_id).first()
@@ -12046,6 +12117,7 @@ async def passkey_sign_in_verify(
                         user_id=ws.user_handle_for(row.user_id), transports=tuple(row.transports or ()))
     allow_ids = [decoded for decoded in (_passkey_b64url_decode(e) for e in challenge.allow_ids) if decoded]
     try:
+        _passkey_algorithm_check(db, user, row)
         assertion = ws.verify_authentication(rp, _passkey_policy(db), challenge=challenge.challenge_bytes,
                                              credential=body.credential, key=known, allow_ids=allow_ids)
     except ws.Refused as refused:
@@ -12103,6 +12175,7 @@ def _passkey_assert(db, user, *, purpose: str, challenge_id, credential, policy)
     row = next((k for k in _passkeys_of(db, user.id) if raw_id and k.credential_id == raw_id), None)
     if row is None:
         raise ws.Refused("credential_not_offered", "not one of the account's keys")
+    _passkey_algorithm_check(db, user, row)
     known = ws.KnownKey(credential_id=row.credential_id, public_key_cose=row.public_key_cose, cose_alg=row.cose_alg,
                         sign_count=int(row.sign_count or 0), backup_eligible=bool(row.backup_eligible),
                         user_id=ws.user_handle_for(row.user_id), transports=tuple(row.transports or ()))
@@ -12178,6 +12251,10 @@ def _passkey_step_up_factor(db, user, request, body) -> str:
         if row.provisional_until and row.provisional_until > now:
             raise _refuse("provisional", "A passkey added soon after an administrator changed your sign-in details "
                                          "cannot prove a compliance step-up until you confirm it.")
+        from app.core import webauthn_settings
+        if webauthn_settings.device_bound_for(user) and row.backup_eligible:
+            raise _refuse("synced_key", "Your role needs a passkey bound to one device for compliance step-ups; a "
+                                        "synced passkey cannot prove this one.")
         if getattr(user, "role", None) != RoleEnum.ADMIN:
             # Anyone but an administrator acts here by the auditor right: only a key the right was approved
             # (or last reconfirmed) with vouches, whichever compliance step the action is.
@@ -28146,6 +28223,9 @@ def _run_lightweight_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS privacy_seen_version INTEGER",
             # The passkeys an auditor grant was approved with (see AuditorGrant in models.py). Nullable.
             "ALTER TABLE auditor_grants ADD COLUMN IF NOT EXISTS approved_credential_ids JSON",
+            # When a role's passkey requirement first applied to the account, and the host operator's clearance.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_required_since TIMESTAMP",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_requirement_cleared_at TIMESTAMP",
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",

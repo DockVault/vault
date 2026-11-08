@@ -239,6 +239,7 @@ def test_the_same_credential_on_another_account_is_refused_at_registration(monke
     from app.core.models import User
     h.db.rows_of(User).append(bob)
     monkeypatch.setitem(h.S.app.dependency_overrides, h.S.get_current_user, lambda: bob)
+    monkeypatch.setitem(h.S.app.dependency_overrides, h.S.get_enrolling_principal, lambda: (bob, None))
     monkeypatch.setitem(h.S.app.dependency_overrides, h.S.require_interactive_admin, lambda: bob)
     status, body = _rcall(h.S, "POST", "/users/me/passkeys/register/options", {"current_password": "pw"})
     assert status == 200
