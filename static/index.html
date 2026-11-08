@@ -1608,6 +1608,11 @@
                         </div>
                         <button id="save-all-settings-btn" class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg> Save All Changes</button>
                     </div>
+                    <!-- Shown when the settings could not be read; Save stays disabled until a load succeeds. -->
+                    <div id="settings-load-error" class="alert alert-error mb-lg flex justify-between items-center" role="alert" hidden>
+                        <span>The settings could not be loaded, so nothing can be saved from this page yet.</span>
+                        <button type="button" id="settings-load-retry" class="btn btn-secondary btn-sm">Retry</button>
+                    </div>
 
                     <!-- Settings Tabs -->
                     <div class="tabs mb-lg">

@@ -7536,13 +7536,17 @@ async function initSettings() {
         delete saveBtn.dataset.settingsReady;
     }
     attachSettingsListeners();
-    try {
-        await loadSettings();
-    } finally {
-        if (saveBtn) {
-            saveBtn.disabled = false;
-            saveBtn.dataset.settingsReady = 'true';
-        }
+    const retry = document.getElementById('settings-load-retry');
+    if (retry && !retry.dataset.wired) { retry.dataset.wired = '1'; retry.addEventListener('click', () => initSettings()); }
+    // Save is enabled only once the settings are on the page. The form holds blanks and defaults until
+    // then, and Save sends every field, so a Save after a failed load would write those blanks over
+    // every setting (the password rule, sharing, the links). A failed load says so and offers Retry.
+    const loaded = await loadSettings();
+    const failed = document.getElementById('settings-load-error');
+    if (failed) failed.hidden = loaded;
+    if (saveBtn && loaded) {
+        saveBtn.disabled = false;
+        saveBtn.dataset.settingsReady = 'true';
     }
     loadLogSettings();  // silent; no-op for non-admins
     
@@ -7597,10 +7601,12 @@ function expandHex(v) {
 // The text input is the source of truth (it can be empty = "use the default");
 // the picker is a convenience. Attached once at Settings init.
 function wireBrandColorInputs() {
+    // Wired once: initSettings() runs on every visit to Settings (see setupUpdateControls).
     Object.keys(BRAND_COLOR_VARS).forEach(textId => {
         const text = document.getElementById(textId);
         const pick = document.getElementById(textId + '-pick');
-        if (!text || !pick) return;
+        if (!text || !pick || text.dataset.wired) return;
+        text.dataset.wired = '1';
         pick.addEventListener('input', () => { text.value = pick.value; });
         text.addEventListener('input', () => {
             const hex = expandHex(text.value);
@@ -7723,20 +7729,25 @@ async function resetBrandAsset(slot) {
 }
 // Attach the logo/favicon Upload + Reset buttons (once, at Settings init).
 function wireBrandAssetUploads() {
+    // Wired once: a second visit to Settings must not make one click send two uploads.
     ['logo', 'favicon'].forEach(slot => {
         const up = document.getElementById(`brand-${slot}-upload`);
         const rs = document.getElementById(`brand-${slot}-reset`);
-        if (up) up.addEventListener('click', () => uploadBrandAsset(slot));
-        if (rs) rs.addEventListener('click', () => resetBrandAsset(slot));
+        if (up && !up.dataset.wired) { up.dataset.wired = '1'; up.addEventListener('click', () => uploadBrandAsset(slot)); }
+        if (rs && !rs.dataset.wired) { rs.dataset.wired = '1'; rs.addEventListener('click', () => resetBrandAsset(slot)); }
     });
 }
 
-// Setup settings tabs
+// Setup settings tabs. Only the Settings page's own tab bar: the vault, notes, shared and upload-link
+// pages have tab bars of their own, and a handler of this page on their buttons would clear this page's
+// open tab. Each button is wired once (initSettings() runs on every visit).
 function setupSettingsTabs() {
-    const tabButtons = document.querySelectorAll('.tabs .tab-btn');
+    const tabButtons = document.querySelectorAll('#settings-section .tabs .tab-btn');
     const tabContents = document.querySelectorAll('.settings-tab-content');
-    
+
     tabButtons.forEach(btn => {
+        if (btn.dataset.wired) return;
+        btn.dataset.wired = '1';
         btn.addEventListener('click', () => {
             // Remove active class from all buttons and contents
             tabButtons.forEach(b => b.classList.remove('active'));
@@ -7766,10 +7777,13 @@ const LOG_COMPONENT_LABELS = {
 };
 
 function setupLogAccess() {
+    // Wired once: a second visit to Settings must not make one toggle send two saves.
     const gen = document.getElementById('log-token-generate-btn');
+    if (!gen || gen.dataset.wired) return;
+    gen.dataset.wired = '1';
     const create = document.getElementById('log-token-create-btn');
     const cancel = document.getElementById('log-token-cancel-btn');
-    if (gen) gen.addEventListener('click', () => toggleLogTokenGenerate(true));
+    gen.addEventListener('click', () => toggleLogTokenGenerate(true));
     if (create) create.addEventListener('click', generateLogToken);
     if (cancel) cancel.addEventListener('click', () => toggleLogTokenGenerate(false));
     const stealth = document.getElementById('log-stealth-toggle');
@@ -8992,10 +9006,12 @@ async function loadSettings() {
         populateAccountsPolicy(settings);
 
         console.log('✓ Settings loaded');
+        return true;
     } catch (error) {
         console.log('Settings endpoint not available');
         // Load default values
         currentSettings = {};
+        return false;
     }
 }
 
