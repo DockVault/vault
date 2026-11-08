@@ -303,6 +303,55 @@ def test_an_administrator_without_the_password_is_asked_for_it_and_then_signed_i
         admin.delete_user(ta["id"])
 
 
+def _store_code(user_id, methods, verifier, **flags):
+    """A one-time sign-in code written to the stack's own code store, as a passkey or provider sign-in will
+    write it, with the tab verifier's hash."""
+    code = ("import json, sys; from app.core import sign_in_codes as c; d = json.loads(sys.argv[1]); "
+            "print(c.store(c.Handover(verifier_hash=c.digest(sys.argv[2]), **d)))")
+    record = {"user_id": user_id, "methods": methods, "client_ip": None, **flags}
+    r = subprocess.run(["docker", "exec", _API_CONTAINER, "python", "-c", code, json.dumps(record), verifier],
+                       capture_output=True, text=True, timeout=90)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip().splitlines()[-1]
+
+
+def test_a_one_time_code_finishes_a_sign_in_once_and_holds_a_half_proof_for_the_password(admin):
+    user = admin.create_user(role="user")
+    try:
+        # A user-verified passkey the policy allows alone: the code becomes the session, once.
+        verifier = uuid.uuid4().hex + uuid.uuid4().hex
+        code = _store_code(user["id"], ["hwk"], verifier, user_verified=True, passwordless_allowed=True)
+        c = ApiClient()
+        r = c.session.post(f"{BASE_URL}/auth/finish", json={"code": code, "verifier": verifier})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert set(body) == LOGIN_KEYS and body["user"]["username"] == user["_username"]
+        claims = _claims(body["access_token"])
+        assert set(claims) == TOKEN_KEYS | {"mfa_at"} and claims["amr"] == ["hwk"]
+        assert c.session.get(f"{BASE_URL}/users/me",
+                             headers={"Authorization": f"Bearer {body['access_token']}"}).status_code == 200
+        assert _login_success_methods(user["id"]) == ["hwk"]
+        assert ApiClient().session.post(f"{BASE_URL}/auth/finish",
+                                        json={"code": code, "verifier": verifier}).status_code == 401
+        # A wrong verifier spends the code.
+        code = _store_code(user["id"], ["hwk"], verifier, user_verified=True, passwordless_allowed=True)
+        assert ApiClient().session.post(f"{BASE_URL}/auth/finish", json={"code": code, "verifier": "x"}).status_code == 401
+        assert ApiClient().session.post(f"{BASE_URL}/auth/finish",
+                                        json={"code": code, "verifier": verifier}).status_code == 401
+        # A passkey without user verification: held for the password, which then finishes it with both proofs.
+        code = _store_code(user["id"], ["hwk"], verifier)
+        r = ApiClient().session.post(f"{BASE_URL}/auth/finish", json={"code": code, "verifier": verifier})
+        assert r.status_code == 200, r.text
+        held = r.json()
+        assert held["access_token"] is None and held["stage"] == "password" and held["username"] == user["_username"]
+        r = ApiClient().session.post(LOGIN, headers={"Authorization": f"Bearer {held['pre_auth_token']}"},
+                                     json={"username": user["_username"], "password": user["_password"]})
+        assert r.status_code == 200, r.text
+        assert _claims(r.json()["access_token"])["amr"] == ["hwk", "pwd"]
+    finally:
+        admin.delete_user(user["id"])
+
+
 def test_a_second_factor_stage_token_at_the_sign_in_form_is_ignored(temp_user):
     """Only a password-stage token means anything at POST /auth/login: a second-factor token sent there leaves
     the form sign-in exactly as it always was, and the pending login it names untouched."""

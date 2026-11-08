@@ -8480,6 +8480,54 @@ async def second_factor_login_cancel(
     return {"cancelled": True}
 
 
+class SignInFinishRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=128)
+    # The web app's per-tab verifier, or the desktop app's PKCE verifier: one of the two.
+    verifier: Optional[str] = Field(default=None, max_length=256)
+    code_verifier: Optional[str] = Field(default=None, max_length=128)
+
+
+@app.post("/auth/finish")
+async def finish_sign_in(
+    body: SignInFinishRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Turn a one-time sign-in code into the sign-in it stands for: the session, or the step that still follows.
+
+    A sign-in that ended on another page (a passkey ceremony, a provider's redirect) comes back to the web app
+    with a code in the URL fragment, never a session in a URL (app/core/sign_in_codes.py). The web app posts the
+    code with the verifier its tab made before the redirect; the desktop app posts it with its PKCE verifier.
+    The code is spent by this call whatever the proof says, so a stolen code gives one guess; a wrong or missing
+    proof, an unknown, spent or expired code, and a code for an account that is gone or inactive all get the
+    same answer. The pipeline then asks its table (a step may still follow: the password for an administrator,
+    the vault's second factor) and answers as POST /auth/login does. Fail-closed rate limit by address; without
+    the code store the exchange is unavailable, never guessed.
+    """
+    from app.core import sign_in_codes
+    from app.core.rate_limiter import rate_limiter as _rl
+    client_ip = get_client_ip(request)
+    allowed, _, reset = _rl.check_rate_limit(identifier=source_of(client_ip), limit=30, window=300,
+                                             prefix="sign_in_finish", fail_open=False)
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
+    try:
+        handover = sign_in_codes.take(body.code, verifier=body.verifier, code_verifier=body.code_verifier)
+    except sign_in_codes.Unavailable:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Sign-in is temporarily unavailable; try again in a moment.")
+    result = sign_in_codes.to_result(db, handover, client_ip=client_ip) if handover is not None else None
+    if result is None:
+        raise HTTPException(status_code=401, detail="This sign-in code is not valid; start again.")
+    outcome = sign_in.finish(db, result)
+    if isinstance(outcome, sign_in.PendingStep):
+        return JSONResponse(status_code=200, content=outcome.body)
+    return LoginResponse(access_token=outcome.access_token, user=UserResponse.model_validate(result.user),
+                         is_temporary=False, is_scoped_temp=False)
+
+
 class SecondFactorChallengeRequest(BaseModel):
     action: str = ""
     method: Optional[str] = None
