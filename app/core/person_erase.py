@@ -808,6 +808,16 @@ def delay_days(view, st) -> int:
     return max(pol.delay_days(honoured), pol.delay_days(view.newest_state()))
 
 
+def listed_delay_days(st=None) -> Optional[int]:
+    """The delay a new request would wait, as the lists show it: from a view read through (ChainState.view_read),
+    else None (not known yet). The default delay is never shown in its place: the chain's may be longer."""
+    st = st or _ai().state()
+    try:
+        return st.trusted(lambda view: delay_days(view, st))
+    except _ai().ViewUnread:
+        return None
+
+
 # --------------------------------------------------------------------------- asking, cancelling, listing
 
 def _pending_names(db, cfg) -> Dict[str, str]:
@@ -923,13 +933,28 @@ def _end_row(db, row, request_id, placeholder, actor, now):
     return audit
 
 
+def trusted_view(st, what: str, refused=None):
+    """This process's view, for a cancel while sealing is stopped, which judges from it without the chain lock: only
+    one read through (ChainState.view_read). Raises ``refused`` (Refused by default) otherwise: whether ``what`` is
+    still waiting cannot be told from a view a check stopped in part way."""
+    if not st.view_read:
+        raise unread_refusal(st, what, refused)
+    return st.view
+
+
+def unread_refusal(st, what: str, refused=None) -> Exception:
+    return (refused or Refused)(f"Whether {what} is still waiting cannot be told just now: {_ai().unread_reason(st)}. "
+                                "Nothing was cancelled; try again later.")
+
+
 def cancel_while_stopped(db, request_id, actor, st=None) -> dict:
     """A cancel while sealing is stopped, in ``db``'s transaction: the erase must be one this process's view holds
     waiting and not begun; its row is ended and its sealed name deleted (so it can never run), and the next pass
     seals the cancel from the database. Raises LookupError and Refused as cancel() does."""
     from app.core.models import EraseRequest
     st = st or _ai().state()
-    view = st.view
+    mark = st.view_mark()
+    view = trusted_view(st, "this erase")
     seq = held_request(view, request_id)
     if seq not in view.pending_requests():
         raise Refused(f"This erase is no longer waiting: it was {ended_as(view, seq)}.")
@@ -937,6 +962,8 @@ def cancel_while_stopped(db, request_id, actor, st=None) -> dict:
         raise Refused("This erase has begun: it completes, and cannot be cancelled now.")
     row = db.get(EraseRequest, fmt.as_uuid(request_id))
     _end_row(db, row, request_id, view.requests[seq].get("placeholder"), actor, st.clock())
+    if not st.still_read(mark):
+        raise unread_refusal(st, "this erase")
     return entry_of(row, view) if row is not None else {"id": str(request_id), "status": CANCELLED}
 
 
@@ -1019,11 +1046,21 @@ def listing(db, st=None) -> list:
     from app.core.models import EraseRequest
     st = st or _ai().state()
     rows = db.query(EraseRequest).order_by(EraseRequest.requested_at.desc()).limit(200).all()
-    out = [entry_of(r, st.view) for r in rows]
-    if not st.view_read:
-        for entry in out:
-            if entry["status"] == "not recorded":
-                entry["status"] = UNREAD
+    return _listed(rows, st, entry_of)
+
+
+def _listed(rows, st, entry) -> list:
+    """``entry(row, view)`` of each row, from a view read through; while it is not, from no view at all (what the
+    database's row says, and the status UNREAD): a view a check stopped in part way holds seals the head record's
+    link has not verified, and a request it does not name may be one the chain holds."""
+    ai = _ai()
+    try:
+        return st.trusted(lambda view: [entry(r, view) for r in rows])
+    except ai.ViewUnread:
+        pass
+    out = [entry(r, ai.View()) for r in rows]
+    for e in out:
+        e["status"] = UNREAD
     return out
 
 

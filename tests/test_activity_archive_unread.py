@@ -8,7 +8,8 @@ database with a chain of its own (tests/_audit_chain_env.py):
   could reach an archived day is refused with a message that says why, and every read that cannot is answered from
   rows: a range younger than the shortest row window, a read of rows that are all rows; the readers of rows only
   send the unread header instead; a block in the table after a range's start makes the range one that could reach;
-- a check that stops while the view holds seals up to the head record it has not verified leaves the view unread;
+- a check that stops while the view holds seals up to the head record it has not verified leaves the view unread,
+  and starts it again (it keeps none of them);
 - a break of the key sequence among the seals up to the head record stops every check that comes after the one that
   found it, the pruner's pass too, which reports it, whoever's check found it first (the start's read, a reader's);
 - a stop a reader's read met is forgotten once a check reads the view through;
@@ -245,8 +246,9 @@ def test_a_check_that_stops_before_the_record_s_link_leaves_the_view_unread(env)
     _tamper_one_seal(env)
     st = env.fresh_process()
     assert ai.read_view(env.engine, st) is False
-    # It accepted the seals before the record's own, and stopped there: none of them is trusted.
-    assert st.view.position == rec_seq - 1 and st.read_stopped == "head-record-mismatch"
+    # It accepted the seals before the record's own, and stopped there: none of them is trusted, or kept (the next
+    # check reads them again from the first seal).
+    assert st.view.position == 0 and rec_seq > 1 and st.read_stopped == "head-record-mismatch"
     assert st.view_read is False
     with env.session() as db:
         with pytest.raises(archive.Unread) as refused:
@@ -282,7 +284,7 @@ def test_a_view_read_before_is_unread_again_when_a_later_check_stops_on_the_seal
         with ai.ChainWriter(env.engine, first, check_key=False):
             pass
     assert stop.value.kind == "head-record-mismatch"
-    assert first.view_read is False and first.view.position == after - 1
+    assert first.view_read is False and first.view.position == 0 and after > before
 
 
 def test_a_check_that_stops_before_it_accepts_a_seal_leaves_a_read_view_as_it_was(env):
@@ -472,9 +474,10 @@ def test_the_status_takes_the_seals_warnings_from_the_record_while_the_view_is_n
     assert env.seal().late == 1
     late = env.st.view.late_seqs[-1]
     assert late == len(env.seals())                       # the newest seal
-    _tamper_one_seal(env, 1)
+    # A view that holds the seals before the record's, not read through (a break of the key sequence among them).
+    _break_key_sequence(env)
     st = env.fresh_process()
-    assert ai.read_view(env.engine, st) is False and st.view.position == late - 1
+    assert ai.read_view(env.engine, st) is False and st.view.position == late - 1 and st.view.late_seqs == []
     assert ai.status(st)["warnings"]["late"]["seqs"] == [late]
 
 
@@ -484,7 +487,7 @@ def test_the_storage_card_counts_nothing_from_a_view_that_is_not_read(env, monke
     _archived(env)
     monkeypatch.setattr(ar, "current", lambda: ar.Numbers(0, 0, 0, 100))
     assert retention_storage.cap_counted(env.clock(), env.st)["counted_bytes"] is not None
-    _tamper_one_seal(env)
+    _break_key_sequence(env)
     st = env.fresh_process()
     assert ai.read_view(env.engine, st) is False and st.view.position > 0
     assert retention_storage.cap_counted(env.clock(), st)["counted_bytes"] is None
@@ -680,6 +683,7 @@ def test_the_previews_answer_503_while_the_chain_cannot_be_read(unread):
 
 
 def test_the_routes_that_read_the_view_read_the_chain_first():
+    import inspect
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "app" / "api"
 
@@ -691,13 +695,17 @@ def test_the_routes_that_read_the_view_read_the_chain_first():
             ("managed_settings_router.py", "def get_managed_settings(", "audit_integrity.read_view(db.get_bind())"),
             ("managed_settings_router.py", "def managed_storage(", "audit_integrity.read_view(db.get_bind())"),
             ("managed_settings_router.py", "def preview_audit_retention(",
-             'require_chain_read(db, "What the audit job would delete")'),
+             'answer_from_view(db, "What the audit job would delete"'),
             ("person_erase_router.py", "def list_erase_requests(", "audit_integrity.read_view(db.get_bind())"),
-            ("person_erase_router.py", "def preview_erase(", "require_chain_read(db, "),
+            ("person_erase_router.py", "def preview_erase(", "answer_from_view(db, "),
             ("value_removal_router.py", "def list_removals(", "audit_integrity.read_view(db.get_bind())"),
-            ("value_removal_router.py", "def preview_removal(", "require_chain_read(db, ")):
+            ("value_removal_router.py", "def preview_removal(", "answer_from_view(db, ")):
         b = body(path, head)
         assert b.count(call) == 1, (path, head)
+    # The previews read the chain first, and answer only from a view that stayed read through while they counted.
+    from app.api import audit_integrity_router as r
+    helper = inspect.getsource(r.answer_from_view)
+    assert helper.index("require_chain_read(db, what)") < helper.index("st.trusted(lambda _view: answer())")
 
 
 def test_a_request_the_view_does_not_hold_is_not_known_until_the_chain_is_read(env):

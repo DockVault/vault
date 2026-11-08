@@ -123,10 +123,16 @@ def test_the_days_an_address_stays_in_full_are_the_chains_never_the_databases_al
     monkeypatch.setattr(settings_registry, "describe", from_the_database)
     monkeypatch.setattr(ai, "state", lambda: ai.ChainState())
     assert routes.describe(db)["ip_full_days"] is None
-    monkeypatch.setattr(managed, "chain_read", lambda st=None: True)
+    read = ai.ChainState()
+    read.view_read = True                         # the chain read through, a policy seal in the view
+    read.view.newest_policy = lambda: (2, {})
+    monkeypatch.setattr(ai, "state", lambda: read)
     monkeypatch.setattr(chain_seals, "honoured_entries", lambda st=None: {
         FULL_DAYS_KEY: {"value": 30, "source": "setting", "setting": 30}})
     assert routes.describe(db)["ip_full_days"] == 30
+    read.view_read = False                        # a check began to accept seals the record has not verified
+    assert routes.describe(db)["ip_full_days"] is None
+    assert managed.chain_read(read) is False
 
 
 # --------------------------------------------------------------------------- the routes

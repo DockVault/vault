@@ -247,6 +247,33 @@ def test_before_the_chain_is_read_the_list_says_so(page: Page, admin_creds):
     expect(box).not_to_contain_text("No change is waiting.")
 
 
+def test_while_the_chain_does_not_check_out_the_list_says_why(page: Page, admin_creds):
+    def edit(data):
+        data["pending"] = []
+        data["pending_chain"] = {"read": False, "stopped": "key-sequence"}
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _serve_managed(page, edit)
+    _open(page)
+    box = page.locator("#retention-pending")
+    expect(box).to_contain_text("which does not check out just now (key-sequence)", timeout=10000)
+    expect(box).not_to_contain_text("No change is waiting.")
+    expect(box).not_to_contain_text("which this server has not read yet")
+
+
+def test_before_the_chain_is_read_the_warnings_to_acknowledge_are_not_known(page: Page, admin_creds):
+    def handle(route):
+        response = route.fetch()
+        data = response.json()
+        data.update(warnings=[], read=False)
+        route.fulfill(response=response, body=json.dumps(data))
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.route(re.compile(r"/settings/audit-integrity/warnings$"), handle)
+    _open(page)
+    box = page.locator("#integrity-warnings-list")
+    expect(box).to_contain_text("Which seals wait to be acknowledged is not known yet", timeout=10000)
+    expect(box).not_to_contain_text("Nothing waits to be acknowledged.")
+
+
 def test_before_the_chain_is_read_a_setting_it_holds_shows_no_value_and_no_field(page: Page, admin_creds):
     """A row the server says is not read yet (the chain holds its value, and the web process has not read the chain
     in the first minutes after a start) shows neither a value, the database's served beside it least of all, nor a

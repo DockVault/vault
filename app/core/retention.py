@@ -120,17 +120,26 @@ def chain_holds(session_factory: Optional[Callable] = None) -> bool:
     the chain counts at once, whatever the database says), a restore of a whole backup not finished, or the
     grace after a restore. Read together with hold_in_force(): the pruner takes the more conservative, so
     neither the database nor the chain alone can let records go. Holds when it cannot tell: a chain in the
-    database this process has not read (sealing stopped before it could) holds too; only a chain not started
-    yet holds nothing."""
+    database this process has not read through (ChainState.view_read: sealing stopped before it could, the
+    pass found the chain busy, or a check began to accept seals the head record's link has not verified while the
+    hold was read) holds too; only a chain not started yet holds nothing."""
     try:
         from app.core import audit_chain_honour as honour
         from app.core import audit_integrity
         st = audit_integrity.state()
         if st.holds_deletion():
             return True
-        if st.view.newest_policy() is None:
+
+        def honoured(view):
+            if view.newest_policy() is None:
+                return None
+            return honour.honoured_state(view, st.known_record(), st.clock())
+        try:
+            state = st.trusted(honoured)
+        except audit_integrity.ViewUnread:
+            state = None
+        if state is None:
             return _chain_in_database(session_factory)
-        state = honour.honoured_state(st.view, st.known_record(), st.clock())
         return bool((state.get(HOLD_KEY) or {}).get("value"))
     except Exception as exc:  # noqa: BLE001 -- keeping records is the safe side
         _say(f"Warning: the audit chain's hold could not be read ({type(exc).__name__}); the jobs over logs wait")
@@ -364,7 +373,7 @@ def apply_waiting_changes(p: Pass) -> JobResult:
     from app.core import audit_chain_policy_seals as ps
     from app.core import audit_integrity
     st = audit_integrity.state()
-    if st.stopped is not None or st.view.newest_policy() is None:
+    if st.stopped is not None or not st.view_read or st.view.newest_policy() is None:
         _say("Waiting settings changes wait for the audit chain")
         return JobResult()
     engine = audit_integrity._engine_of(p.session_factory)

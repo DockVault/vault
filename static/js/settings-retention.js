@@ -270,7 +270,11 @@
         box.replaceChildren();
         const pending = S.data.pending || [];
         const chain = S.data.pending_chain || {};
-        if (chain.read === false) {
+        if (chain.read === false && chain.stopped) {
+            box.appendChild(el('p', 'text-secondary retention-pending-chain',
+                'The changes waiting are read from the audit log\'s integrity chain, which does not check out just ' +
+                `now (${chain.stopped}): they are not known until it does, and no change applies meanwhile.`));
+        } else if (chain.read === false) {
             box.appendChild(el('p', 'text-secondary retention-pending-chain',
                 'The changes waiting are read from the audit log\'s integrity chain, which this server has not ' +
                 'read yet; no change applies until it has.'));

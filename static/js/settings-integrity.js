@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const S = { warnings: [], chosen: new Set(), busy: false };
+    const S = { warnings: [], read: true, chosen: new Set(), busy: false };
 
     function el(tag, cls, text) {
         const node = document.createElement(tag);
@@ -57,7 +57,12 @@
         const button = byId('integrity-warnings-ack');
         if (!box || !button) return;
         box.replaceChildren();
-        if (!S.warnings.length) {
+        if (!S.read) {
+            // The server lists them from its view of the chain only once it has read it through.
+            box.appendChild(el('p', 'text-secondary integrity-warnings-unread', 'Which seals wait to be acknowledged '
+                + "is not known yet: this server has not read the audit log's integrity chain through. The integrity "
+                + 'status on the Activity page says why.'));
+        } else if (!S.warnings.length) {
             box.appendChild(el('p', 'text-secondary', 'Nothing waits to be acknowledged.'));
         }
         S.warnings.forEach((w) => {
@@ -112,6 +117,7 @@
         try {
             const out = await apiRequest('/settings/audit-integrity/warnings', { silent: true });
             S.warnings = out.warnings || [];
+            S.read = out.read !== false;
             S.chosen = new Set([...S.chosen].filter((s) => S.warnings.some((w) => w.seq === s)));
             render();
             renderArchive(out.archive);

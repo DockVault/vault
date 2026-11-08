@@ -709,7 +709,7 @@ def archive_job(p):
     result = retention.JobResult()
     with p.transaction() as db:
         _daily_marker(db, p.now)
-    if st.stopped is not None or st.view.newest_policy() is None:
+    if st.stopped is not None or not st.view_read or st.view.newest_policy() is None:
         return result
     with p.transaction() as db:
         begins = starts_at(st.view, p.now, db)
@@ -1532,15 +1532,16 @@ def summary(st=None) -> dict:
     the view holds is then not known, and is None rather than read from an empty or partial view."""
     ai = _ai()
     st = st or ai.state()
-    view = st.view
-    if not st.view_read:
+
+    def read(view):
+        return (first_start(view), sorted(d for d, e in view.archives.items() if e.parts),
+                [p for _d, p in view.archived_parts()], _starts_on(view, st.clock()))
+    try:
+        first, days, parts, begins = st.trusted(read)
+    except ai.ViewUnread:
         return {"read": False, "hot_days": hot_days(), "start_after_days": start_after_days(), "first_start": None,
                 "starts_on": None, "days": None, "oldest_day": None, "newest_day": None, "blocks": None,
                 "bytes": None, "rows": None}
-    first = first_start(view)
-    days = sorted(d for d, e in view.archives.items() if e.parts)
-    parts = [p for _d, p in view.archived_parts()]
-    begins = _starts_on(view, st.clock())
     return {"read": True, "hot_days": hot_days(), "start_after_days": start_after_days(),
             "first_start": fmt.time_text(first) if first is not None else None,
             "starts_on": fmt.time_text(begins) if begins is not None else None,

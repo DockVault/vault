@@ -829,7 +829,7 @@ def shorten_job(p):
     ap = _ap()
     result = retention.JobResult()
     st = ai.state()
-    if st.stopped is not None or not st.view.position or st.view.newest_policy() is None:
+    if st.stopped is not None or not st.view_read or not st.view.position or st.view.newest_policy() is None:
         return result
     days = full_days(st)
     if days is None:

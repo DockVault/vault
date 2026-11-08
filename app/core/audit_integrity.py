@@ -152,6 +152,11 @@ class NotUnderKeyInForce(Exception):
     key sequence for good: refused, and the writer's transaction rolled back with nothing written."""
 
 
+class ViewUnread(Exception):
+    """This process's view is not read through (ChainState.view_read), or a check cleared it while a reader read it:
+    nothing the reader computed from it is trusted (ChainState.trusted)."""
+
+
 # --------------------------------------------------------------------------- seals
 
 @dataclass
@@ -320,13 +325,19 @@ class ChainState:
         # archive seq when read, the rows of the name, the newest of them, the newest protected one). A day whose
         # archive seal changes is read again (app/core/audit_chain_erase.py).
         self.erase_scans: Dict[tuple, Any] = {}
-        # Whether the view holds the database's chain read through by a check (ChainWriter.check): set once a check
-        # has read every seal (or found no chain at all); cleared when a check starts the view again (a new
-        # generation), and when one stops while the view holds seals up to the head record that it accepted before
-        # it reached the record's link, or that break the key sequence. Until then the view is empty, or partial,
-        # or not verified, and what it lacks (an archived day) would read as if it did not exist: the readers of the
-        # view read the chain first (read_view), and say so when they cannot.
-        self.view_read = False
+        # Whether the view holds the database's chain read through by a check (ChainWriter.check), the property
+        # view_read: set once a check has read every seal (or found no chain at all); cleared when a check starts
+        # the view again (a new generation), and before a check accepts any seal below the head record's, which the
+        # record's link has not verified yet; set again only when a check reads the view through (a check that ends
+        # before that link has verified the seals it accepted starts the view again: between checks the view holds
+        # no seal that link has not verified). Until then the view is empty, or partial, or not verified, and what
+        # it lacks (an archived day) would read as if it did not exist: the readers of the view read the chain first
+        # (read_view), and say so when they cannot.
+        self._view_read = False
+        # Moved on each time view_read is cleared: a reader outside the chain lock takes it with the flag before it
+        # reads the view and compares it after (view_mark, still_read), so a check that began to accept seals the
+        # record's link has not verified while it read makes it refuse rather than answer from them.
+        self.view_epoch = 0
         # The kind of stop the last read for a reader met (read_view), or None; cleared when a check reads the view
         # through.
         self.read_stopped: Optional[str] = None
@@ -335,6 +346,44 @@ class ChainState:
         # the view's position, past them: it raises this again instead, so that every check meets this stop, as it
         # meets every other, until a check starts the view again (a new generation).
         self.view_stop: Optional[ChainStopped] = None
+
+    @property
+    def view_read(self) -> bool:
+        return self._view_read
+
+    @view_read.setter
+    def view_read(self, value: bool) -> None:
+        if not value:
+            self.view_epoch += 1
+        self._view_read = bool(value)
+
+    def view_mark(self) -> Optional[int]:
+        """What a reader outside the chain lock takes before it reads the view: None while the view is not read
+        through (view_read), else the mark still_read() compares once it has read."""
+        epoch = self.view_epoch
+        return epoch if self._view_read else None
+
+    def still_read(self, mark: Optional[int]) -> bool:
+        """Whether the view has stayed read through since view_mark() gave ``mark``: no check cleared it meanwhile
+        (one that began to accept seals the head record's link has not verified, or started the view again)."""
+        return mark is not None and self._view_read and self.view_epoch == mark
+
+    def trusted(self, read: Callable[[View], Any]) -> Any:
+        """``read(view)``, from this process's view while it is read through and stays so while it is read. Raises
+        ViewUnread otherwise, whatever ``read`` returned or raised: what a reader computes from a view that is not
+        read through is never trusted."""
+        mark = self.view_mark()
+        if mark is None:
+            raise ViewUnread()
+        try:
+            out = read(self.view)
+        except Exception:
+            if self.still_read(mark):
+                raise
+            raise ViewUnread()
+        if not self.still_read(mark):
+            raise ViewUnread()
+        return out
 
     def cfg(self):
         return self.settings or _settings()
@@ -362,8 +411,13 @@ class ChainState:
         """The key the chain is under (``key_id``, when the caller read it from the seals) when this process does
         not hold it, or None: after a restore of a backup taken during an unfinished change of AUDIT_CHAIN_KEY, the
         restored chain is under the old key and .env holds the new one. Read from the view once this process has
-        read the chain, else from the head record."""
-        kid = key_id or self.view.key_in_force()
+        read the chain through, else from the head record."""
+        kid = key_id
+        if not kid:
+            try:
+                kid = self.trusted(lambda view: view.key_in_force())
+            except ViewUnread:
+                kid = None
         try:
             if not kid:
                 record = self.head_store().memory
@@ -720,8 +774,8 @@ class ChainWriter:
             raise ChainStopped(stop.kind, str(stop), stop.seq)
         held = st.keys_held()
         early: Optional[ChainStopped] = None
-        # Whether the view holds seals up to the record that this check accepted and that the record's link has
-        # not yet been found to hold without a break of the key sequence.
+        # Whether the view holds seals below the record's that this check accepted and that the record's link has
+        # not verified yet.
         unverified = False
         try:
             for seal in read_seals(db, view.position):
@@ -739,15 +793,20 @@ class ChainWriter:
                         if link != rec_link:
                             raise ChainStopped("head-record-mismatch",
                                                f"seal {rec_seq} is not the one the head record holds")
+                        # The record's link verifies every seal the view holds up to it.
+                        unverified = False
                         if early is not None:
                             # The view keeps the seals before the record's, the break among them: every later
                             # check meets this stop again (view_stop), and the view is not read through when this
-                            # check accepted any of them (``unverified``).
+                            # check accepted any of them (it was cleared before the first).
                             st.view_stop = early
                             raise early
-                        unverified = False
+                    else:
+                        # A seal the record's link has not verified yet goes into the view: from now on no reader
+                        # trusts the view, until a check has read it through.
+                        st.view_read = False
+                        unverified = True
                     view.accept(seal, link)
-                    unverified = seal.seq < rec_seq
                     continue
                 self._accept_after_record(seal, link, held)
                 if seal.kind in ROOT_KINDS:
@@ -756,7 +815,11 @@ class ChainWriter:
                 view.accept(seal, link)
         except BaseException:
             if unverified:
-                st.view_read = False
+                # The check ends with seals in the view that the record's link has not verified (whatever ended it:
+                # a seal not the record's at the record's place, a database error while the seals were read): the
+                # view starts again, so that the next check reads them again from the first seal and meets what
+                # this one met, or a break of the key sequence among them, itself, rather than read on past them.
+                view.reset(view.generation, view.discards)
             raise
         view.record_seq = rec_seq
         st.view_read = True
@@ -1959,21 +2022,27 @@ def before_first_words(n: int, first: datetime) -> str:
 
 
 def every_pass_checks(session_factory, st: ChainState, now: datetime) -> Dict[str, str]:
-    """future-dated rows, rows before the chain's first hour, undated rows, and hooks on the audit tables."""
+    """future-dated rows, rows before the chain's first hour, undated rows, and hooks on the audit tables. The two
+    that compare with the genesis seal run only from a view read through (a pass that could not read the chain, busy
+    or stopped before the record's link, leaves them to the next)."""
     from app.core.models import AuditLog as A
     found: Dict[str, str] = {}
+    try:
+        first, undated_at_genesis = st.trusted(
+            lambda v: (v.first_hour(), int((v.genesis or {}).get("undated_rows") or 0)))
+    except ViewUnread:
+        first, undated_at_genesis = None, 0
     db = session_factory()
     try:
         future = db.query(func.count()).select_from(A).filter(A.timestamp > now + FUTURE_SLACK).scalar() or 0
         if future:
             found["future-dated"] = f"{future} audit rows are dated more than an hour ahead"
-        first = st.view.first_hour()
         if first is not None:
             before = db.query(func.count()).select_from(A).filter(A.timestamp < first).scalar() or 0
             if before:
                 found["row-before-genesis"] = before_first_words(int(before), first)
             undated = db.query(func.count()).select_from(A).filter(A.timestamp.is_(None)).scalar() or 0
-            if undated != int((st.view.genesis or {}).get("undated_rows") or 0):
+            if undated != undated_at_genesis:
                 found["undated-row"] = f"{undated} audit rows have no timestamp"
         from app.core import audit_chain_verify
         hooks = audit_chain_verify.db_hooks(db)
@@ -2015,8 +2084,12 @@ def status(st: Optional[ChainState] = None) -> dict:
                                                                    "head record wait for the host"})
         # This process reads the chain as it starts (read_at_start), and again at every pass; until it has read
         # it through, the warnings from the seals are the ones the last writer recorded.
-        seqs = view_warning_seqs(view, record) if st.view_read and view.position else \
-            (record.get("view_warnings") or {})
+        try:
+            seqs = st.trusted(lambda v: view_warning_seqs(v, record) if v.position else None)
+        except ViewUnread:
+            seqs = None
+        if seqs is None:
+            seqs = record.get("view_warnings") or {}
         late = list(seqs.get("late") or [])
         if late:
             out["warnings"]["late"] = {"message": f"{len(late)} late seals wait to be acknowledged",

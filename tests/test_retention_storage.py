@@ -269,8 +269,12 @@ def test_a_volume_that_cannot_be_read_is_unknown(tmp_path):
 
 
 def test_an_install_with_rows_from_before_this_release_is_told_what_changed(env):
+    from app.core import audit_integrity as ai
     with env.session() as db:
-        assert rs.existing_install(db, env.st) is False          # nothing sealed yet
+        assert rs.existing_install(db, env.st) is None           # the chain not read yet: not known
+    assert ai.read_view(env.engine, env.st) is True              # no chain yet: read through, nothing sealed
+    with env.session() as db:
+        assert rs.existing_install(db, env.st) is False
     _rows(env, OLD, 2)
     env.run_until_sealed()
     with env.session() as db:

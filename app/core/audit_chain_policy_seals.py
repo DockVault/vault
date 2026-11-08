@@ -178,15 +178,21 @@ def honoured_state(view, record: Optional[dict], now: Optional[datetime] = None)
 
 def numbers(st=None) -> Optional[dict]:
     """The values the audit pruner acts on, from the honoured state, or None when the chain cannot give them
-    (no chain yet, or sealing stopped): then nothing is deleted."""
+    (no chain yet, sealing stopped, or a view not read through, ChainState.view_read): then nothing is deleted."""
     ai = _ai()
     st = st or ai.state()
-    if st.stopped is not None or st.view.newest_policy() is None:
+    if st.stopped is not None:
         return None
     record = st.known_record()
-    state = honoured_state(st.view, record, st.clock())
-    out = {name: entry.get("value") for name, entry in state.items()}
-    return out
+
+    def values(view):
+        if view.newest_policy() is None:
+            return None
+        return {name: entry.get("value") for name, entry in honoured_state(view, record, st.clock()).items()}
+    try:
+        return st.trusted(values)
+    except ai.ViewUnread:
+        return None
 
 
 # --------------------------------------------------------------------------- an administrator's change
@@ -392,10 +398,12 @@ def cancel_while_stopped(db, change_id, actor, st=None) -> dict:
     A change whose row the database no longer shows waiting already does not apply: SettingRefused, saying so.
     Returns the change as the chain holds it, ended."""
     from app.core import audit_chain_pending as pending
+    from app.core import person_erase as pe
     from app.core import setting_changes
     from app.core.models import ManagedSettingChange as Change
     st = st or _ai().state()
-    view = st.view
+    mark = st.view_mark()
+    view = pe.trusted_view(st, "this change", registry.SettingRefused)
     req = held_request(view, change_id)
     refuse_unless_waiting(view, req)
     entry = pending.entry(db, view, st.known_record(), req, st.clock())
@@ -406,6 +414,8 @@ def cancel_while_stopped(db, change_id, actor, st=None) -> dict:
                                       "once sealing runs again.")
     now = st.clock()
     setting_changes.cancel(db, change_id, actor=actor, now=now)
+    if not st.still_read(mark):
+        raise pe.unread_refusal(st, "this change", registry.SettingRefused)
     return dict(entry, status=setting_changes.CANCELLED, decided_by=actor.username, decided_at=now.isoformat() + "Z",
                 reason="cancelled")
 
@@ -427,11 +437,16 @@ def judge_now(key: str, st=None) -> Optional[Judge]:
 
 def refuses_while_stopped(db, key: str, requested, st=None) -> bool:
     """Whether a change must be refused because sealing is stopped: one that deletes sooner than what the chain
-    last gave (the database's value before the chain's first policy seal)."""
+    last gave (the database's value before the chain's first policy seal). A setting the chain records is refused
+    whatever the change while this process has not read the chain through (ChainState.view_read): what the chain
+    last gave is then not known."""
     from app.core import setting_changes
     spec = registry.spec_for(key)
     if spec is None:
         return False
+    st = st or _ai().state()
+    if key in pol.chain_setting_keys() and not st.view_read:
+        return True
     j = judge_now(key, st)
     if j is not None:
         return j.deletes_sooner(requested)

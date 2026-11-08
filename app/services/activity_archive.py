@@ -119,11 +119,15 @@ def unread_message(st=None) -> str:
 def archives(st=None) -> dict:
     """{day: ArchiveEntry} of the chain's verified view, copied in one step (a dict copy, which the process's
     sealer cannot change midway: its entries are replaced, never changed). Raises Unread while the view is not read
-    through (audit_integrity.ChainState.view_read): an empty or partial one would leave out days that are archived."""
-    st = st or _ai().state()
-    if not st.view_read:
+    through (audit_integrity.ChainState.view_read), and when a check cleared it while the copy was made (it had
+    begun to accept seals the head record's link has not verified, ChainState.trusted): an empty or partial view
+    would leave out days that are archived, and an unverified one name days that are not."""
+    ai = _ai()
+    st = st or ai.state()
+    try:
+        return st.trusted(lambda view: dict(view.archives))
+    except ai.ViewUnread:
         raise Unread(unread_message(st))
-    return dict(st.view.archives)
 
 
 def read_archives(db=None, st=None) -> dict:

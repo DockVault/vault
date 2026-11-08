@@ -90,15 +90,16 @@ def get_managed_settings(current_user: User = Depends(require_interactive_admin)
     """Every managed setting, from this process's copy, the changes waiting as the audit log's integrity chain
     holds them (app/core/audit_chain_pending.py: the database's rows neither add to that list nor hide an entry),
     and when the audit archive starts and what it holds. The chain is read first when this process has not read it
-    through (audit_integrity.read_view): until it has read any of it, the rows and the list say so (``chain_read``,
-    ``pending_chain.read``), and the archive until it has read it through (``archive.read``)."""
+    through (audit_integrity.read_view): until it has, the rows, the list and the archive say so (``chain_read``,
+    ``pending_chain.read``, ``archive.read``), and ``pending_chain.stopped`` says why when the chain does not check
+    out."""
     limit_statements(db)
     audit_integrity.read_view(db.get_bind())
     from app.core import audit_archive, audit_chain_pending
+    pending, pending_chain = audit_chain_pending.listed(db)
     return {"settings": with_chain(registry.describe()), "locked": sorted(registry.locked_tokens()),
             "reduction_delay_days": registry.resolve(setting_changes.DELAY_KEY),
-            "pending": audit_chain_pending.entries(db), "pending_chain": audit_chain_pending.chain_state(),
-            "archive": audit_archive.summary()}
+            "pending": pending, "pending_chain": pending_chain, "archive": audit_archive.summary()}
 
 
 def spec_or_404(key: str) -> registry.SettingSpec:
@@ -118,11 +119,24 @@ SOURCE_UNREAD = "unread"
 
 
 def chain_read(st=None) -> bool:
-    """Whether this process has read the audit chain's retention state (it reads the chain as it starts,
-    audit_integrity.read_at_start, and again at each pass and before each change; this page reads it too when it has
-    not)."""
+    """Whether this process has read the audit chain's retention state through (audit_integrity.ChainState.view_read:
+    it reads the chain as it starts, audit_integrity.read_at_start, and again at each pass and before each change;
+    this page reads it too when it has not), and the chain holds a policy seal. A view a check stopped in part way
+    holds seals the head record's link has not verified: nothing of it is shown as in force."""
     st = st or audit_integrity.state()
-    return bool(st.view.position) and st.view.newest_policy() is not None
+    try:
+        return st.trusted(lambda view: view.newest_policy() is not None)
+    except audit_integrity.ViewUnread:
+        return False
+
+
+def _honoured_entries(st) -> Optional[dict]:
+    """The honoured state's entries, read from a view read through, or None (not read through, or no policy seal)."""
+    try:
+        return st.trusted(lambda view: chain_seals.honoured_entries(st) if view.newest_policy() is not None
+                          else None)
+    except audit_integrity.ViewUnread:
+        return None
 
 
 def with_chain(rows: list) -> list:
@@ -135,7 +149,8 @@ def with_chain(rows: list) -> list:
     says ``chain_read`` false, with no value and the source ``unread``, the database's value apart as ever (a
     setting the deployment locks keeps its value, which only .env gives). Nothing acts on a value meanwhile: the
     pruner and a change both read the chain first."""
-    if not chain_read():
+    entries = _honoured_entries(audit_integrity.state())
+    if entries is None:
         keys = set(chain_policy.chain_setting_keys())
         for row in rows:
             if row["key"] not in keys or row.get("source") == registry.SOURCE_LOCKED:
@@ -143,7 +158,6 @@ def with_chain(rows: list) -> list:
             row["database_stored"] = row.get("stored")
             row.update(value=None, source=SOURCE_UNREAD, stored=None, clamped=False, chain=None, chain_read=False)
         return rows
-    entries = chain_seals.honoured_entries()
     for row in rows:
         entry = entries.get(row["key"])
         if entry is None:
@@ -308,9 +322,9 @@ def preview_audit_retention(max_days: Optional[int] = None, min_days: Optional[i
         asked[key] = value
     numbers = ar.Numbers(asked.get(ar.MAX_DAYS, numbers.max_days), asked.get(ar.MIN_DAYS, numbers.min_days),
                          asked.get(ar.ADMIN_MIN_DAYS, numbers.admin_min_days), asked.get(ar.MAX_MB, numbers.max_mb))
-    from app.api.audit_integrity_router import require_chain_read
-    require_chain_read(db, "What the audit job would delete")
-    out = ar.preview(db, setting_changes.utcnow(), numbers, bytes_now=bytes_now)
+    from app.api.audit_integrity_router import answer_from_view
+    out = answer_from_view(db, "What the audit job would delete",
+                           lambda: ar.preview(db, setting_changes.utcnow(), numbers, bytes_now=bytes_now))
     out["numbers"] = {ar.MAX_DAYS: numbers.max_days, ar.MIN_DAYS: numbers.min_days,
                       ar.ADMIN_MIN_DAYS: numbers.admin_min_days, ar.MAX_MB: numbers.max_mb}
     return out

@@ -95,14 +95,24 @@ def cap_counted(now: datetime, st=None, db=None) -> Optional[dict]:
         return None
     cap = numbers.max_mb * ar.MB
     st = st or ai.state()
-    if not st.view_read or not st.view.position:
-        return {"cap_bytes": cap, "counted_bytes": None, "now_bytes": None, "fraction": None, "warn": False,
-                "over_from": None}
+    unknown = {"cap_bytes": cap, "counted_bytes": None, "now_bytes": None, "fraction": None, "warn": False,
+               "over_from": None}
     record = st.known_record()
-    counted = chain_size.cap_count(st.view, record, now, ar._delay())[4]
-    now_bytes = max(counted, chain_size.now_count(st.view, record, now)
-                    + (unsealed_bytes(db, st.view) if db is not None else 0))
-    over = chain_size.first_over(st.view, record, now, ar._delay(), cap) if now_bytes > cap else None
+
+    def counts(view):
+        if not view.position:
+            return None
+        counted_ = chain_size.cap_count(view, record, now, ar._delay())[4]
+        now_ = max(counted_, chain_size.now_count(view, record, now)
+                   + (unsealed_bytes(db, view) if db is not None else 0))
+        return counted_, now_, chain_size.first_over(view, record, now, ar._delay(), cap) if now_ > cap else None
+    try:
+        found = st.trusted(counts)
+    except ai.ViewUnread:
+        found = None
+    if found is None:
+        return unknown
+    counted, now_bytes, over = found
     fraction = now_bytes / cap
     return {"cap_bytes": cap, "counted_bytes": counted, "now_bytes": now_bytes, "fraction": round(fraction, 4),
             "warn": fraction >= WARN_AT, "over_from": over.isoformat() + "Z" if over is not None else None}
@@ -117,15 +127,22 @@ def volume(path: str) -> Optional[dict]:
     return {"total": int(usage.total), "used": int(usage.used), "free": int(usage.free)}
 
 
-def existing_install(db, st=None) -> bool:
+def existing_install(db, st=None) -> Optional[bool]:
     """Whether the audit log holds rows from before this release first ran here (its genesis seal's time): the
-    install was running before, and the page tells its administrators what changed."""
+    install was running before, and the page tells its administrators what changed. None while this process has not
+    read the chain through (audit_integrity.ChainState.view_read): not known yet."""
     from app.core import audit_archive as arc
     from app.core import audit_integrity as ai
     st = st or ai.state()
-    first = arc.first_start(st.view)
-    oldest = st.view.first_hour() if st.view.position else None
-    return first is not None and oldest is not None and oldest < first - timedelta(hours=1)
+
+    def told(view) -> bool:
+        first = arc.first_start(view)
+        oldest = view.first_hour() if view.position else None
+        return first is not None and oldest is not None and oldest < first - timedelta(hours=1)
+    try:
+        return st.trusted(told)
+    except ai.ViewUnread:
+        return None
 
 
 def summary(db, now: datetime, storage_path: str, st=None) -> dict:

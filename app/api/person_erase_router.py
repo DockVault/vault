@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.api.audit_integrity_router import require_chain_read
+from app.api.audit_integrity_router import answer_from_view
 from app.api.managed_settings_router import STEP_UP_ACTION, limit_statements
 from app.api.user_management_api import require_interactive_admin
 from app.core import audit_chain_policy_seals as chain_seals
@@ -50,7 +50,7 @@ def list_erase_requests(current_user: User = Depends(require_interactive_admin),
     limit_statements(db)
     audit_integrity.read_view(db.get_bind())     # until it has, a request reads as not known yet (pe.UNREAD)
     st = audit_integrity.state()
-    return {"requests": pe.listing(db, st), "delay_days": pe.delay_days(st.view, st),
+    return {"requests": pe.listing(db, st), "delay_days": pe.listed_delay_days(st),
             "protected_minimum": pe.protected_minimum()}
 
 
@@ -58,10 +58,10 @@ def list_erase_requests(current_user: User = Depends(require_interactive_admin),
 def preview_erase(body: EraseName, current_user: User = Depends(require_interactive_admin),
                   db: Session = Depends(get_db)):
     limit_statements(db, PREVIEW_STATEMENT_TIMEOUT_MS)
-    require_chain_read(db, "What an erase would change (its archived days and its delay)")
     st = audit_integrity.state()
     try:
-        return pe.preview(db, body.name, st.clock(), st)
+        return answer_from_view(db, "What an erase would change (its archived days and its delay)",
+                                lambda: pe.preview(db, body.name, st.clock(), st))
     except pe.Refused as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

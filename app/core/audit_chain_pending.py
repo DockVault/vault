@@ -128,10 +128,27 @@ def _entry(view, record, req: int, d: dict, now: datetime, names: Dict[str, str]
 
 
 def entries(db, st=None, now: Optional[datetime] = None) -> List[dict]:
-    """The changes waiting, oldest request first (the module's docstring says what each holds)."""
-    from app.core import audit_chain_honour as honour
+    """The changes waiting, oldest request first (the module's docstring says what each holds). None of them while
+    this process has not read the chain through (ChainState.view_read): a view a check stopped in part way holds
+    seals the head record's link has not verified, and chain_state() then says the list is not read."""
+    return listed(db, st, now)[0]
+
+
+def listed(db, st=None, now: Optional[datetime] = None) -> tuple:
+    """(entries, chain_state) read together: the entries from a view read through and still read through once they
+    are listed, else none and ``read`` false, so that the list and what is said of it never disagree."""
     ai = _ai()
     st = st or ai.state()
+    try:
+        out = st.trusted(lambda view: _entries(db, st, now))
+    except ai.ViewUnread:
+        return [], chain_state(st, read=False)
+    return out, chain_state(st, read=True)
+
+
+def _entries(db, st, now: Optional[datetime]) -> List[dict]:
+    from app.core import audit_chain_honour as honour
+    ai = _ai()
     view = st.view
     if not view.position:
         return []
@@ -177,8 +194,10 @@ def entry(db, view, record, req: int, now: datetime) -> dict:
 
 
 
-def chain_state(st=None) -> dict:
-    """Beside the list: whether this process has read the chain at all (before that, nothing is listed and
-    nothing applies), and the kind of stop while sealing is stopped (nothing applies until it runs again)."""
+def chain_state(st=None, *, read: Optional[bool] = None) -> dict:
+    """Beside the list: whether this process has read the chain through (ChainState.view_read; before that, nothing
+    is listed and nothing applies), and the kind of stop while sealing is stopped, or while the chain does not check
+    out for a read (nothing applies until it does). ``read``: as listed() found it."""
     st = st or _ai().state()
-    return {"read": bool(st.view.position), "stopped": st.stopped.kind if st.stopped is not None else None}
+    stopped = st.stopped.kind if st.stopped is not None else st.read_stopped
+    return {"read": st.view_read if read is None else read, "stopped": stopped}

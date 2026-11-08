@@ -114,6 +114,12 @@ def delay_days(view, st) -> int:
     return pe.delay_days(view, st)
 
 
+def listed_delay_days(st=None) -> Optional[int]:
+    """The delay as the list shows it: None while this process has not read the chain through (as an erase's)."""
+    from app.core import person_erase as pe
+    return pe.listed_delay_days(st)
+
+
 # --------------------------------------------------------------------------- the preview
 
 def _hot_rows(db, levels, before: datetime, now: Optional[datetime] = None):
@@ -334,12 +340,17 @@ def cancel_while_stopped(db, request_id, actor, st=None) -> dict:
     """A cancel while sealing is stopped, in ``db``'s transaction: the removal must be one this process's view holds
     waiting and not begun; its row is ended (so it never runs: the job vetoes a request whose row does not wait),
     and the next pass seals the cancel from the database. Raises LookupError and Refused as cancel() does."""
+    from app.core import person_erase as pe
     from app.core.models import AuditValueRemoval
     st = st or _ai().state()
-    _cancellable(st.view, request_id)
+    mark = st.view_mark()
+    view = pe.trusted_view(st, "this removal", Refused)
+    _cancellable(view, request_id)
     row = db.get(AuditValueRemoval, fmt.as_uuid(request_id))
     _end_row(db, row, request_id, actor, st.clock())
-    return entry_of(row, st.view) if row is not None else {"id": str(request_id), "status": CANCELLED}
+    if not st.still_read(mark):
+        raise pe.unread_refusal(st, "this removal", Refused)
+    return entry_of(row, view) if row is not None else {"id": str(request_id), "status": CANCELLED}
 
 
 def _iso(v) -> Optional[str]:
@@ -396,15 +407,11 @@ def entry_of(row, view, extra_seal=None) -> dict:
 def listing(db, st=None) -> list:
     """Every removal, newest first, as the chain holds it; a row the chain holds no request of says so, or, while
     this process has not read the chain through (ChainState.view_read), that it is not known yet (UNREAD)."""
+    from app.core import person_erase as pe
     from app.core.models import AuditValueRemoval
     st = st or _ai().state()
     rows = db.query(AuditValueRemoval).order_by(AuditValueRemoval.requested_at.desc()).limit(100).all()
-    out = [entry_of(r, st.view) for r in rows]
-    if not st.view_read:
-        for entry in out:
-            if entry["status"] == "not recorded":
-                entry["status"] = UNREAD
-    return out
+    return pe._listed(rows, st, entry_of)
 
 
 # --------------------------------------------------------------------------- telling the administrators
@@ -803,7 +810,7 @@ def run_job(p):
     ai = _ai()
     st = ai.state()
     result = retention.JobResult()
-    if st.stopped is not None or not st.view.position or st.view.newest_policy() is None:
+    if st.stopped is not None or not st.view_read or not st.view.position or st.view.newest_policy() is None:
         return result
     engine = ai._engine_of(p.session_factory)
     findings: Dict[str, str] = {}

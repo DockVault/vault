@@ -783,7 +783,7 @@ def run_job(p):
     ai = _ai()
     st = ai.state()
     result = retention.JobResult()
-    if st.stopped is not None or not st.view.position or st.view.newest_policy() is None:
+    if st.stopped is not None or not st.view_read or not st.view.position or st.view.newest_policy() is None:
         return result
     engine = ai._engine_of(p.session_factory)
     findings: Dict[str, str] = {}
@@ -818,7 +818,10 @@ def run_job(p):
     # The sealed names of erases that ended while a rule held deletions back go once nothing holds them.
     if p.time_left():
         with p.transaction() as db:
-            pe.sweep_names(db, st.view, p.now)
+            try:
+                st.trusted(lambda view: pe.sweep_names(db, view, p.now))
+            except ai.ViewUnread:
+                db.rollback()            # the names stay until a pass reads the chain through
     for done in finished:
         result.cleared += done["other_rows"]
         pe.tell_administrators("completed", done)

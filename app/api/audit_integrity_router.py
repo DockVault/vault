@@ -61,9 +61,25 @@ def require_chain_read(db, what: str) -> None:
     st = audit_integrity.state()
     if audit_integrity.read_view(db.get_bind(), st):
         return
+    raise _unread(st, what)
+
+
+def _unread(st, what: str) -> HTTPException:
     retry = "" if (st.stopped is not None or st.read_stopped) else " Try again in a minute."
-    raise HTTPException(status_code=503, detail=f"{what} cannot be told yet: {audit_integrity.unread_reason(st)}."
-                                                f"{retry}", headers={"Retry-After": str(UNREAD_RETRY_SECONDS)})
+    return HTTPException(status_code=503, detail=f"{what} cannot be told yet: {audit_integrity.unread_reason(st)}."
+                                                 f"{retry}", headers={"Retry-After": str(UNREAD_RETRY_SECONDS)})
+
+
+def answer_from_view(db, what: str, answer):
+    """``answer()``, for a route whose answer comes from this process's view: the chain read first (require_chain_read),
+    and the answer given only when the view stayed read through while it was computed (ChainState.trusted); else 503
+    as require_chain_read refuses."""
+    require_chain_read(db, what)
+    st = audit_integrity.state()
+    try:
+        return st.trusted(lambda _view: answer())
+    except audit_integrity.ViewUnread:
+        raise _unread(st, what)
 
 
 def _entries(table: dict) -> list:
@@ -108,7 +124,7 @@ def current_view(db):
     """The verified view and the head record with every seal written since this process last read the chain,
     read under the chain lock (a short wait): what another process wrote meanwhile (the host's commands, a pass
     run by hand) is shown at once, not after the pruner's next pass. Busy, stopped or failing: the view as this
-    process holds it."""
+    process holds it (its reader trusts it only while it is read through, ChainState.view_read)."""
     ai = audit_integrity
     st = ai.state()
     try:
@@ -120,8 +136,19 @@ def current_view(db):
 
 @router.get("/settings/audit-integrity/warnings")
 def get_warnings(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
-    """The warnings an administrator may acknowledge, with what each is."""
-    view, record = current_view(db)
+    """The warnings an administrator may acknowledge, with what each is. ``read`` false (and no warning listed)
+    while this process has not read the chain through, or a check cleared its view while they were read: which seals
+    wait is then not known."""
+    st = audit_integrity.state()
+    _view, record = current_view(db)
+    try:
+        out = st.trusted(lambda view: _warnings(db, view, record))
+    except audit_integrity.ViewUnread:
+        return {"warnings": [], "read": False, "archive": audit_archive.summary()}
+    return {"warnings": out, "read": True, "archive": audit_archive.summary()}
+
+
+def _warnings(db, view, record) -> list:
     found = admin_warnings(view, record)
     out = []
     for seq in found["late"]:
@@ -147,7 +174,7 @@ def get_warnings(current_user: User = Depends(require_interactive_admin), db: Se
             what = "kept longer, as the database holds: " + ", ".join(changed)
         out.append({"seq": seq, "kind": "veto-from-database", "sealed_at": fmt.time_text(seal.sealed_at),
                     "what": what})
-    return {"warnings": out, "archive": audit_archive.summary()}
+    return out
 
 
 class AcknowledgeBody(BaseModel):
