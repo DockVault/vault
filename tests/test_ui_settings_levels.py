@@ -633,6 +633,9 @@ def test_the_search_lists_label_hits_before_help_hits(page: Page, levels_admin):
 def test_the_search_lists_at_most_twelve_hits_and_says_how_many_more(page: Page, levels_admin):
     _login(page, levels_admin)
     _open(page)
+    # The log access page draws its rows once its own read lands, a moment after the catalogue; a hit counted
+    # after the results were drawn would be one more than the results say.
+    page.wait_for_function("() => !!window._logSettings", timeout=15000)
     box = page.locator("#settings-search")
     results = page.locator("#settings-search-results")
     box.fill("a")
