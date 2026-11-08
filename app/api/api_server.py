@@ -847,6 +847,9 @@ app.include_router(activity_unlock_router)
 # Settings -> Sign-in: the passkey settings, under the fixed step-up admin.auth_policy.write.
 from app.api.sign_in_settings_router import router as sign_in_settings_router  # noqa: E402
 app.include_router(sign_in_settings_router)
+# Single sign-on: the start, the provider's callback, a person's own identities (app/api/sso_router.py).
+from app.api.sso_router import router as sso_router  # noqa: E402
+app.include_router(sso_router)
 # Compliance access: the auditor right, cases, legal holds and their step-ups.
 from app.api.compliance_router import router as compliance_router  # noqa: E402
 app.include_router(compliance_router)

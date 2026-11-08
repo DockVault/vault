@@ -104,6 +104,8 @@ class Handover:
     purpose: str = "sign_in"
     verifier_hash: Optional[str] = None
     code_challenge: Optional[str] = None
+    # When the person authenticated at the identity provider (seconds since the epoch), when it said so.
+    auth_time: Optional[int] = None
     created_at: int = field(default_factory=lambda: int(time.time()))
     # How many times the account's sessions had been ended when the proof read the account
     # (app/services/sign_in.py, in_the_accounts_turn). A record without it matches no account.
@@ -124,6 +126,8 @@ class Handover:
         if not isinstance(handover.methods, list) or not all(isinstance(m, str) for m in handover.methods):
             return None
         if handover.purpose not in PURPOSES:
+            return None
+        if handover.auth_time is not None and (isinstance(handover.auth_time, bool) or not isinstance(handover.auth_time, int)):
             return None
         # Every proof is a plain value of its kind: a flag is a boolean (never a truthy word), a hash or an id
         # a string or absent; anything else is not a record this module wrote.
@@ -212,6 +216,7 @@ def from_result(result, *, verifier_hash: Optional[str] = None, code_challenge: 
         pending_id=str(result.pending.id) if result.pending is not None else None,
         purpose=purpose, verifier_hash=verifier_hash, code_challenge=code_challenge,
         ended=result.sessions_ended,
+        auth_time=int(result.auth_time.timestamp()) if getattr(result, "auth_time", None) is not None else None,
     )
 
 
@@ -243,7 +248,7 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
         if (pending is None or pending.consumed_at is not None
                 or (exp is not None and exp < datetime.now(timezone.utc))):
             return None
-    return SignInResult(
+    result = SignInResult(
         user, list(handover.methods), client_ip if client_ip is not None else handover.client_ip,
         pending=pending, provider_id=handover.provider_id,
         provider_mfa_trusted=handover.provider_mfa_trusted, user_verified=handover.user_verified,
@@ -252,3 +257,6 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
         # minute ends the sign-in it carries.
         sessions_ended=handover.ended if isinstance(handover.ended, int) else -1,
     )
+    if isinstance(handover.auth_time, int) and not isinstance(handover.auth_time, bool) and 0 <= handover.auth_time < 2 ** 33:
+        result.auth_time = datetime.fromtimestamp(handover.auth_time, tz=timezone.utc)
+    return result

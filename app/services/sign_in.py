@@ -783,7 +783,27 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
     return SignedIn(access_token=access_token, user=user, is_temporary=result.is_temporary)
 
 
+def _stamp_identity(db, result: SignInResult) -> None:
+    """A provider sign-in that is now a session: the identity it came through records the time."""
+    if not result.provider_id:
+        return
+    try:
+        import uuid
+        from app.core.models import ExternalIdentity
+        provider_id = uuid.UUID(str(result.provider_id))
+    except (ImportError, ValueError):
+        return
+    try:
+        db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == provider_id,
+                                          ExternalIdentity.user_id == result.user.id).update(
+            {"last_sign_in_at": datetime.utcnow()}, synchronize_session=False)
+        db.commit()
+    except Exception:  # noqa: BLE001 -- the stamp is a record, never a refusal
+        db.rollback()
+
+
 def _record(db, result: SignInResult, api) -> None:
+    _stamp_identity(db, result)
     """The records of a finished sign-in, the same for every method. Each is best-effort: a sign-in
     that is whole must not fail on its own telemetry."""
     user = result.user
