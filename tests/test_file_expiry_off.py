@@ -167,6 +167,10 @@ def _finalize(monkeypatch, db, vault, expires_at):
     monkeypatch.setattr(vs, "_seal_named_object", lambda *a, **k: None)
     monkeypatch.setattr(vs, "_seal_file_checksum", lambda *a, **k: None)
     monkeypatch.setattr(security, "content_mac", lambda *a, **k: "mac")
+    # No deployment storage limit, whatever MAX_STORAGE_GB an earlier test's start of the server read from a
+    # .env: the room it would need is summed with a query the in-memory database does not answer, and these
+    # tests are about the file's deadline, not its room (tests/test_storage_room_at_finish.py covers that).
+    monkeypatch.setattr(vs, "deployment_storage_limit_bytes", lambda _db: None)
     # Not PostgreSQL: finalize takes no advisory lock and sets no lock_timeout here.
     monkeypatch.setattr(db, "get_bind", lambda: SimpleNamespace(dialect=SimpleNamespace(name="memory")),
                         raising=False)
