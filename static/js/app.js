@@ -702,10 +702,10 @@ function showPrompt(message, title = 'Enter value', options = {}) {
         const onCancel = () => { cleanup(); resolve(null); };
         const onKey = (e) => { if (e.key === 'Enter') { e.preventDefault(); onConfirm(); } };
         const onEsc = (e) => { if (e.key === 'Escape') onCancel(); };
-        // A backdrop click is dismissed by the global modal handler (closeModal),
-        // which would otherwise leave THIS promise unresolved forever (hanging any
-        // awaiting caller). Treat it as cancel so the promise always settles.
-        const onBackdrop = (e) => { if (e.target === modal) onCancel(); };
+        // A backdrop click closes the dialog (static/js/dialogs.js decides when: the press and the
+        // release both on the backdrop, this the top dialog, nothing typed); the promise settles as
+        // cancelled with it, so no caller waits forever.
+        const onBackdrop = (e) => { if (window.Dialogs ? Dialogs.backdropRelease(e, modal) : e.target === modal) onCancel(); };
         confirmBtn.addEventListener('click', onConfirm);
         cancelBtn.addEventListener('click', onCancel);
         closeBtn.addEventListener('click', onCancel);
@@ -15912,9 +15912,9 @@ function showRenameDialog(currentName, type) {
                 if (!warnEl.hidden) onWarnProceed(); else doSave();
             }
         };
-        // A backdrop click is closed by the global modal handler; treat it as cancel so the
-        // promise always settles (same reason as showPrompt).
-        const onBackdrop = (e) => { if (e.target === modal) onCancel(); };
+        // A backdrop click closes the dialog (static/js/dialogs.js decides when); treat it as cancel so
+        // the promise always settles (same reason as showPrompt).
+        const onBackdrop = (e) => { if (window.Dialogs ? Dialogs.backdropRelease(e, modal) : e.target === modal) onCancel(); };
 
         saveBtn.addEventListener('click', onSave);
         cancelBtn.addEventListener('click', onCancel);
@@ -23302,12 +23302,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const vgConfirm = document.getElementById('vault-grant-confirm');
     if (vgConfirm) vgConfirm.addEventListener('click', confirmVaultGrant);
 
-    // Close modal when clicking outside
-    document.querySelectorAll('.modal').forEach(modal => {
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) {
-                closeModal();
-            }
-        });
+    // A click on a dialog's backdrop closes that dialog: the top one only, and only when the press and
+    // the release were both on the backdrop and nothing was typed in it (static/js/dialogs.js). Every
+    // dialog on the page is covered, those built by a script later too.
+    document.addEventListener('click', (e) => {
+        if (window.Dialogs) { Dialogs.backdropClick(e); return; }
+        if (e.target && e.target.classList && e.target.classList.contains('modal')) closeModal();
     });
 });
