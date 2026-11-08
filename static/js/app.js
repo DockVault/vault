@@ -936,6 +936,26 @@ function showScreen(screenId) {
     document.getElementById(screenId).classList.add('active');
 }
 
+// Show or hide the sidebar items only an administrator may use. The Users item then follows its own
+// rule again (an account granted the users permission keeps it), and the group labels are reconciled:
+// revealing the items may have re-populated a group that was empty when the labels were last
+// reconciled, and hiding them may have emptied one.
+function setAdminNavVisible(visible) {
+    document.querySelectorAll('.sidebar-item.admin-only').forEach(item => {
+        item.style.display = visible ? 'flex' : 'none';
+    });
+    const usersTab = document.getElementById('users-tab');  // legacy tab, if present
+    if (usersTab) usersTab.style.display = visible ? 'block' : 'none';
+    updateNavigationPermissions();
+}
+
+// Whether a sidebar item is one this account may not use. A hidden item is not a page: the sidebar
+// refuses it (a click, navigateToSection, a restored view) and shows the dashboard instead, so the
+// page behind it never loads and never asks the server for what it would refuse.
+function navItemHidden(item) {
+    return !item || getComputedStyle(item).display === 'none';
+}
+
 // Update profile UI with user information
 function updateProfileUI(user) {
     // Get initials from username
@@ -960,23 +980,11 @@ function updateProfileUI(user) {
         roleEl.textContent = roleMap[user.role] || user.role;
     }
     
-    // Show admin tab if admin
-    if (user.role === 'admin') {
-        // Show admin-only sidebar items
-        document.querySelectorAll('.sidebar-item.admin-only').forEach(item => {
-            item.style.display = 'flex';
-        });
-        
-        // Legacy tab support (if exists)
-        const usersTab = document.getElementById('users-tab');
-        if (usersTab) {
-            usersTab.style.display = 'block';
-        }
-        // Revealing the admin-only items may have re-populated a group that was empty when
-        // updateNavigationPermissions last reconciled, so reconcile again (a group whose whole run
-        // is admin-only would otherwise keep a wrongly-hidden header).
-        reconcileNavGroupLabels();
-    }
+    // The administrators' sidebar items: shown for an administrator, hidden for anyone else. Both
+    // ways, because this runs for every sign-in on a tab, and the person before on the same tab may
+    // have been an administrator: the items were shown for them, and nothing hid them again, so the
+    // next person found Groups, Activity and Settings in their sidebar.
+    setAdminNavVisible(user.role === 'admin');
 
     // If this is a scoped temp credential whose owner is an admin, the block above
     // just revealed admin sidebar items — re-hide them in the SAME synchronous pass
@@ -2221,6 +2229,8 @@ function logout(how) {
     document.getElementById('dashboard-section')?.classList.add('active');
     document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
     document.querySelector('.sidebar-item[data-section="dashboard"]')?.classList.add('active');
+    // The administrators' items go too: the next person on this tab is shown their own at sign-in.
+    setAdminNavVisible(false);
     const vaultTitleEl = document.getElementById('vault-view-title');
     if (vaultTitleEl) vaultTitleEl.textContent = '';
     const vaultDescEl = document.getElementById('vault-view-description');
@@ -16064,9 +16074,11 @@ function getNavState() {
     try { return JSON.parse(sessionStorage.getItem('dv_nav') || 'null'); } catch (_) { return null; }
 }
 
-// Programmatically switch to a top-level section (mirror of the sidebar click).
+// Programmatically switch to a top-level section (mirror of the sidebar click). A section whose
+// sidebar item is hidden is not this account's: the dashboard opens instead.
 function navigateToSection(section) {
-    const item = document.querySelector(`.sidebar-item[data-section="${section}"]`);
+    let item = document.querySelector(`.sidebar-item[data-section="${section}"]`);
+    if (navItemHidden(item)) item = document.querySelector('.sidebar-item[data-section="dashboard"]');
     if (item) item.click();
 }
 
@@ -16119,9 +16131,11 @@ async function restoreLastView() {
         }
         return true;
     }
-    // A page this release no longer has (the Live Monitor, say) is not restored: the dashboard is.
+    // A page this release no longer has (the Live Monitor, say) is not restored, and neither is a
+    // page this account may not use (Settings saved by an administrator, restored for a user on the
+    // same browser): the dashboard is.
     if (nav.section && nav.section !== 'dashboard'
-            && document.querySelector(`.sidebar-item[data-section="${nav.section}"]`)) {
+            && !navItemHidden(document.querySelector(`.sidebar-item[data-section="${nav.section}"]`))) {
         navigateToSection(nav.section);
         return true;
     }
@@ -22639,6 +22653,10 @@ document.addEventListener('DOMContentLoaded', () => {
             e.preventDefault();
             setMobileNav(false);
             const section = item.getAttribute('data-section');
+
+            // A hidden item is not a page this account has. A click that reaches it anyway (a restored
+            // view, a script) opens the dashboard instead of the page behind it.
+            if (section !== 'dashboard' && navItemHidden(item)) { navigateToSection('dashboard'); return; }
 
             // Remember the section so a refresh restores it (and leaving a vault
             // this way correctly drops us back to that section, not inside it).
