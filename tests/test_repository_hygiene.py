@@ -1,5 +1,6 @@
 """Byte-level guards for the repository's tracked text and binary contract."""
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -210,7 +211,14 @@ def _public(name: str) -> str:
 
 def test_the_security_policy_states_the_lines_the_tags_and_the_backport_rule():
     policy = _public(".github/SECURITY.md")
-    assert "| 0.33.x, the latest line | Yes |" in policy
+    # The newest line of the upgrade matrix's `lines` is the latest, and each line before it has its row with the
+    # day the matrix gives its security fixes.
+    lines = json.loads(_public("docs/upgrade-matrix.json"))["lines"]
+    newest = max(lines, key=lambda line: tuple(int(part) for part in line.split(".")))
+    assert f"| {newest}.x, the latest line | Yes |" in policy
+    for line, entry in lines.items():
+        if line != newest:
+            assert f"| {line}.x | Yes, until {entry['security_fixes_until']} |" in policy, line
     # The row it replaces read "The minor line before the latest, 0.33.x and later lines only".
     assert "0.33.x and later lines only" not in policy
     assert "until six\nmonths after the next minor release ships" in policy
