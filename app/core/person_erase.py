@@ -662,6 +662,9 @@ COVERAGE: Dict[str, str] = {
     "active_sessions": DELETED, "pending_logins": DELETED, "devices": DELETED, "device_grants": DELETED,
     "second_factor_enrollments": DELETED, "second_factor_recovery_codes": DELETED, "otp_codes": DELETED,
     "webauthn_credentials": DELETED,
+    "sso_providers": "sso_providers", "sso_admin_requests": "sso_admin_requests",
+    "external_identities": DELETED, "sso_sessions": "deleted with the session, which goes with the account",
+    "sso_group_mappings": NO_PERSON,
     "password_reset_tokens": DELETED, "email_change_codes": DELETED, "sign_in_lockouts": DELETED,
     "sign_in_phantoms": "a name typed at sign-in only as a keyed stand-in, with an address; each row is gone a day "
                         "after its last failure or its lock's end (a lock with no end: 30 days), as from the cache",

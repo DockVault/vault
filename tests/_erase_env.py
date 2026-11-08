@@ -12,10 +12,12 @@ from app.core import person_erase as pe
 from app.core import retention
 from app.core.models import (AccountInvitation, ActivitySavedSearch, AdminGrant, AuditPrivacyPolicy,  # noqa: F401
                              AuditValueRemoval, CredentialChange, EraseRequest, Note, Notification, RoleEnum,
-                             SecurityAlert, SecurityRecord, TemporaryCredential, User, UserSSHKey)
+                             SecurityAlert, SecurityRecord, SsoAdminRequest, SsoProvider, TemporaryCredential, User,
+                             UserSSHKey)
 
 EXTRA = (EraseRequest, TemporaryCredential, AccountInvitation, SecurityRecord, SecurityAlert, CredentialChange,
-         AdminGrant, ActivitySavedSearch, Notification, Note, AuditPrivacyPolicy, UserSSHKey, AuditValueRemoval)
+         AdminGrant, ActivitySavedSearch, Notification, Note, AuditPrivacyPolicy, UserSSHKey, AuditValueRemoval,
+         SsoProvider, SsoAdminRequest)
 
 
 def add_tables(engine, models=EXTRA):
