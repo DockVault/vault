@@ -2185,6 +2185,8 @@ function logout(how) {
     // (any click 403s); this closes the visual residue.
     state.currentFiles = [];
     state.allVaults = [];
+    state.dashboardVaults = null;   // the lanes' vaults, with any decrypted zero-knowledge names
+    state.dashboardShared = null;
     state.selectedFileIds = new Set();
     try { clearMoveCopy(); } catch (_) {}          // move/copy clipboard + its floating bar
     try { uploadManager.reset(); } catch (_) {}    // upload tray items + DOM (no server cancels)
@@ -2362,6 +2364,11 @@ async function loadDashboardStats() {
         } catch (error) {
             console.log('Shared-with-me not available:', error);
         }
+        // Zero-knowledge vaults by their real names when the key is unlocked, else by their labels;
+        // never a prompt from the dashboard. Kept so a later unlock or lock redraws the lanes.
+        state.dashboardVaults = vaults;
+        state.dashboardShared = sharedWithMe;
+        try { await zkDecryptVaultNames(vaults); } catch (_) {}
         renderDashboardLanes(vaults, sharedWithMe);
 
         // Update system status (the gating also runs at profile-render time, before first paint;
@@ -2424,6 +2431,16 @@ function renderWaitingLane(sharedWithMe) {
     _fillLane('lane-waiting', rows, "You're all caught up.");
 }
 
+// The dashboard lanes drawn again from the vaults they were last drawn from: after an unlock the real
+// names of zero-knowledge vaults, after a lock their labels. Nothing is fetched, nothing is stored.
+async function redrawDashboardLanes() {
+    const vaults = state.dashboardVaults;
+    if (!Array.isArray(vaults)) return;
+    if (zkKeyUnlocked()) { try { await zkDecryptVaultNames(vaults); } catch (_) {} }
+    else zkRelockVaultNames(vaults);
+    renderDashboardLanes(vaults, state.dashboardShared || []);
+}
+
 function _fillLane(id, rows, emptyText) {
     const box = document.getElementById(id);
     if (!box) return;
@@ -2443,7 +2460,7 @@ function _laneVaultRow(v) {
     icon.appendChild(_svgIcon('vault', 'icon-sm'));
     row.appendChild(icon);
     const main = _el('div', 'dashboard-lane-main');
-    main.appendChild(_el('div', 'dashboard-lane-title', v.name || 'Vault'));
+    main.appendChild(_el('div', 'dashboard-lane-title', vaultDisplayName(v)));
     const t = parseServerTime(v.last_viewed_at);
     main.appendChild(_el('div', 'dashboard-lane-sub text-secondary',
         t ? ('Last opened ' + formatTimeAgo(v.last_viewed_at)) : 'Not opened yet'));
@@ -10930,31 +10947,11 @@ async function openVault(vaultId, options) {
         // name/description for the header. While locked the header shows the label / placeholder.
         if (vault.type === 'zero_knowledge' && vault.enc_name) {
             if (vault._zkLabel === undefined) vault._zkLabel = vault.name || null;
-            if (zkKeyUnlocked()) {
-                try {
-                    // Read at the epoch the name was sealed under (name_key_version); NULL/absent => 1
-                    // (how the first sealed build wrote it). The vault name has no content epoch, so
-                    // this is the ONLY thing that says which DEK opens it.
-                    const _ep = vault.name_key_version || 1;
-                    const dek = await zkGetVaultDek(vault.id, _ep);
-                    vault.name = await eccLib().decryptName(vault.enc_name, dek, vault.id, 'name', _ep, vault.id);
-                    if (vault.enc_description) {
-                        try { vault.description = await eccLib().decryptName(vault.enc_description, dek, vault.id, 'description', _ep, vault.id); }
-                        catch (_) { vault.description = null; }
-                    }
-                } catch (_) { vault.name = vault._zkLabel; }   // fall back to the label
-            } else {
-                vault.name = vault._zkLabel;
-            }
+            await zkDecryptOpenVaultMeta(vault);   // the real name when the key is unlocked, else the label
         }
 
         // Update vault view header
-        document.getElementById('vault-view-title').textContent = vaultDisplayName(vault);
-        const descEl = document.getElementById('vault-view-description');
-        if (descEl) {
-            descEl.textContent = vault.description || '';
-            descEl.style.display = vault.description ? '' : 'none';  // no "No description" filler
-        }
+        renderOpenVaultHeader(vault);
         // The neutral banner of a vault under an authorised review (static/js/compliance.js).
         if (typeof window.renderVaultReview === 'function') window.renderVaultReview(vault);
         window.scrollTo({ top: 0 });  // open a vault at the top, not at the grid's scroll position
@@ -11016,6 +11013,9 @@ async function openVault(vaultId, options) {
                 else showError(msg);
                 return;
             }
+            // The header was drawn above, while the key may still have been locked (the label, or
+            // "Encrypted vault"). The key is unlocked now: show the vault's real name and description.
+            await zkRefreshOpenVaultHeader();
         }
 
         // Whether public file/folder links are available (feature on + a tag permits them), so the
@@ -12309,6 +12309,7 @@ function zkIdleLock() {
         if (typeof zkRelockOpenDetail === 'function') zkRelockOpenDetail();
         if (typeof updateZkLockControl === 'function') updateZkLockControl();
         if (typeof renderVaults === 'function') renderVaults();
+        if (typeof redrawDashboardLanes === 'function') redrawDashboardLanes().catch(() => {});
     } catch (_) { /* re-hide is best effort */ }
     try { showInfo('Encryption locked after inactivity — you\'ll be asked for your passphrase again.'); } catch (_) {}
 }
@@ -14473,6 +14474,45 @@ function zkRelockVaultNames(vaults) {
     }
 }
 
+// The open zero-knowledge vault's name and description, decrypted in place when the account key is
+// unlocked, else the non-secret label. Read at the epoch the name was sealed under (name_key_version;
+// NULL/absent => 1, how the first sealed build wrote it): the vault name has no content epoch, so this
+// is the ONLY thing that says which DEK opens it. Decrypted text stays in memory and on the page.
+async function zkDecryptOpenVaultMeta(vault) {
+    if (!zkKeyUnlocked()) { vault.name = vault._zkLabel; return; }
+    try {
+        const _ep = vault.name_key_version || 1;
+        const dek = await zkGetVaultDek(vault.id, _ep);
+        vault.name = await eccLib().decryptName(vault.enc_name, dek, vault.id, 'name', _ep, vault.id);
+        if (vault.enc_description) {
+            try { vault.description = await eccLib().decryptName(vault.enc_description, dek, vault.id, 'description', _ep, vault.id); }
+            catch (_) { vault.description = null; }
+        }
+    } catch (_) { vault.name = vault._zkLabel; }   // fall back to the label
+}
+
+// The open vault's header: its name, and its description when it has one (no "No description" filler).
+function renderOpenVaultHeader(vault) {
+    const title = document.getElementById('vault-view-title');
+    if (title) title.textContent = vaultDisplayName(vault);
+    const descEl = document.getElementById('vault-view-description');
+    if (descEl) {
+        descEl.textContent = vault.description || '';
+        descEl.style.display = vault.description ? '' : 'none';
+    }
+}
+
+// After an unlock, the open zero-knowledge vault's header shows its real name and description instead
+// of the label it was drawn with while locked. No-op without an open sealed vault or an unlocked key
+// (a lock goes through zkRelockOpenDetail).
+async function zkRefreshOpenVaultHeader() {
+    const cv = state.currentVault;
+    if (!cv || !isZkVault(cv) || !cv.enc_name || !zkKeyUnlocked()) return;
+    if (cv._zkLabel === undefined) cv._zkLabel = cv.name || null;
+    await zkDecryptOpenVaultMeta(cv);
+    renderOpenVaultHeader(cv);
+}
+
 // The label a locked zero-knowledge vault shows when its owner set none: a neutral, styled
 // placeholder (never the raw padlock emoji, per design).
 function vaultDisplayName(v) {
@@ -14522,6 +14562,9 @@ async function zkUnlockAllVaults() {
     updateZkLockControl();
     renderVaults();
     zkResetIdleLock();
+    // The open vault's header and the dashboard lanes show the real names too.
+    try { await zkRefreshOpenVaultHeader(); } catch (_) {}
+    try { await redrawDashboardLanes(); } catch (_) {}
     // The key checks of a vault already open run now that its key can be read (they never ask).
     if (state.currentVault && isZkVault(state.currentVault)) refreshZkKeyChecks();
     // Reveal the freshly-decrypted metadata with the decode animation (after the render commits).
@@ -14569,6 +14612,7 @@ function zkLockAllVaults() {
     zkRelockOpenDetail();                    // also re-hide the OPEN vault's detail header/description
     updateZkLockControl();
     renderVaults();
+    redrawDashboardLanes().catch(() => {});  // the lanes show the labels again
     // What was found about the open vault's key went with the keys; its details now say to unlock.
     if (state.currentVault && isZkVault(state.currentVault)) refreshZkKeyChecks();
     try { showInfo('Zero-knowledge vaults locked.'); } catch (_) {}
