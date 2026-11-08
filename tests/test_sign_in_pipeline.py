@@ -106,6 +106,13 @@ def test_single_sign_on_takes_the_vaults_rule_unless_the_providers_mfa_is_truste
     assert _due([], factor_in_effect=True) == s.STAGE_SECOND_FACTOR
     assert _due([], factor_in_effect=True, enrollment_pending=True) == s.ENROLL
     assert _due([], factor_in_effect=True, provider_mfa_trusted=True) == s.DONE
+    # The vault's own code after the provider finishes the sign-in: the second-factor stage is the last step.
+    assert _due(["totp"], factor_in_effect=True) == s.DONE
+    assert _due(["recovery"], factor_in_effect=True, enrollment_pending=True) == s.DONE
+    # ... unless the account became an administrator meanwhile: then the password still follows.
+    assert _due(["totp"], role="admin", factor_in_effect=True) == s.STAGE_PASSWORD
+    # An administrator's password after a trusted provider MFA: done, no code on top.
+    assert _due(["pwd"], role="admin", factor_in_effect=True, provider_mfa_trusted=True) == s.DONE
 
 
 # --- the pre-authentication token's stage and proofs ------------------------------------------------
@@ -122,6 +129,24 @@ def test_a_second_factor_stage_a_passkey_reached_without_the_password_is_refused
     # Single sign-on at the second-factor stage (no password, no passkey) is allowed.
     s.read_pre_auth({"stage": "second_factor", "pre_auth": "x", "methods_so_far": [], "idp": "p1"}, pending)
     assert pending._methods_so_far == () and pending._provider_id == "p1"
+
+
+def test_an_empty_proof_list_is_a_real_answer_not_the_password():
+    """A single sign-on at the second-factor stage proved nothing of the vault's own yet: the list is empty,
+    and the finished token must not claim a password that was never typed."""
+    s = _sign_in()
+    pending = types.SimpleNamespace()
+    s.read_pre_auth({"stage": "second_factor", "pre_auth": "x", "methods_so_far": [], "idp": "p1"}, pending)
+    assert s.methods_so_far(pending) == []
+    assert s.methods_so_far(pending) + ["totp"] == ["totp"]
+    assert s.provider_mfa_of(pending) is False
+    s.read_pre_auth({"stage": "password", "pre_auth": "x", "methods_so_far": [], "idp": "p1", "provider_mfa": True},
+                    pending)
+    assert s.methods_so_far(pending) == [] and s.provider_mfa_of(pending) is True
+    # Only the boolean true counts.
+    s.read_pre_auth({"stage": "password", "pre_auth": "x", "methods_so_far": [], "provider_mfa": "true"}, pending)
+    assert s.provider_mfa_of(pending) is False
+    assert s.provider_mfa_of(None) is False
 
 
 def test_a_token_from_before_the_field_counts_as_a_password_proof():
@@ -203,7 +228,15 @@ def test_the_password_stage_names_the_account_and_carries_the_proofs_and_the_pro
     claims = _claims(step.body["pre_auth_token"])
     assert claims["stage"] == "password" and claims["methods_so_far"] == ["hwk"]
     step = s.begin_pending(_pending_db(user), s.SignInResult(user, [], None, provider_id="p1"), s.STAGE_PASSWORD)
-    assert _claims(step.body["pre_auth_token"])["idp"] == "p1"
+    pre = _claims(step.body["pre_auth_token"])
+    assert pre["idp"] == "p1" and pre["methods_so_far"] == [] and "provider_mfa" not in pre
+    # The trusted provider MFA travels with the stage, so the password after it finishes the sign-in.
+    step = s.begin_pending(_pending_db(user), s.SignInResult(user, [], None, provider_id="p1", provider_mfa_trusted=True),
+                           s.STAGE_PASSWORD)
+    assert _claims(step.body["pre_auth_token"])["provider_mfa"] is True
+    pending = types.SimpleNamespace()
+    s.read_pre_auth(_claims(step.body["pre_auth_token"]), pending)
+    assert s.provider_mfa_of(pending) is True and s.methods_so_far(pending) == []
 
 
 def test_a_pending_login_the_result_continues_is_spent_first():
@@ -340,6 +373,90 @@ def test_a_finished_pending_login_is_spent_once(quiet_records):
     with pytest.raises(HTTPException) as e:
         s.complete_sign_in(db, s.SignInResult(user, ["pwd", "totp"], None, session_token="s", pending=pending))
     assert e.value.status_code == 401
+
+
+# --- finish: a step follows, or the sign-in is whole ----------------------------------------------------
+
+def _finish_db(user, *, session_token=None, pending=None, enrollment=None):
+    from app.core.models import ActiveSession, PendingLogin, SecondFactorEnrollment, SystemSetting
+    from app.core.session_hash_utils import hash_session_token
+    rows = {ActiveSession: [], PendingLogin: [], SecondFactorEnrollment: [], SystemSetting: []}
+    if session_token:
+        rows[ActiveSession].append(types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id,
+                                                         session_token=hash_session_token(session_token)))
+    if pending is not None:
+        rows[PendingLogin].append(pending)
+    if enrollment:
+        rows[SecondFactorEnrollment].append(types.SimpleNamespace(user_id=user.id, status="active", method=enrollment))
+    return MemoryDB(rows)
+
+
+def _policy(monkeypatch, *, in_effect, state="setup"):
+    S = _api()
+    monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, user: in_effect)
+    monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {"state": state, "in_effect": in_effect})
+
+
+def test_a_step_that_follows_deletes_the_session_the_password_made_and_records_the_password(quiet_records, monkeypatch):
+    s = _sign_in()
+    from app.core.models import ActiveSession
+    user = _user()
+    _policy(monkeypatch, in_effect=True)
+    db = _finish_db(user, session_token="sess-1", enrollment="totp")
+    outcome = s.finish(db, s.SignInResult(user, ["pwd"], "10.0.0.1", session_token="sess-1"))
+    assert isinstance(outcome, s.PendingStep) and outcome.stage == "second_factor"
+    assert outcome.body["methods"] == ["totp", "recovery"] and outcome.body["enrollment_required"] is False
+    # No usable session stands while the step is pending.
+    assert db.tables[ActiveSession] == []
+    assert ("action", "login_password_ok") in quiet_records["audit"]
+    # ... and nothing of a finished sign-in was recorded.
+    assert quiet_records["events"] == [] and quiet_records["emails"] == []
+    assert not [a for a in quiet_records["audit"] if a[0] == "alice"]
+
+
+def test_an_enrollment_step_follows_when_the_factor_is_required_but_not_set_up(quiet_records, monkeypatch):
+    s = _sign_in()
+    user = _user()
+    _policy(monkeypatch, in_effect=True, state="pending")
+    outcome = s.finish(_finish_db(user), s.SignInResult(user, ["pwd"], None))
+    assert isinstance(outcome, s.PendingStep)
+    assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["totp"]
+
+
+def test_no_step_follows_when_no_factor_is_in_effect(quiet_records, monkeypatch):
+    s = _sign_in()
+    user = _user()
+    _policy(monkeypatch, in_effect=False)
+    outcome = s.finish(_finish_db(user, session_token="sess-1"),
+                       s.SignInResult(user, ["pwd"], "10.0.0.1", session_token="sess-1"))
+    assert isinstance(outcome, s.SignedIn)
+    assert _claims(outcome.access_token)["amr"] == ["pwd"] and _claims(outcome.access_token)["session_token"] == "sess-1"
+    assert ("alice", "10.0.0.1", False, ["pwd"]) in quiet_records["audit"]
+    assert ("action", "login_password_ok") not in quiet_records["audit"]
+
+
+def test_a_temporary_credential_never_waits(quiet_records, monkeypatch):
+    s = _sign_in()
+    user = _user()
+    _policy(monkeypatch, in_effect=True, state="pending")
+    outcome = s.finish(_finish_db(user), s.SignInResult(user, ["pwd"], None, session_token="t", is_temporary=True,
+                                                        temp_username="temp_x"))
+    assert isinstance(outcome, s.SignedIn) and outcome.is_temporary
+
+
+def test_an_administrators_password_after_a_trusted_provider_finishes_with_two_kinds(quiet_records, monkeypatch):
+    s = _sign_in()
+    admin = _user(role="admin")
+    _policy(monkeypatch, in_effect=True)
+    pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=admin.id, consumed_at=None, attempts=0)
+    db = _finish_db(admin, session_token="sess-2", pending=pending)
+    # Without the carried fact the vault's own code would be asked; with it the password is the last step.
+    outcome = s.finish(db, s.SignInResult(admin, ["pwd"], None, session_token="sess-2", pending=pending,
+                                          provider_id="p1", provider_mfa_trusted=True))
+    assert isinstance(outcome, s.SignedIn)
+    claims = _claims(outcome.access_token)
+    assert claims["amr"] == ["pwd"] and claims["idp"] == "p1" and "mfa_at" in claims
+    assert pending.consumed_at is not None
 
 
 def test_the_pending_logins_own_cap_on_wrong_answers():

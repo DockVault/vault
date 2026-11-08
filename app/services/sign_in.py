@@ -44,8 +44,10 @@ RECOVERY = "recovery"
 HARDWARE_KEY = "hwk"      # a passkey bound to one device
 SOFTWARE_KEY = "swk"      # a synced passkey
 PASSKEYS = frozenset({HARDWARE_KEY, SOFTWARE_KEY})
+# The vault's own codes.
+CODES = frozenset({TOTP, RECOVERY})
 # What counts as a second kind of factor beside the password.
-SECOND_KINDS = frozenset({TOTP, RECOVERY}) | PASSKEYS
+SECOND_KINDS = CODES | PASSKEYS
 
 # What a pending login waits for. The pre-authentication token carries the value in ``stage``.
 STAGE_SECOND_FACTOR = "second_factor"
@@ -122,7 +124,8 @@ def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, e
     * no password yet, a passkey: done when the authenticator verified the person and the policy allows
       a passkey alone for them; otherwise the password (a possession factor needs a knowledge factor,
       never a second possession factor);
-    * no password yet, single sign-on: done when the provider's MFA is trusted and was present;
+    * no password yet, single sign-on: done when the provider's MFA is trusted and was present, or when
+      the vault's own code (an authenticator or recovery code) was already given after the provider;
       otherwise the vault's own rule below;
     * the password and a second kind (a code, a recovery code, a passkey), or the password and a trusted
       provider MFA: done;
@@ -139,7 +142,7 @@ def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, e
             return STAGE_PASSWORD
         if has_passkey:
             return DONE if (user_verified and passwordless_allowed) else STAGE_PASSWORD
-        if provider_mfa_trusted:
+        if provider_mfa_trusted or (methods & CODES):
             return DONE
     elif (methods & SECOND_KINDS) or provider_mfa_trusted:
         return DONE
@@ -171,9 +174,10 @@ def check_second_factor_stage(methods_so_far: Iterable[str]) -> None:
 def read_pre_auth(payload: dict, pending: PendingLogin) -> None:
     """Note on ``pending`` what the pre-authentication token says about the sign-in it holds: the stage,
     the proofs so far (a token from before this field counts as a password proof, which is all a
-    pending login could hold then) and the provider. The values ride in the signed token, not in the
-    row; a request cannot change them. A second-factor stage a passkey reached without the password is
-    refused here, whatever route reads the token."""
+    pending login could hold then; an empty list is a single sign-on with nothing of the vault's own yet),
+    the provider, and whether the provider's trusted MFA was present. The values ride in the signed
+    token, not in the row; a request cannot change them. A second-factor stage a passkey reached without
+    the password is refused here, whatever route reads the token."""
     methods = payload.get("methods_so_far")
     if not isinstance(methods, list) or not all(isinstance(m, str) for m in methods):
         methods = [PASSWORD]
@@ -184,18 +188,26 @@ def read_pre_auth(payload: dict, pending: PendingLogin) -> None:
     pending._methods_so_far = tuple(methods)
     provider = payload.get("idp")
     pending._provider_id = provider if isinstance(provider, str) else None
+    pending._provider_mfa_trusted = payload.get("provider_mfa") is True
 
 
 def methods_so_far(pending: Optional[PendingLogin]) -> List[str]:
-    """The proofs a pending login holds, as :func:`read_pre_auth` read them; the password alone for a pending
-    login nothing read (a token from before the field). No pending login, as at the sign-in form: nothing yet."""
+    """The proofs a pending login holds, as :func:`read_pre_auth` read them (an empty list is a real answer:
+    a single sign-on with nothing of the vault's own yet); the password alone for a pending login nothing
+    read (a token from before the field). No pending login, as at the sign-in form: nothing yet."""
     if pending is None:
         return []
-    return list(getattr(pending, "_methods_so_far", None) or (PASSWORD,))
+    read = getattr(pending, "_methods_so_far", None)
+    return [PASSWORD] if read is None else list(read)
 
 
 def provider_of(pending: Optional[PendingLogin]) -> Optional[str]:
     return getattr(pending, "_provider_id", None)
+
+
+def provider_mfa_of(pending: Optional[PendingLogin]) -> bool:
+    """Whether the pending login's provider sign-in carried the provider's trusted MFA (read from the token)."""
+    return bool(getattr(pending, "_provider_mfa_trusted", False))
 
 
 def delete_session_by_token(db, session_token: Optional[str]) -> None:
@@ -259,6 +271,10 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
               "methods_so_far": list(result.methods)}
     if result.provider_id:
         claims["idp"] = result.provider_id
+    if result.provider_mfa_trusted:
+        # The trusted provider MFA counts at the end of the sign-in too (an administrator's password stage
+        # after it), so the fact travels with the stage.
+        claims["provider_mfa"] = True
     token = create_access_token(data=claims, expires_delta=timedelta(minutes=PRE_AUTH_TTL_MINUTES))
     if stage == STAGE_PASSWORD:
         methods = ["password"]

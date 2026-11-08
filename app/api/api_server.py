@@ -8439,12 +8439,17 @@ async def second_factor_login_verify(
         except Exception:  # noqa: BLE001
             pass
         raise HTTPException(status_code=401, detail="That code is not valid.")
-    # The factor is right: the pipeline spends the pending row (single winner), makes the session and the
-    # token (amr = the proofs so far plus this factor) and the records of a finished sign-in.
-    signed = sign_in.complete_sign_in(db, sign_in.SignInResult(
+    # The factor is right: the pipeline spends the pending row (single winner) and asks its table once
+    # more with this factor added. Normally that finishes the sign-in (the session, the token with amr =
+    # the proofs so far plus this factor, the records); it holds the sign-in again only when the table
+    # says a step still follows, such as the password for an account made an administrator meanwhile.
+    outcome = sign_in.finish(db, sign_in.SignInResult(
         user, sign_in.methods_so_far(pending) + [(body.method or "").lower()], client_ip,
-        pending=pending, provider_id=sign_in.provider_of(pending)))
-    access_token = signed.access_token
+        pending=pending, provider_id=sign_in.provider_of(pending),
+        provider_mfa_trusted=sign_in.provider_mfa_of(pending)))
+    if isinstance(outcome, sign_in.PendingStep):
+        return JSONResponse(status_code=200, content=outcome.body)
+    access_token = outcome.access_token
     recovery_used = (body.method or "").lower() == "recovery"
     try:
         if recovery_used:
@@ -8569,6 +8574,14 @@ async def second_factor_step_up(
 _login_bearer = HTTPBearer(auto_error=False)
 
 
+async def _login_stage_token(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_login_bearer),
+) -> Optional[HTTPAuthorizationCredentials]:
+    """The bearer token a sign-in request carries, when it carries one: a password-stage pre-authentication
+    token (the sign-in form sends none). Named, so the route's dependency list can be read by name."""
+    return credentials
+
+
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
     login_request: LoginRequest,
@@ -8582,7 +8595,7 @@ async def login(
     db: Session = Depends(get_db),
     # A password-stage pre-authentication token (a sign-in that proved a passkey or a provider identity
     # and must add the password): absent at the sign-in form, so nothing is required here.
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_login_bearer),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_login_stage_token),
 ):
     """
     Authenticate user and return access token.
@@ -8643,7 +8656,8 @@ async def login(
             )
             result = sign_in.SignInResult(user, sign_in.methods_so_far(pending) + [sign_in.PASSWORD], client_ip,
                                           session_token=session_token, pending=pending,
-                                          provider_id=sign_in.provider_of(pending))
+                                          provider_id=sign_in.provider_of(pending),
+                                          provider_mfa_trusted=sign_in.provider_mfa_of(pending))
 
         # The pipeline decides whether a step follows (the second factor, its enrollment) and holds the
         # sign-in in a pending login with no session if so; otherwise it makes the session, the token
@@ -11057,10 +11071,15 @@ async def acknowledge_recovery_codes(
         # session, the factor just enrolled counting as this sign-in's second proof. There are no older
         # sessions to revoke — a required-but-unenrolled user never held one.
         client_ip = get_client_ip(request)
-        signed = sign_in.complete_sign_in(db, sign_in.SignInResult(
+        outcome = sign_in.finish(db, sign_in.SignInResult(
             current_user, sign_in.methods_so_far(pending) + [sign_in.TOTP], client_ip,
-            pending=pending, provider_id=sign_in.provider_of(pending)))
-        access_token = signed.access_token
+            pending=pending, provider_id=sign_in.provider_of(pending),
+            provider_mfa_trusted=sign_in.provider_mfa_of(pending)))
+        if isinstance(outcome, sign_in.PendingStep):
+            # The table asks for one more step (the password, for an account made an administrator during
+            # its sign-in): the enrollment stands, the sign-in is held again.
+            return {"enrolled": True, "method": "totp", **outcome.body}
+        access_token = outcome.access_token
         try:
             AuditLogger(db).log_action(action="second_factor_enrolled", status="success", user=current_user,
                                        ip_address=client_ip, details={"method": "totp", "forced": True})

@@ -246,19 +246,30 @@ def test_the_password_stage_adds_the_password_to_a_proof_and_counts_wrong_answer
                                      json={"username": user["_username"], "password": user["_password"]})
         assert r.status_code == 401, r.text
 
-        # The pending login's own cap: five wrong answers spend it, whatever the lockouts do meanwhile.
+        # The pending login's own cap: five wrong passwords for the right name spend it (each also counts in
+        # the account's lockouts, as at the form), and the right password is refused afterwards.
         pid2 = _pending_row(user["id"])
         token2 = _mint({"sub": user["id"], "username": user["_username"], "stage": "password", "pre_auth": pid2,
                         "methods_so_far": ["swk"]})
         h2 = {"Authorization": f"Bearer {token2}"}
-        for _ in range(5):
+        for n in range(1, 6):
             r = ApiClient().session.post(LOGIN, headers=h2,
-                                         json={"username": other["_username"], "password": "x"})
-            assert r.status_code == 401, r.text
-        assert _attempts(pid2) == 5 and _spent(pid2)
+                                         json={"username": user["_username"], "password": f"wrong-{n}"})
+            assert r.status_code in (401, 403), r.text
+            assert _attempts(pid2) == n
+        assert _spent(pid2)
         r = ApiClient().session.post(LOGIN, headers=h2,
                                      json={"username": user["_username"], "password": user["_password"]})
-        assert r.status_code == 401, r.text
+        assert r.status_code in (401, 403), r.text
+
+        # A password-stage token is no second-factor token: refused at the verify and cancel routes.
+        pid4 = _pending_row(user["id"])
+        token4 = _mint({"sub": user["id"], "username": user["_username"], "stage": "password", "pre_auth": pid4,
+                        "methods_so_far": ["hwk"]})
+        h4 = {"Authorization": f"Bearer {token4}"}
+        assert ApiClient().session.post(VERIFY, headers=h4, json={"method": "totp", "code": "000000"}).status_code == 401
+        assert ApiClient().session.post(CANCEL, headers=h4).status_code == 401
+        assert not _spent(pid4)
 
         # A second-factor stage a passkey reached without the password is refused wherever the token is read.
         pid3 = _pending_row(user["id"])
@@ -284,7 +295,22 @@ def test_an_administrator_without_the_password_is_asked_for_it_and_then_signed_i
         r = ApiClient().session.post(LOGIN, headers={"Authorization": f"Bearer {token}"},
                                      json={"username": ta["_username"], "password": ta["_password"]})
         assert r.status_code == 200, r.text
+        assert set(r.json()) == LOGIN_KEYS
         claims = _claims(r.json()["access_token"])
-        assert claims["amr"] == ["hwk", "pwd"] and "mfa_at" in claims
+        assert set(claims) == TOKEN_KEYS | {"mfa_at"}, claims
+        assert claims["amr"] == ["hwk", "pwd"]
     finally:
         admin.delete_user(ta["id"])
+
+
+def test_a_second_factor_stage_token_at_the_sign_in_form_is_ignored(temp_user):
+    """Only a password-stage token means anything at POST /auth/login: a second-factor token sent there leaves
+    the form sign-in exactly as it always was, and the pending login it names untouched."""
+    pid = _pending_row(temp_user["id"])
+    token = _mint({"sub": temp_user["id"], "username": temp_user["_username"], "stage": "second_factor",
+                   "pre_auth": pid, "methods_so_far": ["pwd"]})
+    r = ApiClient().session.post(LOGIN, headers={"Authorization": f"Bearer {token}"},
+                                 json={"username": temp_user["_username"], "password": temp_user["_password"]})
+    assert r.status_code == 200, r.text
+    assert set(r.json()) == LOGIN_KEYS and _claims(r.json()["access_token"])["amr"] == ["pwd"]
+    assert not _spent(pid) and _attempts(pid) == 0
