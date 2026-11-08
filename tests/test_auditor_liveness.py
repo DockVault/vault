@@ -38,7 +38,7 @@ from app.core import credential_changes as cc  # noqa: E402
 from app.core import password_origin  # noqa: E402
 from app.core.models import (AccountInvitation, AdminGrant, AuditLog, AuditorGrant, CredentialChange,  # noqa: E402
                              PasswordResetToken, RoleEnum, SecondFactorEnrollment, SecondFactorRecoveryCode, User,
-                             UserSSHKey)
+                             UserSSHKey, WebAuthnCredential)
 
 pytestmark = pytest.mark.unit
 
@@ -52,7 +52,8 @@ def db():
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'live.db'}")
         copies = sa.MetaData()
         for model in (User, AdminGrant, CredentialChange, AuditLog, AuditorGrant, SecondFactorEnrollment,
-                      SecondFactorRecoveryCode, UserSSHKey, AccountInvitation, PasswordResetToken):
+                      SecondFactorRecoveryCode, UserSSHKey, AccountInvitation, PasswordResetToken,
+                      WebAuthnCredential):
             table = model.__table__.to_metadata(copies)
             for column in table.columns:
                 if column.server_default is not None and "now()" in str(getattr(column.server_default, "arg", "")):

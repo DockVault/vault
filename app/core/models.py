@@ -3373,7 +3373,10 @@ class AuditorGrant(Base):
     role or a permission: authorization never reads this table. One administrator proposes a grant and an
     independent one approves it (or the server's operator on the host, when there is none). It is bound
     to the TOTP enrollment the account had when it was approved (``second_factor_enrollment_id``; no
-    foreign key, so the binding outlives a reset that deletes the enrollment), and lists everyone who
+    foreign key, so the binding outlives a reset that deletes the enrollment) and to the passkeys it held
+    then (``approved_credential_ids``, their ids as text, read again at each reconfirmation: a passkey
+    registered later counts for the compliance step-ups only once the right is confirmed again), and lists
+    everyone who
     changed the account's sign-in details while it stood (``credential_changers``: [{id, name, at}], the
     host operator with no id), which the independence rule reads long after the records of those changes
     are pruned."""
@@ -3398,6 +3401,9 @@ class AuditorGrant(Base):
     reject_reason_enc = Column(Text, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     second_factor_enrollment_id = Column(UUID(as_uuid=True), nullable=True)
+    # The passkeys (webauthn_credentials ids, as text) the account held when the grant was approved or last
+    # reconfirmed. NULL on grants from before passkeys existed: none of the account's passkeys counts then.
+    approved_credential_ids = Column(JSON, nullable=True)
     # The account's role when the grant was approved or last reconfirmed: a holder demoted since is suspended.
     confirmed_role = Column(String(16), nullable=True)
     # What the independence rule read about the proposal when it was made: the proposer, their lineage (who

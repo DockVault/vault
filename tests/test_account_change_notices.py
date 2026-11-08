@@ -61,6 +61,8 @@ def test_a_notice_says_what_when_by_whom_and_what_to_do(sent):
     (cc.EMAIL, {"old_email": "old@example.com", "new_email": "new@example.com"},
      "from old@example.com to new@example.com"),
     (cc.SSH_KEY, {"ssh_key": SimpleNamespace(name="laptop", fingerprint="SHA256:abc")}, '"laptop" (SHA256:abc)'),
+    (cc.PASSKEY, {"passkey_id": "x", "passkey_label": "work laptop"}, 'removed the passkey "work laptop"'),
+    (cc.PASSKEY, {"passkey_gone": True}, "had already been removed"),
 ])
 def test_each_credential_change_says_what_changed(sent, kind, result, words):
     api._notify_credential_change(None, kind, USER, result, by_name="alice")

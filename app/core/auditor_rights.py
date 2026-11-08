@@ -30,7 +30,6 @@ told of each step, in the app and by email, after the commit (deliver()).
 from __future__ import annotations
 
 import uuid
-import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Optional
@@ -133,6 +132,19 @@ def active_totp(db, user_id):
     return db.query(SecondFactorEnrollment).filter(
         SecondFactorEnrollment.user_id == user_id, SecondFactorEnrollment.status == "active",
         SecondFactorEnrollment.method == "totp").first()
+
+
+def passkey_ids(db, user_id) -> list:
+    """The ids (as text, sorted) of the passkeys the account holds now, not retired: what a grant binds to when
+    it is approved and each time it is reconfirmed. A passkey registered after that is not in the list, so it
+    does not count for the compliance step-ups until the holder confirms the right again."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not has_table(db, WebAuthnCredential.__tablename__):
+        return []
+    rows = db.query(WebAuthnCredential.id).filter(WebAuthnCredential.user_id == user_id,
+                                                  WebAuthnCredential.retired_at.is_(None)).all()
+    return sorted(str(r[0]) for r in rows)
 
 
 def open_grant(db, user_id, *, lock: bool = False):
@@ -479,6 +491,7 @@ def approve(db, grant, *, approver=None, now: Optional[datetime] = None):
     totp = active_totp(db, grant.user_id)
     grant.status = "active"
     grant.second_factor_enrollment_id = totp.id
+    grant.approved_credential_ids = passkey_ids(db, grant.user_id)
     grant.confirmed_role = _role(holder)
     grant.approved_at = now
     grant.expires_at = now + timedelta(days=grant_days())
@@ -770,6 +783,7 @@ def reconfirm(db, grant, holder, now: Optional[datetime] = None):
     grant.status, grant.reconfirmed_at, grant.updated_at = "active", now, now
     grant.suspended_at, grant.suspend_reason = None, None
     grant.confirmed_role = _role(holder)
+    grant.approved_credential_ids = passkey_ids(db, holder.id)
     _audit(db, "auditor_reconfirmed", grant, actor=holder, details={"reason": before})
     queue(db, {"event": "reconfirmed", "grant_id": str(grant.id), "holder_id": str(holder.id),
                "holder": holder.username, "by": holder.username})
@@ -779,25 +793,16 @@ def reconfirm(db, grant, holder, now: Optional[datetime] = None):
 # --------------------------------------------------------------------------- what follows from a change
 
 _TABLE = "auditor_grants"
-_HAS_TABLE = weakref.WeakSet()
 
 
 def _has_grants(db) -> bool:
     """Whether the database has the grants table (a database built only with the tables a test needs may not,
     and a stand-in for a session has no database at all; neither holds a grant). Remembered for the engine once
-    found."""
-    get_bind = getattr(db, "get_bind", None)
-    if get_bind is None:
+    found (app/core/table_presence.py)."""
+    if getattr(db, "get_bind", None) is None:
         return False
-    bind = get_bind()
-    engine = getattr(bind, "engine", bind)
-    if engine in _HAS_TABLE:
-        return True
-    from sqlalchemy import inspect
-    if inspect(bind).has_table(_TABLE):
-        _HAS_TABLE.add(engine)
-        return True
-    return False
+    from app.core.table_presence import has_table
+    return has_table(db, _TABLE)
 
 
 def after_credential_change(db, target, kind: str, *, actor_id, actor_name: str, someone_else: bool,

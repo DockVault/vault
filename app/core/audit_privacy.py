@@ -173,6 +173,8 @@ _IDENTIFIER_KEYS = (
     "op", "proof", "finding",
     # the auditor right: the grant, and who proposed it (a username)
     "grant_id", "proposed_by",
+    # a passkey: its row id, and whether it was registered soon after an administrator changed the account
+    "passkey_id", "provisional",
     # legal holds: the case's number, a hold's dates, and what it kept and why (never a name)
     "case_number", "confirm_by", "hold_only", "purge_after", "by_release", "kept_reason", "kept_at", "held_by_case",
     # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes

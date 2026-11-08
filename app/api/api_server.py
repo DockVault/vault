@@ -6467,13 +6467,20 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             SecondFactorEnrollment.user_id == target.id).delete(synchronize_session=False)
         db.query(SecondFactorRecoveryCode).filter(
             SecondFactorRecoveryCode.user_id == target.id).delete(synchronize_session=False)
+        # The account's passkeys stop being accepted too (retired, deleted 30 days later), so the reset
+        # leaves no factor whoever planted one; the person sets a new factor up with their own password.
+        from app.core.models import WebAuthnCredential
+        retired = db.query(WebAuthnCredential).filter(
+            WebAuthnCredential.user_id == target.id, WebAuthnCredential.retired_at.is_(None)).update(
+            {"retired_at": datetime.utcnow()}, synchronize_session=False)
+        had_factor = had_factor or bool(retired)
         if had_factor and for_someone_else:
             # The user signs in with their own password and sets the factor up again, whether the
             # deployment's policy requires a second factor or leaves it optional.
             target.second_factor_reset_at = datetime.utcnow()
         # A change to how the account authenticates should not leave standing sessions.
         _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
-        return {"had_second_factor": had_factor}
+        return {"had_second_factor": had_factor, "passkeys_retired": int(retired or 0)}
     if kind == cc.EMAIL:
         new_email = payload.get("email")
         if new_email is not None and (email_in_use(db, new_email, exclude_user_id=target.id)
@@ -6496,6 +6503,21 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         db.add(key)
         db.flush()
         return {"ssh_key": key}
+    if kind == cc.PASSKEY:
+        # An administrator removes one of the account's passkeys: retired, never deleted here, so the
+        # record of what was removed stays until the pruner deletes retired keys 30 days later. A key
+        # already gone (removed by its owner while the request waited) is reported, not an error.
+        from app.core.models import WebAuthnCredential
+        try:
+            passkey_id = uuid.UUID(str(payload.get("passkey_id")))
+        except (TypeError, ValueError):
+            return {"passkey_gone": True}
+        row = db.query(WebAuthnCredential).filter(WebAuthnCredential.id == passkey_id,
+                                                  WebAuthnCredential.user_id == target.id).first()
+        if row is None or row.retired_at is not None:
+            return {"passkey_gone": True}
+        row.retired_at = datetime.utcnow()
+        return {"passkey_id": str(row.id), "passkey_label": row.label or ""}
     raise ValueError(f"unknown credential change: {kind}")
 
 
@@ -6589,6 +6611,8 @@ def _request_summary(kind, *, delivery=None, new_email=None, key_name=None, fing
         return f"Key \"{key_name}\" ({fingerprint})"
     if kind == cc.PASSWORD:
         return "A password the administrator chose"
+    if kind == cc.PASSKEY:
+        return f"Passkey \"{key_name}\"" if key_name else "An unnamed passkey"
     return None
 
 
@@ -6814,6 +6838,14 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
         return ("An SSH key was added to your account",
                 f"{who} added the SSH key \"{name}\" ({fingerprint}) to your account. It can sign in to "
                 "SFTP as you.")
+    if kind == cc.PASSKEY:
+        if result.get("passkey_gone"):
+            return ("A passkey removal was approved",
+                    f"{who} approved removing a passkey from your account; it had already been removed.")
+        label = result.get("passkey_label") or ""
+        named = f"the passkey \"{label}\"" if label else "an unnamed passkey"
+        return ("A passkey was removed from your account",
+                f"{who} removed {named} from your account. It can no longer sign in or prove a step-up.")
     return ("Your account was changed", f"{who} changed your sign-in details.")
 
 
@@ -11331,6 +11363,438 @@ async def regenerate_recovery_codes(
     db.commit()
     _audit_change(db, current_user, "second_factor_recovery_regenerated", "user", current_user.id)
     return {"recovery_codes": [sf.format_recovery_code(p) for p, _pr, _h in generated]}
+
+
+# --- Passkeys: self-service -----------------------------------------------------------------------
+# Registration (options, then verify), the list, rename, remove and the confirmation of a provisional key;
+# an administrator's list and removal under the two-person rule. The ceremony itself is
+# app/services/webauthn_service.py; the challenges are app/core/webauthn_challenges.py. The settings that
+# tune the policy land with the passkey settings item; until then the service's defaults apply.
+
+PASSKEY_LIMIT = 20                  # passkeys per account
+PASSKEY_LABEL_MAX = 100
+PASSKEY_OPTIONS_LIMIT = 20          # registration starts per account per PASSKEY_OPTIONS_WINDOW
+PASSKEY_OPTIONS_WINDOW = 600
+_PASSKEY_ALG_NAMES = {-7: "ES256", -257: "RS256", -8: "EdDSA"}
+_PASSKEY_REFUSALS = {
+    "origin_mismatch": "The browser signed for another address. Open the vault at its public address and try again.",
+    "rp_id_mismatch": "The passkey was made for another site.",
+    "challenge_mismatch": "That registration request does not match. Start again.",
+    "user_not_present": "The authenticator did not confirm you were present.",
+    "user_not_verified": "The authenticator did not verify you (a PIN, fingerprint or face is required here).",
+    "algorithm_not_allowed": "This authenticator uses a signature algorithm this vault does not accept.",
+    "already_registered": "This passkey is already registered to your account.",
+    "attestation_refused": "The authenticator's attestation was not accepted.",
+    "attestation_unverifiable": "The authenticator's attestation could not be verified.",
+    "authenticator_not_allowed": "This make of authenticator is not allowed here.",
+    "malformed": "The browser's answer could not be read. Try again.",
+}
+
+
+class PasskeyRegisterOptionsRequest(BaseModel):
+    # The account password, required only for the first factor (an account with no factor yet proves its
+    # password, as the TOTP enrollment does); an account with a factor proves the account.second_factor step-up.
+    current_password: Optional[str] = Field(default=None, max_length=1024)
+
+
+class PasskeyRegisterVerifyRequest(BaseModel):
+    challenge_id: str = Field(min_length=1, max_length=64)
+    credential: dict
+    label: Optional[str] = Field(default=None, max_length=PASSKEY_LABEL_MAX)
+
+
+class PasskeyRenameRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=PASSKEY_LABEL_MAX)
+
+
+def _passkey_policy(db):
+    """What the administrator's passkey settings say, as the service needs it: the service's defaults until the
+    settings item lands (user verification required, ES256/RS256/EdDSA, attestation none)."""
+    from app.services import webauthn_service as ws
+    return ws.PasskeyPolicy()
+
+
+def _passkey_relying_party(db):
+    """The vault as a relying party, or 409: passkeys are bound to the vault's public address, and an address
+    with no host name (or an IP address) cannot carry them."""
+    from app.services import webauthn_service as ws
+    from app.config.effective import get_effective_branding
+    try:
+        name = (get_effective_branding(db).app_name or "").strip()
+    except Exception:      # noqa: BLE001
+        name = ""
+    rp = ws.relying_party(name or "DockVault")
+    if rp is None:
+        from app.core import public_url
+        raise HTTPException(status_code=409, detail=(
+            "Passkeys need the vault's public address. " + (public_url.why_no_passkeys() or "Try again.")))
+    return rp
+
+
+def _passkey_time(value) -> Optional[str]:
+    return value.isoformat() + "Z" if value else None
+
+
+def _passkey_public(row, now=None) -> dict:
+    """The shape the profile and the Users page show. Never the public key or the credential id."""
+    now = now or datetime.utcnow()
+    provisional = bool(row.provisional_until and row.provisional_until > now)
+    return {"id": str(row.id), "label": row.label or "", "created_at": _passkey_time(row.created_at),
+            "last_used_at": _passkey_time(row.last_used_at), "synced": bool(row.backup_eligible),
+            "transports": list(row.transports or []), "algorithm": _PASSKEY_ALG_NAMES.get(row.cose_alg, str(row.cose_alg)),
+            "provisional": provisional, "provisional_until": _passkey_time(row.provisional_until) if provisional else None}
+
+
+def _passkey_label(text) -> Optional[str]:
+    """The person's own text for a key: printable characters only, trimmed, at most PASSKEY_LABEL_MAX."""
+    if text is None:
+        return None
+    cleaned = "".join(ch for ch in str(text) if ch.isprintable()).strip()
+    return cleaned[:PASSKEY_LABEL_MAX] or None
+
+
+def _passkeys_of(db, user_id, *, include_retired: bool = False) -> list:
+    from app.core.models import WebAuthnCredential
+    q = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == user_id)
+    if not include_retired:
+        q = q.filter(WebAuthnCredential.retired_at.is_(None))
+    return q.order_by(WebAuthnCredential.created_at.asc()).all()
+
+
+def _passkey_of(db, user_id, passkey_id):
+    """The account's unretired passkey ``passkey_id``, or 404."""
+    from app.core.models import WebAuthnCredential
+    row = db.query(WebAuthnCredential).filter(WebAuthnCredential.id == passkey_id,
+                                              WebAuthnCredential.user_id == user_id).first()
+    if row is None or row.retired_at is not None:
+        raise HTTPException(status_code=404, detail="That passkey was not found.")
+    return row
+
+
+def _passkey_provisional_until(db, user_id, now):
+    """When a passkey registered now stops being provisional: 14 days after the latest change an administrator
+    (or the host operator) made to the account's sign-in details, or None when there was none in the window. A
+    change the account made to itself is never recorded as one (app/core/credential_changes.py)."""
+    from app.core import credential_changes as cc
+    last = cc.last_applied(db, user_id, now)
+    return last.applied_at + cc.WINDOW if last is not None and last.applied_at else None
+
+
+def _passkey_refuse_temp(user) -> None:
+    if getattr(user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot manage passkeys.")
+
+
+def _passkey_first_proof(db, user, request, current_password) -> None:
+    """The proof a registration needs: an account with a factor presents the account.second_factor step-up (a
+    code, a recovery code, or later a passkey); one with none proves its password in the body, as the TOTP
+    enrollment does. An account with neither a factor nor a password (signed in only through a provider) must
+    wait for the provider re-authentication step-up."""
+    from app.core.active_factors import active_factors
+    from app.core.security import verify_password
+    if active_factors(db, user.id).any:
+        _enforce_step_up(db, user, request, "account.second_factor")
+        return
+    if not user.password_hash:
+        raise HTTPException(status_code=409, detail=(
+            "Your account has no password and no second factor yet, so it cannot prove this request here. "
+            "Ask an administrator to set a password, or wait for the identity-provider confirmation step-up."))
+    if not current_password or not verify_password(current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+
+
+def _passkey_notice(db, user, title: str, change: str) -> None:
+    """Tell the owner what they just did to their own passkeys: in the app, and by email when the account has an
+    address and email is configured. Best-effort, after the commit."""
+    try:
+        _notify_users([str(user.id)], "account_changed", title=title,
+                      body=f"{change} If you did not do this, remove what you do not recognize and change your password.",
+                      target="#profile")
+    except Exception as e:      # noqa: BLE001
+        print(f"⚠ passkey notice skipped: {type(e).__name__}")
+    try:
+        if (user.email or "").strip():
+            _fire_action_email(db, "sign_in_method_changed", email=user.email, username=user.username,
+                               action_context={"change": change, "when": _change_time_text()})
+    except Exception as e:      # noqa: BLE001
+        print(f"⚠ passkey email skipped: {type(e).__name__}")
+
+
+def _passkey_last_factor_refusal(db, user, row) -> Optional[str]:
+    """Why ``row`` may not be removed now, or None: it would leave an account whose policy requires a second
+    factor with none, or the last factor of an account that signs in only through a provider."""
+    from app.core.active_factors import active_factors
+    factors = active_factors(db, user.id)
+    others = factors.passkeys - 1 if row.retired_at is None else factors.passkeys
+    if factors.code or others > 0:
+        return None
+    if _second_factor_effective(db, user)["required"]:
+        return ("A second factor is required for your account, and this is its last one. Add another passkey or "
+                "set up an authenticator app first.")
+    if getattr(user, "sso_only", False):
+        return ("Your account signs in only through single sign-on and needs a passkey or an authenticator app for "
+                "the actions that ask for a second proof. Add another one first.")
+    return None
+
+
+def _passkey_audit(db, user, request, action: str, details: dict, status: str = "success") -> None:
+    try:
+        AuditLogger(db).log_action(action=action, status=status, user=user, ip_address=get_client_ip(request),
+                                   details=details)
+    except Exception:      # noqa: BLE001
+        pass
+
+
+@app.post("/users/me/passkeys/register/options")
+async def passkey_register_options(
+    body: PasskeyRegisterOptionsRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Start registering a passkey for the caller's own account: the proof the account owes (the step-up, or the
+    password for a first factor), the account's limit, then a fresh challenge and the options the browser hands
+    to ``navigator.credentials.create``. The answer says whether the key will be provisional (registered within
+    14 days after an administrator changed this account's sign-in details)."""
+    from app.core import webauthn_challenges
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    from app.services import webauthn_service as ws
+    _passkey_refuse_temp(current_user)
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    _passkey_first_proof(db, user, request, body.current_password)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=PASSKEY_OPTIONS_LIMIT,
+                                                 window=PASSKEY_OPTIONS_WINDOW, prefix="passkey_register",
+                                                 fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many registration attempts. Try again later.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, PASSKEY_OPTIONS_WINDOW))})
+    existing = _passkeys_of(db, user.id)
+    if len(existing) >= PASSKEY_LIMIT:
+        raise HTTPException(status_code=409, detail=f"An account can hold {PASSKEY_LIMIT} passkeys. Remove one first.")
+    rp = _passkey_relying_party(db)
+    policy = _passkey_policy(db)
+    try:
+        challenge = webauthn_challenges.issue(webauthn_challenges.REGISTER, user_id=str(user.id))
+    except webauthn_challenges.Unavailable:
+        raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
+    now = datetime.utcnow()
+    options = ws.registration_options(rp, policy, challenge=challenge.challenge_bytes, user_id=ws.user_handle_for(user.id),
+                                      username=user.username, display_name=None,
+                                      existing=[(c.credential_id, tuple(c.transports or ())) for c in existing])
+    return {"challenge_id": challenge.id, "options": options, "expires_in": webauthn_challenges.TTL_SECONDS,
+            "provisional": _passkey_provisional_until(db, user.id, now) is not None}
+
+
+@app.post("/users/me/passkeys/register/verify", status_code=201)
+async def passkey_register_verify(
+    body: PasskeyRegisterVerifyRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Finish registering a passkey: spend the challenge (one ceremony, this account), verify the browser's
+    answer against the vault's origin and policy, store the key, and tell the owner. The row is provisional when
+    an administrator changed this account's sign-in details in the last 14 days."""
+    from app.core import webauthn_challenges
+    from app.core.models import WebAuthnCredential
+    from app.services import webauthn_service as ws
+    _passkey_refuse_temp(current_user)
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        challenge = webauthn_challenges.take(body.challenge_id, purpose=webauthn_challenges.REGISTER)
+    except webauthn_challenges.Unavailable:
+        raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
+    if challenge is None or challenge.user_id != str(user.id):
+        raise HTTPException(status_code=400, detail={
+            "reason": "challenge_unknown", "message": "That registration request is unknown or has expired. Start again."})
+    existing = _passkeys_of(db, user.id)
+    if len(existing) >= PASSKEY_LIMIT:
+        raise HTTPException(status_code=409, detail=f"An account can hold {PASSKEY_LIMIT} passkeys. Remove one first.")
+    rp = _passkey_relying_party(db)
+    policy = _passkey_policy(db)
+    try:
+        key = ws.verify_registration(rp, policy, challenge=challenge.challenge_bytes, credential=body.credential,
+                                     existing_ids=[c.credential_id for c in existing])
+    except ws.Refused as refused:
+        _passkey_audit(db, user, request, "passkey_registration_failed", {"reason": refused.code}, status="failure")
+        raise HTTPException(status_code=400, detail={
+            "reason": refused.code,
+            "message": _PASSKEY_REFUSALS.get(refused.code, "The browser's answer was not accepted. Try again.")})
+    if db.query(WebAuthnCredential.id).filter(WebAuthnCredential.credential_id == key.credential_id).first() is not None:
+        # The same authenticator credential on another account (or retired on this one): one key, one account.
+        raise HTTPException(status_code=409, detail={
+            "reason": "already_registered", "message": "This passkey is already registered. Use another one."})
+    now = datetime.utcnow()
+    row = WebAuthnCredential(
+        id=uuid.uuid4(), user_id=user.id, credential_id=key.credential_id, public_key_cose=key.public_key_cose,
+        cose_alg=key.cose_alg, sign_count=key.sign_count, transports=list(key.transports) or None, aaguid=key.aaguid,
+        backup_eligible=key.backup_eligible, backup_state=key.backup_state, uv_initialized=key.uv_initialized,
+        discoverable=key.discoverable, label=_passkey_label(body.label), created_at=now,
+        created_by_session=_current_session_hash(request), provisional_until=_passkey_provisional_until(db, user.id, now))
+    db.add(row)
+    db.commit()
+    shown = _passkey_public(row, now)
+    _passkey_audit(db, user, request, "passkey_registered",
+                   {"passkey_id": str(row.id), "provisional": shown["provisional"]})
+    named = f"the passkey \"{shown['label']}\"" if shown["label"] else "a passkey"
+    change = f"You added {named} to your account."
+    if shown["provisional"]:
+        change += (" It was added within 14 days after an administrator changed your sign-in details, so it is "
+                   "provisional: it signs you in, but does not count for the actions that need your own factor "
+                   f"until you confirm it with an older factor or until {row.provisional_until.date().isoformat()}.")
+    _passkey_notice(db, user, "A passkey was added to your account", change)
+    return shown
+
+
+@app.get("/users/me/passkeys")
+async def list_my_passkeys(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The caller's own passkeys (never a retired one), oldest first, with the account's limit."""
+    _passkey_refuse_temp(current_user)
+    now = datetime.utcnow()
+    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT}
+
+
+@app.patch("/users/me/passkeys/{passkey_id}")
+async def rename_my_passkey(
+    passkey_id: uuid.UUID,
+    body: PasskeyRenameRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Give one of the caller's passkeys a new name."""
+    _passkey_refuse_temp(current_user)
+    row = _passkey_of(db, current_user.id, passkey_id)
+    label = _passkey_label(body.label)
+    if label is None:
+        raise HTTPException(status_code=400, detail="The name must have at least one printable character.")
+    row.label = label
+    db.commit()
+    _passkey_audit(db, current_user, request, "passkey_renamed", {"passkey_id": str(row.id)})
+    return _passkey_public(row)
+
+
+@app.delete("/users/me/passkeys/{passkey_id}")
+@require_step_up("account.second_factor")
+async def remove_my_passkey(
+    passkey_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove one of the caller's passkeys, under the account.second_factor step-up. Refused (409) when it is the
+    last factor of an account whose policy requires one, or of an account that signs in only through a provider.
+    Sessions stay: a passkey is a way in, not a session."""
+    _passkey_refuse_temp(current_user)
+    row = _passkey_of(db, current_user.id, passkey_id)
+    refusal = _passkey_last_factor_refusal(db, current_user, row)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
+    label = row.label or ""
+    passkey_id_text = str(row.id)
+    db.delete(row)
+    db.commit()
+    _passkey_audit(db, current_user, request, "passkey_removed", {"passkey_id": passkey_id_text})
+    named = f"the passkey \"{label}\"" if label else "a passkey"
+    _passkey_notice(db, current_user, "A passkey was removed from your account",
+                    f"You removed {named} from your account.")
+    return {"removed": True}
+
+
+@app.post("/users/me/passkeys/{passkey_id}/confirm")
+@require_step_up("account.second_factor")
+async def confirm_my_passkey(
+    passkey_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The owner confirms a provisional passkey, in a session that proved the account.second_factor step-up with
+    a factor older than it (an authenticator app, a recovery code, or an older passkey): it becomes ordinary.
+    Refused (409) when the account holds nothing older to confirm it with."""
+    from app.core.active_factors import active_factors
+    _passkey_refuse_temp(current_user)
+    row = _passkey_of(db, current_user.id, passkey_id)
+    now = datetime.utcnow()
+    if not (row.provisional_until and row.provisional_until > now):
+        return _passkey_public(row, now)
+    factors = active_factors(db, current_user.id)
+    older = [k for k in _passkeys_of(db, current_user.id)
+             if k.id != row.id and k.created_at and k.created_at < row.created_at
+             and not (k.provisional_until and k.provisional_until > now)]
+    if not factors.code and not older:
+        raise HTTPException(status_code=409, detail=(
+            "Nothing older can vouch for this passkey: your account has no authenticator app and no earlier "
+            "passkey. It becomes ordinary on its own when its provisional period ends."))
+    row.provisional_until = None
+    db.commit()
+    _passkey_audit(db, current_user, request, "passkey_confirmed", {"passkey_id": str(row.id)})
+    return _passkey_public(row, now)
+
+
+@app.get("/users/{user_id}/passkeys")
+@require_endpoint_permission("USER_MANAGE")
+async def admin_list_passkeys(
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin: a user's passkeys (never a retired one), in the same shape the owner sees."""
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    now = datetime.utcnow()
+    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, target.id)], "limit": PASSKEY_LIMIT}
+
+
+@app.delete("/users/{user_id}/passkeys/{passkey_id}")
+@require_endpoint_permission("USER_MANAGE")
+@require_step_up("admin.user.manage")
+async def admin_remove_passkey(
+    user_id: uuid.UUID,
+    passkey_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin: remove (retire) one of a user's passkeys. A credential change under the two-person rule
+    (app/core/credential_changes.py): the second change to the same account within 14 days waits for another
+    administrator (202). The owner is told. An administrator never adds a passkey for someone else: there is no
+    route for it. Your own passkeys are removed from your profile, under that route's guards."""
+    from app.core import credential_changes as cc
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Remove your own passkeys from your profile.")
+    row = _passkey_of(db, target.id, passkey_id)
+    outcome = _credential_change(db, current_user, target, cc.PASSKEY,
+                                 summary=_request_summary(cc.PASSKEY, key_name=row.label or ""),
+                                 payload={"passkey_id": str(row.id)}, request=request)
+    if outcome.held:
+        db.commit()
+        _announce_held_change(db, outcome.change, target)
+        return JSONResponse(status_code=202, content=_held_body(outcome, target, current_user.id))
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="passkey_admin_removed", status="success", user=current_user,
+                                   resource_type="user", resource_id=str(target.id), ip_address=get_client_ip(request),
+                                   details={"target_username": target.username, "passkey_id": str(row.id)})
+    except Exception:      # noqa: BLE001
+        pass
+    _notify_credential_change(db, cc.PASSKEY, target, outcome.result, by_name=current_user.username)
+    return {"removed": True}
 
 
 # --- Second factor: admin policy matrix ------------------------------------------------------------
@@ -27212,6 +27676,8 @@ def _run_lightweight_migrations():
             *AUDIT_PRIVACY_POLICIES_DDL,
             # The recording notice an account last said it had read (see User in models.py). Nullable.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS privacy_seen_version INTEGER",
+            # The passkeys an auditor grant was approved with (see AuditorGrant in models.py). Nullable.
+            "ALTER TABLE auditor_grants ADD COLUMN IF NOT EXISTS approved_credential_ids JSON",
             # Notes are sealed at rest (a marker + ciphertext); a title that once fit String(255)
             # no longer does, so widen it (and the public-link title snapshot) to TEXT. Idempotent.
             "ALTER TABLE notes ALTER COLUMN title TYPE TEXT",

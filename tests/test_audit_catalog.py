@@ -39,6 +39,7 @@ PASS_THROUGH = {
     ("app/services/audit_logger.py", "log_custom_action"),
     ("app/services/audit_logger.py", "log_error"),
     ("app/api/api_server.py", "_audit_change"),
+    ("app/api/api_server.py", "_passkey_audit"),
     ("app/sftp/sftp_server.py", "_audit"),
     ("app/services/auth_service.py", "_lock_audit_row"),
     ("app/core/sign_in_lockout.py", "_audit_row"),

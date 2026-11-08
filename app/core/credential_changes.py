@@ -87,6 +87,7 @@ RESET_LINK = "reset_link"
 SECOND_FACTOR = "second_factor"
 EMAIL = "email"
 SSH_KEY = "ssh_key"
+PASSKEY = "passkey"
 
 # What each kind is called in a list, and the verb phrase a sentence uses ("alice asked to ...").
 KIND_LABELS = {
@@ -95,6 +96,7 @@ KIND_LABELS = {
     SECOND_FACTOR: "Second factor reset",
     EMAIL: "Email address change",
     SSH_KEY: "SSH key added",
+    PASSKEY: "Passkey removed",
 }
 KIND_PHRASES = {
     PASSWORD: "set a new password",
@@ -102,6 +104,7 @@ KIND_PHRASES = {
     SECOND_FACTOR: "reset the second factor",
     EMAIL: "change the email address",
     SSH_KEY: "add an SSH key",
+    PASSKEY: "remove a passkey",
 }
 
 MADE = "made"            # applied at once: the first change in the window

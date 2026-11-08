@@ -44,5 +44,8 @@ def _passkey_count(db, user_id) -> int:
     provisional one (registered soon after an administrator changed the account's sign-in details) counts
     here, as a factor for signing in; the compliance step-ups ask about it separately."""
     from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not has_table(db, WebAuthnCredential.__tablename__):
+        return 0
     return db.query(WebAuthnCredential.id).filter(
         WebAuthnCredential.user_id == user_id, WebAuthnCredential.retired_at.is_(None)).count()

@@ -114,6 +114,21 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "sign_in_method_changed": {
+        "name": "Sign-in method changed",
+        "subject": "A change to how you sign in to {{vault.name}}",
+        "body_html": (
+            "<h2>A change to how you sign in</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>If this was you, no action is needed. If it was not, open your profile, remove what you do not "
+            "recognize, change your password and tell your administrators.</p>"
+            "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "share_created": {
         "name": "File / folder shared",
         "subject": "Something was shared with you on {{vault.name}}",
@@ -336,6 +351,9 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Optional — sent after an account is created.", OPTIONAL),
     ("login_alert", "New sign-in alert",
      "Optional — notify a user when their account signs in.", OPTIONAL),
+    ("sign_in_method_changed", "Sign-in method changed",
+     "Sent to a user when a passkey is added to or removed from their own account — says what and when.",
+     SYSTEM),
     ("share_created", "File / folder shared",
      "Optional — notify a recipient when something is shared with them.", OPTIONAL),
     ("receiver_upload_received", "Files received on an upload link",

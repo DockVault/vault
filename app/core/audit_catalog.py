@@ -61,6 +61,13 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("privacy_notice_seen", "sign_in", "Recording notice read", "info"),
     AuditAction("logout", "sign_in", "Signed out", "info"),
     AuditAction("session_extended", "sign_in", "Signed-in session extended", "info"),
+    AuditAction("passkey_registered", "sign_in", "Passkey added", "notice"),
+    AuditAction("passkey_registration_failed", "sign_in", "Passkey registration refused", "warning"),
+    AuditAction("passkey_renamed", "sign_in", "Passkey renamed", "info"),
+    AuditAction("passkey_confirmed", "sign_in", "Provisional passkey confirmed", "notice"),
+    AuditAction("passkey_removed", "sign_in", "Passkey removed", "notice"),
+    # By an administrator (through the two-person rule) or by an approved request.
+    AuditAction("passkey_admin_removed", "sign_in", "Passkey removed for another user", "warning"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),
     # By an administrator or by the server's operator on the host: the label names neither.
