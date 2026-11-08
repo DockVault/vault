@@ -15,8 +15,10 @@ each kind of account, and the count of what waits for an administrator.
 Waits are on state, never on time (the timing rules of the browser tests).
 """
 import io
+import json
 import re
 import zipfile
+from datetime import datetime
 
 import pytest
 from playwright.sync_api import Browser, Page, expect
@@ -465,8 +467,14 @@ def test_an_auditor_reads_activity_reveals_a_recorded_name_and_selects_a_case(br
         sheet = page.locator("#cmp-reveal-sheet.active")
         sheet.locator("select").select_option("internal_investigation")
         sheet.locator("textarea").fill("Checking who uploaded the file named in the incident ticket.")
-        sheet.locator(".cmp-reveal-go").click()
+        with page.expect_request(lambda r: r.url.endswith(f"/activity/events/{event}/reveal"),
+                                 timeout=15000) as sent:
+            sheet.locator(".cmp-reveal-go").click()
         expect(sheet.locator(".cmp-reveal-result")).not_to_be_empty(timeout=15000)
+        # The event's time goes with it: an event of an archived day is looked for in the hour it names.
+        at = json.loads(sent.value.post_data)["at"]
+        stored = float(psql(f"SELECT extract(epoch FROM timestamp) FROM audit_logs WHERE id = '{event}'"))
+        assert at and abs(datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp() - stored) < 0.001, (at, stored)
         done = psql("SELECT count(*) FROM audit_logs WHERE action = 'audit_name_revealed' "
                     f"AND details->>'event_id' = '{event}'")
         assert done == "1", done

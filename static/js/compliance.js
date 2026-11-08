@@ -2181,7 +2181,9 @@
             go.disabled = true;
             msg.hidden = true;
             try {
-                const out = await cmp('/activity/events/' + encodeURIComponent(ev.id) + '/reveal', { json: { reason_category: cat.value, reason_text: text.value.trim() } });
+                // The event's time goes with it: an event of a day the archive keeps is looked for in the hour it names.
+                const body = { reason_category: cat.value, reason_text: text.value.trim(), at: ev.timestamp || null };
+                const out = await cmp('/activity/events/' + encodeURIComponent(ev.id) + '/reveal', { json: body });
                 const names = out.names || {};
                 const keys = Object.keys(names);
                 result.replaceChildren(keys.length ? lines(keys.map((k) => [k.replace(/_/g, ' '), names[k]]), 'cmp-revealed')

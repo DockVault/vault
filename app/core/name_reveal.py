@@ -16,7 +16,15 @@ outbox; later reveals that day fold into it). The reveal row is written even whe
 is what is accountable. COMPLIANCE_REVEALS_PER_DAY caps an auditor's reveals in a day; the auditor's account row is
 locked for the reveal, so two at once cannot pass the cap or both tell the owner.
 
-A refused reveal (no such event, no vault, a vault refused, the cap) is recorded, in a transaction of its own.
+A refused reveal (no such event, no vault, a vault refused, the cap, an archived event whose block could not be read)
+is recorded, in a transaction of its own.
+
+An event of a day the archive keeps as compressed blocks is no row of audit_logs any more: the reveal takes the
+event's time (``at``, which the page's details carry), and an id that is no row is looked for in the archived hour
+that time names, nowhere else (app/services/activity_archive.py archived_event), and revealed under the same rules as
+a row. Without a time, or with another hour's, it is no such event. While the server cannot tell which days are
+archived, a look in an hour that could be one raises activity_archive.Unread: the route answers 503 and records
+nothing, as the server, not the auditor, could not answer.
 """
 from __future__ import annotations
 
@@ -41,6 +49,7 @@ CAP = "reveal_cap"
 BAD_REASON = "bad_reason"
 NO_REASON = "no_reason"
 LONG_REASON = "reason_too_long"
+UNREADABLE = "event_unreadable"
 
 TEXTS = {
     NO_SUCH_EVENT: "There is no such event in the log.",
@@ -53,16 +62,19 @@ TEXTS = {
     BAD_REASON: "Choose the reason's category from the list.",
     NO_REASON: "Say why you reveal it.",
     LONG_REASON: f"Say why you reveal it in at most {REASON_MAX:,} characters.",
+    UNREADABLE: "This event's day is archived, and its block could not be read: whether the event is there cannot be "
+                "told.",
 }
 STATUS = {NO_SUCH_EVENT: 404, NO_VAULT: 409, VAULT_GONE: 409, ZERO_KNOWLEDGE: 403, PASSWORD_VAULT: 403,
-          READABLE: 409, CAP: 429, BAD_REASON: 422, NO_REASON: 422, LONG_REASON: 422}
+          READABLE: 409, CAP: 429, BAD_REASON: 422, NO_REASON: 422, LONG_REASON: 422, UNREADABLE: 409}
 
 
 class RevealRefused(Exception):
-    def __init__(self, reason: str, *, record: bool = True):
+    def __init__(self, reason: str, *, record: bool = True, text: Optional[str] = None):
         super().__init__(reason)
         self.reason = reason
         self.record = record
+        self._text = text
 
     @property
     def status(self) -> int:
@@ -70,7 +82,7 @@ class RevealRefused(Exception):
 
     @property
     def text(self) -> str:
-        return TEXTS.get(self.reason, self.reason)
+        return self._text or TEXTS.get(self.reason, self.reason)
 
 
 def utcnow() -> datetime:
@@ -110,15 +122,14 @@ def reveals_today(db, auditor, now: datetime) -> int:
         ComplianceReveal.auditor_id == auditor.id, ComplianceReveal.created_at >= day_start(now)).scalar() or 0)
 
 
-def reveal(db, auditor, event_id, *, reason_category: str, reason_text: str, now: Optional[datetime] = None) -> dict:
+def reveal(db, auditor, event_id, *, reason_category: str, reason_text: str, at: Optional[str] = None,
+           now: Optional[datetime] = None) -> dict:
     """Reveal ``event_id``'s recorded names to the live auditor ``auditor``, in the caller's transaction (the caller
-    commits before it answers). Returns {"event_id", "vault_id", "names": {key: value}, "not_in_full": [key]}.
-    Raises RevealRefused."""
-    from app.core import owner_notices
-    from app.core.audit_privacy import open_name
-    from app.core.models import AuditLog, ComplianceReveal, User, Vault
-    from app.core.security import seal_case_field
-    from app.services.activity_names import _recorded_names, readable_vault_ids
+    commits before it answers). ``at``: the event's time, which names the archived hour an id that is no row of
+    audit_logs is looked for in (see the module's docstring). Returns {"event_id", "vault_id", "names": {key: value},
+    "not_in_full": [key]}. Raises RevealRefused, and activity_archive.Unread and TooBroad (the server cannot answer)."""
+    from app.core.models import AuditLog, User
+    from app.services import activity_archive as archive
     now = now or utcnow()
     text = check_reason(reason_category, reason_text)
     # One reveal of this auditor at a time: the cap and the day's one notice hold under two at once.
@@ -128,8 +139,28 @@ def reveal(db, auditor, event_id, *, reason_category: str, reason_text: str, now
     except (TypeError, ValueError):
         raise RevealRefused(NO_SUCH_EVENT)
     row = db.get(AuditLog, eid)
-    if row is None:
+    if row is not None:
+        return _reveal_row(db, auditor, row, reason_category, text, now)
+    hour = archive.event_hour(at)
+    if hour is None:
         raise RevealRefused(NO_SUCH_EVENT)
+    try:
+        with archive.archived_event(db, eid, hour) as row:
+            if row is None:
+                raise RevealRefused(NO_SUCH_EVENT)
+            # Read while the search is open: its rows end with its transaction.
+            return _reveal_row(db, auditor, row, reason_category, text, now)
+    except archive.Unreadable as exc:
+        raise RevealRefused(UNREADABLE, text=str(exc))
+
+
+def _reveal_row(db, auditor, row, reason_category: str, text: str, now: datetime) -> dict:
+    """The reveal of ``row`` (of audit_logs, or of an archive search), written through the caller's session ``db``."""
+    from app.core import owner_notices
+    from app.core.audit_privacy import open_name
+    from app.core.models import ComplianceReveal, Vault
+    from app.core.security import seal_case_field
+    from app.services.activity_names import _recorded_names, readable_vault_ids
     vault_id = _event_vault(row)
     if vault_id is None:
         raise RevealRefused(NO_VAULT)

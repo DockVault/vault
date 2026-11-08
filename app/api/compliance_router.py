@@ -1586,7 +1586,8 @@ class _ClosingStreamingResponse(StreamingResponse):
 # --------------------------------------------------------------------------- revealing a recorded name, outside a case
 # (app/core/name_reveal.py)
 #
-#     POST /activity/events/{event_id}/reveal    {reason_category, reason_text}: the names the event recorded in full
+#     POST /activity/events/{event_id}/reveal    {reason_category, reason_text, at}: the names the event recorded in
+#                                                full (``at``: the event's time, for an event of an archived day)
 
 
 class RevealIn(BaseModel):
@@ -1594,6 +1595,8 @@ class RevealIn(BaseModel):
     # The reason is sealed whole: a longer one is refused (422), never cut short. Room for surrounding spaces,
     # which check_reason strips before it counts.
     reason_text: str = Field(..., min_length=1, max_length=4000)
+    # The event's time (its timestamp): an event of a day the archive keeps is looked for in the hour it names.
+    at: Optional[str] = Field(default=None, max_length=64)
 
 
 @router.post("/activity/events/{event_id}/reveal")
@@ -1602,16 +1605,26 @@ def reveal_event_names(event_id: uuid.UUID, body: RevealIn, current_user: User =
     """An event's names as the recording levels kept them in full, to an auditor whose right is in force, with a
     reason: never of a vault with a password or a zero-knowledge one, never a fingerprint turned into a value. The
     reveal, its sealed reason and, once a day per auditor and vault, the owner's notice commit before the names are
-    sent; a refusal is recorded."""
+    sent; a refusal is recorded. An event of an archived day is looked for in the hour its time (``at``) names;
+    while this server cannot tell which days are archived, a look in an hour that could be one is refused with 503
+    and Retry-After, and recorded as nothing (the server could not answer)."""
     from app.core import name_reveal
+    from app.services import activity_archive as archive
     limit_statements(db)
     try:
         out = name_reveal.reveal(db, current_user, event_id, reason_category=body.reason_category,
-                                 reason_text=body.reason_text)
+                                 reason_text=body.reason_text, at=body.at)
         db.commit()
     except name_reveal.RevealRefused as refused:
         db.rollback()
         if refused.record:
             name_reveal.record_refused(db, current_user, event_id, refused.reason)
         raise HTTPException(status_code=refused.status, detail={"reason": refused.reason, "text": refused.text})
+    except archive.Unread as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(exc),
+                            headers={"Retry-After": str(archive.UNREAD_RETRY_SECONDS)})
+    except archive.TooBroad as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
     return out

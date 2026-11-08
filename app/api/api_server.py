@@ -2820,8 +2820,9 @@ def activity_event(event_id: str,
     hour is searched as the Events list searches a range (app/services/activity_archive.py). An id that is a row is
     never looked for in the archive, and one that is no row is looked for only in that hour: without ``at`` it is
     not found. While this server cannot tell which days are archived, a look in an hour that could be one is refused
-    with 503 and Retry-After, as the list's read."""
-    from app.core import audit_range
+    with 503 and Retry-After, as the list's read; an event not found in an hour a block of which does not check out
+    is refused with 409, naming the day and why (as the list names a day it could not read), never said not to be
+    in the log."""
     from app.core.models import AuditLog
     from app.services import activity_archive as archive
     from app.services import activity_events as ev
@@ -2836,18 +2837,12 @@ def activity_event(event_id: str,
     if row is not None:
         return _activity_event_view(db, current_user, request, selection, row)
     # A route called as a function (the tests call it so) may leave ``at`` as its Query default: no time.
-    when = audit_range.as_naive_utc(at) if isinstance(at, str) else None
-    if when is None or archive.ids_are_rows(db, [event_id]):
-        raise missing
-    hour = when.replace(minute=0, second=0, microsecond=0)
-    try:
-        end = hour + timedelta(hours=1)
-    except OverflowError:
+    hour = archive.event_hour(at)
+    if hour is None or archive.ids_are_rows(db, [event_id]):
         raise missing
     try:
-        with archive.source(db, hour, end) as src:
-            e = src.entity
-            row = ev.build_events_query(src.db.query(e), e, **_case_filters(selection)).filter(e.id == wanted).first()
+        with archive.archived_event(db, wanted, hour, lambda session, e: ev.build_events_query(
+                session.query(e), e, **_case_filters(selection))) as row:
             if row is None:
                 raise missing
             # Read while the search is open: its rows end with its transaction.
@@ -2856,6 +2851,8 @@ def activity_event(event_id: str,
         raise HTTPException(status_code=400, detail=str(exc))
     except archive.Unread as exc:
         raise _archive_unread(exc)
+    except archive.Unreadable as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 def _activity_event_view(db, current_user, request, selection, row) -> dict:

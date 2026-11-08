@@ -17,8 +17,10 @@ offers a range to search it. The live list's reads of newer rows start where the
 the archive only when that point is in it; its reads of specific rows (``ids``: the new rows the live signal names,
 an open event's re-check) look the ids up in audit_logs first and reach the archive only for an id that is no row
 at all (ids_are_rows), and the page narrows an open event's re-check to the event's own instant. One event read on
-its own (``/activity/events/{id}``: a copied link, the details read again) is looked up in audit_logs first; an id
-that is no row is looked for in the archived hour its time names (the link and the details carry it), nowhere else.
+its own (``/activity/events/{id}``: a copied link, the details read again; and a reveal of its recorded names) is
+looked up in audit_logs first; an id that is no row is looked for in the archived hour its time names (the link,
+the details and the reveal carry it), nowhere else (archived_event). Not found there while a block of that hour does
+not check out, it is refused with the day and why (Unreadable), never said not to be in the log.
 
 The view and the transaction's snapshot are taken in that order: the snapshot first, then the view. A part the
 view names that the snapshot holds no block of was archived after the snapshot (its rows are then still rows in
@@ -513,6 +515,51 @@ def source(db, start: Optional[datetime], end: Optional[datetime], st=None, *,
         yield Source(s.db, s.entity, note)
 
 
+class Unreadable(LookupError):
+    """An event looked for on its own in an archived hour is not found there, and a block of that hour does not check
+    out (``days``: {day: why}, as the list names a day it could not read): whether the event is there cannot be told,
+    so it is never said not to be in the log."""
+
+    def __init__(self, days: Dict[str, str]):
+        self.days = dict(days)
+        named = "; ".join(f"{day} ({why})" for day, why in sorted(self.days.items()))
+        super().__init__(f"That event's day is archived, and its block could not be read: {named}. Whether the event "
+                         "is there cannot be told; the integrity status on the Activity page says what was found.")
+
+
+def event_hour(at) -> Optional[datetime]:
+    """The hour an event's time ``at`` names (its timestamp as the page carries it: ISO text, in UTC or with an
+    offset), or None: no time, one that cannot be read, or one in the calendar's last hour."""
+    from app.core import audit_range
+    when = audit_range.as_naive_utc(at) if isinstance(at, str) else None
+    if when is None:
+        return None
+    hour = when.replace(minute=0, second=0, microsecond=0)
+    try:
+        hour + HOUR
+    except OverflowError:
+        return None
+    return hour
+
+
+@contextlib.contextmanager
+def archived_event(db, wanted, hour: datetime, query: Optional[Callable] = None, st=None) -> Iterator[object]:
+    """The archived event of id ``wanted`` in the hour that starts at ``hour``, looked for as the Events list searches
+    a range (source() over [hour, hour + 1 h)): one event read on its own (a copied link, the details read again, a
+    reveal of its names) whose id is no row of audit_logs. ``query(session, entity)`` gives the query it is looked
+    for in (a selected case's filters); every row of the hour by default. Yields the row, to be read inside the
+    ``with`` (it ends with the search's transaction), or None. Raises Unread (the hour could be archived and the
+    archived days cannot be told), TooBroad, and Unreadable when it is not found and a block of the hour does not
+    check out."""
+    with source(db, hour, hour + HOUR, st) as src:
+        e = src.entity
+        q = query(src.db, e) if query is not None else src.db.query(e)
+        row = q.filter(e.id == wanted).first()
+        if row is None and src.note and src.note.get("unreadable"):
+            raise Unreadable({u["day"]: u["reason"] for u in src.note["unreadable"]})
+        yield row
+
+
 class Held:
     """A search an export streams from (``stack`` holds it open): its batches and its close one at a time. The
     response's background task may close it while a batch is still being read in a worker thread (the client went
@@ -689,6 +736,6 @@ def reaches_archive(start: Optional[datetime], end: Optional[datetime], st=None,
 
 
 __all__ = ["ARCHIVE_HEADERS", "MAX_BYTES", "MAX_DAYS", "MAX_ROWS", "Plan", "Search", "Source", "TooBroad",
-           "UNREAD_HEADER", "Unread", "archives", "band_archive", "check_budget", "could_reach", "headers_for",
-           "ids_are_rows", "oldest_archived", "parts_between", "plan", "reaches_archive", "read_archives", "search",
-           "snapshot_session", "source", "span", "unread_message"]
+           "UNREAD_HEADER", "Unread", "Unreadable", "archived_event", "archives", "band_archive", "check_budget",
+           "could_reach", "event_hour", "headers_for", "ids_are_rows", "oldest_archived", "parts_between", "plan",
+           "reaches_archive", "read_archives", "search", "snapshot_session", "source", "span", "unread_message"]

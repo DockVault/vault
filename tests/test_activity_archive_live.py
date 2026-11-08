@@ -10,7 +10,7 @@ rows over archived and kept days, sealed and archived by the server's own passes
 - the routes: the Events list says what it read of the archive, pages across the boundary and refuses a range
   beyond its bound; the export holds the archived rows, records how many archived days it read, and says when it
   left them out; the readers of rows only send the archive's span in their headers; one archived event is read on
-  its own with its time (a copied link, the details read again).
+  its own with its time (a copied link, the details read again), and an auditor reveals its recorded names with it.
 
 tests/test_activity_archive.py covers the rules offline.
 """
@@ -666,3 +666,120 @@ out["read"] = fresh.view_read
     assert held[0] == 503 and held[2] == {"Retry-After": "60"}, held
     assert held[1].startswith("The archived days of the audit log cannot be read yet"), held
     assert got["after"] is True and got["read"] is True, got
+
+
+def test_an_auditor_reveals_an_archived_event_s_recorded_names_with_its_time_on_postgres(throwaway):
+    """An event whose day is archived is no row of audit_logs any more: an auditor's reveal of its recorded names, with
+    the event's time, finds it in the archived hour that time names and reveals what was kept in full (a name kept only
+    as a fingerprint stays one), with the reveal's own audit row naming the archived event and its sealed reason.
+    Without the time, or in another hour, it is no such event, recorded as a refused reveal; while the chain cannot be
+    read, 503 with Retry-After and nothing recorded; a block that does not check out, 409 with its day, recorded."""
+    got = _script(throwaway, r'''
+from fastapi import HTTPException
+from app.api import compliance_router as cr
+from app.core.audit_privacy import seal_name
+from app.core.models import ComplianceReveal, Vault
+owner_id = add_user("olga", RoleEnum.USER)
+auditor_id = add_user("uma", RoleEnum.USER)
+db = SessionLocal()
+vault = Vault(id=uuid.uuid4(), name="Payroll", owner_id=owner_id, type="standard", password_hash=None, file_count=0,
+              total_size_bytes=0)
+db.add(vault)
+db.commit()
+vid = vault.id
+db.close()
+EID = uuid.uuid4()
+WHEN = at(ARCHIVED[1], 9, 17) + timedelta(microseconds=654321)
+FILE = "payroll-2026-" + uuid.uuid4().hex[:8] + ".xlsx"
+recorded = {"names": {"vault": str(vid), "values": {
+    "file_name": {"fp": "fp1:00000000:" + "0" * 32, "sealed": seal_name(vid, EID, "file_name", FILE)},
+    "folder_name": {"fp": "fp1:00000000:" + "1" * 32}}}}
+q("INSERT INTO audit_logs (id, action, status, channel, timestamp, username, user_id, ip_address, recorded, details, "
+  "resource_type, resource_id, seal_nonce, privacy_version) VALUES (:id, 'file_download', 'success', 'web', :t, "
+  "'olga', :uid, '203.0.113.9', CAST(:r AS jsonb), CAST(:d AS json), 'file', :rid, :n, 3)",
+  id=str(EID), t=WHEN, uid=str(owner_id), r=json.dumps(recorded), d=json.dumps({"vault_id": str(vid)}),
+  rid=str(uuid.uuid4()), n=os.urandom(16))
+# Rows on the other archived days, so that each is archived as on a working install.
+for day in ARCHIVED:
+    q("INSERT INTO audit_logs (id, action, status, timestamp, username, details, seal_nonce, privacy_version) "
+      "VALUES (:id, 'login_success', 'success', :t, 'dana', CAST('{}' AS json), :n, 3)", id=str(uuid.uuid4()),
+      t=at(day, 5, 1), n=os.urandom(16))
+out["stopped"] = passes()
+out["days"] = archive_all()
+out["still_row"] = q("SELECT count(*) FROM audit_logs WHERE id = :id", id=str(EID))[0][0]
+REASON = "Ticket SEC-2041: tracing the copy of the payroll file."
+
+
+def reveal(at_, event_id=EID):
+    db = SessionLocal()
+    try:
+        auditor = db.get(User, auditor_id)
+        body = cr.RevealIn(reason_category="security_incident", reason_text=REASON, at=at_)
+        return cr.reveal_event_names(event_id, body, current_user=auditor, db=db)
+    except HTTPException as exc:
+        return [exc.status_code, exc.detail, dict(exc.headers or {})]
+    finally:
+        db.close()
+
+
+def refused_rows():
+    return [r[0] for r in q("SELECT details->>'reason' FROM audit_logs WHERE action = 'audit_name_revealed' "
+                            "AND status = 'failure' ORDER BY timestamp")]
+
+
+at_ = WHEN.isoformat() + "+00:00"
+out["revealed"] = reveal(at_)
+out["file"] = FILE
+out["reveals"] = q("SELECT event_id::text, vault_id::text, reason_category, reason_text_enc LIKE '%SEC-2041%' "
+                   "FROM compliance_reveals")
+out["own_row"] = q("SELECT status, details->>'event_id', details->>'vault_id', details->>'count', resource_id, "
+                   "user_id::text, audit_logs::text LIKE '%SEC-2041%', audit_logs::text LIKE :f FROM audit_logs "
+                   "WHERE action = 'audit_name_revealed' AND status = 'success'", f="%" + FILE + "%")
+out["notice"] = q("SELECT count(*) FROM compliance_notice_outbox WHERE case_id IS NULL AND kind = 'reveal' "
+                  "AND user_id = :u", u=str(owner_id))[0][0]
+out["vid"] = str(vid)
+out["eid"] = str(EID)
+out["auditor"] = str(auditor_id)
+out["no_time"] = reveal(None)
+out["other_hour"] = reveal((WHEN - timedelta(hours=1)).isoformat() + "+00:00")
+out["refused_after"] = refused_rows()
+# A process that has just started, while another holds the chain's lock: refused, nothing recorded.
+ai.READ_WAIT_SECONDS = 0.5
+fresh = ai.ChainState()
+ai.set_state(fresh)
+holder = engine.connect()
+holder.execute(text("SELECT pg_advisory_lock(:c, :k)"), {"c": ai.CHAIN_LOCK[0], "k": ai.CHAIN_LOCK[1]})
+try:
+    out["held"] = reveal(at_)
+finally:
+    holder.execute(text("SELECT pg_advisory_unlock(:c, :k)"), {"c": ai.CHAIN_LOCK[0], "k": ai.CHAIN_LOCK[1]})
+    holder.close()
+out["refused_held"] = refused_rows()
+# The block of the event's day changed: refused with its day, recorded.
+q("UPDATE audit_archive_blocks SET payload = overlay(payload placing '\\xff'::bytea from 40 for 1) "
+  "WHERE day = :d", d=ARCHIVED[1])
+out["altered"] = reveal(at_)
+out["refused_altered"] = refused_rows()
+out["reveals_after"] = q("SELECT count(*) FROM compliance_reveals")[0][0]
+''')
+    assert got["stopped"] is None and len(got["days"]) == 4 and got["still_row"] == 0, got
+    revealed = got["revealed"]
+    assert revealed == {"event_id": got["eid"], "vault_id": got["vid"], "names": {"file_name": got["file"]},
+                        "not_in_full": ["folder_name"]}, revealed
+    assert got["reveals"] == [[got["eid"], got["vid"], "security_incident", False]], got["reveals"]
+    # The reveal's own audit row names the archived event, never the reason's text or the name it revealed.
+    assert got["own_row"] == [["success", got["eid"], got["vid"], "1", got["eid"], got["auditor"], False, False]], \
+        got["own_row"]
+    assert got["notice"] == 1, got
+    for key in ("no_time", "other_hour"):
+        assert got[key][0] == 404 and got[key][1]["reason"] == "no_such_event", (key, got[key])
+    assert got["refused_after"] == ["no_such_event", "no_such_event"], got
+    held = got["held"]
+    assert held[0] == 503 and held[2] == {"Retry-After": "60"}, held
+    assert held[1].startswith("The archived days of the audit log cannot be read yet"), held
+    assert got["refused_held"] == got["refused_after"], got
+    altered = got["altered"]
+    assert altered[0] == 409 and altered[1]["reason"] == "event_unreadable", altered
+    assert got["days"][1] in altered[1]["text"] and "no such event" not in altered[1]["text"], altered
+    assert got["refused_altered"] == ["no_such_event", "no_such_event", "event_unreadable"], got
+    assert got["reveals_after"] == 1, got
