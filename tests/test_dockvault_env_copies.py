@@ -251,14 +251,14 @@ def test_a_repoint_whose_copy_holds_the_key_the_database_was_sealed_with_goes_on
 
 # --------------------------------------------------------------------------- setup's 'point me at a .env'
 
-def _pointing(tmp_path, monkeypatch, env_is_fresh=False, answers=None):
+def _pointing(tmp_path, monkeypatch, env_is_fresh=False, answers=None, line_end="\n"):
     """Setup's existing-volume menu: option 2 with another set's .env, which verifies. Both files are written as
-    bytes, so what the tool keeps and installs is compared with exactly what was there (Path.write_text would end
-    the lines the platform's way)."""
-    current = _env_text("dvcurrent").encode("utf-8")
+    bytes, each line ended by `line_end`, so what the tool keeps and installs is compared with exactly what was there
+    (Path.write_text would end the lines the platform's way)."""
+    current = _env_text("dvcurrent").replace("\n", line_end).encode("utf-8")
     (tmp_path / ".env").write_bytes(current)
     src = tmp_path / "provided.env"
-    src.write_bytes(_env_text("dvprovided").encode("utf-8"))
+    src.write_bytes(_env_text("dvprovided").replace("\n", line_end).encode("utf-8"))
     replies = iter(answers or ["2", str(src)])
     monkeypatch.setattr(dv, "ask", lambda *a, **k: next(replies))
     monkeypatch.setattr(dv, "flush_stdin", lambda: None)
@@ -276,6 +276,17 @@ def test_pointing_setup_at_another_env_keeps_the_current_one_first(tmp_path, mon
     kept = tmp_path / ".env.dvcurrent"
     assert kept.read_bytes() == current, "the .env the host had is kept, under its set's name"
     assert "Kept the current .env as %s" % kept in " ".join(capsys.readouterr().out.split())
+
+
+def test_pointing_setup_at_another_env_keeps_and_installs_env_files_with_windows_line_ends_as_they_are(
+        tmp_path, monkeypatch):
+    """Both files saved with Windows line ends (by an editor on Windows, say): the current one is kept, and the one
+    pointed at installed, each exactly as it was."""
+    current, provided = _pointing(tmp_path, monkeypatch, line_end="\r\n")
+    assert current.count(b"\r\n") == current.count(b"\n") > 10
+    assert provided.count(b"\r\n") == provided.count(b"\n") > 10
+    assert (tmp_path / ".env").read_bytes() == provided
+    assert (tmp_path / ".env.dvcurrent").read_bytes() == current
 
 
 def test_pointing_setup_at_another_env_keeps_nothing_of_a_env_this_run_just_wrote(tmp_path, monkeypatch):

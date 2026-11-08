@@ -57,10 +57,13 @@ def _sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _backed_up(tmp_path, monkeypatch, prefix, lock=False, write=None):
+def _backed_up(tmp_path, monkeypatch, prefix, lock=False, write=None, env_bytes=None):
     """A backup of set `prefix` with Docker stubbed: each volume's archive written by `write` (a real tar.gz by
-    default). Returns the bundle."""
+    default). `env_bytes`, when given, is the host's .env, written as it is. Returns the bundle."""
     env = _env(tmp_path, prefix)
+    if env_bytes is not None:
+        (tmp_path / ".env").write_bytes(env_bytes)
+        env = dv.parse_env(env_bytes.decode("utf-8"))
     tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
     monkeypatch.setattr(dv, "volume_exists", lambda name, **k: not name.endswith("_vault_brand"))
     monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
@@ -272,6 +275,28 @@ def test_a_sealed_backup_with_its_manifest_as_sealed_restores(tmp_path, monkeypa
         _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt")))
     assert steps[0] == ("stop",) and ("start",) in steps
     assert (tmp_path / ".env").read_bytes() == host_env, "the .env installed is the one backed up, byte for byte"
+
+
+@pytest.mark.parametrize("lock", [False, True], ids=["plain", "sealed"])
+def test_a_backup_and_its_restore_keep_a_env_with_windows_line_ends_byte_for_byte(tmp_path, monkeypatch, lock):
+    """The host's .env saved with Windows line ends (by an editor on Windows, say): the backup carries it, plain or
+    sealed, byte for byte, and its restore puts back those very bytes."""
+    if lock:
+        pytest.importorskip("cryptography")
+    cfg = dict(_reusable_env_cfg(), volume_prefix="dvarchcrlf", deployment_id="dvarchcrlf")
+    host_env = ("\r\n".join(dv.build_env_lines(cfg)) + "\r\n").encode("utf-8")
+    bundle = _backed_up(tmp_path, monkeypatch, "dvarchcrlf", lock=lock, env_bytes=host_env)
+    if lock:
+        payload, dek = _sealed_payload(bundle)
+        assert dv.split_sealed_bundle_payload(payload, dek) == (host_env, True)
+    else:
+        assert (bundle / "env").read_bytes() == host_env
+    (tmp_path / ".env").unlink()
+    steps = []
+    _restoring_tool(tmp_path, monkeypatch, steps)._do_restore(
+        _restore_args(bundle, passphrase_file=str(tmp_path / "pass.txt") if lock else None))
+    assert ("start",) in steps
+    assert (tmp_path / ".env").read_bytes() == host_env
 
 
 def _sealed_payload(bundle, passphrase="seal-passphrase-1"):

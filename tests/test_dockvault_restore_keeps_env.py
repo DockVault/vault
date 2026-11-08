@@ -176,6 +176,23 @@ def test_a_restore_over_the_same_set_keeps_the_env_only_when_something_would_be_
         assert "Kept the current .env" not in said
 
 
+@pytest.mark.parametrize("same_set", [False, True], ids=["another-set", "the-same-set"])
+def test_a_restore_keeps_and_installs_env_files_with_windows_line_ends_byte_for_byte(tmp_path, monkeypatch,
+                                                                                     same_set):
+    """The current .env and the backup's saved with Windows line ends (by an editor on Windows, or a backup made from
+    such a .env): the current one is kept and the backup's installed, each exactly as it was. Over the same set, the
+    same lines with other line ends are other bytes: kept as well."""
+    theirs = _env_bytes(HERE if same_set else THERE).replace(b"\n", b"\r\n")
+    current = (theirs.replace(b"\r\n", b"\n") if same_set else _env_bytes(HERE).replace(b"\n", b"\r\n"))
+    (tmp_path / ".env").write_bytes(current)
+    bundle = _bundle(tmp_path, theirs)
+    _restore(_tool(tmp_path, monkeypatch, []), bundle)
+
+    assert (tmp_path / ".env").read_bytes() == theirs
+    assert _kept_files(tmp_path) == [".env." + HERE]
+    assert (tmp_path / (".env." + HERE)).read_bytes() == current
+
+
 def test_a_restore_onto_a_host_with_no_env_keeps_nothing(tmp_path, monkeypatch, capsys):
     theirs = _env_bytes(THERE)
     bundle = _bundle(tmp_path, theirs)

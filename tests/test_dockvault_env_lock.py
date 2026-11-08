@@ -351,6 +351,19 @@ def test_lock_seals_the_same_sets_edited_env_again(tmp_path):
     assert _opens_to(tmp_path, pf) == a + "WEB_HOST_PORT=8443\n"
 
 
+def test_lock_seals_the_same_sets_env_saved_again_with_windows_line_ends_as_it_is(tmp_path):
+    """The same set's .env, saved again with Windows line ends (by an editor on Windows, say): still the same set, so
+    lock seals it, and the sealed copy is that file byte for byte."""
+    a = _set_env("dvsetaaa")
+    pf = _sealed(tmp_path, a)
+    _app(tmp_path).unlock(_args(passphrase_file=pf))
+    saved = a.replace("\n", "\r\n") + "WEB_HOST_PORT=8443\r\n"
+    _put(tmp_path / ".env", saved)
+    _app(tmp_path).lock(_args(passphrase_file=pf))
+    assert not (tmp_path / ".env").exists()
+    assert _opens_to(tmp_path, pf) == saved
+
+
 def _refused_while_sealed(tmp_path, capsys, run):
     a = _set_env("dvsetaaa")
     pf = _sealed(tmp_path, a)
@@ -444,6 +457,17 @@ def test_unlock_force_over_the_same_sets_edited_env_keeps_it_first(tmp_path, cap
     assert "Kept the current .env (set 'dvsetaaa') as %s" % kept in said
     assert ("To go back to it: python dockvault.py volumes --non-interactive --action repoint --target-prefix "
             "dvsetaaa --env-source %s" % kept) in said
+
+
+def test_unlock_force_keeps_an_edited_env_with_windows_line_ends_byte_for_byte(tmp_path):
+    """A .env with Windows line ends sealed, and an edited one beside it saved the same way: unlock --force keeps the
+    edited one first and puts the sealed one back, each byte for byte."""
+    a = _set_env("dvsetaaa").replace("\n", "\r\n")
+    edited = a + "WEB_HOST_PORT=8443\r\n"
+    pf = _beside_the_seal(tmp_path, a, edited)
+    _app(tmp_path).unlock(_args(passphrase_file=pf, force=True))
+    assert _text(tmp_path / ".env") == a
+    assert _text(tmp_path / ".env.dvsetaaa") == edited
 
 
 def test_unlock_force_takes_the_number_after_the_copies_there(tmp_path):
