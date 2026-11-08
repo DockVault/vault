@@ -56,6 +56,10 @@ def test_the_note_link_page_names_the_wrong_secret(page: Page, kind):
 @pytest.mark.parametrize("kind", ["password", "pin"])
 def test_the_upload_page_asks_for_the_secret_without_a_stale_status(page: Page, tmp_path, kind):
     calls = _stub(page, "**/receivers/*/upload-session", kind)
+    # The page first asks what it may show (the deployment's name, the owner's message, whether a code is
+    # asked for); the stubbed link answers as a plain one, so the code is asked for at the upload itself.
+    page.route("**/receivers/*/page", lambda r: r.fulfill(status=200, content_type="application/json",
+                                                           body=json.dumps({"brand": "", "message": None, "secret_kind": "none"})))
     sample = tmp_path / "notes.txt"
     sample.write_text("hello\n", encoding="utf-8")
     page.goto("/u/stubbedtoken0123456789")

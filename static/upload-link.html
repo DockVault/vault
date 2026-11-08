@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
-  <title>Upload a file</title>
+  <title>Upload files</title>
   <link rel="icon" href="/static/favicon.ico">
   <style>
     :root {
@@ -30,7 +30,7 @@
              margin-bottom: 1rem; }
     h1 { font-size: 1.4rem; margin: 0 0 1rem; }
     label { display: block; font-size: .9rem; margin-bottom: .4rem; color: var(--muted); }
-    input[type="password"], input[type="text"], input[type="file"] {
+    input[type="password"], input[type="text"] {
       width: 100%; padding: .7rem .8rem; font-size: 1rem; border-radius: 8px;
       border: 1px solid var(--border); background: var(--bg); color: var(--text); margin-bottom: 1rem;
     }
@@ -39,6 +39,23 @@
       border: 0; border-radius: 8px; background: var(--accent); color: var(--accent-fg); cursor: pointer;
     }
     button:disabled { opacity: .6; cursor: default; }
+    button.quiet { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+    .owner-message { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 1rem; padding: .75rem .9rem; border-left: 3px solid var(--accent);
+                     background: color-mix(in srgb, var(--accent) 8%, transparent); border-radius: 6px; font-size: .95rem; }
+    /* The drop zone is the file input's label: a click opens the chooser, a drop adds the files. */
+    .drop { display: block; position: relative; border: 2px dashed var(--border); border-radius: 10px; padding: 1.4rem 1rem; text-align: center;
+            color: var(--muted); cursor: pointer; margin-bottom: 1rem; transition: border-color .12s, background .12s; }
+    .drop.over, .drop:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+    .drop strong { color: var(--text); }
+    .drop input[type="file"] { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+    .files { list-style: none; margin: 0 0 1rem; padding: 0; }
+    .files li { display: flex; align-items: center; gap: .6rem; padding: .45rem 0; border-bottom: 1px solid var(--border); font-size: .92rem; }
+    .files li:last-child { border-bottom: 0; }
+    .files .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .files .size, .files .state { color: var(--muted); font-size: .82rem; white-space: nowrap; }
+    .files .state.ok { color: var(--ok); }
+    .files .state.error { color: var(--danger); }
+    .files .remove { width: auto; padding: .1rem .5rem; font-size: .85rem; background: transparent; color: var(--muted); border: 1px solid var(--border); }
     .bar { height: 8px; border-radius: 6px; background: var(--border); overflow: hidden; margin: 1rem 0; }
     .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
     .msg { margin-top: 1rem; font-size: .92rem; }
@@ -48,25 +65,53 @@
             padding-top: .9rem; }
     .center { text-align: center; color: var(--muted); }
     .hidden { display: none; }
+    /* The receipt: what was delivered, when, and a reference the owner can find each file by. */
+    .receipt { width: 100%; border-collapse: collapse; font-size: .9rem; margin: .5rem 0 1rem; }
+    .receipt th, .receipt td { text-align: left; padding: .4rem .3rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .receipt th { color: var(--muted); font-weight: 500; font-size: .8rem; }
+    .receipt td.ref { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .receipt .renamed { color: var(--muted); font-size: .8rem; display: block; }
+    .receipt-actions { display: flex; gap: .6rem; }
+    .receipt-actions button { flex: 1 1 auto; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <div class="brand">Upload a file</div>
+      <div class="brand" id="brand">Upload files</div>
 
       <div id="loading" class="center">Loading&hellip;</div>
 
       <div id="form" class="hidden">
-        <h1 id="title">Send a file</h1>
+        <h1 id="title">Send files</h1>
+        <p id="owner-message" class="owner-message hidden"></p>
         <label id="secret-label" class="hidden" for="secret-input">This link is protected. Enter the code.</label>
         <input id="secret-input" class="hidden" type="password" autocomplete="off" inputmode="text" />
-        <label for="file-input">Choose a file</label>
-        <input id="file-input" type="file" />
+        <label class="drop" id="drop" for="file-input">
+          <strong>Choose files</strong> or drop them here<br>
+          <span id="drop-hint">Several at once is fine.</span>
+          <input id="file-input" type="file" multiple />
+        </label>
+        <ul id="files" class="files"></ul>
         <div class="bar hidden" id="bar"><div id="bar-fill"></div></div>
-        <button id="upload-btn" type="button">Upload</button>
+        <button id="upload-btn" type="button" disabled>Upload</button>
         <div id="msg" class="msg hidden"></div>
-        <div class="meta">Your file is sent directly to the owner of this link. Do not upload anything you were not asked to.</div>
+        <div class="meta">Your files are sent directly to the owner of this link. Do not upload anything you were not asked to.</div>
+      </div>
+
+      <!-- The receipt, once everything chosen has been sent. -->
+      <div id="receipt" class="hidden">
+        <h1>Delivered</h1>
+        <p id="receipt-intro" class="center"></p>
+        <table class="receipt" aria-label="What was delivered">
+          <thead><tr><th>File</th><th>Size</th><th>Delivered</th><th>Reference</th></tr></thead>
+          <tbody id="receipt-rows"></tbody>
+        </table>
+        <p class="meta" style="margin-top:0; border:0; padding-top:0;">Keep the references: the owner can find each file by them. A file whose name was already taken was stored under a new name, shown here.</p>
+        <div class="receipt-actions">
+          <button id="more-btn" type="button" class="quiet">Send more files</button>
+          <button id="print-btn" type="button" class="quiet">Print this receipt</button>
+        </div>
       </div>
 
       <div id="notice" class="hidden center"></div>
@@ -74,6 +119,6 @@
       <p class="meta recording-link"><a href="/recording" target="_blank" rel="noopener">What this vault records</a></p>
     </div>
   </div>
-  <script src="/static/js/upload-link.js?v=20260926b" defer></script>
+  <script src="/static/js/upload-link.js?v=20261108b" defer></script>
 </body>
 </html>

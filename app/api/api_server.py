@@ -12933,6 +12933,7 @@ def _notelink_public_dict(link, tag=None) -> dict:
         "last_viewed_at": link.last_viewed_at.isoformat() if link.last_viewed_at else None,
         "revoked": bool(link.revoked),
         "has_token_copy": link.token_enc is not None,   # presence flag only; the blob is never listed
+        "message": link.message or None,
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
     }
@@ -12997,6 +12998,31 @@ def _notelink_clear_fails(token: str) -> None:
             pass
 
 
+_LINK_MESSAGE_MAX = 500
+
+
+def _link_message(raw) -> Optional[str]:
+    """An owner's message for a public page: plain text (the pages write it with textContent), control
+    characters dropped, at most _LINK_MESSAGE_MAX characters; None when there is nothing to say."""
+    if raw is None:
+        return None
+    text = "".join(ch for ch in str(raw) if ch == "\n" or ch >= " ").strip()
+    if not text:
+        return None
+    if len(text) > _LINK_MESSAGE_MAX:
+        raise HTTPException(status_code=400, detail=f"The message can be at most {_LINK_MESSAGE_MAX} characters.")
+    return text
+
+
+def _brand_name(db: Session) -> str:
+    """The deployment's name, for a public page's heading."""
+    try:
+        from app.config.effective import get_effective_branding
+        return get_effective_branding(db).app_name or ""
+    except Exception:  # noqa: BLE001 - a page is still served without a name
+        return ""
+
+
 class NoteLinkCreate(BaseModel):
     note_id: uuid.UUID
     tag_id: uuid.UUID
@@ -13006,6 +13032,7 @@ class NoteLinkCreate(BaseModel):
     password: Optional[str] = None
     ttl_hours: Optional[int] = None
     max_uses: Optional[int] = None
+    message: Optional[str] = None
 
 
 class NoteLinkRedeem(BaseModel):
@@ -13090,7 +13117,7 @@ async def create_note_link(
         token_len=pol["token_len"],
         title_snapshot=note.title or "", body_snapshot=note.body or "",
         secret_kind=pol["secret_kind"], password_hash=password_hash,
-        expires_at=expires_at, max_uses=pol["max_uses"])
+        expires_at=expires_at, max_uses=pol["max_uses"], message=_link_message(payload.message))
     db.add(link)
     try:
         db.commit()
@@ -13434,7 +13461,8 @@ async def redeem_note_link(
     if peek:
         # A link with no secret, peeked at: the page shows its "Show note" button, nothing is spent.
         _audit("success", reason="peek", link_id=link.id)
-        return {"available": True, "secret_kind": link.secret_kind}
+        return {"available": True, "secret_kind": link.secret_kind,
+                "message": link.message or None, "brand": _brand_name(db)}
 
     # (2) Atomically consume one use under a WHERE guard so max-uses/expiry/revoke can't be raced.
     now = datetime.utcnow()
@@ -13451,7 +13479,7 @@ async def redeem_note_link(
         raise HTTPException(status_code=404, detail="This link is not available.")
     _audit("success", link_id=link.id)
     return {"title": link.title_snapshot or "", "body": link.body_snapshot or "",
-            "secret_kind": link.secret_kind}
+            "secret_kind": link.secret_kind, "message": link.message or None, "brand": _brand_name(db)}
 
 
 # ---------------------------------------------------------------------------
@@ -13828,6 +13856,7 @@ def _publiclink_public_dict(link, tag=None) -> dict:
         "bytes_served": link.bytes_served,
         "revoked": bool(link.revoked),
         "has_token_copy": link.token_enc is not None,   # presence flag only; the blob is never listed
+        "message": link.message or None,
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
         "last_used_at": link.last_used_at.isoformat() if link.last_used_at else None,
@@ -13871,6 +13900,7 @@ class PublicLinkCreate(BaseModel):
     password: Optional[str] = None
     ttl_hours: Optional[int] = None
     max_uses: Optional[int] = None
+    message: Optional[str] = None
 
 
 @app.post("/public-links")
@@ -13986,7 +14016,7 @@ async def create_public_link(
         owner_id=current_user.id, tag_id=tag.id, token_hash=token_hash, token_len=pol["token_len"],
         vault_id=vault.id, target_type=tt, target_file_id=tf_file, target_folder_id=tf_folder,
         secret_kind=pol["secret_kind"], password_hash=password_hash,
-        expires_at=expires_at, max_uses=pol["max_uses"])
+        expires_at=expires_at, max_uses=pol["max_uses"], message=_link_message(payload.message))
     db.add(link)
     try:
         db.commit()
@@ -14458,7 +14488,7 @@ async def redeem_public_link(
     if bool(getattr(payload, "peek", False)):
         # A visit is not a download: return metadata only, consuming no use and minting no grant.
         _audit("success", reason="peek", link_id=link.id)
-        return {**meta, "grant": None}
+        return {**meta, "message": link.message or None, "brand": _brand_name(db), "grant": None}
 
     # Mint the single-use download grant BEFORE consuming a use, so a Redis outage (→ 503) can never
     # burn a use: nothing is consumed until the grant is safely stored. Fail-closed — a grant that
@@ -14493,7 +14523,7 @@ async def redeem_public_link(
 
     # Names are the Standard vault's in-memory-decrypted plaintext (the ORM load event restores it).
     _audit("success", link_id=link.id)
-    return {**meta, "grant": grant}
+    return {**meta, "message": link.message or None, "brand": _brand_name(db), "grant": grant}
 
 
 def _publiclink_is_speculative(request) -> bool:
@@ -14940,6 +14970,8 @@ def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
         "expires_at": r.expires_at.isoformat() if r.expires_at else None,
         "max_uploads": r.max_uploads,
         "upload_count": r.upload_count,
+        "message": r.message or None,
+        "has_token_copy": r.token_enc is not None,   # presence flag only; the blob is never listed
         "max_file_bytes": r.max_file_bytes,
         "max_total_bytes": r.max_total_bytes,
         "retention_days": r.retention_days,
@@ -15043,6 +15075,7 @@ class ReceiverCreate(BaseModel):
     max_file_bytes: Optional[int] = None
     max_total_bytes: Optional[int] = None
     retention_days: Optional[int] = None
+    message: Optional[str] = None
 
 
 @app.post("/receivers")
@@ -15082,7 +15115,7 @@ async def create_receiver(
                             detail=f"You have reached your limit of {cap} active upload links. Revoke one first.")
 
     overrides = payload.model_dump(exclude_unset=True)
-    for k in ("tag_id", "label"):
+    for k in ("tag_id", "label", "message"):
         overrides.pop(k, None)
     try:
         pol = receiver_policy.resolve_receiver_policy(tag, overrides)
@@ -15140,7 +15173,7 @@ async def create_receiver(
         secret_kind=pol["secret_kind"], password_hash=password_hash, envelope=None,
         expires_at=expires_at, max_uploads=pol["max_uploads"],
         max_file_bytes=pol["max_file_bytes"], max_total_bytes=int(total_bytes),
-        retention_days=pol["retention_days"])
+        retention_days=pol["retention_days"], message=_link_message(payload.message))
     db.add(receiver)
     try:
         db.commit()
@@ -15551,6 +15584,116 @@ class ReceiverUploadOpen(BaseModel):
     secret: Optional[str] = None
 
 
+@app.get("/receivers/{token}/page")
+async def receiver_upload_page_info(token: str, request: Request, db: Session = Depends(get_db)):
+    """PUBLIC: what the upload page shows before anything is sent: the deployment's name, the owner's
+    message and whether the link asks for a code. Rate-limited like opening an upload; a missing or
+    unusable link returns the uniform 404 (no oracle)."""
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    client_ip = get_client_ip(request)
+    if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+    try:
+        allowed, _, reset = _rl.check_rate_limit(
+            identifier=source_of(client_ip), limit=_PUBLINK_REDEEM_IP_LIMIT,
+            window=_PUBLINK_REDEEM_IP_WINDOW, prefix="receiver_page", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, _PUBLINK_REDEEM_IP_WINDOW))})
+    if not receiver_policy.public_receivers_enabled(_global_settings_blob(db)):
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+    receiver = db.query(Receiver).filter(Receiver.token_hash == _receiver_token_hash(token)).first()
+    if receiver is None or _receiver_status(receiver) != "active":
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+    return {"brand": _brand_name(db), "message": receiver.message or None, "secret_kind": receiver.secret_kind}
+
+
+def _receiver_owner_or_404(db, receiver_id, current_user):
+    from app.core.temp_scope import is_scoped
+    if is_scoped(current_user) or getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=404, detail="Not found.")
+    r = db.query(Receiver).filter(Receiver.id == receiver_id, Receiver.owner_id == current_user.id).first()
+    if r is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return r
+
+
+@app.put("/receivers/{receiver_id}/token-copy")
+async def put_receiver_token_copy(
+    receiver_id: uuid.UUID, payload: LinkTokenCopyBody,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Store the owner-encrypted re-copy of an upload link's token (the opaque contract of
+    _valid_link_token_copy), as for public and note links: write-once, owner-only on an interactive
+    session, while the link still works (paused counts; revoked, expired or exhausted does not)."""
+    r = _receiver_owner_or_404(db, receiver_id, current_user)
+    if r.token_enc is not None:
+        raise HTTPException(status_code=409, detail="A re-copy is already stored for this link.")
+    if _receiver_status(r) not in ("active", "paused"):
+        raise HTTPException(status_code=409, detail="This link is no longer active.")
+    if not _valid_link_token_copy(payload.token_enc):
+        raise HTTPException(status_code=400, detail="Malformed re-copy blob.")
+    r.token_enc = payload.token_enc
+    db.commit()
+    return {"stored": True}
+
+
+@app.get("/receivers/{receiver_id}/token-copy")
+async def get_receiver_token_copy(
+    receiver_id: uuid.UUID,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """The stored re-copy, for the owner's browser to unwrap; gone with the link (uniform 404)."""
+    r = _receiver_owner_or_404(db, receiver_id, current_user)
+    if _receiver_status(r) not in ("active", "paused") or not r.token_enc:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return {"token_enc": r.token_enc}
+
+
+def _free_name_in_root(db, vault, name: str) -> str:
+    """The name an anonymous upload is stored under: the one it came with, or, when a file of that name
+    is already in the drop vault's root, the first free "name (2).ext", "name (3).ext", ... An anonymous
+    drop never overwrites and is never refused for a name it could not know was taken."""
+    from app.core.security import name_blind_index
+    import os as _os
+
+    def taken(candidate: str) -> bool:
+        return db.query(File.id).filter(File.vault_id == vault.id, File.folder_id.is_(None),
+                                        File.name_bi == name_blind_index(vault.id, candidate)).first() is not None
+
+    if not taken(name):
+        return name
+    stem, ext = _os.path.splitext(name)
+    for n in range(2, 1000):
+        candidate = f"{stem} ({n}){ext}"
+        if len(candidate) > 255:
+            candidate = f"{stem[:255 - len(ext) - len(f' ({n})')]} ({n}){ext}"
+        if not taken(candidate):
+            return candidate
+    return f"{stem} ({uuid.uuid4().hex[:8]}){ext}"
+
+
+def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
+    """The owner learns of an upload: an in-app notice, one an hour per link (the files are all in the
+    link's vault), and, when that notice was new and mail is set up, the optional email. Best-effort."""
+    try:
+        label = receiver.label or "an upload link"
+        bucket = datetime.utcnow().strftime("%Y%m%d%H")
+        notified = _notify_users(
+            [owner.id], "receiver_upload", f"Files received on {label}",
+            f"{file.original_name} arrived on your upload link. Open its vault to see everything received.",
+            target="#uploadlinks", dedup_prefix=f"receiver_upload:{receiver.id}:{bucket}")
+        if notified and owner.email:
+            from app.core.email_actions import send_action_email
+            base = _public_base_url(request) if request is not None else ""
+            send_action_email(db, "receiver_upload_received",
+                              recipient={"email": owner.email, "username": owner.username},
+                              action_context={"link": f"{base}/#uploadlinks", "label": label,
+                                              "file": file.original_name or "a file"})
+    except Exception:  # noqa: BLE001 - telling the owner never fails the upload
+        pass
+
+
 @app.post("/receivers/{token}/upload-session")
 async def open_receiver_upload_session(
     token: str,
@@ -15943,6 +16086,9 @@ async def receiver_complete_upload(
         if not fname:
             raise HTTPException(status_code=409, detail=(
                 "This upload could not be completed here. Cancel it and upload the file again."))
+        # A name already in the drop vault is renamed ("name (2).ext"), never refused and never overwritten.
+        sent_as = fname
+        fname = _free_name_in_root(db, vault, fname)
 
         file_info = None
 
@@ -16038,7 +16184,13 @@ async def receiver_complete_upload(
                          'file_name': file.original_name}, ip_address=get_client_ip(request))
         except Exception:
             pass
-        return {'id': str(file.id), 'name': file.original_name, 'size': file.size_bytes}
+        _tell_receiver_owner(db, request, receiver, owner, vault, file)
+        # The uploader's receipt: the stored name (renamed when it clashed), the size, when, and a reference
+        # the owner can find the file by (the start of its id, as File info shows it).
+        return {'id': str(file.id), 'name': file.original_name, 'size': file.size_bytes,
+                'renamed': file.original_name != sent_as, 'sent_as': sent_as,
+                'reference': str(file.id)[:8].upper(),
+                'received_at': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'}
     finally:
         receiver_transfer_admission.release(transfer_slot)
 
@@ -26539,6 +26691,12 @@ END $$;""",
             "ALTER TABLE credential_changes ADD COLUMN IF NOT EXISTS envelope_released_at TIMESTAMP",
             # Previews of shared files, counted apart from downloads (the model declares NOT NULL DEFAULT 0).
             "ALTER TABLE share_claims ADD COLUMN IF NOT EXISTS preview_count INTEGER NOT NULL DEFAULT 0",
+            # An owner's message on a public page, and the re-copy of an upload link's token (as the other
+            # links have). Nullable, no default; an older release ignores them.
+            "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS message TEXT",
+            "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS token_enc TEXT",
+            "ALTER TABLE public_links ADD COLUMN IF NOT EXISTS message TEXT",
+            "ALTER TABLE note_public_links ADD COLUMN IF NOT EXISTS message TEXT",
         ]
         with get_db_context() as db:
             recorder = _SchemaStepRecorder(db)

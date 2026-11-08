@@ -109,7 +109,8 @@ def test_create_and_redeem_no_secret_snapshot(admin, links_enabled):
     anon = admin.clone_anonymous()
     rr = anon.post(f"/note-links/{link['token']}/redeem", json={})
     assert rr.status_code == 200, rr.text
-    assert rr.json() == {"title": "Hello", "body": "body-v1", "secret_kind": "none"}
+    assert {k: rr.json()[k] for k in ("title", "body", "secret_kind")} == {"title": "Hello", "body": "body-v1", "secret_kind": "none"}
+    assert rr.json()["message"] is None and "brand" in rr.json()   # the owner's message (none here) and the deployment's name
 
     # Editing the source note does NOT change the snapshot.
     admin.patch(f"/notes/{note_id}", json={"body": "body-v2-edited"})
@@ -386,10 +387,11 @@ def test_a_peek_spends_nothing_and_only_the_redeem_spends_the_view(admin, links_
     assert page.status_code == 200 and "the body" not in page.text
     for _ in range(3):
         peek = anon.post(f"/note-links/{link['token']}/redeem", json={"peek": True})
-        assert peek.status_code == 200 and peek.json() == {"available": True, "secret_kind": "none"}
+        assert peek.status_code == 200 and peek.json()["available"] is True and peek.json()["secret_kind"] == "none"
+        assert "body" not in peek.json()
     assert card() == (0, 0, "active")
     shown = anon.post(f"/note-links/{link['token']}/redeem", json={})
-    assert shown.json() == {"title": "Look once", "body": "the body", "secret_kind": "none"}
+    assert {k: shown.json()[k] for k in ("title", "body", "secret_kind")} == {"title": "Look once", "body": "the body", "secret_kind": "none"}
     assert card() == (1, 1, "exhausted")
     # The next visitor's page peeks and is told the link is used up.
     assert anon.post(f"/note-links/{link['token']}/redeem", json={"peek": True}).status_code == 404

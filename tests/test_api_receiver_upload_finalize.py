@@ -148,12 +148,17 @@ def test_unknown_session_or_token_404(admin, receivers_enabled):
 
 
 # --- duplicate name ---------------------------------------------------------------------------------
-def test_duplicate_name_is_409(admin, receivers_enabled):
+def test_duplicate_name_is_stored_under_a_new_name(admin, receivers_enabled):
     rec = _mk_receiver(admin)
     anon = admin.clone_anonymous()
-    assert _upload(anon, rec["token"], "same.txt", b"first").status_code == 200
-    # a second file with the same name is refused (an anon drop never overwrites)
-    assert _upload(anon, rec["token"], "same.txt", b"second one").status_code == 409
+    first = _upload(anon, rec["token"], "same.txt", b"first")
+    assert first.status_code == 200 and first.json()["name"] == "same.txt"
+    # a second file with the same name is renamed, never refused and never overwriting (an anon drop has no
+    # delete authority, and cannot know which names are taken)
+    second = _upload(anon, rec["token"], "same.txt", b"second one")
+    assert second.status_code == 200, second.text
+    assert second.json()["name"] == "same (2).txt" and second.json()["renamed"] is True
+    assert admin.get(f"/vaults/{rec['vault_id']}/files/{first.json()['id']}/download").content == b"first"
 
 
 # --- revoke mid-upload ------------------------------------------------------------------------------

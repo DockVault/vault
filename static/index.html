@@ -688,6 +688,7 @@
                                 <button id="share-vault-btn" class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-link"/></svg> Share</button>
                                 <button id="public-links-btn" class="btn btn-secondary btn-sm" style="display:none;"><svg class="icon icon-sm"><use href="#i-globe"/></svg> Public links</button>
                                 <button id="copied-items-btn" class="btn btn-secondary btn-sm" type="button" hidden aria-haspopup="true"><svg class="icon icon-sm"><use href="#i-copy"/></svg> Copied Items <span class="ci-badge-count" id="copied-items-count">0</span></button>
+                                <button id="move-to-vault-btn" class="btn btn-secondary btn-sm" type="button" style="display:none;" title="Move the selected files (or everything here) into one of your vaults"><svg class="icon icon-sm"><use href="#i-move"/></svg> Move to vault</button>
                             </div>
                             <!-- Selection actions: laid over the toolbar row while files are selected, so the
                                  table below never moves, and Delete sits where no row's own controls are. -->
@@ -696,6 +697,7 @@
                                 <div class="bulk-bar-actions">
                                     <button id="files-bulk-copy" class="btn btn-sm btn-secondary" type="button" title="Add the selection to Copied Items, to paste elsewhere"><svg class="icon icon-sm"><use href="#i-copy"/></svg> Copy</button>
                                     <button id="files-bulk-cut" class="btn btn-sm btn-secondary" type="button" title="Add the selection to Copied Items, to move elsewhere"><svg class="icon icon-sm"><use href="#i-move"/></svg> Cut</button>
+                                    <button id="files-bulk-move-vault" class="btn btn-sm btn-secondary" type="button" style="display:none;" title="Move the selected files into one of your vaults"><svg class="icon icon-sm"><use href="#i-vault"/></svg> Move to vault</button>
                                     <button id="files-bulk-download" class="btn btn-sm btn-secondary" type="button"><svg class="icon icon-sm"><use href="#i-download"/></svg> Download</button>
                                     <button id="files-bulk-delete" class="btn btn-sm btn-danger" type="button"><svg class="icon icon-sm"><use href="#i-trash"/></svg> Delete</button>
                                     <button id="files-bulk-clear" class="btn btn-sm btn-ghost" type="button">Clear</button>
@@ -1089,6 +1091,11 @@
                                     <input type="text" id="rc-label" class="form-control" maxlength="120" placeholder="e.g. Contract from Acme">
                                 </div>
                                 <div class="form-group">
+                                    <label for="rc-message">Message on the upload page (optional)</label>
+                                    <textarea id="rc-message" class="form-control" rows="2" maxlength="500" placeholder="e.g. Please send the signed contract and the two invoices."></textarea>
+                                    <small class="form-help">Plain text, up to 500 characters. Anyone who opens the link reads it.</small>
+                                </div>
+                                <div class="form-group">
                                     <label for="rc-token-len">Link length (characters)</label>
                                     <input type="number" id="rc-token-len" class="form-control" min="6" max="64" style="max-width:160px;">
                                 </div>
@@ -1322,6 +1329,11 @@
                                     </label>
                                 </div>
                                 <div class="form-group">
+                                    <label for="note-public-message">Message on the page (optional)</label>
+                                    <textarea id="note-public-message" class="form-control" rows="2" maxlength="500" placeholder="e.g. Read this before our call."></textarea>
+                                    <small class="form-help">Plain text, up to 500 characters. Anyone who opens the link reads it.</small>
+                                </div>
+                                <div class="form-group">
                                     <label for="note-public-max-uses">Maximum views</label>
                                     <input type="number" id="note-public-max-uses" class="form-control" min="1" placeholder="unlimited" style="max-width:160px;">
                                 </div>
@@ -1406,6 +1418,11 @@
                                     <label class="checkbox-label" id="pfl-never-group" style="margin-top:.35rem;">
                                         <input type="checkbox" id="pfl-never"><span>Never expires</span>
                                     </label>
+                                </div>
+                                <div class="form-group">
+                                    <label for="pfl-message">Message on the page (optional)</label>
+                                    <textarea id="pfl-message" class="form-control" rows="2" maxlength="500" placeholder="e.g. The slides from Tuesday, as promised."></textarea>
+                                    <small class="form-help">Plain text, up to 500 characters. Anyone who opens the link reads it.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="pfl-max-uses">Maximum downloads</label>

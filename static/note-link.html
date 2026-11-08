@@ -49,6 +49,8 @@
     .msg { margin-top: 1rem; font-size: .92rem; }
     .msg.error { color: var(--danger); }
     .center { text-align: center; color: var(--muted); }
+    .owner-message { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 1rem; padding: .75rem .9rem; border-left: 3px solid var(--accent);
+                     background: color-mix(in srgb, var(--accent) 8%, transparent); border-radius: 6px; font-size: .95rem; text-align: left; }
     .hidden { display: none; }
   </style>
 </head>
@@ -69,6 +71,7 @@
 
       <!-- a link with no secret: the note is shown on this click, so loading the page spends nothing -->
       <div id="reveal" class="hidden">
+        <p id="owner-message-reveal" class="owner-message hidden"></p>
         <p class="center">A note has been shared with you. Showing it counts as one view of this link.</p>
         <button id="reveal-btn" type="button">Show note</button>
         <div id="reveal-error" class="msg error hidden"></div>
@@ -77,6 +80,7 @@
       <!-- content -->
       <div id="content" class="hidden">
         <h1 id="note-title"></h1>
+        <p id="owner-message" class="owner-message hidden"></p>
         <pre id="note-body" class="note-body"></pre>
         <div class="meta">A read-only snapshot shared with you. It may expire or stop working later.</div>
       </div>

@@ -7919,7 +7919,7 @@ let notifUnread = 0;
 
 // Map a server-supplied notification target to an in-app section. Targets are short server-controlled
 // tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
-const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes', '#users': 'users' };
+const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes', '#users': 'users', '#uploadlinks': 'uploadlinks' };
 // Targets that open a dialog rather than a page: a notice about the reader's own account (a password,
 // an email address or a second factor an administrator changed) opens "Your account".
 const _NOTIF_TARGET_OPEN = { '#profile': () => openUserSettingsModal() };
@@ -12328,6 +12328,8 @@ function updateFilesBulkBar() {
         || (folders.length > 0 && vaultCapAllowed('folder.delete'))));
     show('files-bulk-copy', !isZkVault(state.currentVault) && selected.some(i => _mayStage(i, 'copy')));
     show('files-bulk-cut', selected.some(i => _mayStage(i, 'move')));
+    // In a drop vault the selection bar covers the toolbar, so the triage action rides the bar too.
+    show('files-bulk-move-vault', state.vaultOpenedFrom === 'uploadlinks' && canWrite && vaultCapAllowed('file.delete') && files.length > 0);
     const all = document.getElementById('files-select-all');
     if (all && all.parentElement) all.parentElement.style.display = allowBulkSelect() ? '' : 'none';
     if (all) {
@@ -12585,6 +12587,75 @@ function _vaultPasswordFor(vaultId) {
 // (every staged item, ignoring selection). Each entry either stays staged (keepAfter) or leaves
 // after it succeeds -- so a KEPT copy can be pasted into many folders, and a single item can be
 // removed from the list without clearing the rest.
+// ---- Move to vault: triage of a drop vault ---------------------------------------------------------------
+// The files selected in the drop vault (or, with nothing selected, every file listed here) move into a vault the
+// owner can write to, by the same move request the Copied Items list uses, one file at a time, waiting when the
+// server asks to (a 429 with Retry-After).
+function _moveToVaultTargets() {
+    const selected = _selectedItems().filter(i => i.type !== 'folder');
+    if (selected.length) return selected;
+    return (state.visibleFiles || state.currentFiles || []).filter(i => i.type !== 'folder' && !i.in_progress);
+}
+
+async function openMoveToVaultModal() {
+    const targets = _moveToVaultTargets();
+    const summary = document.getElementById('mtv-summary');
+    const dest = document.getElementById('mtv-dest');
+    const err = document.getElementById('mtv-error');
+    if (err) err.hidden = true;
+    if (!targets.length) { showWarning('There is nothing here to move.'); return; }
+    const chosen = (state.selectedFileIds && state.selectedFileIds.size) > 0;
+    if (summary) summary.textContent = `${targets.length} file${targets.length === 1 ? '' : 's'} ${chosen ? 'selected' : 'in this folder'} will move out of this drop vault.`;
+    let vaults = [];
+    try { vaults = await apiRequest('/vaults', { silent: true }) || []; } catch (_) { vaults = []; }
+    const mine = vaults.filter(v => v.id !== (state.currentVault && state.currentVault.id)
+        && v.type !== 'zero_knowledge' && !v.has_password
+        && (v.is_owner || v.owner_id === (currentUser && currentUser.id) || v.can_write
+            || ['write', 'admin', 'owner'].includes(String(v.permission_level || v.access_level || '').toLowerCase())));
+    dest.replaceChildren();
+    if (!mine.length) {
+        const o = document.createElement('option'); o.value = ''; o.textContent = 'No vault of yours can take them (a standard vault without a password)';
+        dest.appendChild(o);
+        document.getElementById('mtv-move').disabled = true;
+    } else {
+        mine.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+        mine.forEach(v => { const o = document.createElement('option'); o.value = v.id; o.textContent = v.name || v.id; dest.appendChild(o); });
+        document.getElementById('mtv-move').disabled = false;
+    }
+    openModal('move-to-vault-modal');
+}
+
+async function runMoveToVault() {
+    const dest = document.getElementById('mtv-dest');
+    const err = document.getElementById('mtv-error');
+    const destId = dest && dest.value;
+    if (!destId) return;
+    const targets = _moveToVaultTargets();
+    const srcVault = state.currentVault;
+    if (!srcVault || !targets.length) return;
+    const btn = document.getElementById('mtv-move');
+    btn.disabled = true;
+    const headers = {};
+    const srcPw = _vaultPasswordFor(srcVault.id);
+    if (srcPw) headers['X-Vault-Password'] = srcPw;
+    let ok = 0;
+    const failures = [];
+    for (const f of targets) {
+        try {
+            await _pasteOne(f.name, `/vaults/${srcVault.id}/files/${f.id}/move`, { dest_vault_id: destId, dest_folder_id: null }, headers);
+            ok++;
+        } catch (e) {
+            failures.push(`${f.name}: ${(e && e.message) || 'failed'}`);
+        }
+    }
+    btn.disabled = false;
+    if (failures.length && err) { err.textContent = `Could not move ${failures.length}: ${failures.slice(0, 3).join('; ')}`; err.hidden = false; }
+    else closeModal();
+    if (ok) showSuccess(`Moved ${ok} file${ok === 1 ? '' : 's'}`);
+    if (state.selectedFileIds) state.selectedFileIds.clear();
+    await loadVaultFiles();
+}
+
 // One paste request. A 429 means the account's own copies or moves are ahead of this one, and the server says
 // how long to wait (Retry-After): this waits that long and tries again, up to PASTE_RETRIES times, saying so once.
 const PASTE_RETRIES = 3;
@@ -12686,6 +12757,12 @@ function setupFilesViewControls() {
     if (del) del.addEventListener('click', bulkDeleteFiles);
     const cp = document.getElementById('files-bulk-copy');
     if (cp) cp.addEventListener('click', () => bulkStageSelected('copy'));
+    const mtv = document.getElementById('move-to-vault-btn');
+    if (mtv) mtv.addEventListener('click', openMoveToVaultModal);
+    const mtvSel = document.getElementById('files-bulk-move-vault');
+    if (mtvSel) mtvSel.addEventListener('click', openMoveToVaultModal);
+    const mtvGo = document.getElementById('mtv-move');
+    if (mtvGo) mtvGo.addEventListener('click', runMoveToVault);
     const cut = document.getElementById('files-bulk-cut');
     if (cut) cut.addEventListener('click', () => bulkStageSelected('move'));
     const clear = document.getElementById('files-bulk-clear');
@@ -16716,6 +16793,9 @@ function applyVaultViewPermissions(isOwner, canWrite, canManage) {
     // "Public links" (manage my public file/folder links) shows when the feature is available. The
     // list itself is account-wide; the button just lives on the vault toolbar for discoverability.
     show(document.getElementById('public-links-btn'), !!state._pflEnabled && vaultShareable());
+    // Files received on an upload link are triaged out of the drop vault into a vault of the owner's.
+    show(document.getElementById('move-to-vault-btn'),
+         state.vaultOpenedFrom === 'uploadlinks' && canWrite && vaultCapAllowed('file.delete'));
     // Permissions is open to the owner AND managers (delegated administration);
     // Settings stays owner-only (rename/password/rotate/delete). Don't show dead tabs.
     // Gate on see_permissions specifically — the tab's initial GET /permissions is
@@ -21311,7 +21391,7 @@ async function _saveLinkReCopy(kind, link) {
         const ownerPub = await eccLib().importPublicKeyPEM(pub.public_key);
         const ownerId = link.owner_id || (currentUser && currentUser.id);
         const blob = await eccLib().wrapLinkTokenV2(link.token, ownerPub, { linkId: link.id, ownerId });
-        const base = kind === 'note' ? '/note-links/' : '/public-links/';
+        const base = kind === 'note' ? '/note-links/' : kind === 'receiver' ? '/receivers/' : '/public-links/';
         await apiRequest(base + link.id + '/token-copy',
             { method: 'PUT', body: JSON.stringify({ token_enc: blob }), silent: true });
         return { saved: true };
@@ -21348,7 +21428,7 @@ function _setLinkReCopyNote(resultElId, rc) {
 // AAD, link id || owner id, unchanged) -- otherwise every saved re-copy dies with the old key and
 // this branch becomes the only thing a user sees.
 async function _showLinkAgain(kind, id, urlPrefix) {
-    const base = kind === 'note' ? '/note-links/' : '/public-links/';
+    const base = kind === 'note' ? '/note-links/' : kind === 'receiver' ? '/receivers/' : '/public-links/';
     let resp;
     try { resp = await apiRequest(base + id + '/token-copy', { silent: true }); } catch (_e) { resp = null; }
     if (!resp || !resp.token_enc) { showError('No saved copy for this link.'); return; }
@@ -21717,6 +21797,7 @@ function _notePublicPayload() {
     else { const h = parseInt(_npEl('note-public-ttl').value, 10); if (Number.isFinite(h)) p.ttl_hours = h; }
     const mu = parseInt(_npEl('note-public-max-uses').value, 10);
     p.max_uses = Number.isFinite(mu) ? mu : null;
+    const message = (_npEl('note-public-message') && _npEl('note-public-message').value || '').trim(); if (message) p.message = message;
     return p;
 }
 
@@ -21904,6 +21985,7 @@ function _pflPayload() {
     else { const h = parseInt(_pflEl('pfl-ttl').value, 10); if (Number.isFinite(h)) p.ttl_hours = h; }
     const mu = parseInt(_pflEl('pfl-max-uses').value, 10);
     p.max_uses = Number.isFinite(mu) ? mu : null;
+    const message = (_pflEl('pfl-message') && _pflEl('pfl-message').value || '').trim(); if (message) p.message = message;
     return p;
 }
 
@@ -22180,6 +22262,7 @@ async function refreshReceiverAvailability() {
 
 // ---- Owner: my receivers ------------------------------------------------------------------------
 async function loadMyReceivers() {
+    if (_accountHasKeypair === null) await _refreshAccountKeypairFlag();
     setupReceiverUI();
     const host = _rcEl('receivers-list'); if (!host) return;
     host.replaceChildren(_el('div', 'spinner'));
@@ -22230,6 +22313,7 @@ function renderReceiverVaults(receivers) {
         const files = document.createElement('div'); files.className = 'text-tertiary text-xs';
         files.textContent = (r.max_uploads != null) ? ((r.upload_count || 0) + ' / ' + r.max_uploads + ' files') : ((r.upload_count || 0) + ' files');
         card.appendChild(files);
+        if (r.message) { const note = _el('div', 'text-secondary text-sm rc-message', r.message); note.title = 'Shown on the upload page'; card.appendChild(note); }
         const actions = document.createElement('div'); actions.className = 'rc-vault-actions flex gap-sm';
         const open = _el('button', 'btn btn-primary btn-sm', 'Open vault'); open.type = 'button';
         open.addEventListener('click', () => openVault(r.vault_id, { from: 'uploadlinks' }));
@@ -22248,6 +22332,12 @@ function renderReceiverVaults(receivers) {
             copy.title = 'Copy this upload link to the clipboard';
             copy.addEventListener('click', () => rcCopyUrl(known));
             actions.appendChild(copy);
+        } else if (r.has_token_copy && _accountHasKeypair !== false) {
+            // A re-copy wrapped to the owner's key is stored: unwrapped here, never by the server.
+            const again = _el('button', 'btn btn-secondary btn-sm', 'Copy link again'); again.type = 'button';
+            again.title = 'Unlock your key and copy this upload link again';
+            again.addEventListener('click', () => _showLinkAgain('receiver', r.id, '/u/'));
+            actions.appendChild(again);
         } else {
             const replace = _el('button', 'btn btn-secondary btn-sm', 'Replace link'); replace.type = 'button';
             replace.title = 'Mint a new URL for this drop vault. The old one stops working.';
@@ -22534,6 +22624,7 @@ function _rcPayload() {
     const t = _rcSelectedTag();
     const p = { tag_id: t.id };
     const label = (_rcEl('rc-label').value || '').trim(); if (label) p.label = label;
+    const message = (_rcEl('rc-message') && _rcEl('rc-message').value || '').trim(); if (message) p.message = message;
     const tok = parseInt(_rcEl('rc-token-len').value, 10); if (Number.isFinite(tok)) p.token_len = tok;
     const kind = _rcEl('rc-secret').value; p.secret_kind = kind;
     if (kind === 'pin') p.pin = (_rcEl('rc-pin').value || '').trim();
@@ -22571,6 +22662,9 @@ async function submitReceiver() {
         // give it back, and writing it to disk here would quietly undo that.
         rcSessionUrls[rec.id] = url;
         _rcShowLinkOnce(url, 'Create an upload link');
+        // Wrapped to the owner's own key when there is one, so the link can be copied again later.
+        _saveLinkReCopy('receiver', { id: rec.id, token: rec.token, owner_id: currentUser && currentUser.id })
+            .then((rc) => { _setLinkReCopyNote('rc-result', rc); if (rc.saved) loadMyReceivers(); });
         loadMyReceivers();
     } catch (e) {
         if (err) { err.textContent = (e && e.message) || 'Could not create the upload link.'; err.hidden = false; }
@@ -22625,6 +22719,8 @@ async function rcReplaceLink(r) {
         rcSessionUrls[r.id] = url;
         state._lastRcUrl = url;
         _rcShowLinkOnce(url, 'New upload link');
+        _saveLinkReCopy('receiver', { id: r.id, token: res.token, owner_id: currentUser && currentUser.id })
+            .then((rc) => { _setLinkReCopyNote('rc-result', rc); if (rc.saved) loadMyReceivers(); });
         loadMyReceivers();
     } catch (e) {
         showError((e && e.message) || 'Could not replace the link.');

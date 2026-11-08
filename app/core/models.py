@@ -1905,6 +1905,8 @@ class NoteLink(Base):
     # public key so only the owner's client can decrypt it ("Show link again"). The server stores it
     # OPAQUE and never decrypts it; NULL when the creating client stored none (one-time-show only).
     token_enc = Column(Text, nullable=True)
+    # A short plain-text message from the owner, shown on the public page (capped server-side).
+    message = Column(Text, nullable=True)
 
     # Frozen content snapshot. Text (not String(255)): sealed at rest like the note it copies; the
     # boot DDL widens the same column on an already-deployed DB.
@@ -1957,6 +1959,8 @@ class PublicLink(Base):
     # Owner-encrypted re-copy of the URL token (see NoteLink.token_enc). Opaque, client-wrapped,
     # server never decrypts; NULL when none was stored.
     token_enc = Column(Text, nullable=True)
+    # A short plain-text message from the owner, shown on the public page (capped server-side).
+    message = Column(Text, nullable=True)
 
     # The LIVE target. Cascades from vault/file/folder, so the link dies with what it points at.
     vault_id = Column(UUID(as_uuid=True), ForeignKey('vaults.id', ondelete='CASCADE'), nullable=False)
@@ -2081,6 +2085,10 @@ class Receiver(Base):
     revoked = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     last_upload_at = Column(DateTime, nullable=True)
+    # A short plain-text message from the owner, shown on the upload page (capped server-side).
+    message = Column(Text, nullable=True)
+    # Owner-encrypted re-copy of the URL token (see NoteLink.token_enc). Opaque, client-wrapped.
+    token_enc = Column(Text, nullable=True)
 
     __table_args__ = (
         Index('idx_receiver_owner', 'owner_id'),

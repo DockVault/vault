@@ -118,7 +118,10 @@ def test_a_note_link_stops_with_its_owner(admin, owner, links_on, tags, change):
         p = anon.post(f"/note-links/{token}/redeem", json={"peek": True})
         assert p.status_code == expected, ("peek", expected, p.status_code, p.text)
         if expected == 200:
-            assert p.json() == {"available": True, "secret_kind": "none"}, p.text
+            # The answer of a live link without a secret: available, no secret asked; beside it the page's own
+            # words (the owner's message, the deployment's name).
+            assert {k: p.json()[k] for k in ("available", "secret_kind")} == {"available": True, "secret_kind": "none"}, p.text
+            assert set(p.json()) <= {"available", "secret_kind", "message", "brand"}, p.text
         else:
             assert p.json()["detail"] == "This link is not available.", p.text
         r = anon.post(f"/note-links/{token}/redeem", json={})

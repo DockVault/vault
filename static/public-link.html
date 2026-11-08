@@ -50,6 +50,8 @@
     .msg { margin-top: 1rem; font-size: .92rem; }
     .msg.error { color: var(--danger); }
     .center { text-align: center; color: var(--muted); }
+    .owner-message { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 1rem; padding: .75rem .9rem; border-left: 3px solid var(--accent);
+                     background: color-mix(in srgb, var(--accent) 8%, transparent); border-radius: 6px; font-size: .95rem; }
     .hidden { display: none; }
   </style>
 </head>
@@ -71,6 +73,7 @@
       <!-- content -->
       <div id="content" class="hidden">
         <h1 id="title"></h1>
+        <p id="owner-message" class="owner-message hidden"></p>
         <div id="listing"></div>
         <div id="dl-error" class="msg error hidden"></div>
         <div class="meta">A read-only link shared with you. It may expire or stop working later.</div>

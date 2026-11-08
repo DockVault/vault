@@ -27,15 +27,28 @@
     show("notice");
   }
 
+  // The deployment's name above the page, and the owner's message (text only) where the page stands.
+  function pageIdentity(data, messageId) {
+    var brand = document.querySelector(".brand");
+    if (brand && data && data.brand) { brand.textContent = data.brand + " \u00b7 Shared note"; }
+    var m = $(messageId);
+    if (m) {
+      if (data && data.message) { m.textContent = data.message; m.classList.remove("hidden"); }
+      else { m.textContent = ""; m.classList.add("hidden"); }
+    }
+  }
+
   function renderContent(data) {
     hide("loading"); hide("secret-form"); hide("reveal"); hide("notice");
+    pageIdentity(data, "owner-message");
     $("note-title").textContent = data.title || "Untitled note";
     $("note-body").textContent = data.body || "";
     show("content");
   }
 
-  function offerReveal() {
+  function offerReveal(data) {
     hide("loading"); hide("secret-form"); hide("content"); hide("notice");
+    pageIdentity(data, "owner-message-reveal");
     $("reveal-error").classList.add("hidden");
     show("reveal");
   }
@@ -80,7 +93,7 @@
     if (resp.status === 200) {
       return resp.json().then(function (data) {
         // A peek's answer (no note in it) offers the button; a redeem's answer is the note.
-        if (data && data.available === true && !("body" in data)) { offerReveal(); return; }
+        if (data && data.available === true && !("body" in data)) { offerReveal(data); return; }
         renderContent(data);
       });
     }

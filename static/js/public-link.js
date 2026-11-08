@@ -147,8 +147,20 @@
     return row;
   }
 
+  // The deployment's name above the page, and the owner's message under the title (text only).
+  function pageIdentity(data) {
+    var brand = document.querySelector(".brand");
+    if (brand && data && data.brand) { brand.textContent = data.brand + " \u00b7 Shared files"; }
+    var m = $("owner-message");
+    if (m) {
+      if (data && data.message) { m.textContent = data.message; m.classList.remove("hidden"); }
+      else { m.textContent = ""; m.classList.add("hidden"); }
+    }
+  }
+
   function render(data) {
     hide("loading"); hide("secret-form"); hide("notice");
+    pageIdentity(data);
     var listing = $("listing");
     listing.textContent = "";
     if (data.kind === "file") {
