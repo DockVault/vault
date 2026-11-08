@@ -16570,6 +16570,10 @@ def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
         "download_count": claim.download_count,
         "preview_count": claim.preview_count or 0,
         "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
+        # Who shared it and when: the recipient already learned the sharer's name from the notice.
+        "shared_by_id": str(share.creator_id) if share.creator_id else None,
+        "shared_by": db.query(User.username).filter(User.id == share.creator_id).scalar() if share.creator_id else None,
+        "created_at": share.created_at.isoformat() if share.created_at else None,
     }
 
 
@@ -19071,6 +19075,7 @@ async def list_vault_permissions(
             vault_members.c.delete_permission,
             vault_members.c.manage_permission,
             vault_members.c.added_at,
+            vault_members.c.added_by,
             User.username,
             User.email
         ).join(
@@ -19080,6 +19085,9 @@ async def list_vault_permissions(
         )
 
         result = db.execute(stmt).fetchall()
+        # Who granted each row, named for the members' list (the viewer already sees the vault's members).
+        granter_ids = {row.added_by for row in result if row.added_by}
+        granter_names = dict(db.query(User.id, User.username).filter(User.id.in_(granter_ids)).all()) if granter_ids else {}
 
         # For a zero-knowledge vault, surface each member's encryption-key status so the UI can show
         # "Pending encryption key setup" for a member granted access before they created their key
@@ -19107,6 +19115,8 @@ async def list_vault_permissions(
                 "delete_permission": row.delete_permission,
                 "manage_permission": row.manage_permission,
                 "added_at": row.added_at,
+                "added_by": str(row.added_by) if row.added_by else None,
+                "added_by_username": granter_names.get(row.added_by) if row.added_by else None,
                 # ZK encryption-key status: null for a standard vault; for a ZK vault, whether the
                 # member has set up their key, and whether they're still pending it.
                 "has_encryption_key": (has_key if is_zk else None),

@@ -3465,6 +3465,13 @@ function _ownerCell(link) {
     return td;
 }
 
+// A table cell holding a moment (static/js/people.js), or a dash.
+function _whenCell(iso) {
+    const td = _el('td', 'col-time');
+    td.appendChild(People.time(iso));
+    return td;
+}
+
 function _el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -3558,6 +3565,13 @@ function _sharedCard(it) {
         ? 'Whole vault' : (_sharedKindLabel(it.target_type) + ' in ' + (it.vault_name || 'a vault'))));
 
     const meta = _el('div', 'vault-meta');
+    if (it.shared_by) {
+        const by = _el('span', 'shared-by'); by.appendChild(document.createTextNode('Shared by '));
+        by.appendChild(People.chip({ id: it.shared_by_id, username: it.shared_by }, { small: true }));
+        if (it.created_at) { by.appendChild(document.createTextNode(' ')); by.appendChild(People.time(it.created_at)); }
+        meta.appendChild(by);
+    }
+    if (it.expires_at && active) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(it.expires_at)); meta.appendChild(ex); }
     if (it.view_only) {
         const s = _el('span'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only (preview in the browser, no download)'));
         meta.appendChild(s);
@@ -3676,6 +3690,8 @@ function _sharedByMeCard(sh) {
     main.appendChild(sub);
     const meta = _el('div', 'vault-meta');
     meta.appendChild(_el('span', null, (sh.claim_count || 0) + (sh.max_recipients != null ? '/' + sh.max_recipients : '') + ' recipients'));
+    if (sh.created_at) { const on = _el('span', 'shared-on'); on.appendChild(document.createTextNode('Shared ')); on.appendChild(People.time(sh.created_at)); meta.appendChild(on); }
+    if (sh.expires_at) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(sh.expires_at)); meta.appendChild(ex); }
     if (sh.view_only) meta.appendChild(_el('span', null, 'View only'));
     if (sh.max_downloads != null) meta.appendChild(_el('span', null, sh.max_downloads + ' downloads/recipient'));
     main.appendChild(meta);
@@ -5843,7 +5859,8 @@ function renderInvites(invites) {
         row.appendChild(_el('strong', null, inv.username));
         if (inv.email) row.appendChild(_el('span', 'text-muted', inv.email));
         row.appendChild(_el('span', 'invite-status', inv.status));
-        row.appendChild(_el('span', 'text-muted', 'expires ' + formatServerTime(inv.expires_at)));
+        if (inv.created_at) { const sent = _el('span', 'text-muted'); sent.appendChild(document.createTextNode('sent ')); sent.appendChild(People.time(inv.created_at)); row.appendChild(sent); }
+        const exp = _el('span', 'text-muted'); exp.appendChild(document.createTextNode('expires ')); exp.appendChild(People.time(inv.expires_at)); row.appendChild(exp);
         if (canManage && inv.status === 'pending') {
             const revoke = _el('button', 'btn btn-sm btn-secondary', 'Revoke');
             revoke.style.marginLeft = 'auto';
@@ -19424,7 +19441,7 @@ async function loadVaultPermissions() {
         if (!permissions || permissions.length === 0) {
             tbody.innerHTML = `
                 <tr>
-                    <td colspan="5" style="text-align: center; padding: 40px;">
+                    <td colspan="6" style="text-align: center; padding: 40px;">
                         <div class="empty-state">
                             <p style="font-size: 48px; margin: 0;">${iconSvg('users', 'icon-lg')}</p>
                             <h3 style="margin: 16px 0 8px 0;">No permissions yet</h3>
@@ -19449,6 +19466,9 @@ async function loadVaultPermissions() {
                 ? `<option value="manage" ${level === 'manage' ? 'selected' : ''}>Manager</option>`
                 : '';
             const added = People.whenPlaceholder(perm.added_at);
+            const grantedBy = perm.added_by_username
+                ? People.placeholder({ id: perm.added_by, username: perm.added_by_username }, { small: true })
+                : '<span class="text-tertiary">\u2014</span>';
             // ZK vaults: a member granted access before setting up their encryption key holds the
             // authz row but can't open the vault until they create their key. Flag it so the manager
             // knows the access is real but not yet usable by that member.
@@ -19467,6 +19487,7 @@ async function loadVaultPermissions() {
                     </select>
                 </td>
                 <td>${added}</td>
+                <td>${grantedBy}</td>
                 <td>
                     <button class="action-btn action-btn-danger" data-action="revoke-permission" data-user-id="${perm.user_id}" ${locked ? 'disabled' : ''}>
                         Revoke
@@ -19496,7 +19517,7 @@ async function loadVaultPermissions() {
         console.error('Failed to load permissions:', error);
         tbody.innerHTML = `
             <tr>
-                <td colspan="5" style="text-align: center; padding: 20px; color: var(--error);">
+                <td colspan="6" style="text-align: center; padding: 20px; color: var(--error);">
                     Failed to load permissions
                 </td>
             </tr>
@@ -20647,7 +20668,7 @@ function renderAdminNoteLinks(data) {
     const table = _el('table', 'data-table');
     const thead = _el('thead');
     const hr = _el('tr');
-    ['Owner', 'Type', 'Note', 'Status', 'Protection', 'Expires', 'Views', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    ['Owner', 'Type', 'Note', 'Status', 'Protection', 'Expires', 'Views', 'Created', 'Last used', ''].forEach(h => hr.appendChild(_el('th', '', h)));
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     links.forEach(l => {
@@ -20663,6 +20684,8 @@ function renderAdminNoteLinks(data) {
         tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
         tr.appendChild(_el('td', '', l.expires_at ? _fmtLinkExpiry(l.expires_at).replace(/^Expires /, '') : 'Never'));
         tr.appendChild(_el('td', '', (l.max_uses != null) ? (l.view_count + '/' + l.max_uses) : String(l.view_count)));
+        tr.appendChild(_whenCell(l.created_at));
+        tr.appendChild(_whenCell(l.last_used_at));
         const actTd = _el('td');
         if (l.status === 'active') {
             const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
@@ -20675,6 +20698,7 @@ function renderAdminNoteLinks(data) {
     });
     table.appendChild(tb);
     host.replaceChildren(table);
+    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true });
 }
 
 async function adminRevokeNoteLink(id) {
@@ -21945,7 +21969,7 @@ function renderAdminPublicLinks(data) {
     if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public file/folder links exist.')); return; }
     const table = _el('table', 'data-table');
     const thead = _el('thead'); const hr = _el('tr');
-    ['Owner', 'Type', 'Item', 'Status', 'Protection', 'Expires', 'Uses', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    ['Owner', 'Type', 'Item', 'Status', 'Protection', 'Expires', 'Uses', 'Created', 'Last used', ''].forEach(h => hr.appendChild(_el('th', '', h)));
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     links.forEach(l => {
@@ -21961,6 +21985,8 @@ function renderAdminPublicLinks(data) {
         tr.appendChild(_el('td', '', l.secret_kind === 'password' ? 'Password' : (l.secret_kind === 'pin' ? 'PIN' : 'None')));
         tr.appendChild(_el('td', '', _pflExpiryText(l)));
         tr.appendChild(_pflUsesCell(l));
+        tr.appendChild(_whenCell(l.created_at));
+        tr.appendChild(_whenCell(l.last_used_at));
         const actTd = _el('td');
         if (l.status === 'active') {
             const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button';
@@ -21970,6 +21996,7 @@ function renderAdminPublicLinks(data) {
         tr.appendChild(actTd); tb.appendChild(tr);
     });
     table.appendChild(tb); host.replaceChildren(table);
+    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true });
 }
 
 async function adminRevokePublicLink(id) {
@@ -22678,7 +22705,7 @@ function renderAdminReceivers(data) {
     if (!receivers.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No upload links exist.')); return; }
     const table = _el('table', 'data-table');
     const thead = _el('thead'); const hr = _el('tr');
-    ['Owner', 'Label', 'Type', 'Status', 'Expires', 'Files', 'Budget', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    ['Owner', 'Label', 'Type', 'Status', 'Expires', 'Files', 'Budget', 'Created', ''].forEach(h => hr.appendChild(_el('th', '', h)));
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     receivers.forEach(r => {
@@ -22690,11 +22717,13 @@ function renderAdminReceivers(data) {
         tr.appendChild(_el('td', '', _rcExpiryText(r)));
         tr.appendChild(_el('td', '', (r.max_uploads != null) ? ((r.upload_count || 0) + '/' + r.max_uploads) : String(r.upload_count || 0)));
         tr.appendChild(_el('td', '', r.max_total_bytes != null ? (_mbFromBytes(r.max_total_bytes) + ' MB') : '—'));
+        tr.appendChild(_whenCell(r.created_at));
         const actTd = _el('td');
         if (r.status !== 'revoked') { const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button'; rv.addEventListener('click', () => adminRevokeReceiver(r.id)); actTd.appendChild(rv); }
         tr.appendChild(actTd); tb.appendChild(tr);
     });
     table.appendChild(tb); host.replaceChildren(table);
+    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true });
 }
 
 async function adminRevokeReceiver(id) {

@@ -154,9 +154,10 @@ def test_the_owners_lists_name_people_with_the_chip(page: Page, world, skin):
     # Vault members: the member and the day they were added.
     page.click('[data-vault-tab="permissions"]')
     member_row = page.locator("#permissions-table-body tr", has_text=b["_username"])
-    expect(member_row.locator(CHIP)).to_have_count(1, timeout=15000)
+    member_chip = member_row.locator("td").first.locator(CHIP)   # the member; the row also names who granted
+    expect(member_chip).to_have_count(1, timeout=15000)
     expect(member_row.locator("time.when")).to_have_count(1)
-    colour_b = _colour_class(member_row.locator(CHIP))
+    colour_b = _colour_class(member_chip)
     assert colour_b != colour_a or True  # two accounts may share a colour; what matters is each keeps its own
 
     # Shares: the recipients of a share are chips.
