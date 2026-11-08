@@ -148,3 +148,16 @@ def test_a_prompt_closed_by_its_backdrop_is_answered_as_cancelled(page: Page, pe
     page.mouse.click(x, y)
     expect(page.locator(f"{CONFIRM}.active")).to_be_hidden()
     assert page.evaluate("() => window.__answer") is None
+
+
+def test_escape_on_the_step_up_settles_it_as_cancelled_and_leaves_the_dialog_under_it(page: Page, person):
+    """The step-up dialog floats above whatever asked for it. Escape closes it alone and answers the asker
+    with no receipt (cancelled), never with one."""
+    _login(page, person)
+    _open_account(page)
+    page.evaluate("() => { window.__receipt = 'pending'; requestStepUpReceipt('test', ['password']).then(r => { window.__receipt = r; }); }")
+    expect(page.locator("#stepup-modal.active")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(page.locator("#stepup-modal.active")).to_be_hidden()
+    expect(page.locator(f"{ACCOUNT}.active")).to_be_visible()
+    assert page.evaluate("() => window.__receipt") is None

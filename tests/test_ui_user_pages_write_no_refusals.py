@@ -17,6 +17,7 @@ import subprocess
 
 import pytest
 from playwright.sync_api import Page, expect
+from urllib.parse import urlparse
 
 from conftest import ApiClient, unique
 
@@ -111,3 +112,31 @@ def test_a_users_own_probe_of_an_administrator_route_is_still_recorded_once(owne
                      "ORDER BY timestamp DESC LIMIT 1")
     assert endpoint == "/settings", endpoint  # the route, never the query
     assert not re.search(r"[?=]", endpoint)
+
+
+def test_the_guarded_loaders_ask_nothing_when_forced_as_a_user(page: Page, owner_in_a_department):
+    """The sidebar hides the administrators' pages from a user; behind it, each page's loader and the two
+    settings modules return at once for a non-administrator. Forced open anyway (a script, a link, a restored
+    view), none of them asks an administrator route, and the record gains no refused administrator action."""
+    u = owner_in_a_department["user"]
+    before = _refusals_of(u["id"])
+    _login(page, u["_username"], u["_password"])
+    asked = []
+    page.on("request", lambda r: asked.append(f"{r.method} {r.url}")
+            if re.match(r"^/(settings|groups|users|audit|activity)(/|$)", urlparse(r.url).path)
+            and not urlparse(r.url).path.startswith(("/users/me", "/users/search")) else None)
+    page.evaluate(
+        "async () => {"
+        "  await initSettings(); await loadGroups(); await loadUsers();"
+        "  await SettingsLevels.load(); await RetentionSettings.load();"
+        "  navigateToSection('settings'); navigateToSection('groups'); navigateToSection('users');"
+        "}")
+    expect(page.locator("#dashboard-section")).to_have_class(re.compile(r"\bactive\b"))
+    # A restored view of Settings, as a reload after an administrator used this browser would leave it.
+    page.evaluate("() => sessionStorage.setItem('dv_nav', JSON.stringify({section: 'settings'}))")
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    expect(page.locator("#dashboard-lanes")).to_be_visible(timeout=10000)
+    page.wait_for_timeout(1500)
+    assert not asked, f"a forced loader asked an administrator route: {asked}"
+    assert _refusals_of(u["id"]) == before
