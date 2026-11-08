@@ -118,6 +118,8 @@ class Harness:
         monkeypatch.setattr(sign_in_lockout, "count_at_limit", lambda db, user_id, address, **kw: None)
         from app.core import auditor_rights
         monkeypatch.setattr(auditor_rights, "auditor_live", lambda db, user, now=None: types.SimpleNamespace(live=auditor))
+        monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: (
+            types.SimpleNamespace(status="active", approved_credential_ids=[]) if auditor else None))
         self.failures, self.audits, self.counted, self.monitor = [], [], [], []
 
         class _Audit:
@@ -302,6 +304,7 @@ def test_a_known_keys_failure_counts_against_its_account(monkeypatch):
     credential = auth.get_assertion(body["options"], ORIGIN, sign_count=9)
     status, out = _call(h.S, "POST", "/auth/passkeys/sign-in/verify", {"challenge_id": body["challenge_id"], "credential": credential})
     assert status == 401 and h.failures[-1] == ("alice", "passkey of another account", "passkey")
+    assert h.counted == ["alice"]            # no proof was made: the address paid, not alice
     # A discoverable sign-in whose user handle names someone else.
     status, body = h.options()
     credential = auth.get_assertion(body["options"], ORIGIN, sign_count=10, user_handle_override=bob.id.bytes)
@@ -310,7 +313,7 @@ def test_a_known_keys_failure_counts_against_its_account(monkeypatch):
     # The wrong origin.
     status, body = h.sign_in(auth, username="alice", sign_count=11, origin="https://evil.example.test")
     assert status == 401 and h.failures[-1][1] == "passkey refused: origin_mismatch"
-    assert h.counted == ["alice"] * 4
+    assert h.counted == ["alice"] * 3
 
 
 def test_a_lockout_in_force_refuses_before_the_signature_is_read(monkeypatch):

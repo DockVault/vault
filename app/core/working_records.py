@@ -152,6 +152,23 @@ def prune_notifications(p, *, model=None):
         waits=_waits())
 
 
+RETIRED_PASSKEY_DAYS = 30
+
+
+def retired_passkey_conditions(model, now: datetime) -> list:
+    """The passkeys an administrator's reset or removal retired more than 30 days before ``now``."""
+    return [model.retired_at < now - timedelta(days=RETIRED_PASSKEY_DAYS)]
+
+
+def prune_retired_passkeys(p, *, model=None):
+    """Retired passkeys 30 days after their retirement: the record of what was removed has served."""
+    from app.core import retention
+    from app.core.models import WebAuthnCredential
+    model = model or WebAuthnCredential
+    return p.delete_in_batches(model, retention.deletable(model, p.now, *retired_passkey_conditions(model, p.now)),
+                               model.retired_at)
+
+
 def notifications_kept() -> str:
     """How long notifications are kept, for the recording notice."""
     days = registry.resolve(NOTIFICATION_DAYS_KEY)

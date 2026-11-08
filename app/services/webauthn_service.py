@@ -208,11 +208,14 @@ def verify_registration(rp: RelyingParty, policy: PasskeyPolicy, *, challenge: b
         raise Refused("attestation_refused", type(exc).__name__) from exc
     except ValueError as exc:
         raise Refused(_reason_of(exc), str(exc)) from exc
-    except (KeyError, TypeError, IndexError, AttributeError) as exc:
+    except (KeyError, TypeError, IndexError, AttributeError, AssertionError) as exc:
+        # The library asserts the shape it expects (an attestation without the credential flag, for one).
         raise Refused("malformed", type(exc).__name__) from exc
     cred = auth_data.credential_data
     if cred is None:
         raise Refused("malformed", "no credential in the authenticator data")
+    if not (16 <= len(cred.credential_id) <= 1023):
+        raise Refused("malformed", "credential id outside the standard's bounds")
     flags = AuthenticatorData.FLAG(auth_data.flags)
     if not (flags & AuthenticatorData.FLAG.UP):
         raise Refused("user_not_present")
@@ -229,9 +232,11 @@ def verify_registration(rp: RelyingParty, policy: PasskeyPolicy, *, challenge: b
         if aaguid is None or str(aaguid) not in {a.lower() for a in policy.allowed_aaguids}:
             raise Refused("authenticator_not_allowed")
     response = credential.get("response") or {}
-    transports = tuple(t for t in (response.get("transports") or []) if isinstance(t, str))[:8]
-    extensions = credential.get("clientExtensionResults") or {}
-    rk = (extensions.get("credProps") or {}).get("rk") if isinstance(extensions, dict) else None
+    reported = response.get("transports") if isinstance(response, dict) else None
+    transports = tuple(t[:16] for t in reported if isinstance(t, str) and t)[:8] if isinstance(reported, list) else ()
+    extensions = credential.get("clientExtensionResults")
+    props = extensions.get("credProps") if isinstance(extensions, dict) else None
+    rk = props.get("rk") if isinstance(props, dict) else None
     try:
         fmt = AttestationObject(websafe_decode(response["attestationObject"])).fmt
     except Exception:  # noqa: BLE001 -- the library already parsed it; the name is for the record only

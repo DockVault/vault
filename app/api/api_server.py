@@ -11758,18 +11758,22 @@ async def confirm_my_passkey(
         raise HTTPException(status_code=403, detail={
             "second_factor_required": True, "action": "account.second_factor", "reason": "step_up_required",
             "methods": _sf_step_up_methods(db, current_user, req, has_active)})
-    if marker == f"passkey:{row.id}":
-        raise HTTPException(status_code=409, detail=(
-            "A provisional passkey cannot confirm itself. Prove the step-up with an authenticator app, a recovery "
-            "code or an older passkey."))
-    factors = active_factors(db, current_user.id)
     older = [k for k in _passkeys_of(db, current_user.id)
              if k.id != row.id and k.created_at and k.created_at < row.created_at
              and not (k.provisional_until and k.provisional_until > now)]
+    factors = active_factors(db, current_user.id)
     if not factors.code and not older:
         raise HTTPException(status_code=409, detail=(
             "Nothing older can vouch for this passkey: your account has no authenticator app and no earlier "
             "passkey. It becomes ordinary on its own when its provisional period ends."))
+    # Only a factor older than this key vouches: the authenticator app, a recovery code, or an ordinary passkey
+    # registered before it. The key itself, another provisional key, or an email code never does.
+    vouches = marker in ("totp", "recovery") or (
+        marker.startswith("passkey:") and any(marker == f"passkey:{k.id}" for k in older))
+    if not vouches:
+        raise HTTPException(status_code=409, detail=(
+            "This passkey can be confirmed only with a factor older than it: your authenticator app, a recovery "
+            "code, or a passkey you registered before it. Prove the step-up with one of those."))
     row.provisional_until = None
     db.commit()
     _passkey_audit(db, current_user, request, "passkey_confirmed", {"passkey_id": str(row.id)})
@@ -11896,7 +11900,9 @@ def _passkey_passwordless_allowed(db, user) -> bool:
     from app.core import auditor_rights
     if getattr(user, "role", None) not in PASSKEY_SIGN_IN_ROLES:
         return False
-    return not auditor_rights.auditor_live(db, user).live
+    # A holder of the auditor right, in force or suspended, always adds the password; a proposal is not a right.
+    grant = auditor_rights.open_grant(db, user.id)
+    return grant is None or getattr(grant, "status", None) == "proposed"
 
 
 def _passkey_b64url_decode(text) -> Optional[bytes]:
@@ -11916,7 +11922,11 @@ def _passkey_raw_id(credential) -> Optional[bytes]:
 
 def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, record: bool = True):
     """The generic refusal of a passkey sign-in: an audit row (naming the account only when a known key named
-    it), the security monitor's counter, and for a known account the lockouts' count. 401, one message."""
+    it), the security monitor's counter, and, for a known key whose own proof failed (``record``), the lockouts'
+    count against its account as a wrong password counts. A refusal that needed no proof (a challenge or a key
+    that is not the account's) counts against the address only: a credential id is public, and must not be
+    enough to lock its owner out. A counter that went backwards on a device-bound key tells the owner: the key
+    may have been copied. 401, one message."""
     audit_logger = AuditLogger(db)
     username = user.username if user is not None else ""
     try:
@@ -11929,6 +11939,16 @@ def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, recor
             AuthService(db)._record_failed_login(user.username, client_ip, user)
         except Exception:      # noqa: BLE001 -- the count is best-effort; the refusal stands
             db.rollback()
+    if user is not None and reason.endswith("sign_count_regressed"):
+        _passkey_audit(db, user, request, "passkey_sign_count_regressed", {"reason": "sign_count_regressed"},
+                       status="failure")
+        try:
+            _notify_users([str(user.id)], "security", title="A passkey may have been copied",
+                          body=("A sign-in with one of your passkeys was refused because its counter went backwards, "
+                                "which can mean the key was copied. Review your passkeys and remove any you do not "
+                                "recognize."), target="#profile")
+        except Exception as e:      # noqa: BLE001
+            print(f"⚠ passkey notice skipped: {type(e).__name__}")
     _fire_offloop(_record_failed_login_bg, username, client_ip, reason, record_id)
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="That passkey was not accepted.")
 
@@ -11977,11 +11997,21 @@ async def passkey_sign_in_verify(
     pipeline, which answers as ``/auth/login`` does: a session, a pending password step, or a pending second
     factor. Every refusal is one message; an unknown key counts against the address, a known key's failure
     against its account as a wrong password does."""
+    import hashlib as _hashlib
     from app.core import sign_in_lockout, webauthn_challenges
     from app.core.models import WebAuthnCredential
     from app.services import webauthn_service as ws
     from app.services.auth_service import admin_locked
     client_ip = get_client_ip(request)
+    # The sign-in throttle, charged per address and per key named, as the password path charges per address
+    # and per name typed; given back when the sign-in succeeds, so it counts failures only.
+    raw_id = _passkey_raw_id(body.credential)
+    named = "passkey:" + (_hashlib.sha256(raw_id).hexdigest()[:24] if raw_id else "none")
+    try:
+        throttle = AuthService(db)._check_rate_limit(named, client_ip)
+    except AuthRateLimitExceededError as e:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(int(e.retry_after or 60))})
     try:
         challenge = webauthn_challenges.take(body.challenge_id, purpose=webauthn_challenges.SIGN_IN)
     except webauthn_challenges.Unavailable:
@@ -11991,7 +12021,6 @@ async def passkey_sign_in_verify(
     rp = ws.relying_party("")
     if rp is None:
         raise HTTPException(status_code=409, detail="Passkeys are not available on this deployment.")
-    raw_id = _passkey_raw_id(body.credential)
     row = (db.query(WebAuthnCredential).filter(WebAuthnCredential.credential_id == raw_id).first()
            if raw_id else None)
     if row is None or row.retired_at is not None:
@@ -11999,16 +12028,19 @@ async def passkey_sign_in_verify(
     user = db.query(User).filter(User.id == row.user_id).first()
     if user is None:
         raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
-    if challenge.user_id is not None and challenge.user_id != str(user.id):
-        raise _passkey_sign_in_refused(db, request, client_ip, user=user, reason="passkey of another account")
-    # The lockouts, before the signature is checked, as the password path does (a locked account's guesses
-    # stay bounded; an administrator's lock is reported after the proof, by the pipeline).
+    # The lockouts first, before anything is counted against the account or the signature is checked, as the
+    # password path does: a locked account's guesses stay bounded, and nothing here adds to its counts.
     lock = sign_in_lockout.lock_in_force(db, user.id, client_ip)
     if lock is None and admin_locked(user):
         lock = sign_in_lockout.count_at_limit(db, user.id, client_ip,
                                               administrator=sign_in_lockout.is_administrator(user))
     if lock is not None:
         raise _sign_in_lock_refusal(AccountLockedError("locked", locked_until=lock.locked_until, scope=lock.scope))
+    if challenge.user_id is not None and challenge.user_id != str(user.id):
+        # A key named against another account's challenge: no proof was made, so it counts against the address
+        # (the throttle above), never against the key's owner, whose credential id is public.
+        raise _passkey_sign_in_refused(db, request, client_ip, user=user, reason="passkey of another account",
+                                       record=False)
     known = ws.KnownKey(credential_id=row.credential_id, public_key_cose=row.public_key_cose, cose_alg=row.cose_alg,
                         sign_count=int(row.sign_count or 0), backup_eligible=bool(row.backup_eligible),
                         user_id=ws.user_handle_for(row.user_id), transports=tuple(row.transports or ()))
@@ -12018,10 +12050,6 @@ async def passkey_sign_in_verify(
                                              credential=body.credential, key=known, allow_ids=allow_ids)
     except ws.Refused as refused:
         raise _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}")
-    row.sign_count = assertion.sign_count
-    row.backup_state = assertion.bs
-    row.last_used_at = datetime.utcnow()
-    db.commit()
     method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
     result = sign_in.SignInResult(user, [method], client_ip, user_verified=assertion.uv,
                                   passwordless_allowed=_passkey_passwordless_allowed(db, user))
@@ -12029,6 +12057,13 @@ async def passkey_sign_in_verify(
         outcome = sign_in.finish(db, result)
     except AccountLockedError as locked:
         raise _sign_in_lock_refusal(locked)
+    # The proof was accepted and the sign-in is whole or held for its next step: the key records it, and the
+    # throttle gives the attempt back.
+    row.sign_count = assertion.sign_count
+    row.backup_state = assertion.bs
+    row.last_used_at = datetime.utcnow()
+    db.commit()
+    AuthService._give_back(throttle)
     if isinstance(outcome, sign_in.PendingStep):
         return JSONResponse(status_code=200, content=outcome.body)
     return LoginResponse(access_token=outcome.access_token, user=UserResponse.model_validate(user),
@@ -12042,7 +12077,6 @@ async def passkey_sign_in_verify(
 # actions one of the keys the grant was approved with; a device-bound requirement comes with the settings.
 
 PASSKEY_SESSION_CHALLENGE_LIMIT = 30     # signed-in challenge requests per address per PASSKEY_CHALLENGE_WINDOW
-AUDITOR_OWN_ACTIONS = ("compliance.grant.reconfirm", "compliance.case.request", "compliance.case.export")
 
 
 class PasskeyAssertionRequest(BaseModel):
@@ -12144,7 +12178,9 @@ def _passkey_step_up_factor(db, user, request, body) -> str:
         if row.provisional_until and row.provisional_until > now:
             raise _refuse("provisional", "A passkey added soon after an administrator changed your sign-in details "
                                          "cannot prove a compliance step-up until you confirm it.")
-        if body.action in AUDITOR_OWN_ACTIONS:
+        if getattr(user, "role", None) != RoleEnum.ADMIN:
+            # Anyone but an administrator acts here by the auditor right: only a key the right was approved
+            # (or last reconfirmed) with vouches, whichever compliance step the action is.
             grant = auditor_rights.open_grant(db, user.id)
             approved = list(getattr(grant, "approved_credential_ids", None) or []) if grant is not None else []
             if str(row.id) not in approved:
@@ -12206,6 +12242,10 @@ async def passkey_second_factor_verify(
     try:
         row, assertion = _passkey_assert(db, user, purpose="second_factor", challenge_id=body.challenge_id,
                                          credential=body.credential, policy=_passkey_policy(db))
+    except HTTPException as exc:
+        if exc.status_code == 400:
+            sign_in.count_failed_attempt(db, pending)        # an unusable challenge is a wrong answer too
+        raise
     except ws.Refused as refused:
         sign_in.count_failed_attempt(db, pending)
         try:

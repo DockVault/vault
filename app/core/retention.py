@@ -535,6 +535,12 @@ def prune_notifications(p: Pass) -> JobResult:
     return working_records.prune_notifications(p)
 
 
+def prune_retired_passkeys(p: Pass) -> JobResult:
+    """Passkeys an administrator's reset or removal retired 30 days ago (app/core/working_records.py)."""
+    from app.core import working_records
+    return working_records.prune_retired_passkeys(p)
+
+
 def prune_resolved_alerts(p: Pass) -> JobResult:
     """Security alerts resolved more than SECURITY_ALERT_RETENTION_DAYS ago. Unresolved alerts stay."""
     from app.core import security_records
@@ -623,6 +629,7 @@ JOBS: list[Job] = [
     Job("invitations", "Invitations that ended 30 days ago", prune_invitations),
     Job("one_time_proofs", "Reset links and one-time codes that ended 30 days ago", prune_one_time_proofs),
     Job("notifications", "Notifications older than their window", prune_notifications),
+    Job("retired_passkeys", "Passkeys retired 30 days ago", prune_retired_passkeys),
     Job("security_alerts", "Resolved security alerts", prune_resolved_alerts, held=True),
     Job("security_records", "Failed sign-ins kept in full", prune_security_records, held=True),
     Job("security_alert_values", "Names and addresses in old security alerts", clear_alert_values, held=True),

@@ -218,9 +218,10 @@ def test_the_compliance_policy_holds_a_passkey_to_its_rules(monkeypatch):
     grant.approved_credential_ids = []
     status, body = h.step_up_with_passkey(auth, "compliance.case.request", sign_count=6)
     assert status == 403 and "approved with" in body["detail"]
-    # ...but an administrator's compliance action does not ask for the grant.
+    # ...whichever compliance step it is, for anyone who is not an administrator.
     status, body = h.step_up_with_passkey(auth, "compliance.grant.propose", sign_count=7)
-    assert status == 200, body
+    assert status == 403 and "approved with" in body["detail"]
+    grant.approved_credential_ids = [str(row.id)]
     # A provisional key never proves a compliance step-up.
     row.provisional_until = datetime(2999, 1, 1)
     status, body = h.step_up_with_passkey(auth, "compliance.grant.propose", sign_count=8)
@@ -241,7 +242,7 @@ def test_a_provisional_passkey_cannot_confirm_itself(monkeypatch):
     status, body = h.step_up_with_passkey(auth, "account.second_factor")
     assert status == 200
     status, out = _call_h(h.S, "POST", f"/users/me/passkeys/{row.id}/confirm", None, {"X-Second-Factor": body["receipt"]})
-    assert status == 409 and "cannot confirm itself" in out["detail"] and row.provisional_until is not None
+    assert status == 409 and "older than it" in out["detail"] and row.provisional_until is not None
     # Earned with the older key: accepted.
     status, body = h.step_up_with_passkey(older_auth, "account.second_factor", sign_count=2)
     assert status == 200
