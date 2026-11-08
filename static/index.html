@@ -414,10 +414,25 @@
                 <div id="dashboard-section" class="content-section active">
                     <h1 class="text-3xl font-bold mb-lg">Dashboard</h1>
                     <p class="text-secondary mb-lg" data-brand-template="Overview of your {name} system">Overview of your system</p>
+
+                    <!-- Quick actions, by role and permission (static/js/dashboard-actions.js). -->
+                    <div id="dashboard-quick-actions" class="quick-actions" role="group" aria-label="Quick actions" hidden></div>
+
+                    <!-- Administrators: what a new deployment still has to do. Hidden until an administrator's
+                         dashboard reads it, and gone once everything is done or it is dismissed. -->
+                    <div id="dashboard-get-started" class="card get-started" hidden>
+                        <div class="card-header flex items-center justify-between">
+                            <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-check"/></svg> Get started</h3>
+                            <button type="button" class="btn btn-sm btn-ghost get-started-dismiss">Dismiss</button>
+                        </div>
+                        <div class="card-body">
+                            <ul class="get-started-list"></ul>
+                        </div>
+                    </div>
                     
                     <!-- Stats Grid -->
                     <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-xl);">
-                        <div class="card stat-card">
+                        <div class="card stat-card" data-go="vaults">
                             <div class="card-body">
                                 <div class="flex items-center gap-md">
                                     <div class="stat-tile"><svg class="icon"><use href="#i-vault"/></svg></div>
@@ -431,18 +446,18 @@
                         <!-- Active Users is an administrator metric. It starts hidden so a non-admin
                              never sees it even for one frame; applyDashboardAdminGating() reveals it
                              for an administrator (and re-hides it if the tab moves to a non-admin). -->
-                        <div class="card stat-card" id="dashboard-users-card" style="display: none;">
+                        <div class="card stat-card" id="dashboard-users-card" style="display: none;" data-go="users">
                             <div class="card-body">
                                 <div class="flex items-center gap-md">
                                     <div class="stat-tile is-success"><svg class="icon"><use href="#i-users"/></svg></div>
                                     <div>
-                                        <div class="stat-label">Active Users</div>
+                                        <div class="stat-label">Accounts</div>
                                         <div class="stat-value" id="dashboard-users-count">-</div>
                                     </div>
                                 </div>
                             </div>
                         </div>
-                        <div class="card stat-card">
+                        <div class="card stat-card" data-go="vaults">
                             <div class="card-body">
                                 <div class="flex items-center gap-md">
                                     <div class="stat-tile is-info"><svg class="icon"><use href="#i-hard-drive"/></svg></div>
@@ -453,7 +468,7 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="card stat-card">
+                        <div class="card stat-card" data-go="temp-creds">
                             <div class="card-body">
                                 <div class="flex items-center gap-md">
                                     <div class="stat-tile is-warning"><svg class="icon"><use href="#i-clock"/></svg></div>
@@ -472,6 +487,14 @@
                          join these lanes when the Notes feature ships. Rows are rendered by
                          renderDashboardLanes() with textContent, so names are never HTML. -->
                     <div id="dashboard-lanes" class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-xl);">
+                        <div class="card dashboard-lane">
+                            <div class="card-header">
+                                <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-alert-triangle"/></svg> Needs attention</h3>
+                            </div>
+                            <div class="card-body dashboard-lane-body">
+                                <div id="lane-attention" class="dashboard-lane-list"></div>
+                            </div>
+                        </div>
                         <div class="card dashboard-lane">
                             <div class="card-header">
                                 <h3 class="text-lg font-bold"><svg class="icon"><use href="#i-bell"/></svg> What's waiting for you</h3>
@@ -4241,6 +4264,7 @@
     <script src="/static/js/people.js?v=20261108a"></script>
     <script src="/static/js/tables.js?v=20261108a"></script>
     <script src="/static/js/app.js?v=20261116a"></script>
+    <script src="/static/js/dashboard-actions.js?v=20261108a"></script>
     <script src="/static/js/activity.js?v=20261116a"></script>
     <script src="/static/js/audit-integrity.js?v=20261108a"></script>
     <script src="/static/js/activity-archive.js?v=20261108a"></script>

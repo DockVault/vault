@@ -4704,6 +4704,74 @@ async def update_settings(
     return {"status": "ok"}
 
 
+# --- The administrators' "Get started" checklist on the dashboard ----------------------------------------
+_GET_STARTED_KEY = "get_started"
+
+
+def _get_started_view(db: Session) -> dict:
+    """What a new deployment still has to do, read from the deployment itself where it can be (mail set up
+    and a test message sent, a public address, the second-factor policy) and from what an administrator
+    recorded here where it cannot (a backup taken, the policy kept optional on purpose, the list dismissed)."""
+    from app.core.models import SystemSetting, AuditLog
+    from app.core import second_factor_policy as _sfpol_gs
+    from app.core.email_actions import vault_url as _vault_url
+    row = db.query(SystemSetting).filter(SystemSetting.key == _GET_STARTED_KEY).first()
+    acks = dict(row.value) if (row and row.value) else {}
+    email_ready = _smtp_configured(db)
+    tested = bool(db.query(AuditLog.id).filter(AuditLog.action == "test_email_sent",
+                                               AuditLog.status == "success").first())
+    mode = _sfpol_gs.effective_policy(_global_settings_blob(db)).get("mfa_mode")
+    items = {
+        "email": bool(email_ready and tested),
+        "public_address": bool(_vault_url()),
+        "second_factor": mode == "required" or bool(acks.get("second_factor_decided_at")),
+        "backup": bool(acks.get("backup_recorded_at")),
+    }
+    return {"items": items, "done": all(items.values()), "email_configured": email_ready, "test_email_sent": tested,
+            "dismissed": bool(acks.get("dismissed_at")), "recorded": acks}
+
+
+@app.get("/admin/get-started")
+async def get_started(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    return _get_started_view(db)
+
+
+@app.post("/admin/get-started")
+async def update_get_started(
+    payload: dict,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Record what the checklist cannot see for itself: a backup taken, the second-factor policy kept optional
+    on purpose, the list dismissed; or start it over (reset). Recorded as an administration action."""
+    from app.core.models import SystemSetting
+    allowed = {"backup_recorded": "backup_recorded_at", "second_factor_decided": "second_factor_decided_at",
+               "dismissed": "dismissed_at"}
+    keys = [k for k in (payload or {}) if k in allowed or k == "reset"]
+    if not keys:
+        raise HTTPException(status_code=400, detail="Nothing to record.")
+    row = db.query(SystemSetting).filter(SystemSetting.key == _GET_STARTED_KEY).first()
+    acks = dict(row.value) if (row and row.value) else {}
+    now = datetime.utcnow().isoformat()
+    if payload.get("reset") is True:
+        acks = {}
+    for key, stamp in allowed.items():
+        if payload.get(key) is True:
+            acks[stamp] = now
+    if row is None:
+        db.add(SystemSetting(key=_GET_STARTED_KEY, value=acks))
+    else:
+        row.value = acks
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="get_started_updated", status="success", user=current_user,
+                                   ip_address=get_client_ip(request), details={"keys": sorted(keys)})
+    except Exception:  # noqa: BLE001
+        pass
+    return _get_started_view(db)
+
+
 @app.post("/settings/test-email")
 async def send_test_email(
     request: Request,

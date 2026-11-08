@@ -329,6 +329,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("share_tag_deactivated", "administration", "Share tag deactivated", "notice"),
     AuditAction("share_tag_updated", "administration", "Share tag changed", "notice"),
     AuditAction("test_email_sent", "administration", "Test email sent", "info"),
+    AuditAction("get_started_updated", "administration", "Get-started checklist updated", "info"),
     AuditAction("update_settings_updated", "administration", "Update check interval changed", "notice"),
     # Security and denials
     AuditAction("access_denied", "security", "Access denied", "warning"),

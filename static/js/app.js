@@ -2753,10 +2753,7 @@ async function loadDashboardStats() {
             try {
                 const users = await apiRequest('/users', { silent: true });
                 const usersCountEl = document.getElementById('dashboard-users-count');
-                if (usersCountEl) {
-                    const activeUsers = users.filter(u => u.is_active).length;
-                    usersCountEl.textContent = activeUsers;
-                }
+                if (usersCountEl) usersCountEl.textContent = users.length;   // every account, as the label says
             } catch (error) {
                 console.log('Users endpoint not accessible:', error);
             }
@@ -2799,6 +2796,11 @@ async function loadDashboardStats() {
         state.dashboardShared = sharedWithMe;
         try { await zkDecryptVaultNames(vaults); } catch (_) {}
         renderDashboardLanes(vaults, sharedWithMe);
+        // Quick actions, the attention lane and the administrators' checklist (static/js/dashboard-actions.js).
+        if (window.DashboardActions) {
+            try { await DashboardActions.render({ vaults, sharedWithMe }); }
+            catch (error) { console.error('Failed to render dashboard actions:', error); }
+        }
 
         // Update system status (the gating also runs at profile-render time, before first paint;
         // repeating it here keeps the card correct if the dashboard is re-entered later.)
@@ -3038,6 +3040,8 @@ function applyDashboardAdminGating() {
     // explicitly so the same tab moving between accounts never strands the previous layout.
     if (usersCard) usersCard.style.display = show ? '' : 'none';
     if (card) card.style.display = show ? '' : 'none';
+    const getStarted = document.getElementById('dashboard-get-started');
+    if (getStarted && !show) getStarted.hidden = true;
     if (grid) {
         grid.style.display = show ? '' : 'none';
         grid.style.gridTemplateColumns = show ? '2fr 1fr' : '1fr';
