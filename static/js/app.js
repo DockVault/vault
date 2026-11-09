@@ -12071,7 +12071,7 @@ function fileActionButtons(item, canWrite, opts) {
     // is a no-op (true) for non-scoped sessions; for a scoped temporary credential it gates each action
     // by the cap its scope grants on this vault, matching require_vault_cap server-side.
     const buttons = [
-        `<button type="button" class="action-btn action-more" data-action="more" aria-haspopup="true" aria-label="More actions" title="More actions">${iconSvg('more', 'icon-sm')}</button>`,
+        `<button type="button" class="action-btn action-more" data-action="more" aria-haspopup="menu" aria-expanded="false" aria-label="More actions" title="More actions">${iconSvg('more', 'icon-sm')}</button>`,
     ];
     if (vaultShareable()) buttons.push(btn(isFolder ? 'share-folder' : 'share-file', 'link', 'Share'));
     if (!isFolder && vaultCapAllowed('file.download')) buttons.push(btn('download', 'download', 'Download'));
@@ -12219,17 +12219,46 @@ function _svgUse(name, cls) {
     svg.appendChild(use);
     return svg;
 }
-function _ctxOutside(e) { if (_ctxMenuEl && !_ctxMenuEl.contains(e.target)) closeContextMenu(); }
-function _ctxKey(e) { if (e.key === 'Escape') closeContextMenu(); }
-function closeContextMenu() {
+// The menu's opener: the row's More button (a right click counts as the row's More too), remembered with the
+// item's id, because the file list is drawn again every few seconds and the remembered element may be gone
+// by the time the menu closes; the live button of the same item is found again then.
+let _ctxOpener = null;
+function _ctxOpenerLive() {
+    if (!_ctxOpener) return null;
+    if (_ctxOpener.el && document.contains(_ctxOpener.el)) return _ctxOpener.el;
+    return _ctxMoreButtonFor(_ctxOpener.fileId);
+}
+function _ctxMoreButtonFor(fileId) {
+    if (!fileId) return null;
+    const id = String(fileId).replace(/"/g, '');
+    const name = document.querySelector('.file-name[data-file-id="' + id + '"], .file-name[data-folder-id="' + id + '"]');
+    const row = name && name.closest('tr, .file-tile');
+    return row ? row.querySelector('.action-more') : null;
+}
+function _ctxOutside(e) { if (_ctxMenuEl && !_ctxMenuEl.contains(e.target)) closeContextMenu({ keepFocus: true }); }
+function _ctxKey(e) { if (e.key === 'Escape') { e.preventDefault(); closeContextMenu(); } }
+function _ctxDismiss() { closeContextMenu({ keepFocus: true }); }
+// Closes the menu and gives focus back to its opener (Escape, or choosing an item) so a keyboard user keeps
+// their place in the list, and so a dialog the chosen item opens records the opener and returns to it. A click
+// elsewhere, a scroll or a resize closes it without moving focus (keepFocus).
+function closeContextMenu(opts) {
+    const wasOpen = !!(_ctxMenuEl && !_ctxMenuEl.hidden);
     if (_ctxMenuEl) { _ctxMenuEl.hidden = true; _ctxMenuEl.replaceChildren(); }
     document.removeEventListener('click', _ctxOutside, true);
     document.removeEventListener('keydown', _ctxKey, true);
-    window.removeEventListener('scroll', closeContextMenu, true);
-    window.removeEventListener('resize', closeContextMenu, true);
+    window.removeEventListener('scroll', _ctxDismiss, true);
+    window.removeEventListener('resize', _ctxDismiss, true);
+    const opener = _ctxOpenerLive();
+    if (opener) opener.setAttribute('aria-expanded', 'false');
+    if (wasOpen && !(opts && opts.keepFocus)) {
+        const back = opener || document.getElementById('vault-files-table-body') || document.getElementById('vault-files-grid');
+        if (back) { if (back !== opener && !back.hasAttribute('tabindex')) back.setAttribute('tabindex', '-1'); try { back.focus({ preventScroll: true }); } catch (_) {} }
+    }
+    _ctxOpener = null;
 }
-function openContextMenu(item, x, y) {
+function openContextMenu(item, x, y, opener) {
     if (!item) return;
+    if (_ctxMenuEl && !_ctxMenuEl.hidden) closeContextMenu({ keepFocus: true });
     if (!_ctxMenuEl) {
         _ctxMenuEl = document.createElement('div');
         _ctxMenuEl.id = 'file-context-menu';
@@ -12238,6 +12267,9 @@ function openContextMenu(item, x, y) {
         _ctxMenuEl.hidden = true;
         document.body.appendChild(_ctxMenuEl);
     }
+    _ctxOpener = { el: opener || _ctxMoreButtonFor(item.id), fileId: item.id };
+    if (_ctxOpener.el) _ctxOpener.el.setAttribute('aria-expanded', 'true');
+    _ctxMenuEl.setAttribute('aria-label', 'Actions for ' + (item.name || 'this item'));
     const isFolder = item.type === 'folder';
     const canWrite = state.canWriteCurrentVault !== false;
     const clipHas = (state.moveCopyClip || []).length > 0;
@@ -12321,8 +12353,8 @@ function openContextMenu(item, x, y) {
     if (firstItem) firstItem.focus({ preventScroll: true });
     document.addEventListener('click', _ctxOutside, true);
     document.addEventListener('keydown', _ctxKey, true);
-    window.addEventListener('scroll', closeContextMenu, true);
-    window.addEventListener('resize', closeContextMenu, true);
+    window.addEventListener('scroll', _ctxDismiss, true);
+    window.addEventListener('resize', _ctxDismiss, true);
 }
 
 // Wire file-name / folder / action / checkbox handlers within a container
@@ -12365,7 +12397,7 @@ function wireFileItemHandlers(container) {
                 const fn = row && row.querySelector('.file-name');
                 const fid = fn && (fn.getAttribute('data-file-id') || fn.getAttribute('data-folder-id'));
                 const item = fid && (state.currentFiles || []).find(i => i.id === fid);
-                if (item) { const r = btn.getBoundingClientRect(); openContextMenu(item, r.left, r.bottom + 2); }
+                if (item) { const r = btn.getBoundingClientRect(); openContextMenu(item, r.left, r.bottom + 2, btn); }
                 return;
             }
             runFileAction(action, btn.getAttribute('data-id'), btn.getAttribute('data-name'));

@@ -152,3 +152,48 @@ def test_more_button_opens_the_context_menu(page: Page, admin, admin_creds):
         expect(page.locator("#file-context-menu")).to_be_hidden()
     finally:
         admin.delete_vault(v["id"])
+
+
+@pytest.mark.ui
+def test_the_menu_gives_focus_back_to_more(page: Page, admin, admin_creds):
+    """A keyboard user keeps their place: Escape on the menu returns focus to the row's More button, More says
+    whether its menu is open (aria-expanded), the menu has a name, and a dialog opened from the menu (Rename)
+    returns focus to More when it is cancelled."""
+    v = admin.create_vault(name="focusback")
+    try:
+        _login(page, admin_creds["username"], admin_creds["password"])
+        _open_vault(page, v["id"], "table")
+        _upload(page, "keep-my-place.txt")
+        row = page.locator("#vault-files-table-body tr:has(.file-name[data-file-id])").first
+        expect(row).to_be_visible(timeout=10000)
+        more = row.locator('button[data-action="more"]')
+        expect(more).to_have_attribute("aria-expanded", "false")
+        more.focus()
+        page.keyboard.press("Enter")
+        menu = page.locator("#file-context-menu")
+        expect(menu).to_be_visible()
+        expect(menu).to_have_attribute("aria-label", "Actions for keep-my-place.txt")
+        expect(more).to_have_attribute("aria-expanded", "true")
+        page.keyboard.press("ArrowDown")
+        page.keyboard.press("Escape")
+        expect(menu).to_be_hidden()
+        assert page.evaluate("() => document.activeElement && document.activeElement.getAttribute('data-action')") == "more"
+        expect(more).to_have_attribute("aria-expanded", "false")
+        # Rename from the menu, then cancel: focus comes back to More (the dialog recorded it as its opener).
+        more.click()
+        expect(menu).to_be_visible()
+        menu.locator('.context-menu-item[data-action="rename-file"]').click()
+        expect(page.locator("#rename-modal.active")).to_be_visible()
+        expect(page.locator("#rename-name-input")).to_be_focused()
+        page.keyboard.press("Escape")
+        expect(page.locator("#rename-modal.active")).to_be_hidden()
+        page.wait_for_timeout(100)
+        assert page.evaluate("() => document.activeElement && document.activeElement.getAttribute('data-action')") == "more"
+        # A click elsewhere closes the menu without pulling focus back to the row.
+        more.click()
+        expect(menu).to_be_visible()
+        page.locator("#files-filter").click()
+        expect(menu).to_be_hidden()
+        expect(page.locator("#files-filter")).to_be_focused()
+    finally:
+        admin.delete_vault(v["id"])
