@@ -154,6 +154,25 @@ def test_the_warning_opens_over_an_open_dialog_and_gets_the_keys(page: Page, per
     assert _new_token(page, old) != old
 
 
+def test_the_warning_paints_over_the_step_up_and_gets_the_keys(page: Page, person):
+    """The step-up dialog is lifted above the other dialogs and sits later in the page; the warning still
+    paints over it, and focus is in the warning."""
+    _login(page, person)
+    page.evaluate("() => { requestStepUpReceipt('test', ['password']); }")
+    expect(page.locator("#stepup-modal.active")).to_be_visible(timeout=10000)
+    assert page.evaluate("() => document.getElementById('stepup-modal').style.zIndex") == "1100"
+    page.evaluate("() => SessionWatch.armAt(Date.now() + 61000)")
+    modal = page.locator("#session-expiry-modal.active")
+    expect(modal).to_be_visible(timeout=10000)
+    assert page.evaluate("""() => {
+        const b = document.getElementById('session-stay').getBoundingClientRect();
+        const hit = document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+        return !!(hit && hit.closest('#session-expiry-modal'));
+    }""")
+    assert page.evaluate("() => !!(document.activeElement && document.activeElement.closest('#session-expiry-modal'))")
+    expect(page.locator("#stepup-modal.active")).to_be_visible()
+
+
 def test_a_device_clock_far_ahead_does_not_end_the_session(page: Page, person):
     page.goto("/")
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)

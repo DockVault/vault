@@ -18,7 +18,6 @@
 (function () {
     'use strict';
 
-    const openedAt = new WeakMap();   // dialog -> the order it opened in (a counter)
     const snapshots = new WeakMap();  // dialog -> its fields' values when it opened
     const openers = new WeakMap();    // dialog -> the element that had focus when it opened
     let labelCounter = 0;
@@ -67,7 +66,6 @@
         if (opener.closest('.modal') && !isOpen(opener.closest('.modal'))) return;
         try { opener.focus({ preventScroll: true }); } catch (_) {}
     }
-    let counter = 0;
     let pressedOn = null;             // the dialog whose backdrop the last mouse press began on
 
     function isDialog(el) {
@@ -105,7 +103,6 @@
     }
 
     function opened(dialog) {
-        openedAt.set(dialog, ++counter);
         snapshot(dialog);
         label(dialog);
         // Scrolled to the top: the scroller is the dialog's body where it has one, else its content box.
@@ -148,25 +145,21 @@
         return Array.from(document.querySelectorAll('.modal.active')).filter(isOpen);
     }
 
-    // The top dialog: the one painted over the others (the highest z-index), and among those the one
-    // opened last (a dialog never seen opening, such as one built already open by a script, counts as
-    // later than any seen one, in page order). Paint order and this order agree, so a dialog raised above
-    // the rest (the session warning, the step-up) is also the one Escape and the Tab trap act on.
+    // The top dialog: the one painted over the others. That is the highest z-index, and among dialogs on
+    // the same layer the one later in the page, which the browser paints on top whatever order they opened
+    // in. So what Escape and the Tab trap act on is always what the person sees on top.
     function layerOf(d) {
         const z = parseInt(window.getComputedStyle(d).zIndex, 10);
         return Number.isFinite(z) ? z : 0;
     }
 
     function top() {
-        const all = open();
-        if (!all.length) return null;
+        // open() lists the dialogs in page order: on a tie, the later one wins.
         let best = null;
         let bestLayer = -Infinity;
-        let bestKey = -1;
-        all.forEach((d, index) => {
+        open().forEach((d) => {
             const layer = layerOf(d);
-            const key = openedAt.has(d) ? openedAt.get(d) : Number.MAX_SAFE_INTEGER - all.length + index;
-            if (layer > bestLayer || (layer === bestLayer && key >= bestKey)) { bestLayer = layer; bestKey = key; best = d; }
+            if (layer >= bestLayer) { bestLayer = layer; best = d; }
         });
         return best;
     }

@@ -372,10 +372,12 @@
     }
 }
 
-/* The stay-or-sign-out warning opens over whatever dialog the person is in: above the dialog layer
-   (1000), on the layer the step-up dialog uses, so it is seen and gets the keys. */
+/* The stay-or-sign-out warning opens over whatever the person is in: above every dialog (1000; the
+   step-up and a lifted prompt at 1100; the reset-link overlay at 10000), every panel and tray, the drop
+   zone and the loading overlay, so it is seen and gets the keys. Only the toasts sit higher, so a message
+   such as "You stay signed in" stays readable rather than dimmed behind its backdrop. */
 #session-expiry-modal.modal {
-    z-index: 1100;
+    z-index: 10500;
 }
 
 .modal-content {
@@ -1791,7 +1793,8 @@ details summary:hover {
     position: fixed;
     top: 80px;
     right: 20px;
-    z-index: 10000;
+    /* Above everything, the stay-or-sign-out warning (10500) included: a toast is small and passing. */
+    z-index: 11000;
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
