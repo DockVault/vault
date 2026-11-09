@@ -408,7 +408,7 @@ SESSION_TIMEOUT_MAX_MINUTES = 30 * 24 * 60  # 30 days
 # How long "Stay signed in" may keep one sign-in going, counted from the sign-in itself, in hours. The
 # administrator's session_renewal_max_hours overrides the default, from the session timeout up to 30 days;
 # a renewal at or past the limit is refused and the person signs in again (see _renewal_terms).
-SESSION_RENEWAL_DEFAULT_HOURS = 12
+SESSION_RENEWAL_DEFAULT_HOURS = 24
 SESSION_RENEWAL_MAX_HOURS = 30 * 24
 
 

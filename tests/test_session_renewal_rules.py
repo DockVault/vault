@@ -2,7 +2,7 @@
 
 A sign-in is renewed only up to the renewal limit counted from the sign-in itself (auth_time: the old
 token's, else its iat), the limit being the administrator's setting, never shorter than the session timeout
-nor longer than 30 days, 12 hours by default; a renewal is refused when the account now needs a second
+nor longer than 30 days, 24 hours by default; a renewal is refused when the account now needs a second
 factor at sign-in and its token shows none; the new token carries the identity claims of the old one and
 auth_time, and lives for the session timeout, cut at the limit.
 """
@@ -84,27 +84,27 @@ def _refusal(fn, *args, **kw):
     return refused.value
 
 
-def test_the_default_limit_is_twelve_hours_from_the_sign_in(db):
+def test_the_default_limit_is_a_day_from_the_sign_in(db):
     user = _user(db)
     now = datetime.now(timezone.utc)
-    auth_time, expires_at = api._renewal_terms(db, user, _old(11 * HOUR), now)
-    assert auth_time == _old(11 * HOUR)["iat"]
+    auth_time, expires_at = api._renewal_terms(db, user, _old(23 * HOUR), now)
+    assert auth_time == _old(23 * HOUR)["iat"]
     # The session timeout (30 minutes here) is shorter than what is left of the limit.
     assert abs((expires_at - now).total_seconds() - 30 * 60) < 5
     # Twenty minutes before the limit the new token ends at the limit, not after it.
-    _, expires_at = api._renewal_terms(db, user, _old(12 * HOUR - 20 * 60), now)
+    _, expires_at = api._renewal_terms(db, user, _old(24 * HOUR - 20 * 60), now)
     assert abs((expires_at - now).total_seconds() - 20 * 60) < 5
-    refused = _refusal(api._renewal_terms, db, user, _old(12 * HOUR + 1), now)
+    refused = _refusal(api._renewal_terms, db, user, _old(24 * HOUR + 1), now)
     assert refused.status_code == 403 and "as long as this vault allows" in refused.detail
     # At the limit, with nothing left to hand out, the renewal is refused too.
-    assert _refusal(api._renewal_terms, db, user, _old(12 * HOUR - 2), now).status_code == 403
+    assert _refusal(api._renewal_terms, db, user, _old(24 * HOUR - 2), now).status_code == 403
 
 
 def test_auth_time_outlives_every_renewal_and_wins_over_iat(db):
     user = _user(db)
     now = int(datetime.now(timezone.utc).timestamp())
     # A renewed token: its iat is recent, its auth_time the original sign-in thirteen hours ago.
-    refused = _refusal(api._renewal_terms, db, user, _old(60, auth_time=now - 13 * HOUR))
+    refused = _refusal(api._renewal_terms, db, user, _old(60, auth_time=now - 25 * HOUR))
     assert "as long as this vault allows" in refused.detail
     auth_time, _ = api._renewal_terms(db, user, _old(60, auth_time=now - 2 * HOUR))
     assert auth_time == now - 2 * HOUR
