@@ -5,8 +5,9 @@ The callback spends the state, checks the provider and the issuer parameter, exc
 token (app/services/oidc_client.py), and then does what the state's purpose says:
 
 * ``sign_in``: judges the provider's restriction (app/core/sso_policy.py), finds the account the identity belongs
-  to in the design's order (a known identity; the invitation the state carries, whose account is made now; creation
-  at the first sign-in, with its own item; an account with this verified email when the provider links by email),
+  to in the design's order (a known identity; the invitation the state carries, whose account is made now; an
+  account made at this first sign-in when a restricted provider is set to make them; an account with this verified
+  email when the provider links by email),
   and hands the pipeline's result over as a one-time code the web app redeems at
   ``POST /auth/finish`` (app/core/sign_in_codes.py), so no session ever travels in a URL;
 * ``link``: links the identity to the signed-in account that started it (the state names the account and the
@@ -42,6 +43,9 @@ RESTRICTION_CLAIM_MISSING = sso_policy.RESTRICTION_CLAIM_MISSING
 INVITATION_UNUSABLE = "invitation_unusable"
 EMAIL_REQUIRED = "email_required"
 ACCOUNT_LIMIT = "account_limit"
+USERNAME_UNAVAILABLE = "username_unavailable"
+
+USERNAME_MIN, USERNAME_MAX = 3, 50          # the account rules (the creation and invitation schemas)
 
 # What a person is told for each reason, in words (the admin page and the sign-in page show these).
 REASON_TEXTS = {
@@ -67,8 +71,10 @@ REASON_TEXTS = {
                                 "so the vault could not check who it admits. Ask your administrator."),
     INVITATION_UNUSABLE: "This invitation can no longer be used. Ask your administrator for a new one.",
     EMAIL_REQUIRED: ("Your organisation's sign-in did not provide a verified email address, and this vault requires "
-                     "one. Ask your administrator to put one on your invitation."),
+                     "one for a new account. Ask your administrator."),
     ACCOUNT_LIMIT: "This vault cannot take another account right now. Ask your administrator.",
+    USERNAME_UNAVAILABLE: ("No usable username could be made for you from what your organisation's sign-in provided. "
+                           "Ask your administrator to invite you."),
 }
 
 
@@ -341,9 +347,101 @@ def resolve_account(db, row, answer: ProviderAnswer, *, login=None) -> Resolutio
 
 
 def _create_account(db, row, answer: ProviderAnswer, policy: dict):
-    """Creation at the first sign-in lands with its own item; until then a provider set to make accounts behaves
-    as invite-only (and the test summary says so)."""
+    """Creation at the first sign-in (the design's step 3), only for a restricted provider (the save-time rule's
+    condition, held here too so a hand-edited row never opens the door to anyone with an account at the provider):
+    the role the policy names (never an administrator), a real password hash nobody knows, the provider's verified
+    address when the account policy admits it (a required address that is not there is a refusal: the person can
+    type nothing here), the username from the provider's claim, else the address's local part, else the subject,
+    under the account rules with a numeric suffix on a collision; no departments (the group mapping lands with its
+    item) and no vault access. None when the provider is not restricted: it then behaves as invite-only."""
+    import secrets
+    import uuid as _uuid
+    from sqlalchemy.exc import IntegrityError
+    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
+    from app.core.email_identity import email_in_use, normalize_email
+    from app.core.endpoint_permissions import grant_default_permissions_for_role
+    from app.core.models import RoleEnum, User
+    from app.core.security import hash_password
+    api = _api()
+    account_policy = api._account_policy(db)
+    if not sso_policy.is_restricted(policy, account_policy):
+        return None
+    email = normalize_email(answer.email) if answer.email_verified else None
+    if email is not None and not (
+            signup_email_is_ascii(email)
+            and email_allowed_by_domain_gate(email, account_policy.get("signup_email_domain_mode"),
+                                             account_policy.get("signup_email_domains"))
+            and not email_in_use(db, email) and not api._email_has_pending_invite(db, email)):
+        email = None
+    if email is None and account_policy.get("email_requirement") == "required":
+        raise Refusal(EMAIL_REQUIRED, "email_required")
+    try:
+        api._enforce_user_cap(db)
+    except Exception:          # noqa: BLE001 -- the plan's wording is for an administrator, not a person at a provider
+        raise Refusal(ACCOUNT_LIMIT, "user_cap")
+    username = username_for(db, row, answer)
+    if username is None:
+        raise Refusal(USERNAME_UNAVAILABLE, "no_username")
+    role = RoleEnum(policy["sso_default_role"])
+    sso_only = policy["sso_password_login"] == "disabled"
+    now = datetime.utcnow()
+    user = User(id=_uuid.uuid4(), username=username, email=email, password_hash=hash_password(secrets.token_urlsafe(32)),
+                role=role, created_by=None, created_at=now, updated_at=now, is_active=True, is_locked=False,
+                failed_login_attempts=0, sftp_enabled=True, sso_only=sso_only, sftp_password_auth=not sso_only)
+    db.add(user)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise Refusal(USERNAME_UNAVAILABLE, "race_conflict")
+    grant_default_permissions_for_role(str(user.id), user.role, db, commit=False)
+    identity = link_identity(db, row, user, answer, linked_by="jit")
+    return Resolution(user, identity, created=True, linked_now=True, linked_by="jit")
+
+
+def username_for(db, row, answer: ProviderAnswer) -> Optional[str]:
+    """The username a new account gets: the provider's username claim when it passes the account rules, else the
+    verified address's local part, else the subject shortened; on a collision a numeric suffix (``-2``, ``-3``).
+    None when nothing usable comes out of that (the person is asked to be invited)."""
+    candidates = []
+    preferred = answer.claims.get(claim_name(row, "username", "preferred_username"))
+    if isinstance(preferred, str):
+        candidates.append(preferred)
+    if answer.email_verified and isinstance(answer.email, str) and "@" in answer.email:
+        candidates.append(answer.email.rsplit("@", 1)[0])
+    candidates.append(answer.subject)
+    for raw in candidates:
+        base = _username_base(raw)
+        if base is None:
+            continue
+        for n in range(1, 100):
+            name = base if n == 1 else f"{base[:USERNAME_MAX - len(str(n)) - 1]}-{n}"
+            if len(name) < USERNAME_MIN:
+                break
+            if not _username_taken(db, name):
+                return name
     return None
+
+
+def _username_base(raw) -> Optional[str]:
+    """``raw`` cut to the account rules, or None when it cannot be a username: too short, with spaces, or refused
+    by the rules every new username meets (markup, '@', invisible characters, reserved and server names)."""
+    base = (raw or "").strip()[:USERNAME_MAX]
+    if len(base) < USERNAME_MIN or any(ch.isspace() for ch in base):
+        return None
+    try:
+        _api()._validate_new_username(base)
+    except ValueError:
+        return None
+    return base
+
+
+def _username_taken(db, name: str) -> bool:
+    from app.core.email_identity import email_in_use
+    from app.core.models import User
+    if db.query(User.id).filter(User.username == name).first() is not None:
+        return True
+    return email_in_use(db, name)      # a username that is someone's address would shadow them at the sign-in
 
 
 def _email_match(db, row, answer: ProviderAnswer, policy: dict):
@@ -480,7 +578,12 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
                           else "sign in another account this identity is linked to")}
     policy = policy_of(row)
     if policy["sso_account_creation"] == "jit":
-        return {"restriction": "passes", "would": "refuse: account creation at the first sign-in is not available yet"}
+        if sso_policy.is_restricted(policy, _api()._account_policy(db)):
+            name = username_for(db, row, answer)
+            return {"restriction": "passes",
+                    "would": (f"create the account {name} at the first sign-in and sign it in" if name
+                              else "refuse: no usable username could be made from the provider's answer")}
+        return {"restriction": "passes", "would": "refuse: account creation at the first sign-in needs a restricted provider"}
     match = _email_match(db, row, answer, policy)
     if match is not None:
         return {"restriction": "passes",

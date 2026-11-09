@@ -94,6 +94,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("account_invitation_revoked", "accounts", "Invitation revoked", "notice"),
     AuditAction("account_self_signup", "accounts", "Account created by sign-up", "notice"),
     AuditAction("account_self_signup_failed", "accounts", "Sign-up refused", "warning"),
+    AuditAction("sso_account_created", "accounts", "Account created by single sign-on", "notice"),
     # A second change to someone's sign-in details within 14 days is held for another administrator's
     # approval. Short enough to read whole in a phone's row.
     AuditAction("credential_change_approval_refused", "accounts", "Approval refused (not independent)",

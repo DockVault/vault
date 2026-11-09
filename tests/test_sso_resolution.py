@@ -283,6 +283,117 @@ def test_linking_by_email_happens_in_no_other_case(monkeypatch, arrange):
     assert len(h.identities()) == len(identities) and h.codes() == [] and h.notices == []
 
 
+# --------------------------------------------------------------------------- an account made at the first sign-in
+
+JIT = {"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]}
+
+
+def test_a_restricted_provider_makes_an_account_at_the_first_sign_in(monkeypatch):
+    root = _user("root", role="admin")
+    p = _provider(policy={**JIT, "sso_default_role": "external", "sso_password_login": "disabled"})
+    h = Resolving(monkeypatch, [root], [p])
+    location, _ = _sign_in(h, p, preferred_username="Alice.Example")
+    assert location.startswith("/#sso="), location
+    (user,) = h.users_named("Alice.Example")
+    from app.core.models import RoleEnum
+    assert user.role == RoleEnum.EXTERNAL and user.email == "alice@example.test" and user.created_by is None
+    assert user.password_hash.startswith("argon2:") and user.sso_only is True and user.sftp_password_auth is False
+    (identity,) = h.identities()
+    assert identity.user_id == user.id and identity.linked_by == "jit"
+    assert h.grants == [(str(user.id), str(user.role), False)]
+    assert ("sso_account_created", "success",
+            {"username": "Alice.Example", "role": str(user.role), "provider_id": str(p.id)}) in h.audits, h.audits
+    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "jit"}) in h.audits
+    assert ([str(root.id)], "An account was created by single sign-on") in h.notices
+    assert ("account_welcome", "alice@example.test", None) in h.emails
+    status, body = h.finish(location)
+    assert status == 200 and _claims(body["access_token"])["sub"] == str(user.id)
+    # The next sign-in finds the identity: one account, however many sign-ins.
+    location, _ = _sign_in(h, p, preferred_username="Alice.Example")
+    assert location.startswith("/#sso=") and len(h.users_named("Alice.Example")) == 1 and len(h.identities()) == 1
+
+
+@pytest.mark.parametrize("claims, taken, expected", [
+    ({"preferred_username": "alice.e"}, [], "alice.e"),
+    ({}, [], "alice"),                                                   # the verified address's local part
+    ({"preferred_username": "alice@example.test"}, [], "alice"),         # a UPN never qualifies: no '@'
+    ({"preferred_username": "bad<name>"}, [], "alice"),
+    ({"preferred_username": "erased-7"}, [], "alice"),                   # a reserved prefix
+    ({"preferred_username": "two words"}, [], "alice"),
+    ({"preferred_username": "ab"}, [], "alice"),                         # too short
+    ({"email_verified": False, "tid": "t1"}, [], "subject-1"),           # no address to use: the subject
+    ({"email_verified": False, "tid": "t1", "sub": "x" * 80}, [], "x" * 50),   # shortened to the rules
+    ({}, ["alice"], "alice-2"),
+    ({}, ["alice", "alice-2"], "alice-3"),
+    ({"preferred_username": "alice.e"}, ["alice.e"], "alice.e-2"),
+])
+def test_the_username_comes_from_the_claim_the_address_or_the_subject_with_a_suffix_on_a_collision(
+        monkeypatch, claims, taken, expected):
+    # An unverified address cannot pass a domain rule, so those cases run under a tenant rule instead.
+    policy = JIT if "tid" not in claims else {"sso_account_creation": "jit", "sso_allowed_tenants": ["t1"]}
+    root, p = _user("root", role="admin"), _provider(policy=policy)
+    h = Resolving(monkeypatch, [root] + [_user(name, email=f"{name}@taken.test") for name in taken], [p],
+                  account_policy={"email_requirement": "optional"})
+    location, _ = _sign_in(h, p, **claims)
+    assert location.startswith("/#sso="), location
+    assert len(h.users_named(expected)) == 1
+
+
+def test_the_username_is_never_an_address_in_use(monkeypatch):
+    root, holder, p = _user("root", role="admin"), _user("holder", email="alice@other.test"), _provider(policy=JIT)
+    h = Resolving(monkeypatch, [root, holder], [p])
+    h.db.rows_of(type(holder))                      # the memory store's address check reads the users' emails
+    monkeypatch.setattr(h.S, "_email_has_pending_invite", lambda db, email: False)
+    from app.core import email_identity
+    monkeypatch.setattr(email_identity, "email_in_use", lambda db, email, exclude_user_id=None: email == "alice")
+    location, _ = _sign_in(h, p)
+    assert location.startswith("/#sso=") and h.users_named("alice") == [] and len(h.users_named("alice-2")) == 1
+
+
+@pytest.mark.parametrize("arrange, reason", [
+    ("unrestricted", "no_account"),
+    ("email_required", "email_required"),
+    ("user_cap", "account_limit"),
+    ("no_username", "username_unavailable"),
+])
+def test_creation_at_the_first_sign_in_needs_a_restricted_provider_and_an_admitted_person(monkeypatch, arrange, reason):
+    root = _user("root", role="admin")
+    policy = {"sso_account_creation": "jit"} if arrange == "unrestricted" else dict(JIT)
+    if arrange in ("no_username", "email_required"):
+        policy = {"sso_account_creation": "jit", "sso_allowed_tenants": ["t1"]}
+    h = Resolving(monkeypatch, [root], [p := _provider(policy=policy)],
+                  account_policy={"email_requirement": "optional"} if arrange != "email_required" else None)
+    claims = {}
+    if arrange == "email_required":
+        claims = {"tid": "t1", "email_verified": False}
+    elif arrange == "user_cap":
+        monkeypatch.setattr(h.S.settings, "plan_max_users", 1)
+    elif arrange == "no_username":
+        claims = {"tid": "t1", "email_verified": False, "sub": "a<b", "preferred_username": "x<y"}
+    location, _ = _sign_in(h, p, **claims)
+    assert location == f"/#sso-error={reason}", location
+    from app.core.models import User
+    assert h.db.rows_of(User) == [root] and h.identities() == [] and h.codes() == []
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == reason for a in h.audits), h.audits
+
+
+def test_a_test_sign_in_says_what_account_it_would_make(monkeypatch):
+    root = _user("root", role="admin")
+    p = _provider(state="tested", policy=JIT)
+    h = Resolving(monkeypatch, [root], [p])
+    from app.core import sso_state
+    from app.services import sso_sign_in as sso
+    url = sso.start(p, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
+                    user_id=root.id, session_hash="sess-hash")
+    state, _ = h.state_of(url)
+    h.claims_override = {"preferred_username": "alice.e"}
+    status, location, _ = h.callback(p, state)
+    status, body = h.finish_test(p, location)
+    assert status == 200, body
+    assert p.last_test["would"] == "create the account alice.e at the first sign-in and sign it in"
+    assert h.users_named("alice.e") == [] and h.identities() == []        # a test makes nothing
+
+
 # --------------------------------------------------------------------------- the restriction comes first
 
 @pytest.mark.parametrize("policy, claims, reason", [

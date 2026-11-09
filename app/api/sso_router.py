@@ -346,6 +346,19 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
             api._fire_action_email(db, "account_welcome", email=user.email, username=user.username)
         except Exception as exc:  # noqa: BLE001
             log.info("sso invitation notices skipped: %s", type(exc).__name__)
+    if found.linked_by == "jit":
+        _audit(db, "sso_account_created", user=user, ip=client_ip, resource_type="user", resource_id=str(user.id),
+               details={"username": user.username, "role": str(user.role), "provider_id": details.get("provider_id")})
+        try:
+            admins = [str(a.id) for a in api._active_admins(db)]
+            api._notify_users(admins, "account_created", title="An account was created by single sign-on",
+                              body=(f"{user.username} signed in through {label} for the first time and an account was made "
+                                    f"for them with the role {getattr(user.role, 'value', user.role)}. Check the Users page "
+                                    "if you did not expect this."),
+                              target="#users")
+            api._fire_action_email(db, "account_welcome", email=user.email, username=user.username)
+        except Exception as exc:  # noqa: BLE001
+            log.info("sso account-created notices skipped: %s", type(exc).__name__)
     _audit(db, "sso_identity_linked", user=user, ip=client_ip,
            details={"provider_id": details.get("provider_id"), "linked_by": found.linked_by})
     if found.linked_by == "self":
