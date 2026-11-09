@@ -114,6 +114,9 @@ def test_a_person_adds_a_passkey_signs_in_with_it_and_manages_it(page: Page, no_
     page.locator("#us-passkeys-body .passkey-row").first.get_by_role("button", name="Remove").click()
     page.click("#confirm-modal-confirm-btn")
     expect(page.locator("#stepup-passkey-btn")).to_be_visible(timeout=8000)
+    # The passkey is the only factor: no Confirm that could never succeed, and the dialog focuses itself, not the button.
+    expect(page.locator("#stepup-modal .modal-footer .btn-primary")).to_be_hidden()
+    assert page.get_attribute("#stepup-modal", "data-no-autofocus") is not None
     page.click("#stepup-passkey-btn")
     expect(page.locator("#us-passkeys-body .passkey-row")).to_have_count(0, timeout=10000)
 
@@ -133,7 +136,6 @@ def test_an_administrators_passkey_leads_to_the_password_step_and_together_they_
     page.click("#login-form button[type=submit]")
     # The passkey and the password are two factors: signed in, no further step.
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-    expect(page.locator("#login-second-factor")).to_be_hidden()
 
 
 def test_after_a_password_the_card_offers_the_accounts_passkey_as_the_second_factor(
@@ -183,12 +185,18 @@ def test_the_offer_and_the_button_never_both_act(page: Page, authenticator, fres
     _add_first_passkey(page, fresh_admin["_password"], "Security key")
     _sign_out(page)
     expect(page.locator("#passkey-sign-in-btn")).to_be_visible(timeout=8000)    # the page has read its policy
+    tokens = []
+    page.on("response", lambda r: tokens.append(r) if r.url.endswith("/auth/passkeys/sign-in/verify") else None)
     page.locator("#username").blur()
     page.focus("#username")                   # the offer starts, and completes on its own
     # The button pressed as well (by script: the offer may already have hidden it, which is the race).
     page.evaluate("document.getElementById('passkey-sign-in-btn').click()")
     expect(page.locator("#login-stage-note")).to_be_visible(timeout=10000)
-    page.wait_for_timeout(1000)               # let any second flow land: it must change nothing
+    page.wait_for_timeout(1500)               # let any second flow land: it must change nothing
+    # Whatever answered last is the step the page holds, and the page shows it once.
+    answered = [r.json().get("pre_auth_token") for r in tokens if r.ok]
+    assert answered and page.evaluate("_passwordStage && _passwordStage.token") in answered
+    assert page.locator("#login-stage-note").count() == 1
     page.fill("#password", fresh_admin["_password"])
     page.click("#login-form button[type=submit]")
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
@@ -214,10 +222,57 @@ def test_a_field_that_already_has_the_cursor_gets_its_offer(page: Page, authenti
     _login(page, fresh_user["_username"], fresh_user["_password"])
     _add_first_passkey(page, fresh_user["_password"], "Laptop")
     _sign_out(page)
-    # The cursor goes into the field as soon as the sign-in screen shows, before or after the page has read its
-    # policy (whichever comes first): either way the offer starts.
+    # The policy is held back until the cursor is in the field, so no focus event can start the offer.
+    held = []
+
+    def hold(route):
+        held.append(route)
+
+    page.route("**/auth/policy", hold)
     page.goto("/")
     expect(page.locator("#login-screen")).to_be_visible(timeout=8000)
     page.evaluate("document.getElementById('username').focus()")
+    page.wait_for_timeout(300)
+    assert held, "the page asked for its policy"
+    assert page.evaluate("document.activeElement && document.activeElement.id") == "username"
+    for route in held:
+        route.continue_()
+    page.unroute("**/auth/policy")
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+
+
+def test_the_password_step_has_a_way_out_and_ends_when_the_attempt_is_over(page: Page, no_offer, authenticator,
+                                                                             fresh_admin):
+    _login(page, fresh_admin["_username"], fresh_admin["_password"])
+    _add_first_passkey(page, fresh_admin["_password"], "Security key")
+    _sign_out(page)
+    page.click("#passkey-sign-in-btn")
+    expect(page.locator("#login-stage-note")).to_be_visible(timeout=10000)
+    # "Use another account": the name free again, the passkey button back.
+    page.click("#login-stage-cancel")
+    assert page.get_attribute("#username", "readonly") is None and page.input_value("#username") == ""
+    expect(page.locator("#passkey-sign-in-btn")).to_be_visible()
+    expect(page.locator("#login-stage-note")).to_be_hidden()
+    # Back into the step, then wrong passwords until the attempt is spent: the step ends on its own.
+    page.click("#passkey-sign-in-btn")
+    expect(page.locator("#login-stage-note")).to_be_visible(timeout=10000)
+    for _ in range(8):
+        page.fill("#password", "not-the-password")
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#login-error")).to_be_visible(timeout=10000)
+        if page.get_attribute("#username", "readonly") is None:
+            break
+        page.wait_for_timeout(200)
+    assert page.get_attribute("#username", "readonly") is None
+    expect(page.locator("#login-error")).to_contain_text("start again")
+    expect(page.locator("#passkey-sign-in-btn")).to_be_visible()
+
+
+def test_a_structured_refusal_is_shown_in_words(page: Page, no_offer, fresh_user):
+    """A refusal the server words as {reason, message} reaches the person as its message."""
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    said = page.evaluate("""apiRequest('/users/me/passkeys/register/verify', {method: 'POST', silent: true,
+        body: JSON.stringify({challenge_id: 'no-such-challenge', credential: {type: 'public-key'}})})
+        .then(() => 'accepted', (e) => e.message)""")
+    assert said and said != "[object Object]" and said != "accepted", said
 

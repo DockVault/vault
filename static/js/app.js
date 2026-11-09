@@ -1013,13 +1013,16 @@ async function _apiRequestNow(endpoint, options = {}) {
         
         // Handle other errors
         if (!response.ok) {
-            const errorMsg = data?.detail || `Request failed with status ${response.status}`;
+            const detail = data?.detail;
+            const errorMsg = (detail && typeof detail === 'object' && typeof detail.message === 'string')
+                ? detail.message : (detail || `Request failed with status ${response.status}`);
             if (!silent) {
                 console.error(`API Error: ${endpoint}`, data);
             }
             const err = new Error(errorMsg);
             err.status = response.status;  // let callers branch on e.g. 409 conflict
-            err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
+            err.reason = (data && typeof data.reason === 'string') ? data.reason
+                : (detail && typeof detail === 'object' && typeof detail.reason === 'string') ? detail.reason : undefined;
             throw err;
         }
         
@@ -1720,6 +1723,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     // under the person signing in (_replacePageAfterSignOut).
     _signingIn = true;
     _stopPasskeyOffer();          // a password sent supersedes any passkey sign-in under way
+    _passwordSending = true;
     try {
         const headers = { 'Content-Type': 'application/json' };
         // A sign-in a passkey started, waiting for its password: the stage's token says which account.
@@ -1820,9 +1824,13 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
     } catch (error) {
         console.error('Login error:', error);
+        // The passkey's sign-in is over (too many wrong passwords, or it ran out): back to an ordinary sign-in.
+        if (_passwordStage && /start again/i.test(error.message || '')) _cancelPasswordStage();
         errorDiv.textContent = error.message;
         errorDiv.style.display = 'block';
         _signInEnded(error.message);
+    } finally {
+        _passwordSending = false;
     }
 });
 
@@ -1838,9 +1846,12 @@ let _passkeyOffer = null;          // the AbortController of the waiting offer o
 let _passwordStage = null;         // {token, username} while a passkey's sign-in waits for its password
 let _passkeyFlow = 0;              // the latest passkey sign-in: only it may change the page (an offer the browser
                                    // completes on its own must not race the button or a password being typed)
+let _passwordSending = false;      // a password sign-in is on its way: no passkey sign-in starts meanwhile
+let _passkeyRenewal = null;        // renews the field's offer before its challenge lapses
 
 function _stopPasskeyOffer() {
     _passkeyFlow++;                // whatever passkey sign-in is under way no longer speaks for the page
+    if (_passkeyRenewal) { clearTimeout(_passkeyRenewal); _passkeyRenewal = null; }
     if (_passkeyOffer) { try { _passkeyOffer.abort(); } catch (_) {} }
     _passkeyOffer = null;
 }
@@ -1861,16 +1872,21 @@ async function _initPasskeySignIn(policy) {
     // The offer starts when the person comes to the username field, and only in a browser that has used or added a
     // passkey here (_passkeyUsedHere): each offer asks the server for a challenge, and an office behind one address
     // shares the budget for those. Anyone else has the button, which also marks the browser once it works.
-    if (input && !input.dataset.passkeyOffer && _passkeyUsedHere() && await Passkeys.conditionalAvailable()) {
+    // The listener is attached at once (the check that the browser can make an offer runs inside it), so a cursor
+    // placed in the field while the page is still starting is not missed.
+    if (input && !input.dataset.passkeyOffer && _passkeyUsedHere()) {
         input.dataset.passkeyOffer = '1';
-        input.addEventListener('focus', () => {
-            if (!_passwordStage && !_passkeyOffer) _passkeySignIn({ conditional: true });
-        });
+        input.addEventListener('focus', () => { _offerOnUsername(); });
     }
     // A field that already has the cursor (the page put it there) gets its offer now: no focus event will come.
-    if (input && input.dataset.passkeyOffer && document.activeElement === input && !_passwordStage && !_passkeyOffer) {
-        _passkeySignIn({ conditional: true });
-    }
+    if (input && input.dataset.passkeyOffer && document.activeElement === input) _offerOnUsername();
+}
+
+async function _offerOnUsername() {
+    if (_passwordStage || _passkeyOffer || _passwordSending) return;
+    if (!(await Passkeys.conditionalAvailable())) return;
+    if (_passwordStage || _passkeyOffer || _passwordSending) return;
+    _passkeySignIn({ conditional: true });
 }
 
 const PASSKEY_USED_HERE = 'passkeyUsedHere';
@@ -1904,6 +1920,7 @@ function _showLoginError(message) {
 // conditional: the offer on the username field (silent: a cancelled or aborted offer shows nothing).
 async function _passkeySignIn({ conditional = false } = {}) {
     const errorDiv = document.getElementById('login-error');
+    if (_passwordSending) return;
     _stopPasskeyOffer();
     const flow = ++_passkeyFlow;
     const current = () => flow === _passkeyFlow;
@@ -1924,7 +1941,21 @@ async function _passkeySignIn({ conditional = false } = {}) {
             }
             return;
         }
-        const { challenge_id, options } = await start.json();
+        const { challenge_id, options, expires_in } = await start.json();
+        if (conditional) {
+            // The challenge lapses (expires_in); the browser keeps the offer open past that. Renew it a little before,
+            // while the person is at the field and the page is in view; otherwise let it go, and focus starts a new one.
+            const lifetime = Math.max(30, (Number(expires_in) || 300) - 30) * 1000;
+            _passkeyRenewal = setTimeout(() => {
+                _passkeyRenewal = null;
+                if (!current()) return;
+                _stopPasskeyOffer();
+                const input = document.getElementById('username');
+                if (input && document.activeElement === input && document.visibilityState === 'visible' && !_passwordStage) {
+                    _passkeySignIn({ conditional: true });
+                }
+            }, lifetime);
+        }
         const credential = await Passkeys.get(options, { conditional, signal: controller.signal });
         if (!current()) return;
         const resp = await fetch(`${API_BASE}/auth/passkeys/sign-in/verify`, {
@@ -1945,6 +1976,7 @@ async function _passkeySignIn({ conditional = false } = {}) {
         if (!conditional) _showLoginError(window.Passkeys ? Passkeys.failureText(error) : 'The passkey did not work.');
     } finally {
         if (_passkeyOffer === controller) _passkeyOffer = null;
+        if (current() && _passkeyRenewal) { clearTimeout(_passkeyRenewal); _passkeyRenewal = null; }
     }
 }
 
@@ -1961,8 +1993,17 @@ function _beginPasswordStage(data) {
     const input = document.getElementById('username');
     if (input) { input.value = _passwordStage.username; input.readOnly = true; }
     const button = document.getElementById('passkey-sign-in-btn');
-    if (button) button.style.display = 'none';
+    if (button) { button.dataset.wasShown = button.style.display === 'none' ? '' : '1'; button.style.display = 'none'; }
     _loginNote('Your passkey was accepted. Enter your password to finish signing in.');
+    const note = document.getElementById('login-stage-note');
+    if (note) {
+        const other = _el('button', 'btn btn-link btn-sm', 'Use another account');
+        other.type = 'button';
+        other.id = 'login-stage-cancel';
+        other.addEventListener('click', () => _cancelPasswordStage());
+        note.appendChild(document.createTextNode(' '));
+        note.appendChild(other);
+    }
     const pw = document.getElementById('password');
     if (pw) { pw.value = ''; pw.focus(); }
 }
@@ -1973,6 +2014,19 @@ function _endPasswordStage() {
     const input = document.getElementById('username');
     if (input) input.readOnly = false;
     _loginNote('');
+}
+
+// Leave the passkey's sign-in for an ordinary one: the name free again, the passkey button back.
+function _cancelPasswordStage() {
+    _endPasswordStage();
+    const input = document.getElementById('username');
+    if (input) { input.value = ''; input.focus(); }
+    const pw = document.getElementById('password');
+    if (pw) pw.value = '';
+    const button = document.getElementById('passkey-sign-in-btn');
+    if (button && button.dataset.wasShown) button.style.display = '';
+    const errorDiv = document.getElementById('login-error');
+    if (errorDiv) errorDiv.style.display = 'none';
 }
 
 // The sign-in button says the page is still loading until every script has run (index.html), and a sign-in sent
@@ -2183,7 +2237,9 @@ function renderVerifyCard(box, opts) {
     }
     const hasCode = methods.length > 0;
     if (hasCode) { box.appendChild(desc); box.appendChild(grp); }
-    else box.appendChild(_el('p', 'text-secondary text-sm mb-md', 'Confirm it is you with your passkey.'));
+    else if (passkey) box.appendChild(_el('p', 'text-secondary text-sm mb-md', 'Confirm it is you with your passkey.'));
+    else box.appendChild(_el('p', 'text-secondary text-sm mb-md', 'Your account confirms it is you with a passkey, and '
+        + 'this browser cannot use one here. Sign in from a browser that can, or ask an administrator.'));
     box.appendChild(err);
     if (hasCode) box.appendChild(verify);
     if (passkey) box.appendChild(passkey);
@@ -2358,6 +2414,10 @@ function _buildStepUpBody(action, methods) {
     const hasPassword = methods.includes('password');
     const hasPasskey = methods.includes('passkey') && !!window.Passkeys && Passkeys.supported();
     let otpMode = otpMethod ? 'otp' : (hasRecovery ? 'recovery' : null);   // 'otp' | 'recovery'
+    // With nothing to type, the dialog's first button would start a passkey ceremony: the dialogs' controller then
+    // focuses the dialog itself, so Enter or Space chooses nothing by accident.
+    const stepUpModal = document.getElementById('stepup-modal');
+    if (stepUpModal) stepUpModal.toggleAttribute('data-no-autofocus', hasPasskey && !otpMethod && !hasRecovery && !hasPassword);
 
     body.appendChild(_el('p', 'text-secondary text-sm mb-md', 'This action needs an extra confirmation.'));
 
@@ -2380,8 +2440,15 @@ function _buildStepUpBody(action, methods) {
         g.appendChild(pwInput); body.appendChild(g);
     }
 
+    let passkeyButton = null;
+    const passkeyOnly = !otpMethod && !hasRecovery && methods.includes('passkey');
+    if (passkeyOnly && !hasPasskey) {
+        body.appendChild(_el('p', 'text-secondary text-sm', 'This needs your passkey, and this browser cannot use one '
+            + 'here. Try from a browser that can.'));
+    }
     if (hasPasskey) {
         const passkey = _el('button', 'btn btn-secondary btn-sm mt-sm', 'Use a passkey');
+        passkeyButton = passkey;
         passkey.type = 'button';
         passkey.id = 'stepup-passkey-btn';
         body.appendChild(passkey);
@@ -2443,6 +2510,8 @@ function _buildStepUpBody(action, methods) {
     const cancel = _el('button', 'btn btn-secondary', 'Cancel');
     const confirm = _el('button', 'btn btn-primary', 'Confirm');
     footer.appendChild(cancel); footer.appendChild(confirm); body.appendChild(footer);
+    // With only a passkey as the factor, Confirm could never succeed (and each try would count): it is not shown.
+    if (passkeyOnly) confirm.style.display = 'none';
     cancel.addEventListener('click', () => { closeModal(); });   // closeModal settles the promise null
 
     async function submit() {
@@ -2481,7 +2550,12 @@ function _buildStepUpBody(action, methods) {
     }
     confirm.addEventListener('click', submit);
     if (codeInput) codeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
-    if (pwInput) pwInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    if (pwInput) pwInput.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        if (passkeyOnly) { if (passkeyButton) passkeyButton.click(); }
+        else submit();
+    });
     applyCodeMode();
     if (!codeInput && pwInput) pwInput.focus();
 }
@@ -7168,18 +7242,30 @@ function _usHideEmailCodeRow() {
 
 function _passkeyWhen(iso) {
     if (!iso) return null;
-    try { return new Date(iso).toLocaleDateString(); } catch (_) { return null; }
+    try {
+        const when = parseServerTime(iso);
+        return when ? when.toLocaleDateString() : null;
+    } catch (_) { return null; }
 }
 
 async function renderAccountPasskeys() {
     const section = document.getElementById('us-passkeys-section');
     const body = document.getElementById('us-passkeys-body');
     if (!section || !body) return;
+    body.replaceChildren(_el('div', 'spinner'));      // never the list of whoever used this tab before
     let data;
     try { data = await apiRequest('/users/me/passkeys', { silent: true }); }
     catch (_) { section.style.display = 'none'; return; }
+    if (!data || data.enabled === false) { section.style.display = 'none'; return; }
     section.style.display = '';
     body.replaceChildren();
+    const requirement = data.requirement || {};
+    if (requirement.required && !requirement.cleared) {
+        body.appendChild(_el('p', requirement.overdue ? 'text-danger text-sm mb-sm' : 'text-warning text-sm mb-sm',
+            requirement.overdue ? 'Your role must hold a passkey: add one now to keep signing in.'
+                : 'Your role must hold a passkey' + (requirement.due ? ' by ' + (_passkeyWhen(requirement.due) || requirement.due) : '')
+                  + '.'));
+    }
     const keys = (data && data.passkeys) || [];
     const limit = (data && data.limit) || 0;
     if (!keys.length) {
@@ -7234,6 +7320,7 @@ async function renderAccountPasskeys() {
             try {
                 await apiRequest('/users/me/passkeys/' + encodeURIComponent(key.id), { method: 'DELETE' });
                 showSuccess('Passkey removed.');
+                if (keys.length === 1) { try { storage.removeItem(PASSKEY_USED_HERE); } catch (_) {} }
             } catch (e) { showError(e.message || 'The passkey was not removed.'); }
             renderAccountPasskeys();
         });
