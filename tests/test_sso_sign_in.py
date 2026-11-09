@@ -57,6 +57,37 @@ class DB(MemoryDB):
                 rows.remove(obj)
         self._uncommitted = []
 
+    def expire(self, obj, attrs=None):
+        pass
+
+    def execute(self, stmt):
+        """The two association-table statements the sign-in writes (department memberships), applied to the users'
+        ``groups`` lists as a refresh would show them, and logged; anything else is not modelled."""
+        from sqlalchemy.sql.dml import Delete, Insert
+        from app.core.models import Group, User, user_groups
+        rows = self.rows_of(user_groups)
+        if isinstance(stmt, Insert) and stmt.table is user_groups:
+            params = stmt.compile().params
+            self.log.append(("execute", "insert user_groups", params["user_id"], params["group_id"]))
+            if any(r.user_id == params["user_id"] and r.group_id == params["group_id"] for r in rows):
+                return types.SimpleNamespace(rowcount=0)
+            rows.append(types.SimpleNamespace(**params))
+            user = next((u for u in self.rows_of(User) if u.id == params["user_id"]), None)
+            group = next((g for g in self.rows_of(Group) if g.id == params["group_id"]), None)
+            if user is not None and group is not None and group not in user.groups:
+                user.groups.append(group)
+            return types.SimpleNamespace(rowcount=1)
+        if isinstance(stmt, Delete) and stmt.table is user_groups:
+            gone = [r for r in rows if self.truth(stmt.whereclause, r) is True]
+            for r in gone:
+                rows.remove(r)
+                user = next((u for u in self.rows_of(User) if u.id == r.user_id), None)
+                if user is not None:
+                    user.groups[:] = [g for g in user.groups if g.id != r.group_id]
+            self.log.append(("execute", "delete user_groups", len(gone)))
+            return types.SimpleNamespace(rowcount=len(gone))
+        raise AssertionError(f"the test store does not model {stmt!r}")
+
 
 def _call(S, method, url, body=None, headers=None):
     out = {}
@@ -136,9 +167,9 @@ class Harness:
         from app.core import rate_limiter as R
         from app.core import sign_in_codes, sign_in_lockout, sso_state
         from app.core.database import get_db
-        from app.core.models import (AccountInvitation, ActiveSession, AdminGrant, CredentialChange, ExternalIdentity, Group,
-                                     PendingLogin, SecondFactorAction, SecondFactorEnrollment, SsoAdminRequest,
-                                     SsoGroupMapping, SsoProvider, SystemSetting, User)
+        from app.core.models import (AccountInvitation, ActiveSession, AdminGrant, AuditorGrant, CredentialChange,
+                                     ExternalIdentity, Group, PendingLogin, SecondFactorAction, SecondFactorEnrollment,
+                                     SsoAdminRequest, SsoGroupMapping, SsoProvider, SystemSetting, User)
         from app.api import sso_router
         from app.api.user_management_api import get_current_user as umg, require_interactive_admin as uma
         from app.services import oidc_client as oc
@@ -149,7 +180,7 @@ class Harness:
         self.db = DB({User: list(users), SsoProvider: self.providers, ExternalIdentity: list(identities), PendingLogin: [],
                       ActiveSession: [], SystemSetting: [], SecondFactorEnrollment: [], SecondFactorAction: [],
                       AccountInvitation: list(invitations), SsoGroupMapping: [], SsoAdminRequest: [], Group: [],
-                      AdminGrant: [], CredentialChange: []})
+                      AdminGrant: [], CredentialChange: [], AuditorGrant: []})
         self.current_user = users[0] if users else None
         monkeypatch.setitem(S.app.dependency_overrides, get_db, lambda: self.db)
         monkeypatch.setitem(S.app.dependency_overrides, umg, lambda: self.current_user)

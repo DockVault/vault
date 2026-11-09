@@ -3971,7 +3971,7 @@ class SsoAdminRequest(Base):
     provider_group = Column(String(255), nullable=False)
     requested_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
-    state = Column(String(8), nullable=False, default='held', server_default='held')   # held | approved | denied | expired
+    state = Column(String(8), nullable=False, default='held', server_default='held')   # held | approved | denied | expired | demoted
     decided_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     decided_by_name = Column(String(255), nullable=True)
     decided_at = Column(DateTime, nullable=True)

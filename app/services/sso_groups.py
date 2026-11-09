@@ -26,7 +26,8 @@ from app.core import sso_policy
 log = logging.getLogger("dockvault.sso")
 
 REQUEST_DAYS = 7
-HELD, APPROVED, DENIED, EXPIRED = "held", "approved", "denied", "expired"
+GRANT_MATCH_SECONDS = 300            # an approval's grant record is written with the decision
+HELD, APPROVED, DENIED, EXPIRED, DEMOTED = "held", "approved", "denied", "expired", "demoted"
 
 # What the owners of vaults a department reaches are told about a join made by a sign-in (the access notices
 # want a granter with an id and a name; nobody's own account made this change).
@@ -115,7 +116,7 @@ def apply(db, row, user, answer) -> Applied:
     maps_admin = any(m.role == "admin" for m in mappings)
     if getattr(user, "role", None) == RoleEnum.ADMIN:
         if maps_admin and admin_group is None and made_administrator_through(db, user, row):
-            _demote(db, user, roles, applied)
+            _demote(db, row, user, roles, applied)
         return applied
     if admin_group is not None and policy["sso_admin_mapping"]:
         applied.request = _request_admin(db, user, row, admin_group)
@@ -146,11 +147,18 @@ def _join(db, row, user, group_ids, applied: Applied) -> None:
             reach.watch_share(share, db.query(Vault).filter(Vault.id == share.vault_id).first(), [user.id],
                               department=group.name)
         groups.append(group)
+    # User.groups is read-only (the association is written through the groups routes), so the rows are written
+    # here as those routes write them; a membership written meanwhile by an administrator is left as it is.
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from app.core.models import user_groups
+    now = datetime.utcnow()
     for group in groups:
-        user.groups.append(group)
+        db.execute(pg_insert(user_groups).values(user_id=user.id, group_id=group.id, group_role="member",
+                                                  added_at=now, added_by=None).on_conflict_do_nothing())
         applied.joined.append(group.name)
         applied.joined_ids.append(str(group.id))
     db.flush()
+    db.expire(user, ["groups"])
     reach.tell()
 
 
@@ -167,15 +175,22 @@ def _reach_of(db, group_id):
 
 
 def _leave(db, user, group_ids, applied: Applied) -> None:
+    from app.core.models import user_groups
     wanted = {str(g) for g in group_ids}
     for group in list(user.groups or []):
         if str(group.id) in wanted:
-            user.groups.remove(group)
+            result = db.execute(user_groups.delete().where((user_groups.c.user_id == user.id)
+                                                           & (user_groups.c.group_id == group.id)))
+            if getattr(result, "rowcount", 1) == 0:
+                continue                     # removed meanwhile by an administrator: nothing to record
             applied.left.append(group.name)
             applied.left_ids.append(str(group.id))
+    if applied.left_ids:
+        db.flush()
+        db.expire(user, ["groups"])
 
 
-def _demote(db, user, roles, applied: Applied) -> None:
+def _demote(db, row, user, roles, applied: Applied) -> None:
     """An administrator made so by an approved request who left the mapped group: the demotion the Users page
     would make, by nobody (the host-operator reading of ``actor=None``), unless they are the last administrator
     able to act."""
@@ -191,6 +206,8 @@ def _demote(db, user, roles, applied: Applied) -> None:
     applied.permissions_removed = api._set_role(db, user, new_role, actor=None)
     applied.role = ("admin", new_role.value)
     applied.demoted = True
+    for request in _approvals_of(db, user, row):
+        request.state = DEMOTED                 # the approval is spent: a later role is somebody else's doing
 
 
 def _request_admin(db, user, row, group: str):
@@ -201,18 +218,42 @@ def _request_admin(db, user, row, group: str):
                                               SsoAdminRequest.provider_id == row.id).all():
         if r.state == HELD and r.expires_at > now:
             return None                      # already waiting: nothing new to tell
+    for r in db.query(SsoAdminRequest).filter(SsoAdminRequest.user_id == user.id,
+                                              SsoAdminRequest.provider_id == row.id).all():
+        if r.state == DENIED and r.decided_at is not None and r.decided_at > now - timedelta(days=REQUEST_DAYS):
+            return None                      # a denial holds for as long as a request would have waited
     request = SsoAdminRequest(id=uuid.uuid4(), user_id=user.id, provider_id=row.id, provider_group=str(group)[:255],
                               requested_at=now, expires_at=now + timedelta(days=REQUEST_DAYS), state=HELD)
     db.add(request)
     return request
 
 
-def made_administrator_through(db, user, row) -> bool:
-    """Whether ``user`` became an administrator by an approved request of this provider's mapping (the only
-    administrators a mapping may take the role from; one made by hand keeps it)."""
+def _approvals_of(db, user, row) -> list:
     from app.core.models import SsoAdminRequest
     return db.query(SsoAdminRequest).filter(SsoAdminRequest.user_id == user.id, SsoAdminRequest.provider_id == row.id,
-                                            SsoAdminRequest.state == APPROVED).first() is not None
+                                            SsoAdminRequest.state == APPROVED).all()
+
+
+def made_administrator_through(db, user, row) -> bool:
+    """Whether ``user``'s administrator role is the one an approved request of this provider's mapping granted: the
+    approval stands, and the account's current grant record is that approval's (made by its approver, at or after
+    the decision). One made by hand since, or by another provider's mapping, keeps the role."""
+    from app.core import admin_grants
+    approvals = _approvals_of(db, user, row)
+    if not approvals:
+        return False
+    grant = admin_grants.of(db, [user.id]).get(user.id)
+    if grant is None:
+        return False
+    for r in approvals:
+        if r.decided_by is None or r.decided_at is None or grant.granted_at is None:
+            continue
+        since = (grant.granted_at - r.decided_at).total_seconds()
+        # The approval records the grant as it is decided; a grant made by hand later, even by the same
+        # administrator, is another decision and keeps the role.
+        if str(getattr(grant, "granted_by_id", None)) == str(r.decided_by) and 0 <= since <= GRANT_MATCH_SECONDS:
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- after the commit
@@ -329,13 +370,22 @@ def approver_refusal(db, approver, request) -> Optional[str]:
 
 def decision_refusal(db, request, approver, *, now: Optional[datetime] = None) -> Optional[Conflict]:
     """Why ``request`` cannot be decided by ``approver`` now, or None."""
-    from app.core.models import RoleEnum, User
+    from app.core.models import RoleEnum, SsoGroupMapping, SsoProvider, User
     from app.services.sso_sign_in import account_usable
     now = now or datetime.utcnow()
     if request.state != HELD:
         return Conflict("decided", f"This request was already {request.state}.")
     if request.expires_at <= now:
         return Conflict("expired", "This request has expired; the person signs in again to raise a new one.")
+    provider = db.query(SsoProvider).filter(SsoProvider.id == request.provider_id).first()
+    if provider is None or getattr(provider, "state", None) != "enabled":
+        return Conflict("provider_gone", "The provider this request came from is gone or disabled.")
+    if not sso_policy.effective(getattr(provider, "policy", None))["sso_admin_mapping"]:
+        return Conflict("mapping_off", "The provider no longer maps a group to the administrator role.")
+    if db.query(SsoGroupMapping).filter(SsoGroupMapping.provider_id == request.provider_id,
+                                        SsoGroupMapping.provider_group == request.provider_group,
+                                        SsoGroupMapping.role == "admin").first() is None:
+        return Conflict("mapping_gone", "The group this request came from is no longer mapped to the administrator role.")
     user = db.query(User).filter(User.id == request.user_id).first()
     if user is None or not account_usable(user):
         return Conflict("account_unusable", "The account this request is about cannot sign in.")
@@ -355,6 +405,7 @@ def approve(db, request, approver, *, http_request=None) -> dict:
     api = _api()
     user = db.query(User).filter(User.id == request.user_id).first()
     now = datetime.utcnow()
+    old_role = getattr(user.role, "value", user.role)
     api._record_admin_grant(db, user, by=approver)
     taken = api._take_back_password_at_promotion(db, user, by=approver)
     removed = api._set_role(db, user, RoleEnum.ADMIN, actor=approver)
@@ -365,7 +416,7 @@ def approve(db, request, approver, *, http_request=None) -> dict:
     db.commit()
     try:
         api._announce_admin_granted(db, user, by_name=approver.username, how="promoted")
-        api._notify_account_status_changes(db, user, by_name=approver.username, role=("user", "admin"),
+        api._notify_account_status_changes(db, user, by_name=approver.username, role=(old_role, "admin"),
                                            permissions_removed=removed)
     except Exception as exc:  # noqa: BLE001
         log.info("sso approval notices skipped: %s", type(exc).__name__)

@@ -68,11 +68,19 @@ class Grouping(Resolving):
                             lambda db, user, *, by_name, how: self.announced.append((user.username, by_name, how)))
         monkeypatch.setattr(sso_admin_router, "_step_up", lambda db, user, request: self.step_ups.append(user.username))
 
-    def department(self, name):
-        from app.core.models import Group
+    def department(self, name, *members):
+        """A department; ``members`` are filed in the association table as an administrator's add files them."""
+        from app.core.models import Group, user_groups
         group = types.SimpleNamespace(id=uuid.uuid4(), name=name)
         self.db.rows_of(Group).append(group)
+        for user in members:
+            self.db.rows_of(user_groups).append(types.SimpleNamespace(user_id=user.id, group_id=group.id, group_role="member"))
+            user.groups.append(group)
         return group
+
+    def membership_rows(self, user):
+        from app.core.models import user_groups
+        return sorted(str(r.group_id) for r in self.db.rows_of(user_groups) if r.user_id == user.id)
 
     def mapping(self, provider, group, department=None, role=None):
         from app.core.models import SsoGroupMapping
@@ -98,14 +106,16 @@ def _names(groups):
 def test_the_mappings_move_the_person_between_departments_and_touch_nothing_else(monkeypatch):
     alice, root, p = _user(), _user("root", role="admin"), _provider()
     h = Grouping(monkeypatch, [alice, root], [p], identities=[_identity(alice, p)])
-    finance, legal, board = h.department("Finance"), h.department("Legal"), h.department("Board")
-    alice.groups = [legal, board]
+    finance, legal, board = h.department("Finance"), h.department("Legal", alice), h.department("Board", alice)
     h.mapping(p, "fin", finance)
     h.mapping(p, "legal", legal)
     h.reach_of[str(finance.id)] = (["vault-1"], [])
     location, _ = _sign_in(h, p, groups=["fin", "other"])
     assert location.startswith("/#sso="), location
     assert _names(alice.groups) == ["Board", "Finance"]                     # joined Finance, left Legal, Board kept
+    # Written through the association table, as the groups routes write it (the relationship is read-only).
+    assert h.membership_rows(alice) == sorted([str(board.id), str(finance.id)])
+    assert ("execute", "insert user_groups", alice.id, finance.id) in h.db.log and ("execute", "delete user_groups", 1) in h.db.log
     assert ("commit",) in h.db.log
     added = [a for a in h.audits if a[0] == "group_members_added"]
     removed = [a for a in h.audits if a[0] == "group_member_removed"]
@@ -130,15 +140,15 @@ def test_the_mappings_move_the_person_between_departments_and_touch_nothing_else
 def test_a_token_without_group_information_changes_nothing_and_tells_the_administrators(monkeypatch):
     alice, root, p = _user(), _user("root", role="admin"), _provider()
     h = Grouping(monkeypatch, [alice, root], [p], identities=[_identity(alice, p)])
-    legal = h.department("Legal")
-    alice.groups = [legal]
+    legal = h.department("Legal", alice)
     h.mapping(p, "legal", legal)
     h.mapping(p, "fin", h.department("Finance"))
+    # A list beside the marker would move alice to Finance if it were trusted; it is partial, so nothing moves.
     for claims in ({"groups": ...}, {"groups": ..., "_claim_names": {"groups": "src1"}},
-                   {"groups": ["legal"], "_claim_names": {"groups": "src1"}}):
+                   {"groups": ["fin"], "_claim_names": {"groups": "src1"}}):
         location, _ = _sign_in(h, p, **claims)
         assert location.startswith("/#sso="), location
-        assert _names(alice.groups) == ["Legal"] and h.membership_audits() == []
+        assert _names(alice.groups) == ["Legal"] and h.membership_rows(alice) == [str(legal.id)] and h.membership_audits() == []
     assert [a for a in h.audits if a[0] == "sso_groups_missing" and a[1] == "failure"]
     assert ([str(root.id)], "A provider sent no group information") in h.notices
     # A provider with no mappings has nothing to miss.
@@ -198,6 +208,13 @@ def test_an_administrator_group_opens_one_held_request_and_grants_nothing(monkey
     _sign_in(h, p, groups=["admins"])
     assert len(h.requests()) == 1
     assert [n for n in h.notices if n[1] == "An administrator request is waiting"] == [([str(root.id)], "An administrator request is waiting")]
+    # Denied: no new request for as long as one would have waited; after that, a sign-in may ask again.
+    request.state, request.decided_at = "denied", datetime.utcnow() - timedelta(days=2)
+    _sign_in(h, p, groups=["admins"])
+    assert len(h.requests()) == 1
+    request.decided_at = datetime.utcnow() - timedelta(days=8)
+    _sign_in(h, p, groups=["admins"])
+    assert len(h.requests()) == 2 and h.requests()[-1].state == "held"
 
 
 # --------------------------------------------------------------------------- the decision
@@ -213,10 +230,10 @@ def _request_for(h, p, user, **extra):
     return row
 
 
-def _grant(h, admin, granted_at, lineage=()):
+def _grant(h, admin, granted_at, lineage=(), granted_by_id=None):
     from app.core.models import AdminGrant
     h.db.rows_of(AdminGrant).append(types.SimpleNamespace(user_id=admin.id, granted_at=granted_at, lineage=list(lineage),
-                                                           granted_by_id=None, granted_by_name="x"))
+                                                           granted_by_id=granted_by_id, granted_by_name="x"))
 
 
 def test_the_request_is_decided_by_another_administrator_under_the_approver_rules(monkeypatch):
@@ -224,8 +241,10 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     p = _provider(policy={"sso_admin_mapping": True})
     h = Grouping(monkeypatch, [bob, root], [p])
     h.current_user = root                               # the administrator at the keyboard
+    h.mapping(p, "admins", role="admin")
     request = _request_for(h, p, bob)
     S = h.S
+    from app.core.models import RoleEnum
     status, body, _ = _call(S, "GET", "/admin/sso/admin-requests")
     assert status == 200, body
     (held,) = body["held"]
@@ -248,17 +267,58 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
     assert status == 409 and body["detail"]["reason"] == "changed"
     h.db.rows_of(CredentialChange).clear()
-    # A locked administrator cannot act.
+    # A locked administrator cannot act; one whose password someone else set may not decide.
     root.is_locked = True
-    assert _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")[1]["detail"]["reason"] == "cannot_act"
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "cannot_act", body
     root.is_locked = False
+    root.password_set_by_other_at = datetime.utcnow()
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "password", body
+    root.password_set_by_other_at = None
+    # The account the request is about must be able to sign in.
+    bob.is_active = False
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "account_unusable", body
+    bob.is_active = True
+    # A held request past its time is refused as expired even when nothing marked it yet.
+    request.expires_at = datetime.utcnow() - timedelta(seconds=1)
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "expired", body
+    request.expires_at = datetime.utcnow() + timedelta(days=6)
+    # The mapping, the setting and the provider must still stand.
+    p.policy = {"sso_admin_mapping": False}
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "mapping_off", body
+    p.policy = {"sso_admin_mapping": True}
+    p.state = "disabled"
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "provider_gone", body
+    p.state = "enabled"
+    from app.core.models import SsoGroupMapping
+    h.db.rows_of(SsoGroupMapping)[0].provider_group = "other"
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "mapping_gone", body
+    h.db.rows_of(SsoGroupMapping)[0].provider_group = "admins"
+    assert h.step_ups == []
     # A request about an administrator (their own account included) has nothing to grant.
     own = _request_for(h, p, root)
-    assert _call(S, "POST", f"/admin/sso/admin-requests/{own.id}/approve")[1]["detail"]["reason"] == "already_admin"
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{own.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "already_admin", body
+    # A request decided while the step-up was being proved is not decided twice.
+    def deciding_step_up(db, user, http_request):
+        h.step_ups.append(user.username)
+        request.state = "denied"
+    from app.api import sso_admin_router
+    monkeypatch.setattr(sso_admin_router, "_step_up", deciding_step_up)
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "changed" and h.step_ups == ["root"] and bob.role == RoleEnum.USER
+    request.state = "held"
+    h.step_ups.clear()
+    monkeypatch.setattr(sso_admin_router, "_step_up", lambda db, user, http_request: h.step_ups.append(user.username))
     # Approved: the step-up, then the promotion path with the approver as the grantor, the announcements.
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
     assert status == 200, body
-    from app.core.models import RoleEnum
     assert h.step_ups == ["root"] and h.grants_recorded == [("bob", "root")] and bob.role == RoleEnum.ADMIN
     assert h.role_sets == [("bob", "admin", "root")] and h.announced == [("bob", "root", "promoted")] and h.handed == [{"user_id": bob.id}]
     assert h.status_notices == [("bob", "root", ("user", "admin"), ["old-permission"])]
@@ -275,6 +335,11 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     denied = _request_for(h, p, carol)
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{denied.id}/deny")
     assert status == 200 and denied.state == "denied" and carol.role == RoleEnum.USER and len(h.role_sets) == 1
+    # The approval's notice names the role the account really had.
+    carol.role = RoleEnum.EXTERNAL
+    again = _request_for(h, p, carol)
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{again.id}/approve")
+    assert status == 200 and h.status_notices[-1] == ("carol", "root", ("external", "admin"), ["old-permission"])
     assert ([str(carol.id)], "Your administrator role was not granted") in h.notices
     assert any(a[0] == "sso_admin_denied" and a[1] == "success" for a in h.audits)
     # Expired: marked as it is read, and undecidable.
@@ -282,7 +347,8 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     status, body, _ = _call(S, "GET", "/admin/sso/admin-requests")
     assert stale.state == "expired" and any(r["id"] == str(stale.id) and r["state"] == "expired" for r in body["decided"])
     assert any(a[0] == "sso_admin_expired" for a in h.audits)
-    assert _call(S, "POST", f"/admin/sso/admin-requests/{stale.id}/approve")[1]["detail"]["reason"] == "decided"
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{stale.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "decided", body
     assert _call(S, "POST", f"/admin/sso/admin-requests/{uuid.uuid4()}/approve")[0] == 404
     assert _call(S, "POST", "/admin/sso/admin-requests/not-an-id/approve")[0] == 404
 
@@ -293,7 +359,9 @@ def test_an_administrator_made_by_the_mapping_is_demoted_when_the_group_is_gone_
     h = Grouping(monkeypatch, [bob, root], [p], identities=[_identity(bob, p), _identity(root, p, subject="root-subject")])
     h.mapping(p, "admins", role="admin")
     h.mapping(p, "staff", role="user")
-    _request_for(h, p, bob, state="approved")
+    decided = datetime.utcnow() - timedelta(days=10)
+    approval = _request_for(h, p, bob, state="approved", decided_by=root.id, decided_at=decided)
+    _grant(h, bob, decided + timedelta(seconds=1), granted_by_id=root.id)      # the approval's own grant record
     from app.core.models import RoleEnum
     # Still in the group: nothing.
     _sign_in(h, p, groups=["admins", "staff"])
@@ -310,6 +378,39 @@ def test_an_administrator_made_by_the_mapping_is_demoted_when_the_group_is_gone_
     assert h.lost[0] == ("bob", "demoted", None) and ("told", "lost") in h.lost
     assert ("sso_role_changed", "success", {"provider_id": str(p.id), "from": "admin", "to": "user", "demoted": True}) in h.audits
     assert h.status_notices[-1] == ("bob", "single sign-on", ("admin", "user"), ["old-permission"])
+    assert approval.state == "demoted"                                           # the approval is spent
     # An administrator made by hand (no approved request) keeps the role whatever the token says.
     _sign_in(h, p, sub="root-subject", groups=["staff"])
     assert root.role == RoleEnum.ADMIN and len(h.role_sets) == 1
+
+
+def test_a_stale_approval_demotes_nobody_made_an_administrator_since(monkeypatch):
+    bob, root = _user("bob", role="admin"), _user("root", role="admin")
+    p, q = _provider(policy={"sso_admin_mapping": True}), _provider(name="other", policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p, q], identities=[_identity(bob, p), _identity(bob, q, subject="s-q")])
+    h.mapping(p, "admins", role="admin")
+    h.mapping(q, "admins-q", role="admin")
+    from app.core.models import AdminGrant, RoleEnum
+    decided = datetime.utcnow() - timedelta(days=30)
+    _request_for(h, p, bob, state="approved", decided_by=root.id, decided_at=decided)
+    # Promoted by hand since (a fresh grant by root, after the approval was spent): the mapping takes nothing.
+    _grant(h, bob, datetime.utcnow() - timedelta(days=1), granted_by_id=root.id)
+    _sign_in(h, p, groups=["staff"])
+    assert bob.role == RoleEnum.ADMIN and h.role_sets == [] and h.lost == []
+    # The approval of another provider's mapping does not count for this one.
+    h.db.rows_of(AdminGrant).clear()
+    _grant(h, bob, decided + timedelta(seconds=1), granted_by_id=root.id)
+    _request_for(h, q, bob, state="approved", decided_by=root.id, decided_at=decided)
+    _sign_in(h, q, sub="s-q", groups=["nothing"])            # q's approval, q's token lacks the group: q demotes
+    assert bob.role == RoleEnum.USER and len(h.role_sets) == 1
+    # An external mapping present and no user mapping: the demotion lands on external.
+    carol = _user("carol", role="admin")
+    from app.core.models import User
+    h.db.rows_of(User).append(carol)
+    from app.core.models import ExternalIdentity
+    h.db.rows_of(ExternalIdentity).append(_identity(carol, p, subject="s-carol"))
+    h.mapping(p, "ext", role="external")
+    _request_for(h, p, carol, state="approved", decided_by=root.id, decided_at=decided)
+    _grant(h, carol, decided + timedelta(seconds=1), granted_by_id=root.id)
+    _sign_in(h, p, sub="s-carol", groups=["ext"])
+    assert carol.role == RoleEnum.EXTERNAL and h.role_sets[-1] == ("carol", "external", None)

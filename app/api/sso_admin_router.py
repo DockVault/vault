@@ -40,12 +40,15 @@ def _audit(db, action: str, *, user=None, ip, details: dict, status_: str = "suc
         pass
 
 
-def _request_or_404(db, request_id) -> SsoAdminRequest:
+def _request_or_404(db, request_id, *, lock: bool = False) -> SsoAdminRequest:
     try:
         rid = uuid.UUID(str(request_id))
     except ValueError:
         raise HTTPException(status_code=404, detail="No such request.")
-    row = db.query(SsoAdminRequest).filter(SsoAdminRequest.id == rid).first()
+    query = db.query(SsoAdminRequest).filter(SsoAdminRequest.id == rid)
+    if lock:
+        query = query.populate_existing().with_for_update()     # one decision at a time, read as it stands
+    row = query.first()
     if row is None:
         raise HTTPException(status_code=404, detail="No such request.")
     return row
@@ -89,7 +92,7 @@ def _decide(db, request_id, current_user, request: Request, *, approve: bool):
                         details={"user_id": str(row.user_id), "reason": conflict.code})
         raise HTTPException(status_code=409, detail={"reason": conflict.code, "message": conflict.message})
     _step_up(db, current_user, request)       # may commit (a receipt is used once)
-    row = _request_or_404(db, request_id)
+    row = _request_or_404(db, request_id, lock=True)
     if sso_groups.decision_refusal(db, row, current_user) is not None:
         raise HTTPException(status_code=409, detail={"reason": "changed", "message": "The request changed meanwhile; look again."})
     if approve:
