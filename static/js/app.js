@@ -3686,8 +3686,9 @@ function setupSharedTabsOnce() {
 }
 
 function switchSharedTab(which) {
-    document.querySelectorAll('#shared-section .tab-btn[data-shared-tab]').forEach(
-        b => b.classList.toggle('active', b.getAttribute('data-shared-tab') === which));
+    const buttons = document.querySelectorAll('#shared-section .tab-btn[data-shared-tab]');
+    buttons.forEach(b => b.classList.toggle('active', b.getAttribute('data-shared-tab') === which));
+    _markCurrentTab(buttons, b => b.getAttribute('data-shared-tab') === which);
     const withMe = document.getElementById('shared-tab-with-me');
     const byMe = document.getElementById('shared-tab-by-me');
     if (withMe) withMe.style.display = which === 'with-me' ? '' : 'none';
@@ -8379,6 +8380,12 @@ function wireBrandAssetUploads() {
     });
 }
 
+// The page strips (Settings, Shared, Notes, Upload links) are groups of plain buttons, not tab lists: the
+// open page's button carries aria-current="page", the others none.
+function _markCurrentTab(buttons, isCurrent) {
+    buttons.forEach(b => { if (isCurrent(b)) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
+}
+
 // Setup settings tabs. Only the Settings page's own tab bar: the vault, notes, shared and upload-link
 // pages have tab bars of their own, and a handler of this page on their buttons would clear this page's
 // open tab. Each button is wired once (initSettings() runs on every visit).
@@ -8395,9 +8402,10 @@ function setupSettingsTabs() {
             // Remove active class from all buttons and contents
             tabButtons.forEach(b => b.classList.remove('active'));
             tabContents.forEach(c => c.classList.remove('active'));
-            
+
             // Add active class to clicked button and corresponding content
             btn.classList.add('active');
+            _markCurrentTab(tabButtons, b => b === btn);
             const tabId = btn.getAttribute('data-tab');
             const content = document.getElementById(`settings-tab-${tabId}`);
             if (content) {
@@ -11021,7 +11029,10 @@ function setEditorView(view) {
     const panes = document.getElementById('et-panes');
     panes.classList.remove('et-view-code', 'et-view-render', 'et-view-split');
     panes.classList.add('et-view-' + view);
-    document.querySelectorAll('.et-view').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    document.querySelectorAll('.et-view').forEach(b => {
+        b.classList.toggle('active', b.dataset.view === view);
+        b.setAttribute('aria-pressed', b.dataset.view === view ? 'true' : 'false');
+    });
     if (view !== 'code') refreshTemplatePreview();
 }
 
@@ -21391,8 +21402,9 @@ function renderNotes() {
     const hideToggle = document.getElementById('notes-hide-toggle');
     if (hideToggle) hideToggle.checked = state.notesHideText;
     // Tabs
-    document.querySelectorAll('#notes-section .tab-btn[data-notes-tab]').forEach(
-        b => b.classList.toggle('active', b.getAttribute('data-notes-tab') === state.notesTab));
+    const notesTabButtons = document.querySelectorAll('#notes-section .tab-btn[data-notes-tab]');
+    notesTabButtons.forEach(b => b.classList.toggle('active', b.getAttribute('data-notes-tab') === state.notesTab));
+    _markCurrentTab(notesTabButtons, b => b.getAttribute('data-notes-tab') === state.notesTab);
     const mineTab = document.getElementById('notes-tab-mine');
     const recvTab = document.getElementById('notes-tab-received');
     const sharedTab = document.getElementById('notes-tab-shared');
@@ -23235,7 +23247,9 @@ function setupReceiverUI() {
     document.querySelectorAll('#uploadlinks-section [data-rc-tab]').forEach(btn => {
         btn.addEventListener('click', () => {
             const tab = btn.dataset.rcTab;
-            document.querySelectorAll('#uploadlinks-section [data-rc-tab]').forEach(b => b.classList.toggle('active', b === btn));
+            const rcButtons = document.querySelectorAll('#uploadlinks-section [data-rc-tab]');
+            rcButtons.forEach(b => b.classList.toggle('active', b === btn));
+            _markCurrentTab(rcButtons, b => b === btn);
             const links = document.getElementById('receivers-tab-links');
             const vaults = document.getElementById('receivers-tab-vaults');
             if (links) links.style.display = tab === 'links' ? '' : 'none';

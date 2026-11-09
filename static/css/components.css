@@ -914,7 +914,7 @@ button.vault-sort-dir {
         border-bottom-color: transparent; }
 }
 /* A long help text: one sentence, the rest under "More" (static/js/settings-help.js). */
-.form-help .help-more, p.text-secondary .help-more { display: inline; }
+.form-help .help-more, p.text-secondary .help-more, small .help-more, .email-hint .help-more { display: inline; }
 .help-more > summary { display: inline; cursor: pointer; color: var(--primary, var(--brand-secondary)); list-style: none; font-weight: 600; }
 .help-more > summary::-webkit-details-marker { display: none; }
 .help-more[open] > summary { display: none; }

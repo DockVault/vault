@@ -622,8 +622,8 @@
                     <div class="flex justify-between items-center mb-lg">
                         <h2 class="text-2xl font-bold">Shared</h2>
                     </div>
-                    <div class="tabs mb-lg" role="tablist">
-                        <button class="tab-btn active" type="button" data-shared-tab="with-me">Shared with me</button>
+                    <div class="tabs mb-lg" role="group" aria-label="Shared pages">
+                        <button class="tab-btn active" type="button" data-shared-tab="with-me" aria-current="page">Shared with me</button>
                         <button class="tab-btn" type="button" data-shared-tab="by-me">Shared by me</button>
                     </div>
                     <div id="shared-tab-with-me" class="shared-tab-content">
@@ -1037,8 +1037,8 @@
                             <button id="note-new-btn" class="btn btn-primary btn-sm" type="button"><svg class="icon icon-sm"><use href="#i-plus"/></svg> New note</button>
                         </div>
                     </div>
-                    <div class="tabs mb-md" role="tablist">
-                        <button class="tab-btn active" data-notes-tab="mine" type="button">My notes <span id="notes-mine-count" class="badge badge-secondary" hidden>0</span></button>
+                    <div class="tabs mb-md" role="group" aria-label="Notes pages">
+                        <button class="tab-btn active" data-notes-tab="mine" type="button" aria-current="page">My notes <span id="notes-mine-count" class="badge badge-secondary" hidden>0</span></button>
                         <button class="tab-btn" data-notes-tab="received" type="button">Sent to me <span id="notes-received-count" class="badge badge-secondary" hidden>0</span></button>
                         <button class="tab-btn" data-notes-tab="shared" type="button">Shared <span id="notes-shared-count" class="badge badge-secondary" hidden>0</span></button>
                     </div>
@@ -1061,8 +1061,8 @@
                         <button id="receiver-new-btn" class="btn btn-primary btn-sm" type="button"><svg class="icon icon-sm"><use href="#i-plus"/></svg> New upload link</button>
                     </div>
                     <p class="text-secondary text-sm mb-md">An upload link lets anyone you share it with send files to you — no account needed. Each link drops uploads into its own dedicated vault that only you can open. Pause a link to stop new uploads without losing what's already in it; revoke it to close it for good.</p>
-                    <div class="tabs mb-lg" role="tablist">
-                        <button class="tab-btn active" type="button" data-rc-tab="links">Links</button>
+                    <div class="tabs mb-lg" role="group" aria-label="Upload link pages">
+                        <button class="tab-btn active" type="button" data-rc-tab="links" aria-current="page">Links</button>
                         <button class="tab-btn" type="button" data-rc-tab="vaults">Drop vaults</button>
                     </div>
                     <div id="receivers-tab-links" class="rc-tab-panel">
@@ -1748,10 +1748,10 @@
                     <!-- The Settings pages: on a wide screen a list at the left, grouped under five headings
                          (and a sixth, Sign-in, kept hidden until it has a page); on a phone the same buttons as a
                          strip, the headings hidden. The groups are CSS only, so every page keeps its data-tab. -->
-                    <div class="tabs mb-lg settings-nav" role="tablist" aria-label="Settings pages">
+                    <div class="tabs mb-lg settings-nav" role="group" aria-label="Settings pages">
                         <div class="settings-nav-group" data-settings-group="organisation">
                             <span class="settings-nav-title">Organisation</span>
-                            <button class="tab-btn active" data-tab="general">General</button>
+                            <button class="tab-btn active" data-tab="general" aria-current="page">General</button>
                             <button class="tab-btn" data-tab="branding">Branding</button>
                             <button class="tab-btn" data-tab="storage">Storage</button>
                         </div>
@@ -2287,10 +2287,10 @@
                                         <button type="button" class="btn btn-secondary btn-sm" id="et-load-from" aria-haspopup="true" aria-expanded="false" title="Replace the subject and body with a default or an existing template">⤓ Load from ▾</button>
                                         <div id="et-loadfrom-menu" class="et-dyn-menu et-loadfrom-menu" hidden role="menu"></div>
                                     </span>
-                                    <span class="et-view-toggle" role="tablist" aria-label="Editor view">
-                                        <button type="button" class="btn btn-secondary btn-sm et-view active" data-view="code">Code</button>
-                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="render">Render</button>
-                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="split">Split</button>
+                                    <span class="et-view-toggle" role="group" aria-label="Editor view">
+                                        <button type="button" class="btn btn-secondary btn-sm et-view active" data-view="code" aria-pressed="true">Code</button>
+                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="render" aria-pressed="false">Render</button>
+                                        <button type="button" class="btn btn-secondary btn-sm et-view" data-view="split" aria-pressed="false">Split</button>
                                     </span>
                                 </div>
 
