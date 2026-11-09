@@ -3634,7 +3634,7 @@ function _sharedCard(it) {
     }
     if (it.expires_at && active) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(it.expires_at)); meta.appendChild(ex); }
     if (it.view_only) {
-        const s = _el('span'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only (preview in the browser, no download)'));
+        const s = _el('span', 'shared-view-only'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only (preview in the browser, no download)'));
         meta.appendChild(s);
     }
     if (it.max_downloads != null) {
@@ -3754,7 +3754,7 @@ function _sharedByMeCard(sh) {
     meta.appendChild(_el('span', null, (sh.claim_count || 0) + (sh.max_recipients != null ? '/' + sh.max_recipients : '') + ' recipients'));
     if (sh.created_at) { const on = _el('span', 'shared-on'); on.appendChild(document.createTextNode('Shared ')); on.appendChild(People.time(sh.created_at)); meta.appendChild(on); }
     if (sh.expires_at) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(sh.expires_at)); meta.appendChild(ex); }
-    if (sh.view_only) meta.appendChild(_el('span', null, 'View only'));
+    if (sh.view_only) meta.appendChild(_el('span', 'shared-view-only', 'View only'));
     if (sh.max_downloads != null) meta.appendChild(_el('span', null, sh.max_downloads + ' downloads/recipient'));
     main.appendChild(meta);
     body.appendChild(main);
@@ -12206,7 +12206,7 @@ function renderFilesTable(items, canWrite, tbody, needle) {
                 <td>
                     <div class="file-name" ${nameAttrs} role="button" tabindex="0">
                         <span class="file-icon">${icon}</span>
-                        <span>${escapeHtml(item.name)}${lockIcon}</span>
+                        <span title="${escapeHtml(item.name)}">${escapeHtml(item.name)}${lockIcon}</span>
                     </div>
                 </td>
                 <td class="col-num"><span class="file-size">${size}</span></td>
@@ -21180,7 +21180,7 @@ function renderAdminNoteLinks(data) {
     if (!host) return;
     const links = (data && data.links) || [];
     if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public links exist.')); return; }
-    const table = _el('table', 'data-table');
+    const table = _el('table', 'data-table pin-actions');
     const thead = _el('thead');
     const hr = _headerRow([['Owner', 'owner'], ['Type', 'tag'], ['Note', 'note'], ['Status', 'status'], ['Protection', 'protection'],
         ['Expires', 'expires'], ['Views', 'views'], ['Created', 'created'], ['Last used', 'last-used'], ['', '']]);
@@ -22523,7 +22523,7 @@ function renderAdminPublicLinks(data) {
     const host = _pflEl('pfl-admin-links'); if (!host) return;
     const links = (data && data.links) || [];
     if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public file/folder links exist.')); return; }
-    const table = _el('table', 'data-table');
+    const table = _el('table', 'data-table pin-actions');
     const thead = _el('thead');
     const hr = _headerRow([['Owner', 'owner'], ['Type', 'tag'], ['Item', 'item'], ['Status', 'status'], ['Protection', 'protection'],
         ['Expires', 'expires'], ['Uses', 'uses'], ['Created', 'created'], ['Last used', 'last-used'], ['', '']]);
@@ -23281,7 +23281,7 @@ function renderAdminReceivers(data) {
     const host = _rcEl('rc-admin-links'); if (!host) return;
     const receivers = (data && data.receivers) || [];
     if (!receivers.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No upload links exist.')); return; }
-    const table = _el('table', 'data-table');
+    const table = _el('table', 'data-table pin-actions');
     const thead = _el('thead');
     const hr = _headerRow([['Owner', 'owner'], ['Label', 'label'], ['Type', 'tag'], ['Status', 'status'], ['Expires', 'expires'],
         ['Files', 'files'], ['Budget', 'budget'], ['Created', 'created'], ['Last used', 'last-used'], ['', '']]);

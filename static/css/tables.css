@@ -10,6 +10,13 @@
 .table-facet { display: inline-block; width: auto; max-width: 100%; margin: 0 var(--space-sm) var(--space-sm) 0; vertical-align: middle; }
 .table-search-empty { margin: var(--space-sm) 0; }
 
+/* The administrators' link tables keep each row's Revoke in view: the action column is pinned to the right edge of
+   the table's scroll box, on the card's surface (the header on the header's), with a hairline at its left so the
+   cells scrolling under it stay readable. */
+.data-table.pin-actions th:last-child,
+.data-table.pin-actions td:last-child { position: sticky; right: 0; z-index: 1; background: var(--surface-0); box-shadow: inset 1px 0 0 var(--surface-3); white-space: nowrap; }
+.data-table.pin-actions th:last-child { background: var(--thead-bg, var(--surface-0)); }
+
 /* The pending invitations table scrolls inside its own box on a narrow screen, like the other section tables. */
 #invites-list { overflow-x: auto; }
 

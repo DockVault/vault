@@ -2179,7 +2179,8 @@ details summary:hover {
 .rc-ring-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .rc-ring { width: 84px; height: 84px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
 .rc-ring-hole { width: 62px; height: 62px; border-radius: 50%; background: var(--surface-1); display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.95rem; color: var(--text-primary); }
-.rc-vault-actions { margin-top: auto; }
+/* The card's buttons wrap onto a second centred line instead of running past the card's edges. */
+.rc-vault-actions { margin-top: auto; flex-wrap: wrap; justify-content: center; max-width: 100%; }
 .rc-retention-val { display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap; }
 
 /* Disabled "hint" item in the file context menu (e.g. Public link when no Link tag permits files). */
