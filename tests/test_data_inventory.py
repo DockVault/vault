@@ -114,3 +114,25 @@ def test_the_grant_row_says_what_a_grant_holds_and_for_how_long():
     for part in ("the link's id", "the address that redeemed it", "when it was minted"):
         assert part in holds, part
     assert lifetime.strip().startswith("60 seconds"), lifetime
+
+
+@pytest.mark.parametrize("row,added", [
+    ("| `shares`, `share_claims` |", ["share_claims.preview_count"]),
+    ("| `receivers` |", ["message", "token_enc", "token_enc_for"]),
+    ("| `public_links` |", ["message"]),
+    ("| `note_public_links` |", ["message"]),
+    ("| `publiclink_redeem:", ["receiver_page:<address>"]),
+])
+def test_what_0_35_0_adds_to_a_row_is_marked_as_new_in_it(row, added):
+    # One label, the same in every row, so an operator who reads the inventory for an upgrade finds each
+    # addition by the same words.
+    rows = [line for line in _text().splitlines() if line.startswith(row)]
+    assert len(rows) == 1, row
+    assert rows[0].count("**New in 0.35.0:**") == 1, rows[0]
+    new_part = rows[0].split("**New in 0.35.0:**", 1)[1]
+    for name in added:
+        assert f"`{name}`" in new_part, f"{row} does not mark {name} as new in 0.35.0"
+
+
+def test_no_row_says_from_0_35_0_in_other_words():
+    assert not [line for line in _text().splitlines() if line.startswith("| ") and "from 0.35.0" in line]
