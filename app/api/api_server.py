@@ -13302,13 +13302,14 @@ async def extend_receiver(receiver_id: uuid.UUID, body: ExtendExpiryBody, reques
 
 # ---- reminders before an expiry --------------------------------------------------------------------------------
 def _tell_about_expiry(item: dict) -> bool:
-    """One maker told about one thing about to expire: an in-app notice (once per thing and expiry date) and,
-    when that notice was new, the optional email. Returns whether the notice was new."""
+    """One maker told about one thing about to expire: an in-app notice (once per thing and expiry date, even
+    after the person dismisses it: the notice ledger remembers) and, when that notice was new, the optional
+    email. Returns whether the notice was new."""
     from app.core import expiry_reminders
     when = expiry_reminders.in_words(item["expires_at"])
     notified = _notify_users([item["owner_id"]], "expiry_reminder", f"{item['title']} expires {when}",
                              "Extend it if people still need it; otherwise nothing needs doing.",
-                             target=item["target"], dedup_prefix=expiry_reminders.dedup_key(item))
+                             target=item["target"], dedup_prefix=expiry_reminders.dedup_key(item), once=True)
     if not notified:
         return False
     try:
@@ -16006,7 +16007,8 @@ def _free_name_in_root(db, vault, name: str) -> str:
 
 def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
     """The owner learns of an upload: an in-app notice, one an hour per link (the files are all in the
-    link's vault), and, when that notice was new and mail is set up, the optional email. Best-effort.
+    link's vault; dismissing it does not bring the hour's next upload back: the notice ledger remembers),
+    and, when that notice was new and mail is set up, the optional email. Best-effort.
 
     Neither names the file: a file's name is sealed at rest, and the notice's columns and the mail are
     plaintext. The link's label is the owner's own plain name for it and may be named."""
@@ -16016,7 +16018,7 @@ def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
         notified = _notify_users(
             [owner.id], "receiver_upload", f"Files received on {label}",
             f"A file arrived on {label}. Open its vault to see everything received.",
-            target="#uploadlinks/drops", dedup_prefix=f"receiver_upload:{receiver.id}:{bucket}")
+            target="#uploadlinks/drops", dedup_prefix=f"receiver_upload:{receiver.id}:{bucket}", once=True)
         if notified and owner.email:
             from app.core.email_actions import send_action_email
             base = _public_base_url(request) if request is not None else ""
@@ -17310,15 +17312,17 @@ async def list_shared_with_me(
 # ---------------------------------------------------------------------------
 
 def _notify_users(user_ids, ntype: str, title: str, body: str = None,
-                  target: str = None, dedup_prefix: str = None) -> list:
+                  target: str = None, dedup_prefix: str = None, once: bool = False) -> list:
     """Best-effort: create an in-app notification for each user in a SEPARATE session, so a failure
     or a dedup collision can never affect the caller's request/transaction. When dedup_prefix is
     given, each row's dedup_key is f"{dedup_prefix}:{user_id}" and a UNIQUE(user_id, dedup_key)
-    collision is silently skipped (that user was already notified for this event). Returns the ids of
-    the users a notification was written for (none after a failure), so a caller can send an email only
-    to the people the deduplicated notice reached."""
+    collision is silently skipped (that user was already notified for this event). With ``once`` the
+    same key is also written to the notice ledger (NoticeLedger), in the same savepoint and first, so
+    the notice is given once even after the person dismisses it: a dismissal deletes the notification
+    row, never the ledger's. Returns the ids of the users a notification was written for (none after a
+    failure), so a caller can send an email only to the people the deduplicated notice reached."""
     from app.core.database import get_db_context
-    from app.core.models import Notification
+    from app.core.models import Notification, NoticeLedger
     ids = [str(u) for u in dict.fromkeys(user_ids) if u]  # de-dup + drop falsy, preserve order
     if not ids:
         return []
@@ -17329,6 +17333,8 @@ def _notify_users(user_ids, ntype: str, title: str, body: str = None,
                 dedup = f"{dedup_prefix}:{uid}" if dedup_prefix else None
                 try:
                     with db.begin_nested():
+                        if once and dedup:
+                            db.add(NoticeLedger(user_id=uid, dedup_key=dedup))
                         db.add(Notification(user_id=uid, type=ntype, title=title, body=body,
                                             target=target, dedup_key=dedup))
                     notified.append(uid)

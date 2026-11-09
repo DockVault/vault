@@ -647,6 +647,7 @@ COVERAGE: Dict[str, str] = {
     "account_invitations": "account_invitations",
     "activity_saved_searches": "activity_saved_searches",
     "notifications": "notifications",
+    "notice_ledger": DELETED,
     "notes": "notes",
     "managed_setting_changes": "managed_setting_changes",
     "managed_settings": "managed_settings",

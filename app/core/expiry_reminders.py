@@ -19,6 +19,9 @@ from typing import Callable, Optional
 
 WINDOW_HOURS = 48
 INTERVAL_SECONDS = 600
+# How long the notice ledger remembers what was told: a reminder's key carries the expiry date and an upload
+# notice's its hour, so nothing is due again under a key this old.
+LEDGER_DAYS = 30
 
 _executor: Optional[ThreadPoolExecutor] = None
 
@@ -91,10 +94,20 @@ def in_words(expires_at: datetime, now: Optional[datetime] = None) -> str:
     return f"in about {days} day{'s' if days != 1 else ''}"
 
 
+def prune_ledger(db, now: Optional[datetime] = None) -> int:
+    """Forget what was told more than ``LEDGER_DAYS`` ago (the notice ledger, which keeps a once-only notice
+    from coming back after the person dismisses it). Returns how many rows went."""
+    from app.core.models import NoticeLedger
+
+    now = now or datetime.utcnow()
+    return (db.query(NoticeLedger).filter(NoticeLedger.created_at < now - timedelta(days=LEDGER_DAYS))
+            .delete(synchronize_session=False))
+
+
 def sweep_once(tell: Callable[[dict], bool], now: Optional[datetime] = None) -> int:
     """Tell each maker about what is due; ``tell(item)`` returns True when a notice was written (a second
     call for the same thing and date is its own no-op). Returns how many notices were written. Never
-    raises past one failed item."""
+    raises past one failed item. Also prunes the notice ledger."""
     from app.core.database import get_db_context
     from app.core.safe_log import safe_event
 
@@ -105,6 +118,11 @@ def sweep_once(tell: Callable[[dict], bool], now: Optional[datetime] = None) -> 
     except Exception as e:  # noqa: BLE001
         safe_event("expiry-reminders.read.failed", e)
         return 0
+    try:
+        with get_db_context() as db:
+            prune_ledger(db, now=now)
+    except Exception as e:  # noqa: BLE001
+        safe_event("expiry-reminders.ledger.failed", e)
     for item in items:
         try:
             if tell(item):

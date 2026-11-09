@@ -5,7 +5,8 @@ _tell_receiver_owner), offline on a real (SQLite) database, with the mail captur
 Each names the thing by its kind only (a share of a vault, a folder or a file; a public link and its tag; a note
 link; an upload link and its label) and deep-links to the page that manages it. Neither puts a vault's name, a
 note's title or a file's name into the notice's title or text, nor into what the email is given: those names are
-sealed at rest, and the notice's columns and the mail are in the clear. The matching live tests
+sealed at rest, and the notice's columns and the mail are in the clear. Each is given once: the notice ledger
+remembers what was told, so dismissing the notification does not bring it, or its email, back. The matching live tests
 (tests/test_api_expiry_reminders.py, tests/test_api_upload_links_collect.py) drive the routes on a running stack.
 """
 import uuid
@@ -17,6 +18,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import Session as _Session
 
+from _async_run import run_coroutine
 from _bare_api_env import set_bare_api_env
 
 set_bare_api_env()
@@ -173,3 +175,60 @@ def test_an_upload_notice_names_the_link_never_the_file(db, owner, emails):
     assert rows[0].body.startswith("A file arrived on Signed contracts.")
     assert emails[0][0] == "receiver_upload_received" and emails[0][1]["email"] == "olga@example.test"
     assert "your upload link Signed contracts" in emails[0][2]["change"]
+
+
+def dismiss(row, owner, db):
+    """The person dismisses a notification from the bell: the real route, which deletes the row."""
+    run_coroutine(api.dismiss_notification(row.id, current_user=owner, db=db))
+
+
+def ledger(db, owner):
+    db.expire_all()
+    return db.query(m.NoticeLedger).filter(m.NoticeLedger.user_id == owner.id).all()
+
+
+# --------------------------------------------------------------------------- once, even after a dismissal
+
+def test_a_dismissed_reminder_is_not_written_or_emailed_again(db, owner, emails):
+    v = vault(db, owner)
+    share(db, owner, v, expires_at=NOW + timedelta(hours=20))
+    [item] = expiry_reminders.due(db, now=NOW)
+
+    assert api._tell_about_expiry(item) is True            # the first sweep: a notice and an email
+    assert api._tell_about_expiry(item) is False           # the next sweep: nothing more
+    rows = notices(db, "expiry_reminder", owner)
+    assert len(rows) == 1 and len(emails) == 1 and len(ledger(db, owner)) == 1
+    dismiss(rows[0], owner, db)
+    assert notices(db, "expiry_reminder", owner) == []
+    assert api._tell_about_expiry(item) is False           # ten minutes later: the dismissal stands
+    assert notices(db, "expiry_reminder", owner) == [] and len(emails) == 1
+    # Moved to another day: one more reminder, as before.
+    item = dict(item, expires_at=item["expires_at"] + timedelta(days=1))
+    assert api._tell_about_expiry(item) is True
+    assert len(notices(db, "expiry_reminder", owner)) == 1 and len(emails) == 2
+
+
+def test_a_dismissed_upload_notice_does_not_come_back_within_the_hour(db, owner, emails):
+    receiver = SimpleNamespace(id=uuid.uuid4(), label="Signed contracts")
+    api._tell_receiver_owner(db, None, receiver, owner, None, SimpleNamespace(original_name="a.pdf"))
+    api._tell_receiver_owner(db, None, receiver, owner, None, SimpleNamespace(original_name="b.pdf"))
+    rows = notices(db, "receiver_upload", owner)
+    assert len(rows) == 1 and len(emails) == 1
+    dismiss(rows[0], owner, db)
+    api._tell_receiver_owner(db, None, receiver, owner, None, SimpleNamespace(original_name="c.pdf"))
+    assert notices(db, "receiver_upload", owner) == [] and len(emails) == 1
+
+
+def test_the_ledger_holds_no_name_and_the_sweep_forgets_it_after_thirty_days(db, owner, emails):
+    v = vault(db, owner)
+    share(db, owner, v, expires_at=NOW + timedelta(hours=20))
+    [item] = expiry_reminders.due(db, now=NOW)
+    assert api._tell_about_expiry(item) is True
+    [row] = ledger(db, owner)
+    assert row.dedup_key == f"{expiry_reminders.dedup_key(item)}:{owner.id}"
+    assert SECRET_VAULT not in row.dedup_key and set(m.NoticeLedger.__table__.columns.keys()) ==         {"id", "user_id", "dedup_key", "created_at"}
+    db.add(m.NoticeLedger(user_id=owner.id, dedup_key="old:key", created_at=NOW - timedelta(days=31)))
+    db.add(m.NoticeLedger(user_id=owner.id, dedup_key="recent:key", created_at=NOW - timedelta(days=29)))
+    db.commit()
+    expiry_reminders.sweep_once(lambda _item: False, now=NOW)
+    assert sorted(r.dedup_key for r in ledger(db, owner)) == sorted([row.dedup_key, "recent:key"])

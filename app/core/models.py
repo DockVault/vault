@@ -1785,6 +1785,32 @@ class Notification(Base):
     )
 
 
+class NoticeLedger(Base):
+    """What a person has already been told once, kept apart from the notification itself.
+
+    A notice meant to be given once per thing (the reminder before a share or a link expires, the word
+    that a file arrived on an upload link within the hour) used to be deduplicated by the notification
+    row's UNIQUE(user_id, dedup_key) alone; dismissing the notification deletes that row, so the next
+    sweep or upload wrote the notice, and sent its email, again. A row here is written in the same
+    savepoint as the notification and outlives its dismissal; a collision on it means "already told".
+    Rows hold no name or text, only the recipient and the key (the kind and id of the thing and the
+    date, or the link and the hour), and the reminder sweep deletes them after 30 days. A whole new
+    table, created by create_all(), so it needs no lightweight-migration entry; the user_id FK cascades
+    so deleting a user takes their rows with it.
+    """
+    __tablename__ = 'notice_ledger'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    dedup_key = Column(String(255), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'dedup_key', name='uq_notice_ledger_user_dedup'),
+        Index('idx_notice_ledger_created', 'created_at'),
+    )
+
+
 class Note(Base):
     """A personal note (title + free text), owned by ONE account.
 
