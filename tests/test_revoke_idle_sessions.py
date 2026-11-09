@@ -107,6 +107,47 @@ def test_a_durable_revocation_also_revokes_the_idle_web_sessions(db, published):
     assert published == [_token(db, live)]
 
 
+def _hint(db, row_id, *, token="enc:the-id-token"):
+    """A provider sign-in's record for the session, with its logout hint."""
+    from datetime import datetime
+    from app.core.models import SsoSession
+    engine = db.get_bind()
+    if not sa.inspect(engine).has_table("sso_sessions"):
+        SsoSession.__table__.create(engine)
+    db.add(SsoSession(session_id=row_id, provider_id=uuid.uuid4(), idp_sid=f"sid-{row_id}", idp_sub="subject-1",
+                      auth_time=datetime.utcnow(), id_token_enc=token))
+    db.commit()
+
+
+def _hint_of(db, row_id):
+    from app.core.models import SsoSession
+    db.expire_all()
+    return db.query(SsoSession.id_token_enc).filter(SsoSession.session_id == row_id).scalar()
+
+
+def test_every_session_a_revocation_ends_drops_its_provider_logout_hint(db, published):
+    """The hint (an encrypted ID token kept for the provider's own logout at sign-out) goes with every session a
+    durable revocation ends: the live ones and, in the second pass, the idle ones it revokes. Another account's and
+    a temporary credential's rows are untouched; a revocation that is not durable leaves an idle session alone."""
+    user, other = uuid.uuid4(), uuid.uuid4()
+    live = _row(db, user, active=True)
+    idle = _row(db, user, active=False)
+    temp_idle = _row(db, user, active=False, temp_credential_id=uuid.uuid4())
+    someone_else = _row(db, other, active=False)
+    for row in (live, idle, temp_idle, someone_else):
+        _hint(db, row)
+    assert _revoke(db, user_id=user) == 2
+    assert _hint_of(db, live) is None and _hint_of(db, idle) is None
+    assert _hint_of(db, temp_idle) == "enc:the-id-token" and _hint_of(db, someone_else) == "enc:the-id-token"
+    # Not durable: the live session ends and its hint goes; an idle one is not revoked and keeps it.
+    third = uuid.uuid4()
+    live3, idle3 = _row(db, third, active=True), _row(db, third, active=False)
+    _hint(db, live3)
+    _hint(db, idle3)
+    assert _revoke(db, user_id=third, durable=False) == 1
+    assert _hint_of(db, live3) is None and _hint_of(db, idle3) == "enc:the-id-token"
+
+
 def test_a_session_the_cleanup_ends_meanwhile_is_revoked_and_counted_once(db, monkeypatch):
     """The cleanup can mark a live session inactive between the moment this loads it as live and
     the statement that revokes the idle ones. It must still end up revoked, and be counted once."""

@@ -29,6 +29,10 @@ class FakeRedis:
     def get(self, key):
         return self.rows.get(key)
 
+    def delete(self, *keys):
+        for key in keys:
+            self.rows.pop(key, None)
+
     def zadd(self, key, mapping):
         self.zsets.setdefault(key, {}).update(mapping)
 
@@ -216,9 +220,17 @@ def test_a_logout_tokens_id_is_remembered_once_per_provider_and_never_guessed_wi
     assert st.seen_logout_jti("j1", 120, scope="p2", redis=r) is False                 # another provider's own id
     (key, *_rest) = sorted(r.rows)
     assert key.startswith(st.LOGOUT_JTI_PREFIX) and "j1" not in key and r.ttl[key] == 120
-    down = type("Down", (), {"set": lambda *a, **k: (_ for _ in ()).throw(ConnectionError())})()
+    down = type("Down", (), {"set": lambda *a, **k: (_ for _ in ()).throw(ConnectionError()),
+                             "delete": lambda *a, **k: (_ for _ in ()).throw(ConnectionError())})()
     with pytest.raises(st.Unavailable):
         st.seen_logout_jti("j2", 120, scope="p1", redis=down)                         # not "seen": the caller answers failed
+    # A logout that could not be applied forgets its id, for that provider only, so the provider's retry is honoured.
+    st.forget_logout_jti("j1", scope="p2", redis=r)
+    assert st.seen_logout_jti("j1", 120, scope="p1", redis=r) is True
+    st.forget_logout_jti("j1", scope="p1", redis=r)
+    assert st.seen_logout_jti("j1", 120, scope="p1", redis=r) is False
+    st.forget_logout_jti("j3", scope="p1", redis=down)                                  # best effort without the store
+    st.forget_logout_jti(None, scope="p1", redis=r)
 
 
 def test_a_pending_sign_ins_logout_hint_waits_encrypted_for_the_step_that_completes_it():

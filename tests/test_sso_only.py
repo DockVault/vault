@@ -324,6 +324,16 @@ def test_the_message_names_the_provider_and_its_button(monkeypatch):
     assert sso_only.provider_only_message(h.db, alice) == (
         "Your organisation signs this account in through Contoso or Fabrikam. Use the \u201cSign in with Contoso\u201d "
         "or \u201cFabrikam SSO\u201d button on the sign-in page.")
+    # One provider on the sign-in page and one not: both named, the button of the one that has it.
+    q.show_on_sign_in = False
+    assert sso_only.provider_only_message(h.db, alice) == (
+        "Your organisation signs this account in through Contoso or Fabrikam. Use the \u201cSign in with Contoso\u201d "
+        "button on the sign-in page.")
+    # A button without a label shows the provider's name.
+    q.show_on_sign_in, q.label = True, ""
+    assert sso_only.provider_only_message(h.db, alice) == (
+        "Your organisation signs this account in through Contoso or Fabrikam. Use the \u201cSign in with Contoso\u201d "
+        "or \u201cFabrikam\u201d button on the sign-in page.")
     # A provider not on the sign-in page: its link.
     q.state = "disabled"
     p.show_on_sign_in = False
@@ -332,6 +342,26 @@ def test_the_message_names_the_provider_and_its_button(monkeypatch):
     # No provider of the account enabled: ask an administrator.
     p.state = "disabled"
     assert "Ask your administrator" in sso_only.provider_only_message(h.db, alice)
+
+
+def test_the_refusal_names_the_door_in_its_audit_row(monkeypatch):
+    from app.services import sign_in as s
+    alice, p = _user(sso_only=True), _provider()
+    h = Resolving(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    seen = []
+
+    class Audit:
+        def __init__(self, db):
+            pass
+
+        def log_login_failure(self, username, ip, reason, **kw):
+            seen.append((username, reason, kw.get("login_identifier"), kw.get("account")))
+    monkeypatch.setattr(h.S, "AuditLogger", Audit)
+    with pytest.raises(s.ProviderOnly):
+        _finish(h, alice, [s.SOFTWARE_KEY], user_verified=True, passwordless_allowed=True)
+    with pytest.raises(s.ProviderOnly):
+        _finish(h, alice, [s.PASSWORD])
+    assert seen == [("alice", s.PROVIDER_ONLY_REASON, "passkey", alice), ("alice", s.PROVIDER_ONLY_REASON, "username", alice)]
 
 
 def test_the_password_door_and_the_pipeline_record_the_same_reason():

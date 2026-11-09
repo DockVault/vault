@@ -47,20 +47,18 @@ def provider_only_message(db, user) -> str:
     other way (a passkey): the organisation's provider by name and the button to use, or the link when the provider
     is not on the sign-in page; when no provider of the account is enabled, to ask an administrator."""
     from app.core.models import ExternalIdentity, SsoProvider
-    names, buttons, hidden = [], [], False
+    names, buttons = [], []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
         row = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
         if row is None or getattr(row, "state", None) != "enabled":
             continue
         name = (getattr(row, "name", None) or "").strip()
-        label = (getattr(row, "label", None) or "").strip()
+        label = (getattr(row, "label", None) or "").strip() or name       # the button shows the name when no label
         if name and name not in names:
             names.append(name)
-        if getattr(row, "show_on_sign_in", True) and label:
-            if label not in buttons:
+        if getattr(row, "show_on_sign_in", True):
+            if label and label not in buttons:
                 buttons.append(label)
-        else:
-            hidden = True
     if not names:
         return ("Your organisation signs this account in through its own sign-in, which is not available on this vault "
                 "right now. Ask your administrator.")
@@ -68,7 +66,6 @@ def provider_only_message(db, user) -> str:
     if buttons:
         return (f"Your organisation signs this account in through {through}. Use the "
                 + " or ".join(f"“{b}”" for b in buttons) + " button on the sign-in page.")
-    assert hidden
     return (f"Your organisation signs this account in through {through}. Use the sign-in link your organisation "
             "gave you.")
 

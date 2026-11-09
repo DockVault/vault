@@ -377,8 +377,10 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
     invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
     failed = JSONResponse(status_code=501, content={"error": "logout_failed"})
     try:
+        # One bucket per source, whatever the address names: a path with a new provider id each time gets no bucket
+        # of its own.
         allowed, _, _reset = _rl.check_rate_limit(
-            identifier=f"{sign_in_lockout.source_of(client_ip)}:{str(provider_id)[:64]}", limit=LOGOUT_LIMIT,
+            identifier=sign_in_lockout.source_of(client_ip), limit=LOGOUT_LIMIT,
             window=START_WINDOW, prefix="sso_backchannel", fail_open=False)
     except RateLimiterUnavailable:
         allowed = False
@@ -390,23 +392,31 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
     except Exception:  # noqa: BLE001
         token = None
     row = _provider(db, provider_id)
-    if row is None or getattr(row, "kind", None) != "oidc" or not isinstance(token, str) or not token \
+    if row is None:
+        return invalid                     # no provider by that id: nothing to record (the address is anyone's to type)
+    scope = str(row.id)
+    if getattr(row, "kind", None) != "oidc" or not isinstance(token, str) or not token \
             or not sso.policy_of(row)["sso_backchannel_logout"]:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": str(provider_id)[:64], "reason": "not_accepted"})
+               details={"provider_id": scope, "reason": "not_accepted"})
         return invalid
     try:
         provider = sso.provider_config(row)
-        discovery = oc.discover(provider, fetch=oc.fetch_json)
-        claims = oc.verify_logout_token(provider, discovery, token, fetch=oc.fetch_json,
-                                        seen_jti=lambda jti, ttl: sso_state.seen_logout_jti(jti, ttl, scope=str(row.id)))
+
+        def verify():
+            # The provider's discovery and keys are fetched over the network: off the event loop.
+            discovery = oc.discover(provider, fetch=oc.fetch_json)
+            return oc.verify_logout_token(provider, discovery, token, fetch=oc.fetch_json,
+                                          seen_jti=lambda jti, ttl: sso_state.seen_logout_jti(jti, ttl, scope=scope))
+        from starlette.concurrency import run_in_threadpool
+        claims = await run_in_threadpool(verify)
     except sso_state.Unavailable:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": str(row.id), "reason": "store_unavailable"})
+               details={"provider_id": scope, "reason": "store_unavailable"})
         return failed
     except (sso.Refusal, oc.OidcError) as exc:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": str(row.id), "reason": exc.code})
+               details={"provider_id": scope, "reason": exc.code})
         return failed if exc.code == oc.TEMPORARILY_UNAVAILABLE else invalid
     from app.core.models import SsoSession
     sid, sub = claims.get("sid"), claims.get("sub")
@@ -417,12 +427,21 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         query, by = query.filter(SsoSession.idp_sub == sub), "sub"
     else:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": str(row.id), "reason": "no_identifier"})
+               details={"provider_id": scope, "reason": "no_identifier"})
         return invalid
-    session_ids = [s.session_id for s in query.all()]
-    ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout", durable=True) if session_ids else 0
-    db.commit()
-    _audit(db, "sso_backchannel_logout", ip=client_ip, details={"provider_id": str(row.id), "by": by, "sessions": ended})
+    try:
+        session_ids = [s.session_id for s in query.all()]
+        ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
+                                     durable=True) if session_ids else 0
+        db.commit()
+    except Exception as exc:  # noqa: BLE001 -- the logout failed: the token is not spent, so the provider's retry works
+        db.rollback()
+        sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
+        log.warning("sso back-channel logout not applied: %s", type(exc).__name__)
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": "revocation_failed"})
+        return failed
+    _audit(db, "sso_backchannel_logout", ip=client_ip, details={"provider_id": scope, "by": by, "sessions": ended})
     return JSONResponse(status_code=200, content={})
 
 

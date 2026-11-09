@@ -608,15 +608,6 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
 PROVIDER_ONLY_REASON = "Account signs in only through its identity provider"
 
 
-class ProviderOnly(HTTPException):
-    """The account signs in only through its organisation's identity provider and this sign-in did not come through
-    it: a passkey, or any other first proof, does not stand in for the provider (a leaver disabled at the provider
-    must lose access at the next sign-in). 403 with a message naming the provider's button."""
-
-    def __init__(self, message: str):
-        super().__init__(status_code=403, detail=message)
-
-
 def refuse_without_the_provider(db, result: SignInResult) -> None:
     """Refuse a sign-in of an account that signs in only through its provider (``users.sso_only``) when this sign-in
     did not come through a provider: one audit row with the password door's reason, nothing counted (the proof was
@@ -637,6 +628,18 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
     raise ProviderOnly(message)
 
 
+def carry_provider_session(result: SignInResult) -> None:
+    """A step that finishes a provider's sign-in (the second factor, a passkey, an enrollment, the password) records
+    the provider's session the pending login carries: its session id and subject (so the provider's back-channel
+    logout finds the session), its authentication time and the logout hint. Filled here for every route, so none
+    can forget; a field the route set itself is kept."""
+    if result.pending is None or not result.provider_id:
+        return
+    for name, value in provider_session_of(result.pending).items():
+        if getattr(result, name, None) is None and value is not None:
+            setattr(result, name, value)
+
+
 @a_refusal_leaves_no_session
 def finish(db, result: SignInResult):
     """Finish a sign-in or hold it for its next step: a :class:`SignedIn` or a :class:`PendingStep`.
@@ -646,6 +649,7 @@ def finish(db, result: SignInResult):
     """
     from app.api import api_server as api
     user = result.user
+    carry_provider_session(result)
     enrollment_methods = []
     if result.is_temporary:
         stage = DONE
@@ -892,31 +896,49 @@ def forget_provider_logout_hints(db, session_ids) -> int:
     """Drop the provider logout hints (the encrypted ID tokens) kept for the given sessions: a session that has
     ended has no provider logout to make, and the token's claims are personal data. In the caller's transaction;
     returns how many rows changed."""
+    from sqlalchemy.sql import Select
     from app.core.models import SsoSession
-    ids = [i for i in session_ids if i is not None]
-    if not ids or not table_present(db, "sso_sessions"):
+    if isinstance(session_ids, Select):
+        named = SsoSession.session_id.in_(session_ids)           # sessions chosen by a query, in one statement
+    else:
+        ids = [i for i in session_ids if i is not None]
+        if not ids:
+            return 0
+        named = SsoSession.session_id.in_(ids)
+    if not table_present(db, "sso_sessions"):
         return 0
-    return db.query(SsoSession).filter(SsoSession.session_id.in_(ids), SsoSession.id_token_enc.isnot(None)).update(
+    return db.query(SsoSession).filter(named, SsoSession.id_token_enc.isnot(None)).update(
         {SsoSession.id_token_enc: None}, synchronize_session=False)
 
 
-_TABLES_PRESENT: set = set()
+import weakref as _weakref
+
+_TABLES_PRESENT: "_weakref.WeakKeyDictionary" = _weakref.WeakKeyDictionary()
 
 
 def table_present(db, name: str) -> bool:
     """Whether the database has the table ``name``: a database built with only the tables a test needs may not, and
-    a query there would fail (and abort a real transaction). A stand-in with no engine answers for itself. Remembered
-    per engine once found."""
+    a query there would fail (and abort a real transaction). A stand-in with no engine answers for itself. Asked on
+    the session's own connection (no second connection from the pool); remembered per engine, without keeping the
+    engine alive, once found."""
     get_bind = getattr(db, "get_bind", None)
     if get_bind is None:
         return True
     bind = get_bind()
     engine = getattr(bind, "engine", bind)
-    if (engine, name) in _TABLES_PRESENT:
+    try:
+        known = _TABLES_PRESENT.get(engine)
+    except TypeError:                                  # an engine that cannot be weakly referenced: ask every time
+        known = None
+    if known is not None and name in known:
         return True
     from sqlalchemy import inspect
-    if inspect(bind).has_table(name):
-        _TABLES_PRESENT.add((engine, name))
+    connection = db.connection() if hasattr(db, "connection") else bind
+    if inspect(connection).has_table(name):
+        try:
+            _TABLES_PRESENT.setdefault(engine, set()).add(name)
+        except TypeError:
+            pass
         return True
     return False
 

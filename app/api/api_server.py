@@ -8674,8 +8674,7 @@ async def second_factor_login_verify(
     outcome = sign_in.finish(db, sign_in.SignInResult(
         user, sign_in.methods_so_far(pending) + [(body.method or "").lower()], client_ip,
         pending=pending, provider_id=sign_in.provider_of(pending),
-        provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending),
-        **sign_in.provider_session_of(pending)))
+        provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending)))
     if isinstance(outcome, sign_in.PendingStep):
         return JSONResponse(status_code=200, content=outcome.body)
     access_token = outcome.access_token
@@ -8984,8 +8983,7 @@ async def login(
                                           provider_mfa_trusted=sign_in.provider_mfa_of(pending),
                                           # What the first proof read: the held sign-in's, or this check's.
                                           sessions_ended=(sign_in.ended_of(pending) if pending is not None
-                                                          else getattr(auth_service, "sessions_ended_as_read", None)),
-                                          **sign_in.provider_session_of(pending))
+                                                          else getattr(auth_service, "sessions_ended_as_read", None)))
 
         # The pipeline decides whether a step follows (the second factor, its enrollment) and holds the
         # sign-in in a pending login with no session if so; otherwise it makes the session, the token
@@ -9646,6 +9644,14 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
         if handled_ids:
             stale = stale.filter(ActiveSession.id.notin_(handled_ids))
         count += stale.update({ActiveSession.revoked: True}, synchronize_session=False)
+        # The sessions revoked by that statement keep no provider logout hint either, also in one statement.
+        from sqlalchemy import select as _select
+        revoked_now = [ActiveSession.revoked == True, ActiveSession.temp_credential_id.is_(None)]  # noqa: E712
+        if user_id is not None:
+            revoked_now.append(ActiveSession.user_id == user_id)
+        if session_ids is not None:
+            revoked_now.append(ActiveSession.id.in_(ids))
+        sign_in.forget_provider_logout_hints(db, _select(ActiveSession.id).where(*revoked_now))
     return count
 
 
@@ -11541,8 +11547,7 @@ async def acknowledge_recovery_codes(
         outcome = sign_in.finish(db, sign_in.SignInResult(
             current_user, sign_in.methods_so_far(pending) + [sign_in.TOTP], client_ip,
             pending=pending, provider_id=sign_in.provider_of(pending),
-            provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending),
-            **sign_in.provider_session_of(pending)))
+            provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending)))
         if isinstance(outcome, sign_in.PendingStep):
             # The table asks for one more step (the password, for an account made an administrator during
             # its sign-in): the enrollment stands, the sign-in is held again.
@@ -27413,6 +27418,13 @@ async def logout(
             # Invalidate session in database: durably revoked, so rejected per request even if the Redis
             # denylist read fails open during an outage (see _end_web_session).
             session, _ended = _end_web_session(db, session_token)
+            if session and _ended:
+                # An ended session makes no provider logout: its logout hint (the encrypted ID token) goes with it.
+                try:
+                    sign_in.forget_provider_logout_hints(db, [session.id])
+                    db.commit()
+                except Exception:  # noqa: BLE001
+                    db.rollback()
             if session:
                 session_invalidated = True
                 print(f"🔓 Session invalidated for user {current_user.username} (session {hash_session_token(session_token)[:8]}..., as stored)")

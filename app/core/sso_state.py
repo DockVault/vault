@@ -293,6 +293,19 @@ def seen_logout_jti(jti: str, ttl_seconds: int, *, scope: str, redis=None) -> bo
     return not bool(fresh)
 
 
+def forget_logout_jti(jti, *, scope: str, redis=None) -> None:
+    """Forget a back-channel logout token's id recorded by :func:`seen_logout_jti`: the logout it carried could not
+    be applied, so the provider's retry of the same token must be honoured. Best effort."""
+    import hashlib
+    if not isinstance(jti, str) or not jti:
+        return
+    key = LOGOUT_JTI_PREFIX + hashlib.sha256(f"{scope}:{jti}".encode("utf-8")).hexdigest()
+    try:
+        _redis(redis).delete(key)
+    except Exception:  # noqa: BLE001 -- the token then stays spent; the provider's retry is answered as a replay
+        pass
+
+
 LOGOUT_HINT_PREFIX = "sso:logout-hint:"
 
 

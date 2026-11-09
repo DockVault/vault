@@ -563,12 +563,15 @@ def test_a_logout_token_is_checked_by_its_own_rules():
                 _logout_claims(signer, jti=...), _logout_claims(signer, jti="j6", iat=NOW - 200),
                 _logout_claims(signer, jti="j7", iss="https://evil.example.com"),
                 _logout_claims(signer, jti="j9", iat=-10 ** 400), _logout_claims(signer, jti="j10", iat=float("nan")),
-                _logout_claims(signer, jti="j11", aud=[CLIENT, "other"]), _logout_claims(signer, jti="x" * 256)):
+                _logout_claims(signer, jti="j11", aud=[CLIENT, "other"]), _logout_claims(signer, jti="x" * 256),
+                _logout_claims(signer, jti="j12", sid=""), _logout_claims(signer, jti="j13", sid="", sub="")):
         with pytest.raises(oc.OidcError):
             oc.verify_logout_token(_provider(oc), d, signer.token(bad), seen_jti=seen_jti, fetch=_fetch_for(signer),
                                    resolve=_PUBLIC, now=NOW)
-    # sub instead of sid is enough.
+    # sub instead of sid is enough, also beside an empty sid.
     oc.verify_logout_token(_provider(oc), d, signer.token(_logout_claims(signer, jti="j8", sid=..., sub="user-1")),
+                           seen_jti=seen_jti, fetch=_fetch_for(signer), resolve=_PUBLIC, now=NOW)
+    oc.verify_logout_token(_provider(oc), d, signer.token(_logout_claims(signer, jti="j14", sid="", sub="user-1")),
                            seen_jti=seen_jti, fetch=_fetch_for(signer), resolve=_PUBLIC, now=NOW)
 
 

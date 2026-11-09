@@ -179,3 +179,18 @@ def test_the_staged_proof_never_meets_the_factor_part(monkeypatch):
     # Spent: the same again needs the password.
     assert h.step_up(method="totp", code="123456", password_method="idp_reauth")[0] == 403
     assert h.step_up(method="totp", code="123456", password="pw")[0] == 200
+
+
+def test_the_re_authentication_is_not_offered_where_the_identities_table_is_missing():
+    """A database without the identities table (one a test builds with only the tables it needs) offers nothing and
+    raises nothing: the step-up route asks before every password step."""
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.services import sso_sign_in as sso
+    db = sessionmaker(bind=create_engine("sqlite://"))()
+    try:
+        assert sso.reauth_available(db, types.SimpleNamespace(id=uuid.uuid4())) is False
+    finally:
+        db.close()
