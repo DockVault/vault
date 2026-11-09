@@ -138,6 +138,11 @@ def test_endpoints_must_be_https_on_a_public_name_unless_the_provider_is_private
     with pytest.raises(oc.OidcError) as e:
         oc.check_endpoint("https://idp.example.com", resolve=lambda h: ["10.0.0.1"])
     assert e.value.code == "endpoint_refused"
+    # A name that does not resolve is the resolver's state (a blip, an outage): temporarily unavailable, not refused.
+    for unresolved in (_fails, lambda h: []):
+        with pytest.raises(oc.OidcError) as e:
+            oc.check_endpoint("https://idp.example.com", resolve=unresolved)
+        assert e.value.code == "temporarily_unavailable"
 
 
 # --------------------------------------------------------------------------- discovery and keys
@@ -253,6 +258,89 @@ def test_a_refetch_that_fails_on_any_answer_is_not_repeated_per_request():
         assert len(calls) == 1, code
         # Keys already held are still served meanwhile.
         assert "rsa1" in oc.signing_keys(_provider(oc), d, kid="rsa1", fetch=broken, cache=cache, resolve=_PUBLIC, now=NOW + 12)
+
+
+def test_a_document_that_fails_its_own_checks_is_remembered_like_a_failed_fetch():
+    """A discovery document with a wrong issuer, a missing endpoint or an endpoint at a refused address is not
+    fetched again on every request: it is answered from memory for a short while, with its own reason."""
+    oc = _oc()
+    signer = Signer()
+    for bad, code in (({"issuer": "https://elsewhere.example.com"}, oc.ISSUER_MISMATCH),
+                      ({"jwks_uri": ...}, oc.DISCOVERY_INVALID)):
+        cache = oc.Cache()
+        fetch = _fetch_for(signer, discovery=signer.discovery(**bad))
+        for _ in range(3):
+            with pytest.raises(oc.OidcError) as e:
+                oc.discover(_provider(oc), fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW)
+            assert e.value.code == code
+        assert len(fetch.calls) == 1, code
+    # An endpoint inside the document at a refused address.
+    cache, looked = oc.Cache(), []
+
+    def resolve(host):
+        looked.append(host)
+        return ["10.0.0.9"] if "keys.internal" in host else ["8.8.8.8"]
+    fetch = _fetch_for(signer, discovery=signer.discovery(jwks_uri="https://keys.internal.example.com/certs"))
+    for _ in range(2):
+        with pytest.raises(oc.OidcError) as e:
+            oc.discover(_provider(oc), fetch=fetch, cache=cache, resolve=resolve, now=NOW)
+        assert e.value.code == oc.ENDPOINT_REFUSED
+    assert len(fetch.calls) == 1
+    # A refresh that fails is remembered again: the next ordinary call is answered from memory.
+    cache2 = oc.Cache()
+    down_calls = []
+
+    def down(url, **kw):
+        down_calls.append(url)
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")
+    with pytest.raises(oc.OidcError):
+        oc.discover(_provider(oc), fetch=down, cache=cache2, resolve=_PUBLIC, now=NOW, refresh=True)
+    with pytest.raises(oc.OidcError):
+        oc.discover(_provider(oc), fetch=down, cache=cache2, resolve=_PUBLIC, now=NOW + 1)
+    assert len(down_calls) == 1
+
+
+def test_the_cache_digest_cannot_be_confused_by_a_separator_inside_an_address():
+    oc = _oc()
+    p = _provider(oc)
+    assert oc._where(p, "https://a|https://b", "c") != oc._where(p, "https://a", "https://b|c")
+    assert oc._where(p, "x") != oc._where(_provider(oc, private_network=True), "x")
+
+
+def test_a_key_set_that_cannot_be_used_is_remembered_and_belongs_to_its_private_network_setting():
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    # A body without keys (no exception from the fetch itself) is remembered.
+    cache = oc.Cache()
+    calls = []
+
+    def no_keys(url, **kw):
+        calls.append(url)
+        return {"x": 1}
+    for _ in range(2):
+        with pytest.raises(oc.OidcError) as e:
+            oc.signing_keys(_provider(oc), d, fetch=no_keys, cache=cache, resolve=_PUBLIC, now=NOW)
+        assert e.value.code == oc.DISCOVERY_INVALID
+    assert len(calls) == 1
+    # A key-set address refused is remembered without looking the name up again.
+    cache2, looked = oc.Cache(), []
+
+    def private(host):
+        looked.append(host)
+        return ["10.0.0.7"]
+    for _ in range(2):
+        with pytest.raises(oc.OidcError) as e:
+            oc.signing_keys(_provider(oc), d, fetch=_fetch_for(signer), cache=cache2, resolve=private, now=NOW)
+        assert e.value.code == oc.ENDPOINT_REFUSED
+    assert len(looked) == 1
+    # Keys fetched while private addresses were allowed are not served once they are not.
+    cache3 = oc.Cache()
+    allowed = _fetch_for(signer)
+    oc.signing_keys(_provider(oc, private_network=True), d, fetch=allowed, cache=cache3, resolve=private, now=NOW)
+    with pytest.raises(oc.OidcError) as e:
+        oc.signing_keys(_provider(oc), d, fetch=allowed, cache=cache3, resolve=private, now=NOW + 1)
+    assert e.value.code == oc.ENDPOINT_REFUSED
 
 
 def test_the_throttle_and_the_failures_belong_to_the_key_set_address():

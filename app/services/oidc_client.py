@@ -49,8 +49,8 @@ DISCOVERY_FAILURE_SECONDS = 30   # a fetch of discovery or keys that failed is n
 def _where(provider: "ProviderConfig", *parts: str) -> str:
     """A short digest of what a cached answer was fetched for (the addresses, the issuer, whether private addresses
     were allowed), so an answer is never served for another configuration later saved under the same provider id."""
-    scope = ("private" if provider.private_network else "public",) + parts
-    return hashlib.sha256("|".join(scope).encode("utf-8")).hexdigest()[:16]
+    scope = ["private" if provider.private_network else "public", *parts]
+    return hashlib.sha256(json.dumps(scope).encode("utf-8")).hexdigest()[:16]
 
 
 def _remember_failure(cache: "Cache", key: str, exc: "OidcError", now: Optional[float]) -> None:
@@ -212,6 +212,9 @@ def _address_is_private(address: str) -> bool:
             or ip.is_multicast or ip.is_unspecified or getattr(ip, "is_site_local", False))
 
 
+UNRESOLVED = "the endpoint's name does not resolve"
+
+
 def resolved_address_problem(url: str, *, private_network: bool = False, resolve=None) -> Optional[str]:
     """At use: the host must resolve, and (without ``private_network``) to public addresses only."""
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -219,9 +222,9 @@ def resolved_address_problem(url: str, *, private_network: bool = False, resolve
     try:
         addresses = resolve(host)
     except OSError:
-        return "the endpoint's name does not resolve"
+        return UNRESOLVED
     if not addresses:
-        return "the endpoint's name does not resolve"
+        return UNRESOLVED
     if private_network:
         return None
     if any(_address_is_private(a) for a in addresses):
@@ -237,10 +240,13 @@ def _resolve(host: str) -> List[str]:
 
 
 def check_endpoint(url: str, *, private_network: bool = False, resolve=None) -> None:
-    """Raise :class:`OidcError` (``endpoint_refused``) unless ``url`` passes both rules."""
+    """Raise :class:`OidcError` (``endpoint_refused``) unless ``url`` passes both rules; a name that does not resolve
+    (a lookup that failed, or no address) is ``temporarily_unavailable``: the resolver's state, not the address."""
     why = endpoint_problem(url, private_network=private_network)
     if why is None:
         why = resolved_address_problem(url, private_network=private_network, resolve=resolve)
+    if why == UNRESOLVED:
+        raise OidcError(TEMPORARILY_UNAVAILABLE, why)
     if why is not None:
         raise OidcError(ENDPOINT_REFUSED, why)
 
@@ -330,11 +336,21 @@ def discover(provider: ProviderConfig, *, fetch: Callable = fetch_json, cache: O
         # that is not a document) is answered the same, with its own code, without the name lookup or the timeout.
         _remembered_failure(cache, failed_key, now, "the provider's discovery")
     try:
-        check_endpoint(url, private_network=provider.private_network, resolve=resolve)
-        doc = fetch(url)
+        # The fetch and the document's own checks: any failure is remembered, so a document that is wrong is not
+        # fetched again on every request either.
+        found = _discovery_document(provider, url, fetch=fetch, resolve=resolve)
     except OidcError as exc:
         _remember_failure(cache, failed_key, exc, now)
         raise
+    cache.set(key, found, CACHE_SECONDS, now)
+    return found
+
+
+def _discovery_document(provider: ProviderConfig, url: str, *, fetch: Callable, resolve) -> "Discovery":
+    """Fetch the discovery document and check it: the issuer exactly as configured, the required endpoints, an
+    allowed signing algorithm, ``S256`` when the document lists methods, every endpoint under the endpoint rule."""
+    check_endpoint(url, private_network=provider.private_network, resolve=resolve)
+    doc = fetch(url)
     issuer = doc.get("issuer")
     if not isinstance(issuer, str) or issuer != provider.issuer:
         raise OidcError(ISSUER_MISMATCH, "the discovery document's issuer is not the configured one")
@@ -369,7 +385,6 @@ def discover(provider: ProviderConfig, *, fetch: Callable = fetch_json, cache: O
         backchannel_logout_supported=doc.get("backchannel_logout_supported") is True,
         iss_in_callback=doc.get("authorization_response_iss_parameter_supported") is True,
         claims_supported=_strings("claims_supported"), acr_values_supported=_strings("acr_values_supported"))
-    cache.set(key, found, CACHE_SECONDS, now)
     return found
 
 
