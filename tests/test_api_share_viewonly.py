@@ -162,3 +162,34 @@ def test_share_download_is_audited(admin, temp_user, temp_user_client):
         assert int(n or "0") >= 1
     finally:
         admin.delete_vault(v["id"])
+
+
+def test_the_vault_says_when_it_was_reached_through_a_view_only_claim(admin, temp_user_client):
+    """GET /vaults/{id} carries via_share for a share-only caller: view_only True when none of their claims on
+    the vault allows a download, False for a downloadable claim; the owner gets no via_share at all. The web
+    app reads it to offer a view-only recipient the preview and nothing that would be refused."""
+    _enable_sharing(admin, True)
+    v = admin.create_vault(name=unique("vosay"))
+    w = admin.create_vault(name=unique("vosay2"))
+    try:
+        _upload(admin, v["id"], "a.txt", content=b"aaa")
+        _upload(admin, w["id"], "b.txt", content=b"bbb")
+        tag = _tag(admin)
+        _claim(temp_user_client, _make_share(admin, v, tag, view_only=True))
+        _claim(temp_user_client, _make_share(admin, w, tag))
+        seen = temp_user_client.get(f"/vaults/{v['id']}")
+        assert seen.status_code == 200, seen.text
+        assert seen.json()["via_share"] == {"view_only": True}, seen.json()
+        assert seen.json()["my_permission"] == "read"
+        normal = temp_user_client.get(f"/vaults/{w['id']}")
+        assert normal.status_code == 200, normal.text
+        assert normal.json()["via_share"] == {"view_only": False}, normal.json()
+        owner = admin.get(f"/vaults/{v['id']}")
+        assert owner.status_code == 200 and owner.json()["via_share"] is None, owner.json()
+        # The refusal a download still meets names the reason, which the web app shows in these words.
+        a = _file_id(admin, v["id"], "a.txt")
+        refused = temp_user_client.get(f"/vaults/{v['id']}/files/{a}/download")
+        assert refused.status_code == 403 and "view-only" in refused.json()["detail"], refused.text
+    finally:
+        admin.delete_vault(v["id"])
+        admin.delete_vault(w["id"])

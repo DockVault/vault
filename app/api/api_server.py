@@ -1476,6 +1476,10 @@ class VaultResponse(BaseModel):
     # While an approved investigation covers the vault: until when, and whether deleted files are kept. Neutral:
     # no case number, purpose, auditor or person concerned (app/core/owner_access.py, member_review).
     compliance_review: Optional[dict] = None
+    # Present only when the caller reached the vault through a share claim (no owner, member or group
+    # access of their own): {"view_only": bool}. view_only is True when none of their claims on this vault
+    # allows a download, so the web app offers them the preview and nothing that would be refused.
+    via_share: Optional[dict] = None
 
     class Config:
         from_attributes = True
@@ -18711,10 +18715,17 @@ async def get_vault(
         # the vault, it was via an active share claim: reflect read-only in my_permission and audit the
         # open ONCE here (not on the polled file-list). base_perms is None only for a share-only caller.
         base_perms = permission_service.get_vault_permissions(current_user, vault.id)
+        via_share = None
         if base_perms is None:
             share_perms = permission_service.get_vault_permissions(current_user, vault.id, allow_share=True)
             if share_perms is not None:
                 base_perms = share_perms
+                # What the claims allow: get_vault (allow_share=True) stamped the caller's downloadable scope
+                # for this vault; a dict with nothing in it means every claim here is view-only. None means a
+                # whole-vault claim that allows downloads.
+                _dl_scopes = getattr(current_user, "_share_download_scope", None) or {}
+                _dl = _dl_scopes.get(str(vault.id)) if str(vault.id) in _dl_scopes else None
+                via_share = {"view_only": isinstance(_dl, dict) and not _dl.get("files") and not _dl.get("folders")}
                 try:
                     AuditLogger(db).log_action(
                         action="share_opened", status="success", user=current_user,
@@ -18760,6 +18771,7 @@ async def get_vault(
             'last_viewed_at': _vault_view_times(db, current_user, vault.id).get(vault.id),
             # Here, never in VaultService.get_vault (which downloads, file operations and SFTP run too).
             'compliance_review': _owner_access.member_review_shown(db, vault.id),
+            'via_share': via_share,
         }
         # Opening the detail view IS the view. Stamped after the payload is built, so the value
         # returned is the PREVIOUS visit rather than the current instant — otherwise every read

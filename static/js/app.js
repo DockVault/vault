@@ -357,8 +357,17 @@ function tempVaultCaps(vaultId) {
 // True if the current open vault's scope permits `cap` (or the session is not a
 // scoped temp credential, in which case the vault-role gating alone applies).
 function vaultCapAllowed(cap) {
+    // A view-only share recipient (GET /vaults/{id} says via_share.view_only) may preview, never download,
+    // so nothing download-shaped (Download, Copy, Copy SHA-256, Render) is offered: the server refuses each.
+    if (cap === 'file.download' && viaShareViewOnly()) return false;
     const caps = state.tempVaultCaps;   // set by openVault(); null when not scope-limited
     return !caps || caps.has(cap);
+}
+
+// True when the open vault was reached through a share claim that allows no download.
+function viaShareViewOnly(vault) {
+    const v = vault || state.currentVault;
+    return !!(v && v.via_share && v.via_share.view_only);
 }
 
 // The two BULK file actions (select checkboxes + the bulk bar) must be cap-gated
@@ -3833,7 +3842,8 @@ const _shareCreate = { targetType: null, targetId: null, vaultId: null, targetNa
 // protected). Hide the Share affordances for those so they aren't a dead-end.
 function vaultShareable() {
     const v = state.currentVault;
-    return !!(v && (v.type || 'standard') !== 'zero_knowledge' && !v.has_password);
+    // A view-only recipient cannot share on, or make public links of, what they may only look at.
+    return !!(v && (v.type || 'standard') !== 'zero_knowledge' && !v.has_password && !viaShareViewOnly(v));
 }
 
 async function openCreateShareModal(targetType, targetId, targetName) {
@@ -11636,6 +11646,23 @@ async function openVault(vaultId, options) {
         // file rows can show/hide the "Public link" action on first render. Best-effort; never blocks.
         await refreshPublicFileLinkAvailability();
 
+        // Determine the caller's capabilities before the files are drawn: the rows read them (a row's
+        // checkbox, its actions), and a list drawn first would carry the previous vault's access, or none
+        // (read-only users shouldn't see Upload/New folder; non-owners shouldn't see the owner-only
+        // Permissions/Settings tabs).
+        const isOwner = vault.owner_id === currentUser.id;
+        const canWrite = ['owner', 'manage', 'write', 'delete'].includes(vault.my_permission);
+        // A Manager (manage_permission) may administer membership/access but is
+        // not the owner — they get the Permissions tab, not the owner-only Settings.
+        const canManage = ['owner', 'manage'].includes(vault.my_permission);
+        state.canWriteCurrentVault = canWrite;
+        state.canManageCurrentVault = canManage;
+        // For a scoped temp credential, further restrict what's shown to the caps its
+        // scope grants ON THIS vault (the vault-role above reflects the OWNER, not the
+        // credential). null for everyone else => no extra gating. Read by
+        // vaultCapAllowed() in applyVaultViewPermissions + fileActionButtons.
+        state.tempVaultCaps = tempVaultCaps(vaultId);
+
         // Load vault files — this validates the password. If it fails (wrong /
         // changed password), do NOT show the vault view.
         const loaded = await loadVaultFiles();
@@ -11653,21 +11680,7 @@ async function openVault(vaultId, options) {
             state.rememberVaultPassword(vaultId, state.vaultPassword, vault.unlock_remember_minutes);
         }
 
-        // Determine the caller's capabilities and hide controls they can't use
-        // (read-only users shouldn't see Upload/New folder; non-owners shouldn't
-        // see the owner-only Permissions/Settings tabs).
-        const isOwner = vault.owner_id === currentUser.id;
-        const canWrite = ['owner', 'manage', 'write', 'delete'].includes(vault.my_permission);
-        // A Manager (manage_permission) may administer membership/access but is
-        // not the owner — they get the Permissions tab, not the owner-only Settings.
-        const canManage = ['owner', 'manage'].includes(vault.my_permission);
-        state.canWriteCurrentVault = canWrite;
-        state.canManageCurrentVault = canManage;
-        // For a scoped temp credential, further restrict what's shown to the caps its
-        // scope grants ON THIS vault (the vault-role above reflects the OWNER, not the
-        // credential). null for everyone else => no extra gating. Read by
-        // vaultCapAllowed() in applyVaultViewPermissions + fileActionButtons.
-        state.tempVaultCaps = tempVaultCaps(vaultId);
+        // Hide the controls the caller can't use (capabilities set above, before the files were drawn).
         applyVaultViewPermissions(isOwner, canWrite, canManage);
         startVaultAccessWatch(vaultId);
         // Zero-knowledge: tell a key holder if the vault owes a key rotation. Not awaited, so the
@@ -16101,9 +16114,9 @@ async function _downloadFile(fileId, fileName) {
         let response = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, {
             headers, signal: _dlAbort.signal
         });
-        
+
         if (!response.ok) {
-            throw new Error('Download failed');
+            throw await _downloadRefusal(response);
         }
         
         // Decrypting in-browser for zero-knowledge vaults, from the body rather than from a
@@ -16135,7 +16148,7 @@ async function _downloadFile(fileId, fileName) {
             }
             response = await fetch(
                 `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers, signal: _dlAbort.signal });
-            if (!response.ok) throw new Error('Download failed');
+            if (!response.ok) throw await _downloadRefusal(response);
         }
 
         if (isZkVault(state.currentVault) && state.downloadSink === 'streaming') {
@@ -16163,7 +16176,7 @@ async function _downloadFile(fileId, fileName) {
             response = await fetch(
                 `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`,
                 { headers, signal: _dlAbort.signal });
-            if (!response.ok) throw new Error('Download failed');
+            if (!response.ok) throw await _downloadRefusal(response);
         }
 
         // Final backstop: any remaining path here is a small file (the pre-fetch guard and the
@@ -16217,10 +16230,22 @@ async function _downloadFile(fileId, fileName) {
             return;
         }
         console.error('Download failed:', error);
-        showError('Failed to download file');
+        // A refusal the server explained (a view-only share, a scoped credential) is shown in its words.
+        showError((error && error.refusal) || 'Failed to download file');
     } finally {
         _downloadsOfThisSession.delete(_dlAbort);
     }
+}
+
+// The error for a download response the server refused: carries the server's own reason (its `detail`)
+// when it gave one, so the person reads why rather than a generic failure.
+async function _downloadRefusal(response) {
+    const e = new Error('Download failed');
+    try {
+        const body = await response.json();
+        if (body && typeof body.detail === 'string' && body.detail) e.refusal = body.detail;
+    } catch (_) { /* no JSON body: the generic message */ }
+    return e;
 }
 
 // In-browser file preview. The file stays encrypted at rest; the server decrypts
@@ -16566,7 +16591,12 @@ async function openFilePreview(fileId, fileName, mime) {
     _spinner.className = 'spinner';
     bodyEl.replaceChildren(_spinner);
     const dlBtn = document.getElementById('file-preview-download');
-    if (dlBtn) dlBtn.onclick = () => downloadFile(fileId, fileName);
+    if (dlBtn) {
+        // Offered only when a download would be allowed (a view-only share recipient, or a scoped credential
+        // without the download capability, may preview and nothing more).
+        dlBtn.style.display = vaultCapAllowed('file.download') ? '' : 'none';
+        dlBtn.onclick = () => downloadFile(fileId, fileName);
+    }
     modal.classList.add('active');
 
     try {
@@ -16639,7 +16669,9 @@ async function openFilePreview(fileId, fileName, mime) {
             // no script runs, no external request is made, and the file's markup cannot script the
             // page. A zero-knowledge vault's content lives only in the browser (the server holds
             // ciphertext), so it stays raw text there.
-            if (RENDERABLE_PREVIEW_EXTS.has(ext) && !isZkVault(state.currentVault)) {
+            // The rendered document comes from the download path, so it is offered only where a download is
+            // allowed (a view-only share recipient keeps the raw text).
+            if (RENDERABLE_PREVIEW_EXTS.has(ext) && !isZkVault(state.currentVault) && vaultCapAllowed('file.download')) {
                 bodyEl.replaceChildren(_buildRenderablePreview(fileId, fileName, pre, headers));
             } else {
                 bodyEl.replaceChildren(pre);

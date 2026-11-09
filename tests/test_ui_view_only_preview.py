@@ -56,11 +56,65 @@ def test_the_recipient_previews_in_the_browser_and_cannot_download(page: Page, v
     expect(card).to_contain_text("View only (preview in the browser, no download)")
     page.evaluate("id => openSharedItem(id)", vault["id"])
     expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+    # The vault says the claim is view-only, and the recipient is offered only what works: no Download on the
+    # row, no Share or Public links on the toolbar, no row checkboxes (no bulk action is possible).
+    assert page.evaluate("() => state.currentVault.via_share") == {"view_only": True}
+    row = page.locator(f'#vault-files-table-body tr:has(.file-name[data-file-id="{fid}"])')
+    expect(row).to_be_visible(timeout=15000)
+    assert row.locator(".file-actions button[data-action]").evaluate_all(
+        "els => els.map(b => b.getAttribute('data-action'))") == ["more"]
+    expect(page.locator("#share-vault-btn")).to_be_hidden()
+    expect(page.locator("#public-links-btn")).to_be_hidden()
+    expect(page.locator("#vault-files-table-body .file-check")).to_have_count(0)
+    # The one menu lists Preview and File info, nothing that downloads, copies or shares.
+    row.locator('button[data-action="more"]').click()
+    menu = page.locator("#file-context-menu")
+    expect(menu).to_be_visible()
+    labels = [l.strip() for l in menu.locator(".context-menu-item").all_text_contents()]
+    assert "Preview" in labels and "File info" in labels, labels
+    for absent in ("Download", "Copy", "Share", "Public link", "Copy SHA-256", "Rename", "Delete", "Move"):
+        assert absent not in labels, labels
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
     page.click(f'.file-name[data-file-id="{fid}"]')
     expect(page.locator("#file-preview-modal")).to_be_visible(timeout=10000)
     expect(page.locator("#file-preview-body")).to_contain_text("look, do not take", timeout=15000)
-    # The same session cannot download.
-    assert client.get(f"/vaults/{vault['id']}/files/{fid}/download").status_code == 403
+    # The preview header offers no Download either.
+    expect(page.locator("#file-preview-download")).to_be_hidden()
+    page.keyboard.press("Escape")
+    # The same session cannot download; the refusal says why, and the app shows the server's words when a
+    # download is still attempted.
+    refused = client.get(f"/vaults/{vault['id']}/files/{fid}/download")
+    assert refused.status_code == 403 and "view-only" in refused.json()["detail"]
+    said = page.evaluate(
+        """id => { const said = []; const orig = window.showError; window.showError = (m) => said.push(m);
+            return _downloadFile(id, 'brief.txt').then(() => { window.showError = orig; return said; }); }""", fid)
+    assert any("view-only" in m for m in said), said
+
+
+def test_the_owner_keeps_download_share_and_the_preview_download(page: Page, view_only_share, admin_creds):
+    """The same vault, opened by its owner: Download on the row, Share on the toolbar, checkboxes, and Download in
+    the preview header."""
+    _recipient, _client, vault, fid = view_only_share
+    page.goto("/")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    page.fill("#username", admin_creds["username"])
+    page.fill("#password", admin_creds["password"])
+    page.click("#login-form button[type=submit]")
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    page.click('.sidebar-item[data-section="vaults"]')
+    page.click(f'.open-vault-btn[data-vault-id="{vault["id"]}"]')
+    expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => state.currentVault.via_share") is None
+    row = page.locator(f'#vault-files-table-body tr:has(.file-name[data-file-id="{fid}"])')
+    expect(row).to_be_visible(timeout=15000)
+    assert row.locator(".file-actions button[data-action]").evaluate_all(
+        "els => els.map(b => b.getAttribute('data-action'))") == ["more", "share-file", "download"]
+    expect(page.locator("#share-vault-btn")).to_be_visible()
+    expect(page.locator("#vault-files-table-body .file-check")).to_have_count(1)
+    page.click(f'.file-name[data-file-id="{fid}"]')
+    expect(page.locator("#file-preview-modal")).to_be_visible(timeout=10000)
+    expect(page.locator("#file-preview-download")).to_be_visible()
 
 
 def test_the_share_dialog_says_what_view_only_means(page: Page, admin_creds):
