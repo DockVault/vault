@@ -328,8 +328,8 @@ the recipients' mailboxes.
 | New administrator **New in 0.33.0** | Every other active administrator | Which account became an administrator, how (created, promoted, or an invitation accepted), by whom, and when. It cannot be switched off. |
 | SSH keys an administrator added **New in 0.34.0** | The owner of each account that holds SSH keys an administrator added, when that administrator is demoted, deactivated, locked or deleted | The administrator's username, why they left, each key's name and fingerprint, and a link to Your account. It cannot be switched off. The other administrators get an in-app notice naming the accounts. |
 | Welcome, new sign-in alert, something shared with you, added to a vault, temporary credential issued | The person concerned | Off unless an administrator turns each on. The username and the template's text. |
-| Files received on an upload link **New in 0.35.0** | The owner of the upload link | On unless an administrator turns it off. The link's label, that a file arrived on it (more within the hour are not announced again), and a link to the upload links page when a public address is configured; never the file's name. |
-| Something you shared is about to expire **New in 0.35.0** | The maker of the share or link | On unless an administrator turns it off. The kind of thing (a share of a vault, a folder or a file; a public link and its tag; a note link; an upload link and its label), when it expires, and a link to the page that manages it when a public address is configured; never a vault's name, a note's title or a file's name. |
+| Files received on an upload link **New in 0.35.0** | The owner of the upload link | Off until an administrator turns it on in Email Studio. The link's label, that a file arrived on it (more within the hour are not announced again), and a link to the upload links page when a public address is configured; never the file's name. |
+| Something you shared is about to expire **New in 0.35.0** | The maker of the share or link | Off until an administrator turns it on in Email Studio. The kind of thing (a share of a vault, a folder or a file; a public link and its tag; a note link; an upload link and its label), when it expires, and a link to the page that manages it when a public address is configured; never a vault's name, a note's title or a file's name. |
 | Email Studio sends | People or addresses an administrator chooses | The template the administrator wrote. |
 
 ## Exports, backups and host tools
@@ -627,8 +627,8 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
 - Links and notices: an owner's message on a public link, a note link and an upload link (`message` on
   `public_links`, `note_public_links` and `receivers`); a notice to an upload link's owner when a file arrives,
   and a reminder to the maker of a share or a link before it expires, each naming the kind of thing and never a
-  vault, a note or a file, given once even when dismissed (`notice_ledger`), each with an optional email that is
-  on by default; the account's table sorts and density (`user_preferences`); and "Stay signed in", which adds a
+  vault, a note or a file, given once even when dismissed (`notice_ledger`), each with an optional email that an
+  administrator turns on; the account's table sorts and density (`user_preferences`); and "Stay signed in", which adds a
   session row (`active_sessions`) and a `session_extended` audit row.
 - Shares: how many times each claim previewed a file (`share_claims.preview_count`), counted against the
   share's download limit; a preview is recorded as a preview.

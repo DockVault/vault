@@ -6,9 +6,9 @@ Each names the thing by its kind only (a share of a vault, a folder or a file; a
 link; an upload link and its label) and deep-links to the page that manages it. Neither puts a vault's name, a
 note's title or a file's name into the notice's title or text, nor into what the email is given: those names are
 sealed at rest, and the notice's columns and the mail are in the clear. Each is given once: the notice ledger
-remembers what was told, so dismissing the notification does not bring it, or its email, back. Both emails are on
-by default (an administrator can turn either off in Email Studio), and their links are built from the configured
-public address only, never from the request, which for an upload is the anonymous uploader's: with no address
+remembers what was told, so dismissing the notification does not bring it, or its email, back. Both emails are
+optional and off until an administrator turns them on in Email Studio (mail is not set up everywhere), and their
+links are built from the configured public address only, never from the request, which for an upload is the anonymous uploader's: with no address
 configured the email goes out without a link. The matching live tests
 (tests/test_api_expiry_reminders.py, tests/test_api_upload_links_collect.py) drive the routes on a running stack.
 """
@@ -239,27 +239,43 @@ def test_the_ledger_holds_no_name_and_the_sweep_forgets_it_after_thirty_days(db,
     assert sorted(r.dedup_key for r in ledger(db, owner)) == sorted([row.dedup_key, "recent:key"])
 
 
-# --------------------------------------------------------------------------- the emails: on by default, link from the configured address
+# --------------------------------------------------------------------------- the emails: off until turned on, link from the configured address
 
-def test_the_two_emails_are_on_by_default_and_every_other_optional_one_is_off(db):
-    on = {a["key"] for a in email_actions.ACTION_CATALOG if a["default_enabled"]}
-    optional = {a["key"] for a in email_actions.ACTION_CATALOG if a["category"] == email_actions.OPTIONAL}
-    assert on & optional == {"receiver_upload_received", "expiry_reminder"}
-    assert {a["key"] for a in email_actions.ACTION_CATALOG if a["category"] in email_actions.ALWAYS_ON} <= on
-    # Seeded that way, and bound to their default templates, so they send as soon as mail is set up.
+def test_the_two_emails_are_optional_and_off_until_an_administrator_turns_them_on(db):
+    for key in ("receiver_upload_received", "expiry_reminder"):
+        assert email_actions.SPEC_BY_KEY[key]["category"] == email_actions.OPTIONAL, key
     assert email_actions.seed_email_actions(db) == len(email_actions.ACTION_CATALOG)
     email_actions.seed_default_templates(db)
     rows = {a.key: a for a in db.query(m.EmailAction).all()}
     for key in ("receiver_upload_received", "expiry_reminder"):
-        assert rows[key].enabled is True and rows[key].template_id is not None, key
-    for key in optional - on:
-        assert rows[key].enabled is False, key
-    # Seeding again changes no administrator's choice.
-    rows["expiry_reminder"].enabled = False
+        # Off, but bound to its default template, so turning it on is all an administrator does.
+        assert rows[key].enabled is False and rows[key].template_id is not None, key
+    for a in email_actions.ACTION_CATALOG:
+        assert rows[a["key"]].enabled is (a["category"] in email_actions.ALWAYS_ON), a["key"]
+
+
+@pytest.mark.parametrize("key,context", [
+    ("receiver_upload_received", {"link": "https://vault.example.test/#uploadlinks/drops",
+                                  "change": "A file arrived on your upload link Signed contracts."}),
+    ("expiry_reminder", {"link": "https://vault.example.test/#shared/by-me", "expires": "in about 20 hours",
+                         "change": "Your share of a vault expires in about 20 hours."}),
+])
+def test_each_email_is_sent_only_once_it_is_turned_on(db, monkeypatch, key, context):
+    from app.core import email_send
+    sent = []
+    monkeypatch.setattr(email_send, "resolve_default_config",
+                        lambda db_: {"smtp_server": "smtp.example.test", "from_email": "vault@example.test",
+                                     "from_name": "Vault"})
+    monkeypatch.setattr(email_send, "smtp_send", lambda cfg, msg: sent.append(msg))
+    email_actions.seed_email_actions(db)
+    email_actions.seed_default_templates(db)
+    recipient = {"email": "owner@example.test", "username": "owner"}
+    assert email_actions.send_action_email(db, key, recipient=recipient, action_context=context) is False
+    assert sent == []
+    db.get(m.EmailAction, key).enabled = True
     db.commit()
-    assert email_actions.seed_email_actions(db) == 0
-    db.expire_all()
-    assert db.get(m.EmailAction, "expiry_reminder").enabled is False
+    assert email_actions.send_action_email(db, key, recipient=recipient, action_context=context) is True
+    assert len(sent) == 1
 
 
 def test_the_upload_email_links_only_to_the_configured_address_or_not_at_all(db, owner, emails, monkeypatch):
