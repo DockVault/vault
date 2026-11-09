@@ -656,12 +656,13 @@ function showConfirm(message, title = 'Confirm Action', requireInput = null, con
         closeBtn.addEventListener('click', cancelHandler);
         confirmModalResolver = cancelHandler;   // settleConfirmModal answers it as cancelled
         
-        // ESC key to cancel
+        // ESC key to cancel: only while this dialog is the one on top (one lifted over it takes the key first,
+        // and dialogs.js marks a key it has used).
         const escHandler = (e) => {
-            if (e.key === 'Escape') {
-                cleanup();
-                resolve(false);
-            }
+            if (e.key !== 'Escape' || e.defaultPrevented) return;
+            if (window.Dialogs && window.Dialogs.top() !== modal) return;
+            cleanup();
+            resolve(false);
         };
         document.addEventListener('keydown', escHandler);
     });
@@ -723,7 +724,11 @@ function showPrompt(message, title = 'Enter value', options = {}) {
         const onConfirm = () => { const v = inputEl.value; cleanup(); resolve(v); };
         const onCancel = () => { cleanup(); resolve(null); };
         const onKey = (e) => { if (e.key === 'Enter') { e.preventDefault(); onConfirm(); } };
-        const onEsc = (e) => { if (e.key === 'Escape') onCancel(); };
+        const onEsc = (e) => {
+            if (e.key !== 'Escape' || e.defaultPrevented) return;
+            if (window.Dialogs && window.Dialogs.top() !== modal) return;   // a dialog over it takes the key
+            onCancel();
+        };
         // A backdrop click closes the dialog (static/js/dialogs.js decides when: the press and the
         // release both on the backdrop, this the top dialog, nothing typed); the promise settles as
         // cancelled with it, so no caller waits forever.
