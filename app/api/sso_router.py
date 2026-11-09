@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -56,6 +56,11 @@ class SsoLinkStartRequest(BaseModel):
 class SsoHandoverFinishRequest(BaseModel):
     code: str = Field(min_length=1, max_length=128)
     verifier: str = Field(min_length=1, max_length=256)
+
+
+class SsoReauthStartRequest(BaseModel):
+    verifier_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    action: str = Field(min_length=1, max_length=80)
 
 
 def _api():
@@ -317,10 +322,21 @@ async def sign_in_callback(
     if not sso.account_usable(user):
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": sso.ACCOUNT_DISABLED})
         return _redirect("sso-error=" + sso.ACCOUNT_DISABLED)
-    if login.purpose not in (sso_state.LINK, sso_state.TEST) or not login.verifier_hash or not login.session_hash:
+    if login.purpose not in (sso_state.LINK, sso_state.TEST, sso_state.STEP_UP) or not login.verifier_hash \
+            or not login.session_hash:
         _audit(db, "sso_sign_in_refused", user=user, ip=client_ip, status_="failure",
                details={**details, "reason": sso.PURPOSE_NOT_READY})
         return _redirect("sso-error=" + sso.PURPOSE_NOT_READY)
+    if login.purpose == sso_state.STEP_UP:
+        # A fresh sign-in of the account's own identity, within the minute, with the provider's MFA when trusted.
+        try:
+            sso.reauth_refusal(db, row, user, answer)
+        except sso.Refusal as exc:
+            _audit(db, "sso_sign_in_refused", user=user, ip=client_ip, status_="failure",
+                   details={**details, "reason": exc.code, "step_up": login.step_up_action})
+            return _redirect("sso-error=" + exc.code)
+        if not login.step_up_action:
+            return _redirect("sso-error=" + sso.PURPOSE_NOT_READY)
     if login.purpose == sso_state.LINK:
         # Refusals that need no claim are given now, so the person is told at once.
         try:
@@ -333,11 +349,126 @@ async def sign_in_callback(
               "session_hash": login.session_hash, "verifier_hash": login.verifier_hash, **sso.answer_record(answer)}
     if login.purpose == sso_state.TEST:
         record["summary"] = sso.test_summary(db, row, answer, user)
+    if login.purpose == sso_state.STEP_UP:
+        record["step_up_action"] = login.step_up_action
     try:
         handover = sso_state.store_handover(record)
     except sso_state.Unavailable:
         return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
-    return _redirect(("sso-linked=" if login.purpose == sso_state.LINK else "sso-test=") + handover)
+    fragment = {sso_state.LINK: "sso-linked=", sso_state.TEST: "sso-test=", sso_state.STEP_UP: "sso-stepup="}[login.purpose]
+    return _redirect(fragment + handover)
+
+
+@router.post("/auth/sso/{provider_id}/backchannel-logout")
+async def backchannel_logout(provider_id: str, request: Request, db: Session = Depends(get_db)):
+    """Where the provider says a person signed out of it (OpenID Connect back-channel logout, a form with
+    ``logout_token``): the token is verified as an ID token with the logout event, honoured once by its id, and the
+    vault sessions it names (by the provider's session id, else by the subject) are ended, those and no others.
+    200 on success; 400 with ``{"error": "invalid_request"}`` otherwise, never a body that says why."""
+    api = _api()
+    client_ip = api.get_client_ip(request)
+    from app.core import sign_in_lockout
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    try:
+        allowed, _, _reset = _rl.check_rate_limit(identifier=sign_in_lockout.source_of(client_ip), limit=START_LIMIT,
+                                                  window=START_WINDOW, prefix="sso_backchannel", fail_open=False)
+    except RateLimiterUnavailable:
+        allowed = False
+    invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
+    if not allowed:
+        return invalid
+    try:
+        form = await request.form()
+        token = form.get("logout_token")
+    except Exception:  # noqa: BLE001
+        token = None
+    row = _provider(db, provider_id)
+    if row is None or getattr(row, "kind", None) != "oidc" or not isinstance(token, str) or not token \
+            or not sso.policy_of(row)["sso_backchannel_logout"]:
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": str(provider_id)[:64], "reason": "not_accepted"})
+        return invalid
+    try:
+        provider = sso.provider_config(row)
+        discovery = oc.discover(provider)
+        claims = oc.verify_logout_token(provider, discovery, token, seen_jti=sso_state.seen_logout_jti)
+    except (sso.Refusal, oc.OidcError) as exc:
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": str(row.id), "reason": exc.code})
+        return invalid
+    from app.core.models import SsoSession
+    sid, sub = claims.get("sid"), claims.get("sub")
+    query = db.query(SsoSession).filter(SsoSession.provider_id == row.id)
+    if isinstance(sid, str) and sid:
+        query, by = query.filter(SsoSession.idp_sid == sid), "sid"
+    else:
+        query, by = query.filter(SsoSession.idp_sub == str(sub)), "sub"
+    session_ids = [s.session_id for s in query.all()]
+    ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout", durable=True) if session_ids else 0
+    db.commit()
+    _audit(db, "sso_backchannel_logout", ip=client_ip, details={"provider_id": str(row.id), "by": by, "sessions": ended})
+    return JSONResponse(status_code=200, content={})
+
+
+@router.post("/users/me/identities/{provider_id}/reauth")
+async def start_reauth(
+    provider_id: str,
+    body: SsoReauthStartRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Start a fresh sign-in at a linked provider to meet the password part of a step-up for ``action``: the
+    provider is told to authenticate again (``prompt=login``, ``max_age=0``); the callback hands the answer to this
+    tab, which stages it (``POST /users/me/identities/reauth/finish``) and then calls the step-up route with the
+    method ``idp_reauth``. Offered only for a provider whose test sign-in carried ``auth_time``."""
+    from app.core import second_factor_actions as acts
+    api = _api()
+    _refuse_temp(current_user)
+    if not acts.is_step_up_action(body.action):
+        raise HTTPException(status_code=404, detail="Unknown action.")
+    client_ip = api.get_client_ip(request)
+    _limit_start(client_ip)
+    row = _provider(db, provider_id)
+    if row is None or not sso.reauth_offered(row):
+        raise HTTPException(status_code=404, detail={"reason": sso.PROVIDER_DISABLED,
+                                                     "message": "This provider cannot confirm you for a step-up."})
+    identity = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id,
+                                                 ExternalIdentity.user_id == current_user.id).first()
+    if identity is None:
+        raise HTTPException(status_code=404, detail="Your account has no identity on this provider.")
+    from app.core import sign_in_lockout
+    try:
+        url = sso.start(row, purpose=sso_state.STEP_UP, source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
+                        verifier_hash=body.verifier_hash, user_id=current_user.id, session_hash=api._current_session_hash(request),
+                        step_up_action=body.action, reauthenticate=True, login_hint=identity.email_at_link or None)
+    except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
+        raise _refused_start(exc)
+    return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
+
+
+@router.post("/users/me/identities/reauth/finish")
+async def finish_reauth(
+    body: SsoHandoverFinishRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The tab that started a provider re-authentication stages its answer for the step-up route (one use, two
+    minutes, this session and this action only)."""
+    _refuse_temp(current_user)
+    api = _api()
+    record = _claim_handover(db, request, current_user, body, purpose=sso_state.STEP_UP)
+    action = record.get("step_up_action")
+    if not isinstance(action, str) or not action:
+        raise HTTPException(status_code=401, detail="This code is not valid for this tab; start again.")
+    try:
+        sso_state.stage_reauth(record["session_hash"], action)
+    except sso_state.Unavailable:
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
+    _audit(db, "step_up_idp_reauth", user=current_user, ip=api.get_client_ip(request),
+           details={"provider_id": record["provider_id"], "step_up": action})
+    return {"staged": True, "action": action, "expires_in": sso_state.REAUTH_TTL_SECONDS}
 
 
 def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:

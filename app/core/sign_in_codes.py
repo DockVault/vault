@@ -106,6 +106,11 @@ class Handover:
     code_challenge: Optional[str] = None
     # When the person authenticated at the identity provider (seconds since the epoch), when it said so.
     auth_time: Optional[int] = None
+    # What the provider session remembers for the provider's logouts: its session id and subject, and the hint the
+    # provider's own logout takes (the ID token), encrypted, only when the provider logout option wants it.
+    provider_sid: Optional[str] = None
+    provider_sub: Optional[str] = None
+    provider_logout_hint_enc: Optional[str] = None
     created_at: int = field(default_factory=lambda: int(time.time()))
     # How many times the account's sessions had been ended when the proof read the account
     # (app/services/sign_in.py, in_the_accounts_turn). A record without it matches no account.
@@ -134,7 +139,8 @@ class Handover:
         for flag in ("provider_mfa_trusted", "user_verified", "passwordless_allowed"):
             if type(getattr(handover, flag)) is not bool:
                 return None
-        for text_field in ("client_ip", "provider_id", "pending_id", "verifier_hash", "code_challenge"):
+        for text_field in ("client_ip", "provider_id", "pending_id", "verifier_hash", "code_challenge",
+                           "provider_sid", "provider_sub", "provider_logout_hint_enc"):
             value = getattr(handover, text_field)
             if value is not None and not isinstance(value, str):
                 return None
@@ -217,7 +223,26 @@ def from_result(result, *, verifier_hash: Optional[str] = None, code_challenge: 
         purpose=purpose, verifier_hash=verifier_hash, code_challenge=code_challenge,
         ended=result.sessions_ended,
         auth_time=int(result.auth_time.timestamp()) if getattr(result, "auth_time", None) is not None else None,
+        provider_sid=getattr(result, "provider_sid", None), provider_sub=getattr(result, "provider_sub", None),
+        provider_logout_hint_enc=_encrypted(getattr(result, "provider_logout_hint", None)),
     )
+
+
+def _encrypted(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    from app.core.security import encrypt_secret
+    return encrypt_secret(token)
+
+
+def _decrypted(token_enc: Optional[str]) -> Optional[str]:
+    if not token_enc:
+        return None
+    from app.core.security import decrypt_secret
+    try:
+        return decrypt_secret(token_enc)
+    except Exception:  # noqa: BLE001 -- a token the key cannot open is no token
+        return None
 
 
 def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
@@ -253,6 +278,8 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
         pending=pending, provider_id=handover.provider_id,
         provider_mfa_trusted=handover.provider_mfa_trusted, user_verified=handover.user_verified,
         passwordless_allowed=handover.passwordless_allowed,
+        provider_sid=handover.provider_sid, provider_sub=handover.provider_sub,
+        provider_logout_hint=_decrypted(handover.provider_logout_hint_enc),
         # What the proof read, not what the account says now: the code lives a minute, and a change in that
         # minute ends the sign-in it carries.
         sessions_ended=handover.ended if isinstance(handover.ended, int) else -1,

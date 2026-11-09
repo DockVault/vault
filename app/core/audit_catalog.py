@@ -76,6 +76,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("sso_identity_unlinked", "sign_in", "Organisation identity unlinked", "notice"),
     AuditAction("sso_provider_tested", "sign_in", "Single sign-on provider tested", "notice"),
     AuditAction("sso_groups_missing", "sign_in", "Single sign-on token without group information", "warning"),
+    AuditAction("sso_backchannel_logout", "sign_in", "Provider signed the person out", "notice"),
+    AuditAction("step_up_idp_reauth", "sign_in", "Step-up confirmed by a fresh provider sign-in", "notice"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),
     # By an administrator or by the server's operator on the host: the label names neither.

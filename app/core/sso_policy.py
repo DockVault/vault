@@ -22,6 +22,8 @@ DEFAULTS = {
     "sso_link_by_email": False,
     "sso_admin_mapping": False,           # a group may raise an administrator request (never the role itself)
     "sso_use_signup_domains": False,      # the account policy's sign-up domain list as a restriction too
+    "sso_backchannel_logout": True,       # a provider's back-channel logout token ends the sessions it names
+    "sso_idp_logout": False,              # a vault sign-out also sends the browser to the provider's logout
     "sso_trust_idp_mfa": False,           # a token with an accepted amr or acr value counts as the second factor
     "sso_accepted_amr": [],
     "sso_accepted_acr": [],
@@ -32,7 +34,8 @@ DEFAULTS = {
 }
 _ENUMS = {"sso_account_creation": ACCOUNT_CREATION_VALUES, "sso_default_role": DEFAULT_ROLE_VALUES,
           "sso_password_login": PASSWORD_LOGIN_VALUES}
-_BOOLS = ("sso_link_by_email", "sso_admin_mapping", "sso_use_signup_domains", "sso_trust_idp_mfa")
+_BOOLS = ("sso_link_by_email", "sso_admin_mapping", "sso_use_signup_domains", "sso_trust_idp_mfa",
+          "sso_backchannel_logout", "sso_idp_logout")
 _LISTS = ("sso_allowed_tenants", "sso_allowed_domains", "sso_required_groups", "sso_accepted_amr", "sso_accepted_acr")
 _STRS = ("sso_requested_acr",)
 MAX_LIST_ITEMS = 200

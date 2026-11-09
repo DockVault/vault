@@ -38,6 +38,9 @@ ACCOUNT_DISABLED = "account_disabled"
 ALREADY_LINKED = "already_linked"
 NOT_THIS_ACCOUNT = "not_this_account"
 PURPOSE_NOT_READY = "purpose_not_ready"
+REAUTH_STALE = "reauth_stale"
+REAUTH_NO_MFA = "reauth_no_mfa"
+REAUTH_MAX_AGE_SECONDS = 60
 RESTRICTED = sso_policy.RESTRICTED
 RESTRICTION_CLAIM_MISSING = sso_policy.RESTRICTION_CLAIM_MISSING
 INVITATION_UNUSABLE = "invitation_unusable"
@@ -65,6 +68,8 @@ REASON_TEXTS = {
     ALREADY_LINKED: "That organisation identity is already linked to an account.",
     NOT_THIS_ACCOUNT: "That organisation identity belongs to another account here.",
     PURPOSE_NOT_READY: "This step is not available yet.",
+    REAUTH_STALE: "Your organisation's sign-in did not ask you to sign in again just now. Start again.",
+    REAUTH_NO_MFA: "Your organisation's sign-in did not confirm you with a second factor. Start again.",
     RESTRICTED: ("Your organisation's sign-in worked, but this vault is not open to your tenant, domain or group. Ask "
                  "your administrator."),
     RESTRICTION_CLAIM_MISSING: ("Your organisation's sign-in did not say which tenant, domain or groups you belong to, "
@@ -115,8 +120,6 @@ def usable_for(row, purpose: str) -> Optional[str]:
         return PROVIDER_DISABLED
     if purpose == sso_state.TEST:
         return None
-    if purpose == sso_state.STEP_UP:
-        return PURPOSE_NOT_READY
     return None if row.state == "enabled" else PROVIDER_DISABLED
 
 
@@ -194,8 +197,8 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     discovery = oc.discover(provider, fetch=fetch, cache=cache, resolve=resolve, now=now)
     tokens = oc.exchange_code(provider, discovery, code=code, redirect_uri=redirect_uri(row.id),
                               code_verifier=state.code_verifier, fetch=fetch, resolve=resolve)
+    # A re-authentication's freshness (``auth_time``) is judged once, by reauth_refusal, with its own reason.
     claims = oc.verify_id_token(provider, discovery, tokens.id_token, nonce=state.nonce,
-                                max_age=0 if state.purpose == sso_state.STEP_UP else None,
                                 access_token=tokens.access_token, code=code, fetch=fetch, cache=cache,
                                 resolve=resolve, now=now)
     email_name = claim_name(row, "email", "email")
@@ -705,8 +708,74 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
     provider's policy trusts the values the token carried."""
     from app.services.sign_in import SignInResult
+    policy = policy_of(row)
     return SignInResult(user, [], client_ip, provider_id=provider_id, provider_mfa_trusted=mfa_trusted(row, answer),
-                        auth_time=answer.auth_time or datetime.now(timezone.utc))
+                        auth_time=answer.auth_time or datetime.now(timezone.utc),
+                        provider_sid=answer.sid, provider_sub=answer.subject,
+                        provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)
+
+
+def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:
+    """Raise :class:`Refusal` unless ``answer`` is a fresh sign-in of ``user``'s own identity at ``row``: the
+    identity the token names must be the account's, the provider must say the person authenticated within the
+    last minute (``auth_time``; a provider that sends none cannot re-authenticate), and, when the provider's MFA
+    is trusted, the token must carry an accepted value."""
+    identity = known_identity(db, row, answer)
+    if identity is None or str(identity.user_id) != str(user.id):
+        raise Refusal(NOT_THIS_ACCOUNT)
+    now = now or datetime.now(timezone.utc)
+    if answer.auth_time is None or not (0 <= (now - answer.auth_time).total_seconds() <= REAUTH_MAX_AGE_SECONDS):
+        raise Refusal(REAUTH_STALE)
+    if policy_of(row)["sso_trust_idp_mfa"] and not mfa_trusted(row, answer):
+        raise Refusal(REAUTH_NO_MFA)
+
+
+def reauth_available(db, user) -> bool:
+    """Whether a provider re-authentication may be offered to ``user`` for a step-up: an enabled provider the
+    account has an identity on, whose last test sign-in carried ``auth_time`` (without it no freshness can be
+    judged)."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    rows = db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all()
+    for identity in rows:
+        provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+        if provider is not None and reauth_offered(provider):
+            return True
+    return False
+
+
+def reauth_offered(row) -> bool:
+    last_test = getattr(row, "last_test", None) or {}
+    return (getattr(row, "state", None) == "enabled" and getattr(row, "kind", None) == "oidc"
+            and isinstance(last_test, dict) and last_test.get("auth_time_present") is True)
+
+
+def provider_logout_url(db, session_row) -> Optional[str]:
+    """Where the browser goes after a vault sign-out when the session's provider wants its own logout: the
+    provider's end-session address with the ID token as the hint and the vault's sign-in page to come back to.
+    None when the session was not a provider's, the option is off, the provider has no such address, or anything
+    fails: the vault's sign-out stands on its own."""
+    if session_row is None:
+        return None
+    try:
+        from urllib.parse import urlencode
+        from app.core.models import SsoProvider, SsoSession
+        from app.core.public_url import public_base_url
+        from app.core.security import decrypt_secret
+        sso_session = db.query(SsoSession).filter(SsoSession.session_id == session_row.id).first()
+        if sso_session is None or not sso_session.id_token_enc:
+            return None
+        row = db.query(SsoProvider).filter(SsoProvider.id == sso_session.provider_id).first()
+        if row is None or not policy_of(row)["sso_idp_logout"]:
+            return None
+        discovery = oc.discover(provider_config(row))
+        if not discovery.end_session_endpoint:
+            return None
+        import secrets
+        query = urlencode({"id_token_hint": decrypt_secret(sso_session.id_token_enc),
+                           "post_logout_redirect_uri": public_base_url() + "/", "state": secrets.token_urlsafe(16)})
+        return f"{discovery.end_session_endpoint}?{query}"
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def verifier_hash_of(verifier: str) -> str:

@@ -4641,10 +4641,13 @@ def _sf_step_up_methods(db, user, req, has_active) -> list:
     resolved; the table reads the factors itself."""
     from app.core import step_up_methods
     from app.core.active_factors import active_factors
+    from app.services import sso_sign_in
     factors = active_factors(db, user.id)
     # A passkey may meet the factor part when the account holds one (the passkey settings item adds the
-    # administrator's switch to this context).
-    return step_up_methods.offered(req, factors, step_up_methods.Context(passkey_step_up=factors.passkeys > 0))
+    # administrator's switch to this context); a fresh sign-in at a linked provider may meet the password part.
+    context = step_up_methods.Context(passkey_step_up=factors.passkeys > 0,
+                                      idp_reauth=sso_sign_in.reauth_available(db, user))
+    return step_up_methods.offered(req, factors, context)
 
 
 def _refuse_unenrolled(action, req):
@@ -8657,7 +8660,8 @@ async def second_factor_login_verify(
     outcome = sign_in.finish(db, sign_in.SignInResult(
         user, sign_in.methods_so_far(pending) + [(body.method or "").lower()], client_ip,
         pending=pending, provider_id=sign_in.provider_of(pending),
-        provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending)))
+        provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending),
+        **sign_in.provider_session_of(pending)))
     if isinstance(outcome, sign_in.PendingStep):
         return JSONResponse(status_code=200, content=outcome.body)
     access_token = outcome.access_token
@@ -8766,6 +8770,9 @@ class SecondFactorStepUpRequest(BaseModel):
     # A passkey as the factor part: the challenge POST /auth/passkeys/step-up/options issued, and the assertion.
     challenge_id: Optional[str] = Field(default=None, max_length=64)
     credential: Optional[dict] = None
+    # "idp_reauth": the password part is met by a fresh sign-in at the linked provider, staged by the tab
+    # (POST /users/me/identities/reauth/finish), instead of the account password.
+    password_method: Optional[str] = None
 
 
 @app.post("/auth/second-factor/challenge")
@@ -8845,13 +8852,28 @@ async def second_factor_step_up(
             raise HTTPException(status_code=403, detail="That code is not valid.")
         else:
             factor_marker = method
-    if req["password"]:
-        pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
-        if not (pw and current_user.password_hash and verify_password(pw, current_user.password_hash)):
-            _audit_change(db, current_user, "step_up_password_failed", "user", current_user.id,
-                          {"step_up": body.action}, status="failed")
-            raise HTTPException(status_code=403, detail="Your account password is required and must be correct.")
     session_hash = _current_session_hash(request)
+    if req["password"]:
+        by_provider = ((body.password_method or "").lower() == "idp_reauth"
+                       or ((body.method or "").lower() == "idp_reauth" and not req["otp"]))
+        if by_provider:
+            # A fresh sign-in at the linked provider, staged by this tab for this action: spent here, once.
+            from app.core import sso_state
+            from app.services import sso_sign_in
+            try:
+                staged = sso_state.take_reauth(session_hash, body.action)
+            except sso_state.Unavailable:
+                staged = False
+            if not staged or not sso_sign_in.reauth_available(db, current_user):
+                _audit_change(db, current_user, "step_up_password_failed", "user", current_user.id,
+                              {"step_up": body.action, "method": "idp_reauth"}, status="failed")
+                raise HTTPException(status_code=403, detail="Confirm with your organisation's sign-in first, then try again.")
+        else:
+            pw = body.password or (body.code if (body.method or "").lower() == "password" else None)
+            if not (pw and current_user.password_hash and verify_password(pw, current_user.password_hash)):
+                _audit_change(db, current_user, "step_up_password_failed", "user", current_user.id,
+                              {"step_up": body.action}, status="failed")
+                raise HTTPException(status_code=403, detail="Your account password is required and must be correct.")
     return {"receipt": sf.issue_step_up_receipt(db, user_id=current_user.id, action=body.action,
                                                 session_hash=session_hash, method=factor_marker)}
 
@@ -8945,7 +8967,8 @@ async def login(
                                           provider_mfa_trusted=sign_in.provider_mfa_of(pending),
                                           # What the first proof read: the held sign-in's, or this check's.
                                           sessions_ended=(sign_in.ended_of(pending) if pending is not None
-                                                          else getattr(auth_service, "sessions_ended_as_read", None)))
+                                                          else getattr(auth_service, "sessions_ended_as_read", None)),
+                                          **sign_in.provider_session_of(pending))
 
         # The pipeline decides whether a step follows (the second factor, its enrollment) and holds the
         # sign-in in a pending login with no session if so; otherwise it makes the session, the token
@@ -9500,7 +9523,7 @@ def _count_the_end_of_the_accounts_sessions(db, user_id) -> None:
 
 
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
-                     durable=True, except_session_token=None):
+                     durable=True, except_session_token=None, session_ids=None):
     """Deactivate the matching active sessions AND publish a force-close signal to
     the 'session_terminations' Redis channel so the SFTP server tears down any live
     transport immediately — not just at the connection's next operation. This is
@@ -9549,11 +9572,19 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
         ).all():
             up.status = 'cancelled'
 
+    if user_id is None and temp_credential_id is None and session_ids is None:
+        return 0                       # nothing named: never every session
     matching = db.query(ActiveSession)
     if user_id is not None:
         matching = matching.filter(ActiveSession.user_id == user_id)
     if temp_credential_id is not None:
         matching = matching.filter(ActiveSession.temp_credential_id == temp_credential_id)
+    if session_ids is not None:
+        # A provider's logout names sessions (by its own session id), not an account: those and no others.
+        ids = list(session_ids)
+        if not ids:
+            return 0
+        matching = matching.filter(ActiveSession.id.in_(ids))
     # Optionally keep the caller's OWN session (e.g. enrolling a second factor should revoke the
     # account's OTHER sessions but leave the one doing the enrollment logged in). except_session_token
     # is the PLAINTEXT token; the stored value is its hash, so we hash at the comparison — never
@@ -11479,7 +11510,8 @@ async def acknowledge_recovery_codes(
         outcome = sign_in.finish(db, sign_in.SignInResult(
             current_user, sign_in.methods_so_far(pending) + [sign_in.TOTP], client_ip,
             pending=pending, provider_id=sign_in.provider_of(pending),
-            provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending)))
+            provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending),
+            **sign_in.provider_session_of(pending)))
         if isinstance(outcome, sign_in.PendingStep):
             # The table asks for one more step (the password, for an account made an administrator during
             # its sign-in): the enrollment stands, the sign-in is held again.
@@ -27462,7 +27494,9 @@ def sign_out(
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }
             })
-    return {"signed_out": True, "session_ended": ended}
+    from app.services import sso_sign_in
+    return {"signed_out": True, "session_ended": ended,
+            "provider_logout_url": sso_sign_in.provider_logout_url(db, session) if ended else None}
 
 
 @app.get("/api/monitoring/metrics")

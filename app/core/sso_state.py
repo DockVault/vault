@@ -27,6 +27,11 @@ STARTED_PREFIX = "sso:started:"
 # A finished link or test, waiting for the tab and session that started it to claim it (one use, a minute).
 HANDOVER_PREFIX = "sso:handover:"
 HANDOVER_TTL_SECONDS = 60
+# A provider re-authentication the step-up route may spend once, within two minutes, for one action of one session.
+REAUTH_PREFIX = "sso:reauth:"
+REAUTH_TTL_SECONDS = 120
+# A back-channel logout token's id, kept for the token's remaining life so it is honoured once.
+LOGOUT_JTI_PREFIX = "sso:logout_jti:"
 
 SIGN_IN = "sign_in"
 LINK = "link"
@@ -222,7 +227,12 @@ def take_handover(code, *, redis=None) -> Optional[dict]:
         record = json.loads(raw)
     except ValueError:
         return None
-    if not isinstance(record, dict) or record.get("purpose") not in (LINK, TEST):
+    if not isinstance(record, dict) or record.get("purpose") not in (LINK, TEST, STEP_UP):
+        return None
+    action = record.get("step_up_action")
+    if record["purpose"] == STEP_UP and (not isinstance(action, str) or not action):
+        return None                                  # a re-authentication is staged for one named action
+    if action is not None and not isinstance(action, str):
         return None
     for name in _HANDOVER_TEXT:
         if not isinstance(record.get(name), str) or not record.get(name):
@@ -243,3 +253,40 @@ def abandoned_count(source: str, *, redis=None, now: Optional[float] = None) -> 
                                         now - STATE_TTL_SECONDS) or 0)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in state store cannot be reached") from exc
+
+
+# --------------------------------------------------------------------------- staged re-authentications, logout ids
+
+def _reauth_key(session_hash: str, action: str) -> str:
+    import hashlib
+    return REAUTH_PREFIX + hashlib.sha256(f"{session_hash}:{action}".encode("utf-8")).hexdigest()
+
+
+def stage_reauth(session_hash: str, action: str, *, redis=None) -> None:
+    """Note that this session re-authenticated at its provider for ``action``: spent by :func:`take_reauth` once,
+    within :data:`REAUTH_TTL_SECONDS`. Raises :class:`Unavailable` without the store."""
+    try:
+        _redis(redis).set(_reauth_key(session_hash, action), "1", ex=REAUTH_TTL_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable(str(exc)) from exc
+
+
+def take_reauth(session_hash: str, action: str, *, redis=None) -> bool:
+    """Spend the staged re-authentication of this session for ``action``: True once, then False."""
+    try:
+        return _redis(redis).getdel(_reauth_key(session_hash, action)) is not None
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable(str(exc)) from exc
+
+
+def seen_logout_jti(jti: str, ttl_seconds: int, *, redis=None) -> bool:
+    """Record a back-channel logout token's id for ``ttl_seconds`` and say whether it was already recorded (a
+    replayed token). Without the store the token is treated as seen: a logout is never honoured twice, and the
+    provider retries."""
+    import hashlib
+    key = LOGOUT_JTI_PREFIX + hashlib.sha256(str(jti).encode("utf-8")).hexdigest()
+    try:
+        fresh = _redis(redis).set(key, "1", nx=True, ex=max(1, int(ttl_seconds)))
+    except Exception:  # noqa: BLE001
+        return True
+    return not bool(fresh)

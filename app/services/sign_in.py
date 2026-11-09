@@ -122,6 +122,11 @@ class SignInResult:
     # was present in this sign-in.
     provider_id: Optional[str] = None
     provider_mfa_trusted: bool = False
+    # What a provider session remembers for the provider's logouts: the provider's session id and subject, and
+    # the ID token (plain here, encrypted at rest) when the provider logout option wants it.
+    provider_sid: Optional[str] = None
+    provider_sub: Optional[str] = None
+    provider_logout_hint: Optional[str] = None      # the ID token, for the provider's own logout; only when wanted
     # A passkey: whether the authenticator verified the person (the UV flag), and whether the policy lets
     # this person sign in with a user-verified passkey alone.
     user_verified: bool = False
@@ -260,6 +265,9 @@ def read_pre_auth(payload: dict, pending: PendingLogin) -> None:
     pending._provider_mfa_trusted = payload.get("provider_mfa") is True
     ended = payload.get("ended")
     pending._sessions_ended = ended if isinstance(ended, int) and not isinstance(ended, bool) else None
+    sid, sub = payload.get("idp_sid"), payload.get("idp_sub")
+    pending._provider_sid = sid if isinstance(sid, str) else None
+    pending._provider_sub = sub if isinstance(sub, str) else None
 
 
 def methods_so_far(pending: Optional[PendingLogin]) -> List[str]:
@@ -429,6 +437,11 @@ def drop_the_session_the_proof_made(db, result: "SignInResult") -> None:
         delete_session_by_token(db, made)
 
 
+def provider_session_of(pending: Optional[PendingLogin]) -> dict:
+    """What the pending login's provider sign-in remembers for the provider's logouts, as result fields."""
+    return {"provider_sid": getattr(pending, "_provider_sid", None), "provider_sub": getattr(pending, "_provider_sub", None)}
+
+
 def delete_session_by_token(db, session_token: Optional[str]) -> None:
     """Delete the session the password check just made, so a sign-in with a step still to go leaves no
     usable session behind. The stored value is the token's SHA-256 hash."""
@@ -531,6 +544,10 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
               "methods_so_far": list(result.methods), "ended": result.sessions_ended}
     if result.provider_id:
         claims["idp"] = result.provider_id
+        if result.provider_sid:
+            claims["idp_sid"] = result.provider_sid
+        if result.provider_sub:
+            claims["idp_sub"] = result.provider_sub
     if result.provider_mfa_trusted:
         # The trusted provider MFA counts at the end of the sign-in too (an administrator's password stage
         # after it), so the fact travels with the stage.
@@ -779,8 +796,32 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
     if not result.is_temporary:
         expires = timedelta(minutes=api._setting_int(db, "session_timeout", api.settings.jwt_access_token_expire_minutes))
     access_token = create_access_token(data=claims, expires_delta=expires)
+    _record_provider_session(db, result, session_token)
     _record(db, result, api)
     return SignedIn(access_token=access_token, user=user, is_temporary=result.is_temporary)
+
+
+def _record_provider_session(db, result: SignInResult, session_token: Optional[str]) -> None:
+    """A session signed in through a provider remembers the provider's session id and subject (so the provider's
+    back-channel logout finds it) and, when the provider logout option is on, the ID token encrypted. Best effort:
+    a sign-in that is whole must not fail on its own record."""
+    if not result.provider_id or not session_token:
+        return
+    try:
+        import uuid
+        from app.core.models import ActiveSession, SsoSession
+        from app.core.security import encrypt_secret
+        row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(session_token)).first()
+        if row is None:
+            return
+        auth_time = result.auth_time.astimezone(timezone.utc).replace(tzinfo=None) if result.auth_time.tzinfo else result.auth_time
+        db.add(SsoSession(session_id=row.id, provider_id=uuid.UUID(str(result.provider_id)),
+                          idp_sid=(result.provider_sid or None), idp_sub=(result.provider_sub or None),
+                          auth_time=auth_time,
+                          id_token_enc=encrypt_secret(result.provider_logout_hint) if result.provider_logout_hint else None))
+        db.commit()
+    except Exception:  # noqa: BLE001 -- the record is a record, never a refusal
+        db.rollback()
 
 
 def _stamp_identity(db, result: SignInResult) -> None:

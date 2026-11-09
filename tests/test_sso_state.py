@@ -194,8 +194,12 @@ def test_a_finished_link_or_test_waits_under_a_one_time_code():
     assert r.getdel_calls == asked
     import hashlib
     for broken in ({"purpose": "sign_in"}, {"user_id": ""}, {"verifier_hash": None}, {"subject": 5}, {"tenant_id": 1},
-                   {"email_verified": "true"}, {"summary": "x"}):
+                   {"email_verified": "true"}, {"summary": "x"}, {"purpose": st.STEP_UP}, {"purpose": st.STEP_UP, "step_up_action": ""},
+                   {"purpose": st.STEP_UP, "step_up_action": 3}, {"step_up_action": 3}):
         r.rows[st.HANDOVER_PREFIX + hashlib.sha256(b"c2").hexdigest()] = json.dumps({**record, **broken})
         assert st.take_handover("c2", redis=r) is None, broken
+    # A re-authentication's record names the step-up action it was made for.
+    staged = {**record, "purpose": st.STEP_UP, "step_up_action": "admin.retention.write"}
+    assert st.take_handover(st.store_handover(staged, redis=r), redis=r) == staged
     with pytest.raises(st.Unavailable):
         st.store_handover(record, redis=type("Down", (), {"set": lambda *a, **k: (_ for _ in ()).throw(ConnectionError())})())

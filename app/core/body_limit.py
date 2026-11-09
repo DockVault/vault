@@ -109,6 +109,7 @@ _PUBLIC_ROUTES: Sequence[Tuple[Tuple[str, ...], str]] = (
     (_POST, "/auth/second-factor/passkey/verify"),
     # Starting a single sign-on: the tab verifier's hash or an app's code challenge, and where to return.
     (_POST, "/auth/sso/{provider_id}/start"),
+    (_POST, "/auth/sso/{provider_id}/backchannel-logout"),
     # Second-factor enrollment takes a session OR a pending sign-in token, resolved after the body.
     (_POST, "/users/me/second-factor/totp/enroll"),
     (_POST, "/users/me/second-factor/totp/confirm"),
