@@ -2507,6 +2507,9 @@ async def recent_audit_events(
         out.append({
             'action': r.action,
             'username': r.username,
+            # The account's id beside its name (an administrator's feed that already shows the name), so the
+            # dashboard's person chip keeps the colour the same account has in every other list.
+            'user_id': str(r.user_id) if r.user_id else None,
             'description': (r.action or '').replace('_', ' '),
             'level': level,
             'timestamp': r.timestamp.isoformat() if r.timestamp else None,
@@ -24292,6 +24295,9 @@ async def get_file_info(
             "modified_at": file.updated_at.isoformat() if file.updated_at else None,
             "created_by": names.get(file.uploaded_by) if show_actor else None,
             "modified_by": names.get(last_modifier_id) if show_actor else None,
+            # The ids beside the names (shown to the same viewer), for the person chips.
+            "created_by_id": str(file.uploaded_by) if show_actor and file.uploaded_by else None,
+            "modified_by_id": str(last_modifier_id) if show_actor and last_modifier_id else None,
             "checksum_sha256": checksum,
             "checksum_algorithm": "SHA-256" if checksum else None,
             "is_zero_knowledge": is_zk,

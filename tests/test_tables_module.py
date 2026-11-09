@@ -292,3 +292,33 @@ def test_the_upload_links_admin_table_shows_when_each_link_was_last_used():
     assert "['Created', 'created'], ['Last used', 'last-used']" in body
     assert "_whenCell(r.last_upload_at)" in body
     assert "facets: _LINK_TABLE_FACETS" in body
+
+
+def test_placeholders_become_chips_and_times_before_a_remembered_sort_or_a_search_reads_the_rows():
+    """A list drawn from a template holds People placeholders (an empty span with the time or the name in its
+    attributes) until the page's watcher runs, after the script that drew it. The library hydrates them first,
+    so a remembered sort on such a column orders the rows and a search for a name keeps its row on a redraw."""
+    out = _node("""
+const ph = (attrs) => { const s = document.createElement('span'); Object.keys(attrs).forEach((k) => s.setAttribute(k, attrs[k])); return s; };
+const rows = () => [
+    [ph({ 'data-person': '1', 'data-person-id': 'u1', 'data-person-name': 'zed' }), ph({ 'data-when': '2026-03-01T10:00:00Z' })],
+    [ph({ 'data-person': '1', 'data-person-id': 'u2', 'data-person-name': 'amy' }), ph({ 'data-when': '2026-01-01T10:00:00Z' })],
+    [ph({ 'data-person': '1', 'data-person-id': 'u3', 'data-person-name': 'bob' }), ph({ 'data-when': '', 'data-when-fallback': 'Never' })],
+];
+Tables.applyPreferences({ tables: JSON.stringify({ users: { col: 'last-signin', dir: 'desc' } }) });
+const t = T([{ label: 'User', col: 'user' }, { label: 'Last sign-in', col: 'last-signin' }], rows(), { id: 'users' });
+Tables.enhance(t, { key: 'users', search: true });
+const sorted = { names: col(t, 0), sorts: sorts(t), chips: t.querySelectorAll('tbody .person-chip').length, times: t.querySelectorAll('tbody time.when').length,
+                 left: t.querySelectorAll('span[data-person], span[data-when]').length };
+// The box holds a name and the body is drawn again (a grant, a failed change): the row still shows.
+const search = t.parentNode.querySelector('input.table-search');
+search.value = 'amy'; search.dispatch('input');
+const tbody = t.tBodies[0]; tbody.replaceChildren();
+rows().forEach((cells) => { const tr = document.createElement('tr'); cells.forEach((c) => { const td = document.createElement('td'); td.appendChild(c); tr.appendChild(td); }); tbody.appendChild(tr); });
+Tables.enhance(t, { key: 'users', search: true });
+console.log(JSON.stringify({ sorted, redrawn: col(t, 0), empty: !!t.parentNode.querySelector('.table-search-empty') && !t.parentNode.querySelector('.table-search-empty').hidden }));
+""")
+    assert out["sorted"]["names"] == ["zed", "amy", "bob"]        # newest first, never-signed-in last
+    assert out["sorted"]["sorts"] == ["none", "descending"]
+    assert out["sorted"]["chips"] == 3 and out["sorted"]["times"] == 2 and out["sorted"]["left"] == 0
+    assert out["redrawn"] == ["amy"] and out["empty"] is False

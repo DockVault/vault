@@ -16,7 +16,8 @@
 //   Tables.setDensity('comfortable' | 'compact'), Tables.density()
 //       The tables' row height, as data-density on <html>, remembered for the account.
 //
-// Everything is built with createElement and textContent; nothing is read from the rows but their text.
+// Everything is built with createElement and textContent; nothing is read from the rows but their text. People
+// placeholders (static/js/people.js) in the rows are turned into their chips and times before anything is read.
 (function () {
     'use strict';
 
@@ -254,6 +255,10 @@
 
     function enhance(table, options) {
         if (!table || !table.tHead) return table;
+        // A list drawn from a template holds People placeholders until the page's watcher turns them into
+        // chips and times, which happens after this call: turn them now, so a remembered sort on a time
+        // column and a search for a name see the real cells.
+        if (window.People && typeof People.hydrate === 'function') People.hydrate(table);
         const o = options || {};
         const key = o.key || table.id || '';
         const skip = new Set(o.skip || []);

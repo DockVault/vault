@@ -2998,36 +2998,37 @@ async function loadRecentEvents() {
         const eventsFeed = document.getElementById('events-feed');
         
         if (!eventsFeed) return;
-        
+
         if (!events || events.length === 0) {
-            eventsFeed.innerHTML = `
-                <div class="empty-state text-center p-lg">
-                    <p class="text-secondary">No recent events</p>
-                </div>
-            `;
+            const box = _el('div', 'empty-state text-center p-lg');
+            box.appendChild(_el('p', 'text-secondary', 'No recent events'));
+            eventsFeed.replaceChildren(box);
             return;
         }
-        
-        eventsFeed.innerHTML = events.map(event => {
-            const eventClass = event.level === 'error' ? 'event-error' : 
+
+        // Each event names its person with the chip and its moment with the time element every other list
+        // uses (static/js/people.js); built with DOM calls only.
+        eventsFeed.replaceChildren(...events.map(event => {
+            const eventClass = event.level === 'error' ? 'event-error' :
                               event.level === 'warning' ? 'event-warning' :
                               event.level === 'success' ? 'event-success' : 'event-info';
-            
-            const iconName = dashboardEventIcon(event);
-
-            return `
-                <div class="event-item ${eventClass}">
-                    <div class="event-header">
-                        <span class="event-icon">${iconSvg(iconName)}</span>
-                        <span class="event-user">${escapeHtml(event.username || 'System')}</span>
-                        <span class="event-action">${escapeHtml(event.description || event.action)}</span>
-                        <span class="event-time">${formatTimeAgo(event.timestamp)}</span>
-                    </div>
-                    ${event.details ? `<div class="event-details">${escapeHtml(event.details)}</div>` : ''}
-                </div>
-            `;
-        }).join('');
-        
+            const item = _el('div', 'event-item ' + eventClass);
+            const head = _el('div', 'event-header');
+            const icon = _el('span', 'event-icon');
+            icon.appendChild(_svgIcon(dashboardEventIcon(event)));
+            head.appendChild(icon);
+            const who = _el('span', 'event-user');
+            if (event.username) who.appendChild(People.chip({ id: event.user_id, username: event.username }, { small: true }));
+            else who.textContent = 'System';
+            head.appendChild(who);
+            head.appendChild(_el('span', 'event-action', event.description || event.action || ''));
+            const when = _el('span', 'event-time');
+            when.appendChild(People.time(event.timestamp));
+            head.appendChild(when);
+            item.appendChild(head);
+            if (event.details) item.appendChild(_el('div', 'event-details', String(event.details)));
+            return item;
+        }));
     } catch (error) {
         console.log('Failed to load events:', error);
         const eventsFeed = document.getElementById('events-feed');
@@ -5610,7 +5611,7 @@ function renderTempCredRow(cred) {
             <td colspan="5">
                 <div class="row-detail">
                     <div class="detail-meta">
-                        <span class="meta-item">${iconSvg('calendar', 'icon-sm')}<span class="meta-label">Created</span><span class="meta-value">${formatServerTime(cred.created_at)}</span></span>
+                        <span class="meta-item">${iconSvg('calendar', 'icon-sm')}<span class="meta-label">Created</span><span class="meta-value">${People.whenPlaceholder(cred.created_at)}</span></span>
                         ${cred.note ? `<span class="meta-item">${iconSvg('file-text', 'icon-sm')}<span class="meta-label">Note</span><span class="meta-value">${escapeHtml(cred.note)}</span></span>` : ''}
                         ${cred.can_create_temp_credentials ? `<span class="entity-note">${iconSvg('key', 'icon-sm')} Can create temp credentials</span>` : ''}
                         ${cred.active_session_count > 0 ? `<span class="entity-note">${iconSvg('activity', 'icon-sm')} ${cred.active_session_count} active session(s)</span>` : ''}
@@ -12030,8 +12031,14 @@ function renderFileInfo(body, info, fallbackName) {
     row('Type', info.mime_type || friendlyFileType({ type: 'file', name: displayName }));
     row('Created', info.created_at ? formatModified(info.created_at) : null);
     row('Modified', info.modified_at ? formatModified(info.modified_at) : null);
-    if (info.created_by) row('Created by', info.created_by);
-    if (info.modified_by) row('Modified by', info.modified_by);
+    const person = (label, name, id) => {
+        const dt = document.createElement('dt'); dt.textContent = label;
+        const dd = document.createElement('dd');
+        dd.appendChild(People.chip({ id: id || null, username: name }, { small: true }));
+        dl.append(dt, dd);
+    };
+    if (info.created_by) person('Created by', info.created_by, info.created_by_id);
+    if (info.modified_by) person('Modified by', info.modified_by, info.modified_by_id);
     body.replaceChildren(dl);
 
     // Hash: Standard vaults carry a real plaintext SHA-256; ZK vaults do not (the server holds only
