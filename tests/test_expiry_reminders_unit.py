@@ -178,3 +178,54 @@ def test_a_spent_link_is_not_reminded(db):
     due = {i["id"] for i in expiry_reminders.due(db, now=NOW)}
     assert due == {str(x.id) for x in (open_public, unlimited_public, open_note, open_drop)}, due
     assert not due & {str(x.id) for x in (spent_public, spent_note, spent_drop)}
+
+
+def test_a_revoked_share_or_link_is_not_reminded(db):
+    olga = user(db)
+    v = vault(db, olga)
+    soon = NOW + timedelta(hours=20)
+    gone_share = share(db, olga, v, expires_at=soon)
+    gone_share.status = "revoked"
+    kept_share = share(db, olga, vault(db, olga, name="b0"), expires_at=soon)
+    gone_public = public_link(db, olga, v, expires_at=soon)
+    gone_public.revoked = True
+    kept_public = public_link(db, olga, v, expires_at=soon)
+    gone_note = note_link(db, olga, expires_at=soon)
+    gone_note.revoked = True
+    kept_note = note_link(db, olga, expires_at=soon)
+    gone_drop = receiver(db, olga, vault(db, olga, name="b1"), expires_at=soon)
+    gone_drop.revoked = True
+    kept_drop = receiver(db, olga, vault(db, olga, name="b2"), expires_at=soon)
+    db.commit()
+
+    due = {i["id"] for i in expiry_reminders.due(db, now=NOW)}
+    assert due == {str(x.id) for x in (kept_share, kept_public, kept_note, kept_drop)}, due
+
+
+@pytest.mark.parametrize("state", ["deactivated", "locked by an administrator"])
+def test_a_link_whose_owner_may_no_longer_publish_is_not_reminded(db, state):
+    olga = user(db)
+    v = vault(db, olga)
+    soon = NOW + timedelta(hours=20)
+    links = [public_link(db, olga, v, expires_at=soon), note_link(db, olga, expires_at=soon),
+             receiver(db, olga, vault(db, olga, name="c1"), expires_at=soon)]
+    own_share = share(db, olga, vault(db, olga, name="c2"), expires_at=soon)
+    assert {i["id"] for i in expiry_reminders.due(db, now=NOW)} >= {str(x.id) for x in links}
+    if state == "deactivated":
+        olga.is_active = False
+    else:
+        olga.is_locked, olga.locked_until = True, None
+    db.commit()
+
+    due = {i["id"] for i in expiry_reminders.due(db, now=NOW)}
+    assert not due & {str(x.id) for x in links}, due
+    # A share does not hang on its maker's account staying live: it is still reminded.
+    assert str(own_share.id) in due
+
+
+def test_a_timed_lock_from_wrong_passwords_keeps_the_links_and_their_reminders(db):
+    olga = user(db)
+    olga.is_locked, olga.locked_until = True, NOW + timedelta(minutes=15)
+    db.commit()
+    link = public_link(db, olga, vault(db, olga), expires_at=NOW + timedelta(hours=20))
+    assert str(link.id) in {i["id"] for i in expiry_reminders.due(db, now=NOW)}

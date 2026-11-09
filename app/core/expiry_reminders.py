@@ -42,8 +42,17 @@ def _spent(used: Optional[int], cap: Optional[int]) -> bool:
 def due(db, now: Optional[datetime] = None, within_hours: int = WINDOW_HOURS) -> list:
     """Everything that expires within ``within_hours``, still works and was made for longer than that, as
     dicts the caller tells about: kind (share | public_link | note_link | receiver), id, owner_id, title,
-    expires_at, target (the page in the web app that manages it)."""
-    from app.core.models import Share, PublicLink, NoteLink, Receiver, NoteLinkTag
+    expires_at, target (the page in the web app that manages it). A link whose owner may no longer publish
+    (deactivated, or locked by an administrator: app/core/link_owner.py) is dead and is not reminded."""
+    from app.core.models import Share, PublicLink, NoteLink, Receiver, NoteLinkTag, User
+    from app.core.link_owner import may_publish
+
+    live_owner = {}
+
+    def owner_live(owner_id) -> bool:
+        if owner_id not in live_owner:
+            live_owner[owner_id] = may_publish(db.query(User).filter(User.id == owner_id).first())
+        return live_owner[owner_id]
 
     now = now or datetime.utcnow()
     window = timedelta(hours=within_hours)
@@ -69,7 +78,8 @@ def due(db, now: Optional[datetime] = None, within_hours: int = WINDOW_HOURS) ->
     tag_ids = {l.tag_id for l in links if l.tag_id}
     tags = dict(db.query(NoteLinkTag.id, NoteLinkTag.name).filter(NoteLinkTag.id.in_(tag_ids)).all()) if tag_ids else {}
     for l in links:
-        if not _long_lived(l.created_at, l.expires_at, window) or _spent(l.use_count, l.max_uses):
+        if (not _long_lived(l.created_at, l.expires_at, window) or _spent(l.use_count, l.max_uses)
+                or not owner_live(l.owner_id)):
             continue
         tag = tags.get(l.tag_id)
         items.append({"kind": "public_link", "id": str(l.id), "owner_id": str(l.owner_id),
@@ -81,7 +91,8 @@ def due(db, now: Optional[datetime] = None, within_hours: int = WINDOW_HOURS) ->
                                        NoteLink.expires_at > now, NoteLink.expires_at <= until)
              .order_by(NoteLink.expires_at).all())
     for n in notes:
-        if not _long_lived(n.created_at, n.expires_at, window) or _spent(n.use_count, n.max_uses):
+        if (not _long_lived(n.created_at, n.expires_at, window) or _spent(n.use_count, n.max_uses)
+                or not owner_live(n.owner_id)):
             continue
         items.append({"kind": "note_link", "id": str(n.id), "owner_id": str(n.owner_id),
                       "title": "Your note link",
@@ -92,7 +103,8 @@ def due(db, now: Optional[datetime] = None, within_hours: int = WINDOW_HOURS) ->
                                            Receiver.expires_at > now, Receiver.expires_at <= until)
                  .order_by(Receiver.expires_at).all())
     for r in receivers:
-        if not _long_lived(r.created_at, r.expires_at, window) or _spent(r.upload_count, r.max_uploads):
+        if (not _long_lived(r.created_at, r.expires_at, window) or _spent(r.upload_count, r.max_uploads)
+                or not owner_live(r.owner_id)):
             continue
         items.append({"kind": "receiver", "id": str(r.id), "owner_id": str(r.owner_id),
                       "title": f"Your upload link {r.label}" if r.label else "Your upload link",

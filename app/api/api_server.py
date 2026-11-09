@@ -14239,12 +14239,9 @@ def _link_owner_if_live(db, owner_id):
     Automatic locks live in their own table now (app/core/sign_in_lockout.py) and never set
     is_locked, so only an administrator's lock, or a timed one left from before they moved, is on
     the account row; the timed one has an end and is ignored here like any automatic lock."""
+    from app.core.link_owner import may_publish
     owner = db.query(User).filter(User.id == owner_id).first()
-    if owner is None or not getattr(owner, "is_active", True):
-        return None
-    if getattr(owner, "is_locked", False) and getattr(owner, "locked_until", None) is None:
-        return None
-    return owner
+    return owner if may_publish(owner) else None
 
 
 def _publiclink_resolve_live(db, link):
