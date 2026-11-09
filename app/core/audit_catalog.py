@@ -82,6 +82,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("sso_freshness_expired", "sign_in", "Keys paused for want of a provider sign-in", "notice",
                 automatic=True),
     AuditAction("sso_access_ended_by_refusal", "sign_in", "Access ended: the provider refused the person", "warning"),
+    AuditAction("sso_refusal_cleared", "sign_in", "A provider's refusal lifted by an administrator", "notice"),
     AuditAction("step_up_idp_reauth", "sign_in", "Step-up confirmed by a fresh provider sign-in", "notice"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),

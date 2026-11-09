@@ -1058,3 +1058,30 @@ def test_the_administrators_user_list_shows_when_keys_pause(monkeypatch):
                                                  "provider": "contoso", "lapsed": False, "refused": False}
     assert by_name["bob"]["sso_freshness"] is None and by_name["root"]["sso_freshness"] is None
 
+
+def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own(monkeypatch):
+    from app.api import sso_admin_router as A
+    from app.services import sso_freshness as F
+    root, alice = _user("root", role="admin"), _user()
+    p = _provider(state="disabled")
+    identity = _identity(alice, p, refused_at=datetime.utcnow())
+    own = _identity(root, p, subject="subject-root", refused_at=datetime.utcnow())
+    h = Harness(monkeypatch, [root, alice], [p], identities=[identity, own])
+    # The route is an administrator's, under the sign-in policy step-up.
+    assert A._step_up.action == "admin.auth_policy.write"
+    steps = []
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: steps.append(user.username))
+    # The provider is disabled, and the refusal it recorded still pauses alice's keys.
+    assert F.lapsed(h.db, alice.id) is not None
+    status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{own.id}/clear-refusal")
+    assert status == 409 and body["detail"]["reason"] == "own_identity" and steps == [] and own.refused_at is not None
+    status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
+    assert status == 200 and body == {"cleared": True} and steps == ["root"]
+    assert identity.refused_at is None and F.lapsed(h.db, alice.id) is None
+    assert ("sso_refusal_cleared", "success", {"user_id": str(alice.id), "provider_id": str(p.id),
+                                               "identity_id": str(identity.id)}) in h.audits
+    status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
+    assert status == 409 and body["detail"]["reason"] == "not_refused" and steps == ["root"]
+    assert _call(h.S, "POST", f"/admin/sso/identities/{uuid.uuid4()}/clear-refusal")[0] == 404
+    assert _call(h.S, "POST", "/admin/sso/identities/not-an-id/clear-refusal")[0] == 404
+

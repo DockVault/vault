@@ -317,3 +317,26 @@ def test_ending_a_temporary_credentials_sessions_signals_the_sftp_server_once_th
     out = run_coroutine(route(temp_username="tmp_ends", current_user=admin, db=db))
     assert out["terminated_count"] == 1
     assert seen == [("session_terminations", _token(db, live), False)], "the signal went before the end committed"
+
+
+def test_the_revocation_a_providers_refusal_makes_closes_the_live_sftp_connections_too(db, published):
+    """A provider's verified refusal ends the account's access through the same revocation a password reset or a
+    forced sign-out makes (app/services/sso_freshness.py end_access_on_refusal): every session of the account, web
+    and SFTP alike, revoked, and a force-close sent for each live one, which the SFTP server answers by closing
+    the connection at once."""
+    import inspect
+    from app.services import sso_freshness
+    user, other = uuid.uuid4(), uuid.uuid4()
+    web = _row(db, user, active=True)
+    sftp = _row(db, user, active=True)
+    db.query(ActiveSession).filter(ActiveSession.id == sftp).update({ActiveSession.channel: "sftp"})
+    db.commit()
+    elsewhere = _row(db, other, active=True)
+    assert "_revoke_sessions(db, user_id=user.id, actor_username=\"system\", durable=True)" in inspect.getsource(
+        sso_freshness.end_access_on_refusal)
+    assert S._revoke_sessions(db, user_id=user, actor_username="system", durable=True) == 2
+    db.commit()
+    assert _state(db, web) == (False, True) and _state(db, sftp) == (False, True)
+    assert sorted(published) == sorted([_token(db, web), _token(db, sftp)])
+    assert _state(db, elsewhere) == (True, False)
+

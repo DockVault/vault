@@ -126,3 +126,63 @@ def deny_admin_request(request_id: str, request: Request, current_user: User = D
                        db: Session = Depends(get_db)):
     """Refuse the request; the account is unchanged and the person is told."""
     return _decide(db, request_id, current_user, request, approve=False)
+
+
+# --------------------------------------------------------------------------- a provider's refusal, cleared
+
+def _identity_or_404(db, identity_id, *, lock: bool = False):
+    from app.core.models import ExternalIdentity
+    try:
+        iid = uuid.UUID(str(identity_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="No such identity.")
+    query = db.query(ExternalIdentity).filter(ExternalIdentity.id == iid)
+    if lock:
+        query = query.populate_existing().with_for_update()
+    identity = query.first()
+    if identity is None:
+        raise HTTPException(status_code=404, detail="No such identity.")
+    return identity
+
+
+@router.post("/admin/sso/identities/{identity_id}/clear-refusal")
+def clear_identity_refusal(identity_id: str, request: Request, current_user: User = Depends(require_interactive_admin),
+                           db: Session = Depends(get_db)):
+    """Lift a refusal the identity's provider recorded (its verified token excluded the person, so their SSH keys,
+    temporary credentials and devices paused): for a refusal that was a mistake the provider cannot answer, such as
+    one recorded before the provider was disabled. Never an administrator's own: another administrator clears that.
+    Under the administrators' sign-in policy step-up, recorded, and the person is told. The provider's freshness
+    window, when it asks one, still applies."""
+    api = _api()
+    client_ip = api.get_client_ip(request)
+    identity = _identity_or_404(db, identity_id)
+    if getattr(identity, "refused_at", None) is None:
+        raise HTTPException(status_code=409, detail={"reason": "not_refused",
+                                                     "message": "No refusal is recorded for this identity."})
+    if str(identity.user_id) == str(current_user.id):
+        raise HTTPException(status_code=409, detail={"reason": "own_identity", "message": (
+            "Another administrator must clear a refusal of your own identity.")})
+    _step_up(db, current_user, request)       # may commit (a receipt is used once)
+    identity = _identity_or_404(db, identity_id, lock=True)
+    if identity.refused_at is None:
+        raise HTTPException(status_code=409, detail={"reason": "changed", "message": "The identity changed meanwhile."})
+    identity.refused_at = None
+    user = db.query(User).filter(User.id == identity.user_id).first()
+    provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+    label = ((provider.name or provider.label) if provider is not None else None) or "an identity provider"
+    try:
+        from app.core import owner_notices
+        if user is not None:
+            owner_notices.notify_in_transaction(
+                db, [user.id], title="An administrator lifted a sign-in refusal",
+                body=(f"{current_user.username} lifted the refusal {label} recorded for your account; your SSH keys, "
+                      "temporary credentials and devices work again unless another rule pauses them."),
+                ntype="sso_refusal_cleared", target="#profile")
+    except Exception as exc:  # noqa: BLE001 -- the clearing stands without its notice
+        log.info("sso refusal-cleared notice skipped: %s", type(exc).__name__)
+    db.commit()
+    _audit(db, "sso_refusal_cleared", user=current_user, ip=client_ip, resource_type="user",
+           resource_id=str(identity.user_id),
+           details={"user_id": str(identity.user_id), "provider_id": str(identity.provider_id),
+                    "identity_id": str(identity.id)})
+    return {"cleared": True}

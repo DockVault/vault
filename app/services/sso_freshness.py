@@ -7,7 +7,8 @@ for that provider), the account is fresh while the identity's last sign-in throu
 not signed in since) is younger than that many days, and the provider has not refused the person since: a verified
 token that excluded a known identity (the refusal-ends-access rule) stamps ``refused_at``, and only a later sign-in the
 provider admits answers it. Each such provider asks on its own: a sign-in through another provider does not answer
-it. Nothing is deleted, so the next sign-in through the provider restores everything.
+it. Nothing is deleted, so the next sign-in through the provider restores everything. A refusal stays in force even
+when the provider is disabled afterwards; an administrator may clear it (app/api/sso_admin_router.py).
 
 The daily sweep warns the person :data:`WARNING_DAYS` days before, in the app and by email, and the administrators'
 user list shows the due date. Device credentials of the desktop app join the same check when they exist.
@@ -43,21 +44,22 @@ def _tables_present(db) -> bool:
 
 
 def deadline_of(identity, provider) -> Optional[Deadline]:
-    """The deadline ``identity`` keeps on ``provider``, or None when the provider asks nothing: it is not enabled, or
-    its freshness is off and it has not refused the person since their last sign-in (a refusal pauses the keys
-    whatever the window)."""
-    if provider is None or getattr(provider, "state", None) != "enabled":
-        return None
-    days = sso_policy.effective(getattr(provider, "policy", None))["sso_freshness_days"]
+    """The deadline ``identity`` keeps on ``provider``, or None when the provider asks nothing. A refusal the provider
+    made since the person's last sign-in through it pauses the keys whatever the window and whatever has become of
+    the provider since: disabling a provider (during an incident, say) must not hand keys back to people it excluded.
+    Only a later sign-in it admits, or an administrator clearing the refusal, lifts it. Otherwise a provider asks
+    only while it is enabled and its freshness is on."""
     last = identity.last_sign_in_at
     refused_at = getattr(identity, "refused_at", None)
     refused = refused_at is not None and (last is None or refused_at >= last)
-    if days <= 0 and not refused:
+    enabled = provider is not None and getattr(provider, "state", None) == "enabled"
+    days = sso_policy.effective(getattr(provider, "policy", None))["sso_freshness_days"] if enabled else 0
+    if not refused and (not enabled or days <= 0):
         return None
     since = last or identity.linked_at or datetime.utcnow()
     due = since + timedelta(days=days) if days > 0 else refused_at
     name = (getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
-    return Deadline(identity_id=str(identity.id), user_id=str(identity.user_id), provider_id=str(provider.id),
+    return Deadline(identity_id=str(identity.id), user_id=str(identity.user_id), provider_id=str(identity.provider_id),
                     provider_name=name or "your identity provider", due=due, refused=refused)
 
 
@@ -93,6 +95,11 @@ def due_date(db, user_id) -> Optional[datetime]:
 
 def refusal_text(found: Deadline) -> str:
     return LAPSE_MESSAGE.format(provider=found.provider_name)
+
+
+def warning_text(found: Deadline, when: str) -> str:
+    return (f"Sign in through {found.provider_name} by {when}. If you do not, your SSH keys, temporary credentials "
+            f"and devices pause then, and a sign-in through {found.provider_name} restores them.")
 
 
 def _all_deadlines(db) -> List[Deadline]:
@@ -168,7 +175,7 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
                 _audit(db, WARNED, user=user, details=details)
                 if user.email:
                     api._fire_action_email(db, "sso_freshness_warning", email=user.email, username=user.username,
-                                           action_context={"provider": found.provider_name, "when": when})
+                                           action_context={"change": warning_text(found, when), "when": when})
         else:
             told = api._notify_users(
                 [found.user_id], EXPIRED, title="Your SSH keys and temporary credentials are paused",

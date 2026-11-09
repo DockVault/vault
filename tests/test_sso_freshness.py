@@ -181,7 +181,9 @@ def test_the_sweep_warns_five_days_before_once_and_tells_once_when_keys_pause(to
     assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 1}
     due_a = (NOW + 3 * DAY).strftime("%d %B %Y, %H:%M UTC")
     assert (str(alice.id), F.WARNED, f"Sign in through contoso by {due_a}") == told.notices[0][:3]
-    assert told.emails == [("sso_freshness_warning", "alice@example.test", {"provider": "contoso", "when": due_a})]
+    assert told.emails == [("sso_freshness_warning", "alice@example.test",
+                            {"change": F.warning_text(F.deadlines(db, alice.id)[0], due_a), "when": due_a})]
+    assert told.emails[0][2]["change"].startswith(f"Sign in through contoso by {due_a}.")
     assert (str(carol.id), F.EXPIRED, "Your SSH keys and temporary credentials are paused") == told.notices[1][:3]
     assert told.notices[1][3].startswith("Sign in through contoso again")
     wave = told.notices[2]
@@ -358,3 +360,105 @@ def test_no_device_sync_credential_is_minted_for_a_lapsed_account(monkeypatch):
         svc.mint_device_sync_credential(device, vault_id)
     assert getattr(e.value, "detail", {}) == {} or e.value.detail.get("reason") != "sso-freshness-lapsed"
 
+
+
+# --------------------------------------------------------------------------- a refusal outlives the provider's state
+
+def test_a_refusal_stays_in_force_when_the_provider_is_disabled_or_removed():
+    alice, p = _user(), _provider(0)
+    i = _identity(alice, p, signed_in=NOW - DAY, refused=NOW - timedelta(hours=1))
+    db = _db([alice], [p], [i])
+    for state in ("disabled", "draft"):
+        p.state = state
+        found = F.lapsed(db, alice.id, now=NOW)
+        assert found is not None and found.refused and found.provider_id == str(p.id), state
+    # The provider removed altogether (its row gone, the identity left behind): still refused.
+    gone = _db([alice], [], [i])
+    assert F.lapsed(gone, alice.id, now=NOW).refused
+    assert F.standing_of(gone, now=NOW)[str(alice.id)]["refused"] is True
+    # Without a refusal, a provider that is not enabled asks nothing.
+    i.refused_at = None
+    assert F.lapsed(db, alice.id, now=NOW) is None
+
+
+class _Store:
+    """The in-memory store for the identities and providers, and fixed answers for everything else a door reads."""
+
+    def __init__(self, memory, fixed):
+        self.memory, self.fixed = memory, fixed
+        self.claims = []
+
+    def query(self, entity, *a):
+        if entity in (ExternalIdentity, SsoProvider):
+            return self.memory.query(entity)
+        return _Fixed(self, self.fixed.get(entity))
+
+    def commit(self):
+        pass
+
+    def add(self, row):
+        pass
+
+
+class _Fixed:
+    def __init__(self, store, value):
+        self.store, self.value = store, value
+
+    def filter(self, *a, **k):
+        return self
+
+    def first(self):
+        return self.value[0] if isinstance(self.value, list) else self.value
+
+    def all(self):
+        return list(self.value or [])
+
+    def update(self, *a, **k):
+        self.store.claims.append(1)
+        return 1
+
+
+def test_refused_then_the_provider_disabled_the_ssh_key_and_the_temporary_credential_are_still_refused(monkeypatch):
+    """The real rule, not a stand-in: the provider refuses alice, an administrator disables the provider, and alice's
+    SSH key and temporary credential are still refused; nothing is spent."""
+    import paramiko
+    from app.core.models import TemporaryCredential, UserSSHKey
+    from app.services import auth_service as A
+    from app.sftp import sftp_server as S
+    alice = _user(sftp_enabled=True, is_locked=False, locked_until=None, role=None)
+    p = _provider(30)
+    i = _identity(alice, p, signed_in=NOW - DAY, refused=datetime.utcnow())
+    memory = _db([alice], [p], [i])
+    p.state = "disabled"
+    key_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIRefusalKeyRefusalKeyRefusalKeyRefusal0"
+    stored = types.SimpleNamespace(id=uuid.uuid4(), public_key=f"ssh-ed25519 {key_b64} laptop", last_used=None)
+    later = datetime.now(timezone.utc) + timedelta(hours=1)
+    cred = types.SimpleNamespace(id=uuid.uuid4(), device_id=None, credential_hash="h", is_active=True, is_used=False,
+                                 expires_at=later, deactivate_at=None, user=alice)
+    store = _Store(memory, {User: alice, UserSSHKey: [stored], TemporaryCredential: cred})
+
+    @contextmanager
+    def ctx():
+        yield store
+    monkeypatch.setattr(S, "get_db_context", ctx)
+    monkeypatch.setattr(S, "_sftp_key_throttled", lambda ip, username: False)
+    monkeypatch.setattr(S, "_sftp_key_clear", lambda ip, username: None)
+    monkeypatch.setattr(S, "_user_requires_temp_cred_for_sftp", lambda db, user, fail_closed=True: False)
+    import app.core.sign_in_lockout as lockout
+    monkeypatch.setattr(lockout, "lock_in_force", lambda db, user_id, address, **kw: None)
+    key = types.SimpleNamespace(get_base64=lambda: key_b64)
+    assert S.SFTPServer("203.0.113.9").check_auth_publickey("alice", key) == paramiko.AUTH_FAILED
+    svc = A.AuthService.__new__(A.AuthService)
+    svc.db = store
+    svc._check_rate_limit = svc._check_username_rate_limit = lambda *a, **k: None
+    svc._record_failed_login = lambda name, ip: None
+    svc._create_session = lambda *a, **k: "session-token"
+    monkeypatch.setattr(A, "verify_temporary_credential", lambda *a, **k: True)
+    monkeypatch.setattr("app.core.temp_scope.attach_scope", lambda *a, **k: None)
+    with pytest.raises(A.FreshnessLapsedError):
+        svc.authenticate_temporary_credential("temp_x", "cred", "203.0.113.9")
+    assert store.claims == []
+    # A sign-in the provider admits (only possible once it is enabled again) lifts the refusal.
+    p.state = "enabled"
+    i.last_sign_in_at = datetime.utcnow() + timedelta(seconds=1)
+    assert S.SFTPServer("203.0.113.9").check_auth_publickey("alice", key) == paramiko.AUTH_SUCCESSFUL

@@ -252,13 +252,12 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
     },
     "sso_freshness_warning": {
         "name": "Sign in through your organisation",
-        "subject": "Sign in through {{action.provider}} by {{action.when}}",
+        "subject": "Sign in through your organisation by {{action.when}}",
         "body_html": (
             "<h2>Sign in through your organisation</h2>"
             "<p>Hi {{user.username}},</p>"
-            "<p>Sign in to {{vault.name}} through {{action.provider}} by {{action.when}}. If you do not, your SSH "
-            "keys, temporary credentials and devices pause then, and a sign-in through {{action.provider}} "
-            "restores them.</p>"
+            "<p>{{action.change}}</p>"
+            "<p>By: {{action.when}}</p>"
             "<hr>"
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),

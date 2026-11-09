@@ -67,6 +67,7 @@ COMPUTED = {
      "'receiver_pause' if want else 'receiver_resume'"): ("receiver_pause", "receiver_resume"),
     ("app/sftp/sftp_server.py", "rename",
      "'file_rename' if f is not None else 'folder_rename'"): ("file_rename", "folder_rename"),
+    ("app/services/sso_freshness.py", "_audit", "action"): ("sso_freshness_warned", "sso_freshness_expired"),
 }
 
 

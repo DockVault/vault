@@ -100,7 +100,7 @@ def test_the_catalog_names_exactly_the_encryption_key_emails_and_the_owners_noti
     for key in LOCKED:
         assert email_actions.SPEC_BY_KEY[key]["category"] == email_actions.LOCKED
     assert {a["key"] for a in email_actions.ACTION_CATALOG if a["category"] == email_actions.LOCKED} == (
-        set(LOCKED) | {"compliance_access_notice", "vault_access_notice"})
+        set(LOCKED) | {"compliance_access_notice", "vault_access_notice", "sso_freshness_warning"})
     # Always sent, and no default template is made for them: what they send is their built-in wording.
     assert email_actions.LOCKED in email_actions.ALWAYS_ON
     assert not set(LOCKED) & {p["key"] for p in email_actions.default_template_payloads()}
