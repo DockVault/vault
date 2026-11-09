@@ -117,7 +117,9 @@ def test_tracked_text_contract_is_explicit_and_bytes_are_clean():
             errors.append(f"{path}: PowerShell scripts must remain ASCII")
         if b"\r" in data:
             errors.append(f"{path}: CR or CRLF line ending found")
-        if data and not data.endswith(b"\n"):
+        # A vendored third-party file (tests/vendor/) is kept byte for byte as its release ships it, its hash
+        # pinned by its own test; it may end without a newline. Every other rule above holds for it.
+        if data and not data.endswith(b"\n") and Path("tests/vendor") not in path.parents:
             errors.append(f"{path}: final LF is required")
 
     assert not errors, "\n".join(errors)
