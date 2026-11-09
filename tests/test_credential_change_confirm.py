@@ -42,11 +42,21 @@ def _function(js, name):
     return js[start:js.index("\n}\n", start) + 3]
 
 
+# The scenarios read a fixed clock. The page names a date without its year only within the current year, so
+# from the real clock, dates four days back or ten days ahead crossed into another year every 22 December to
+# 4 January and the expected sentences, which never show a year, no longer matched.
+_FIXED_CLOCK = ("const _RealDate = Date, _FIXED_NOW = _RealDate.parse('2026-06-15T12:00:00Z');\n"
+                "globalThis.Date = class extends _RealDate {\n"
+                "  constructor(...a) { super(...(a.length ? a : [_FIXED_NOW])); }\n"
+                "  static now() { return _FIXED_NOW; }\n"
+                "};\n")
+
+
 def _run(scenario):
     node = shutil.which("node")
     assert node, "Node is required: the shipped page code must not be skipped"
     js = APP_JS.read_text(encoding="utf-8")
-    harness = ("let currentUser = { id: 'me', username: 'alice' };\n"
+    harness = (_FIXED_CLOCK + "let currentUser = { id: 'me', username: 'alice' };\n"
                "const asked = [];\n"
                "const showConfirm = async (...args) => { asked.push(args); return true; };\n"
                + "".join(_function(js, n) for n in _SHIPPED)
@@ -153,7 +163,7 @@ def test_the_note_on_an_account_says_what_was_done_by_whom_and_when():
     const = js[start:js.index("\n};\n", start) + 4]
     node = shutil.which("node")
     assert node, "Node is required: the shipped page code must not be skipped"
-    harness = ("let currentUser = { id: 'me', username: 'alice' };\n" + const
+    harness = (_FIXED_CLOCK + "let currentUser = { id: 'me', username: 'alice' };\n" + const
                + "".join(_function(js, n) for n in ("parseServerTime", "formatDayMonth", "credentialChangeNoteText"))
                + """
 const at = new Date(Date.now() - 4 * 86400000).toISOString(), ends = new Date(Date.now() + 10 * 86400000).toISOString();
