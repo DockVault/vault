@@ -1,9 +1,11 @@
 """The upload page (/u) collects properly, and the drop vault can be triaged.
 
-The page shows the deployment's name and the owner's message before anything is sent; it takes several
-files at once and gives a receipt (name, size, time, a reference), saying when a file was stored under a
-new name. The owner's drop vault has a Move to vault action that moves the received files into a vault of
-the owner's. The owner sees the message on the drop-vault card.
+The page shows the deployment's name and, for a link without a code, the owner's message before anything is
+sent (a protected link's message appears once its code is accepted); it takes several files at once and gives
+a receipt (the name as sent, size, time, a reference). A file whose name the drop vault already holds is stored
+under a new name, which the owner sees and the uploader is not told. The owner's drop vault has a Move to vault
+action that moves the received files into a vault of the owner's. The owner sees the message on the drop-vault
+card.
 """
 import pytest
 from playwright.sync_api import Page, expect
@@ -74,15 +76,19 @@ def test_the_page_takes_several_files_and_gives_a_receipt(page: Page, admin, lin
     assert names == ["one.txt", "two.txt"]
     ids = {f["name"]: f["id"][:8].upper() for f in admin.get(f"/vaults/{link['vault_id']}/files").json()["items"]}
     assert set(refs) == set(ids.values())
-    # Sending the same name again: delivered, under a new name, and the receipt says what it was sent as.
+    # Sending the same name again: delivered, stored under a new name the owner sees; the receipt names the
+    # file as it was sent and says nothing of the rename.
     page.click("#more-btn")
     expect(page.locator("#form")).to_be_visible()
     expect(page.locator("#files li")).to_have_count(0)
     page.set_input_files("#file-input", files=[{"name": "one.txt", "mimeType": "text/plain", "buffer": b"again"}])
     page.click("#upload-btn")
     expect(page.locator("#receipt")).to_be_visible(timeout=20000)
-    expect(page.locator("#receipt-rows tr").last).to_contain_text("one (2).txt")
-    expect(page.locator("#receipt-rows tr").last.locator(".renamed")).to_have_text("sent as one.txt")
+    expect(page.locator("#receipt-rows tr").last).to_contain_text("one.txt")
+    assert "(2)" not in page.locator("#receipt").inner_text()
+    assert "renamed" not in page.locator("#receipt").inner_text().lower()
+    names = sorted(f["name"] for f in admin.get(f"/vaults/{link['vault_id']}/files").json()["items"])
+    assert names == ["one (2).txt", "one.txt", "two.txt"]
 
 
 def test_a_protected_link_shows_the_owners_message_once_the_code_is_accepted(page: Page, admin, receivers_enabled):

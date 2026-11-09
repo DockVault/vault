@@ -6,10 +6,11 @@
  * opens an upload session (POST /receivers/{token}/upload-session), streams its bytes in fixed-size chunks
  * (PUT .../chunks/{i}) and finalizes (POST .../complete). A secret-protected link first gets a 401
  * {error:"secret_required"}; the page then prompts for the PIN/password and retries, and the owner's
- * message arrives with the first session the accepted code opens. A file whose name was already taken is stored
- * under a new name the server chooses, and the receipt says so. When everything chosen has been sent, a
- * receipt lists each file with its size, the time and a reference the owner can find it by. All status
- * text is written with textContent only; no inline handlers (strict CSP). */
+ * message arrives with the first session the accepted code opens. When everything chosen has been sent, a
+ * receipt lists each file by the name it was sent as, with its size, the time and a reference the owner can
+ * find it by (a file whose name was already taken is stored under a new name; the owner sees that, the
+ * uploader is not told which names are taken). All status text is written with textContent only; no inline
+ * handlers (strict CSP). */
 (function () {
   "use strict";
 
@@ -24,7 +25,7 @@
   var token = parts.length ? decodeURIComponent(parts[parts.length - 1]) : "";
   var secret = null;
   var queue = [];        // { file, li, state }
-  var delivered = [];    // the receipt's rows: { name, sentAs, renamed, size, at, reference }
+  var delivered = [];    // the receipt's rows: { name, size, at, reference }
   var busy = false;
 
   function notice(text) {
@@ -188,15 +189,25 @@
     var fr = await complete(sid);
     if (fr.status === 200) {
       var done = await fr.json();
-      delivered.push({ name: done.name || file.name, sentAs: done.sent_as || file.name, renamed: !!done.renamed,
+      delivered.push({ name: file.name,
                        size: done.size != null ? done.size : file.size, at: done.received_at || new Date().toISOString(),
                        reference: done.reference || String(done.id || "").slice(0, 8).toUpperCase() });
-      setState(q, done.renamed ? ("Delivered as " + done.name) : "Delivered", "ok");
+      setState(q, "Delivered", "ok");
       q.state = "sent";
       return "sent";
     }
-    if (fr.status === 409) { setState(q, "Its name was taken at the same moment; try again", "error"); return "failed"; }
-    setState(q, "Could not be finalized", "error"); return "failed";
+    if (fr.status === 409) { setState(q, await notFinalizedWhy(fr), "error"); return "failed"; }
+    setState(q, "Could not be finalized; try again", "error"); return "failed";
+  }
+
+  // What a 409 from /complete says, by the server's own detail: parts missing, a size that did not match, or
+  // a session that cannot be completed. (A name already taken is never a refusal: it is stored under a new name.)
+  async function notFinalizedWhy(resp) {
+    var detail = null;
+    try { detail = (await resp.json()).detail; } catch (e) { detail = null; }
+    if (detail && detail.error === "incomplete") { return "Not every part arrived; try again"; }
+    if (detail && detail.code === "size_mismatch") { return "Arrived with a different size than expected; try again"; }
+    return "Could not be finalized; try again";
   }
 
   async function run() {
@@ -256,7 +267,6 @@
     delivered.forEach(function (r) {
       var tr = document.createElement("tr");
       var name = document.createElement("td"); name.textContent = r.name;
-      if (r.renamed) { var was = document.createElement("span"); was.className = "renamed"; was.textContent = "sent as " + r.sentAs; name.appendChild(was); }
       var size = document.createElement("td"); size.textContent = humanSize(r.size);
       var at = document.createElement("td"); at.textContent = when(r.at);
       var ref = document.createElement("td"); ref.className = "ref"; ref.textContent = r.reference;

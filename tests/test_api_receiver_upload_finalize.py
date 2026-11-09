@@ -153,11 +153,13 @@ def test_duplicate_name_is_stored_under_a_new_name(admin, receivers_enabled):
     anon = admin.clone_anonymous()
     first = _upload(anon, rec["token"], "same.txt", b"first")
     assert first.status_code == 200 and first.json()["name"] == "same.txt"
-    # a second file with the same name is renamed, never refused and never overwriting (an anon drop has no
-    # delete authority, and cannot know which names are taken)
+    # a second file with the same name is stored under a new name, never refused and never overwriting (an anon
+    # drop has no delete authority, and is not told which names are taken: its receipt names the file as sent)
     second = _upload(anon, rec["token"], "same.txt", b"second one")
     assert second.status_code == 200, second.text
-    assert second.json()["name"] == "same (2).txt" and second.json()["renamed"] is True
+    assert second.json()["name"] == "same.txt" and "renamed" not in second.json()
+    stored = {f["id"]: f["name"] for f in admin.get(f"/vaults/{rec['vault_id']}/files").json()["items"]}
+    assert stored[first.json()["id"]] == "same.txt" and stored[second.json()["id"]] == "same (2).txt"
     assert admin.get(f"/vaults/{rec['vault_id']}/files/{first.json()['id']}/download").content == b"first"
 
 

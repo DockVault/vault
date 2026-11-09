@@ -16000,29 +16000,6 @@ async def get_receiver_token_copy(
     return {"token_enc": r.token_enc}
 
 
-def _free_name_in_root(db, vault, name: str) -> str:
-    """The name an anonymous upload is stored under: the one it came with, or, when a file of that name
-    is already in the drop vault's root, the first free "name (2).ext", "name (3).ext", ... An anonymous
-    drop never overwrites and is never refused for a name it could not know was taken."""
-    from app.core.security import name_blind_index
-    import os as _os
-
-    def taken(candidate: str) -> bool:
-        return db.query(File.id).filter(File.vault_id == vault.id, File.folder_id.is_(None),
-                                        File.name_bi == name_blind_index(vault.id, candidate)).first() is not None
-
-    if not taken(name):
-        return name
-    stem, ext = _os.path.splitext(name)
-    for n in range(2, 1000):
-        candidate = f"{stem} ({n}){ext}"
-        if len(candidate) > 255:
-            candidate = f"{stem[:255 - len(ext) - len(f' ({n})')]} ({n}){ext}"
-        if not taken(candidate):
-            return candidate
-    return f"{stem} ({uuid.uuid4().hex[:8]}){ext}"
-
-
 def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
     """The owner learns of an upload: an in-app notice, one an hour per link (the files are all in the
     link's vault; dismissing it does not bring the hour's next upload back: the notice ledger remembers),
@@ -16446,9 +16423,6 @@ async def receiver_complete_upload(
         if not fname:
             raise HTTPException(status_code=409, detail=(
                 "This upload could not be completed here. Cancel it and upload the file again."))
-        # A name already in the drop vault is renamed ("name (2).ext"), never refused and never overwritten.
-        sent_as = fname
-        fname = _free_name_in_root(db, vault, fname)
 
         file_info = None
 
@@ -16486,15 +16460,18 @@ async def receiver_complete_upload(
                     "message": (f"This upload delivered {final_size} bytes but declared "
                                 f"{session.total_size}. Nothing has been stored.")})
 
-            # An anonymous drop never OVERWRITES an existing file (no delete authority): the name was
-            # moved off a clash above, so only two uploads of one name finishing in the same moment
-            # still meet here, and the second gets a clean 409 to try again, not a silent replace. The
-            # vault's size limit and the deployment's storage limit are checked inside finalize, under
-            # lock, as the row is written.
+            # An anonymous drop never OVERWRITES an existing file (no delete authority) and is never
+            # refused for a name it could not know was taken: a name already in the drop vault's root
+            # is stored as "name (2).ext". The name is decided inside finalize, under the vault's row
+            # lock, so a same-name upload that finished during this one's assembly is seen; should the
+            # insert still meet a duplicate, finalize keeps the assembled file and tries the row again
+            # under the next free name. A clash never costs the uploader a second upload. The vault's
+            # size limit and the deployment's storage limit are checked inside finalize too, under the
+            # same lock, as the row is written.
             try:
                 return vault_service.finalize_streaming_upload(
                     file_info=file_info, total_size=final_size, checksum=final_checksum,
-                    replace_same_name=False)
+                    replace_same_name=False, rename_on_clash=True)
             except StorageLimitExceeded as refused:
                 raise _no_room(refused, "This upload would exceed the link's space.") from None
 
@@ -16547,10 +16524,11 @@ async def receiver_complete_upload(
         except Exception:
             pass
         _tell_receiver_owner(db, request, receiver, owner, vault, file)
-        # The uploader's receipt: the stored name (renamed when it clashed), the size, when, and a reference
-        # the owner can find the file by (the start of its id, as File info shows it).
-        return {'id': str(file.id), 'name': file.original_name, 'size': file.size_bytes,
-                'renamed': file.original_name != sent_as, 'sent_as': sent_as,
+        # The uploader's receipt: the name they sent, the size, when, and a reference the owner can find
+        # the file by (the start of its id, as File info shows it). Not the stored name: whether the
+        # file was renamed would tell an anonymous uploader which names the drop vault already holds.
+        # The owner sees the stored name in the vault.
+        return {'id': str(file.id), 'name': fname, 'size': file.size_bytes,
                 'reference': str(file.id)[:8].upper(),
                 'received_at': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'}
     finally:

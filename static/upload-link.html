@@ -72,7 +72,6 @@
     .receipt th:nth-child(1) { width: 40%; }
     .receipt th { color: var(--muted); font-weight: 500; font-size: .8rem; }
     .receipt td.ref { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .receipt .renamed { color: var(--muted); font-size: .8rem; display: block; }
     .receipt-actions { display: flex; gap: .6rem; }
     .receipt-actions button { flex: 1 1 auto; }
   </style>
@@ -110,7 +109,7 @@
           <thead><tr><th>File</th><th>Size</th><th>Delivered</th><th>Reference</th></tr></thead>
           <tbody id="receipt-rows"></tbody>
         </table>
-        <p class="meta" style="margin-top:0; border:0; padding-top:0;">Keep the references: the owner can find each file by them. A file whose name was already taken was stored under a new name, shown here.</p>
+        <p class="meta" style="margin-top:0; border:0; padding-top:0;">Keep the references: the owner can find each file by them.</p>
         <div class="receipt-actions">
           <button id="more-btn" type="button" class="quiet">Send more files</button>
           <button id="print-btn" type="button" class="quiet">Print this receipt</button>

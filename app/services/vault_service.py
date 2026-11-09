@@ -290,6 +290,26 @@ _GONE = {
 # PostgreSQL's code for an insert that names a row which does not exist.
 _FOREIGN_KEY_VIOLATION = "23503"
 
+# A file name's longest form, as the name columns and most filesystems have it.
+_NAME_MAX = 255
+# Past this, what follows the last dot is not an extension but part of the name ("a." + 300 letters).
+_EXTENSION_MAX = 24
+
+
+def numbered_name(name: str, n: int) -> str:
+    """``name (n).ext`` for a file whose name is taken: at most _NAME_MAX characters, with a stem that is
+    never empty. The stem gives way first; an over-long "extension" counts as part of the stem, and when
+    even the extension and the number would not fit, the extension goes. Pure: no database."""
+    stem, ext = os.path.splitext(name)
+    if not stem or len(ext) > _EXTENSION_MAX:
+        stem, ext = name, ""
+    tag = f" ({n})"
+    room = _NAME_MAX - len(tag) - len(ext)
+    if room < 1:
+        ext = ""
+        room = _NAME_MAX - len(tag)
+    return f"{stem[:room].rstrip()}{tag}{ext}"
+
 
 def _gone_by(error) -> str:
     """Which of _GONE a file insert that failed on a foreign key is, from the constraint PostgreSQL names
@@ -1544,6 +1564,28 @@ class VaultService:
             self.db.flush()
         return paths
 
+    def free_name_in_folder(self, vault_id, folder_id, name: str) -> str:
+        """The name a file is stored under when it must not replace and must not be refused: ``name``
+        when no file in the folder (None: the vault's root) has it, else the first free ``name (2).ext``,
+        ``name (3).ext``, ... (numbered_name). Read by the blind index, as the unique index is. Called
+        by finalize_streaming_upload under the vault's row lock, so two files finishing into the vault
+        cannot both be given the same free name."""
+        from app.core.security import name_blind_index
+
+        def taken(candidate: str) -> bool:
+            q = self.db.query(File.id).filter(File.vault_id == vault_id,
+                                              File.name_bi == name_blind_index(vault_id, candidate))
+            q = q.filter(File.folder_id.is_(None)) if folder_id is None else q.filter(File.folder_id == folder_id)
+            return q.first() is not None
+
+        if not taken(name):
+            return name
+        for n in range(2, 1000):
+            candidate = numbered_name(name, n)
+            if not taken(candidate):
+                return candidate
+        return numbered_name(name, int(uuid.uuid4().hex[:8], 16))
+
     def _remove_blobs(self, rel_paths: List[str]) -> None:
         """Securely remove on-disk encrypted blobs by storage_path (relative to the storage
         root), except those a legal hold keeps. Best-effort: a failure here only orphans a blob,
@@ -1808,7 +1850,9 @@ class VaultService:
                                   zk_enc_mime: Optional[str] = None,
                                   zk_name_bi: Optional[str] = None,
                                   zk_name_bi_candidates: Optional[list] = None,
-                                  replace_same_name: bool = False):
+                                  replace_same_name: bool = False,
+                                  rename_on_clash: bool = False,
+                                  _name_retries: int = 2):
         """
         Finalize a streaming upload by creating the File database record.
 
@@ -1830,6 +1874,14 @@ class VaultService:
                 old file). The CALLER must pre-authorize replacement (the upload paths gate
                 this on the principal's file.delete capability); when the principal cannot
                 replace, pass False and a same-name clash surfaces as DuplicateNameError (409).
+            rename_on_clash: same-name policy = RENAME (Standard vaults; an anonymous drop, which
+                may neither replace nor be refused). The stored name is decided HERE, under the vault
+                row lock _claim_room takes, as the first free "name (2).ext" when the name is taken
+                (free_name_in_folder): a same-name file finishing while this one was written is seen.
+                Should the insert still meet a duplicate (a rename or a move does not take that
+                lock), the written file is KEPT and the row tried again from the lock, under the next
+                free name, up to _name_retries more times; only then is the file removed and
+                DuplicateNameError raised. A clash never costs the caller the written file.
 
         Raises StorageLimitExceeded, the new file removed, when the vault's size limit or the
         deployment's storage limit has no room for it (_claim_room).
@@ -1847,6 +1899,18 @@ class VaultService:
         # Whether the vault and the deployment have room is decided here, under locks this transaction
         # holds until the row below commits, and not only by the caller before it.
         self._claim_room(file_info, total_size)
+
+        # Rename-on-clash: the stored name is chosen now, under the vault's row lock, so a same-name
+        # file that finished while this one was written (and waited for, or committed before, that
+        # lock) is counted and this one steps aside to the next free name.
+        if rename_on_clash and not is_zk:
+            # Always from the name as requested, so a retry numbers "a.bin" to "a (3).bin", never
+            # "a (2).bin" to "a (2) (2).bin".
+            asked = file_info.setdefault('requested_name', file_info['original_name'])
+            chosen = self.free_name_in_folder(file_info['vault_id'], file_info['folder_id'], asked)
+            if chosen != file_info['original_name']:
+                file_info['original_name'] = chosen
+                file_info['name'] = sanitize_filename(chosen)
 
         # Replace-on-clash: delete any prior same-name row BEFORE inserting the new one,
         # within this transaction (blobs removed only after a successful commit, below).
@@ -1954,9 +2018,21 @@ class VaultService:
             # Or the insert named a row that is gone (a foreign key): the folder, deleted while the
             # file was written, or the account the row names, deleted meanwhile -- the vault's row is
             # locked, so not the vault. Said as what it is, by the constraint the database names.
+            #
+            # Under rename_on_clash a duplicate keeps the written file: the chosen name was taken between
+            # the pick and the insert (a rename or a move does not take the vault lock), so the row is
+            # tried again, from the lock, under the next free name. The file is removed only when the
+            # retries are spent.
             self.db.rollback()
+            gone = getattr(getattr(e, 'orig', None), 'pgcode', None) == _FOREIGN_KEY_VIOLATION
+            if not gone and rename_on_clash and _name_retries > 0:
+                return self.finalize_streaming_upload(
+                    file_info, total_size, checksum, zk_key_version=zk_key_version,
+                    zk_enc_name=zk_enc_name, zk_enc_mime=zk_enc_mime, zk_name_bi=zk_name_bi,
+                    zk_name_bi_candidates=zk_name_bi_candidates, replace_same_name=replace_same_name,
+                    rename_on_clash=True, _name_retries=_name_retries - 1)
             self._remove_blobs([file_info['storage_path']])
-            if getattr(getattr(e, 'orig', None), 'pgcode', None) == _FOREIGN_KEY_VIOLATION:
+            if gone:
                 raise DestinationGoneError(_GONE[_gone_by(e)]) from None
             raise DuplicateNameError("A file with that name already exists in this folder.")
         # A refresh failure AFTER a successful commit is non-fatal — the row is already durable. Guard

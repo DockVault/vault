@@ -1,5 +1,6 @@
-"""Upload links that collect properly: a clash is renamed, the uploader gets a receipt, the owner is told,
-the page knows the owner's message and the deployment's name, and the owner can copy the link again.
+"""Upload links that collect properly: a same-name upload lands under a new name and the uploader is not told
+which names are taken, the uploader gets a receipt, the owner is told, the page knows the owner's message and
+the deployment's name, and the owner can copy the link again.
 """
 import os
 import subprocess
@@ -58,25 +59,33 @@ def _upload(anon, token, filename, content):
     return anon.post(f"/receivers/{token}/upload-session/{sid}/complete", json={})
 
 
-def test_a_same_name_upload_is_renamed_and_the_receipt_says_so(admin, receivers_enabled):
+def test_same_name_uploads_all_land_suffixed_and_the_uploader_is_not_told(admin, receivers_enabled):
+    """Three uploads of one name: all three land, the later two under "name (2)" and "name (3)", nothing
+    overwritten and no 409. Each receipt names the file as it was sent: whether it was renamed would tell an
+    anonymous uploader which names the drop vault already holds. The owner sees the stored names."""
     rec = _mk_receiver(admin, label=unique("Drop"))
     anon = admin.clone_anonymous()
     first = _upload(anon, rec["token"], "report.pdf", b"first")
     assert first.status_code == 200, first.text
     one = first.json()
-    assert one["name"] == "report.pdf" and one["renamed"] is False and one["sent_as"] == "report.pdf"
+    assert one["name"] == "report.pdf"
     assert len(one["reference"]) == 8 and one["reference"] == one["id"][:8].upper()
     assert one["received_at"].endswith("Z") and one["size"] == 5
     second = _upload(anon, rec["token"], "report.pdf", b"second one")
     assert second.status_code == 200, second.text
     two = second.json()
-    assert two["renamed"] is True and two["sent_as"] == "report.pdf" and two["name"] == "report (2).pdf"
-    third = _upload(anon, rec["token"], "report.pdf", b"third").json()
-    assert third["name"] == "report (3).pdf"
-    # Both are in the drop vault, nothing overwritten.
-    names = sorted(f["name"] for f in admin.get(f"/vaults/{rec['vault_id']}/files").json()["items"])
-    assert names == ["report (2).pdf", "report (3).pdf", "report.pdf"]
+    assert two["name"] == "report.pdf" and two["id"] != one["id"]
+    assert "renamed" not in two and "sent_as" not in two and "(2)" not in second.text
+    third = _upload(anon, rec["token"], "report.pdf", b"third")
+    assert third.status_code == 200 and third.json()["name"] == "report.pdf"
+    # All three are in the drop vault, under their own names, nothing overwritten.
+    files = admin.get(f"/vaults/{rec['vault_id']}/files").json()["items"]
+    assert sorted(f["name"] for f in files) == ["report (2).pdf", "report (3).pdf", "report.pdf"]
+    stored = {f["id"]: f["name"] for f in files}
+    assert stored[one["id"]] == "report.pdf" and stored[two["id"]] == "report (2).pdf"
+    assert stored[third.json()["id"]] == "report (3).pdf"
     assert admin.get(f"/vaults/{rec['vault_id']}/files/{one['id']}/download").content == b"first"
+    assert admin.get(f"/vaults/{rec['vault_id']}/files/{two['id']}/download").content == b"second one"
 
 
 def test_the_owner_is_told_once_an_hour_per_link(admin, receivers_enabled):
