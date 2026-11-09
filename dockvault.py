@@ -3776,8 +3776,9 @@ def _merge_lines(local_lines, main_lines):
 
 
 def _today():
-    import datetime as _dt
-    return _dt.date.today().isoformat()
+    """Today in UTC, as the app counts the support periods: a period ends with its day in UTC on every host."""
+    import time
+    return time.strftime("%Y-%m-%d", time.gmtime())
 
 
 def line_support_note(matrix, version, today=None):
