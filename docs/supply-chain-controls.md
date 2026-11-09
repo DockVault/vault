@@ -27,7 +27,17 @@ proof of a hosted setting.
 - Release OCI metadata includes the public source URL, semantic version, tested revision, and
   `AGPL-3.0-only` license identifier.
 - Dependabot covers the production and test Python manifests, the Dockerfile, both Compose
-  variants under `deploy/`, and GitHub Actions.
+  variants under `deploy/`, and GitHub Actions. Each older line that still gets security fixes
+  (`lines` in `docs/upgrade-matrix.json`) has its own entries aimed at its `release/X.Y` branch,
+  limited to what a patch release may carry: patch updates of the Python packages and the base
+  image, patch and minor updates of the Compose images, and the pinned actions. A test holds these
+  entries to `lines`.
+- Older lines stay checked after they stop being the newest. `.github/workflows/maintenance-lines.yml`
+  reads the supported lines from the matrix. Nightly it runs the full suite and the setup scenarios
+  on each older line's `release/X.Y` branch. Weekly it pulls the published `:vX.Y` image of every
+  supported line, the newest included, and scans it with the release policy and that release's own
+  reviewed VEX, so a new finding in an image people already run is seen within a week. A line drops
+  out by itself when its date passes.
 
 ## Scanner and backport policy
 

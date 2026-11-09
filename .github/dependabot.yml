@@ -111,3 +111,63 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # ---- Maintenance lines ------------------------------------------------------------------------
+  # Each older line that still gets security fixes (`lines` in docs/upgrade-matrix.json) gets its own
+  # entries, aimed at its release/X.Y branch. A line takes only what a patch release may carry:
+  # patch updates of the Python packages and of the base image's interpreter, patch and minor updates
+  # of the Compose images (a postgres or redis minor is how they ship fixes), and the pinned actions.
+  # Security advisories open their own pull requests against the default branch only, so a fix the
+  # line needs is cherry-picked onto release/X.Y. Add the entries when a line starts and remove them
+  # when its date passes; tests/test_maintenance_lines_contract.py holds the list to `lines`.
+  - package-ecosystem: "pip"
+    target-branch: "release/0.33"
+    directories:
+      - "/"
+      - "/tests"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      line-0.33-pip:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+
+  - package-ecosystem: "docker"
+    target-branch: "release/0.33"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+
+  - package-ecosystem: "docker-compose"
+    target-branch: "release/0.33"
+    directory: "/deploy"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+
+  - package-ecosystem: "github-actions"
+    target-branch: "release/0.33"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      line-0.33-github-actions:
+        patterns:
+          - "*"

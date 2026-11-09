@@ -1,0 +1,127 @@
+name: Maintenance lines
+
+# Keeps every supported release line checked after it stops being the newest. The list of lines comes
+# from the upgrade matrix's `lines` (.github/scripts/supported_lines.py), so a line starts being
+# checked when it gets a support date and stops by itself when that date passes.
+#
+# Nightly: the full suite (tests.yml) and the setup scenarios (setup-matrix.yml) run on each older
+# line's release/X.Y branch, from that branch's own workflow files. The runs are dispatched, not
+# awaited: read them with `gh run list --repo DockVault/vault --branch release/X.Y`.
+#
+# Weekly: the published image of every supported line, the newest included, is pulled anonymously
+# and scanned with the release policy (every High or Critical finding the line's reviewed VEX does
+# not cover fails), so a new CVE in what people actually run is seen within a week. amd64 only, as
+# in the pull-request scan: the release itself scans both platforms when it publishes.
+#
+# Scheduled workflows run only on the default branch, so this file acts from main alone.
+
+on:
+  schedule:
+    - cron: "30 4 * * *"    # nightly, after main's own setup run at 03:00
+    - cron: "0 5 * * 1"     # weekly, Monday
+  workflow_dispatch:
+    inputs:
+      scan:
+        description: Also scan the published images now
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintenance-lines
+  cancel-in-progress: false
+
+jobs:
+  lines:
+    name: Supported lines
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      maintenance: ${{ steps.read.outputs.maintenance }}
+      published: ${{ steps.read.outputs.published }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: read
+        run: python3 .github/scripts/supported_lines.py --matrix docs/upgrade-matrix.json >> "$GITHUB_OUTPUT"
+
+  suites:
+    name: Run the suites on release/${{ matrix.line }}
+    needs: lines
+    if: >-
+      needs.lines.outputs.maintenance != '[]' &&
+      (github.event_name == 'workflow_dispatch' || github.event.schedule == '30 4 * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        line: ${{ fromJSON(needs.lines.outputs.maintenance) }}
+    steps:
+      - name: Dispatch tests.yml and setup-matrix.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINE: ${{ matrix.line }}
+        run: |
+          set -euo pipefail
+          gh workflow run tests.yml --repo "$GITHUB_REPOSITORY" --ref "release/${LINE}"
+          gh workflow run setup-matrix.yml --repo "$GITHUB_REPOSITORY" --ref "release/${LINE}"
+
+  scan:
+    name: Scan the published v${{ matrix.line }} image
+    needs: lines
+    if: >-
+      github.event.schedule == '0 5 * * 1' ||
+      (github.event_name == 'workflow_dispatch' && inputs.scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        line: ${{ fromJSON(needs.lines.outputs.published) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The newest release of the line is what :vX.Y points at. Its reviewed VEX and the renderer
+      # come from that tag, so the scan judges the image by the exceptions it was released with.
+      - name: Pull the line's image and render its VEX
+        env:
+          LINE: ${{ matrix.line }}
+        run: |
+          set -euo pipefail
+          # The glob holds the line (its dots are literal); the pattern holds the form vX.Y.Z.
+          tag="$(git tag -l "v${LINE}.*" --sort=-v:refname | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+          test -n "$tag" || { echo "no release tag for line ${LINE}"; exit 1; }
+          revision="$(git rev-parse "${tag}^{commit}")"
+          docker pull --platform linux/amd64 "ghcr.io/dockvault/vault:v${LINE}"
+          docker tag "ghcr.io/dockvault/vault:v${LINE}" "ghcr.io/dockvault/vault:${tag}-amd64"
+          label="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "ghcr.io/dockvault/vault:${tag}-amd64")"
+          test "v${label}" = "$tag" || { echo ":v${LINE} is ${label}, not ${tag}"; exit 1; }
+          git show "${tag}:security/vex.openvex.json" > line-vex.json
+          git show "${tag}:.github/scripts/render_release_vex.py" > render_line_vex.py
+          python3 render_line_vex.py \
+            --template line-vex.json \
+            --output line-scan.openvex.json \
+            --image-digest "$(docker image inspect --format '{{.Id}}' "ghcr.io/dockvault/vault:${tag}-amd64")" \
+            --image-reference "ghcr.io/dockvault/vault:${tag}-amd64" \
+            --source-revision "$revision"
+          echo "IMAGE=ghcr.io/dockvault/vault:${tag}-amd64" >> "$GITHUB_ENV"
+
+      - name: Scan with the release policy
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ env.IMAGE }}
+          grype-version: v0.112.0
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          vex: line-scan.openvex.json
