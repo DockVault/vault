@@ -140,3 +140,20 @@ def test_a_link_already_at_its_ceiling_offers_no_extend(page: Page, admin, admin
     expect(card).to_be_visible(timeout=15000)
     expect(card.locator("button.link-extend")).to_have_count(0)
     expect(card.locator("button", has_text="Info")).to_be_visible()
+
+
+def test_the_dialog_is_described_and_a_refusal_is_announced(page: Page, admin_creds):
+    """The dialog is described by the current expiry, the date field by its help and the current expiry, and a
+    refusal is an alert."""
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.evaluate("""() => openExtendExpiry('share', '00000000-0000-0000-0000-000000000000',
+        new Date(Date.now() + 86400000).toISOString(), 'a share', null, new Date(Date.now() + 7 * 86400000).toISOString())""")
+    expect(page.locator("#extend-expiry-modal.active")).to_be_visible()
+    modal = page.locator("#extend-expiry-modal")
+    expect(modal).to_have_attribute("aria-describedby", "extend-expiry-current")
+    expect(page.locator("#extend-expiry-current")).to_contain_text("Expires now")
+    described = page.locator("#extend-expiry-until").get_attribute("aria-describedby").split()
+    assert "extend-expiry-help" in described and "extend-expiry-current" in described, described
+    expect(page.locator("#extend-expiry-help")).to_be_visible()
+    expect(page.locator("#extend-expiry-error")).to_have_attribute("role", "alert")
+    page.keyboard.press("Escape")

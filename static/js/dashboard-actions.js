@@ -6,8 +6,10 @@
 //     invite a user, a new temporary credential. Each opens the page and the dialog the action lives in;
 //     nothing here changes data on its own.
 //   * a "Needs attention" lane: the account's own shares, public links, note links and upload links that
-//     expire within seven days; uploads received on its upload links; for an administrator, invitations
-//     still pending and credential changes waiting for approval.
+//     expire within seven days; files still waiting in the drop vaults of its upload links; for an
+//     administrator, invitations still pending and credential changes waiting for approval. A thing listed
+//     here is left out of "What's waiting for you" (the notice about it is the same thing, said twice).
+//     Each row's full title is its tooltip, for a title the lane cuts short.
 //   * for an administrator, a "Get started" checklist (email set up and a test send passed, a public
 //     address, the second-factor policy decided, a backup recorded) that goes away once done or dismissed.
 //
@@ -152,15 +154,22 @@
         return `in ${d} day${d === 1 ? '' : 's'}`;
     }
 
-    function row(iconName, title, sub, onClick) {
+    function row(iconName, title, sub, onClick, kind) {
         const r = el('button', 'dashboard-lane-item attention-item');
         r.type = 'button';
+        if (kind) r.setAttribute('data-kind', kind);
         const ic = el('span', 'dashboard-lane-icon');
         ic.appendChild(icon(iconName));
         r.appendChild(ic);
         const main = el('div', 'dashboard-lane-main');
-        main.appendChild(el('div', 'dashboard-lane-title', title));
-        if (sub) main.appendChild(el('div', 'dashboard-lane-sub text-secondary', sub));
+        const t = el('div', 'dashboard-lane-title', title);
+        t.title = title;                    // the lane cuts a long title short; the whole of it on hover
+        main.appendChild(t);
+        if (sub) {
+            const s = el('div', 'dashboard-lane-sub text-secondary', sub);
+            s.title = sub;
+            main.appendChild(s);
+        }
         r.appendChild(main);
         r.addEventListener('click', onClick);
         return r;
@@ -185,20 +194,23 @@
             // app.js understands the same targets the reminder notices carry).
             list(shares, 'shares').filter(s => s.status === 'active' && soon(s.expires_at) != null)
                 .forEach(s => rows.push(row('link', `Share of ${s.target_name || s.vault_name || 'an item'} expires ${inDays(soon(s.expires_at))}`,
-                                             s.vault_name || '', () => openAppTarget('#shared/by-me/' + s.id))));
+                                             s.vault_name || '', () => openAppTarget('#shared/by-me/' + s.id), 'share')));
             list(publicLinks, 'links').filter(l => !l.revoked && l.status !== 'expired' && soon(l.expires_at) != null)
                 .forEach(l => rows.push(row('globe', `Public link expires ${inDays(soon(l.expires_at))}`,
-                                             l.tag_name || '', () => openAppTarget('#vault/' + l.vault_id + '/public-links/' + l.id))));
+                                             l.tag_name || '', () => openAppTarget('#vault/' + l.vault_id + '/public-links/' + l.id), 'public_link')));
             list(noteLinks, 'links').filter(l => !l.revoked && soon(l.expires_at) != null)
                 .forEach(l => rows.push(row('file-text', `Note link "${l.title || 'note'}" expires ${inDays(soon(l.expires_at))}`,
-                                             '', () => openAppTarget('#notes/shared/' + l.id))));
+                                             '', () => openAppTarget('#notes/shared/' + l.id), 'note_link')));
             const recv = list(receivers, 'receivers');
-            recv.filter(r => (r.upload_count || 0) > 0)
-                .forEach(r => rows.push(row('upload', `${r.upload_count} upload${r.upload_count === 1 ? '' : 's'} received on ${r.label || 'an upload link'}`,
-                                             'Open the drop vault', () => openVault(r.vault_id, { from: 'uploadlinks' }))));
+            // The files still in the drop vault, not every upload ever received: once the owner has moved them
+            // out, nothing waits and the row goes. (An older server without the count: the uploads received.)
+            const waiting = r => (r.files_in_vault != null ? r.files_in_vault : (r.upload_count || 0));
+            recv.filter(r => waiting(r) > 0)
+                .forEach(r => rows.push(row('upload', `${waiting(r)} file${waiting(r) === 1 ? '' : 's'} waiting in ${r.label || 'an upload link'}`,
+                                             'Open the drop vault', () => openVault(r.vault_id, { from: 'uploadlinks' }), 'receiver_upload')));
             recv.filter(r => soon(r.expires_at) != null)
                 .forEach(r => rows.push(row('upload', `Upload link ${r.label || ''} expires ${inDays(soon(r.expires_at))}`.replace(/\s+/g, ' '),
-                                             '', () => openAppTarget('#uploadlinks/drops/' + r.id))));
+                                             '', () => openAppTarget('#uploadlinks/drops/' + r.id), 'receiver')));
         }
         if (isAdmin()) {
             const [invites, requests] = await Promise.all([
@@ -211,19 +223,49 @@
                                        'Approve or deny on the Users page', () => navigateToSection('users')));
         }
         box.replaceChildren();
-        if (!rows.length) { box.appendChild(el('p', 'dashboard-lane-empty text-secondary', 'Nothing needs your attention.')); return; }
-        rows.slice(0, LANE_LIMIT).forEach(r => box.appendChild(r));
+        const listed = rows.slice(0, LANE_LIMIT);
+        shown = new Set(listed.map(r => r.getAttribute('data-kind')).filter(Boolean));
+        if (!rows.length) box.appendChild(el('p', 'dashboard-lane-empty text-secondary', 'Nothing needs your attention.'));
+        else listed.forEach(r => box.appendChild(r));
+        // "What's waiting for you" was drawn first; drawn again, it leaves out what this lane now lists.
+        if (typeof renderWaitingLane === 'function' && typeof state !== 'undefined') {
+            try { renderWaitingLane(state.dashboardShared || []); } catch (_) {}
+        }
+    }
+
+    // The kinds of thing the lane lists right now, and whether a notice is about one of them: an expiry
+    // reminder names its kind by the page it opens, an upload notice by its type.
+    let shown = new Set();
+    const REMINDER_KIND = { '#shared': 'share', '#vaults': 'public_link', '#vault': 'public_link', '#notes': 'note_link', '#uploadlinks': 'receiver' };
+    function listsNotice(n) {
+        if (!n) return false;
+        if (n.type === 'receiver_upload') return shown.has('receiver_upload');
+        if (n.type === 'expiry_reminder') return shown.has(REMINDER_KIND[String(n.target || '').split('/')[0]] || '');
+        return false;
     }
 
     // ---- get started (administrators) -----------------------------------------------------------------------
+    // Settings opened on the page an item is about, not on General: the page's button is pressed once the
+    // Settings page has wired it.
+    function openSettingsPage(tab) {
+        navigateToSection('settings');
+        let left = 40;
+        const tick = () => {
+            const b = document.querySelector('#settings-section .tab-btn[data-tab="' + tab + '"]');
+            if (b && b.dataset.wired) { if (!b.classList.contains('active')) b.click(); return; }
+            if (--left > 0) setTimeout(tick, 100);
+        };
+        setTimeout(tick, 50);
+    }
+
     const CHECKS = [
         { key: 'email', label: 'Email set up, and a test message sent',
-          hint: 'Settings > Email: a sending profile, then "Send a test email".', go: () => navigateToSection('settings') },
+          hint: 'Settings > Email: a sending profile, then "Send a test email".', go: () => openSettingsPage('email') },
         { key: 'public_address', label: 'A public address for emailed links',
           hint: 'ALLOWED_HOSTS in the deployment’s .env names the address people use; emailed links are pinned to it.' },
         { key: 'second_factor', label: 'The second-factor policy decided',
           hint: 'Settings > Security: require a second factor, or keep it optional on purpose.',
-          go: () => navigateToSection('settings'), ack: { second_factor_decided: true }, ackLabel: 'Keep it optional' },
+          go: () => openSettingsPage('security'), ack: { second_factor_decided: true }, ackLabel: 'Keep it optional' },
         { key: 'backup', label: 'A backup recorded',
           hint: 'Back up the data and record it here, so the first restore is not the first try.',
           ack: { backup_recorded: true }, ackLabel: 'I recorded a backup' },
@@ -305,5 +347,5 @@
         await Promise.all([renderQuickActions(ctx || {}), renderAttention(ctx || {}), renderGetStarted()]);
     }
 
-    window.DashboardActions = { render, soon, inDays };
+    window.DashboardActions = { render, soon, inDays, listsNotice };
 })();

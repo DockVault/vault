@@ -169,3 +169,110 @@ def test_an_expiring_share_row_leads_to_its_card_on_the_shared_by_me_tab(page: P
     finally:
         admin.delete_vault(v["id"])
         admin.put("/settings", json={"sharing_enabled": sharing_before})
+
+
+def test_an_attention_row_shows_its_whole_title_on_hover(page: Page, admin, admin_creds, invites_on):
+    sharing_before = admin.get("/settings").json().get("sharing_enabled", False)
+    admin.put("/settings", json={"sharing_enabled": True}).raise_for_status()
+    v = admin.create_vault(name=unique("A vault with a name long enough that the lane cuts it short"))
+    tag = admin.post("/share-tags", json={"name": unique("hover"), "allowed_audiences": ["anyone_internal"],
+                                          "max_recipients_cap": 10, "auto_enroll_new_users": True}).json()
+    try:
+        r = admin.post("/shares", json={"vault_id": v["id"], "tag_id": tag["id"], "target_type": "vault",
+                                        "claim_audience": "anyone_internal", "lifetime_minutes": 2 * 24 * 60})
+        assert r.status_code == 200, r.text
+        _login(page, admin_creds["username"], admin_creds["password"])
+        title = page.locator("#lane-attention .attention-item", has_text=v["name"]).locator(".dashboard-lane-title")
+        expect(title).to_be_visible(timeout=15000)
+        expect(title).to_have_attribute("title", title.text_content())
+        assert v["name"] in title.get_attribute("title")
+    finally:
+        admin.delete_vault(v["id"])
+        admin.put("/settings", json={"sharing_enabled": bool(sharing_before)})
+
+
+@pytest.fixture
+def drop_link(admin):
+    before = admin.get("/settings").json()
+    keys = ("public_receivers_enabled", "public_receiver_user_cap")
+    admin.put("/settings", json={"public_receivers_enabled": True, "public_receiver_user_cap": 50})
+    tag = admin.post("/receiver-tags", json={"name": unique("rtag"), "min_token_len": 6, "require_secret": "none",
+                                             "max_total_bytes_cap": 100 * 1024 * 1024, "auto_enroll_new_users": True,
+                                             "default_ttl_hours": 24, "max_ttl_hours": 72}).json()
+    rec = admin.post("/receivers", json={"tag_id": tag["id"], "max_total_bytes": 10 * 1024 * 1024,
+                                         "label": unique("Inbox"), "ttl_hours": 24}).json()
+    anon = admin.clone_anonymous()
+    for name in ("a.txt", "b.txt"):
+        o = anon.post(f"/receivers/{rec['token']}/upload-session", json={"filename": name, "total_size": 1, "total_chunks": 1})
+        sid = o.json()["session_id"]
+        anon.put(f"/receivers/{rec['token']}/upload-session/{sid}/chunks/0", data=b"x",
+                 headers={"Content-Type": "application/octet-stream"})
+        assert anon.post(f"/receivers/{rec['token']}/upload-session/{sid}/complete", json={}).status_code == 200
+    try:
+        yield rec
+    finally:
+        admin.put("/settings", json={k: before.get(k) for k in keys})
+
+
+def test_the_drop_vault_row_counts_the_files_still_waiting(page: Page, admin, admin_creds, drop_link):
+    """Two files arrive; one is moved out: the row says one file waits, not two uploads received. With both
+    moved out, the row goes."""
+    rec = drop_link
+    _login(page, admin_creds["username"], admin_creds["password"])
+    lane = page.locator("#lane-attention")
+    row = lane.locator(".attention-item", has_text=rec["label"]).filter(has_text="waiting")
+    expect(row).to_contain_text("2 files waiting", timeout=15000)
+    dest = admin.create_vault(name=unique("Dest"))
+    try:
+        files = admin.get(f"/vaults/{rec['vault_id']}/files").json()["items"]
+        moved = admin.post(f"/vaults/{rec['vault_id']}/files/{files[0]['id']}/move", json={"dest_vault_id": dest["id"]})
+        assert moved.status_code in (200, 202), moved.text
+        listed = next(r for r in admin.get("/receivers").json()["receivers"] if r["id"] == rec["id"])
+        assert listed["upload_count"] == 2 and listed["files_in_vault"] == 1, listed
+        page.reload()
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        expect(row).to_contain_text("1 file waiting", timeout=15000)
+        admin.post(f"/vaults/{rec['vault_id']}/files/{files[1]['id']}/move", json={"dest_vault_id": dest["id"]})
+        page.reload()
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        # The lane has drawn again (it lists at most six rows, so which others it shows depends on the data),
+        # and the files row is gone.
+        expect(lane.locator(".attention-item").first).to_be_visible(timeout=15000)
+        expect(row).to_have_count(0)
+    finally:
+        admin.delete_vault(dest["id"])
+
+
+def test_a_thing_in_needs_attention_is_not_listed_again_under_whats_waiting(page: Page, admin, admin_creds, drop_link):
+    """The upload notice about files the Needs-attention lane already lists is left out of What's waiting; a
+    notice of another kind stays."""
+    rec = drop_link
+    _login(page, admin_creds["username"], admin_creds["password"])
+    expect(page.locator("#lane-attention .attention-item", has_text=rec["label"]).filter(has_text="waiting")).to_be_visible(timeout=15000)
+    page.evaluate("""() => {
+        notifItems = [{ id: 'n-up', type: 'receiver_upload', title: 'Files received on the inbox', body: '', target: '#uploadlinks', is_read: false },
+                      { id: 'n-other', type: 'share_received', title: 'A colleague shared a vault with you', body: '', target: '#shared', is_read: false }];
+        renderWaitingLane(state.dashboardShared || []); }""")
+    waiting = page.locator("#lane-waiting")
+    expect(waiting).to_contain_text("A colleague shared a vault with you")
+    expect(waiting).not_to_contain_text("Files received on the inbox")
+    assert page.evaluate("() => DashboardActions.listsNotice({ type: 'receiver_upload', target: '#uploadlinks' })") is True
+    assert page.evaluate("() => DashboardActions.listsNotice({ type: 'share_received', target: '#shared' })") is False
+
+
+def test_get_started_opens_the_settings_page_of_its_item(page: Page, admin, admin_creds, checklist_fresh):
+    _login(page, admin_creds["username"], admin_creds["password"])
+    card = page.locator("#dashboard-get-started")
+    expect(card).to_be_visible(timeout=15000)
+    email = card.locator('.get-started-item[data-check="email"]')
+    if "is-done" in (email.get_attribute("class") or ""):
+        pytest.skip("email is already set up on this install, so its item offers no button")
+    email.get_by_role("button", name="Open settings").click()
+    expect(page.locator("#settings-tab-email")).to_be_visible(timeout=15000)
+    expect(page.locator('#settings-section .tab-btn[data-tab="email"]')).to_have_attribute("aria-current", "page")
+    expect(page.locator("#settings-tab-general")).to_be_hidden()
+    page.click('.sidebar-item[data-section="dashboard"]')
+    expect(card).to_be_visible(timeout=15000)
+    card.locator('.get-started-item[data-check="second_factor"]').get_by_role("button", name="Open settings").click()
+    expect(page.locator("#settings-tab-security")).to_be_visible(timeout=15000)
+    expect(page.locator('#settings-section .tab-btn[data-tab="security"]')).to_have_attribute("aria-current", "page")

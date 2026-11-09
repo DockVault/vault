@@ -127,3 +127,29 @@ def test_a_paste_waits_the_time_the_server_asks_and_tries_again(page: Page, admi
     expect(page.locator("#toast-container")).to_contain_text("Pasted 1 item", timeout=15000)
     assert seen["n"] == 2, seen
     expect(page.locator("#vault-files-table-body .file-name[data-file-id]")).to_have_count(1, timeout=10000)
+
+
+def test_the_row_menu_follows_the_same_copy_rule_as_the_bar(page: Page, admin_creds, world):
+    """In a zero-knowledge vault the row's own menu offers no Copy either (Move stays), as the selection bar
+    does; one rule decides both. Driven on the open vault marked zero-knowledge, as the bar's test is."""
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_vault(page, world["vault"]["id"])
+    expect(page.locator("#vault-files-table-body tr")).to_have_count(3, timeout=15000)
+
+    def menu_labels(item_id):
+        page.evaluate("id => openContextMenu((state.currentFiles || []).find(i => i.id === id), 10, 10)", item_id)
+        menu = page.locator("#file-context-menu")
+        expect(menu).to_be_visible()
+        labels = [t.strip() for t in menu.locator(".context-menu-item").all_text_contents()]
+        page.keyboard.press("Escape")
+        expect(menu).to_be_hidden()
+        return labels
+
+    assert "Copy" in menu_labels(world["file"])
+    assert "Copy" in menu_labels(world["folder"])
+    page.evaluate("() => { state.currentVault.type = 'zero_knowledge'; }")
+    for item in (world["file"], world["folder"]):
+        labels = menu_labels(item)
+        assert "Copy" not in labels and "Add to copy list" not in labels, labels
+        assert "Move" in labels or "Add to move list" in labels, labels
+    page.evaluate("() => { state.currentVault.type = 'standard'; }")

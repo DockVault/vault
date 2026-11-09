@@ -677,6 +677,7 @@
                                  works in a zero-knowledge vault too, whose names are decrypted here). Empty again on leaving. -->
                             <input type="search" id="files-filter" class="form-control files-filter" placeholder="Find in this folder"
                                    aria-label="Find in this folder" autocomplete="off" spellcheck="false">
+                            <div id="files-filter-status" class="sr-only" role="status" aria-live="polite"></div>
                             <div class="files-toolbar-actions">
                                 <div class="seg-filter" role="group" aria-label="File view">
                                     <button id="files-view-table" class="seg-btn active" type="button" data-files-view="table" title="Table view" aria-label="Table view"><svg class="icon icon-sm"><use href="#i-list"/></svg> Table</button>
@@ -1187,7 +1188,7 @@
                 </div>
 
                 <!-- Extend an expiry: a share's, a public link's, a note link's or an upload link's, within its type's ceiling. -->
-                <div id="extend-expiry-modal" class="modal">
+                <div id="extend-expiry-modal" class="modal" aria-describedby="extend-expiry-current">
                     <div class="modal-content" style="max-width: 440px;">
                         <div class="modal-header">
                             <h3 id="extend-expiry-title">Extend</h3>

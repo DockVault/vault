@@ -2873,10 +2873,13 @@ function renderDashboardLanes(vaults, sharedWithMe) {
 
 // "What's waiting for you": unread notifications (who shared with you), then any items pushed to you
 // that still need claiming, then items already shared with you that you can open — capped together.
+// A notice about something the Needs-attention lane already lists (an expiry, files waiting in a drop
+// vault) is left out here, so one thing shows once (static/js/dashboard-actions.js).
 function renderWaitingLane(sharedWithMe) {
     const rows = [];
+    const listed = (n) => !!(window.DashboardActions && DashboardActions.listsNotice && DashboardActions.listsNotice(n));
     const unread = (typeof notifItems !== 'undefined' && Array.isArray(notifItems))
-        ? notifItems.filter(n => !n.is_read) : [];
+        ? notifItems.filter(n => !n.is_read && !listed(n)) : [];
     unread.slice(0, _DASHBOARD_LANE_LIMIT).forEach(n => rows.push(_laneNotifRow(n)));
 
     const shared = Array.isArray(sharedWithMe) ? sharedWithMe : [];
@@ -12019,6 +12022,16 @@ function renderVaultFiles() {
     const needle = (state.filesFilter || '').trim().toLowerCase();
     const items = needle ? all.filter(i => String(i.name || '').toLowerCase().includes(needle)) : all;
     state.visibleFiles = items;
+    // Said to a screen reader too, from a status region that stays on the page (the empty state below is drawn
+    // anew on every keystroke, so it cannot announce itself): a filter that matches nothing, or how many match.
+    const said = document.getElementById('files-filter-status');
+    if (said) {
+        const typed = (state.filesFilter || '').trim();
+        const text = !needle ? ''
+            : (items.length ? (items.length === 1 ? `1 item here matches “${typed}”.` : `${items.length} items here match “${typed}”.`)
+                : `Nothing here matches “${typed}”.`);
+        if (said.textContent !== text) said.textContent = text;
+    }
     const view = state.filesView === 'grid' ? 'grid' : 'table';
     const canWrite = state.canWriteCurrentVault !== false;
 
@@ -12293,7 +12306,7 @@ function openContextMenu(item, x, y, opener) {
     if (isFolder) {
         add('Open', 'folder', 'open-folder');
         if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-folder');
-        if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-folder');
+        if (_mayStage(item, 'copy')) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-folder');
         if (canWrite && vaultCapAllowed('folder.create')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-folder');
         if (vaultShareable()) add('Share', 'link', 'share-folder');
         if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-folder');
@@ -12303,7 +12316,7 @@ function openContextMenu(item, x, y, opener) {
         const canDownload = vaultCapAllowed('file.download');
         add('Preview', 'eye', 'preview');
         if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-file');
-        if (canDownload) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-file');
+        if (_mayStage(item, 'copy')) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-file');
         if (canWrite && vaultCapAllowed('file.delete')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-file');
         if (vaultShareable()) add('Share', 'link', 'share-file');
         if (state._pflEnabled && vaultShareable()) add('Public link', 'globe', 'publiclink-file');
@@ -12468,7 +12481,7 @@ function updateFilesBulkBar() {
     show('files-bulk-download', files.length > 0 && bulkDownloadAllowed());
     show('files-bulk-delete', canWrite && ((files.length > 0 && vaultCapAllowed('file.delete'))
         || (folders.length > 0 && vaultCapAllowed('folder.delete'))));
-    show('files-bulk-copy', !isZkVault(state.currentVault) && selected.some(i => _mayStage(i, 'copy')));
+    show('files-bulk-copy', selected.some(i => _mayStage(i, 'copy')));
     show('files-bulk-cut', selected.some(i => _mayStage(i, 'move')));
     // In a drop vault the selection bar covers the toolbar, so the triage action rides the bar too.
     show('files-bulk-move-vault', state.vaultOpenedFrom === 'uploadlinks' && canWrite && vaultCapAllowed('file.delete') && files.length > 0);
@@ -12487,9 +12500,11 @@ function _selectedItems() {
     return (state.currentFiles || []).filter(i => ids.has(i.id));
 }
 
-// Whether Copy or Cut may stage this item from here: the gates the row's own menu applies (openContextMenu).
+// Whether Copy or Cut may stage this item from here: one rule for the row's own menu (openContextMenu) and the
+// selection bar. Copy stays out of a zero-knowledge vault.
 function _mayStage(item, action) {
     const canWrite = state.canWriteCurrentVault !== false;
+    if (action === 'copy' && isZkVault(state.currentVault)) return false;
     if (item.type === 'folder') return canWrite && vaultCapAllowed('folder.create');
     return action === 'copy' ? vaultCapAllowed('file.download') : (canWrite && vaultCapAllowed('file.delete'));
 }

@@ -79,3 +79,26 @@ def test_the_box_narrows_both_views_and_clears_on_leaving(page: Page, admin_cred
     expect(page.locator("#vault-breadcrumb")).to_contain_text("Reports archive", timeout=10000)
     expect(box).to_have_value("")
     assert page.evaluate("() => state.filesFilter || ''") == ""
+
+
+def test_a_filter_that_matches_nothing_is_announced(page: Page, admin_creds, world):
+    """The empty match is said from a status region that stays on the page (the empty state is drawn anew on
+    every keystroke and so cannot announce itself); a match says how many, and a clear box says nothing."""
+    v, _folder = world
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.click('.sidebar-item[data-section="vaults"]')
+    page.click(f'.open-vault-btn[data-vault-id="{v["id"]}"]')
+    expect(page.locator("#vault-view-section")).to_be_visible(timeout=10000)
+    expect(page.locator("#vault-files-table-body tr")).to_have_count(4, timeout=15000)
+    status = page.locator("#files-filter-status")
+    expect(status).to_have_attribute("role", "status")
+    expect(status).to_have_text("")
+    box = page.locator("#files-filter")
+    box.fill("zzz-nothing")
+    expect(status).to_have_text("Nothing here matches “zzz-nothing”.")
+    box.fill("2026")
+    expect(status).to_have_text("1 item here matches “2026”.")
+    box.fill("report")
+    expect(status).to_have_text("3 items here match “report”.")
+    box.press("Escape")
+    expect(status).to_have_text("")

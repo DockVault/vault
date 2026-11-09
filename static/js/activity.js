@@ -1162,12 +1162,20 @@
         const whoTd = el('td', 'act-c-who');
         const who = whoText(ev);
         const whoWrap = el('div', 'act-who');
-        // An account's name as the chip every list uses (static/js/people.js), coloured by the account.
-        const name = (ev.user_id && !who.quiet && window.People)
-            ? People.chip({ id: ev.user_id, username: who.text }, { small: true })
-            : el('span', 'act-who-name' + (who.quiet ? ' is-quiet' : ''), who.text);
+        // An account's name as the chip every list uses (static/js/people.js), coloured by the account. A name
+        // with no account behind it now (a deleted account's) is the same chip, greyed as people.js greys a
+        // deleted account, and its tooltip says there is no account.
+        let name;
+        if (!who.quiet && window.People && ev.user_id) {
+            name = People.chip({ id: ev.user_id, username: who.text }, { small: true });
+        } else if (!who.quiet && window.People) {
+            name = People.chip({ username: who.text }, { small: true });
+            name.classList.add('person-deleted');
+        } else {
+            name = el('span', 'act-who-name' + (who.quiet ? ' is-quiet' : ''), who.text);
+        }
         name.classList.add('act-who-name');
-        name.title = who.title || who.text;
+        if (who.title || !name.title) name.title = who.title || who.text;
         whoWrap.appendChild(name);
         if (ev.temp_credential_id) whoWrap.appendChild(tempBadge(ev));
         const under = recordedUnder(ev);
