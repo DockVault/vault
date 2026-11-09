@@ -266,8 +266,8 @@
     rows.textContent = "";
     delivered.forEach(function (r) {
       var tr = document.createElement("tr");
-      var name = document.createElement("td"); name.textContent = r.name;
-      var size = document.createElement("td"); size.textContent = humanSize(r.size);
+      var name = document.createElement("td"); name.className = "name"; name.textContent = r.name;
+      var size = document.createElement("td"); size.className = "size"; size.textContent = humanSize(r.size);
       var at = document.createElement("td"); at.textContent = when(r.at);
       var ref = document.createElement("td"); ref.className = "ref"; ref.textContent = r.reference;
       tr.appendChild(name); tr.appendChild(size); tr.appendChild(at); tr.appendChild(ref);
@@ -277,6 +277,9 @@
       ? "1 file was delivered to the owner of this link."
       : delivered.length + " files were delivered to the owner of this link.";
     show("receipt");
+    // The form the person was in is gone: say so by moving them to the receipt's heading (the intro beside
+    // it is a status region, so the count is read out too).
+    $("receipt-title").focus();
   }
 
   function sendMore() {

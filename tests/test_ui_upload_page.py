@@ -91,6 +91,44 @@ def test_the_page_takes_several_files_and_gives_a_receipt(page: Page, admin, lin
     assert names == ["one (2).txt", "one.txt", "two.txt"]
 
 
+def test_the_page_is_usable_from_the_keyboard_and_announces_the_receipt(page: Page, admin, link):
+    """The file input is hidden (1x1, transparent), so the first Tab must show its focus on the drop zone;
+    the page has one h1; when the upload finishes, focus moves to the receipt's heading and the count beside
+    it is a status region; on a phone the reference and the size never break mid-word."""
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"/u/{link['token']}")
+    expect(page.locator("#form")).to_be_visible(timeout=15000)
+    assert page.locator("h1").count() == 1
+    drop = page.locator("#drop")
+    before = drop.evaluate("el => getComputedStyle(el).outlineStyle")
+    page.keyboard.press("Tab")
+    assert page.evaluate("document.activeElement.id") == "file-input"
+    after = drop.evaluate("el => [getComputedStyle(el).outlineStyle, getComputedStyle(el).outlineWidth]")
+    assert before == "none" and after[0] != "none" and after[1] != "0px", (before, after)
+    page.set_input_files("#file-input", files=[
+        {"name": "a-very-long-file-name-that-has-no-spaces-anywhere-in-it-at-all-" * 2 + ".txt",
+         "mimeType": "text/plain", "buffer": b"long"},
+    ])
+    page.click("#upload-btn")
+    expect(page.locator("#receipt")).to_be_visible(timeout=20000)
+    assert page.evaluate("document.activeElement.id") == "receipt-title"
+    assert page.locator("#receipt-intro").get_attribute("role") == "status"
+    expect(page.locator("#receipt-intro")).to_have_text("1 file was delivered to the owner of this link.")
+    # The reference and the size are each on one line (a cell is as tall as its row, which the long name makes
+    # tall, so the lines of the text itself are counted, not the cell).
+    lines = page.evaluate("""() => ['td.ref', 'td.size'].map(sel => {
+        const cell = document.querySelector('#receipt-rows ' + sel);
+        const range = document.createRange();
+        range.selectNodeContents(cell);
+        const tops = new Set([...range.getClientRects()].map(r => Math.round(r.top)));
+        return [sel, cell.textContent, tops.size];
+    })""")
+    for sel, text, count in lines:
+        assert text and count == 1, (sel, text, count)     # one line: never broken mid-word
+    # The long name wrapped inside the card instead of pushing the table past it.
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
 def test_a_protected_link_shows_the_owners_message_once_the_code_is_accepted(page: Page, admin, receivers_enabled):
     tag = admin.post("/receiver-tags", json={"name": unique("rtag"), "min_token_len": 6, "require_secret": "pin",
                                              "min_pin_len": 4, "max_total_bytes_cap": 100 * _MB,
