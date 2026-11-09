@@ -737,6 +737,22 @@ def allowed_hosts_value(cfg):
     return server if port == 443 else "https://%s:%d" % (server, port)
 
 
+def passkey_address_note(name):
+    """Why passkeys stay hidden when the address people open is ``name`` (the host of ALLOWED_HOSTS's first entry
+    that is not a wildcard, from _allowed_hosts_name), or None: browsers make no passkey for an address reached by
+    IP, so the passkey sign-in and the passkey settings wait for a host name. Single sign-on and the emailed links
+    work either way."""
+    import ipaddress
+    host = (name or "").strip().strip("[]")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return ("passkeys stay hidden at this address: browsers make no passkey for an address reached by IP. Put the "
+            "vault's host name first in ALLOWED_HOSTS when you want them; single sign-on and the emailed links work "
+            "either way.")
+
+
 def build_env_lines(cfg):
     """Build the .env content (list of lines) from a collected-config dict — deterministic + pure
     (it does NOT generate secrets; the caller passes them in). Values are single-quoted, matching
@@ -5202,6 +5218,10 @@ class DockVault:
                                 "'unlock' then 'down' to remove them.", "red"))
             print(pal.paint("  (containers not listed while .env is locked - unlock first)", "yellow"))
             return
+        env = self._load_env()
+        passkey_note = passkey_address_note(_allowed_hosts_name(env.get("ALLOWED_HOSTS")))
+        if passkey_note:
+            print(pal.paint("  Passkeys: hidden - %s" % passkey_note, "yellow"))
         try:
             self._run_dc("ps", capture=False, timeout=30)
         except (OSError, subprocess.SubprocessError):
@@ -5577,6 +5597,11 @@ class DockVault:
             self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
         if sftp_public_port is not None and not (1 <= int(sftp_public_port) <= 65535):
             self._fail("invalid SFTP client port (1-65535): %r" % sftp_public_port)
+        # The address people open, as it will be written: passkeys need a host name there, so an IP is said now.
+        passkey_note = passkey_address_note(_allowed_hosts_name(allowed_hosts_value(
+            {"server_name": server, "web_public_address": web_public, "web_host_port": web_port})))
+        if passkey_note:
+            print(pal.paint("  Note: %s" % passkey_note, "yellow"))
 
         return {
             "server_name": server,

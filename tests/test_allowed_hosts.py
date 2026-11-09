@@ -237,15 +237,16 @@ def test_a_fresh_volume_set_keeps_allowed_hosts_and_reads_the_name_from_it(curre
 
 
 def test_every_read_of_allowed_hosts_in_setup_takes_its_name_or_keeps_it_whole():
-    """Setup reads ALLOWED_HOSTS at three places for a name (a fresh volume set, a re-run's summary and the
-    certificate's) and once to keep it: each name goes through _allowed_hosts_name."""
+    """The host tool reads ALLOWED_HOSTS at four places for a name (a fresh volume set, a re-run's summary, the
+    certificate's and the status line that says passkeys stay hidden at an IP) and once to keep it: each name goes
+    through _allowed_hosts_name."""
     import ast
     tree = ast.parse((ROOT / "dockvault.py").read_text(encoding="utf-8"))
     parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     reads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "get"
              and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == "ALLOWED_HOSTS"]
     named = [n for n in reads if getattr(getattr(parents[id(n)], "func", None), "id", None) == "_allowed_hosts_name"]
-    assert len(reads) == 4 and len(named) == 3, [ast.unparse(parents[id(n)]) for n in reads]
+    assert len(reads) == 5 and len(named) == 4, [ast.unparse(parents[id(n)]) for n in reads]
     kept = [n for n in reads if n not in named]
     assert ast.unparse(parents[id(parents[id(kept[0])])]) == "(current_env.get('ALLOWED_HOSTS') or '').strip"
 
