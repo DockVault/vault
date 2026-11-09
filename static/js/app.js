@@ -20195,7 +20195,7 @@ async function loadVaultGroupAccess() {
         if (accessList.length) {
             body = `
             <table class="data-table">
-                <thead><tr><th>Department</th><th>Members</th><th>Access</th><th>Granted</th><th></th></tr></thead>
+                <thead><tr><th>Department</th><th>Members</th><th>Access</th><th>Granted</th><th>Granted by</th><th></th></tr></thead>
                 <tbody>
                 ${accessList.map(a => `
                     <tr>
@@ -20208,6 +20208,9 @@ async function loadVaultGroupAccess() {
                             </select>
                         </td>
                         <td>${grantedDate(a.added_at)}</td>
+                        <td class="vga-granted-by">${a.added_by_username
+                            ? People.placeholder({ id: a.added_by, username: a.added_by_username }, { small: true })
+                            : '<span class="text-tertiary">—</span>'}</td>
                         <td><button class="action-btn action-btn-danger vga-remove" data-group-id="${a.group_id}">Revoke</button></td>
                     </tr>`).join('')}
                 </tbody>

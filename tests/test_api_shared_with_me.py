@@ -77,3 +77,21 @@ def test_shared_with_me_empty_for_temp_session(admin):
     temp = ApiClient()
     temp.login(creds["temp_username"], creds["credential"])
     assert temp.get("/shares/shared-with-me").json() == []
+
+
+def test_every_card_names_its_sharer(admin, admin_creds, temp_user_client):
+    # The sharers' names are loaded once for the whole list; every card still names its own.
+    _enable_sharing(admin, True)
+    me = admin.get("/users/me").json()
+    v = admin.create_vault(name=unique("swby"))
+    try:
+        tag = _tag(admin)
+        shares = [_make_share(admin, v, tag), _make_share(admin, v, tag)]
+        for s in shares:
+            _claim(temp_user_client, s)
+        rows = {r["share_id"]: r for r in temp_user_client.get("/shares/shared-with-me").json()}
+        for s in shares:
+            assert rows[s["id"]]["shared_by"] == admin_creds["username"], rows[s["id"]]
+            assert rows[s["id"]]["shared_by_id"] == str(me["id"]), rows[s["id"]]
+    finally:
+        admin.delete_vault(v["id"])

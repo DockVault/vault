@@ -17246,12 +17246,14 @@ async def claim_pushed_share(
     return _claim_resolved_share(db, share, current_user, request)
 
 
-def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
+def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share,
+                         sharer_names: Optional[dict] = None) -> dict:
     """Recipient-facing card for the 'Shared with me' tab. Describes the shared item (vault name +
     target kind/name) + the effective status so an expired/revoked card can show its reason, and the
     recipient's own download usage. NEVER includes the link token or any creator/allowlist internals.
     Standard vaults only, so the target name is server-visible plaintext the recipient may already
-    list."""
+    list. `sharer_names` maps creator ids to usernames, loaded once by the list for all its cards;
+    without it the one sharer is looked up here."""
     if claim.revoked or share.status == "revoked":
         st = "revoked"
     elif _share_effective_status(share) == "expired":
@@ -17290,7 +17292,9 @@ def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share) -> dict:
         "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
         # Who shared it and when: the recipient already learned the sharer's name from the notice.
         "shared_by_id": str(share.creator_id) if share.creator_id else None,
-        "shared_by": db.query(User.username).filter(User.id == share.creator_id).scalar() if share.creator_id else None,
+        "shared_by": ((sharer_names.get(share.creator_id) if sharer_names is not None
+                       else db.query(User.username).filter(User.id == share.creator_id).scalar())
+                      if share.creator_id else None),
         "created_at": share.created_at.isoformat() if share.created_at else None,
     }
 
@@ -17357,7 +17361,10 @@ async def list_shared_with_me(
         .order_by(ShareClaim.claimed_at.desc())
         .all()
     )
-    out = [_shared_with_me_dict(db, claim, share) for claim, share in rows]
+    # The sharers' names for every card in one query, not one query per card.
+    creator_ids = {share.creator_id for _claim, share in rows if share.creator_id}
+    sharer_names = dict(db.query(User.id, User.username).filter(User.id.in_(creator_ids)).all()) if creator_ids else {}
+    out = [_shared_with_me_dict(db, claim, share, sharer_names) for claim, share in rows]
 
     # Direct push: active named-audience shares addressed to this user that they haven't claimed appear
     # as 'available' cards. Narrowed SERVER-SIDE via JSONB @> containment (GIN-indexed) so we fetch only
@@ -20197,14 +20204,20 @@ async def list_vault_group_access(
         raise HTTPException(status_code=403, detail="Only the vault owner or a manager can view access")
     rows = db.execute(
         select(vault_group_access.c.group_id, vault_group_access.c.permission,
-               vault_group_access.c.added_at, Group.name, Group.color)
+               vault_group_access.c.added_at, Group.name, Group.color,
+               vault_group_access.c.added_by)
         .join(Group, Group.id == vault_group_access.c.group_id)
         .where(vault_group_access.c.vault_id == vault_id)
         .order_by(Group.name)
     ).all()
+    # Who granted each department, named the same way as the members' list: one lookup for all rows.
+    granter_ids = {r[5] for r in rows if r[5]}
+    granter_names = dict(db.query(User.id, User.username).filter(User.id.in_(granter_ids)).all()) if granter_ids else {}
     return [{"group_id": str(r[0]), "permission": r[1],
              "added_at": r[2].isoformat() if r[2] else None,
-             "name": r[3], "color": r[4]} for r in rows]
+             "name": r[3], "color": r[4],
+             "added_by": str(r[5]) if r[5] else None,
+             "added_by_username": granter_names.get(r[5]) if r[5] else None} for r in rows]
 
 
 @app.post("/vaults/{vault_id}/group-access")
