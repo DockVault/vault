@@ -137,6 +137,32 @@ def test_a_user_cannot_resend(admin, invites_on):
         admin.delete(f"/invites/{inv['id']}")
 
 
+@pytest.mark.parametrize("policy,email,words", [
+    ({"signup_email_domain_mode": "allowlist", "signup_email_domains": ["elsewhere.example"]},
+     "invitee@example.com", "domain is not permitted"),
+    ({"signup_email_domain_mode": "denylist", "signup_email_domains": ["example.com"]},
+     "invitee@sub.example.com", "domain is not permitted"),
+    ({"email_requirement": "required"}, None, "email address is required"),
+])
+def test_an_invitation_the_email_rules_now_refuse_cannot_be_sent_again(admin, invites_on, policy, email, words):
+    body = {"username": unique("er"), "role": "user"}
+    if email:
+        body["email"] = email.replace("invitee", unique("invitee"))
+    inv = admin.post("/invites", json=body)
+    assert inv.status_code == 200, inv.text
+    inv = inv.json()
+    try:
+        assert admin.put("/settings", json=policy).status_code == 200
+        r = admin.post(f"/invites/{inv['id']}/resend")
+        assert r.status_code == 400 and words in r.text and "cannot be sent again" in r.text, r.text
+        # Refused before anything changed: the invitation is still the pending one.
+        assert _psql(f"SELECT revoked_at IS NULL FROM account_invitations WHERE id = {_q(inv['id'])}") == "t"
+    finally:
+        admin.put("/settings", json={"email_requirement": "optional", "signup_email_domain_mode": "off",
+                                     "signup_email_domains": []})
+        admin.delete(f"/invites/{inv['id']}")
+
+
 def test_an_invitation_whose_name_an_account_took_cannot_be_sent_again(admin, invites_on):
     inv = admin.post("/invites", json={"username": unique("tk"), "role": "user"}).json()
     try:

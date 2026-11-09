@@ -5324,7 +5324,6 @@ async def create_invite(
     """Mint an account invitation (interactive admin only — a temp-cred admin is refused). The
     plaintext invite link is returned ONCE; only its peppered HMAC is stored."""
     from app.core.models import AccountInvitation
-    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
     from app.core import invitations
     from sqlalchemy.exc import IntegrityError
 
@@ -5356,16 +5355,10 @@ async def create_invite(
 
     # Email: optional or required per policy, domain-gated, unique.
     email = normalize_email(payload.email)
-    if pol.get("email_requirement") == "required" and not email:
-        raise HTTPException(status_code=400, detail="An email address is required for new accounts.")
+    refusal = _invite_email_refusal(pol, email)
+    if refusal:
+        raise HTTPException(status_code=400, detail=refusal)
     if email:
-        # ASCII-only, same as self-signup: the domain-gate config is ASCII/punycode, so a unicode IDN
-        # domain (or a homograph of a denylisted one) would otherwise slip the allow/deny check.
-        if not signup_email_is_ascii(email):
-            raise HTTPException(status_code=400, detail="That email domain is not permitted.")
-        if not email_allowed_by_domain_gate(email, pol.get("signup_email_domain_mode"),
-                                            pol.get("signup_email_domains")):
-            raise HTTPException(status_code=400, detail="That email domain is not permitted.")
         if email_in_use(db, email):
             raise HTTPException(status_code=400, detail="That email address is already in use.")
         # Symmetric with the username guard: don't let two LIVE invitations claim one address (the
@@ -5462,6 +5455,24 @@ async def list_invites(
     } for i in rows]
 
 
+def _invite_email_refusal(pol, email):
+    """Why the account policy refuses an invitation's email address now, or None: an address is required and
+    there is none, or it is not ASCII, or the domain gate does not admit it. Read when an invitation is made
+    and again when it is sent again (the policy may have changed in between)."""
+    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
+    if pol.get("email_requirement") == "required" and not email:
+        return "An email address is required for new accounts."
+    if email:
+        # ASCII-only, same as self-signup: the domain-gate config is ASCII/punycode, so a unicode IDN
+        # domain (or a homograph of a denylisted one) would otherwise slip the allow/deny check.
+        if not signup_email_is_ascii(email):
+            return "That email domain is not permitted."
+        if not email_allowed_by_domain_gate(email, pol.get("signup_email_domain_mode"),
+                                            pol.get("signup_email_domains")):
+            return "That email domain is not permitted."
+    return None
+
+
 @app.post("/invites/{invite_id}/resend")
 @require_endpoint_permission("USER_MANAGE")
 @require_step_up("admin.user.manage")
@@ -5505,6 +5516,11 @@ async def resend_invite(
             or (inv.email and email_in_use(db, inv.email))):
         raise HTTPException(status_code=400, detail=(
             "An account now uses this invitation's name or email address, so it cannot be sent again; revoke it."))
+    # The email rules too: a link that the policy now refuses would be refused when it is used.
+    refusal = _invite_email_refusal(pol, normalize_email(inv.email))
+    if refusal:
+        raise HTTPException(status_code=400, detail=(
+            f"{refusal} This invitation cannot be sent again as it is; revoke it and send a new one."))
     old_prefix = inv.token_prefix
     plaintext, prefix = invitations.mint_invite()
     _ttl_h = int(pol.get("invite_ttl_hours") or 24)
