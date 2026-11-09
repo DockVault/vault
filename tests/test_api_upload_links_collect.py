@@ -125,6 +125,15 @@ def test_the_owner_can_store_and_read_a_re_copy_of_the_link(admin, receivers_ena
     assert admin.put(f"/receivers/{rec['id']}/token-copy", json={"token_enc": blob}).status_code == 409   # write-once
     mine = next(r for r in admin.get("/receivers").json()["receivers"] if r["id"] == rec["id"])
     assert mine["has_token_copy"] is True
+    # Replacing the link retires the re-copy with the URL it was a copy of: the card stops offering a dead
+    # link, and the write-once slot is free for a copy of the new one.
+    assert admin.post(f"/receivers/{rec['id']}/replace-link").status_code == 200
+    assert admin.get(f"/receivers/{rec['id']}/token-copy").status_code == 404
+    mine = next(r for r in admin.get("/receivers").json()["receivers"] if r["id"] == rec["id"])
+    assert mine["has_token_copy"] is False
+    put = admin.put(f"/receivers/{rec['id']}/token-copy", json={"token_enc": blob})
+    assert put.status_code == 200, put.text
+    assert admin.get(f"/receivers/{rec['id']}/token-copy").json()["token_enc"] == blob
     # Someone else gets the uniform 404; a revoked link's copy is gone.
     u = admin.create_user(role="user")
     try:

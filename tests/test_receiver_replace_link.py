@@ -99,6 +99,20 @@ def test_replacing_a_link_is_gated_exactly_as_creating_one_is():
 
 
 @pytest.mark.unit
+def test_replacing_a_link_retires_the_owners_stored_re_copy():
+    """The owner may keep an encrypted re-copy of the URL (PUT /receivers/{id}/token-copy, write-once).
+    It is a copy of the token that a replacement has just killed: left in place, "Copy link again" would
+    hand out a dead URL, and the slot would never accept a copy of the live one. So the replacement
+    clears it, in the same transaction as the new hash. test_api_upload_links_collect.py proves the
+    behaviour on a running stack; this pins the shape.
+    """
+    src = API.read_text(encoding="utf-8")
+    body = _endpoint_body(src, "post", "/receivers/{receiver_id}/replace-link")
+    assert body.index("r.token_hash = token_hash") < body.index("r.token_enc = None") < body.index("db.commit()"), (
+        "the stored re-copy must go with the new hash, before the commit that makes it live")
+
+
+@pytest.mark.unit
 def test_the_new_token_is_never_written_to_the_audit_log():
     """The row records THAT the link was replaced, not what it was replaced with."""
     src = API.read_text(encoding="utf-8")

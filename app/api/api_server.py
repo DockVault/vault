@@ -15685,6 +15685,11 @@ async def replace_receiver_link(
         raise HTTPException(status_code=500, detail="Could not allocate a link token; try again.")
 
     r.token_hash = token_hash
+    # The owner's stored re-copy, if any, is of the URL that has just stopped working: a "Copy link
+    # again" that handed it out would hand out a dead link, and the write-once slot would never take
+    # a copy of the new one. Set to nothing in the same transaction as the new hash, so the slot is
+    # free for the browser to store the replacement.
+    r.token_enc = None
     db.commit()
 
     # Replacing a link is an access change: the old URL stops working and a new bearer credential
