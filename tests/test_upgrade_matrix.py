@@ -143,13 +143,27 @@ def _undeclared(released: list[str], declared, preparing: str) -> tuple[list[str
     return failures, warnings_
 
 
+def _advisories(entry: dict) -> set:
+    """The advisories a version's entry lists as affecting it, by id (or title, on an entry that has no id)."""
+    return {v.get("advisory") or v.get("title") for v in entry.get("vulnerabilities") or [] if isinstance(v, dict)}
+
+
+def _loses_no_fix(versions: dict, source: str, target: str) -> bool:
+    """Whether moving from `source` to `target` keeps every fix `source` has: each advisory that affects
+    `target` affects `source` too."""
+    return _advisories(versions[target]) <= _advisories(versions[source])
+
+
 def _unreachable(data: dict, released: list[str]) -> list[str]:
     """Released, declared versions with no takeable route in, each with the reason.
 
     The gate's rule is an edge from the version-order predecessor. A maintenance release made after
-    the next minor makes itself that minor's predecessor, and no honest edge leads from it into a
-    release that predates its fix; the validator's backport rule then asks for an edge from some
-    release no later than it instead, and so does this.
+    the next minor makes itself that minor's predecessor. An edge from it into that minor is honest
+    only when it loses no fix: when every advisory affecting the minor affects the maintenance release
+    too (a rebuild, or a fix the minor already had). Then the line's newest release can take the edge
+    up over from the one before it, and the matrix keeps one such edge per line. When it would lose a
+    fix, no honest edge leads from it into a release that predates that fix; the validator's backport
+    rule then asks for an edge from some release no later than it instead, and so does this.
     """
     versions = data["versions"]
     ordered = sorted(versions, key=_vkey)
@@ -162,9 +176,10 @@ def _unreachable(data: dict, released: list[str]) -> list[str]:
         previous = ordered[index - 1] if index else None
         if previous is not None and versions[previous]["released"] > versions[version]["released"]:
             if not any(e["to"] == version and e["kind"] != "blocked"
-                       and versions[e["from"]]["released"] <= versions[version]["released"]
+                       and (versions[e["from"]]["released"] <= versions[version]["released"]
+                            or _loses_no_fix(versions, e["from"], version))
                        for e in edges):
-                problems.append(f"{version}: no route in from a release made before it")
+                problems.append(f"{version}: no route in from a release made before it, or one that loses no fix")
             continue
         try:
             um.assert_release_declared(data, version)
@@ -2007,8 +2022,9 @@ def test_a_minor_after_a_later_maintenance_release_is_still_reachable():
     assert _unreachable(data, ["0.1.0", "0.2.0", "0.2.1", "0.3.0"]) == []
 
     # Without that route, it is not reachable, and says so -- an edge from the later patch into a
-    # release that predates its fix is not a route in either.
+    # release that predates its fix (an advisory 0.3.0 is still affected by) is not a route in either.
     data["edges"] = [e for e in data["edges"] if (e["from"], e["to"]) != ("0.2.0", "0.3.0")]
+    data["versions"]["0.3.0"]["vulnerabilities"] = [_ref(slug="fixed-in-the-patch", fixed_in="0.2.1")]
     assert [p.split(":")[0] for p in _unreachable(data, ["0.1.0", "0.2.0", "0.2.1", "0.3.0"])] == [
         "0.3.0"]
 
@@ -2030,3 +2046,38 @@ def test_the_suites_that_read_the_matrix_check_out_history():
         text = (workflows / name).read_text(encoding="utf-8")
         checkout = text.split(marker, 1)[1].split("- name:", 1)[0]
         assert "fetch-depth: 0" in checkout, name
+
+
+def _line_release_after_the_minor(moved: bool) -> dict:
+    """_valid() with 0.1.1, a release of the 0.1 line made after 0.2.0. `moved`: the edge up leaves from 0.1.1 only
+    (0.1.0 -> 0.1.1 -> 0.2.0); otherwise 0.1.0 -> 0.2.0 stays as well."""
+    data = _valid()
+    data["versions"]["0.1.1"] = {"released": "2026-02-01", "notes": "a rebuild of the line", "support": _support()}
+    if moved:
+        data["edges"] = []
+    data["edges"] += [{"from": "0.1.0", "to": "0.1.1", "kind": "direct", "reversible": True, "requires_backup": False},
+                      {"from": "0.1.1", "to": "0.2.0", "kind": "direct", "reversible": True, "requires_backup": False}]
+    return data
+
+
+def test_a_later_line_release_that_loses_no_fix_takes_the_edge_up_over():
+    """0.1.1 is made after 0.2.0 and fixes nothing 0.2.0 still has, so 0.1.1 -> 0.2.0 is an honest way in to 0.2.0:
+    the edge up can move to the line's newest release and the matrix keeps one per line."""
+    data = _line_release_after_the_minor(moved=True)
+    um.validate_matrix(data, released_ceiling=None)
+    assert _unreachable(data, ["0.1.0", "0.1.1", "0.2.0"]) == []
+
+
+def test_a_later_line_release_that_would_lose_a_fix_is_no_way_in():
+    """0.2.0 is affected by an advisory 0.1.1 fixed: 0.1.1 -> 0.2.0 would undo that fix, so 0.2.0 still needs an
+    edge from a release made before it."""
+    data = _line_release_after_the_minor(moved=True)
+    data["versions"]["0.2.0"]["vulnerabilities"] = [_ref(slug="fixed-on-the-line", fixed_in="0.1.1")]
+    assert _unreachable(data, ["0.1.0", "0.1.1", "0.2.0"]) == [
+        "0.2.0: no route in from a release made before it, or one that loses no fix"]
+    kept = _line_release_after_the_minor(moved=False)
+    kept["versions"]["0.2.0"]["vulnerabilities"] = [_ref(slug="fixed-on-the-line", fixed_in="0.1.1")]
+    assert _unreachable(kept, ["0.1.0", "0.1.1", "0.2.0"]) == []
+    # The same advisory on both: moving loses nothing.
+    data["versions"]["0.1.1"]["vulnerabilities"] = [_ref(slug="fixed-on-the-line", fixed_in="0.1.1")]
+    assert _unreachable(data, ["0.1.0", "0.1.1", "0.2.0"]) == []

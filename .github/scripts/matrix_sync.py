@@ -153,6 +153,14 @@ def sync(main: dict, branch: dict) -> tuple[dict, list[str]]:
             notes.append(f"took the edge {pair[0]} -> {pair[1]} from the branch")
         elif edge != main_edges[pair]:
             notes.append(f"kept main's edge {pair[0]} -> {pair[1]}; the branch's differs")
+    # An edge main has between two releases the branch also declares, but the branch does not: the branch
+    # dropped it, as when the line's newest release takes the edge up over from the one before it. main's is
+    # kept, so the release commit drops it from main by hand; say so, or the sync undoes the change quietly.
+    branch_pairs = {(e["from"], e["to"]) for e in branch["edges"]}
+    for pair in main_edges:
+        if pair not in branch_pairs and all(v in branch["versions"] for v in pair):
+            notes.append(f"kept main's edge {pair[0]} -> {pair[1]}, which the branch does not have though it "
+                         "declares both releases")
     result["edges"] = _insert_edges(result["edges"], extra_edges)
 
     for slug, record in branch["advisories"].items():

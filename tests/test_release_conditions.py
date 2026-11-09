@@ -246,14 +246,14 @@ def test_a_release_entry_made_from_this_file_passes_the_matrix_check_and_this_on
 
 def _drop(cid):
     def change(data):
-        edge = _edge(data, rc.SOURCE_FLOOR)
+        edge = _edge(data, rc.newest_below(data))
         edge["conditions"] = [c for c in edge["conditions"] if c["id"] != cid]
     return change
 
 
 def _alter(cid, key, value):
     def change(data):
-        (condition,) = [c for c in _edge(data, rc.SOURCE_FLOOR)["conditions"] if c["id"] == cid]
+        (condition,) = [c for c in _edge(data, rc.newest_below(data))["conditions"] if c["id"] == cid]
         if value is None:
             condition.pop(key, None)
         else:
@@ -555,3 +555,21 @@ def test_the_panel_retention_text_names_a_command_the_tool_has():
             in text)
     assert "Set AUDIT_LOG_RETENTION_DAYS=0 before going back" in text
     assert "FROM managed_settings" in sql and text.endswith("The check lists the values set in the panel.")
+
+
+def test_a_later_release_of_the_line_before_takes_the_edge_into_the_release_over():
+    """Once the 0.33 line has a release after 0.33.6 (0.33.7, made after 0.34.0, a rebuild), the edge into 0.34.0
+    leaves from it, and the release entry made from this file still passes both checks."""
+    committed = _matrix()
+    later = rc.before_the_release(committed)
+    newest = max(later["versions"], key=rc._version_key)
+    major, minor, patch = (int(p) for p in newest.split("."))
+    after = f"{major}.{minor}.{patch + 1}"
+    later["versions"][after] = dict(later["versions"][newest], released="2026-11-20", notes="A rebuild.")
+    later["edges"].append({"from": newest, "to": after, "kind": "direct", "reversible": True,
+                           "requires_backup": False})
+    assert rc.newest_below(later) == after
+    data = rc.with_the_release(later)
+    assert [e["from"] for e in data["edges"] if e["to"] == rc.INTO] == [after]
+    _matrix_script().validate_matrix(data, released_ceiling=rc.INTO)
+    assert rc.edge_problems(data) == []
