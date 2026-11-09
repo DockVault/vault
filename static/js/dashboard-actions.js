@@ -180,22 +180,25 @@
         if (!scoped) {
             const [shares, publicLinks, noteLinks, receivers] = await Promise.all([
                 quiet('/shares'), quiet('/public-links'), quiet('/note-links'), quiet('/receivers')]);
+            // Each expiry row opens the place its Extend button is: the "Shared by me" tab and the card, the
+            // Notes "Shared" tab, the Drop vaults tab, or the vault's "My public links" dialog (openAppTarget in
+            // app.js understands the same targets the reminder notices carry).
             list(shares, 'shares').filter(s => s.status === 'active' && soon(s.expires_at) != null)
                 .forEach(s => rows.push(row('link', `Share of ${s.target_name || s.vault_name || 'an item'} expires ${inDays(soon(s.expires_at))}`,
-                                             s.vault_name || '', () => navigateToSection('shared'))));
+                                             s.vault_name || '', () => openAppTarget('#shared/by-me/' + s.id))));
             list(publicLinks, 'links').filter(l => !l.revoked && l.status !== 'expired' && soon(l.expires_at) != null)
                 .forEach(l => rows.push(row('globe', `Public link expires ${inDays(soon(l.expires_at))}`,
-                                             l.tag_name || '', () => openVault(l.vault_id))));
+                                             l.tag_name || '', () => openAppTarget('#vault/' + l.vault_id + '/public-links/' + l.id))));
             list(noteLinks, 'links').filter(l => !l.revoked && soon(l.expires_at) != null)
                 .forEach(l => rows.push(row('file-text', `Note link "${l.title || 'note'}" expires ${inDays(soon(l.expires_at))}`,
-                                             '', () => navigateToSection('notes'))));
+                                             '', () => openAppTarget('#notes/shared/' + l.id))));
             const recv = list(receivers, 'receivers');
             recv.filter(r => (r.upload_count || 0) > 0)
                 .forEach(r => rows.push(row('upload', `${r.upload_count} upload${r.upload_count === 1 ? '' : 's'} received on ${r.label || 'an upload link'}`,
                                              'Open the drop vault', () => openVault(r.vault_id, { from: 'uploadlinks' }))));
             recv.filter(r => soon(r.expires_at) != null)
                 .forEach(r => rows.push(row('upload', `Upload link ${r.label || ''} expires ${inDays(soon(r.expires_at))}`.replace(/\s+/g, ' '),
-                                             '', () => navigateToSection('uploadlinks'))));
+                                             '', () => openAppTarget('#uploadlinks/drops/' + r.id))));
         }
         if (isAdmin()) {
             const [invites, requests] = await Promise.all([

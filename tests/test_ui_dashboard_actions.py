@@ -129,3 +129,43 @@ def test_the_get_started_checklist_ticks_what_is_recorded_and_can_be_dismissed(p
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
     expect(page.locator("#lane-attention")).to_be_visible(timeout=15000)
     expect(card).to_be_hidden()
+
+
+def test_an_expiring_share_row_leads_to_its_card_on_the_shared_by_me_tab(page: Page, admin, admin_creds, invites_on):
+    """A Needs-attention row for a share lands on Shared's "Shared by me" tab with that share's card (and its
+    Extend button) in view, not on "Shared with me" where the person's own share is not listed. The reminder
+    notices carry the same target, so a click on one lands in the same place."""
+    sharing_before = admin.get("/settings").json().get("sharing_enabled", False)
+    admin.put("/settings", json={"sharing_enabled": True}).raise_for_status()
+    v = admin.create_vault(name=unique("Soonest"))
+    tag = admin.post("/share-tags", json={"name": unique("soonest"), "allowed_audiences": ["anyone_internal"],
+                                          "max_recipients_cap": 10, "auto_enroll_new_users": True}).json()
+    try:
+        r = admin.post("/shares", json={"vault_id": v["id"], "tag_id": tag["id"], "target_type": "vault",
+                                        "claim_audience": "anyone_internal", "lifetime_minutes": 2 * 24 * 60})
+        assert r.status_code == 200, r.text
+        share_id = r.json()["id"]
+        _login(page, admin_creds["username"], admin_creds["password"])
+        lane = page.locator("#lane-attention")
+        lane_row = lane.locator(".attention-item", has_text=v["name"])
+        expect(lane_row).to_be_visible(timeout=15000)
+        lane_row.click()
+        expect(page.locator("#shared-section")).to_be_visible()
+        expect(page.locator('#shared-section .tab-btn[data-shared-tab="by-me"]')).to_have_class("tab-btn active")
+        card = page.locator(f'#shared-by-me-list [data-share-id="{share_id}"]')
+        expect(card).to_be_visible(timeout=15000)
+        expect(card.locator("button.share-extend")).to_be_visible()
+        # A notice with the same target lands in the same place; a plain "#shared" target still opens the page.
+        page.click('.sidebar-item[data-section="dashboard"]')
+        page.evaluate("t => openAppTarget(t)", "#uploadlinks/drops")
+        if page.locator("#uploadlinks-section").is_visible():
+            expect(page.locator("#receivers-tab-vaults")).to_be_visible()
+        page.evaluate("t => openAppTarget(t)", "#notes/shared")
+        expect(page.locator("#notes-section")).to_be_visible()
+        expect(page.locator("#notes-tab-shared")).to_be_visible(timeout=10000)
+        page.evaluate("t => openAppTarget(t)", "#shared")
+        expect(page.locator("#shared-section")).to_be_visible()
+        expect(page.locator('#shared-section .tab-btn[data-shared-tab="with-me"]')).to_have_class("tab-btn active")
+    finally:
+        admin.delete_vault(v["id"])
+        admin.put("/settings", json={"sharing_enabled": sharing_before})

@@ -2280,3 +2280,10 @@ details summary:hover {
 /* Row-expand toggle in expandable tables: both skins style it as a bare icon, so drop the native
    button border they never reset (it drew a bevelled box around the chevron). */
 .exp-toggle { border: 0; padding: 0; cursor: pointer; }
+/* A card or row the person was led to (from a notice or the dashboard's Needs-attention lane): lit for a moment. */
+.is-flashed { animation: flash-target 1.8s ease-out; }
+@keyframes flash-target {
+    0%, 45% { box-shadow: 0 0 0 3px var(--primary, var(--brand-secondary, #2563eb)); }
+    100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .is-flashed { animation: none; outline: 3px solid var(--primary, var(--brand-secondary, #2563eb)); } }

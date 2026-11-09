@@ -7950,6 +7950,73 @@ const _NOTIF_TARGET_OPEN = { '#profile': () => openUserSettingsModal() };
 // A notice about one vault opens it: "#vault/" and its id, nothing else (a zero-knowledge vault's name is
 // sealed, so a notice can only name it by id). The id is matched in full before it is used.
 const _NOTIF_VAULT_TARGET = /^#vault\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+// A target that names a tab, or an item, inside a page, as the expiry reminders and the dashboard's
+// Needs-attention lane use: "#shared/by-me", "#notes/shared", "#uploadlinks/drops" (each with an optional
+// item id after it) and "#vault/<vault id>/public-links" (optionally with a link id). Each piece is matched
+// in full before use, and an id only ever selects an element the page has drawn itself.
+const _UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const _TAB_TARGET = new RegExp('^#(shared/by-me|notes/shared|uploadlinks/drops)(?:/(' + _UUID_PATTERN + '))?$');
+const _VAULT_LINKS_TARGET = new RegExp('^#vault/(' + _UUID_PATTERN + ')/public-links(?:/(' + _UUID_PATTERN + '))?$');
+
+// Waits, briefly, for an element the page is still drawing, then scrolls to it and lights it for a moment.
+function _flashWhenDrawn(selector, tries) {
+    let left = tries || 30;
+    const tick = () => {
+        const el = document.querySelector(selector);
+        if (el) {
+            try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) { el.scrollIntoView(); }
+            el.classList.remove('is-flashed');
+            void el.offsetWidth;   // restart the animation when the same element is led to twice
+            el.classList.add('is-flashed');
+            el.addEventListener('animationend', () => el.classList.remove('is-flashed'), { once: true });
+            return;
+        }
+        if (--left > 0) setTimeout(tick, 100);
+    };
+    setTimeout(tick, 50);
+}
+
+// Opens what a target names: a page, a tab of a page (and the item on it), a vault, or a vault's "My public
+// links" dialog. Returns true when the target was understood. Nothing from the target becomes text or markup.
+async function openAppTarget(target) {
+    const t = String(target || '');
+    if (_NOTIF_TARGET_SECTION[t]) { navigateToSection(_NOTIF_TARGET_SECTION[t]); return true; }
+    if (_NOTIF_TARGET_OPEN[t]) { _NOTIF_TARGET_OPEN[t](); return true; }
+    const tab = t.match(_TAB_TARGET);
+    if (tab) {
+        const id = tab[2];
+        if (tab[1] === 'shared/by-me') {
+            // Entering Shared lands on "Shared with me" first; the by-me tab is asked for right after.
+            navigateToSection('shared');
+            switchSharedTab('by-me');
+            if (id) _flashWhenDrawn('#shared-by-me-list [data-share-id="' + id + '"]');
+        } else if (tab[1] === 'notes/shared') {
+            state.notesTab = 'shared';
+            try { localStorage.setItem('notesTab', 'shared'); } catch (_) {}
+            navigateToSection('notes');
+            renderNotes();
+            if (id) _flashWhenDrawn('#notes-tab-shared [data-link-id="' + id + '"]');
+        } else {
+            navigateToSection('uploadlinks');
+            const drops = document.querySelector('#uploadlinks-section [data-rc-tab="vaults"]');
+            if (drops) drops.click();
+            if (id) _flashWhenDrawn('#receivers-vaults [data-receiver-id="' + id + '"]');
+        }
+        return true;
+    }
+    const links = t.match(_VAULT_LINKS_TARGET);
+    if (links) {
+        await openVault(links[1]);
+        if (state.currentVault && state.currentVault.id === links[1]) {
+            await openPublicLinksManage();
+            if (links[2]) _flashWhenDrawn('#pflm-list [data-link-id="' + links[2] + '"]');
+        }
+        return true;
+    }
+    const vault = t.match(_NOTIF_VAULT_TARGET);
+    if (vault) { await openVault(vault[1]); return true; }
+    return false;
+}
 
 async function initNotifications() {
     // Idempotent — called on login AND on refresh-restore. A temp session owns no notifications.
@@ -8026,20 +8093,11 @@ function buildNotifRow(n) {
 
 async function onNotifClick(n) {
     if (!n.is_read) await markNotifRead(n.id);
-    const section = _NOTIF_TARGET_SECTION[n.target];
     const menu = document.querySelector('.notif-menu'); if (menu) menu.classList.remove('active');
-    if (section) {
-        const item = document.querySelector('.sidebar-item[data-section="' + section + '"]');
-        if (item) item.click();
-    } else if (_NOTIF_TARGET_OPEN[n.target]) {
-        _NOTIF_TARGET_OPEN[n.target]();
-    } else {
-        const vault = String(n.target || '').match(_NOTIF_VAULT_TARGET);
-        if (vault) await openVault(vault[1]);
-        else if (n.target && typeof window.openNotifTarget === 'function') {
-            // A target that carries another id (static/js/compliance.js).
-            window.openNotifTarget(n.target);
-        }
+    if (await openAppTarget(n.target)) return;
+    if (n.target && typeof window.openNotifTarget === 'function') {
+        // A target that carries another id (static/js/compliance.js).
+        window.openNotifTarget(n.target);
     }
 }
 
@@ -21453,6 +21511,7 @@ function _fmtLinkExpiry(iso) {
 
 function _noteLinkCard(l) {
     const card = _el('div', 'card note-link-card');
+    card.setAttribute('data-link-id', l.id);
     const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
     if (hex) card.style.borderLeft = '4px solid ' + hex;
     const body = _el('div', 'card-body');
@@ -22234,6 +22293,7 @@ function renderMyPublicLinks(links) {
     const tb = _el('tbody');
     links.forEach(l => {
         const tr = _el('tr');
+        tr.setAttribute('data-link-id', l.id);
         const typeTd = _el('td', 'nl-tag-cell');
         const hex = (typeof noteLinkColorHex === 'function') ? noteLinkColorHex(l.tag_border_color) : '';
         if (hex) { const dot = _el('span', 'nl-color-dot'); dot.style.background = hex; typeTd.appendChild(dot); }
@@ -22442,6 +22502,7 @@ function renderReceiverVaults(receivers) {
     const grid = document.createElement('div'); grid.className = 'rc-vault-grid';
     receivers.forEach(r => {
         const card = document.createElement('div'); card.className = 'card rc-vault-card';
+        card.setAttribute('data-receiver-id', r.id);
         const head = document.createElement('div'); head.className = 'rc-vault-head';
         if (r.tag_icon) head.appendChild(_svgIcon(r.tag_icon, 'icon-sm'));
         const nm = document.createElement('div'); nm.className = 'rc-vault-name font-medium'; nm.textContent = r.label || 'Upload link'; head.appendChild(nm);
