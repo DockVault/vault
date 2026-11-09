@@ -16,6 +16,10 @@ the 0.33 line.
   0.34.0 exists, a 0.33 patch release comes from `main` like any other release.
 - A release candidate is pushed as `candidate/X.Y.Z`. Candidates get the full test run on demand;
   pushes to `main` and to `release/X.Y` branches run the merge checks automatically.
+- While a line is supported, its `release/X.Y` branch gets the full test run and the setup scenarios
+  every night, and its published `:vX.Y` image is scanned every week
+  (`.github/workflows/maintenance-lines.yml`, reading `lines` in `docs/upgrade-matrix.json`).
+  Dependabot proposes patch updates against the branch.
 
 ## Image tags
 
