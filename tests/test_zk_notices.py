@@ -311,9 +311,14 @@ def test_the_web_app_opens_the_vault_a_notice_names_and_nothing_else():
     for other in (f"#vault/{vid}/x", f"#vault/{vid[:-1]}", "#vault/../settings", f"#vaults/{vid}",
                   f"#vault/{vid.upper()}", f"javascript:#vault/{vid}"):
         assert not pattern.fullmatch(other), other
+    # A click on a notice opens what its target names through openAppTarget, which matches the whole
+    # target against the pattern and opens that vault and nothing else.
     click = app_js[app_js.index("async function onNotifClick("):app_js.index("async function markNotifRead(")]
-    assert "String(n.target || '').match(_NOTIF_VAULT_TARGET)" in click
-    assert "if (vault) await openVault(vault[1]);" in click
+    assert "await openAppTarget(n.target)" in click
+    opener = app_js[app_js.index("async function openAppTarget("):app_js.index("async function initNotifications(")]
+    assert "const t = String(target || '');" in opener
+    assert "const vault = t.match(_NOTIF_VAULT_TARGET);" in opener
+    assert "if (vault) { await openVault(vault[1]); return true; }" in opener
 
 
 def test_a_notice_that_cannot_be_written_never_raises(world, monkeypatch):
