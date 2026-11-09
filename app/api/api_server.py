@@ -5413,9 +5413,13 @@ async def resend_invite(
     db: Session = Depends(get_db),
     request: Request = None,
 ):
-    """Send a pending invitation again: a new link (the old one stops working at once), a fresh expiry from
-    the policy's lifetime, emailed when the invitation carries an address and mail is set up. The new link is
-    returned once, as at creation, for the administrator to copy. Only a pending invitation can be resent."""
+    """Send a pending invitation again: the invitation is revoked and made anew (same name, address, role,
+    maker and lineage), so the old link is dead on every path that reads an invitation, with a fresh expiry
+    from the policy's lifetime, emailed when the invitation carries an address and mail is set up. The new
+    link is returned once, as at creation, for its maker to copy. Only the administrator who made an
+    invitation may send it again, whatever its role: the new link reaches whoever asks for it, and an
+    administrator's invitation records its maker as the one who held the link. Only a pending invitation
+    can be resent."""
     from app.core.models import AccountInvitation
     from app.core import invitations
     try:
@@ -5428,6 +5432,9 @@ async def resend_invite(
     now = datetime.utcnow()
     if _invite_status(inv, now) != "pending":
         raise HTTPException(status_code=400, detail="Only a pending invitation can be sent again.")
+    if inv.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail=(
+            "Only the administrator who sent this invitation can resend it. Revoke it and send a new one."))
     pol = _account_policy(db)
     if not pol.get("invite_enabled"):
         raise HTTPException(status_code=400, detail="Invitations are disabled for this deployment.")
@@ -5442,16 +5449,28 @@ async def resend_invite(
             "An account now uses this invitation's name or email address, so it cannot be sent again; revoke it."))
     old_prefix = inv.token_prefix
     plaintext, prefix = invitations.mint_invite()
-    inv.token_prefix = prefix
-    inv.token_hash = invitations.hash_invite_token(plaintext, pepper)
     _ttl_h = int(pol.get("invite_ttl_hours") or 24)
-    inv.expires_at = now + timedelta(hours=_ttl_h)
-    db.commit()
-    db.refresh(inv)
+    # The old invitation is revoked and a new one made in its place, in one transaction: every path that
+    # reads an invitation refuses a revoked one, so the old link dies at once, an acceptance already begun
+    # with it included; the record of the acceptance then names the link that was used.
+    inv.revoked_at = now
+    made = AccountInvitation(
+        username=inv.username, email=inv.email, role=inv.role,
+        token_prefix=prefix, token_hash=invitations.hash_invite_token(plaintext, pepper),
+        expires_at=now + timedelta(hours=_ttl_h), created_by=inv.created_by, inviter_lineage=inv.inviter_lineage)
+    db.add(made)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Could not send the invitation again; please try again.")
+    db.refresh(made)
+    inv = made
     try:
         AuditLogger(db).log_action(
             action="account_invitation_resent", status="success", user=current_user,
             ip_address=get_client_ip(request) if request is not None else None,
+            resource_type="account_invitation", resource_id=str(inv.id),
             details={"username": inv.username, "email": inv.email, "role": inv.role,
                      "token_prefix": prefix, "replaced_token_prefix": old_prefix})
     except Exception:

@@ -254,6 +254,7 @@ CHANGES_AN_ACCOUNT = {
     ("POST", "/admin/credential-requests/{change_id}/approve"),
     ("POST", "/users"),
     ("POST", "/invites"),
+    ("POST", "/invites/{invite_id}/resend"),     # makes the invitation anew: a new link to an account to be
 }
 
 # Routes that name an account, or look as if they change one, but change something else, with the reason.
