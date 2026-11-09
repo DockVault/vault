@@ -285,7 +285,8 @@ def test_every_place_that_audits_a_failed_sign_in_writes_the_record():
     from app.api import api_server as api
     from app.sftp import sftp_server
     src = inspect.getsource(api)
-    assert src.count("log_second_factor_failure(") == 2
+    # The authenticator code's two sites, and the passkey's two (the sign-in's second step, the step-up).
+    assert src.count("log_second_factor_failure(") == 4
     assert '"second_factor_failed"' not in src and "action=\"second_factor_failed\"" not in src
     assert inspect.getsource(sftp_server).count("audit_logger.log_login_failure(") == 2
     # Nothing else writes those rows except through the two methods that write the record with them.

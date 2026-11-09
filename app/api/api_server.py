@@ -11996,7 +11996,7 @@ def _passkey_raw_id(credential) -> Optional[bytes]:
     return _passkey_b64url_decode(credential.get("rawId")) if isinstance(credential, dict) else None
 
 
-def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, record: bool = True):
+async def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, record: bool = True):
     """The generic refusal of a passkey sign-in: an audit row (naming the account only when a known key named
     it), the security monitor's counter, and, for a known key whose own proof failed (``record``), the lockouts'
     count against its account as a wrong password counts. A refusal that needed no proof (a challenge or a key
@@ -12025,7 +12025,9 @@ def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, recor
                                 "recognize."), target="#profile")
         except Exception as e:      # noqa: BLE001
             print(f"⚠ passkey notice skipped: {type(e).__name__}")
-    _fire_offloop(_record_failed_login_bg, username, client_ip, reason, record_id)
+    # Awaited in the offload pool, as the password door does: the brute-force counter must advance on every
+    # refusal and is never shed under a spray.
+    await run_offloaded(_record_failed_login_bg, username, client_ip, reason, record_id)
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="That passkey was not accepted.")
 
 
@@ -12087,23 +12089,23 @@ async def passkey_sign_in_verify(
         throttle = AuthService(db)._check_rate_limit(named, client_ip)
     except AuthRateLimitExceededError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts; please wait a few minutes.",
-                            headers={"Retry-After": str(int(e.retry_after or 60))})
+                            headers={"Retry-After": str(e.retry_after)})
     try:
         challenge = webauthn_challenges.take(body.challenge_id, purpose=webauthn_challenges.SIGN_IN)
     except webauthn_challenges.Unavailable:
         raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
     if challenge is None:
-        raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="passkey challenge unknown or expired")
+        raise await _passkey_sign_in_refused(db, request, client_ip, user=None, reason="passkey challenge unknown or expired")
     rp = ws.relying_party("") if _passkeys_enabled(db) else None
     if rp is None:
         raise HTTPException(status_code=409, detail="Passkeys are not available on this deployment.")
     row = (db.query(WebAuthnCredential).filter(WebAuthnCredential.credential_id == raw_id).first()
            if raw_id else None)
     if row is None or row.retired_at is not None:
-        raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
+        raise await _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
     user = db.query(User).filter(User.id == row.user_id).first()
     if user is None:
-        raise _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
+        raise await _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
     # The lockouts first, before anything is counted against the account or the signature is checked, as the
     # password path does: a locked account's guesses stay bounded, and nothing here adds to its counts.
     lock = sign_in_lockout.lock_in_force(db, user.id, client_ip)
@@ -12115,7 +12117,7 @@ async def passkey_sign_in_verify(
     if challenge.user_id is not None and challenge.user_id != str(user.id):
         # A key named against another account's challenge: no proof was made, so it counts against the address
         # (the throttle above), never against the key's owner, whose credential id is public.
-        raise _passkey_sign_in_refused(db, request, client_ip, user=user, reason="passkey of another account",
+        raise await _passkey_sign_in_refused(db, request, client_ip, user=user, reason="passkey of another account",
                                        record=False)
     known = ws.KnownKey(credential_id=row.credential_id, public_key_cose=row.public_key_cose, cose_alg=row.cose_alg,
                         sign_count=int(row.sign_count or 0), backup_eligible=bool(row.backup_eligible),
@@ -12126,7 +12128,7 @@ async def passkey_sign_in_verify(
         assertion = ws.verify_authentication(rp, _passkey_policy(db), challenge=challenge.challenge_bytes,
                                              credential=body.credential, key=known, allow_ids=allow_ids)
     except ws.Refused as refused:
-        raise _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}")
+        raise await _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}")
     method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
     result = sign_in.SignInResult(user, [method], client_ip, user_verified=assertion.uv,
                                   passwordless_allowed=_passkey_passwordless_allowed(db, user))

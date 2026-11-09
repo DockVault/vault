@@ -107,7 +107,7 @@ def get_managed_settings(current_user: User = Depends(require_interactive_admin)
 
 # Pages whose settings have a route of their own, with guards these routes know nothing of (the Sign-in page's
 # passkey settings: app/api/sign_in_settings_router.py, under its own fixed step-up). Neither listed nor written here.
-OWN_ROUTE_PAGES = ("sign_in",)
+OWN_ROUTE_PAGES = ("signin",)
 
 
 def listed_specs() -> list:

@@ -31,6 +31,14 @@ NOT_RECORDED = {
         "the export, posted so what was typed stays out of the request line; its handler records it",
     ("app/api/api_server.py", "POST /auth/second-factor/cancel"):
         "abandons a pending sign-in; no session was made",
+    ("app/api/api_server.py", "POST /auth/passkeys/sign-in/options"):
+        "issues a challenge; the sign-in is recorded when the answer is verified or refused",
+    ("app/api/api_server.py", "POST /auth/second-factor/passkey/options"):
+        "issues a challenge for the sign-in's second step; the answer is recorded",
+    ("app/api/api_server.py", "POST /auth/passkeys/step-up/options"):
+        "issues a challenge for a step-up; the step-up records its outcome",
+    ("app/api/api_server.py", "POST /users/me/passkeys/register/options"):
+        "issues a challenge; the registration is recorded when the key is verified",
     ("app/api/api_server.py", "POST /auth/second-factor/challenge"):
         "only lists the methods a step-up accepts; the step-up itself is recorded when it fails",
     ("app/api/api_server.py", "POST /users/me/second-factor/totp/enroll"):

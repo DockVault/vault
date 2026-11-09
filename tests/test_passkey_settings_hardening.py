@@ -218,7 +218,7 @@ def test_bounds_refuse_before_the_step_up_and_the_managed_route_knows_nothing_of
     assert stepped == []
     # The managed-settings route neither lists nor writes a Sign-in page setting; the other pages stay its own.
     rows = managed.listed_specs()
-    assert rows and not [r for r in rows if r["key"] in wss.KEYS] and not [r for r in rows if r["page"] == "sign_in"]
+    assert rows and not [r for r in rows if r["key"] in wss.KEYS] and not [r for r in rows if r["page"] == "signin"]
     with pytest.raises(HTTPException) as refused:
         managed.spec_or_404("webauthn_mode")
     assert refused.value.status_code == 404

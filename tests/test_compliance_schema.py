@@ -155,9 +155,15 @@ def test_the_case_index_is_built_in_the_background_and_never_at_start():
 
 
 def test_the_new_tables_are_new_so_create_all_builds_them_and_no_start_statement_alters_them():
+    """The tables were new in 0.34.0, so that release built them whole. 0.36.0 adds one column to auditor_grants
+    (the passkeys an auditor right was approved with), which a deployment on 0.34.0 gets at start-up; nothing else
+    alters these tables at start."""
     source = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    allowed = {"auditor_grants": {"approved_credential_ids"}}
     for table in TABLES:
-        assert not re.search(rf"ALTER TABLE (IF EXISTS )?{table}\b", source), table
+        for statement in re.findall(rf"ALTER TABLE (?:IF EXISTS )?{table}\b[^\n\"]*", source):
+            columns = set(re.findall(r"ADD COLUMN IF NOT EXISTS (\w+)", statement))
+            assert columns and columns <= allowed.get(table, set()), (table, statement)
 
 
 # --------------------------------------------------------------------------- case numbers

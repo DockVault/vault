@@ -61,7 +61,9 @@ def test_both_levels_are_used_and_most_settings_are_advanced():
 
 
 def test_the_managed_settings_are_on_their_page_and_the_rate_limits_on_security():
-    assert {spec.page for spec in reg.all_specs()} == {reg.MANAGED_PAGE} == {"records"}
+    # The records page holds the managed settings; the sign-in page holds how people sign in (the passkey settings,
+    # written through their own route).
+    assert {spec.page for spec in reg.all_specs()} == {reg.MANAGED_PAGE, "signin"} and reg.MANAGED_PAGE == "records"
     assert {listed.page for listed in reg.all_listed()} == {"security"}
 
 
@@ -72,7 +74,7 @@ def test_the_records_page_draws_every_group_of_its_settings():
     assert js.count("const GROUPS = [") == 1
     start = js.index("const GROUPS = [")
     drawn = set(re.findall(r"\['([a-z_]+)', '", js[start:js.index("];", start)]))
-    missing = {spec.group for spec in reg.all_specs()} - drawn
+    missing = {spec.group for spec in reg.all_specs() if spec.page == reg.MANAGED_PAGE} - drawn
     assert not missing, sorted(missing)
 
 
@@ -323,7 +325,8 @@ def markup():
 def test_the_pages_are_the_tabs_of_the_settings_section(markup):
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     tabs = re.findall(r'<button class="tab-btn(?: active)?" data-tab="([a-z]+)"(?: aria-current="page")?>', html)
-    assert tuple(tabs) == reg.PAGES
+    # The sign-in page's tab lands with its pages (the passkey and single sign-on settings).
+    assert tuple(tabs) == tuple(page for page in reg.PAGES if page != "signin")
     assert {page for _, page in markup.settings} <= set(reg.PAGES)
 
 

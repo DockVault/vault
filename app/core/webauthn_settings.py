@@ -1,6 +1,6 @@
 """The passkey settings: what an administrator tunes on Settings → Sign-in, and the rules that read them.
 
-Registered in the settings registry (group ``webauthn``, page ``sign_in``, lockable by the deployment) so the
+Registered in the settings registry (group ``webauthn``, page ``signin``, lockable by the deployment) so the
 panel lists them with the value in force and ``SETTINGS_LOCKED_KEYS`` can name them; every write goes through
 the sign-in settings routes under the fixed step-up ``admin.auth_policy.write``. The service's policy
 (app/services/webauthn_service.PasskeyPolicy) is built from them here, so the routes never read a setting by
@@ -32,7 +32,7 @@ from typing import Optional, Tuple
 from app.core import settings_registry as registry
 
 GROUP = "webauthn"
-PAGE = "sign_in"
+PAGE = "signin"                 # the Settings section's slot for how people sign in
 SINCE = "0.36.0"
 STEP_UP_ACTION = "admin.auth_policy.write"
 

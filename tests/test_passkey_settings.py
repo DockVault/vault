@@ -38,7 +38,7 @@ def _resolving(monkeypatch, registry, values: dict):
 def test_the_nine_settings_live_on_the_sign_in_page_with_their_defaults():
     registry, wss = _mod()
     specs = {s.key: s for s in registry.all_specs() if s.group == wss.GROUP}
-    assert set(specs) == set(wss.KEYS) and all(s.page == "sign_in" and s.since == "0.36.0" and s.editable == registry.ADMIN
+    assert set(specs) == set(wss.KEYS) and all(s.page == "signin" and s.since == "0.36.0" and s.editable == registry.ADMIN
                                               and s.lockable for s in specs.values())
     assert specs[wss.MODE].default == "optional" and specs[wss.GRACE_DAYS].default == 14
     assert specs[wss.SIGN_IN_ROLES].default == ["user", "external"] and specs[wss.SIGN_IN_ROLES].choices == ("user", "external")
@@ -48,7 +48,7 @@ def test_the_nine_settings_live_on_the_sign_in_page_with_their_defaults():
     assert "may hold only user, external" in registry.check_value(specs[wss.SIGN_IN_ROLES], ["admin"])
     assert registry.check_value(specs[wss.ALLOWED_ALGS], []) and registry.check_value(specs[wss.ALLOWED_ALGS], ["MD5"])
     assert registry.check_value(specs[wss.ALLOWED_AAGUIDS], ["not-a-uuid"]) and registry.check_value(specs[wss.ALLOWED_AAGUIDS], [str(uuid.uuid4())]) is None
-    assert "sign_in" in registry.PAGES
+    assert "signin" in registry.PAGES
 
 
 def test_the_policy_is_built_from_the_settings(monkeypatch):

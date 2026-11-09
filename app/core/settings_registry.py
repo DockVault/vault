@@ -118,7 +118,7 @@ LEVELS = (ESSENTIAL, ADVANCED)
 # In the order the Settings section lists them (static/index.html): grouped as Organisation, Security and access,
 # Sharing and links, Email, Records.
 PAGES = ("general", "branding", "storage", "security", "accounts", "sftp", "sharing", "notelinks", "uploadlinks",
-         "email", "records", "logs", "sign_in")
+         "email", "records", "logs", "signin")
 # The page that shows the settings this registry resolves (the managed settings).
 MANAGED_PAGE = "records"
 
