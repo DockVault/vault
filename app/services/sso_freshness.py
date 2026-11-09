@@ -33,9 +33,16 @@ class Deadline:
     identity_id: str
     user_id: str
     provider_id: str
-    provider_name: str          # the sign-in button's label, else the provider's name
+    provider_name: str          # the provider's name, else its button label
     due: datetime               # naive UTC, like the columns
     refused: bool               # the provider refused the person after their last sign-in through it
+    window_days: int = 0        # the provider's freshness window (0: off, a refusal alone)
+
+
+def warning_lead(window_days: int) -> timedelta:
+    """How long before a deadline the person is warned: :data:`WARNING_DAYS`, but never more than half the window, so
+    a short window does not warn right after every sign-in (a window of a day warns not at all)."""
+    return timedelta(days=min(WARNING_DAYS, max(0, int(window_days)) // 2))
 
 
 def _tables_present(db) -> bool:
@@ -60,7 +67,7 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
     due = since + timedelta(days=days) if days > 0 else refused_at
     name = (getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
     return Deadline(identity_id=str(identity.id), user_id=str(identity.user_id), provider_id=str(identity.provider_id),
-                    provider_name=name or "your identity provider", due=due, refused=refused)
+                    provider_name=name or "your identity provider", due=due, refused=refused, window_days=days)
 
 
 def deadlines(db, user_id) -> List[Deadline]:
@@ -102,8 +109,8 @@ def warning_text(found: Deadline, when: str) -> str:
             f"and devices pause then, and a sign-in through {found.provider_name} restores them.")
 
 
-def _all_deadlines(db) -> List[Deadline]:
-    """Every identity's deadline in two queries (the identities, the providers), for the sweep and the user list."""
+def _identities_with_deadlines(db) -> list:
+    """Every identity a provider asks of, with its deadline, in two queries (the identities, the providers)."""
     if not _tables_present(db):
         return []
     from app.core.models import ExternalIdentity, SsoProvider
@@ -112,8 +119,12 @@ def _all_deadlines(db) -> List[Deadline]:
     for identity in db.query(ExternalIdentity).all():
         found = deadline_of(identity, providers.get(str(identity.provider_id)))
         if found is not None:
-            out.append(found)
+            out.append((identity, found))
     return out
+
+
+def _all_deadlines(db) -> List[Deadline]:
+    return [found for _, found in _identities_with_deadlines(db)]
 
 
 def standing_of(db, now: Optional[datetime] = None) -> dict:
@@ -145,17 +156,25 @@ def _audit(db, action: str, *, user, details: dict) -> None:
 
 
 def sweep(db, now: Optional[datetime] = None) -> dict:
-    """The daily pass: a person whose deadline is within :data:`WARNING_DAYS` days is told, in the app and by email,
-    once for that deadline; one whose deadline has passed is told their keys paused, once for that deadline, and the
-    administrators get one notice for the accounts that lapsed in this pass. A refusal was told when it happened and
-    is not told again here. Writes its audit rows into ``db`` (the caller commits); the notices commit in their own
-    sessions, and their dedup keys are what makes each telling happen once. Returns the counts."""
+    """The daily pass: a person whose deadline is near (:func:`warning_lead`) is told, in the app and by email, once
+    for that deadline; one whose deadline has passed is told their keys paused, once for that deadline, and the
+    administrators get one notice for the accounts that paused in this pass. A refusal was told when it happened and
+    is not told again here. What was told is kept on the identity row (``freshness_warned_for``,
+    ``freshness_paused_for``) in ``db``, with the audit rows, so a pass that rolls back tells again and a notice the
+    person deleted is not sent again; the notices commit in their own sessions and keep their own dedup keys, so a
+    retried pass adds no second notice or email. The caller commits. Returns the counts."""
     from app.api import api_server as api
     from app.core.models import User
     now = now or datetime.utcnow()
     warned, paused = 0, []
-    for found in _all_deadlines(db):
-        if found.refused or found.due - timedelta(days=WARNING_DAYS) > now:
+    for identity, found in _identities_with_deadlines(db):
+        if found.refused:
+            continue
+        if found.due > now:
+            lead = warning_lead(found.window_days)
+            if not lead or found.due - lead > now or getattr(identity, "freshness_warned_for", None) == found.due:
+                continue
+        elif getattr(identity, "freshness_paused_for", None) == found.due:
             continue
         user = db.query(User).filter(User.id == uuid.UUID(found.user_id)).first()
         if user is None or not user.is_active:
@@ -170,20 +189,20 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
                 body=(f"Your SSH keys, temporary credentials and devices pause on {when} unless you sign in through "
                       f"{found.provider_name} before then. Signing in restores them at any time."),
                 target=NOTICE_TARGET, dedup_prefix=f"{WARNED}:{found.identity_id}:{due_day}")
-            if told:
-                warned += 1
-                _audit(db, WARNED, user=user, details=details)
-                if user.email:
-                    api._fire_action_email(db, "sso_freshness_warning", email=user.email, username=user.username,
-                                           action_context={"change": warning_text(found, when), "when": when})
+            warned += 1
+            identity.freshness_warned_for = found.due
+            _audit(db, WARNED, user=user, details=details)
+            if told and user.email:
+                api._fire_action_email(db, "sso_freshness_warning", email=user.email, username=user.username,
+                                       action_context={"change": warning_text(found, when), "when": when})
         else:
-            told = api._notify_users(
+            api._notify_users(
                 [found.user_id], EXPIRED, title="Your SSH keys and temporary credentials are paused",
                 body=refusal_text(found), target=NOTICE_TARGET,
                 dedup_prefix=f"{EXPIRED}:{found.identity_id}:{due_day}")
-            if told:
-                paused.append(user.username)
-                _audit(db, EXPIRED, user=user, details=details)
+            paused.append(user.username)
+            identity.freshness_paused_for = found.due
+            _audit(db, EXPIRED, user=user, details=details)
     if paused:
         admins = [str(a.id) for a in api._active_admins(db)]
         shown = ", ".join(sorted(paused)[:20]) + (f" and {len(paused) - 20} more" if len(paused) > 20 else "")
@@ -220,6 +239,10 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
         return False
     identity.refused_at = now or datetime.utcnow()
     ended = api._revoke_sessions(db, user_id=user.id, actor_username="system", durable=True)
+    # A sign-in already under way (a pending password or second-factor step) does not finish after the refusal.
+    from app.core.models import PendingLogin
+    db.query(PendingLogin).filter(PendingLogin.user_id == user.id, PendingLogin.consumed_at.is_(None)).update(
+        {PendingLogin.consumed_at: identity.refused_at}, synchronize_session=False)
     from app.services.audit_logger import AuditLogger
     db.add(AuditLogger(db).build_row(
         action=ENDED, status="success", user=user, ip_address=client_ip, resource_type="user",
@@ -229,10 +252,13 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
     label = (getattr(row, "name", None) or "").strip() or (getattr(row, "label", None) or "the identity provider")
     try:
         admins = [str(a.id) for a in api._active_admins(db)]
-        api._notify_users(admins, ENDED, title=f"{label} refused {user.username}: access ended",
+        password_too = "" if getattr(user, "sso_only", False) else (
+            " Their password still signs them in to the web app unless the account signs in only through the provider.")
+        api._notify_users(admins, ENDED, title=f"{label} refused {user.username}: sessions ended, keys paused",
                           body=(f"{label} signed {user.username} in with a token its restriction excludes (a tenant, "
                                 "a domain or a required group), so their sessions ended and their SSH keys, temporary "
-                                "credentials and devices paused. A later sign-in the provider admits restores them."),
+                                "credentials and devices paused until a later sign-in the provider admits, or until "
+                                "an administrator clears the refusal." + password_too),
                           target="#users", dedup_prefix=f"{ENDED}:{identity.id}:{identity.refused_at:%Y-%m-%d}")
     except Exception:  # noqa: BLE001 -- the ending and its row stand without the notice
         pass

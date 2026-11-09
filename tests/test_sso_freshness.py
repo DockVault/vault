@@ -462,3 +462,40 @@ def test_refused_then_the_provider_disabled_the_ssh_key_and_the_temporary_creden
     p.state = "enabled"
     i.last_sign_in_at = datetime.utcnow() + timedelta(seconds=1)
     assert S.SFTPServer("203.0.113.9").check_auth_publickey("alice", key) == paramiko.AUTH_SUCCESSFUL
+
+
+def test_a_short_window_warns_within_half_of_it_and_a_window_of_a_day_not_at_all(told):
+    assert F.warning_lead(1) == timedelta(0) and F.warning_lead(4) == 2 * DAY and F.warning_lead(30) == 5 * DAY
+    assert F.warning_lead(0) == timedelta(0)
+    alice, bob = _user(), _user("bob")
+    daily, short = _provider(1, name="daily"), _provider(4, name="short")
+    ia = _identity(alice, daily, signed_in=NOW - timedelta(hours=12))      # due in 12 hours: never warned
+    ib = _identity(bob, short, signed_in=NOW - DAY)                        # due in 3 days, warned 2 days before
+    db = _db([alice, bob], [daily, short], [ia, ib])
+    assert F.sweep(db, NOW) == {"warned": 0, "lapsed": 0} and told.emails == []
+    assert F.sweep(db, NOW + DAY + timedelta(hours=1)) == {"warned": 1, "lapsed": 1}
+    assert [e[1] for e in told.emails] == ["bob@example.test"]
+
+
+def test_told_once_is_kept_on_the_identity_whatever_becomes_of_the_notices(told):
+    alice, p = _user(), _provider(30)
+    i = _identity(alice, p, signed_in=NOW - 27 * DAY)
+    db = _db([alice], [p], [i])
+    assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 0} and len(told.emails) == 1
+    assert i.freshness_warned_for == NOW + 3 * DAY
+    # The person deleted the notice (or it was pruned): not told again.
+    told.seen.clear()
+    assert F.sweep(db, NOW + DAY) == {"warned": 0, "lapsed": 0} and len(told.emails) == 1
+    # A pass whose transaction rolled back: the row's mark is lost, its notice was kept. Recorded again, with no
+    # second notice and no second email.
+    i.freshness_warned_for = None
+    told.seen.add(f"{F.WARNED}:{i.id}:{(NOW + 3 * DAY):%Y-%m-%d}:{alice.id}")
+    shown = len(told.notices)
+    assert F.sweep(db, NOW + DAY) == {"warned": 1, "lapsed": 0}
+    assert len(told.emails) == 1 and len(told.notices) == shown
+    assert [a for a, _, _ in told.audits].count(F.WARNED) == 2
+    # The pause is told once, and not again once its notice is gone.
+    assert F.sweep(db, NOW + 4 * DAY) == {"warned": 0, "lapsed": 1} and i.freshness_paused_for == NOW + 3 * DAY
+    told.seen.clear()
+    assert F.sweep(db, NOW + 5 * DAY) == {"warned": 0, "lapsed": 0}
+

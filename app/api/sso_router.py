@@ -948,6 +948,14 @@ async def unlink_my_identity(
             "Your account signs in only through single sign-on, and this is its only identity. Ask an "
             "administrator for a password first."))
     row = _provider(db, identity.provider_id)
+    # An identity whose provider refused the person, or whose freshness has lapsed, is not unlinked by its owner:
+    # unlinking would end the provider's say over the account's keys and credentials.
+    standing = sso_freshness.deadline_of(identity, row)
+    if standing is not None and (standing.refused or standing.due <= datetime.utcnow()):
+        raise HTTPException(status_code=409, detail={"reason": "sso_freshness_lapsed", "message": (
+            f"{standing.provider_name} refused your account; an administrator must clear that before you can unlink it."
+            if standing.refused else
+            f"Sign in through {standing.provider_name} again before you unlink it.")})
     provider_id = str(identity.provider_id)
     db.delete(identity)
     db.commit()

@@ -1013,6 +1013,10 @@ def _refusal_world(monkeypatch, **policy):
 def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provider_admits_it(monkeypatch):
     from app.services import sso_freshness as F
     h, alice, root, p, identity, callback_with = _refusal_world(monkeypatch)
+    from app.core.models import PendingLogin
+    pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, consumed_at=None)
+    others = types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, consumed_at=None)
+    h.db.rows_of(PendingLogin).extend([pending, others])
     # A missing claim refuses the sign-in and ends nothing: it is not proof.
     assert callback_with(groups=...) == "/#sso-error=restriction_claim_missing"
     assert identity.refused_at is None and h.revoked == []
@@ -1024,7 +1028,9 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
             {"provider_id": str(p.id), "identity_id": str(identity.id), "sessions": 2}) in h.audits
     assert ("sso_sign_in_refused", "failure",
             {"provider_id": str(p.id), "purpose": "sign_in", "reason": "restricted"}) in h.audits
-    assert ([str(root.id)], "contoso refused alice: access ended") in h.notices
+    assert ([str(root.id)], "contoso refused alice: sessions ended, keys paused") in h.notices
+    # A sign-in already under way for alice ends with the refusal; another account's does not.
+    assert pending.consumed_at is not None and others.consumed_at is None
     assert F.lapsed(h.db, alice.id) is not None
     # A sign-in the provider admits answers the refusal.
     location = callback_with(groups=["vault-users"])
@@ -1084,4 +1090,26 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     assert status == 409 and body["detail"]["reason"] == "not_refused" and steps == ["root"]
     assert _call(h.S, "POST", f"/admin/sso/identities/{uuid.uuid4()}/clear-refusal")[0] == 404
     assert _call(h.S, "POST", "/admin/sso/identities/not-an-id/clear-refusal")[0] == 404
+
+
+def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_owner(monkeypatch):
+    """Unlinking would end the provider's say over the account's keys and credentials: refused while the provider's
+    refusal stands or its window has lapsed, whatever the provider's state; allowed once the person signed in again."""
+    from datetime import timedelta
+    alice, p = _user(), _provider()
+    identity = _identity(alice, p, refused_at=datetime.utcnow())
+    h = Harness(monkeypatch, [alice], [p], identities=[identity])
+    for state in ("enabled", "disabled"):
+        p.state = state
+        status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+        assert status == 409 and out["detail"]["reason"] == "sso_freshness_lapsed", out
+        assert "an administrator must clear" in out["detail"]["message"]
+    p.state = "enabled"
+    identity.refused_at, identity.last_sign_in_at = None, datetime.utcnow() - timedelta(days=31)
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+    assert status == 409 and out["detail"]["message"] == "Sign in through contoso again before you unlink it."
+    assert len(h.identities()) == 1
+    identity.last_sign_in_at = datetime.utcnow()
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+    assert status == 200 and h.identities() == []
 

@@ -3904,6 +3904,10 @@ class ExternalIdentity(Base):
     linked_by = Column(String(16), nullable=False)                   # self | invitation | jit | admin
     last_sign_in_at = Column(DateTime, nullable=True)
     refused_at = Column(DateTime, nullable=True)
+    # The freshness deadline the person was last warned about, and the one they were last told had paused their keys:
+    # each is told once, in the same transaction as its audit row.
+    freshness_warned_for = Column(DateTime, nullable=True)
+    freshness_paused_for = Column(DateTime, nullable=True)
 
     user = relationship('User', backref=backref('external_identities', cascade='all, delete-orphan',
                                                 passive_deletes=True))
