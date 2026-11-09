@@ -1,6 +1,7 @@
 """The phone and tablet pass: every section of the signed-in app, both skins, at 390, 768 and 1024 pixels, as an
-administrator and as a user; nothing wider than the screen, no sideways scroll, the main dialogs on screen; the
-public upload page at phone width too."""
+administrator, as a user and as a share recipient; every Settings page; nothing wider than the screen, no sideways
+scroll, the dialogs on screen at every width; the public upload, file-link and note-link pages at phone width too,
+each with an owner's message."""
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -12,6 +13,10 @@ WIDTHS = {"phone": (390, 844), "tablet": (768, 1024), "small-laptop": (1024, 768
 ADMIN_SECTIONS = ["dashboard", "vaults", "shared", "notes", "uploadlinks", "temp-creds", "users", "groups",
                   "activity", "compliance", "settings"]
 USER_SECTIONS = ["dashboard", "vaults", "shared", "notes", "temp-creds"]
+SETTINGS_PAGES = ["general", "branding", "storage", "security", "accounts", "sftp", "sharing", "notelinks",
+                  "uploadlinks", "email", "records", "logs"]
+OWNER_MESSAGE = ("A message long enough to wrap on a phone screen, twice over, so that its box is tested: "
+                 "averyveryverylongwordwithoutanyspacesinitatalltoseethatitbreaksinsteadofoverflowing.")
 
 OVERFLOW_JS = """() => {
   const w = document.documentElement.clientWidth;
@@ -110,7 +115,7 @@ def test_an_administrators_sections_fit_the_screen(page: Page, people, skin, wid
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
-@pytest.mark.parametrize("width", ["phone", "tablet"])
+@pytest.mark.parametrize("width", list(WIDTHS))
 def test_a_users_sections_fit_the_screen(page: Page, people, skin, width):
     _a, u, _v = people
     _login(page, u, skin, WIDTHS[width])
@@ -167,3 +172,164 @@ def test_the_upload_page_fits_a_phone(page: Page, admin):
         assert page.evaluate("() => document.documentElement.scrollWidth") <= 391
     finally:
         admin.put("/settings", json={k: before.get(k) for k in ("public_receivers_enabled", "public_receiver_user_cap")})
+
+
+def _dialog_box_fits(page: Page, modal_id: str, width: int):
+    box = page.locator(f"#{modal_id} .modal-content").bounding_box()
+    return bool(box) and box["x"] >= 0 and box["x"] + box["width"] <= width + 1, box
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+@pytest.mark.parametrize("width", list(WIDTHS))
+def test_every_settings_page_fits_the_screen(page: Page, people, skin, width):
+    a, _u, _v = people
+    _login(page, a, skin, WIDTHS[width])
+    assert _go(page, "settings")
+    expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
+    problems = {}
+    visited = []
+    for tab in SETTINGS_PAGES:
+        btn = page.locator(f'#settings-section .tab-btn[data-tab="{tab}"]')
+        if not btn.is_visible():
+            continue
+        btn.click()
+        expect(page.locator(f"#settings-tab-{tab}")).to_be_visible(timeout=10000)
+        page.wait_for_timeout(400)          # the pages that load lists on opening draw them
+        visited.append(tab)
+        bad = page.evaluate(OVERFLOW_JS)
+        if bad:
+            problems[tab] = bad
+    assert len(visited) >= 10, visited      # the loop reached the pages, not one of them
+    assert problems == {}, problems
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+@pytest.mark.parametrize("width", list(WIDTHS))
+def test_the_new_dialogs_stay_on_screen_at_every_width(page: Page, people, skin, width):
+    """The Extend dialog and the Move to vault dialog, at 390, 768 and 1024, both skins."""
+    a, _u, v = people
+    size = WIDTHS[width]
+    _login(page, a, skin, size)
+    bad = {}
+    # Extend: opened as a card's Extend button opens it, on a share that ends tomorrow with a type allowing a week.
+    page.evaluate("""() => { const soon = new Date(Date.now() + 86400000).toISOString();
+        const most = new Date(Date.now() + 7 * 86400000).toISOString();
+        openExtendExpiry('share', '00000000-0000-0000-0000-000000000000', soon,
+                         'the share of a vault with a rather long name that has to wrap on a phone', null, most); }""")
+    expect(page.locator("#extend-expiry-modal.active")).to_be_visible()
+    ok, box = _dialog_box_fits(page, "extend-expiry-modal", size[0])
+    if not ok:
+        bad["extend-expiry-modal"] = box
+    assert page.evaluate("() => document.documentElement.scrollWidth") <= size[0] + 1
+    page.keyboard.press("Escape")
+    expect(page.locator("#extend-expiry-modal.active")).to_be_hidden()
+    # Move to vault: from an open vault with a file in it, as the drop vault's button opens it.
+    _go(page, "vaults")
+    page.click(f'.open-vault-btn[data-vault-id="{v["id"]}"]')
+    expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+    expect(page.locator("#vault-files-table-body tr")).to_have_count(1, timeout=15000)
+    page.evaluate("() => openMoveToVaultModal()")
+    expect(page.locator("#move-to-vault-modal.active")).to_be_visible(timeout=10000)
+    ok, box = _dialog_box_fits(page, "move-to-vault-modal", size[0])
+    if not ok:
+        bad["move-to-vault-modal"] = box
+    assert page.evaluate("() => document.documentElement.scrollWidth") <= size[0] + 1
+    page.keyboard.press("Escape")
+    assert bad == {}, bad
+
+
+@pytest.fixture
+def recipient(admin):
+    """A user holding two claimed shares: one view-only, one with download, each a vault with a file in it."""
+    before = admin.get("/settings").json().get("sharing_enabled")
+    admin.put("/settings", json={"sharing_enabled": True})
+    r = admin.create_user(role="user")
+    rc = ApiClient(); rc.login(r["_username"], r["_password"])
+    tag = admin.post("/share-tags", json={"name": unique("widetag"), "auto_enroll_new_users": True,
+                                          "allowed_audiences": ["anyone_internal"], "max_recipients_cap": 10,
+                                          "allow_view_only": True}).json()
+    vaults = []
+    try:
+        for view_only in (True, False):
+            v = admin.create_vault(name=unique("Shared with a rather long vault name" + (" view" if view_only else "")))
+            vaults.append(v)
+            admin.post(f"/vaults/{v['id']}/files",
+                       files=[("files", ("a-rather-long-file-name-for-the-width-pass.txt", b"x", "text/plain"))])
+            share = admin.post("/shares", json={"vault_id": v["id"], "tag_id": tag["id"], "target_type": "vault",
+                                                "claim_audience": "anyone_internal", "view_only": view_only})
+            assert share.status_code == 200, share.text
+            assert rc.post("/shares/claim", json={"token": share.json()["link_token"]}).status_code == 200
+        yield r, vaults
+    finally:
+        for v in vaults:
+            admin.delete_vault(v["id"])
+        admin.delete_user(r["id"])
+        admin.put("/settings", json={"sharing_enabled": before})
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+@pytest.mark.parametrize("width", list(WIDTHS))
+def test_a_recipients_shared_section_and_shared_vaults_fit_the_screen(page: Page, recipient, skin, width):
+    r, vaults = recipient
+    _login(page, r, skin, WIDTHS[width])
+    problems = {}
+    for section in USER_SECTIONS:
+        if not _go(page, section):
+            continue
+        if section == "shared":
+            # Both cards drawn, the view-only one with its note, before anything is measured.
+            expect(page.locator("#shared-tab-with-me [data-share-id]")).to_have_count(2, timeout=15000)
+        bad = page.evaluate(OVERFLOW_JS)
+        if bad:
+            problems[section] = bad
+    # Each shared vault, opened from the Shared page: the view-only one offers less, both must fit.
+    for v in vaults:
+        _go(page, "shared")
+        page.evaluate("id => openSharedItem(id)", v["id"])
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+        expect(page.locator("#vault-files-table-body tr")).to_have_count(1, timeout=15000)
+        page.wait_for_timeout(400)
+        bad = page.evaluate(OVERFLOW_JS)
+        if bad:
+            problems[f"shared-vault-{v['name']}"] = bad
+    assert problems == {}, problems
+
+
+@pytest.fixture
+def public_links_on(admin):
+    keys = ("public_file_links_enabled", "public_note_links_enabled", "public_note_link_user_cap")
+    before = admin.get("/settings").json()
+    admin.put("/settings", json={"public_file_links_enabled": True, "public_note_links_enabled": True,
+                                 "public_note_link_user_cap": 100})
+    yield
+    admin.put("/settings", json={k: before.get(k) for k in keys})
+
+
+def test_the_file_link_and_note_link_pages_fit_a_phone(page: Page, admin, public_links_on):
+    """/p and /l, each with an owner's message holding a long unbroken word, at phone width: no sideways scroll."""
+    tag = admin.post("/note-link-tags", json={"name": unique("widelink"), "min_token_len": 10, "require_secret": "none",
+                                              "auto_enroll_new_users": True, "allowed_targets": ["note", "file", "folder"],
+                                              "default_ttl_hours": 24, "max_ttl_hours": 24}).json()
+    v = admin.create_vault(name=unique("Wide link"))
+    try:
+        admin.post(f"/vaults/{v['id']}/files",
+                   files=[("files", ("a-long-name-" + "x" * 60 + ".txt", b"x", "text/plain"))])
+        fid = admin.get(f"/vaults/{v['id']}/files").json()["items"][0]["id"]
+        link = admin.post("/public-links", json={"vault_id": v["id"], "target_type": "file", "target_file_id": fid,
+                                                 "tag_id": tag["id"], "ttl_hours": 1, "message": OWNER_MESSAGE})
+        assert link.status_code == 200, link.text
+        note = admin.post("/notes", json={"title": "A title long enough to wrap " * 3, "body": "line one " * 40}).json()
+        nl = admin.post("/note-links", json={"note_id": note["id"], "tag_id": tag["id"], "message": OWNER_MESSAGE})
+        assert nl.status_code == 200, nl.text
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto(f"/p/{link.json()['token']}")
+        expect(page.locator("#owner-message")).to_have_text(OWNER_MESSAGE, timeout=15000)
+        assert page.evaluate("() => document.documentElement.scrollWidth") <= 391
+        page.goto(f"/l/{nl.json()['token']}")
+        expect(page.locator("#owner-message-reveal")).to_have_text(OWNER_MESSAGE, timeout=15000)
+        assert page.evaluate("() => document.documentElement.scrollWidth") <= 391
+        page.click("#reveal-btn")
+        expect(page.locator("#content")).to_be_visible(timeout=10000)
+        assert page.evaluate("() => document.documentElement.scrollWidth") <= 391
+    finally:
+        admin.delete_vault(v["id"])
