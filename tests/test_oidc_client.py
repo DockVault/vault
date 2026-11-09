@@ -872,3 +872,129 @@ def test_a_provider_that_cannot_be_reached_is_not_asked_again_for_a_short_while(
     oc.discover(_provider(oc, discovery_url=ISSUER + "/moved/.well-known/openid-configuration"), fetch=moved,
                 cache=cache2, resolve=_PUBLIC, now=NOW + 1)
     assert len(moved.calls) == 1
+
+
+def _warnings(caplog):
+    return [r.getMessage() for r in caplog.records if "could not be fetched" in r.getMessage()]
+
+
+def test_a_failed_fetch_serves_the_last_good_document_for_a_day_with_a_warning(caplog):
+    """One bad response from the provider does not stop sign-ins: the last good document is served, with a warning
+    in the server log for each fetch that failed, until a day after it was fetched; then the failure is the answer."""
+    import logging
+    oc = _oc()
+    signer = Signer()
+    cache = oc.Cache()
+    first = oc.discover(_provider(oc), fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+    calls = []
+
+    def down(url, **kw):
+        calls.append(url)
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")
+    later = NOW + oc.CACHE_SECONDS + 1          # the hour's copy has lapsed: a fetch is due, and it fails
+    caplog.set_level(logging.WARNING, logger="dockvault.sso")
+    assert oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=later) is first
+    assert len(calls) == 1
+    warned = _warnings(caplog)
+    assert len(warned) == 1
+    assert "p1" in warned[0] and oc.TEMPORARILY_UNAVAILABLE in warned[0] and f"{oc.CACHE_SECONDS + 1} s ago" in warned[0]
+    # Within the pause the copy is served again without a fetch and without another warning.
+    assert oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=later + 29) is first
+    assert len(calls) == 1 and len(_warnings(caplog)) == 1
+    # After it the provider is asked again; still failing, the copy again, one more warning.
+    assert oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=later + 31) is first
+    assert len(calls) == 2 and len(_warnings(caplog)) == 2
+    # A document that now fails its own checks is a failed fetch like any other.
+    wrong = _fetch_for(signer, discovery=signer.discovery(issuer="https://elsewhere.example.com"))
+    assert oc.discover(_provider(oc), fetch=wrong, cache=cache, resolve=_PUBLIC, now=later + 62) is first
+    assert len(wrong.calls) == 1 and oc.ISSUER_MISMATCH in _warnings(caplog)[-1]
+    # A refresh asks for a new document and never takes the old one instead.
+    with pytest.raises(oc.OidcError) as e:
+        oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=later + 100, refresh=True)
+    assert e.value.code == oc.TEMPORARILY_UNAVAILABLE
+    # The copy belongs to its configuration: another issuer or address setting has none to fall back on.
+    with pytest.raises(oc.OidcError):
+        oc.discover(_provider(oc, private_network=True), fetch=down, cache=cache, resolve=_PUBLIC, now=later + 200)
+    # The ceiling: a day after the good copy was fetched it is not served; the failure is the answer.
+    assert oc.STALE_IF_ERROR_SECONDS == 24 * 3600
+    oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + oc.STALE_IF_ERROR_SECONDS - 1)
+    with pytest.raises(oc.OidcError) as e:
+        oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + oc.STALE_IF_ERROR_SECONDS + 31)
+    assert e.value.code == oc.TEMPORARILY_UNAVAILABLE
+    # Remembered once the copy is gone: the failure again, without a fetch.
+    before = len(calls)
+    with pytest.raises(oc.OidcError):
+        oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + oc.STALE_IF_ERROR_SECONDS + 32)
+    assert len(calls) == before
+
+
+def test_the_day_is_counted_from_the_last_good_fetch():
+    oc = _oc()
+    signer = Signer()
+    cache = oc.Cache()
+
+    def down(url, **kw):
+        raise oc.OidcError(oc.PROVIDER_ERROR, "down")
+    oc.discover(_provider(oc), fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+    # Back at hour 23: that fetch is the new good copy, served through hour 25 when the provider fails again.
+    renewed = oc.discover(_provider(oc), fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW + 23 * 3600,
+                          refresh=True)
+    assert oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 25 * 3600) is renewed
+
+
+def test_a_failed_key_fetch_serves_the_last_good_key_set_only_for_a_key_it_holds(caplog):
+    import logging
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    cache = oc.Cache()
+    held = oc.signing_keys(_provider(oc), d, fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+    calls = []
+
+    def down(url, **kw):
+        calls.append(url)
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")
+    later = NOW + oc.CACHE_SECONDS + 1
+    caplog.set_level(logging.WARNING, logger="dockvault.sso")
+    assert oc.signing_keys(_provider(oc), d, kid="rsa1", fetch=down, cache=cache, resolve=_PUBLIC, now=later) is held
+    assert len(calls) == 1 and len(_warnings(caplog)) == 1 and "key set" in _warnings(caplog)[0]
+    # Remembered: the copy again for any key it holds, no fetch, no warning.
+    assert oc.signing_keys(_provider(oc), d, kid="ec1", fetch=down, cache=cache, resolve=_PUBLIC, now=later + 1) is held
+    assert oc.signing_keys(_provider(oc), d, fetch=down, cache=cache, resolve=_PUBLIC, now=later + 2) is held
+    assert len(calls) == 1 and len(_warnings(caplog)) == 1
+    # A key the copy does not hold is the failure, not the copy, during the pause and after it.
+    for at in (later + 3, later + 40):
+        with pytest.raises(oc.OidcError) as e:
+            oc.signing_keys(_provider(oc), d, kid="rsa9", fetch=down, cache=cache, resolve=_PUBLIC, now=at)
+        assert e.value.code == oc.TEMPORARILY_UNAVAILABLE
+    assert len(calls) == 2
+    # An ID token is verified end to end while the provider is down.
+    token = signer.token(signer.id_claims(iat=later + 45, exp=later + 300, auth_time=later + 40))
+    claims = oc.verify_id_token(_provider(oc), d, token, nonce="n1", fetch=down, cache=cache, resolve=_PUBLIC,
+                                now=later + 50)
+    assert claims["sub"] == "user-1"
+    # The ceiling, counted from the good fetch.
+    with pytest.raises(oc.OidcError):
+        oc.signing_keys(_provider(oc), d, kid="rsa1", fetch=down, cache=cache, resolve=_PUBLIC,
+                        now=NOW + oc.STALE_IF_ERROR_SECONDS + 31)
+
+
+def test_a_failed_refetch_for_an_unknown_key_does_not_serve_or_spoil_the_keys_held():
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    cache = oc.Cache()
+    held = oc.signing_keys(_provider(oc), d, fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+    calls = []
+
+    def down(url, **kw):
+        calls.append(url)
+        raise oc.OidcError(oc.PROVIDER_ERROR, "down")
+    with pytest.raises(oc.OidcError) as e:
+        oc.signing_keys(_provider(oc), d, kid="rsa9", fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 10)
+    assert e.value.code == oc.PROVIDER_ERROR
+    # The keys held are served as before; another made-up key is not fetched for.
+    assert oc.signing_keys(_provider(oc), d, kid="rsa1", fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 11) is held
+    with pytest.raises(oc.OidcError):
+        oc.signing_keys(_provider(oc), d, kid="rsa8", fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 12)
+    assert len(calls) == 1

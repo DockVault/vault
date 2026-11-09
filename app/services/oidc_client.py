@@ -24,6 +24,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import logging
 import math
 import secrets
 import socket
@@ -36,6 +37,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import jwt
 
+log = logging.getLogger("dockvault.sso")
+
 ALLOWED_ALGS = ("RS256", "PS256", "ES256")
 SKEW_SECONDS = 60
 HTTP_TIMEOUT_SECONDS = 10
@@ -44,24 +47,9 @@ MAX_TOKEN_BYTES = 16 * 1024
 MAX_SUBJECT_LENGTH = 255
 CACHE_SECONDS = 3600
 DISCOVERY_FAILURE_SECONDS = 30   # a fetch of discovery or keys that failed is not tried again for this long
-
-
-def _where(provider: "ProviderConfig", *parts: str) -> str:
-    """A short digest of what a cached answer was fetched for (the addresses, the issuer, whether private addresses
-    were allowed), so an answer is never served for another configuration later saved under the same provider id."""
-    scope = ["private" if provider.private_network else "public", *parts]
-    return hashlib.sha256(json.dumps(scope).encode("utf-8")).hexdigest()[:16]
-
-
-def _remember_failure(cache: "Cache", key: str, exc: "OidcError", now: Optional[float]) -> None:
-    cache.set(key, exc.code, DISCOVERY_FAILURE_SECONDS, now)
-
-
-def _remembered_failure(cache: "Cache", key: str, now: Optional[float], what: str) -> None:
-    """Raise the failure remembered under ``key`` with its own code, or nothing."""
-    code = cache.get(key, now)
-    if code is not None:
-        raise OidcError(code, f"{what} failed moments ago")
+# How long after it was fetched a good discovery document or key set is still served when a fetch fails (the provider
+# down, a bad answer): one bad response does not stop sign-ins, and a copy older than this is never served.
+STALE_IF_ERROR_SECONDS = 24 * 3600
 JWKS_REFETCH_INTERVAL_SECONDS = 60
 LOGOUT_TOKEN_FRESHNESS_SECONDS = 120
 BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
@@ -156,6 +144,44 @@ _DEFAULT_CACHE = Cache()
 
 def _cache(cache: Optional[Cache]) -> Cache:
     return cache if cache is not None else _DEFAULT_CACHE
+
+
+def _where(provider: ProviderConfig, *parts: str) -> str:
+    """A short digest of what a cached answer was fetched for (the addresses, the issuer, whether private addresses
+    were allowed), so an answer is never served for another configuration later saved under the same provider id."""
+    scope = ["private" if provider.private_network else "public", *parts]
+    return hashlib.sha256(json.dumps(scope).encode("utf-8")).hexdigest()[:16]
+
+
+def _remember_failure(cache: Cache, key: str, exc: OidcError, now: Optional[float]) -> None:
+    """Pace the next attempt: a fetch that failed is not tried again for :data:`DISCOVERY_FAILURE_SECONDS`, so a
+    provider that is down (or tokens naming made-up keys) cannot make the vault fetch on every request."""
+    cache.set(key, exc.code, DISCOVERY_FAILURE_SECONDS, now)
+
+
+def _keep_good(cache: Cache, key: str, value, now: Optional[float]) -> None:
+    """Keep ``value`` as the last good copy, with the time it was fetched; it lapses :data:`STALE_IF_ERROR_SECONDS`
+    after that fetch, whatever is served meanwhile."""
+    now = time.time() if now is None else now
+    cache.set(key, (now, value), STALE_IF_ERROR_SECONDS, now)
+
+
+def _good_copy(cache: Cache, key: str, now: Optional[float], *, kid: Optional[str] = None):
+    """The last good copy kept under ``key`` as ``(fetched_at, value)``, or None: none was kept, it is older than
+    the ceiling, or (for a key set) it does not hold the key the token names."""
+    row = cache.get(key, now)
+    if row is None or (kid is not None and kid not in row[1]):
+        return None
+    return row
+
+
+def _serve_good(row, provider: ProviderConfig, what: str, exc: OidcError, now: Optional[float]):
+    """Serve the last good copy for a fetch that has just failed, with a warning in the server log (one for each
+    failed fetch: a failure remembered for the next requests serves the copy without a new warning)."""
+    age = int((time.time() if now is None else now) - row[0])
+    log.warning("sso: the %s of provider %s could not be fetched (%s); serving the copy fetched %d s ago",
+                what, provider.id, exc.code, age)
+    return row[1]
 
 
 # --------------------------------------------------------------------------- the endpoint rule
@@ -321,7 +347,14 @@ def discover(provider: ProviderConfig, *, fetch: Callable = fetch_json, cache: O
              resolve=None, now: Optional[float] = None, refresh: bool = False) -> Discovery:
     """The provider's discovery document, checked: the issuer exactly as configured, the required endpoints,
     an allowed signing algorithm, ``S256`` when the document lists methods; every endpoint under the endpoint
-    rule. Cached an hour."""
+    rule. Cached an hour.
+
+    When a fetch fails (the network, a name that would not resolve, an address refused, an answer that is not a
+    document or fails its checks) the last good document is served, with a warning, for up to
+    :data:`STALE_IF_ERROR_SECONDS` after it was fetched; the failure is the answer only when there is no such copy.
+    Either way the next fetch waits :data:`DISCOVERY_FAILURE_SECONDS`. Every endpoint of a document served this way
+    is checked again under the endpoint rule when it is called. ``refresh`` asks for a new document and never takes
+    the old one instead."""
     cache = _cache(cache)
     url = discovery_url(provider)
     where = _where(provider, provider.issuer, url)
@@ -331,18 +364,27 @@ def discover(provider: ProviderConfig, *, fetch: Callable = fetch_json, cache: O
         if cached is not None:
             return cached
     failed_key = f"sso:disc-failed:{provider.id}:{where}"
+    good_key = f"sso:disc-good:{provider.id}:{where}"
     if not refresh:
-        # A fetch that failed moments ago (the network, a name that would not resolve, an address refused, an answer
-        # that is not a document) is answered the same, with its own code, without the name lookup or the timeout.
-        _remembered_failure(cache, failed_key, now, "the provider's discovery")
+        # A fetch that failed moments ago is not tried again yet: the last good copy, else the same failure with its
+        # own code, without the name lookup or the timeout.
+        remembered = cache.get(failed_key, now)
+        if remembered is not None:
+            good = _good_copy(cache, good_key, now)
+            if good is not None:
+                return good[1]
+            raise OidcError(remembered, "the provider's discovery failed moments ago")
     try:
-        # The fetch and the document's own checks: any failure is remembered, so a document that is wrong is not
-        # fetched again on every request either.
+        # The fetch and the document's own checks: a document that is wrong is a failed fetch like any other.
         found = _discovery_document(provider, url, fetch=fetch, resolve=resolve)
     except OidcError as exc:
         _remember_failure(cache, failed_key, exc, now)
-        raise
+        good = None if refresh else _good_copy(cache, good_key, now)
+        if good is None:
+            raise
+        return _serve_good(good, provider, "discovery document", exc, now)
     cache.set(key, found, CACHE_SECONDS, now)
+    _keep_good(cache, good_key, found, now)
     return found
 
 
@@ -410,10 +452,12 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
                  now: Optional[float] = None) -> Dict[str, dict]:
     """The provider's signing keys by ``kid`` (RSA or EC, for signing, with a key id), cached an hour. When a
     token names a ``kid`` the cache does not hold, the set is fetched again: after a refetch that succeeded, not
-    again for a minute; after any fetch that failed, not again for 30 seconds (the failure is answered again with
-    its own code). A key still unknown after a successful refetch is a refusal for the caller; a key unknown while a
+    again for a minute; after any fetch that failed, not again for 30 seconds (meanwhile the last good copy is
+    served, else the failure is answered again with its own code). A key still unknown after a successful refetch is a refusal for the caller; a key unknown while a
     refetch is throttled is not the token's fault: that answers ``TEMPORARILY_UNAVAILABLE`` (the key may be newer
-    than the last fetch). Keys already held are served whatever the throttle or the failure says."""
+    than the last fetch). Keys already held are served whatever the throttle or the failure says. When a fetch
+    fails, the last good key set is served, with a warning, for up to :data:`STALE_IF_ERROR_SECONDS` after it was
+    fetched, if it holds the key asked for; the failure is the answer only when no such copy exists."""
     cache = _cache(cache)
     where = _where(provider, discovery.jwks_uri)
     key = f"sso:jwks:{provider.id}:{where}"
@@ -421,7 +465,13 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
     if keys is not None and (kid is None or kid in keys):
         return keys
     failed_key = f"sso:jwks-failed:{provider.id}:{where}"
-    _remembered_failure(cache, failed_key, now, "the provider's keys")
+    good_key = f"sso:jwks-good:{provider.id}:{where}"
+    remembered = cache.get(failed_key, now)
+    if remembered is not None:
+        good = _good_copy(cache, good_key, now, kid=kid)
+        if good is not None:
+            return good[1]
+        raise OidcError(remembered, "the provider's keys failed moments ago")
     refetch_key = f"sso:jwks-refetch:{provider.id}:{where}"
     refetching = keys is not None and kid is not None
     if refetching and cache.get(refetch_key, now) is not None:
@@ -431,8 +481,12 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
         keys = _usable_keys(fetch(discovery.jwks_uri))
     except OidcError as exc:
         _remember_failure(cache, failed_key, exc, now)          # any failure: a refetch cannot be forced per request
-        raise
+        good = _good_copy(cache, good_key, now, kid=kid)
+        if good is None:
+            raise
+        return _serve_good(good, provider, "key set", exc, now)
     cache.set(key, keys, CACHE_SECONDS, now)
+    _keep_good(cache, good_key, keys, now)
     if refetching:
         # Only a fetch that succeeded throttles the next one: a failed refetch must not leave real keys unknown.
         cache.set(refetch_key, True, JWKS_REFETCH_INTERVAL_SECONDS, now)
