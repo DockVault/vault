@@ -998,3 +998,34 @@ def test_a_failed_refetch_for_an_unknown_key_does_not_serve_or_spoil_the_keys_he
     with pytest.raises(oc.OidcError):
         oc.signing_keys(_provider(oc), d, kid="rsa8", fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 12)
     assert len(calls) == 1
+
+
+def test_a_logout_token_is_never_verified_with_a_stale_key_set():
+    """A back-channel logout token is posted by anyone: a key the provider has since removed must not outlive the
+    hour's cache for it, so the last good copy that serves sign-ins during an outage does not serve logout tokens."""
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    cache = oc.Cache()
+    oc.signing_keys(_provider(oc), d, fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+
+    def down(url, **kw):
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")
+    later = NOW + oc.CACHE_SECONDS + 1
+    # Within the hour the cached keys serve a logout token as before.
+    token = signer.token(_logout_claims(signer, iat=NOW + 60, exp=NOW + 180, jti="j-early"))
+    assert oc.verify_logout_token(_provider(oc), d, token, seen_jti=lambda jti, ttl: False, fetch=down, cache=cache,
+                                  resolve=_PUBLIC, now=NOW + 61)["jti"] == "j-early"
+    # After it, with the provider down: refused, on the failed fetch and on the remembered one.
+    for at, jti in ((later, "j1"), (later + 1, "j2")):
+        token = signer.token(_logout_claims(signer, iat=at, exp=at + 120, jti=jti))
+        with pytest.raises(oc.OidcError) as e:
+            oc.verify_logout_token(_provider(oc), d, token, seen_jti=lambda jti, ttl: False, fetch=down, cache=cache,
+                                   resolve=_PUBLIC, now=at)
+        assert e.value.code == oc.TEMPORARILY_UNAVAILABLE
+    # An ID token in the same state is verified with the copy: it arrives over the code exchange's own connection.
+    at = later + 2
+    token = signer.token(signer.id_claims(iat=at - 5, exp=at + 300, auth_time=at - 10))
+    assert oc.verify_id_token(_provider(oc), d, token, nonce="n1", fetch=down, cache=cache, resolve=_PUBLIC,
+                              now=at)["sub"] == "user-1"
+

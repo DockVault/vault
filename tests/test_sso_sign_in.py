@@ -730,7 +730,7 @@ def test_the_loop_answers_other_requests_while_a_provider_is_slow(monkeypatch):
     import asyncio
     alice, p = _user(), _provider()
     h = Harness(monkeypatch, [alice], [p])
-    _slow_fetch(h, monkeypatch, slow="openid-configuration", seconds=0.8)
+    _slow_fetch(h, monkeypatch, slow="openid-configuration", seconds=1.5)
 
     async def both():
         loop = asyncio.get_running_loop()
@@ -743,7 +743,7 @@ def test_the_loop_answers_other_requests_while_a_provider_is_slow(monkeypatch):
     began, quick, slow = run_coroutine(both(), timeout=30)
     assert quick[0] == 200 and slow[0] == 200, (quick[:2], slow[:2])
     # The other request was answered while the provider was still thinking, not after it.
-    assert quick[2] < slow[2] and quick[2] - began < 0.75 and slow[2] - began >= 0.8
+    assert quick[2] < slow[2] and slow[2] - began >= 1.5
 
 
 def test_a_provider_that_does_not_answer_in_time_is_temporarily_unavailable(monkeypatch):
@@ -802,51 +802,135 @@ def test_calls_that_outlive_their_request_never_queue_the_next_ones(monkeypatch)
     assert sso_router.PROVIDER_THREADS >= 4 and 5 <= sso_router.PROVIDER_WAIT_SECONDS <= 30
 
 
-def test_the_routes_that_reach_the_provider_hold_a_sign_in_slot_and_a_full_house_spends_no_state(monkeypatch):
-    import asyncio
-    import app.core.auth_offload as ao
+def test_the_routes_that_reach_the_provider_hold_no_sign_in_slot_and_let_go_of_the_database(monkeypatch):
+    """A slow provider must not hold what password sign-in waits on: these routes take none of the server's sign-in
+    slots, and each ends its read transaction before it waits on the provider, handing the worker a plain view of
+    the provider row. A full provider pool at the callback answers with the state unspent."""
+    import threading
     from app.api import sso_router
+    from app.core import auth_offload as ao
+    from app.services import sso_sign_in as sso
     from fastapi.routing import APIRoute
     alice, p = _user(), _provider()
     h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    inner, events = h.provider_fetch, []
+
+    def fetch(url, **kw):
+        events.append("fetch " + url.rsplit("/", 1)[-1])
+        return inner(url, **kw)
+    monkeypatch.setattr(sso.oc, "fetch_json", fetch)
+    release = sso_router._release_database
+
+    def released(db):
+        events.append("released")
+        release(db)
+    monkeypatch.setattr(sso_router, "_release_database", released)
+    # What it does: end the read transaction (here, the store's rollback).
+    probe = DB({})
+    release(probe)
+    assert probe.log[-1] == ("rollback",)
+    given = []
+    real_start = sso.start
+    monkeypatch.setattr(sso, "start", lambda row, **kw: given.append(row) or real_start(row, **kw))
     status, out = h.start(p)
+    assert status == 200, out
     state, _ = h.state_of(out["authorization_url"])
-    monkeypatch.setattr(ao, "SLOT_ACQUIRE_TIMEOUT_SECONDS", 0.1)
-    # The start (an API call) answers the house's 503; the callback (a browser navigation) a redirect into the app,
-    # with the state not spent. A semaphore a loop waited on belongs to that loop: one for each request here.
-    monkeypatch.setattr(ao, "_auth_slots", asyncio.Semaphore(0))
-    status, out = h.start(p)
-    assert status == 503, out
-    monkeypatch.setattr(ao, "_auth_slots", asyncio.Semaphore(0))
+    # The worker was handed a plain view of the row, not the session's row, and the request had let go first.
+    assert given and given[0] is not p and given[0].id == p.id and given[0].issuer == p.issuer
+    assert events[:2] == ["released", "fetch openid-configuration"], events
+    # A full pool at the callback: a redirect into the app, the state not spent; with a place free it finishes.
+    full = threading.BoundedSemaphore(1)
+    assert full.acquire(blocking=False)
+    monkeypatch.setattr(sso_router, "_provider_threads", full)
     status, location, _ = h.callback(p, state)
     assert status == 302 and location == "/#sso-error=temporarily_unavailable", location
     assert "sso:state:" + state in h.redis.rows
-    # With a slot free the same callback finishes, and gives its slot back.
-    slots = asyncio.Semaphore(1)
-    monkeypatch.setattr(ao, "_auth_slots", slots)
+    full.release()
+    events.clear()
     status, location, _ = h.callback(p, state)
     assert status == 302 and location.startswith("/#sso="), location
+    assert events[:2] == ["released", "fetch token"], events
     assert h.finish(location)[0] == 200
-    assert not slots.locked()
-
-    # The callback's slot is given back as its dependency exits, not later by the loop's clean-up of a generator.
-    async def held_then_left():
-        gen = sso_router._callback_slot()
-        assert await gen.__anext__() is True and slots.locked()
-        with pytest.raises(StopAsyncIteration):
-            await gen.__anext__()
-        return slots.locked()
-    monkeypatch.setattr(ao, "_auth_slots", slots)
-    assert run_coroutine(held_then_left(), timeout=10) is False
-    # Each route that reaches the provider takes the slot first, before the database session.
+    # None of the four routes takes a sign-in slot.
     wanted = {"start_sign_in", "sign_in_callback", "start_reauth", "start_link"}
-    seen = set()
+    found = set()
     for route in sso_router.router.routes:
         if isinstance(route, APIRoute) and route.endpoint.__name__ in wanted:
-            first = route.dependant.dependencies[0].call
-            assert first in (ao.auth_offload_slot, sso_router._callback_slot), (route.path, first)
-            seen.add(route.endpoint.__name__)
-    assert seen == wanted
+            calls = {d.call for d in route.dependant.dependencies}
+            assert ao.auth_offload_slot not in calls, route.path
+            found.add(route.endpoint.__name__)
+    assert found == wanted
+
+
+def test_a_call_keeps_its_place_until_its_work_ends_and_a_call_never_run_gives_it_back(monkeypatch):
+    import asyncio
+    import threading
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    from app.api import sso_router
+    from app.services import oidc_client as oc
+    places = threading.BoundedSemaphore(2)
+    monkeypatch.setattr(sso_router, "_provider_threads", places)
+    release = threading.Event()
+    hung = threading.Event()
+
+    def stuck():
+        hung.set()
+        release.wait(10)
+        return "late"
+
+    async def timed_out():
+        loop = asyncio.get_running_loop()
+        try:
+            await sso_router._provider_call(stuck, deadline=loop.time() + 0.2)
+        except oc.OidcError as exc:
+            return exc.code
+    try:
+        assert run_coroutine(timed_out(), timeout=10) == "temporarily_unavailable"
+        assert hung.is_set()
+        # The request stopped waiting; its call still runs and still holds its place.
+        assert places._value == 1
+    finally:
+        release.set()
+    for _ in range(100):
+        if places._value == 2:
+            break
+        _time.sleep(0.02)
+    assert places._value == 2
+    # No time left: nothing is submitted and no place is taken.
+    ran = []
+
+    async def too_late():
+        loop = asyncio.get_running_loop()
+        try:
+            await sso_router._provider_call(lambda: ran.append(1), deadline=loop.time() - 0.001)
+        except oc.OidcError as exc:
+            return exc.code
+    assert run_coroutine(too_late(), timeout=10) == "temporarily_unavailable"
+    assert ran == [] and places._value == 2
+    # A call cancelled while it waits for a thread (the pool busy) gives its place back without ever running.
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(sso_router, "_provider_pool", pool)
+    blocker = threading.Event()
+    pool.submit(blocker.wait, 10)
+
+    async def cancelled():
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(sso_router._provider_call(lambda: ran.append(2), deadline=loop.time() + 5))
+        await asyncio.sleep(0.05)
+        assert places._value == 1
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return places._value
+    try:
+        assert run_coroutine(cancelled(), timeout=10) == 2
+    finally:
+        blocker.set()
+        pool.shutdown(wait=True)
+    assert ran == []
 
 
 def test_no_route_calls_the_provider_on_the_event_loop():

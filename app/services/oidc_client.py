@@ -449,7 +449,7 @@ def _usable_keys(doc: dict) -> Dict[str, dict]:
 
 def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optional[str] = None,
                  fetch: Callable = fetch_json, cache: Optional[Cache] = None, resolve=None,
-                 now: Optional[float] = None) -> Dict[str, dict]:
+                 now: Optional[float] = None, stale_ok: bool = True) -> Dict[str, dict]:
     """The provider's signing keys by ``kid`` (RSA or EC, for signing, with a key id), cached an hour. When a
     token names a ``kid`` the cache does not hold, the set is fetched again: after a refetch that succeeded, not
     again for a minute; after any fetch that failed, not again for 30 seconds (meanwhile the last good copy is
@@ -457,7 +457,9 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
     refetch is throttled is not the token's fault: that answers ``TEMPORARILY_UNAVAILABLE`` (the key may be newer
     than the last fetch). Keys already held are served whatever the throttle or the failure says. When a fetch
     fails, the last good key set is served, with a warning, for up to :data:`STALE_IF_ERROR_SECONDS` after it was
-    fetched, if it holds the key asked for; the failure is the answer only when no such copy exists."""
+    fetched, if it holds the key asked for; the failure is the answer only when no such copy exists. ``stale_ok``
+    False takes no such copy: a back-channel logout token is posted by anyone, and a key the provider has since
+    removed must not outlive the hour's cache for it."""
     cache = _cache(cache)
     where = _where(provider, discovery.jwks_uri)
     key = f"sso:jwks:{provider.id}:{where}"
@@ -468,7 +470,7 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
     good_key = f"sso:jwks-good:{provider.id}:{where}"
     remembered = cache.get(failed_key, now)
     if remembered is not None:
-        good = _good_copy(cache, good_key, now, kid=kid)
+        good = _good_copy(cache, good_key, now, kid=kid) if stale_ok else None
         if good is not None:
             return good[1]
         raise OidcError(remembered, "the provider's keys failed moments ago")
@@ -481,7 +483,7 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
         keys = _usable_keys(fetch(discovery.jwks_uri))
     except OidcError as exc:
         _remember_failure(cache, failed_key, exc, now)          # any failure: a refetch cannot be forced per request
-        good = _good_copy(cache, good_key, now, kid=kid)
+        good = _good_copy(cache, good_key, now, kid=kid) if stale_ok else None
         if good is None:
             raise
         return _serve_good(good, provider, "key set", exc, now)
@@ -575,14 +577,15 @@ def _header(token: str) -> dict:
         raise OidcError(TOKEN_INVALID, "header unreadable") from exc
 
 
-def _key_for(provider, discovery, header, *, fetch, cache, resolve, now):
+def _key_for(provider, discovery, header, *, fetch, cache, resolve, now, stale_ok: bool = True):
     alg = header.get("alg")
     if alg not in ALLOWED_ALGS:
         raise OidcError(TOKEN_INVALID, "algorithm not allowed")
     kid = header.get("kid")
     if not isinstance(kid, str) or not kid:
         raise OidcError(TOKEN_INVALID, "no key id")
-    keys = signing_keys(provider, discovery, kid=kid, fetch=fetch, cache=cache, resolve=resolve, now=now)
+    keys = signing_keys(provider, discovery, kid=kid, fetch=fetch, cache=cache, resolve=resolve, now=now,
+                        stale_ok=stale_ok)
     jwk = keys.get(kid)
     if jwk is None:
         raise OidcError(TOKEN_INVALID, "unknown key id")
@@ -692,7 +695,8 @@ def verify_logout_token(provider: ProviderConfig, discovery: Discovery, token: s
     if not isinstance(token, str) or len(token.encode("utf-8", "ignore")) > MAX_TOKEN_BYTES:
         raise OidcError(TOKEN_INVALID, "token missing or over the size cap")
     header = _header(token)
-    key, alg = _key_for(provider, discovery, header, fetch=fetch, cache=cache, resolve=resolve, now=now)
+    key, alg = _key_for(provider, discovery, header, fetch=fetch, cache=cache, resolve=resolve, now=now,
+                        stale_ok=False)       # posted by anyone: never a key from a stale copy
     claims = _decode(token, key, alg, issuer=provider.issuer, audience=provider.client_id, now=now,
                      require=("exp", "iat", "iss", "aud", "jti", "events"))
     _check_azp(claims, provider)
