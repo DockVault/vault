@@ -2,7 +2,8 @@
 
 "Stay signed in" mints a new session only when its own call ended the old one: a request whose session was
 ended between its sign-in check and the renewal (by a sign-out in another tab, or a second renewal with the
-same token) gets 401 and leaves no new session. Sending an invitation again revokes it by one conditional
+same token) gets 401 and leaves no new session; a renewal that wins carries the released zero-knowledge
+envelope of the old session to the new one. Sending an invitation again revokes it by one conditional
 update: a resend that finds it already revoked gets 409 and makes nothing. And the Get-started list keeps a
 passed test message in its own row, so the item stays done after the audit row is archived.
 """
@@ -11,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import jwt
 import pytest
 import sqlalchemy as sa
 from fastapi import HTTPException
@@ -99,6 +101,40 @@ def test_a_renewal_of_a_live_session_ends_it_and_makes_one_new(db, monkeypatch):
     with pytest.raises(HTTPException) as refused:
         run_coroutine(api.extend_session(request=_request(token), current_user=user, db=db))
     assert refused.value.status_code == 401 and db.query(ActiveSession).count() == 2
+
+
+def test_a_renewal_carries_the_released_envelope_to_the_new_session(db, monkeypatch):
+    """A session whose zero-knowledge envelope was released after an emailed code keeps that release when it is
+    renewed: the new row carries the old row's time, so the renewal does not ask for another code."""
+    from app.services import auth_service
+    monkeypatch.setattr(auth_service, "denylist_token", lambda *a, **k: None)
+    monkeypatch.setattr(auth_service, "_best_effort_cache", lambda *a, **k: None, raising=False)
+    user = _user(db, "released")
+    plain = "a-released-session"
+    released = datetime(2026, 1, 2, 3, 4, 5)
+    db.add(ActiveSession(session_token=hash_session_token(plain), user_id=user.id, ip_address="127.0.0.1",
+                         expires_at=datetime.utcnow() + timedelta(days=1), zk_envelope_released_at=released))
+    db.commit()
+    token = create_access_token(data={"sub": str(user.id), "username": user.username, "session_token": plain,
+                                      "is_temporary": False}, expires_delta=timedelta(minutes=30))
+    answer = run_coroutine(api.extend_session(request=_request(token), current_user=user, db=db))
+    new_plain = jwt.decode(answer["access_token"], options={"verify_signature": False})["session_token"]
+    assert new_plain and new_plain != plain
+    db.expire_all()
+    new_row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(new_plain)).one()
+    assert new_row.zk_envelope_released_at == released
+    # A renewal of a session with nothing released carries nothing.
+    plain2 = "a-plain-session"
+    db.add(ActiveSession(session_token=hash_session_token(plain2), user_id=user.id, ip_address="127.0.0.1",
+                         expires_at=datetime.utcnow() + timedelta(days=1)))
+    db.commit()
+    token2 = create_access_token(data={"sub": str(user.id), "username": user.username, "session_token": plain2,
+                                       "is_temporary": False}, expires_delta=timedelta(minutes=30))
+    answer2 = run_coroutine(api.extend_session(request=_request(token2), current_user=user, db=db))
+    new_plain2 = jwt.decode(answer2["access_token"], options={"verify_signature": False})["session_token"]
+    db.expire_all()
+    row2 = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(new_plain2)).one()
+    assert row2.zk_envelope_released_at is None
 
 
 def _invitation(db, maker):
