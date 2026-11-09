@@ -41,10 +41,153 @@ def test_the_users_table_has_its_two_new_columns_and_the_detail_row_spans_them()
     head = app[app.index("function renderUsersTable() {"):]
     head = head[:head.index("\nfunction ")]
     assert len(re.findall(r"<th[ >]", head)) == 8, re.findall(r"<th[ >]", head)
-    assert "<th>Last sign-in</th>" in head and "<th>Created</th>" in head
+    assert '<th data-col="last-signin">Last sign-in</th>' in head and '<th data-col="created">Created</th>' in head
     assert 'colspan="8"' in app[app.index("function renderUserRow(u) {"):app.index("function renderUserDetail(u) {")]
 
 
 def test_the_stylesheets_keep_their_order():
     links = re.findall(r'<link rel="stylesheet" href="/static/css/([a-z0-9-]+)\.css', HTML)
     assert links.index("tables") < links.index("mobile")
+
+
+# ---- the library's behaviour, run under Node on a small document (tests/js/mini_dom.js) ---------------------
+
+import json
+import os
+import shutil
+import subprocess
+
+PRELUDE = """
+const dom = require('./tests/js/mini_dom.js');
+const env = dom.install();
+const fs = require('fs');
+const vm = require('vm');
+vm.runInThisContext(fs.readFileSync('static/js/tables.js', 'utf8'), { filename: 'tables.js' });
+vm.runInThisContext(fs.readFileSync('static/js/people.js', 'utf8'), { filename: 'people.js' });
+const { saved, store } = env;   // `document` is the global the helper installed
+const T = (headers, rows, o) => dom.table(document, headers, rows, o);
+const col = dom.column;
+const header = (t, text) => t.tHead.rows[0].cells.find((th) => th.textContent === text);
+const sorts = (t) => t.tHead.rows[0].cells.map((th) => th.getAttribute('aria-sort'));
+const when = (iso, o) => People.time(iso, o);
+"""
+
+
+def _node(body: str) -> dict:
+    node = shutil.which("node")
+    assert node, "Node is required: the library's own code must not be skipped"
+    done = subprocess.run([node, "-"], input=PRELUDE + body, capture_output=True, text=True, encoding="utf-8",
+                          timeout=60, cwd=str(ROOT), env=dict(os.environ, TZ="UTC"))
+    assert done.returncode == 0, done.stdout + done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+def test_the_next_account_on_the_tab_does_not_inherit_the_last_ones_sorts():
+    """Account A saved a sort and signed out (the app forgets the browser copy and calls reset); account B, who never
+    sorted, signs in: B's table is drawn in server order, and B's first click saves B's entry alone."""
+    out = _node("""
+Tables.applyPreferences({ tables: JSON.stringify({ users: { col: 'name', dir: 'desc' } }) });
+Tables.reset();                 // sign-out
+Tables.applyPreferences({});    // B's preferences hold no saved sort
+const t = T(['Name', 'Role'], [['ann', 'user'], ['bob', 'admin'], ['cid', 'user']]);
+Tables.enhance(t, { key: 'users' });
+const before = { names: col(t, 0), sorts: sorts(t) };
+header(t, 'Role').click();
+console.log(JSON.stringify({ before, saved, store: store.dv_tables }));
+""")
+    assert out["before"] == {"names": ["ann", "bob", "cid"], "sorts": ["none", "none"]}
+    assert out["saved"] == [{"tables": json.dumps({"users": {"col": "role", "dir": "asc"}}, separators=(",", ":"))}]
+    assert json.loads(out["store"]) == {"users": {"col": "role", "dir": "asc"}}
+
+
+def test_preferences_without_a_saved_sort_clear_what_was_remembered_even_without_a_reset():
+    out = _node("""
+Tables.applyPreferences({ tables: JSON.stringify({ users: { col: 'name', dir: 'desc' } }) });
+Tables.applyPreferences({ density: 'compact' });
+const t = T(['Name'], [['ann'], ['bob']]);
+Tables.enhance(t, { key: 'users' });
+console.log(JSON.stringify({ names: col(t, 0), sorts: sorts(t), store: store.dv_tables === undefined }));
+""")
+    assert out == {"names": ["ann", "bob"], "sorts": ["none"], "store": True}
+
+
+def test_a_saved_sort_is_keyed_by_the_columns_id_and_survives_a_column_added_before_it():
+    out = _node("""
+const t1 = T([{ label: 'User', col: 'user' }, { label: 'Created', col: 'created' }],
+             [['zed', when('2026-03-01T10:00:00Z')], ['amy', when('2026-01-01T10:00:00Z')]]);
+Tables.enhance(t1, { key: 'users' });
+header(t1, 'Created').click();
+const first = { saved: saved[saved.length - 1], order: col(t1, 0) };
+// Drawn again with a column added between: the remembered sort still lands on Created.
+const t2 = T([{ label: 'User', col: 'user' }, { label: 'Sign-in methods', col: 'methods' }, { label: 'Created', col: 'created' }],
+             [['zed', 'password', when('2026-03-01T10:00:00Z')], ['amy', 'passkey', when('2026-01-01T10:00:00Z')]]);
+Tables.enhance(t2, { key: 'users' });
+console.log(JSON.stringify({ first, order: col(t2, 0), sorts: sorts(t2), ids: t2.tHead.rows[0].cells.map((th) => th.getAttribute('data-col')) }));
+""")
+    assert json.loads(out["first"]["saved"]["tables"]) == {"users": {"col": "created", "dir": "asc"}}
+    assert out["first"]["order"] == ["amy", "zed"]
+    assert out["order"] == ["amy", "zed"]
+    assert out["sorts"] == ["none", "none", "ascending"]
+    assert out["ids"] == ["user", "methods", "created"]
+
+
+def test_a_header_without_an_id_gets_a_slug_of_its_title_and_an_old_index_is_not_read():
+    out = _node("""
+store.dv_tables = JSON.stringify({ users: { col: 1, dir: 'desc' }, other: { col: 'name', dir: 'asc' } });
+const t = T(['User', 'Last sign-in'], [['ann', 'x'], ['bob', 'y']]);
+Tables.enhance(t, { key: 'users' });
+console.log(JSON.stringify({ ids: t.tHead.rows[0].cells.map((th) => th.getAttribute('data-col')), sorts: sorts(t), order: col(t, 0),
+                             kept: JSON.parse(store.dv_tables) }));
+""")
+    assert out["ids"] == ["user", "last-sign-in"]
+    assert out["sorts"] == ["none", "none"] and out["order"] == ["ann", "bob"]
+    assert out["kept"] == {"other": {"col": "name", "dir": "asc"}}
+
+
+def test_missing_values_sort_last_whichever_way_the_column_goes():
+    out = _node("""
+const rows = () => [['ann', when(null, { fallback: 'Never' })], ['bob', when('2026-02-01T00:00:00Z')],
+                    ['cid', when('2026-01-01T00:00:00Z')], ['dee', when(null)]];
+const t = T([{ label: 'User', col: 'user' }, { label: 'Last sign-in', col: 'last-signin' }], rows());
+Tables.enhance(t, { key: 'k' });
+header(t, 'Last sign-in').click();
+const asc = col(t, 0);
+header(t, 'Last sign-in').click();
+const desc = col(t, 0);
+const n = T([{ label: 'Name', col: 'name' }, { label: 'Uses', col: 'uses' }], [['a', '—'], ['b', '7'], ['c', ''], ['d', '12']]);
+Tables.enhance(n, { key: 'n' });
+header(n, 'Uses').click(); const nAsc = col(n, 0);
+header(n, 'Uses').click(); const nDesc = col(n, 0);
+console.log(JSON.stringify({ asc, desc, nAsc, nDesc }));
+""")
+    assert out["asc"] == ["cid", "bob", "ann", "dee"]
+    assert out["desc"] == ["bob", "cid", "ann", "dee"]
+    assert out["nAsc"] == ["b", "d", "a", "c"]
+    assert out["nDesc"] == ["d", "b", "a", "c"]
+
+
+def test_a_cell_holding_a_select_sorts_by_the_chosen_option():
+    out = _node("""
+const pick = (label) => { const s = document.createElement('select');
+    ['Read only', 'Read & write', 'Manager'].forEach((o, i) => { const op = document.createElement('option'); op.textContent = o; s.appendChild(op); if (o === label) s.selectedIndex = i; });
+    return s; };
+const t = T([{ label: 'User', col: 'user' }, { label: 'Permission Level', col: 'level' }],
+            [['ann', pick('Read only')], ['bob', pick('Manager')], ['cid', pick('Read & write')]]);
+Tables.enhance(t, { key: 'm' });
+header(t, 'Permission Level').click();
+console.log(JSON.stringify({ order: col(t, 0) }));
+""")
+    assert out["order"] == ["bob", "cid", "ann"]   # Manager, Read & write, Read only
+
+
+def test_a_moment_to_come_within_a_week_is_said_in_words():
+    out = _node("""
+const now = Date.now();
+const at = (ms) => when(new Date(now + ms).toISOString()).textContent;
+console.log(JSON.stringify({ h23: at(23 * 3600 * 1000 + 30000), d3: at(3 * 86400 * 1000 + 30000), d1: at(86400 * 1000 + 30000),
+    m12: at(12 * 60 * 1000 + 30000), soon: at(10 * 1000), ago: at(-3 * 3600 * 1000), beyond: at(10 * 86400 * 1000),
+    title: when(new Date(now + 3600 * 1000).toISOString()).title.includes('UTC') }));
+""")
+    assert out["h23"] == "in 23 h" and out["d3"] == "in 3 days" and out["d1"] == "in 1 day"
+    assert out["m12"] == "in 12 min" and out["soon"] == "in a moment" and out["ago"] == "3 h ago"
+    assert "in " not in out["beyond"] and out["title"] is True

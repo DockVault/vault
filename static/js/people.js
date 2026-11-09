@@ -4,8 +4,8 @@
 //   People.chip(person, options)   -> a <span class="person-chip"> with an initials avatar and the name.
 //                                     person: {id, username, display_name?, deleted?}. options: {nameless, small}.
 //   People.time(iso, options)      -> a <time class="when" datetime="..."> whose text is relative within a
-//                                     week ("3 h ago") and a date after; the exact local time and the UTC
-//                                     time are its tooltip. options: {fallback}.
+//                                     week either way ("3 h ago", "in 2 days") and a date beyond; the exact
+//                                     local time and the UTC time are its tooltip. options: {fallback}.
 //   People.placeholder(person, options), People.whenPlaceholder(iso, options)
 //                                  -> the same two as HTML placeholders, for a list drawn from a template
 //                                     string; People.hydrate(root) then turns every placeholder under root
@@ -85,17 +85,22 @@
     }
 
     function parse(value) {
+        if (value == null || value === '') return null;
         if (typeof parseServerTime === 'function') return parseServerTime(value);
         const d = new Date(value);
         return isNaN(d.getTime()) ? null : d;
     }
 
+    // "3 h ago" for a past moment, "in 3 h" for one to come.
     function relative(date, now) {
-        const seconds = Math.floor((now - date) / 1000);
-        if (seconds < 45) return 'just now';
-        if (seconds < 3600) return Math.max(1, Math.floor(seconds / 60)) + ' min ago';
-        if (seconds < 86400) return Math.floor(seconds / 3600) + ' h ago';
-        return Math.floor(seconds / 86400) + ' d ago';
+        const ahead = date > now;
+        const seconds = Math.floor(Math.abs(now - date) / 1000);
+        if (seconds < 45) return ahead ? 'in a moment' : 'just now';
+        let span;
+        if (seconds < 3600) span = Math.max(1, Math.floor(seconds / 60)) + ' min';
+        else if (seconds < 86400) span = Math.floor(seconds / 3600) + ' h';
+        else { const days = Math.floor(seconds / 86400); span = ahead ? days + (days === 1 ? ' day' : ' days') : days + ' d'; }
+        return ahead ? 'in ' + span : span + ' ago';
     }
 
     function time(iso, options) {
@@ -106,7 +111,7 @@
         const node = el('time', 'when');
         node.setAttribute('datetime', date.toISOString());
         const age = now - date;
-        node.textContent = (age >= 0 && age < WEEK) ? relative(date, now) : date.toLocaleDateString();
+        node.textContent = Math.abs(age) < WEEK ? relative(date, now) : date.toLocaleDateString();
         node.title = date.toLocaleString() + ' · ' + date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
         return node;
     }

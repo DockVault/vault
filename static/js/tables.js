@@ -3,10 +3,14 @@
 //   Tables.enhance(table, {key, search: inputEl | true, skip: [colIndex...]})
 //       Makes every titled header of `table` sortable (click or Enter/Space; aria-sort says which way), sorting
 //       the body's rows by that column: a <time datetime> cell by its moment, a number by its value, else by
-//       text. An expandable table (rows .exp-row followed by their .exp-detail) keeps each pair together. The
-//       sort is remembered under `key` for this account (saveUserPreference "tables"), and applied again when
-//       the table is drawn again. `search: true` adds a search box above the table that hides rows whose text
-//       does not hold every typed word; an existing input can be given instead.
+//       text; a cell with nothing in it ("—", "Never", empty) goes last either way. An expandable table (rows
+//       .exp-row followed by their .exp-detail) keeps each pair together. Each header is known by its column id
+//       (`data-col`, set by the caller; else a slug of its text), so the sort is remembered under `key` for this
+//       account (saveUserPreference "tables") as {col: id, dir}, and applied again when the table is drawn again,
+//       even after a column is added. `search: true` adds a search box above the table that hides rows whose
+//       text does not hold every typed word; an existing input can be given instead.
+//   Tables.reset()
+//       Forgets every remembered sort (sign-out: the next account on this tab starts from its own).
 //   Tables.setDensity('comfortable' | 'compact'), Tables.density()
 //       The tables' row height, as data-density on <html>, remembered for the account.
 //
@@ -16,11 +20,26 @@
 
     const KEY = 'dv_tables';
     const DENSITY_KEY = 'dv_density';
+    const COL_ID = /^[a-z][a-z0-9-]{0,31}$/;
     let remembered = null;
+
+    // A saved map with only the entries this build reads: a column id and a direction.
+    function clean(map) {
+        const out = {};
+        if (!map || typeof map !== 'object') return out;
+        Object.keys(map).forEach((k) => {
+            const e = map[k];
+            if (e && typeof e.col === 'string' && COL_ID.test(e.col) && (e.dir === 'asc' || e.dir === 'desc')) out[k] = { col: e.col, dir: e.dir };
+        });
+        return out;
+    }
 
     function load() {
         if (remembered) return remembered;
-        try { remembered = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (_) { remembered = {}; }
+        let raw = null;
+        try { raw = localStorage.getItem(KEY); remembered = clean(JSON.parse(raw || '{}')); } catch (_) { remembered = {}; }
+        const text = JSON.stringify(remembered);
+        if (raw !== null && raw !== text) { try { localStorage.setItem(KEY, text); } catch (_) {} }
         return remembered;
     }
 
@@ -30,36 +49,82 @@
         if (typeof saveUserPreference === 'function' && text.length <= 2000) saveUserPreference({ tables: text });
     }
 
+    // Nothing remembered: the next account on this tab starts from what its own preferences say.
+    function reset() {
+        remembered = {};
+        try { localStorage.removeItem(KEY); } catch (_) {}
+    }
+
     // What the account saved on the server, applied once the app has it (the app calls this with the
-    // preferences it fetched at sign-in).
+    // preferences it fetched at sign-in). An account that saved no sort starts with none.
     function applyPreferences(prefs) {
         if (!prefs) return;
         if (typeof prefs.tables === 'string') {
             try {
                 const parsed = JSON.parse(prefs.tables);
                 if (parsed && typeof parsed === 'object') {
-                    remembered = parsed;
-                    try { localStorage.setItem(KEY, prefs.tables); } catch (_) {}
+                    remembered = clean(parsed);
+                    try { localStorage.setItem(KEY, JSON.stringify(remembered)); } catch (_) {}
                 }
             } catch (_) { /* a saved value this build cannot read: ignored */ }
+        } else {
+            reset();
         }
         if (prefs.density === 'compact' || prefs.density === 'comfortable') setDensity(prefs.density, { quiet: true });
     }
 
+    function slug(text) {
+        return String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+    }
+
+    // The column's id: what the caller named it, else a slug of its title.
+    function colId(th) {
+        return th.getAttribute('data-col') || slug(th.textContent);
+    }
+
+    function headerCells(table) {
+        return table.tHead && table.tHead.rows[0] ? Array.from(table.tHead.rows[0].cells) : [];
+    }
+
+    // The index of a column named by id (or given as an index); -1 when the table has no such column.
+    function columnIndex(table, col) {
+        const headers = headerCells(table);
+        if (typeof col === 'number') return col >= 0 && col < headers.length ? col : -1;
+        return headers.findIndex((th) => colId(th) === col);
+    }
+
+    const MISSING = /^(—|–|-|never|none)?$/i;
+
+    // What a cell shows: the chosen option of a select, else its text.
+    function cellText(cell) {
+        const sel = cell.querySelector('select');
+        if (sel && sel.selectedIndex >= 0 && sel.options && sel.options[sel.selectedIndex]) return sel.options[sel.selectedIndex].textContent.trim();
+        return cell.textContent.trim();
+    }
+
     function cellKey(cell) {
-        if (!cell) return { text: '', time: null, num: null };
+        if (!cell) return { text: '', time: null, num: null, missing: true };
+        const explicit = cell.getAttribute('data-sort-value');
+        if (explicit != null) {
+            const n = explicit.trim();
+            const num = /^-?\d+(\.\d+)?$/.test(n) ? parseFloat(n) : null;
+            return { text: n, time: null, num, missing: n === '' };
+        }
         const t = cell.querySelector('time[datetime]');
         if (t) {
             const ms = Date.parse(t.getAttribute('datetime'));
-            return { text: cell.textContent.trim(), time: isNaN(ms) ? null : ms, num: null };
+            return { text: cell.textContent.trim(), time: isNaN(ms) ? null : ms, num: null, missing: isNaN(ms) };
         }
-        const text = cell.textContent.trim();
+        const text = cellText(cell);
         const n = text.replace(/[,\s]/g, '');
         const num = /^-?\d+(\.\d+)?$/.test(n) ? parseFloat(n) : null;
-        return { text, time: null, num };
+        return { text, time: null, num, missing: MISSING.test(text) };
     }
 
+    // A cell with nothing in it sorts last whichever way the column goes.
     function compare(a, b, dir) {
+        if (a.missing !== b.missing) return a.missing ? 1 : -1;
+        if (a.missing && b.missing) return 0;
         let out;
         if (a.time != null || b.time != null) out = (a.time == null) - (b.time == null) || (a.time || 0) - (b.time || 0);
         else if (a.num != null && b.num != null) out = a.num - b.num;
@@ -79,13 +144,14 @@
 
     function sortTable(table, col, dir) {
         const tbody = table.tBodies[0];
-        if (!tbody) return;
-        const list = units(tbody).map((u, i) => ({ u, i, key: cellKey(u[0].cells[col]) }));
+        const index = columnIndex(table, col);
+        if (!tbody || index < 0) return;
+        const list = units(tbody).map((u, i) => ({ u, i, key: cellKey(u[0].cells[index]) }));
         list.sort((x, y) => compare(x.key, y.key, dir) || x.i - y.i);
         list.forEach((item) => item.u.forEach((row) => tbody.appendChild(row)));
+        const id = colId(headerCells(table)[index]);
         table.querySelectorAll('thead th[data-sort-col]').forEach((th) => {
-            const mine = Number(th.getAttribute('data-sort-col')) === col;
-            th.setAttribute('aria-sort', mine ? (dir === 'desc' ? 'descending' : 'ascending') : 'none');
+            th.setAttribute('aria-sort', colId(th) === id ? (dir === 'desc' ? 'descending' : 'ascending') : 'none');
         });
     }
 
@@ -137,10 +203,13 @@
         const o = options || {};
         const key = o.key || table.id || '';
         const skip = new Set(o.skip || []);
-        const headers = Array.from(table.tHead.rows[0] ? table.tHead.rows[0].cells : []);
+        const headers = headerCells(table);
         headers.forEach((th, col) => {
-            if (skip.has(col) || !th.textContent.trim() || th.dataset.sortCol !== undefined) return;
-            th.setAttribute('data-sort-col', String(col));
+            if (skip.has(col) || !th.textContent.trim()) return;
+            const id = colId(th);
+            if (!th.getAttribute('data-col')) th.setAttribute('data-col', id);
+            if (th.dataset.sortCol !== undefined) return;
+            th.setAttribute('data-sort-col', id);
             th.setAttribute('aria-sort', 'none');
             th.setAttribute('tabindex', '0');
             th.setAttribute('role', 'columnheader');
@@ -148,13 +217,14 @@
             th.title = 'Sort by ' + th.textContent.trim();
             const go = () => {
                 const dir = th.getAttribute('aria-sort') === 'ascending' ? 'desc' : 'asc';
-                sortTable(table, col, dir);
-                if (key) { load()[key] = { col, dir }; save(); }
+                sortTable(table, id, dir);
+                if (key) { load()[key] = { col: id, dir }; save(); }
             };
             th.addEventListener('click', go);
             th.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
         });
-        if (key && load()[key] && headers[load()[key].col]) sortTable(table, load()[key].col, load()[key].dir === 'desc' ? 'desc' : 'asc');
+        const kept = key ? load()[key] : null;
+        if (kept && columnIndex(table, kept.col) >= 0) sortTable(table, kept.col, kept.dir === 'desc' ? 'desc' : 'asc');
         let input = null;
         if (o.search === true) input = searchBox(table, key);
         else if (o.search && o.search.addEventListener) input = o.search;
@@ -195,5 +265,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
     else start();
 
-    window.Tables = { enhance, sortTable, filterTable, setDensity, density, applyPreferences };
+    window.Tables = { enhance, sortTable, filterTable, setDensity, density, applyPreferences, reset };
 })();

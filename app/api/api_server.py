@@ -10752,8 +10752,8 @@ _PREF_PATTERNS = {"settings_seen": re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")}
 
 def _tables_preference_ok(value) -> bool:
     """The sort each table was left in (static/js/tables.js): a JSON object of at most 2000 characters mapping a
-    table's key (a short name) to {"col": a column index, "dir": "asc" or "desc"}, nothing else. The server
-    stores it and reads nothing from it."""
+    table's key (a short name) to {"col": the column's id, a short slug, "dir": "asc" or "desc"}, nothing else.
+    The server stores it and reads nothing from it."""
     if not isinstance(value, str) or len(value) > 2000:
         return False
     try:
@@ -10767,7 +10767,7 @@ def _tables_preference_ok(value) -> bool:
             return False
         if not (isinstance(entry, dict) and set(entry) == {"col", "dir"}):
             return False
-        if not (isinstance(entry["col"], int) and not isinstance(entry["col"], bool) and 0 <= entry["col"] <= 99):
+        if not (isinstance(entry["col"], str) and re.fullmatch(r"[a-z][a-z0-9-]{0,31}", entry["col"])):
             return False
         if entry["dir"] not in ("asc", "desc"):
             return False

@@ -1,9 +1,10 @@
-/* Business tables (static/js/tables.js): sortable headers, the table search box, and the density choice. */
+/* Business tables (static/js/tables.js): sortable headers, the table search box, and the density choice.
+   The sort marker is drawn only on headers the library made sortable (data-sort-col): the files table draws its own. */
 .data-table th.sortable { cursor: pointer; user-select: none; }
 .data-table th.sortable:focus-visible { outline: 2px solid var(--brand-secondary); outline-offset: -2px; }
-.data-table th.sortable::after { content: ''; display: inline-block; width: .55em; margin-left: .35em; opacity: .55; }
-.data-table th.sortable[aria-sort="ascending"]::after { content: '\25B4'; }
-.data-table th.sortable[aria-sort="descending"]::after { content: '\25BE'; }
+.data-table th.sortable[data-sort-col]::after { content: ''; display: inline-block; width: .55em; margin-left: .35em; opacity: .55; }
+.data-table th.sortable[data-sort-col][aria-sort="ascending"]::after { content: '\25B4'; }
+.data-table th.sortable[data-sort-col][aria-sort="descending"]::after { content: '\25BE'; }
 
 .table-search { max-width: 320px; margin-bottom: var(--space-sm); }
 .table-search-empty { margin: var(--space-sm) 0; }

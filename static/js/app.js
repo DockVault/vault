@@ -2688,7 +2688,7 @@ function logout(how, reason) {
     // their own account when they sign in.
     state.userPreferences = null;
     try { localStorage.removeItem('dv_tables'); localStorage.removeItem('dv_density'); } catch (_) {}
-    if (window.Tables) Tables.setDensity('comfortable', { quiet: true });
+    if (window.Tables) { Tables.reset(); Tables.setDensity('comfortable', { quiet: true }); }
     state.notesHideText = undefined;
     state.notesRevealed = new Set();
 
@@ -3512,6 +3512,17 @@ function _ownerCell(link) {
 }
 
 // A table cell holding a moment (static/js/people.js), or a dash.
+// A header row whose cells carry their column ids ([label, id] pairs; an empty label makes an untitled column).
+function _headerRow(cols) {
+    const hr = _el('tr');
+    cols.forEach(([label, col]) => {
+        const th = _el('th', '', label);
+        if (col) th.setAttribute('data-col', col);
+        hr.appendChild(th);
+    });
+    return hr;
+}
+
 function _whenCell(iso) {
     const td = _el('td', 'col-time');
     td.appendChild(People.time(iso));
@@ -5438,10 +5449,10 @@ function renderTempCreds() {
                 <table class="data-table exp-table" id="tc-shared-table">
                     <thead><tr>
                         <th class="col-toggle"></th>
-                        <th>Credential</th>
-                        <th>User</th>
-                        <th>Status</th>
-                        <th>Expires</th>
+                        <th data-col="credential">Credential</th>
+                        <th data-col="user">User</th>
+                        <th data-col="status">Status</th>
+                        <th data-col="expires">Expires</th>
                     </tr></thead>
                     <tbody>${shared.map(renderTempCredRow).join('')}</tbody>
                 </table>
@@ -5454,10 +5465,10 @@ function renderTempCreds() {
             <div class="data-table-wrapper">
                 <table class="data-table" id="tc-per-computer-table">
                     <thead><tr>
-                        <th>Computer</th>
-                        <th>Credential</th>
-                        <th>Status</th>
-                        <th>Expires</th>
+                        <th data-col="computer">Computer</th>
+                        <th data-col="credential">Credential</th>
+                        <th data-col="status">Status</th>
+                        <th data-col="expires">Expires</th>
                     </tr></thead>
                     <tbody>${perComputer.map(renderPerComputerRow).join('')}</tbody>
                 </table>
@@ -6261,13 +6272,13 @@ function renderUsersTable() {
                 <table class="data-table exp-table">
                     <thead><tr>
                         <th class="col-toggle"></th>
-                        <th>User</th>
-                        <th>Role</th>
-                        <th class="col-depts">Departments</th>
-                        <th>Status</th>
-                        <th>MFA</th>
-                        <th>Last sign-in</th>
-                        <th>Created</th>
+                        <th data-col="user">User</th>
+                        <th data-col="role">Role</th>
+                        <th class="col-depts" data-col="departments">Departments</th>
+                        <th data-col="status">Status</th>
+                        <th data-col="mfa">MFA</th>
+                        <th data-col="last-signin">Last sign-in</th>
+                        <th data-col="created">Created</th>
                     </tr></thead>
                     <tbody>${list.map(renderUserRow).join('')}</tbody>
                 </table>
@@ -21119,8 +21130,8 @@ function renderAdminNoteLinks(data) {
     if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public links exist.')); return; }
     const table = _el('table', 'data-table');
     const thead = _el('thead');
-    const hr = _el('tr');
-    ['Owner', 'Type', 'Note', 'Status', 'Protection', 'Expires', 'Views', 'Created', 'Last used', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    const hr = _headerRow([['Owner', 'owner'], ['Type', 'tag'], ['Note', 'note'], ['Status', 'status'], ['Protection', 'protection'],
+        ['Expires', 'expires'], ['Views', 'views'], ['Created', 'created'], ['Last used', 'last-used'], ['', '']]);
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     links.forEach(l => {
@@ -22461,8 +22472,9 @@ function renderAdminPublicLinks(data) {
     const links = (data && data.links) || [];
     if (!links.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No public file/folder links exist.')); return; }
     const table = _el('table', 'data-table');
-    const thead = _el('thead'); const hr = _el('tr');
-    ['Owner', 'Type', 'Item', 'Status', 'Protection', 'Expires', 'Uses', 'Created', 'Last used', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    const thead = _el('thead');
+    const hr = _headerRow([['Owner', 'owner'], ['Type', 'tag'], ['Item', 'item'], ['Status', 'status'], ['Protection', 'protection'],
+        ['Expires', 'expires'], ['Uses', 'uses'], ['Created', 'created'], ['Last used', 'last-used'], ['', '']]);
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     links.forEach(l => {
@@ -23218,8 +23230,9 @@ function renderAdminReceivers(data) {
     const receivers = (data && data.receivers) || [];
     if (!receivers.length) { host.replaceChildren(_el('p', 'text-tertiary text-sm', 'No upload links exist.')); return; }
     const table = _el('table', 'data-table');
-    const thead = _el('thead'); const hr = _el('tr');
-    ['Owner', 'Label', 'Type', 'Status', 'Expires', 'Files', 'Budget', 'Created', ''].forEach(h => hr.appendChild(_el('th', '', h)));
+    const thead = _el('thead');
+    const hr = _headerRow([['Owner', 'owner'], ['Label', 'label'], ['Type', 'tag'], ['Status', 'status'], ['Expires', 'expires'],
+        ['Files', 'files'], ['Budget', 'budget'], ['Created', 'created'], ['', '']]);
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     receivers.forEach(r => {

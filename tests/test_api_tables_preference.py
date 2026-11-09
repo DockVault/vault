@@ -14,7 +14,7 @@ def _put(client, **prefs):
 
 
 def test_a_real_sort_is_kept_and_read_back(temp_user_client):
-    value = json.dumps({"users": {"col": 1, "dir": "asc"}, "vault-members": {"col": 3, "dir": "desc"}})
+    value = json.dumps({"users": {"col": "user", "dir": "asc"}, "vault-members": {"col": "granted-by", "dir": "desc"}})
     got = _put(temp_user_client, tables=value)
     assert json.loads(got["tables"]) == json.loads(value)
     got = _put(temp_user_client, density="compact")
@@ -22,10 +22,12 @@ def test_a_real_sort_is_kept_and_read_back(temp_user_client):
 
 
 @pytest.mark.parametrize("bad", [
-    "not json", "[]", json.dumps({"users": {"col": "1", "dir": "asc"}}), json.dumps({"users": {"col": 1, "dir": "up"}}),
-    json.dumps({"users": {"col": 1}}), json.dumps({"users": {"col": 1, "dir": "asc", "x": 1}}),
-    json.dumps({"a b": {"col": 1, "dir": "asc"}}), json.dumps({"users": {"col": True, "dir": "asc"}}),
-    json.dumps({f"t{i}": {"col": 0, "dir": "asc"} for i in range(51)}), "{" + "x" * 2000 + "}",
+    "not json", "[]", json.dumps({"users": {"col": "1", "dir": "asc"}}), json.dumps({"users": {"col": "user", "dir": "up"}}),
+    json.dumps({"users": {"col": "user"}}), json.dumps({"users": {"col": "user", "dir": "asc", "x": 1}}),
+    json.dumps({"a b": {"col": "user", "dir": "asc"}}), json.dumps({"users": {"col": True, "dir": "asc"}}),
+    json.dumps({"users": {"col": 1, "dir": "asc"}}), json.dumps({"users": {"col": "User", "dir": "asc"}}),
+    json.dumps({"users": {"col": "a" * 33, "dir": "asc"}}),
+    json.dumps({f"t{i}": {"col": "a", "dir": "asc"} for i in range(51)}), "{" + "x" * 2000 + "}",
 ])
 def test_anything_else_is_dropped(temp_user_client, bad):
     before = temp_user_client.get("/users/me/preferences").json().get("tables")
