@@ -90,12 +90,18 @@ def _put_settings_as_a_second_administrator(client, body):
     from conftest import ApiClient
 
     other = client.create_user(role="admin")
+    done = False
     try:
         second = ApiClient()
         second.login(other["_username"], other["_password"])
         r = second.post("/auth/second-factor/step-up",
                         json={"action": SESSION_LIMITS_ACTION, "method": "password", "code": other["_password"]})
         r.raise_for_status()
-        return second.put("/settings", json=body, headers={"X-Second-Factor": r.json()["receipt"]})
+        answer = second.put("/settings", json=body, headers={"X-Second-Factor": r.json()["receipt"]})
+        done = True
+        return answer
     finally:
-        client.delete_user(other["id"])
+        gone = client.delete_user(other["id"])
+        # Checked only when nothing else went wrong, so the first failure is the one reported.
+        if done:
+            assert gone.status_code in (200, 204), f"the second administrator was not removed: {gone.text}"

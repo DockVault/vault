@@ -205,3 +205,18 @@ def test_a_changed_or_unreadable_policy_value_counts_as_a_change(changed):
     assert api._changes_second_factor_policy({}, {**pol.effective_policy({}), **changed})
     assert not api._changes_second_factor_policy({}, dict(pol.effective_policy({})))
     assert not api._changes_second_factor_policy({}, {"app_name": "x"})
+
+
+def test_the_step_up_is_limited_to_ten_an_account_in_five_minutes():
+    # The live tests' helper (tests/_sf_helpers.py) turns to a second administrator when this limit answers;
+    # pinned here so a change to the limit is seen, not hidden by that fallback.
+    import ast
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(source))
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "second_factor_step_up")
+    calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and ast.unparse(c.func).endswith("check_rate_limit")]
+    assert len(calls) == 1
+    kw = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert (kw["limit"], kw["window"], kw["prefix"], kw["fail_open"]) == ("10", "300", "'sf_step_up'", "False"), kw
+    assert "current_user.id" in kw["identifier"], kw
