@@ -1021,8 +1021,11 @@ async function _apiRequestNow(endpoint, options = {}) {
             }
             const err = new Error(errorMsg);
             err.status = response.status;  // let callers branch on e.g. 409 conflict
-            err.reason = (data && typeof data.reason === 'string') ? data.reason
-                : (detail && typeof detail === 'object' && typeof detail.reason === 'string') ? detail.reason : undefined;
+            err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
+            // A structured refusal carries its reason inside the detail.
+            if (err.reason === undefined && detail && typeof detail === 'object' && typeof detail.reason === 'string') {
+                err.reason = detail.reason;
+            }
             throw err;
         }
         
