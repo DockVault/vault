@@ -368,3 +368,25 @@ def test_the_compact_command_writes_nothing_when_it_refuses(tmp_path, capsys):
     assert _SYNC.main(["compact", str(source)]) == 1
     assert source.read_bytes() == before
     assert "not valid" in capsys.readouterr().err
+
+
+def test_an_edge_the_branch_dropped_is_kept_and_reported():
+    """The line's newest release takes the edge up over from the one before it: release/0.33 drops
+    0.33.1 -> 0.34.0 for 0.33.1 -> 0.33.2 -> 0.34.0. The sync keeps main's edge, as it keeps everything of
+    main's, and says so, so the release commit can drop it from main by hand."""
+    main = _main()
+    branch = copy.deepcopy(main)
+    branch["versions"]["0.33.2"] = _entry("2026-12-20")
+    branch["edges"] = [e for e in branch["edges"] if (e["from"], e["to"]) != ("0.33.1", "0.34.0")]
+    branch["edges"] += [_edge("0.33.1", "0.33.2"), _edge("0.33.2", "0.34.0")]
+
+    result, notes = _SYNC.sync(main, branch)
+
+    assert ("0.33.1", "0.34.0") in {(e["from"], e["to"]) for e in result["edges"]}
+    assert "kept main's edge 0.33.1 -> 0.34.0, which the branch does not have though it declares both releases" \
+        in notes
+    # An edge into a release the branch does not declare is not the branch's to drop: no note.
+    main["versions"]["0.34.1"] = _entry("2026-12-21")
+    main["edges"].append(_edge("0.34.0", "0.34.1"))
+    _, notes = _SYNC.sync(main, branch)
+    assert not [n for n in notes if "0.34.1" in n]

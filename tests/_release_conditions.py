@@ -350,19 +350,25 @@ def before_the_release(matrix: dict) -> dict:
     return out
 
 
+def newest_below(matrix: dict) -> str:
+    """The newest release below INTO: SOURCE_FLOOR, or a later release of the line before, which takes the edge into
+    INTO over from the one before it."""
+    return max(before_the_release(matrix)["versions"], key=_version_key)
+
+
 def with_the_release(matrix: dict) -> dict:
     """``matrix`` as the release commit makes it from this file: the releases below INTO, then INTO declared (its
-    entry made from SOURCE_FLOOR's), its line listed, and one edge into it, from SOURCE_FLOOR, with every condition.
-    SOURCE_FLOOR must be the newest release below INTO: a later one needs its own edge into INTO."""
+    entry made from the newest release below it), its line listed, and one edge into it, from that release (SOURCE_FLOOR
+    or later), with every condition."""
     data = before_the_release(matrix)
-    newest = max(data["versions"], key=_version_key)
-    assert newest == SOURCE_FLOOR, "a later release of the line before needs its own edge into 0.34.0 here"
+    newest = newest_below(matrix)
+    assert _version_key(newest) >= _version_key(SOURCE_FLOOR), "the newest release below 0.34.0 is older than 0.33.6"
     entry = copy.deepcopy(data["versions"][newest])
     entry.update(released="2026-11-15", notes="The release.")
     entry["support"] = {"eol": False, "secure": True}
     entry.pop("vulnerabilities", None)
     data["versions"][INTO] = entry
     data["lines"] = {"0.33": {"security_fixes_until": "2027-05-15"}, "0.34": {"security_fixes_until": None}}
-    data["edges"].append({"from": SOURCE_FLOOR, "to": INTO, "kind": "direct", "reversible": True,
+    data["edges"].append({"from": newest, "to": INTO, "kind": "direct", "reversible": True,
                           "requires_backup": True, "conditions": [condition(cid) for cid in CONDITIONS]})
     return data
