@@ -463,8 +463,18 @@ def render_for_send(
         by_id[rid] = inline
         return f"cid:{cid}"
 
-    final_html = _rewrite_images(personalized, src_for)
+    final_html = _rewrite_images(_drop_empty_links(personalized), src_for)
     return final_html, attachments
+
+
+# An anchor whose href came out empty: the sanitizer keeps it (with its rel), so match it after that pass.
+_EMPTY_LINK_RE = re.compile(r'<a\b[^>]*\bhref=""[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+
+
+def _drop_empty_links(html: str) -> str:
+    """A link whose address substituted to nothing (an automated email's ``{{action.link}}`` when no public
+    address is configured) is sent as its text: a link that points nowhere would only mislead."""
+    return _EMPTY_LINK_RE.sub(r"\1", html)
 
 
 def render_plaintext_fallback(final_html: str) -> str:

@@ -13318,9 +13318,9 @@ def _tell_about_expiry(item: dict) -> bool:
         with get_db_context() as db:
             owner = db.query(User).filter(User.id == uuid.UUID(str(item["owner_id"]))).first()
             if owner is not None and owner.email:
-                base = _public_base_url(None)
+                base = _public_base_url(None)      # the configured public address, or no link at all
                 send_action_email(db, "expiry_reminder", recipient={"email": owner.email, "username": owner.username},
-                                  action_context={"link": f"{base}/{item['target']}" if base else item["target"],
+                                  action_context={"link": f"{base}/{item['target']}" if base else "",
                                                   "change": f"{item['title']} expires {when}.", "expires": when})
     except Exception:  # noqa: BLE001 - the notice is written; mail is best-effort
         pass
@@ -16021,10 +16021,12 @@ def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
             target="#uploadlinks/drops", dedup_prefix=f"receiver_upload:{receiver.id}:{bucket}", once=True)
         if notified and owner.email:
             from app.core.email_actions import send_action_email
-            base = _public_base_url(request) if request is not None else ""
+            # The link is built from the configured public address only, never from this request's Host:
+            # the request is the anonymous uploader's. With no address configured the email carries no link.
+            base = _public_base_url(None)
             send_action_email(db, "receiver_upload_received",
                               recipient={"email": owner.email, "username": owner.username},
-                              action_context={"link": f"{base}/#uploadlinks/drops",
+                              action_context={"link": f"{base}/#uploadlinks/drops" if base else "",
                                               "change": f"A file arrived on your upload link {label} on "
                                                         f"{_brand_name(db) or 'the vault'}."})
     except Exception:  # noqa: BLE001 - telling the owner never fails the upload

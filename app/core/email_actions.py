@@ -323,70 +323,74 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
     },
 }
 
-# (key, name, description, category) for each cataloged action. Subject/body come from DEFAULT_TEMPLATES
-# above, so the seeded template, the send-time fallback, and the "Load From" source are one and the same.
-_ACTION_META: tuple[tuple[str, str, str, str], ...] = (
+# (key, name, description, category, default_enabled) for each cataloged action. Subject/body come from
+# DEFAULT_TEMPLATES above, so the seeded template, the send-time fallback, and the "Load From" source are one
+# and the same. default_enabled is how the action is seeded (and taken before its row exists): on for every
+# system and locked action; for an optional one, on when the email is useful to its reader and bounded (the
+# word to an upload link's owner that files arrived, once an hour; the reminder before something expires,
+# once per thing and date), off otherwise. An administrator can turn any optional action on or off.
+_ACTION_META: tuple[tuple[str, str, str, str, bool], ...] = (
     ("email_change", "Email change verification",
-     "Sent to a new address when a user changes their email — carries the confirmation code.", SYSTEM),
+     "Sent to a new address when a user changes their email — carries the confirmation code.", SYSTEM, True),
     ("password_reset", "Password reset",
-     "Sent when a user requests a password reset — carries the reset link.", SYSTEM),
+     "Sent when a user requests a password reset — carries the reset link.", SYSTEM, True),
     ("account_invite", "Account invitation",
-     "Sent when an admin invites someone to create an account — carries the invitation link.", SYSTEM),
+     "Sent when an admin invites someone to create an account — carries the invitation link.", SYSTEM, True),
     ("account_welcome", "Welcome email",
-     "Optional — sent after an account is created.", OPTIONAL),
+     "Optional — sent after an account is created.", OPTIONAL, False),
     ("login_alert", "New sign-in alert",
-     "Optional — notify a user when their account signs in.", OPTIONAL),
+     "Optional — notify a user when their account signs in.", OPTIONAL, False),
     ("share_created", "File / folder shared",
-     "Optional — notify a recipient when something is shared with them.", OPTIONAL),
+     "Optional — notify a recipient when something is shared with them.", OPTIONAL, False),
     ("receiver_upload_received", "Files received on an upload link",
-     "Optional — tell the owner of an upload link when files arrive on it (once an hour per link).", OPTIONAL),
+     "Optional — tell the owner of an upload link when files arrive on it (once an hour per link).", OPTIONAL, True),
     ("expiry_reminder", "Something you shared is about to expire",
      "Optional — remind the maker of a share or a link two days before it expires (one made for less than two "
-     "days is not reminded).", OPTIONAL),
+     "days is not reminded).", OPTIONAL, True),
     ("vault_member_added", "Added to a vault",
-     "Optional — notify a user when they're added to a vault or team.", OPTIONAL),
+     "Optional — notify a user when they're added to a vault or team.", OPTIONAL, False),
     ("temp_credential_issued", "Temporary credential issued",
-     "Optional — notify a user when a temporary access credential is created for them.", OPTIONAL),
+     "Optional — notify a user when a temporary access credential is created for them.", OPTIONAL, False),
     ("account_changed_by_admin", "Account changed by an administrator",
      "Sent to a user when an administrator changes their password, reset link, second factor, email "
      "address (to the old address), SSH keys, lock, activation or role — says what, when and by whom.",
-     SYSTEM),
+     SYSTEM, True),
     ("administrator_added", "New administrator",
      "Sent to every administrator when an account is created as, promoted to or invited as an "
-     "administrator — says who, when and by whom.", SYSTEM),
+     "administrator — says who, when and by whom.", SYSTEM, True),
     ("ssh_keys_adder_left", "SSH keys an administrator added",
      "Sent to a user when an administrator who added SSH keys to their account is demoted, deactivated, "
-     "locked or deleted — names the keys, which still sign in, and links to where they are removed.", SYSTEM),
+     "locked or deleted — names the keys, which still sign in, and links to where they are removed.", SYSTEM, True),
     ("auditor_right", "The auditor right",
      "Sent to every administrator and to the account when the auditor right is proposed, granted, turned down, "
-     "revoked, suspended, ended, reconfirmed, or lapses or expires -- says what, when and by whom.", SYSTEM),
+     "revoked, suspended, ended, reconfirmed, or lapses or expires -- says what, when and by whom.", SYSTEM, True),
     ("compliance_access_notice", "Access to your vaults",
      "Sent to a vault's owner when an investigation may open their vaults, is extended, narrowed, ends or is "
      "closed, when a legal hold on their vaults is placed, confirmed, released, restored or lapses, and when files "
      "are exported -- says what, when and by whom, never a vault, file or folder name. Its wording is fixed: "
-     "it cannot be changed or turned off.", LOCKED),
+     "it cannot be changed or turned off.", LOCKED, True),
     ("vault_access_notice", "Access given to your vault",
      "Sent to a vault's owner when someone who could not open the vault gives a person access to it (a grant to "
      "the person or to a department, adding them to a department, or removing their own access row) -- names the "
      "person, when and by whom their account was created and whether its password was set by someone else; never "
-     "a vault's name. Its wording is fixed: it cannot be changed or turned off.", LOCKED),
+     "a vault's name. Its wording is fixed: it cannot be changed or turned off.", LOCKED, True),
     ("retention_change", "How long records are kept",
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
-     SYSTEM),
+     SYSTEM, True),
     ("recorded_values_removal", "Removal of recorded values",
      "Sent to every administrator when a removal of the values the audit log recorded under earlier "
-     "recording levels is asked for, cancelled or completed — says what, when and by whom.", SYSTEM),
+     "recording levels is asked for, cancelled or completed — says what, when and by whom.", SYSTEM, True),
     ("encryption_key_release_code", "Encryption key release code",
      "Sent to a user whose sign-in details an administrator changed recently, when a browser asks to open "
      "their encryption key — carries the code that releases it, to the address the account had before the "
      "first of those changes (for an email change, the address it replaced), never to the one it has now. "
-     "Its wording is fixed: it cannot be changed or turned off.", LOCKED),
+     "Its wording is fixed: it cannot be changed or turned off.", LOCKED, True),
     ("encryption_key_notice", "Encryption key notice",
      "Sent to a user when a change to a zero-knowledge vault's key was refused because it did not come with "
      "their own encryption key (at most once an hour), when an encryption key is set up for their account, "
      "and to a vault's managers when its owner resets its key — says what happened and when. Its wording is "
-     "fixed: it cannot be changed or turned off.", LOCKED),
+     "fixed: it cannot be changed or turned off.", LOCKED, True),
 )
 
 ACTION_CATALOG: tuple[dict, ...] = tuple(
@@ -395,11 +399,12 @@ ACTION_CATALOG: tuple[dict, ...] = tuple(
         "name": name,
         "description": description,
         "category": category,
+        "default_enabled": default_enabled,
         "default_subject": DEFAULT_TEMPLATES[key]["subject"],
         "default_body_html": DEFAULT_TEMPLATES[key]["body_html"],
         "default_template_name": DEFAULT_TEMPLATES[key]["name"],
     }
-    for (key, name, description, category) in _ACTION_META
+    for (key, name, description, category, default_enabled) in _ACTION_META
 )
 
 SPEC_BY_KEY: dict[str, dict] = {a["key"]: a for a in ACTION_CATALOG}
@@ -465,9 +470,10 @@ def _load_resource(db: Session, rid: str):
 def seed_email_actions(db: Session) -> int:
     """Idempotently ensure every cataloged action exists. Actions are seeded WITHOUT a bound template
     here; :func:`seed_default_templates` (called right after) materializes each action's default
-    template and pre-binds it. System actions are seeded enabled; optional ones disabled. Metadata is
-    refreshed from the catalog; an admin's template/enabled choices are never overwritten. Returns the
-    number of actions created."""
+    template and pre-binds it. Each action is seeded with its catalog default (default_enabled: system and
+    locked actions on; an optional one on or off as the catalog says). Metadata is refreshed from the
+    catalog; an admin's template/enabled choices are never overwritten. Returns the number of actions
+    created."""
     from app.core.models import EmailAction
 
     created = 0
@@ -476,7 +482,7 @@ def seed_email_actions(db: Session) -> int:
         action = db.get(EmailAction, spec["key"])
         if action is None:
             db.add(EmailAction(key=spec["key"], name=spec["name"], description=spec["description"],
-                               category=spec["category"], enabled=(spec["category"] in ALWAYS_ON)))
+                               category=spec["category"], enabled=spec["default_enabled"]))
             created += 1
             changed = True
         elif (action.name, action.description, action.category) != (spec["name"], spec["description"], spec["category"]):
@@ -560,7 +566,7 @@ def default_template_payloads() -> list[dict]:
     action has none: its wording is fixed, no template row is seeded for it, and none can be bound to it."""
     from app.core import email_sanitize
     out: list[dict] = []
-    for key, _n, _d, category in _ACTION_META:
+    for key, _n, _d, category, _default in _ACTION_META:
         if category == LOCKED:
             continue
         spec = DEFAULT_TEMPLATES[key]
@@ -616,12 +622,12 @@ def send_action_email(db: Session, key: str, *, recipient: dict,
     spec = SPEC_BY_KEY.get(key, {})
     if action is None and not spec:
         return False
-    # An OPTIONAL action is off unless explicitly enabled — including the brief pre-seed window where
-    # its DB row doesn't exist yet (default to the catalog category, disabled). System actions are on.
-    # A locked action's category is the catalog's, whatever its row says.
+    # An OPTIONAL action sends only when enabled: by the administrator, or, in the brief pre-seed window
+    # where its DB row doesn't exist yet, by its catalog default. System actions are on. A locked action's
+    # category is the catalog's, whatever its row says.
     category = spec.get("category") if spec.get("category") == LOCKED else (
         action.category if action is not None else spec.get("category", OPTIONAL))
-    enabled = action.enabled if action is not None else (category in ALWAYS_ON)
+    enabled = action.enabled if action is not None else spec.get("default_enabled", category in ALWAYS_ON)
     if category == OPTIONAL and not enabled and not force:
         return False
 

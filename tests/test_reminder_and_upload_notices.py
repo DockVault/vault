@@ -6,7 +6,10 @@ Each names the thing by its kind only (a share of a vault, a folder or a file; a
 link; an upload link and its label) and deep-links to the page that manages it. Neither puts a vault's name, a
 note's title or a file's name into the notice's title or text, nor into what the email is given: those names are
 sealed at rest, and the notice's columns and the mail are in the clear. Each is given once: the notice ledger
-remembers what was told, so dismissing the notification does not bring it, or its email, back. The matching live tests
+remembers what was told, so dismissing the notification does not bring it, or its email, back. Both emails are on
+by default (an administrator can turn either off in Email Studio), and their links are built from the configured
+public address only, never from the request, which for an upload is the anonymous uploader's: with no address
+configured the email goes out without a link. The matching live tests
 (tests/test_api_expiry_reminders.py, tests/test_api_upload_links_collect.py) drive the routes on a running stack.
 """
 import uuid
@@ -139,7 +142,8 @@ def everything_said(rows, emails):
 
 # --------------------------------------------------------------------------- named by kind, never by a sealed name
 
-def test_a_reminder_names_the_kind_of_thing_never_the_vault_or_the_note(db, owner, emails):
+def test_a_reminder_names_the_kind_of_thing_never_the_vault_or_the_note(db, owner, emails, monkeypatch):
+    monkeypatch.setattr(email_actions, "vault_url", lambda: "https://vault.example.test")
     v = vault(db, owner)
     soon = NOW + timedelta(hours=20)
     share(db, owner, v, expires_at=soon)
@@ -159,7 +163,8 @@ def test_a_reminder_names_the_kind_of_thing_never_the_vault_or_the_note(db, owne
     assert by_target["#shared/by-me"].title.startswith("Your share of a folder expires ")
     assert by_target["#notes/shared"].title.startswith("Your note link expires ")
     assert {e[0] for e in emails} == {"expiry_reminder"}
-    assert sorted(e[2]["link"].rsplit("/#", 1)[-1].lstrip("#") for e in emails) == ["notes/shared", "shared/by-me"]
+    assert sorted(e[2]["link"] for e in emails) == ["https://vault.example.test/#notes/shared",
+                                                     "https://vault.example.test/#shared/by-me"]
 
 
 def test_an_upload_notice_names_the_link_never_the_file(db, owner, emails):
@@ -232,3 +237,60 @@ def test_the_ledger_holds_no_name_and_the_sweep_forgets_it_after_thirty_days(db,
     db.commit()
     expiry_reminders.sweep_once(lambda _item: False, now=NOW)
     assert sorted(r.dedup_key for r in ledger(db, owner)) == sorted([row.dedup_key, "recent:key"])
+
+
+# --------------------------------------------------------------------------- the emails: on by default, link from the configured address
+
+def test_the_two_emails_are_on_by_default_and_every_other_optional_one_is_off(db):
+    on = {a["key"] for a in email_actions.ACTION_CATALOG if a["default_enabled"]}
+    optional = {a["key"] for a in email_actions.ACTION_CATALOG if a["category"] == email_actions.OPTIONAL}
+    assert on & optional == {"receiver_upload_received", "expiry_reminder"}
+    assert {a["key"] for a in email_actions.ACTION_CATALOG if a["category"] in email_actions.ALWAYS_ON} <= on
+    # Seeded that way, and bound to their default templates, so they send as soon as mail is set up.
+    assert email_actions.seed_email_actions(db) == len(email_actions.ACTION_CATALOG)
+    email_actions.seed_default_templates(db)
+    rows = {a.key: a for a in db.query(m.EmailAction).all()}
+    for key in ("receiver_upload_received", "expiry_reminder"):
+        assert rows[key].enabled is True and rows[key].template_id is not None, key
+    for key in optional - on:
+        assert rows[key].enabled is False, key
+    # Seeding again changes no administrator's choice.
+    rows["expiry_reminder"].enabled = False
+    db.commit()
+    assert email_actions.seed_email_actions(db) == 0
+    db.expire_all()
+    assert db.get(m.EmailAction, "expiry_reminder").enabled is False
+
+
+def test_the_upload_email_links_only_to_the_configured_address_or_not_at_all(db, owner, emails, monkeypatch):
+    receiver = SimpleNamespace(id=uuid.uuid4(), label="Signed contracts")
+    uploader = SimpleNamespace(base_url="https://evil.example/", headers={"host": "evil.example"})
+    monkeypatch.setattr(email_actions, "vault_url", lambda: "https://vault.example.test")
+    api._tell_receiver_owner(db, uploader, receiver, owner, None, SimpleNamespace(original_name="a.pdf"))
+    assert emails[-1][2]["link"] == "https://vault.example.test/#uploadlinks/drops"
+    # No public address configured: no link, and never the uploader's host.
+    monkeypatch.setattr(email_actions, "vault_url", lambda: "")
+    other = SimpleNamespace(id=uuid.uuid4(), label="Receipts")
+    api._tell_receiver_owner(db, uploader, other, owner, None, SimpleNamespace(original_name="b.pdf"))
+    assert emails[-1][2]["link"] == "" and "evil.example" not in str(emails[-1][2])
+    # The reminder's link follows the same rule.
+    v = vault(db, owner)
+    share(db, owner, v, expires_at=NOW + timedelta(hours=20))
+    [item] = expiry_reminders.due(db, now=NOW)
+    assert api._tell_about_expiry(item) is True
+    assert emails[-1][0] == "expiry_reminder" and emails[-1][2]["link"] == ""
+
+
+def test_an_email_with_no_address_goes_out_without_a_link():
+    from app.core import email_sanitize
+    for key, text in (("receiver_upload_received", "Open your upload links"), ("expiry_reminder", "Open Acme vault")):
+        body = email_actions.DEFAULT_TEMPLATES[key]["body_html"]
+        with_link = email_sanitize.token_context(brand_name="Acme vault", action={
+            "link": "https://vault.example.test/#uploadlinks/drops", "change": "A file arrived.", "expires": "soon"})
+        html, _ = email_sanitize.render_for_send(body, context=with_link, load_resource=lambda _r: None)
+        assert 'href="https://vault.example.test/#uploadlinks/drops"' in html and text in html
+        without = email_sanitize.token_context(brand_name="Acme vault", action={
+            "link": "", "change": "A file arrived.", "expires": "soon"})
+        html, _ = email_sanitize.render_for_send(body, context=without, load_resource=lambda _r: None)
+        assert "<a " not in html and 'href=' not in html, html
+        assert text in html and "A file arrived." in html
