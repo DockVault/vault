@@ -265,7 +265,10 @@ def test_every_step_of_a_hold_tells_its_owners_through_the_outbox(db, people, st
     assert titles[-1] == title
 
 
-def test_an_undone_release_tells_the_owner(db, people):
+def test_an_undone_release_tells_the_owner(db, people, monkeypatch):
+    # The undo reads the clock for itself and is refused once the release's purge time has passed: read from the
+    # wall clock, that time passed the purge delay after NOW, whatever day the suite runs.
+    monkeypatch.setattr(holds, "utcnow", lambda: NOW + timedelta(hours=2))
     bob = _user(db, "bob", m.RoleEnum.ADMIN)
     case = _place(db, people.ada, [people.v1])
     holds.confirm(db, case, by=bob, now=NOW)

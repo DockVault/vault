@@ -62,6 +62,15 @@ def told(monkeypatch):
     return out
 
 
+@pytest.fixture
+def clock_after_placing(monkeypatch):
+    """The module's clock an hour after NOW. A test that places a hold at NOW and then calls a path that reads the
+    clock itself (the host's steps, the case summary, an undo) needs it: read from the wall clock, that path would
+    see the hold's confirmation time, or the purge time of its release, run out days after NOW, whatever day the
+    suite runs. NOW itself stays a fixed date: case numbers carry its year."""
+    monkeypatch.setattr(holds, "utcnow", lambda: NOW + timedelta(hours=1))
+
+
 @pytest.fixture(autouse=True)
 def sftp_same(monkeypatch):
     """Every SFTP server runs this version, unless a test sets ``check`` (an answer) or clears it (the real check,
@@ -441,7 +450,7 @@ def test_for_an_auditors_case_the_grants_exclusions_decide(db, people, monkeypat
     assert holds.decider_refusal(db, case, people.bob, NOW) == ind.PROPOSED and asked == ["bob"]
 
 
-def test_the_host_confirms_as_the_operator_when_no_administrator_could(db, people):
+def test_the_host_confirms_as_the_operator_when_no_administrator_could(db, people, clock_after_placing):
     """bob is independent of ada but has no authenticator (the confirmation asks for its code): nobody can
     confirm on the web, so the server's operator may."""
     case = _place(db, people.ada, [people.v1])
@@ -457,7 +466,8 @@ def test_the_host_confirms_as_the_operator_when_no_administrator_could(db, peopl
         host_compliance.CASE_STEPS["confirm-hold"](db, case)
 
 
-def test_the_host_may_not_confirm_while_an_administrator_could_and_the_refusal_is_recorded(db, people):
+def test_the_host_may_not_confirm_while_an_administrator_could_and_the_refusal_is_recorded(db, people,
+                                                                                         clock_after_placing):
     from app.core.host_operator import _Answer
     case = _place(db, people.ada, [people.v1])
     _totp(db, people.ada)        # the placer: never a confirmer
@@ -473,7 +483,7 @@ def test_the_host_may_not_confirm_while_an_administrator_could_and_the_refusal_i
     assert refused.details["reason"] == holds.INDEPENDENT_ADMIN
 
 
-def test_the_host_list_and_show_say_whether_the_host_may_confirm(db, people):
+def test_the_host_list_and_show_say_whether_the_host_may_confirm(db, people, clock_after_placing):
     case = _place(db, people.ada, [people.v1, people.v2])
     summary = host_compliance._case_summary(db, case)
     assert (summary["holds_to_confirm"], summary["independent_confirmers"], summary["host_may_confirm"]) == \
@@ -503,7 +513,8 @@ def test_past_its_confirm_deadline_a_hold_is_confirmed_by_nobody_before_the_job_
     assert holds.lapse_due(db, late) == 1
 
 
-def test_a_confirmation_takes_the_turn_of_holds_and_deletions_before_it_writes(db, people, monkeypatch):
+def test_a_confirmation_takes_the_turn_of_holds_and_deletions_before_it_writes(db, people, monkeypatch,
+                                                                               clock_after_placing):
     """From its confirmation a hold holds back every erase and other deletion of records, so the confirmation takes
     the turn as a placing does: exclusively, before it writes (test_legal_hold_turn_routes_live.py shows the wait on
     Postgres). A deletion step that keeps the turn too long refuses the host's confirmation, recorded, and nothing
@@ -953,7 +964,7 @@ def test_a_raised_purge_delay_counts_and_a_lowered_one_does_not(db, people, sett
     assert holds.last_release(db, case2.id)[0].purge_after == NOW + timedelta(days=10)
 
 
-def test_an_independent_administrator_undoes_a_release_before_the_purge(db, people):
+def test_an_independent_administrator_undoes_a_release_before_the_purge(db, people, clock_after_placing):
     case = _place(db, people.ada, [people.v1])
     holds.confirm(db, case, by=people.bob, now=NOW)
     kept = _keep(db, people.v1)

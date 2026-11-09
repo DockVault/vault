@@ -417,8 +417,11 @@ def test_the_preview_is_what_the_job_deletes(env, factory, numbers):
     assert shown["by_age"]["rows"] + shown["by_size"]["rows"] == len(gone) == result.deleted
 
 
-def test_the_preview_route_is_a_bounded_plain_function_for_administrators(env, factory):
+def test_the_preview_route_is_a_bounded_plain_function_for_administrators(env, factory, monkeypatch):
     route = routes.preview_audit_retention
+    # The rows' ages count from NOW and the route reads the clock itself: read from the wall clock, the youngest
+    # row passed the 30-day maximum 30 days after it was seeded, whatever day the suite runs.
+    monkeypatch.setattr(sc, "utcnow", lambda: NOW)
     assert not inspect.iscoroutinefunction(route)
     body = inspect.getsource(route).split('"""', 2)[2]
     assert body.lstrip().startswith("limit_statements(db, PREVIEW_STATEMENT_TIMEOUT_MS)")
