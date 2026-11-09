@@ -80,7 +80,7 @@
         if (p.deleted) parts.push('account deleted');
         else if (!p.id) parts.push('no account');
         wrap.title = parts.join(' · ');
-        if (o.nameless) wrap.setAttribute('aria-label', wrap.title);
+        if (o.nameless) { wrap.setAttribute('role', 'img'); wrap.setAttribute('aria-label', wrap.title); }
         return wrap;
     }
 

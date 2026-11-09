@@ -191,7 +191,7 @@
                     <!-- Persistent product attribution. Visible by default so it survives even
                          if JS/branding fails; brand.js updates the name/link and only hides it
                          when a deploy sets BRAND_SHOW_POWERED_BY=false. NOT tenant-editable. -->
-                    <div id="powered-by" class="text-secondary" style="margin-top: var(--space-lg); font-size: 0.8em; opacity: 0.7;">
+                    <div id="powered-by" class="text-secondary" style="margin-top: var(--space-lg); font-size: 0.8em;">
                         powered by <a data-powered-by-link href="https://dockvault.io" target="_blank" rel="noopener noreferrer" style="color: inherit; font-weight: 600; text-decoration: none;"><span data-powered-by-name>DockVault</span></a>
                     </div>
                 </div>
@@ -285,7 +285,7 @@
                         <div class="accent-picker">
                             <span class="accent-picker-label">Accent color</span>
                             <div class="accent-swatches" role="group" aria-label="Accent color">
-                                <button type="button" class="accent-swatch" data-accent="teal" style="background:#0d9488" aria-label="Teal" title="Teal"></button>
+                                <button type="button" class="accent-swatch" data-accent="teal" style="background:#0f766e" aria-label="Teal" title="Teal"></button>
                                 <button type="button" class="accent-swatch" data-accent="indigo" style="background:#4f46e5" aria-label="Indigo" title="Indigo"></button>
                                 <button type="button" class="accent-swatch" data-accent="violet" style="background:#7c3aed" aria-label="Violet" title="Violet"></button>
                                 <button type="button" class="accent-swatch" data-accent="rose" style="background:#e11d48" aria-label="Rose" title="Rose"></button>
@@ -533,7 +533,7 @@
                             <div class="card-header">
                                 <h3 class="text-xl font-bold"><svg class="icon"><use href="#i-activity"/></svg> Recent Events</h3>
                             </div>
-                            <div class="card-body" style="max-height: 400px; overflow-y: auto;">
+                            <div class="card-body" style="max-height: 400px; overflow-y: auto;" tabindex="0" role="region" aria-label="Recent events">
                                 <div id="events-feed" class="events-list">
                                     <div class="empty-state text-center p-lg">
                                         <p class="text-secondary">No recent events</p>
@@ -759,11 +759,11 @@
                                         <thead>
                                             <tr>
                                                 <th class="col-check"><input type="checkbox" id="files-select-all" class="files-check" aria-label="Select all"></th>
-                                                <th class="sortable" data-sort-key="name" role="button" tabindex="0" aria-sort="none">Name<span class="sort-ind" aria-hidden="true"></span></th>
-                                                <th class="col-num sortable" data-sort-key="size" role="button" tabindex="0" aria-sort="none">Size<span class="sort-ind" aria-hidden="true"></span></th>
-                                                <th class="sortable col-meta" data-sort-key="type" role="button" tabindex="0" aria-sort="none">Type<span class="sort-ind" aria-hidden="true"></span></th>
-                                                <th class="sortable col-meta" data-sort-key="modified" role="button" tabindex="0" aria-sort="none">Modified<span class="sort-ind" aria-hidden="true"></span></th>
-                                                <th class="sortable col-meta" data-sort-key="modified_by" role="button" tabindex="0" aria-sort="none">Modified by<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable" data-sort-key="name" tabindex="0" aria-sort="none">Name<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="col-num sortable" data-sort-key="size" tabindex="0" aria-sort="none">Size<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable col-meta" data-sort-key="type" tabindex="0" aria-sort="none">Type<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable col-meta" data-sort-key="modified" tabindex="0" aria-sort="none">Modified<span class="sort-ind" aria-hidden="true"></span></th>
+                                                <th class="sortable col-meta" data-sort-key="modified_by" tabindex="0" aria-sort="none">Modified by<span class="sort-ind" aria-hidden="true"></span></th>
                                                 <th class="col-actions">Actions</th>
                                             </tr>
                                         </thead>
@@ -1978,7 +1978,7 @@
                                     <label>Logo</label>
                                     <div class="flex items-center gap-md flex-wrap">
                                         <img id="brand-logo-preview" alt="Logo preview" style="height:48px;max-width:180px;object-fit:contain;background:var(--surface-1);border-radius:6px;padding:4px;">
-                                        <input type="file" id="brand-logo-file" accept="image/png,image/jpeg,image/gif,image/webp,image/x-icon,image/svg+xml">
+                                        <input type="file" id="brand-logo-file" aria-label="Logo file" accept="image/png,image/jpeg,image/gif,image/webp,image/x-icon,image/svg+xml">
                                         <button type="button" id="brand-logo-upload" class="btn btn-secondary">Upload</button>
                                         <button type="button" id="brand-logo-reset" class="btn btn-secondary">Reset</button>
                                     </div>
@@ -2176,7 +2176,7 @@
                             </div>
                             <div class="p-lg">
                                 <div class="email-hint">A <strong>sending profile</strong> is an SMTP sender identity (server, credentials, From address). Create one or more; the <strong>default</strong> profile also powers the vault's own system mail. Each profile saves on its own — there is no central Save here. <em>If the vault runs in a container, the SMTP server is reached from inside it — <strong>localhost</strong> means the vault container itself, so use the mail server's hostname (e.g. <code>host.docker.internal</code> or the service name), not <code>localhost</code>.</em></div>
-                                <div id="email-profiles-grid" class="email-card-grid" role="list" aria-label="Sending profiles"></div>
+                                <div id="email-profiles-grid" class="email-card-grid" role="group" aria-label="Sending profiles"></div>
                             </div>
                         </div>
 

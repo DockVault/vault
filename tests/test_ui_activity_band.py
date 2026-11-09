@@ -103,7 +103,7 @@ def test_every_panel_filters_the_list_and_its_chip_undoes_it(page: Page, anon, a
 
     page.click("#act-p-active .act-toggle-btn[data-fkey=mode-addresses]")
     address = page.locator("#act-p-active .act-rank-row").first
-    ip = (address.get_attribute("aria-label") or "").split(",")[0]          # the full address, never cut
+    ip = (address.get_attribute("title") or "").split(": ")[0]              # the full address, never cut
     address.click()
     expect(_chips(page)).to_have_text([f"Address: {ip}"])
     _remove_chip(page, f"Address: {ip}")

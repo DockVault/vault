@@ -2546,7 +2546,7 @@
     function rankRow(opts) {
         const b = button('act-rank-row' + (opts.cls ? ' ' + opts.cls : ''), null, {
             'aria-pressed': opts.pressed ? 'true' : 'false',
-            'aria-label': opts.aria,
+            // The row's visible text is its name; the fuller sentence is its title (read as its description).
             title: opts.title || opts.aria,
             'data-fkey': opts.key,
         });
@@ -3198,7 +3198,7 @@
             const pressed = outcomeChosen(k);
             const b = button('act-signin-row' + (pressed ? ' is-sel' : (anyChosen ? ' is-dim' : '')), null, {
                 'aria-pressed': pressed ? 'true' : 'false', 'data-fkey': 'si-' + k,
-                'aria-label': `${label}, ${nf(count || 0)}`, title: title || `${label}: ${nf(count || 0)}. Click to filter.`,
+                title: title || `${label}: ${nf(count || 0)}. Click to filter.`,
             });
             const lab = el('span', 'act-signin-label');
             if (mark === 'act-mark-bad') lab.appendChild(el('span', 'act-key act-key-bad'));

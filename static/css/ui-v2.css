@@ -42,13 +42,17 @@
 
     /* Brand — neutral ink + the selectable accent (teal default, see §25) */
     --brand-primary:   #16191f;
-    --brand-secondary: #0d9488;
+    --brand-secondary: #0f766e;
     --brand-accent:    #0891b2;
-    --brand-strong:    #0f766e;
+    --brand-strong:    #115e59;
     --brand-glow:      rgba(13,148,136,.10);
 
     --success: #16803c;
     --warning: #b45309;
+    --success-strong: #166534;   /* text on a success tint (AA) */
+    --warning-strong: #92400e;   /* text on a warning tint (AA) */
+    --error-strong:   #991b1b;   /* text on an error tint (AA) */
+    --info-strong:    #075985;   /* text on an info tint (AA) */
     --error:   #d92d20;
     --info:    #175cd3;
 
@@ -119,10 +123,15 @@
     --brand-secondary: #2dd4bf;
     --brand-accent:    #22d3ee;
     --brand-strong:    #0d9488;
+    --brand-on-tint:   var(--brand-secondary);   /* brand text on a dark surface or tint: the lighter shade */
     --brand-glow:      rgba(45,212,191,.14);
 
     --success: #3fce77;
     --warning: #f5a524;
+    --success-strong: #3fce77;
+    --warning-strong: #f5a524;
+    --error-strong: #f97066;
+    --info-strong: #53b1fd;
     --error:   #f97066;
     --info:    #53b1fd;
 
@@ -515,7 +524,7 @@ code { background: var(--surface-2); color: var(--text-primary); border-radius: 
    for genuinely destructive confirms. */
 .btn-warning {
     background: color-mix(in srgb, var(--warning) 12%, transparent);
-    color: var(--warning);
+    color: var(--warning-strong, var(--warning));
     border-color: color-mix(in srgb, var(--warning) 32%, transparent);
 }
 .btn-warning:hover:not(:disabled) {
@@ -725,22 +734,22 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
 
 .badge-success, .badge-user {
     background: color-mix(in srgb, var(--success) 12%, transparent);
-    color: var(--success);
+    color: var(--success-strong, var(--success));
     border-color: color-mix(in srgb, var(--success) 28%, transparent);
 }
 .badge-warning {
     background: color-mix(in srgb, var(--warning) 12%, transparent);
-    color: var(--warning);
+    color: var(--warning-strong, var(--warning));
     border-color: color-mix(in srgb, var(--warning) 28%, transparent);
 }
 .badge-error, .badge-danger {
     background: color-mix(in srgb, var(--error) 12%, transparent);
-    color: var(--error);
+    color: var(--error-strong, var(--error));
     border-color: color-mix(in srgb, var(--error) 28%, transparent);
 }
 .badge-info, .badge-external {
     background: color-mix(in srgb, var(--info) 12%, transparent);
-    color: var(--info);
+    color: var(--info-strong, var(--info));
     border-color: color-mix(in srgb, var(--info) 28%, transparent);
 }
 .badge-secondary {
@@ -750,7 +759,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand-secondar
 /* Role accent (admin) uses the brand accent, not a red gradient */
 .badge-admin {
     background: color-mix(in srgb, var(--brand-secondary) 12%, transparent);
-    color: var(--brand-secondary);
+    color: var(--brand-on-tint, var(--brand-strong, var(--brand-secondary)));
     border-color: color-mix(in srgb, var(--brand-secondary) 28%, transparent);
 }
 
@@ -1578,7 +1587,7 @@ button.chip:hover { filter: brightness(1.06); }
        over; only the brand tokens change, everything neutral is shared.
        Default (no attribute) = teal, matching :root. Dark blocks follow.
    ---------------------------------------------------------------------------- */
-[data-accent="teal"]   { --brand-secondary:#0d9488; --brand-accent:#0891b2; --brand-strong:#0f766e; --brand-glow:rgba(13,148,136,.10); --focus-ring:0 0 0 1px var(--surface-0), 0 0 0 3px rgba(13,148,136,.45); }
+[data-accent="teal"]   { --brand-secondary:#0f766e; --brand-accent:#0891b2; --brand-strong:#115e59; --brand-glow:rgba(13,148,136,.10); --focus-ring:0 0 0 1px var(--surface-0), 0 0 0 3px rgba(13,148,136,.45); }
 [data-accent="indigo"] { --brand-secondary:#4f46e5; --brand-accent:#6366f1; --brand-strong:#4338ca; --brand-glow:rgba(79,70,229,.11);  --focus-ring:0 0 0 1px var(--surface-0), 0 0 0 3px rgba(79,70,229,.45); }
 [data-accent="violet"] { --brand-secondary:#7c3aed; --brand-accent:#9333ea; --brand-strong:#6d28d9; --brand-glow:rgba(124,58,237,.11); --focus-ring:0 0 0 1px var(--surface-0), 0 0 0 3px rgba(124,58,237,.45); }
 [data-accent="rose"]   { --brand-secondary:#e11d48; --brand-accent:#f43f5e; --brand-strong:#be123c; --brand-glow:rgba(225,29,72,.10);  --focus-ring:0 0 0 1px var(--surface-0), 0 0 0 3px rgba(225,29,72,.45); }

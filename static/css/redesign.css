@@ -26,13 +26,17 @@
 
     /* Brand — deep ink neutral + a single confident teal accent */
     --brand-primary:   #0b1220;
-    --brand-secondary: #0d9488;   /* hero teal */
+    --brand-secondary: #0f766e;   /* hero teal (AA as text on white, and under white text) */
     --brand-accent:    #0891b2;   /* cyan-teal */
-    --brand-strong:    #0f766e;   /* deep teal for solid fills (AA on white) */
+    --brand-strong:    #115e59;   /* deeper teal: text on a teal tint, solid fills */
     --brand-glow:      rgba(13,148,136,.16);
 
-    --success: #059669;
-    --warning: #d97706;
+    --success: #047857;
+    --success-strong: #065f46;   /* text on a success tint */
+    --warning-strong: #92400e;   /* text on a warning tint */
+    --error-strong:   #991b1b;   /* text on an error tint */
+    --info-strong:    #075985;   /* text on an info tint */
+    --warning: #b45309;
     --error:   #dc2626;
     --info:    #0284c7;
 
@@ -44,7 +48,7 @@
 
     --text-primary:   #0b1220;
     --text-secondary: #46505f;
-    --text-tertiary:  #69748a;
+    --text-tertiary:  #5f6a80;
     --text-disabled:  #9aa4b2;
     --text-inverse:   #ffffff;
 
@@ -78,9 +82,14 @@
     --brand-secondary: #2dd4bf;
     --brand-accent:    #22d3ee;
     --brand-strong:    #0d9488;
+    --brand-on-tint:   var(--brand-secondary);   /* brand text on a dark surface or tint: the lighter shade */
     --brand-glow:      rgba(45,212,191,.20);
 
     --success: #34d399;
+    --success-strong: #34d399;
+    --warning-strong: #fbbf24;
+    --error-strong: #f87171;
+    --info-strong: #38bdf8;
     --warning: #fbbf24;
     --error:   #f87171;
     --info:    #38bdf8;
@@ -374,12 +383,12 @@ label.checkbox-label,
    13. Badges, alerts, toasts
    ---------------------------------------------------------------------------- */
 .badge { display: inline-flex; align-items: center; gap: .3rem; font-size: var(--text-xs); font-weight: 600; padding: .2rem .55rem; border-radius: var(--radius-full); border: 1px solid transparent; }
-.badge-success, .badge-user { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
-.badge-warning { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); }
-.badge-error, .badge-danger { background: color-mix(in srgb, var(--error) 16%, transparent); color: var(--error); }
-.badge-info, .badge-external { background: color-mix(in srgb, var(--info) 16%, transparent); color: var(--info); }
+.badge-success, .badge-user { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success-strong, var(--success)); }
+.badge-warning { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning-strong, var(--warning)); }
+.badge-error, .badge-danger { background: color-mix(in srgb, var(--error) 16%, transparent); color: var(--error-strong, var(--error)); }
+.badge-info, .badge-external { background: color-mix(in srgb, var(--info) 16%, transparent); color: var(--info-strong, var(--info)); }
 .badge-secondary { background: var(--surface-2); color: var(--text-tertiary); }
-.badge-admin { background: color-mix(in srgb, var(--brand-secondary) 16%, transparent); color: var(--brand-secondary); }
+.badge-admin { background: color-mix(in srgb, var(--brand-secondary) 16%, transparent); color: var(--brand-on-tint, var(--brand-strong)); }
 /* Separate an inline status badge (e.g. "Active") from the card title it trails. */
 .vault-name .badge { margin-left: .4rem; vertical-align: middle; }
 
@@ -462,7 +471,7 @@ label.checkbox-label,
        brand tokens; everything else (surfaces, text) is shared, so light & dark
        both stay coherent. A matching dark block follows each light one.
    ---------------------------------------------------------------------------- */
-[data-accent="teal"]   { --brand-secondary:#0d9488; --brand-accent:#0891b2; --brand-strong:#0f766e; --brand-glow:rgba(13,148,136,.16); --focus-ring:0 0 0 3px rgba(13,148,136,.20); }
+[data-accent="teal"]   { --brand-secondary:#0f766e; --brand-accent:#0891b2; --brand-strong:#115e59; --brand-glow:rgba(13,148,136,.16); --focus-ring:0 0 0 3px rgba(13,148,136,.20); }
 [data-accent="indigo"] { --brand-secondary:#4f46e5; --brand-accent:#6366f1; --brand-strong:#4338ca; --brand-glow:rgba(79,70,229,.18);  --focus-ring:0 0 0 3px rgba(79,70,229,.22); }
 [data-accent="violet"] { --brand-secondary:#7c3aed; --brand-accent:#9333ea; --brand-strong:#6d28d9; --brand-glow:rgba(124,58,237,.18); --focus-ring:0 0 0 3px rgba(124,58,237,.22); }
 [data-accent="rose"]   { --brand-secondary:#e11d48; --brand-accent:#f43f5e; --brand-strong:#be123c; --brand-glow:rgba(225,29,72,.16);  --focus-ring:0 0 0 3px rgba(225,29,72,.22); }

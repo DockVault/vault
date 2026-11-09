@@ -915,7 +915,7 @@ button.vault-sort-dir {
 }
 /* A long help text: one sentence, the rest under "More" (static/js/settings-help.js). */
 .form-help .help-more, p.text-secondary .help-more, small .help-more, .email-hint .help-more { display: inline; }
-.help-more > summary { display: inline; cursor: pointer; color: var(--primary, var(--brand-secondary)); list-style: none; font-weight: 600; }
+.help-more > summary { display: inline; cursor: pointer; color: var(--brand-on-tint, var(--brand-strong, var(--primary))); list-style: none; font-weight: 600; }
 .help-more > summary::-webkit-details-marker { display: none; }
 .help-more[open] > summary { display: none; }
 .help-more > .help-more-text { display: inline; }

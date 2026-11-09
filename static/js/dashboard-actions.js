@@ -295,6 +295,7 @@
             const li = el('li', 'get-started-item' + (done ? ' is-done' : ''));
             li.setAttribute('data-check', c.key);
             const mark = el('span', 'get-started-mark', done ? '✓' : '');
+            mark.setAttribute('role', 'img');
             mark.setAttribute('aria-label', done ? 'Done' : 'To do');
             li.appendChild(mark);
             const main = el('div', 'get-started-main');
