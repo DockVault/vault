@@ -43,15 +43,25 @@ MAX_BODY_BYTES = 256 * 1024
 MAX_TOKEN_BYTES = 16 * 1024
 MAX_SUBJECT_LENGTH = 255
 CACHE_SECONDS = 3600
-DISCOVERY_FAILURE_SECONDS = 30   # a provider that could not be reached is not asked again for this long
-# The failures remembered for that long: the network, and an address that could not be resolved or is refused.
-REMEMBERED_FAILURES = frozenset({"temporarily_unavailable", "endpoint_refused"})
+DISCOVERY_FAILURE_SECONDS = 30   # a fetch of discovery or keys that failed is not tried again for this long
 
 
-def _where(*parts: str) -> str:
-    """A short digest of what a cached answer was fetched for, so an answer is never served for another address or
-    issuer configured later under the same provider id."""
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+def _where(provider: "ProviderConfig", *parts: str) -> str:
+    """A short digest of what a cached answer was fetched for (the addresses, the issuer, whether private addresses
+    were allowed), so an answer is never served for another configuration later saved under the same provider id."""
+    scope = ("private" if provider.private_network else "public",) + parts
+    return hashlib.sha256("|".join(scope).encode("utf-8")).hexdigest()[:16]
+
+
+def _remember_failure(cache: "Cache", key: str, exc: "OidcError", now: Optional[float]) -> None:
+    cache.set(key, exc.code, DISCOVERY_FAILURE_SECONDS, now)
+
+
+def _remembered_failure(cache: "Cache", key: str, now: Optional[float], what: str) -> None:
+    """Raise the failure remembered under ``key`` with its own code, or nothing."""
+    code = cache.get(key, now)
+    if code is not None:
+        raise OidcError(code, f"{what} failed moments ago")
 JWKS_REFETCH_INTERVAL_SECONDS = 60
 LOGOUT_TOKEN_FRESHNESS_SECONDS = 120
 BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
@@ -308,23 +318,22 @@ def discover(provider: ProviderConfig, *, fetch: Callable = fetch_json, cache: O
     rule. Cached an hour."""
     cache = _cache(cache)
     url = discovery_url(provider)
-    where = _where(provider.issuer, url)
+    where = _where(provider, provider.issuer, url)
     key = f"sso:disc:{provider.id}:{where}"
     if not refresh:
         cached = cache.get(key, now)
         if cached is not None:
             return cached
     failed_key = f"sso:disc-failed:{provider.id}:{where}"
-    if not refresh and cache.get(failed_key, now) is not None:
-        # Unreachable moments ago (the network, or a name that would not resolve): every request in the meantime
-        # would wait out the same timeout, the name lookup included.
-        raise OidcError(TEMPORARILY_UNAVAILABLE, "the provider could not be reached moments ago")
+    if not refresh:
+        # A fetch that failed moments ago (the network, a name that would not resolve, an address refused, an answer
+        # that is not a document) is answered the same, with its own code, without the name lookup or the timeout.
+        _remembered_failure(cache, failed_key, now, "the provider's discovery")
     try:
         check_endpoint(url, private_network=provider.private_network, resolve=resolve)
         doc = fetch(url)
     except OidcError as exc:
-        if exc.code in REMEMBERED_FAILURES:
-            cache.set(failed_key, True, DISCOVERY_FAILURE_SECONDS, now)
+        _remember_failure(cache, failed_key, exc, now)
         raise
     issuer = doc.get("issuer")
     if not isinstance(issuer, str) or issuer != provider.issuer:
@@ -385,19 +394,19 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
                  fetch: Callable = fetch_json, cache: Optional[Cache] = None, resolve=None,
                  now: Optional[float] = None) -> Dict[str, dict]:
     """The provider's signing keys by ``kid`` (RSA or EC, for signing, with a key id), cached an hour. When a
-    token names a ``kid`` the cache does not hold, the set is fetched again once, at most once a minute per
-    provider; a key still unknown after that fetch is a refusal for the caller. A key unknown while a refetch is
-    throttled, or while the key set could not be fetched moments ago, is not the token's fault: that answers
-    ``TEMPORARILY_UNAVAILABLE`` (the key may be newer than the last fetch)."""
+    token names a ``kid`` the cache does not hold, the set is fetched again: after a refetch that succeeded, not
+    again for a minute; after any fetch that failed, not again for 30 seconds (the failure is answered again with
+    its own code). A key still unknown after a successful refetch is a refusal for the caller; a key unknown while a
+    refetch is throttled is not the token's fault: that answers ``TEMPORARILY_UNAVAILABLE`` (the key may be newer
+    than the last fetch). Keys already held are served whatever the throttle or the failure says."""
     cache = _cache(cache)
-    where = _where(discovery.jwks_uri)
+    where = _where(provider, discovery.jwks_uri)
     key = f"sso:jwks:{provider.id}:{where}"
     keys = cache.get(key, now)
     if keys is not None and (kid is None or kid in keys):
         return keys
     failed_key = f"sso:jwks-failed:{provider.id}:{where}"
-    if cache.get(failed_key, now) is not None:
-        raise OidcError(TEMPORARILY_UNAVAILABLE, "the provider's keys could not be fetched moments ago")
+    _remembered_failure(cache, failed_key, now, "the provider's keys")
     refetch_key = f"sso:jwks-refetch:{provider.id}:{where}"
     refetching = keys is not None and kid is not None
     if refetching and cache.get(refetch_key, now) is not None:
@@ -406,8 +415,7 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
         check_endpoint(discovery.jwks_uri, private_network=provider.private_network, resolve=resolve)
         keys = _usable_keys(fetch(discovery.jwks_uri))
     except OidcError as exc:
-        if exc.code in REMEMBERED_FAILURES:
-            cache.set(failed_key, True, DISCOVERY_FAILURE_SECONDS, now)
+        _remember_failure(cache, failed_key, exc, now)          # any failure: a refetch cannot be forced per request
         raise
     cache.set(key, keys, CACHE_SECONDS, now)
     if refetching:

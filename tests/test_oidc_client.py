@@ -232,6 +232,56 @@ def test_only_signing_keys_with_an_id_are_kept_and_an_unknown_kid_refetches_once
     assert len(fetch3.calls) == 2
 
 
+def test_a_refetch_that_fails_on_any_answer_is_not_repeated_per_request():
+    """Junk tokens naming random key ids must not each make the vault fetch the key set, whatever the provider
+    answers: a refetch that fails, also with a page or an answer without keys, is remembered for 30 seconds."""
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    for code in (oc.PROVIDER_ERROR, oc.DISCOVERY_INVALID):
+        cache = oc.Cache()
+        oc.signing_keys(_provider(oc), d, fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+        calls = []
+
+        def broken(url, _code=code, **kw):
+            calls.append(url)
+            raise oc.OidcError(_code, "the provider is answering with a page")
+        for i in range(10):
+            with pytest.raises(oc.OidcError) as e:
+                oc.signing_keys(_provider(oc), d, kid=f"junk-{i}", fetch=broken, cache=cache, resolve=_PUBLIC, now=NOW + 1 + i)
+            assert e.value.code == code
+        assert len(calls) == 1, code
+        # Keys already held are still served meanwhile.
+        assert "rsa1" in oc.signing_keys(_provider(oc), d, kid="rsa1", fetch=broken, cache=cache, resolve=_PUBLIC, now=NOW + 12)
+
+
+def test_the_throttle_and_the_failures_belong_to_the_key_set_address():
+    """A refetch throttled for one key-set address does not throttle another; a failure at one does not hold back
+    another."""
+    import dataclasses
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    other = dataclasses.replace(d, jwks_uri=ISSUER + "/other/certs")
+    cache = oc.Cache()
+    oc.signing_keys(_provider(oc), d, fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+    oc.signing_keys(_provider(oc), d, kid="nope", fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW + 1)
+    fetch_other = _fetch_for(signer)
+    oc.signing_keys(_provider(oc), other, fetch=fetch_other, cache=cache, resolve=_PUBLIC, now=NOW + 2)
+    oc.signing_keys(_provider(oc), other, kid="nope", fetch=fetch_other, cache=cache, resolve=_PUBLIC, now=NOW + 3)
+    assert len(fetch_other.calls) == 2                                        # its own refetch, not throttled by d's
+    down_calls = []
+
+    def down(url, **kw):
+        down_calls.append(url)
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")
+    cache2 = oc.Cache()
+    with pytest.raises(oc.OidcError):
+        oc.signing_keys(_provider(oc), d, fetch=down, cache=cache2, resolve=_PUBLIC, now=NOW)
+    fine = _fetch_for(signer)
+    assert "rsa1" in oc.signing_keys(_provider(oc), other, fetch=fine, cache=cache2, resolve=_PUBLIC, now=NOW + 1)
+
+
 def test_a_key_fetch_that_failed_neither_throttles_the_next_nor_is_retried_at_once():
     """Only a refetch that succeeded throttles the next one; a fetch that failed on the network is remembered for a
     short while (the same answer, without fetching), then tried again."""
@@ -263,10 +313,17 @@ def test_cached_answers_belong_to_the_address_and_issuer_they_were_fetched_for()
     signer = Signer()
     cache = oc.Cache()
     first = _fetch_for(signer)
-    oc.discover(_provider(oc), fetch=first, cache=cache, resolve=_PUBLIC, now=NOW)
+    explicit = ISSUER + "/.well-known/openid-configuration"
+    oc.discover(_provider(oc, discovery_url=explicit), fetch=first, cache=cache, resolve=_PUBLIC, now=NOW)
     seen = len(first.calls)
-    oc.discover(_provider(oc), fetch=first, cache=cache, resolve=_PUBLIC, now=NOW + 1)
+    oc.discover(_provider(oc, discovery_url=explicit), fetch=first, cache=cache, resolve=_PUBLIC, now=NOW + 1)
     assert len(first.calls) == seen                                           # the same provider: cached
+    # The same discovery address with another issuer configured: not the old document (its issuer is checked anew).
+    renamed = _fetch_for(signer)
+    with pytest.raises(oc.OidcError) as e:
+        oc.discover(_provider(oc, discovery_url=explicit, issuer=ISSUER + "/renamed"), fetch=renamed, cache=cache,
+                    resolve=_PUBLIC, now=NOW + 2)
+    assert e.value.code == oc.ISSUER_MISMATCH and len(renamed.calls) == 1
     moved = _fetch_for(signer)
     oc.discover(_provider(oc, discovery_url=ISSUER + "/other/.well-known/openid-configuration"), fetch=moved,
                 cache=cache, resolve=_PUBLIC, now=NOW + 2)
@@ -696,17 +753,22 @@ def test_a_provider_that_cannot_be_reached_is_not_asked_again_for_a_short_while(
         with pytest.raises(oc.OidcError):
             oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + later, refresh=True)
     assert len(calls) == 3
-    # A name that would not resolve, or an address refused, is remembered too, and the name is not looked up again.
+    # An address refused is remembered too, with its own reason, and the name is not looked up again; allowing
+    # private addresses is another configuration, asked at once.
     cache3, looked_up = oc.Cache(), []
 
     def private(host):
         looked_up.append(host)
         return ["10.0.0.7"]
     for _ in range(2):
-        with pytest.raises(oc.OidcError):
+        with pytest.raises(oc.OidcError) as e:
             oc.discover(_provider(oc, id="p3"), fetch=_fetch_for(signer), cache=cache3, resolve=private, now=NOW)
+        assert e.value.code == oc.ENDPOINT_REFUSED
     assert len(looked_up) == 1
-    # An answer that is not a document (a page instead of JSON) is not remembered: the next request asks again.
+    found = oc.discover(_provider(oc, id="p3", private_network=True), fetch=_fetch_for(signer), cache=cache3,
+                        resolve=private, now=NOW + 1)
+    assert found.issuer == ISSUER and len(looked_up) >= 2
+    # An answer that is not a document (a page instead of JSON) is remembered as well, with its own code.
     cache2, wrong = oc.Cache(), []
 
     def not_a_document(url, **kw):
@@ -716,4 +778,9 @@ def test_a_provider_that_cannot_be_reached_is_not_asked_again_for_a_short_while(
         with pytest.raises(oc.OidcError) as e:
             oc.discover(_provider(oc), fetch=not_a_document, cache=cache2, resolve=_PUBLIC, now=NOW)
         assert e.value.code == oc.PROVIDER_ERROR
-    assert len(wrong) == 2
+    assert len(wrong) == 1
+    # The failure belongs to the address: another discovery address for the same provider is asked at once.
+    moved = _fetch_for(signer)
+    oc.discover(_provider(oc, discovery_url=ISSUER + "/moved/.well-known/openid-configuration"), fetch=moved,
+                cache=cache2, resolve=_PUBLIC, now=NOW + 1)
+    assert len(moved.calls) == 1

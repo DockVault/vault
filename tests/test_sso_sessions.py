@@ -372,6 +372,18 @@ def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_toke
     assert h.logout(p, token) == failed and reasons()[-1] == "busy"
     monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", asyncio.Semaphore(sso_router.BACKCHANNEL_CONCURRENCY))
     assert 1 <= sso_router.BACKCHANNEL_CONCURRENCY <= 8 and sso_router.BACKCHANNEL_WAIT_SECONDS <= 10
+    # A key the vault does not hold after a fresh fetch: the token's fault (400). Another unknown key within the
+    # minute after that fetch may be newer than it: not the token's fault (501, the provider retries).
+    import time as _time
+    def keyed(kid):
+        now = int(_time.time())
+        return h.signer.token({"iss": oc_issuer(), "aud": oc_client(), "iat": now, "exp": now + 120,
+                               "jti": uuid.uuid4().hex, "sid": "s-1",
+                               "events": {"http://schemas.openid.net/event/backchannel-logout": {}}}, kid=kid)
+    assert h.logout(p, keyed("rotated-0")) == (400, {"error": "invalid_request"})        # the first fetch of the keys
+    assert h.logout(p, keyed("rotated-1")) == (400, {"error": "invalid_request"})        # a refetch, still unknown
+    assert h.logout(p, keyed("rotated-2")) == failed and reasons()[-1] == "temporarily_unavailable"
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
     # A token whose own issuer is wrong: the token's fault.
     wrong = h.logout_token(sid="s-1", sub="subject-1", iss="https://elsewhere.example.com")
     assert h.logout(p, wrong) == (400, {"error": "invalid_request"}) and reasons()[-1] == "issuer_mismatch"
@@ -379,6 +391,35 @@ def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_toke
     assert all(s.is_active for s in h.active_sessions())
     status, body = h.logout(p, token)
     assert status == 200 and not [s for s in h.active_sessions() if s.is_active], body
+
+
+def oc_issuer():
+    return ISSUER
+
+
+def oc_client():
+    return CLIENT
+
+
+def test_a_logout_waits_for_a_slot_that_frees_up(monkeypatch):
+    """Every slot in use, then one freed within the wait: the logout is verified, not refused."""
+    import asyncio
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    from app.api import sso_router
+    released = []
+
+    class FreedSoon:
+        async def acquire(self):
+            await asyncio.sleep(0.05)                # another logout gives its slot back meanwhile
+            return True
+
+        def release(self):
+            released.append(True)
+    monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", FreedSoon())
+    status, body = h.logout(p, h.logout_token(sid="s-1", sub="subject-1"))
+    assert status == 200 and released == [True], body
 
 
 def test_the_back_channel_logout_gives_its_connection_back_before_the_network_work(monkeypatch):
