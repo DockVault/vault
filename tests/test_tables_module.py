@@ -191,3 +191,104 @@ console.log(JSON.stringify({ h23: at(23 * 3600 * 1000 + 30000), d3: at(3 * 86400
     assert out["h23"] == "in 23 h" and out["d3"] == "in 3 days" and out["d1"] == "in 1 day"
     assert out["m12"] == "in 12 min" and out["soon"] == "in a moment" and out["ago"] == "3 h ago"
     assert "in " not in out["beyond"] and out["title"] is True
+
+
+def test_a_facet_lists_the_columns_values_and_narrows_the_rows_together_with_the_search():
+    out = _node("""
+const rows = [['ann', 'Active', 'Drop vault'], ['bob', 'Revoked', 'Drop vault'], ['cid', 'Active', 'Confidential inbox'], ['dee', 'Paused', '—']];
+const t = T([{ label: 'Owner', col: 'owner' }, { label: 'Status', col: 'status' }, { label: 'Type', col: 'tag' }], rows);
+Tables.enhance(t, { key: 'links', search: true, facets: [{ col: 'status', label: 'Status' }, { col: 'tag', label: 'Type' }] });
+const host = t.parentNode;
+const controls = host.children.map((c) => c.localName + (c.getAttribute('data-facet-col') ? '[' + c.getAttribute('data-facet-col') + ']' : ''));
+const status = host.querySelector('select[data-facet-col="status"]');
+const options = (s) => s.options.map((o) => o.textContent);
+status.value = 'Active'; status.dispatch('change');
+const active = col(t, 0);
+const search = host.querySelector('input.table-search');
+search.value = 'cid'; search.dispatch('input');
+const both = col(t, 0);
+search.value = 'nobody'; search.dispatch('input');
+const none = { rows: col(t, 0), empty: host.querySelector('.table-search-empty') && !host.querySelector('.table-search-empty').hidden };
+search.value = ''; search.dispatch('input');
+status.value = ''; status.dispatch('change');
+console.log(JSON.stringify({ controls, statusOptions: options(status), typeOptions: options(host.querySelector('select[data-facet-col="tag"]')),
+    label: status.getAttribute('aria-label'), active, both, none, all: col(t, 0) }));
+""")
+    assert out["controls"] == ["input", "select[status]", "select[tag]", "table"]
+    assert out["statusOptions"] == ["Status: all", "Active", "Paused", "Revoked"]
+    assert out["typeOptions"] == ["Type: all", "Confidential inbox", "Drop vault"]      # a dash is not a value
+    assert out["label"] == "Filter by Status"
+    assert out["active"] == ["ann", "cid"]
+    assert out["both"] == ["cid"]
+    assert out["none"] == {"rows": [], "empty": True}
+    assert out["all"] == ["ann", "bob", "cid", "dee"]
+
+
+def test_a_chosen_facet_survives_the_table_being_drawn_again_and_follows_the_new_table():
+    """The administrators' link tables are built anew on every load, under the same host; the facet select stays,
+    keeps its choice while the column still holds that value, and narrows the new table, not the old one."""
+    out = _node("""
+const t1 = T([{ label: 'Owner', col: 'owner' }, { label: 'Status', col: 'status' }], [['ann', 'Active'], ['bob', 'Revoked']]);
+Tables.enhance(t1, { key: 'links', search: true, facets: [{ col: 'status', label: 'Status' }] });
+const host = t1.parentNode;
+const status = host.querySelector('select[data-facet-col="status"]');
+status.value = 'Active'; status.dispatch('change');
+// Drawn again: the app empties the host and puts a new table in it, then enhances it.
+host.replaceChildren();
+const t2 = T([{ label: 'Owner', col: 'owner' }, { label: 'Status', col: 'status' }], [['ann', 'Active'], ['bob', 'Revoked'], ['cid', 'Active']]);
+host.appendChild(t2);   // into the same host (its own empty wrapper stays behind)
+Tables.enhance(t2, { key: 'links', search: true, facets: [{ col: 'status', label: 'Status' }] });
+const fresh = host.querySelector('select[data-facet-col="status"]');
+const afterRedraw = { value: fresh.value, rows: col(t2, 0), selects: host.querySelectorAll('select').length, inputs: host.querySelectorAll('input').length };
+fresh.value = 'Revoked'; fresh.dispatch('change');
+console.log(JSON.stringify({ afterRedraw, revoked: col(t2, 0) }));
+""")
+    # the host was emptied, so the controls are new ones, and a new choice narrows the new table
+    assert out["afterRedraw"]["selects"] == 1 and out["afterRedraw"]["inputs"] == 1
+    assert out["afterRedraw"]["rows"] == ["ann", "bob", "cid"] and out["afterRedraw"]["value"] == ""
+    assert out["revoked"] == ["bob"]
+
+
+def test_a_facet_on_a_persisting_table_keeps_its_choice_when_only_the_rows_are_drawn_again():
+    """A vault's members table keeps its header; its body is drawn again on every change, and enhance runs again."""
+    out = _node("""
+const pick = (label) => { const s = document.createElement('select');
+    ['Read only', 'Read & write', 'Manager'].forEach((o, i) => { const op = document.createElement('option'); op.textContent = o; s.appendChild(op); if (o === label) s.selectedIndex = i; });
+    return s; };
+const t = T([{ label: 'User', col: 'user' }, { label: 'Permission Level', col: 'level' }], [['ann', pick('Read only')], ['bob', pick('Manager')]]);
+const opts = { key: 'vault-members', search: true, facets: [{ col: 'level', label: 'Level' }] };
+Tables.enhance(t, opts);
+const level = t.parentNode.querySelector('select[data-facet-col="level"]');
+level.value = 'Manager'; level.dispatch('change');
+const first = col(t, 0);
+// The body is drawn again (a grant): the same table, new rows, enhance again.
+const tbody = t.tBodies[0]; tbody.replaceChildren();
+[['ann', pick('Read only')], ['bob', pick('Manager')], ['cid', pick('Manager')]].forEach((cells) => { const tr = document.createElement('tr');
+    cells.forEach((c) => { const td = document.createElement('td'); if (c.nodeType) td.appendChild(c); else td.textContent = c; tr.appendChild(td); }); tbody.appendChild(tr); });
+Tables.enhance(t, opts);
+console.log(JSON.stringify({ first, value: level.value, rows: col(t, 0), options: level.options.map((o) => o.textContent),
+    selects: t.parentNode.querySelectorAll('select.table-facet').length }));
+""")
+    assert out["first"] == ["bob"]
+    assert out["value"] == "Manager" and out["rows"] == ["bob", "cid"]
+    assert out["options"] == ["Level: all", "Manager", "Read only"]
+    assert out["selects"] == 1
+
+
+def test_the_pending_invitations_are_a_table_the_library_enhances_and_leave_revoked_ones_out():
+    app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    body = app[app.index("function renderInvites(invites) {"):app.index("function _refocusInviteResend(")]
+    assert "invites.filter(inv => inv.status !== 'revoked')" in body
+    assert "Tables.enhance(table, { key: 'invites-table', search: true })" in body
+    assert "['Invited by', 'invited-by'], ['Sent', 'sent'], ['Expires', 'expires']" in body.replace("\n        ", " ")
+    assert "_inviteResentAt[inv.id] || inv.created_at" in body
+    assert "innerHTML" not in body
+
+
+def test_the_upload_links_admin_table_shows_when_each_link_was_last_used():
+    app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    body = app[app.index("function renderAdminReceivers(data) {"):]
+    body = body[:body.index("\n}\n") + 3]
+    assert "['Created', 'created'], ['Last used', 'last-used']" in body
+    assert "_whenCell(r.last_upload_at)" in body
+    assert "facets: _LINK_TABLE_FACETS" in body

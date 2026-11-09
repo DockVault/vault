@@ -3523,6 +3523,9 @@ function _headerRow(cols) {
     return hr;
 }
 
+// The administrators' link tables narrow by status and by type (the link's tag).
+const _LINK_TABLE_FACETS = [{ col: 'status', label: 'Status' }, { col: 'tag', label: 'Type' }];
+
 function _whenCell(iso) {
     const td = _el('td', 'col-time');
     td.appendChild(People.time(iso));
@@ -5890,6 +5893,10 @@ async function resendInvite(inv) {
         }
         showInviteLink(res, 'A new link for ' + res.username + '; the one sent before no longer works.');
         openModal('invite-user-modal');
+        // A resend replaces the invitation with a new one (a new id): its row is the one to mark and return to.
+        const madeId = (res && res.id) || inv.id;
+        _inviteResentAt[madeId] = new Date().toISOString();
+        _refocusInviteResend(madeId);
         loadInvites();
     } catch (err) {
         showError('Could not send the invitation again: ' + err.message);
@@ -5945,41 +5952,79 @@ async function loadInvites() {
     }
 }
 
+// When an invitation was last sent again from this page (invitation id -> ISO time): the list's own record
+// keeps the first send, so the Sent cell shows the latest.
+const _inviteResentAt = {};
+
+// The pending invitations as a sortable, searchable table; a revoked invitation is not pending and is left out.
 function renderInvites(invites) {
     const block = document.getElementById('invites-block');
     const list = document.getElementById('invites-list');
     list.replaceChildren();
-    if (!invites.length) {
+    const pending = invites.filter(inv => inv.status !== 'revoked');
+    if (!pending.length) {
         block.style.display = 'none';
         return;
     }
     block.style.display = '';
     const canManage = hasPermission('USER_MANAGE') && !isScopedTemp;
-    invites.forEach(inv => {
-        const row = _el('div', 'invite-row');
-        row.setAttribute('data-invite-id', inv.id);
-        row.setAttribute('style', 'display:flex; gap:var(--space-md); align-items:center; padding:var(--space-sm) 0; border-bottom:1px solid var(--border);');
-        row.appendChild(_el('strong', null, inv.username));
-        if (inv.email) row.appendChild(_el('span', 'text-muted', inv.email));
-        row.appendChild(_el('span', 'invite-status', inv.status));
-        if (inv.created_by_username) {
-            const by = _el('span', 'text-muted invite-by'); by.appendChild(document.createTextNode('invited by '));
-            by.appendChild(People.chip({ id: inv.created_by, username: inv.created_by_username }, { small: true }));
-            row.appendChild(by);
-        }
-        if (inv.created_at) { const sent = _el('span', 'text-muted'); sent.appendChild(document.createTextNode('sent ')); sent.appendChild(People.time(inv.created_at)); row.appendChild(sent); }
-        const exp = _el('span', 'text-muted'); exp.appendChild(document.createTextNode('expires ')); exp.appendChild(People.time(inv.expires_at)); row.appendChild(exp);
-        if (canManage && inv.status === 'pending') {
-            const again = _el('button', 'btn btn-sm btn-secondary invite-resend', 'Send again');
-            again.style.marginLeft = 'auto';
-            again.addEventListener('click', () => resendInvite(inv));
-            row.appendChild(again);
-            const revoke = _el('button', 'btn btn-sm btn-secondary', 'Revoke');
-            revoke.addEventListener('click', () => revokeInvite(inv.id));
-            row.appendChild(revoke);
-        }
-        list.appendChild(row);
+    const table = _el('table', 'data-table');
+    table.id = 'invites-table';
+    const thead = _el('thead');
+    thead.appendChild(_headerRow([['Name', 'name'], ['Email', 'email'], ['Status', 'status'], ['Invited by', 'invited-by'],
+        ['Sent', 'sent'], ['Expires', 'expires'], ['', '']]));
+    table.appendChild(thead);
+    const tb = _el('tbody');
+    pending.forEach(inv => tb.appendChild(_inviteRow(inv, canManage)));
+    table.appendChild(tb);
+    list.appendChild(table);
+    if (window.Tables) Tables.enhance(table, { key: 'invites-table', search: true });
+}
+
+function _inviteRow(inv, canManage) {
+    const row = _el('tr', 'invite-row');
+    row.setAttribute('data-invite-id', inv.id);
+    const name = _el('td');
+    name.appendChild(_el('strong', null, inv.username));
+    row.appendChild(name);
+    row.appendChild(_el('td', 'text-muted', inv.email || '\u2014'));
+    row.appendChild(_el('td', 'invite-status', inv.status));
+    const by = _el('td', 'invite-by');
+    if (inv.created_by_username) by.appendChild(People.chip({ id: inv.created_by, username: inv.created_by_username }, { small: true }));
+    else by.appendChild(_el('span', 'text-tertiary', '\u2014'));
+    row.appendChild(by);
+    const sent = _whenCell(_inviteResentAt[inv.id] || inv.created_at);
+    sent.classList.add('invite-sent');
+    row.appendChild(sent);
+    row.appendChild(_whenCell(inv.expires_at));
+    const actions = _el('td', 'invite-actions');
+    if (canManage && inv.status === 'pending') {
+        const again = _el('button', 'btn btn-sm btn-secondary invite-resend', 'Send again');
+        again.type = 'button';
+        again.addEventListener('click', () => resendInvite(inv));
+        actions.appendChild(again);
+        const revoke = _el('button', 'btn btn-sm btn-secondary invite-revoke', 'Revoke');
+        revoke.type = 'button';
+        revoke.addEventListener('click', () => revokeInvite(inv.id));
+        actions.appendChild(revoke);
+    }
+    row.appendChild(actions);
+    return row;
+}
+
+// Once the dialog showing the new link closes, focus goes back to the invitation's own Send again button, found
+// again by the invitation's id: the list was drawn again meanwhile, so the button that opened the dialog is gone.
+function _refocusInviteResend(inviteId) {
+    const modal = document.getElementById('invite-user-modal');
+    if (!modal) return;
+    const find = () => document.querySelector('#invites-list .invite-row[data-invite-id="' + CSS.escape(inviteId) + '"] .invite-resend');
+    const watcher = new MutationObserver(() => {
+        if (modal.classList.contains('active')) return;
+        watcher.disconnect();
+        const again = find();
+        if (again) { try { again.focus({ preventScroll: true }); } catch (_) {} }
     });
+    watcher.observe(modal, { attributes: true, attributeFilter: ['class'] });
 }
 
 async function revokeInvite(id) {
@@ -19958,7 +20003,7 @@ async function loadVaultPermissions() {
             </tr>
         `;
         }).join('');
-        if (window.Tables) Tables.enhance(tbody.closest('table'), { key: 'vault-members', search: true });
+        if (window.Tables) Tables.enhance(tbody.closest('table'), { key: 'vault-members', search: true, facets: [{ col: 'level', label: 'Level' }] });
 
         // Add event listeners for revoke buttons
         tbody.querySelectorAll('button[data-action="revoke-permission"]').forEach(btn => {
@@ -21161,7 +21206,7 @@ function renderAdminNoteLinks(data) {
     });
     table.appendChild(tb);
     host.replaceChildren(table);
-    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true });
+    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true, facets: _LINK_TABLE_FACETS });
 }
 
 async function adminRevokeNoteLink(id) {
@@ -22501,7 +22546,7 @@ function renderAdminPublicLinks(data) {
         tr.appendChild(actTd); tb.appendChild(tr);
     });
     table.appendChild(tb); host.replaceChildren(table);
-    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true });
+    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true, facets: _LINK_TABLE_FACETS });
 }
 
 async function adminRevokePublicLink(id) {
@@ -23232,7 +23277,7 @@ function renderAdminReceivers(data) {
     const table = _el('table', 'data-table');
     const thead = _el('thead');
     const hr = _headerRow([['Owner', 'owner'], ['Label', 'label'], ['Type', 'tag'], ['Status', 'status'], ['Expires', 'expires'],
-        ['Files', 'files'], ['Budget', 'budget'], ['Created', 'created'], ['', '']]);
+        ['Files', 'files'], ['Budget', 'budget'], ['Created', 'created'], ['Last used', 'last-used'], ['', '']]);
     thead.appendChild(hr); table.appendChild(thead);
     const tb = _el('tbody');
     receivers.forEach(r => {
@@ -23245,12 +23290,13 @@ function renderAdminReceivers(data) {
         tr.appendChild(_el('td', '', (r.max_uploads != null) ? ((r.upload_count || 0) + '/' + r.max_uploads) : String(r.upload_count || 0)));
         tr.appendChild(_el('td', '', r.max_total_bytes != null ? (_mbFromBytes(r.max_total_bytes) + ' MB') : '—'));
         tr.appendChild(_whenCell(r.created_at));
+        tr.appendChild(_whenCell(r.last_upload_at));
         const actTd = _el('td');
         if (r.status !== 'revoked') { const rv = _el('button', 'btn btn-ghost btn-sm', 'Revoke'); rv.type = 'button'; rv.addEventListener('click', () => adminRevokeReceiver(r.id)); actTd.appendChild(rv); }
         tr.appendChild(actTd); tb.appendChild(tr);
     });
     table.appendChild(tb); host.replaceChildren(table);
-    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true });
+    if (window.Tables) Tables.enhance(table, { key: host.id || 'links', search: true, facets: _LINK_TABLE_FACETS });
 }
 
 async function adminRevokeReceiver(id) {

@@ -6,8 +6,12 @@
 .data-table th.sortable[data-sort-col][aria-sort="ascending"]::after { content: '\25B4'; }
 .data-table th.sortable[data-sort-col][aria-sort="descending"]::after { content: '\25BE'; }
 
-.table-search { max-width: 320px; margin-bottom: var(--space-sm); }
+.table-search { display: inline-block; width: 16rem; max-width: 100%; margin: 0 var(--space-sm) var(--space-sm) 0; vertical-align: middle; }
+.table-facet { display: inline-block; width: auto; max-width: 100%; margin: 0 var(--space-sm) var(--space-sm) 0; vertical-align: middle; }
 .table-search-empty { margin: var(--space-sm) 0; }
+
+/* The pending invitations table scrolls inside its own box on a narrow screen, like the other section tables. */
+#invites-list { overflow-x: auto; }
 
 /* Compact density: tighter rows in every data table and in the dense file table. The default is the
    comfortable density the tables have always had. */

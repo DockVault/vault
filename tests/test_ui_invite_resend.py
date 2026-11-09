@@ -64,8 +64,15 @@ def test_a_pending_invitation_can_be_sent_again_from_its_row(page: Page, admin, 
         assert "invite=" in link and inv["token"] not in link
         expect(page.locator("#invite-link-expiry")).to_contain_text("no longer works")
         page.click("#invite-done-footer .close-modal-btn")
-        expect(row).to_contain_text("pending")
+        # The resend made a new invitation: the old row is gone, the new one is pending under the same name.
+        expect(row).to_have_count(0)
+        again = page.locator("#invites-list .invite-row", has_text=inv["username"])
+        expect(again).to_have_count(1)
+        expect(again).to_contain_text("pending")
         # The old link is dead.
         assert admin.get(f"/invites/{inv['token']}").status_code == 404
     finally:
+        for x in admin.get("/invites").json():
+            if x["username"] == inv["username"] and x["status"] == "pending":
+                admin.delete(f"/invites/{x['id']}")
         admin.delete(f"/invites/{inv['id']}")

@@ -8,7 +8,9 @@
 //       (`data-col`, set by the caller; else a slug of its text), so the sort is remembered under `key` for this
 //       account (saveUserPreference "tables") as {col: id, dir}, and applied again when the table is drawn again,
 //       even after a column is added. `search: true` adds a search box above the table that hides rows whose
-//       text does not hold every typed word; an existing input can be given instead.
+//       text does not hold every typed word; an existing input can be given instead. `facets: [{col, label}]`
+//       adds one small select per named column, listing the values its cells hold, that keeps only the rows
+//       with the chosen value; the search and the facets narrow the table together.
 //   Tables.reset()
 //       Forgets every remembered sort (sign-out: the next account on this tab starts from its own).
 //   Tables.setDensity('comfortable' | 'compact'), Tables.density()
@@ -22,6 +24,9 @@
     const DENSITY_KEY = 'dv_density';
     const COL_ID = /^[a-z][a-z0-9-]{0,31}$/;
     let remembered = null;
+    const facetsOf = new WeakMap();   // table -> its facet selects
+    const searchOf = new WeakMap();   // table -> its search box
+    const tableOf = new WeakMap();    // a search box or facet select -> the table it narrows now (a redrawn table is a new element)
 
     // A saved map with only the entries this build reads: a column id and a direction.
     function clean(map) {
@@ -97,6 +102,7 @@
 
     // What a cell shows: the chosen option of a select, else its text.
     function cellText(cell) {
+        if (!cell) return '';
         const sel = cell.querySelector('select');
         if (sel && sel.selectedIndex >= 0 && sel.options && sel.options[sel.selectedIndex]) return sel.options[sel.selectedIndex].textContent.trim();
         return cell.textContent.trim();
@@ -155,13 +161,23 @@
         });
     }
 
+    // The facets with a value chosen, as the column index and the value each row must show there.
+    function activeFacets(table) {
+        return (facetsOf.get(table) || []).filter((s) => s.value)
+            .map((s) => ({ index: columnIndex(table, s.getAttribute('data-facet-col')), value: s.value }))
+            .filter((f) => f.index >= 0);
+    }
+
+    // Rows that hold every word of `query` (the search box's text when not given) and match every chosen facet.
     function filterTable(table, query) {
-        const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+        const q = query == null ? ((searchOf.get(table) || {}).value || '') : query;
+        const words = String(q).toLowerCase().split(/\s+/).filter(Boolean);
+        const facets = activeFacets(table);
         const tbody = table.tBodies[0];
         if (!tbody) return;
         units(tbody).forEach((u) => {
             const text = u[0].textContent.toLowerCase();
-            const show = words.every((w) => text.indexOf(w) >= 0);
+            const show = words.every((w) => text.indexOf(w) >= 0) && facets.every((f) => cellText(u[0].cells[f.index]) === f.value);
             u.forEach((row, idx) => {
                 if (idx === 0) row.hidden = !show;
                 else if (!show) row.hidden = true;
@@ -171,7 +187,7 @@
         let empty = table.nextElementSibling && table.nextElementSibling.classList.contains('table-search-empty')
             ? table.nextElementSibling : null;
         const none = Array.from(tbody.children).every((r) => r.hidden);
-        if (none && words.length) {
+        if (none && (words.length || facets.length)) {
             if (!empty) {
                 empty = document.createElement('p');
                 empty.className = 'text-secondary text-sm table-search-empty';
@@ -196,6 +212,44 @@
         if (key) input.id = 'table-search-' + key;
         table.insertAdjacentElement('beforebegin', input);
         return input;
+    }
+
+    // One facet's select, kept across redraws of the table; its options are the values the column holds now,
+    // and a chosen value stays chosen while the column still holds it.
+    function facetSelect(table, key, facet) {
+        const label = facet.label || facet.col;
+        let el = table.parentNode && table.parentNode.querySelector(':scope > select.table-facet[data-facet-col="' + facet.col + '"]');
+        if (!el) {
+            el = document.createElement('select');
+            el.className = 'form-control form-control-sm table-facet';
+            el.setAttribute('data-facet-col', facet.col);
+            el.setAttribute('aria-label', 'Filter by ' + label);
+            if (key) el.id = 'table-facet-' + key + '-' + facet.col;
+            table.insertAdjacentElement('beforebegin', el);
+        }
+        const index = columnIndex(table, facet.col);
+        const values = [];
+        if (index >= 0 && table.tBodies[0]) {
+            units(table.tBodies[0]).forEach((u) => {
+                const v = cellText(u[0].cells[index]);
+                if (v && !MISSING.test(v) && values.indexOf(v) < 0) values.push(v);
+            });
+        }
+        values.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+        const current = el.value;
+        el.replaceChildren();
+        const all = document.createElement('option');
+        all.value = '';
+        all.textContent = label + ': all';
+        el.appendChild(all);
+        values.forEach((v) => {
+            const option = document.createElement('option');
+            option.value = v;
+            option.textContent = v;
+            el.appendChild(option);
+        });
+        el.value = values.indexOf(current) >= 0 ? current : '';
+        return el;
     }
 
     function enhance(table, options) {
@@ -228,11 +282,24 @@
         let input = null;
         if (o.search === true) input = searchBox(table, key);
         else if (o.search && o.search.addEventListener) input = o.search;
-        if (input && !input.dataset.tableWired) {
-            input.dataset.tableWired = '1';
-            input.addEventListener('input', () => filterTable(table, input.value));
+        if (input) {
+            searchOf.set(table, input);
+            tableOf.set(input, table);
+            if (!input.dataset.tableWired) {
+                input.dataset.tableWired = '1';
+                input.addEventListener('input', () => filterTable(tableOf.get(input), input.value));
+            }
         }
-        if (input && input.value) filterTable(table, input.value);
+        const facets = (Array.isArray(o.facets) ? o.facets : []).filter((f) => f && f.col).map((f) => facetSelect(table, key, f));
+        facetsOf.set(table, facets);
+        facets.forEach((s) => {
+            tableOf.set(s, table);
+            if (!s.dataset.tableWired) {
+                s.dataset.tableWired = '1';
+                s.addEventListener('change', () => filterTable(tableOf.get(s)));
+            }
+        });
+        if ((input && input.value) || facets.some((s) => s.value)) filterTable(table);
         return table;
     }
 
