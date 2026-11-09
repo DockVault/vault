@@ -248,10 +248,32 @@ def _decrypted(token_enc: Optional[str]) -> Optional[str]:
         return None
 
 
+def _refused_since(db, provider_id, user_id, created_at: int) -> bool:
+    """Whether the provider refused this account's identity after the handover was made: a refusal at a later
+    callback ends the sign-ins under way, this one too (app/services/sso_freshness.py). The handover keeps its time in
+    whole seconds, so a refusal within the same second counts as after it (fail closed)."""
+    import uuid
+    from datetime import datetime, timezone
+    from app.services.sign_in import table_present
+    if not table_present(db, "external_identities"):
+        return False
+    from app.core.models import ExternalIdentity
+    try:
+        pid = uuid.UUID(str(provider_id))
+    except ValueError:
+        return False
+    identity = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == pid,
+                                                 ExternalIdentity.user_id == user_id).first()
+    refused = getattr(identity, "refused_at", None) if identity is not None else None
+    made = datetime.fromtimestamp(created_at, tz=timezone.utc).replace(tzinfo=None)
+    return refused is not None and refused >= made
+
+
 def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
     """The pipeline result a record stands for, read back against the database: the account must still
-    exist and be active, and a pending login it names must still be live. None otherwise (the finisher
-    then answers as for an unknown code)."""
+    exist and be active, a pending login it names must still be live, and a provider's handover must not have been
+    overtaken by that provider's refusal of the identity. None otherwise (the finisher then answers as for an
+    unknown code)."""
     import uuid
     from datetime import datetime, timezone
     from app.core.models import PendingLogin, User
@@ -262,6 +284,8 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
         return None
     user = db.query(User).filter(User.id == user_id).first()
     if user is None or not getattr(user, "is_active", True):
+        return None
+    if handover.provider_id and _refused_since(db, handover.provider_id, user_id, handover.created_at):
         return None
     pending = None
     if handover.pending_id:

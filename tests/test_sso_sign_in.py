@@ -1032,7 +1032,10 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
     # A sign-in already under way for alice ends with the refusal; another account's does not.
     assert pending.consumed_at is not None and others.consumed_at is None
     assert F.lapsed(h.db, alice.id) is not None
-    # A sign-in the provider admits answers the refusal.
+    # A sign-in the provider admits answers the refusal (a moment later: a handover keeps whole seconds, and one made
+    # in the same second as a refusal counts as overtaken by it).
+    from datetime import timedelta
+    identity.refused_at -= timedelta(seconds=2)
     location = callback_with(groups=["vault-users"])
     assert location.startswith("/#sso="), location
     assert h.finish(location)[0] == 200
@@ -1113,3 +1116,27 @@ def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_own
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
     assert status == 200 and h.identities() == []
 
+
+def test_a_handover_the_providers_refusal_overtook_is_not_redeemed(monkeypatch):
+    """An admitted callback mints a one-time code; the provider then refuses the person at another callback. The code
+    is answered as unknown: the refusal ends the sign-ins under way. A refusal made before an admitted callback is
+    answered by it, as before."""
+    from datetime import timedelta
+    alice, p = _user(), _provider()
+    identity = _identity(alice, p, refused_at=None)
+    h = Harness(monkeypatch, [alice], [p], identities=[identity])
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso="), location
+    identity.refused_at = datetime.utcnow() + timedelta(seconds=1)
+    status, body = h.finish(location)
+    assert status == 401, body
+    # Refused earlier, admitted since: the admitted sign-in finishes and answers the refusal.
+    identity.refused_at = datetime.utcnow() - timedelta(minutes=5)
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    status, body = h.finish(location)
+    assert status == 200, body
+    assert identity.last_sign_in_at is not None and identity.last_sign_in_at > identity.refused_at
