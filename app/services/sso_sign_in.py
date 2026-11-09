@@ -39,6 +39,7 @@ ALREADY_LINKED = "already_linked"
 NOT_THIS_ACCOUNT = "not_this_account"
 PURPOSE_NOT_READY = "purpose_not_ready"
 REAUTH_STALE = "reauth_stale"
+PRIVILEGED_ON_PASSWORD_LESS = "privileged_on_password_less"
 REAUTH_NO_MFA = "reauth_no_mfa"
 REAUTH_MAX_AGE_SECONDS = 60
 RESTRICTED = sso_policy.RESTRICTED
@@ -69,6 +70,8 @@ REASON_TEXTS = {
     NOT_THIS_ACCOUNT: "That organisation identity belongs to another account here.",
     PURPOSE_NOT_READY: "This step is not available yet.",
     REAUTH_STALE: "Your organisation's sign-in did not ask you to sign in again just now. Start again.",
+    PRIVILEGED_ON_PASSWORD_LESS: ("An administrator's or auditor's account keeps a local password, so it cannot be linked "
+                                  "to a provider whose people sign in without one."),
     REAUTH_NO_MFA: "Your organisation's sign-in did not confirm you with a second factor. Start again.",
     RESTRICTED: ("Your organisation's sign-in worked, but this vault is not open to your tenant, domain or group. Ask "
                  "your administrator."),
@@ -655,6 +658,7 @@ def link_refusal(db, row, user, answer: ProviderAnswer) -> None:
     """Raise :class:`Refusal` when ``answer``'s identity cannot be linked to ``user``: it already belongs to
     another account, or the account already has an identity on this provider."""
     from app.core.models import ExternalIdentity
+    _password_less_refusal(db, row, user)
     existing = subject_owner(db, row, answer)
     if existing is not None and (existing.user_id != user.id or known_identity(db, row, answer) is None):
         raise Refusal(ALREADY_LINKED)         # another account's, or this account's under another tenant
@@ -667,6 +671,7 @@ def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str):
     """Link ``answer``'s identity to ``user``: refused when the subject already belongs to another account, or
     the account already has an identity on this provider. In the caller's transaction."""
     from app.core.models import ExternalIdentity
+    _password_less_refusal(db, row, user)
     existing = subject_owner(db, row, answer)
     if existing is not None:
         if existing.user_id == user.id and known_identity(db, row, answer) is not None:
@@ -684,6 +689,17 @@ def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str):
                                 last_sign_in_at=None)
     db.add(identity)
     return identity
+
+
+def _password_less_refusal(db, row, user) -> None:
+    """A provider whose people hold no password (``sso_password_login`` disabled) never takes an administrator's or
+    an auditor's account: those keep a local password for the fixed step-ups (app/core/sso_only.py)."""
+    from app.core import privileged_accounts
+    if policy_of(row)["sso_password_login"] != "disabled":
+        return
+    kind = privileged_accounts.kind(db, user)
+    if kind is not None:
+        raise Refusal(PRIVILEGED_ON_PASSWORD_LESS, kind)
 
 
 def test_summary(db, row, answer: ProviderAnswer, tester) -> dict:

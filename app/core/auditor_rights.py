@@ -59,6 +59,7 @@ ADMIN_NOT_ALLOWED = "admin_not_allowed"
 NO_TOTP = "no_totp"
 PASSWORD_NOT_OWN = "password_not_own"
 RECENT_CHANGE = "recent_change"
+SSO_ONLY = "sso_only"
 OPEN_GRANT = "open_grant"
 
 # Why a step on a grant is refused besides (the independence rule's own reasons are in app/core/independence.py).
@@ -75,6 +76,7 @@ TEXTS = {
     ADMIN_NOT_ALLOWED: "this deployment does not let an administrator hold the auditor right "
                        "(COMPLIANCE_AUDITOR_NOT_ADMIN)",
     NO_TOTP: "the account has no authenticator app set up (an email code does not count)",
+    SSO_ONLY: "the account signs in only through its identity provider and holds no password",
     PASSWORD_NOT_OWN: "the account's password was set by someone else: its holder must set their own first",
     RECENT_CHANGE: "someone else changed the account's sign-in details in the last 14 days",
     OPEN_GRANT: "the account already holds the auditor right, or a proposal for it is waiting",
@@ -225,6 +227,8 @@ def preconditions(db, user, now: Optional[datetime] = None) -> List[str]:
         problems.append(ADMIN_NOT_ALLOWED)
     if active_totp(db, user.id) is None:
         problems.append(NO_TOTP)
+    if getattr(user, "sso_only", False):
+        problems.append(SSO_ONLY)
     if password_origin.is_set_by_other(user):
         problems.append(PASSWORD_NOT_OWN)
     if cc.last_applied(db, user.id, now) is not None:

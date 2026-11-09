@@ -547,6 +547,24 @@ def test_the_requested_acr_rides_in_the_authorization_request_and_the_test_repor
     assert "acr_values" not in h.start(q)[1]["authorization_url"]
 
 
+def test_a_privileged_account_never_links_itself_to_a_password_less_provider(monkeypatch):
+    root, p = _user("root", role="admin"), _provider(policy={"sso_password_login": "disabled"})
+    h = Resolving(monkeypatch, [root], [p])
+    status, out = h.start_link(p)
+    assert status == 200, out
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location == "/#sso-error=privileged_on_password_less", location
+    assert h.identities() == [] and h.codes() == []
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "privileged_on_password_less" for a in h.audits), h.audits
+    # The same provider with password sign-in allowed takes the link.
+    p.policy = {"sso_password_login": "allowed"}
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-linked="), location
+
+
 # --------------------------------------------------------------------------- the restriction comes first
 
 @pytest.mark.parametrize("policy, claims, reason", [

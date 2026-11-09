@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from test_sso_resolution import Resolving, _sign_in
-from test_sso_sign_in import _call, _identity, _provider, _user
+from test_sso_sign_in import _call, _h, _identity, _provider, _user
 
 pytestmark = pytest.mark.unit
 
@@ -128,6 +128,15 @@ def test_the_mappings_move_the_person_between_departments_and_touch_nothing_else
     before = len(h.membership_audits())
     _sign_in(h, p, groups=["fin", "other"])
     assert _names(alice.groups) == ["Board", "Finance"] and len(h.membership_audits()) == before
+    # Leaving a department takes nobody else out of it.
+    from app.core.models import User
+    dave = _user("dave")
+    h.db.rows_of(User).append(dave)
+    legal2 = h.department("Legal 2", alice, dave)
+    h.mapping(p, "legal2", legal2)
+    _sign_in(h, p, groups=["fin"])
+    assert _names(alice.groups) == ["Board", "Finance"] and _names(dave.groups) == ["Legal 2"]
+    assert h.membership_rows(dave) == [str(legal2.id)]
     # A department two mappings name, one group present: the person is in it.
     h.mapping(p, "fin2", finance)
     _sign_in(h, p, groups=["fin"])
@@ -204,6 +213,13 @@ def test_an_administrator_group_opens_one_held_request_and_grants_nothing(monkey
     assert any(a[0] == "sso_admin_requested" and a[2]["provider_group"] == "admins" for a in h.audits)
     assert ([str(root.id)], "An administrator request is waiting") in h.notices
     assert ([str(alice.id)], "Your administrator role waits for approval") in h.notices
+    # An account that signs in only through its provider raises no request: it could never type the password.
+    carol = _user("carol", sso_only=True)
+    from app.core.models import ExternalIdentity, RoleEnum, User
+    h.db.rows_of(User).append(carol)
+    h.db.rows_of(ExternalIdentity).append(_identity(carol, p, subject="s-carol"))
+    _sign_in(h, p, sub="s-carol", email="carol@example.test", groups=["admins"])
+    assert len(h.requests()) == 1 and carol.role == RoleEnum.USER
     # Signing in again while it waits: no second request, no second notice.
     _sign_in(h, p, groups=["admins"])
     assert len(h.requests()) == 1
@@ -215,6 +231,42 @@ def test_an_administrator_group_opens_one_held_request_and_grants_nothing(monkey
     request.decided_at = datetime.utcnow() - timedelta(days=8)
     _sign_in(h, p, groups=["admins"])
     assert len(h.requests()) == 2 and h.requests()[-1].state == "held"
+
+
+def test_a_decision_reads_the_request_locked_after_the_step_up():
+    """The memory store shows no row lock; the decision's read is pinned in the source: the request row is read
+    again, locked, after the step-up, so two decisions cannot both pass."""
+    import inspect
+    from app.api import sso_admin_router
+    source = inspect.getsource(sso_admin_router._decide)
+    assert source.index("_step_up(db, current_user, request)") < source.index("_request_or_404(db, request_id, lock=True)")
+    assert inspect.getsource(sso_admin_router._request_or_404).count("with_for_update()") == 1
+
+
+def test_a_test_sign_in_syncs_nothing(monkeypatch):
+    """A test sign-in by an administrator reports and changes nothing: no membership moves, no role changes, no
+    administrator request is opened, whatever the mappings say."""
+    root, p = _user("root", role="admin"), _provider(state="tested", policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [root], [p])
+    finance = h.department("Finance")
+    legal = h.department("Legal", root)
+    h.mapping(p, "fin", finance)
+    h.mapping(p, "legal", legal)
+    h.mapping(p, "admins", role="admin")
+    h.mapping(p, "ext", role="external")
+    from app.core import sso_state
+    from app.services import sso_sign_in as sso
+    url = sso.start(p, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
+                    user_id=root.id, session_hash="sess-hash")
+    state, _ = h.state_of(url)
+    h.claims_override = {"groups": ["fin", "admins", "ext"]}
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-test="), location
+    assert h.finish_test(p, location)[0] == 200
+    from app.core.models import RoleEnum
+    assert _names(root.groups) == ["Legal"] and h.membership_rows(root) == [str(legal.id)]
+    assert root.role == RoleEnum.ADMIN and h.role_sets == [] and h.requests() == [] and h.membership_audits() == []
+    assert p.last_test["groups"] == ["admins", "ext", "fin"]
 
 
 # --------------------------------------------------------------------------- the decision
@@ -281,6 +333,17 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
     assert status == 409 and body["detail"]["reason"] == "account_unusable", body
     bob.is_active = True
+    # ... with a password of its own, and under the promotion rules; both judged before the step-up is spent.
+    bob.sso_only = True
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "sso_only" and h.step_ups == [], body
+    bob.sso_only = False
+    from app.core import auditor_rights
+    monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: "bob holds the auditor right")
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "auditor_right" and h.step_ups == [], body
+    assert body["detail"]["message"] == "bob holds the auditor right"
+    monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: None)
     # A held request past its time is refused as expired even when nothing marked it yet.
     request.expires_at = datetime.utcnow() - timedelta(seconds=1)
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
@@ -323,6 +386,7 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     assert h.role_sets == [("bob", "admin", "root")] and h.announced == [("bob", "root", "promoted")] and h.handed == [{"user_id": bob.id}]
     assert h.status_notices == [("bob", "root", ("user", "admin"), ["old-permission"])]
     assert request.state == "approved" and request.decided_by == root.id and request.decided_by_name == "root"
+    assert request.decided_at is not None
     assert body["request"]["state"] == "approved" and body["username"] == "bob"
     assert any(a[0] == "sso_admin_approved" and a[1] == "success" for a in h.audits)
     # Decided once: a second decision is refused.
@@ -397,6 +461,17 @@ def test_a_stale_approval_demotes_nobody_made_an_administrator_since(monkeypatch
     _grant(h, bob, datetime.utcnow() - timedelta(days=1), granted_by_id=root.id)
     _sign_in(h, p, groups=["staff"])
     assert bob.role == RoleEnum.ADMIN and h.role_sets == [] and h.lost == []
+    # A grant by another administrator at the approval's moment is not the approval's either ...
+    other = _user("other", role="admin")
+    h.db.rows_of(AdminGrant).clear()
+    _grant(h, bob, decided + timedelta(seconds=1), granted_by_id=other.id)
+    _sign_in(h, p, groups=["staff"])
+    assert bob.role == RoleEnum.ADMIN and h.role_sets == []
+    # ... nor one by the approver minutes later.
+    h.db.rows_of(AdminGrant).clear()
+    _grant(h, bob, decided + timedelta(minutes=5), granted_by_id=root.id)
+    _sign_in(h, p, groups=["staff"])
+    assert bob.role == RoleEnum.ADMIN and h.role_sets == []
     # The approval of another provider's mapping does not count for this one.
     h.db.rows_of(AdminGrant).clear()
     _grant(h, bob, decided + timedelta(seconds=1), granted_by_id=root.id)

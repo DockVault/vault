@@ -36,7 +36,9 @@ def restore_password_sign_in(db, user, *, base_url: str, created_by_id) -> Optio
     hash stays unusable until then). Returns the link, or None when no link can be minted (the reset pepper is not
     configured). ``_mint_reset_link`` commits on its own."""
     from app.api import api_server as api
+    from app.core.security import hash_password
     user.sso_only = False
+    user.password_hash = hash_password(secrets.token_urlsafe(32))     # whatever was set meanwhile is not a password
     return api._mint_reset_link(db, user, base_url, created_by_id=created_by_id, made_by_other=True)
 
 

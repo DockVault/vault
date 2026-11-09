@@ -107,17 +107,110 @@ def test_no_reset_link_and_no_password_change_for_an_sso_only_account(monkeypatc
     status, body, _ = _call(S, "POST", f"/users/{alice.id}/send-reset-link")
     assert status == 409, body
     assert minted == []
-    # The self-service request answers as for anyone and mints nothing.
+    # The self-service request answers as for anyone and mints nothing, with self-service reset on, mail set up
+    # and a public address to build the link on (without them nobody gets a link, and the pin would hold for the
+    # wrong reason).
+    sent = []
+    monkeypatch.setattr(S, "_public_base_url", lambda: "https://vault.example.test")
+    monkeypatch.setattr(S, "_password_reset_policy", lambda db: (True, 3600))
+    monkeypatch.setattr(S, "_smtp_configured", lambda db: True)
+    monkeypatch.setattr(S, "_mint_and_send_reset_async", lambda user_id, base_url: sent.append(user_id))
     monkeypatch.setattr(S, "_resolve_reset_user", lambda db, identifier: alice)
     status, body, _ = _call(S, "POST", "/auth/forgot-password", {"identifier": "alice"})
-    assert status == 202 and minted == []
+    assert status == 202 and sent == [], body
+    monkeypatch.setattr(S, "_resolve_reset_user", lambda db, identifier: root)
+    status, body, _ = _call(S, "POST", "/auth/forgot-password", {"identifier": "root"})
+    assert status == 202 and sent == [root.id], body                    # an ordinary account gets its link
+    # A link that outlived the change is refused as any unusable link, at the form and at the reset.
+    link = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, created_by=root.id, made_by_other=True,
+                                 consumed_at=None, token_prefix="abc")
+    monkeypatch.setattr(S, "_resolve_valid_reset_token", lambda db, token: link)
+    refused = []
+    monkeypatch.setattr(S, "_refuse_reset_link", lambda db, r, target, reason, *, ip: refused.append((target.username, reason)))
+    status, body, _ = _call(S, "GET", "/reset/some-token")
+    assert status == 404, body
+    status, body, _ = _call(S, "POST", "/reset/some-token", {"new_password": "a-new-password-1"})
+    assert status == 404 and refused == [("alice", "sso_only")] and alice.password_hash == "x", body
     # The account cannot set a password.
     h.current_user = alice
     status, body, _ = _call(S, "PATCH", "/users/me", {"current_password": "pw", "new_password": "a-new-password-1"})
     assert status == 409 and "no password of its own" in body["detail"], body
-    # Other self-service changes stand.
+    # Other self-service changes stand; the SFTP password sign-in cannot be turned back on, by anyone.
     status, body, _ = _call(S, "PATCH", "/users/me", {"sftp_enabled": False})
     assert status == 200, body
+    alice.sftp_password_auth = False
+    status, body, _ = _call(S, "PATCH", "/users/me", {"sftp_password_auth": True})
+    assert status == 409 and "SSH key" in body["detail"], body
+    assert alice.sftp_password_auth is False
+    import pytest as _pytest
+    from fastapi import HTTPException
+    with _pytest.raises(HTTPException) as refused:
+        S._refuse_sftp_password_for_sso_only(alice, True)              # the administrator's update asks the same
+    assert refused.value.status_code == 409
+    S._refuse_sftp_password_for_sso_only(alice, False)                  # turning it off is always allowed
+    S._refuse_sftp_password_for_sso_only(root, True)                    # an ordinary account may turn it on
+
+
+def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(monkeypatch):
+    """A password set by an administrator would go live the moment the flag clears; the administrator role needs a
+    password for the fixed step-ups. Both are refused while the account signs in only through its provider: at the
+    credential change a held approval applies as well as at the route, and the auditor right's preconditions name
+    it; a restore re-randomizes the hash before the link is minted."""
+    privileged_accounts, sso_only = _mod()
+    from fastapi import HTTPException
+    from app.core import credential_changes as cc
+    from app.core import security
+    import app.api.api_server as S
+    alice = _user(sso_only=True, password_hash="unusable")
+    with pytest.raises(HTTPException) as refused:
+        S._make_credential_change(types.SimpleNamespace(), cc.PASSWORD, alice, {"password_hash": "admins-choice"},
+                                  actor_id=uuid.uuid4(), actor_name="root")
+    assert refused.value.status_code == 409 and alice.password_hash == "unusable"
+    # The promotion is refused where every promotion passes (the Users page, the user-management API, an approval).
+    from app.core import admin_grants, auditor_rights
+    monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: None)
+    recorded = []
+    monkeypatch.setattr(admin_grants, "record", lambda db, user_id, **kw: recorded.append(user_id))
+    with pytest.raises(HTTPException) as refused:
+        S._record_admin_grant(types.SimpleNamespace(), alice, by=_user("root", role="admin"))
+    assert refused.value.status_code == 409 and "allow password sign-in" in refused.value.detail and recorded == []
+    alice.sso_only = False
+    monkeypatch.setattr(S, "_revoke_reset_links_outranked_by", lambda db, user, actor: None)
+    S._record_admin_grant(types.SimpleNamespace(), alice, by=_user("root", role="admin"))
+    assert recorded == [alice.id]
+    alice.sso_only = True
+    # The auditor right's preconditions name it too.
+    monkeypatch.setattr(auditor_rights, "active_totp", lambda db, user_id: object())
+    monkeypatch.setattr(cc, "last_applied", lambda db, user_id, now: None)
+    assert auditor_rights.preconditions(types.SimpleNamespace(), alice) == [auditor_rights.SSO_ONLY]
+    assert "identity provider" in auditor_rights.text(auditor_rights.SSO_ONLY)
+    # A restore sets a fresh unknown hash before minting the link: nothing set meanwhile is a password.
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    alice.password_hash = "admins-choice"
+    monkeypatch.setattr(S, "_mint_reset_link", lambda db, user, base_url, **kw: "https://x/reset/t")
+    link = sso_only.restore_password_sign_in(types.SimpleNamespace(), alice, base_url="https://x", created_by_id=None)
+    assert link == "https://x/reset/t" and alice.sso_only is False and alice.password_hash.startswith("argon2:")
+    assert alice.password_hash != "admins-choice"
+
+
+def test_the_sftp_door_refuses_an_sso_only_account_too(monkeypatch):
+    """The SFTP password sign-in goes through the same service as the web's: an SSO-only account is refused there as
+    well, whatever its SFTP password flag says."""
+    set_bare_api_env()
+    from app.core import sign_in_lockout
+    from app.core.models import User
+    from app.services import auth_service as A
+    from test_sso_sign_in import DB
+    alice = _user(sso_only=True, password_hash="right", sftp_password_auth=True)
+    monkeypatch.setattr(A, "verify_password", lambda plain, hashed: plain == "pw" and hashed == "right")
+    monkeypatch.setattr(A, "account_locked", lambda user: False)
+    for name in ("release_expired", "lock_in_force", "count_at_limit"):
+        monkeypatch.setattr(sign_in_lockout, name, lambda *a, **k: None)
+    svc = A.AuthService(DB({User: [alice]}))
+    monkeypatch.setattr(svc, "_record_failed_login", lambda name, ip, user=None: None)
+    with pytest.raises(A.InvalidCredentialsError) as refused:
+        svc._authenticate_in_turn(alice, "alice", "pw", "203.0.113.9", channel=A.AuthService.SFTP)
+    assert "identity provider" in str(refused.value)
 
 
 def test_the_provider_setting_is_refused_while_a_privileged_account_is_linked_and_applied_both_ways(monkeypatch):

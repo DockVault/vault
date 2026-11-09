@@ -6459,6 +6459,12 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         # takes the turn again and waits for nothing.
         _sessions_turn(db, target.id)
     if kind == cc.PASSWORD:
+        if getattr(target, "sso_only", False):
+            # Held and approved later, or made at once: a password is never set on an account that signs in only
+            # through its provider (app/core/sso_only.py); the provider's setting changes first.
+            raise HTTPException(status_code=409, detail=(
+                "This account signs in only through its organisation's provider and holds no password; allow "
+                "password sign-in on the provider first."))
         from app.core import password_origin
         target.password_hash = payload["password_hash"]
         target.updated_at = datetime.now(timezone.utc)
@@ -7024,8 +7030,10 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     change INTO the role.
 
     Refused (409) while COMPLIANCE_AUDITOR_NOT_ADMIN is on and the account holds the auditor right or a
-    proposal for it (app/core/auditor_rights.py, promotion_refusal): the right is revoked first. Raised in the
-    caller's transaction, before anything of the promotion is committed."""
+    proposal for it (app/core/auditor_rights.py, promotion_refusal): the right is revoked first. Refused (409) too
+    for an account that signs in only through its identity provider (app/core/sso_only.py): an administrator needs
+    a password for the fixed step-ups, so the provider's password sign-in is allowed first. Both raised in the
+    caller's transaction, before anything of the promotion is committed; every promotion passes here."""
     from app.core import admin_grants, auditor_rights
     from app.core import credential_changes as cc
     # The account's turn at its sessions first, before anything below reads or writes the account (the order of
@@ -7039,6 +7047,10 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     refusal = auditor_rights.promotion_refusal(db, user)
     if refusal is not None:
         raise HTTPException(status_code=409, detail=refusal)
+    if getattr(user, "sso_only", False):
+        raise HTTPException(status_code=409, detail=(
+            f"{user.username} signs in only through its organisation's provider and holds no password, which an "
+            "administrator needs; allow password sign-in on the provider first."))
     # The account's sessions, and its sign-ins under way, end with the promotion. Each was made with what a user
     # owes: a passkey by itself, where the role lets one in alone, or a password with no second factor. An
     # administrator always gives the password and whatever the administrators' policy asks, and a session from
@@ -7647,6 +7659,8 @@ async def get_reset(token: str, request: Request, db: Session = Depends(get_db))
     if r is None:
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     user = db.query(User).filter(User.id == r.user_id).first()
+    if user is not None and getattr(user, "sso_only", False):
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     if user is not None:
         # A link someone else made is judged again as its maker and the account stand now: refused
         # exactly like an unknown one, revoked, and recorded (_reset_link_refusal).
@@ -9522,6 +9536,16 @@ def _count_the_end_of_the_accounts_sessions(db, user_id) -> None:
         {User.sessions_ended: int(counted[0] or 0) + 1}, synchronize_session=False)
 
 
+def _refuse_sftp_password_for_sso_only(user, wanted) -> None:
+    """An account that signs in only through its identity provider holds no password of its own (app/core/sso_only.py),
+    so its SFTP password sign-in cannot be turned on, by the account or by an administrator: SSH keys remain its way
+    in over SFTP."""
+    if wanted and getattr(user, "sso_only", False):
+        raise HTTPException(status_code=409, detail=(
+            "This account signs in only through its organisation's provider and has no password for SFTP either; "
+            "use an SSH key, or allow password sign-in on the provider first."))
+
+
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
                      durable=True, except_session_token=None, session_ids=None):
     """Deactivate the matching active sessions AND publish a force-close signal to
@@ -10981,6 +11005,7 @@ async def update_own_account(
         user.sftp_enabled = body.sftp_enabled
         changes.append("sftp_enabled")
     if body.sftp_password_auth is not None and body.sftp_password_auth != user.sftp_password_auth:
+        _refuse_sftp_password_for_sso_only(user, body.sftp_password_auth)
         user.sftp_password_auth = body.sftp_password_auth
         changes.append("sftp_password_auth")
 
@@ -13245,6 +13270,10 @@ async def update_user(
         _validate_password_policy(db, user_update.password)
         # A credential change like the address above. Applying it also ends the account's sessions:
         # a stolen token must not survive the response to a suspected compromise.
+        if getattr(user, "sso_only", False):
+            raise HTTPException(status_code=409, detail=(
+                "This account signs in only through its organisation's provider and holds no password; allow "
+                "password sign-in on the provider first."))
         outcome = _credential_change(
             db, current_user, user, "password", summary=_request_summary("password"),
             payload={"password_hash": hash_password(user_update.password)}, request=request)
@@ -13259,6 +13288,7 @@ async def update_user(
         changes['sftp_enabled'] = {'old': user.sftp_enabled, 'new': user_update.sftp_enabled}
         user.sftp_enabled = user_update.sftp_enabled
     if user_update.sftp_password_auth is not None:
+        _refuse_sftp_password_for_sso_only(user, user_update.sftp_password_auth)
         changes['sftp_password_auth'] = {'old': user.sftp_password_auth, 'new': user_update.sftp_password_auth}
         user.sftp_password_auth = user_update.sftp_password_auth
 
@@ -13289,7 +13319,7 @@ async def update_user(
             # Who made an administrator one is recorded with the change, for the two-administrator
             # rule; a demotion drops the record (app/core/admin_grants.py).
             if user_update.role == RoleEnum.ADMIN and user.role != RoleEnum.ADMIN:
-                _record_admin_grant(db, user, by=current_user)
+                _record_admin_grant(db, user, by=current_user)        # refuses an SSO-only account (409)
                 taken_back = _take_back_password_at_promotion(db, user, by=current_user)
                 admin_granted = True
             elif user_update.role != RoleEnum.ADMIN and user.role == RoleEnum.ADMIN:

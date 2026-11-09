@@ -26,7 +26,7 @@ from app.core import sso_policy
 log = logging.getLogger("dockvault.sso")
 
 REQUEST_DAYS = 7
-GRANT_MATCH_SECONDS = 300            # an approval's grant record is written with the decision
+GRANT_MATCH_SECONDS = 2              # an approval's grant record is written with the decision, at its moment
 HELD, APPROVED, DENIED, EXPIRED, DEMOTED = "held", "approved", "denied", "expired", "demoted"
 
 # What the owners of vaults a department reaches are told about a join made by a sign-in (the access notices
@@ -118,7 +118,9 @@ def apply(db, row, user, answer) -> Applied:
         if maps_admin and admin_group is None and made_administrator_through(db, user, row):
             _demote(db, row, user, roles, applied)
         return applied
-    if admin_group is not None and policy["sso_admin_mapping"]:
+    if admin_group is not None and policy["sso_admin_mapping"] and not getattr(user, "sso_only", False):
+        # An account that signs in only through its provider holds no password, and an administrator needs one for
+        # the fixed step-ups: no request is raised for it (the provider's password sign-in comes first).
         applied.request = _request_admin(db, user, row, admin_group)
     lesser = "user" if "user" in roles else ("external" if "external" in roles else None)
     if lesser is not None and getattr(user.role, "value", user.role) != lesser:
@@ -248,10 +250,10 @@ def made_administrator_through(db, user, row) -> bool:
     for r in approvals:
         if r.decided_by is None or r.decided_at is None or grant.granted_at is None:
             continue
-        since = (grant.granted_at - r.decided_at).total_seconds()
-        # The approval records the grant as it is decided; a grant made by hand later, even by the same
+        since = abs((grant.granted_at - r.decided_at).total_seconds())
+        # The approval records the grant at the decision's moment; a grant made by hand later, even by the same
         # administrator, is another decision and keeps the role.
-        if str(getattr(grant, "granted_by_id", None)) == str(r.decided_by) and 0 <= since <= GRANT_MATCH_SECONDS:
+        if str(getattr(grant, "granted_by_id", None)) == str(r.decided_by) and since <= GRANT_MATCH_SECONDS:
             return True
     return False
 
@@ -345,10 +347,14 @@ def requests(db, *, now: Optional[datetime] = None):
     held, decided = [], []
     for r in rows:
         if r.state == HELD and r.expires_at <= now:
-            r.state = EXPIRED
-            r.decided_at = now
-            _audit(db, "sso_admin_expired", ip=None, resource_type="sso_admin_request", resource_id=str(r.id),
-                   details={"provider_id": str(r.provider_id), "user_id": str(r.user_id)})
+            # Guarded by the row's state as the database holds it: a decision landing this second is not overwritten.
+            expired = db.query(SsoAdminRequest).filter(SsoAdminRequest.id == r.id, SsoAdminRequest.state == HELD,
+                                                       SsoAdminRequest.expires_at <= now).update(
+                {"state": EXPIRED, "decided_at": now}, synchronize_session=False)
+            if expired:
+                r.state, r.decided_at = EXPIRED, now
+                _audit(db, "sso_admin_expired", ip=None, resource_type="sso_admin_request", resource_id=str(r.id),
+                       details={"provider_id": str(r.provider_id), "user_id": str(r.user_id)})
         (held if r.state == HELD else decided).append(r)
     return held, decided
 
@@ -391,6 +397,13 @@ def decision_refusal(db, request, approver, *, now: Optional[datetime] = None) -
         return Conflict("account_unusable", "The account this request is about cannot sign in.")
     if getattr(user, "role", None) == RoleEnum.ADMIN:
         return Conflict("already_admin", "The account is an administrator already.")
+    if getattr(user, "sso_only", False):
+        return Conflict("sso_only", "The account signs in only through its provider and holds no password; allow "
+                                    "password sign-in on the provider before granting the administrator role.")
+    from app.core import auditor_rights
+    held_by_rule = auditor_rights.promotion_refusal(db, user)
+    if held_by_rule:
+        return Conflict("auditor_right", held_by_rule)
     why = approver_refusal(db, approver, request)
     if why is not None:
         return Conflict(why, REFUSAL_TEXTS.get(why, "You may not decide this request."))
@@ -409,10 +422,13 @@ def approve(db, request, approver, *, http_request=None) -> dict:
     api._record_admin_grant(db, user, by=approver)
     taken = api._take_back_password_at_promotion(db, user, by=approver)
     removed = api._set_role(db, user, RoleEnum.ADMIN, actor=approver)
+    from app.core import admin_grants
+    grant = admin_grants.of(db, [user.id]).get(user.id)
     request.state = APPROVED
     request.decided_by = approver.id
     request.decided_by_name = approver.username
-    request.decided_at = now
+    # The decision's moment is the grant record's, so the two match exactly when the demotion rule asks.
+    request.decided_at = getattr(grant, "granted_at", None) or now
     db.commit()
     try:
         api._announce_admin_granted(db, user, by_name=approver.username, how="promoted")
