@@ -15412,6 +15412,14 @@ function _previewBlobType(kind, type, ext) {
     return byExt && byExt.startsWith(kind + '/') ? byExt : 'application/octet-stream';
 }
 
+// Whether a preview is drawn as an SVG. A stored SVG type decides it; the .svg extension does only
+// when the stored type is not some other image type, so a PNG that happens to be named .svg still
+// shows as the picture it is (and _previewBlobType never gives it an SVG type).
+function _previewAsSvg(type, ext) {
+    const t = String(type || '').toLowerCase();
+    return t.includes('svg') || (ext === 'svg' && !t.startsWith('image/'));
+}
+
 // A data: address for an SVG preview. An SVG document can carry script, and a blob: address of
 // it would run that script with this origin if opened in a tab of its own; a data: document has
 // an opaque origin, and inside an <img> no SVG script runs at all.
@@ -15546,6 +15554,10 @@ function setupImageZoom(img, wrap, controls) {
 // Above this size, a media/image/PDF file is NOT pulled into memory just to preview it inline --
 // loading a multi-GB blob can crash the tab. It is refused with a "download it" message instead.
 const MEDIA_PREVIEW_MAX_BYTES = 150 * 1024 * 1024;   // 150 MB
+// An SVG is shown from a data: address (see _blobToDataUrl), a string about a third larger than
+// the file, which some browsers cap well below the media limit; a larger SVG is offered as a
+// download instead.
+const SVG_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;      // 20 MB
 // Above this size, a Standard-vault text file is previewed from just its FIRST WINDOW (a Range
 // request) rather than loaded whole; the window itself is capped at MEDIA-independent bytes below.
 const TEXT_PREVIEW_WINDOW_BYTES = 2 * 1024 * 1024;   // 2 MB (matches the whole-blob text cap)
@@ -15738,7 +15750,8 @@ async function openFilePreview(fileId, fileName, mime) {
         const _mt0 = (mime || '').toLowerCase();
         const _isMedia = _mt0.startsWith('video/') || _mt0.startsWith('audio/') || _mt0.startsWith('image/')
             || _mt0.includes('pdf') || LARGE_MEDIA_EXTS.has(_ext0);
-        if (_isMedia && _fsize > MEDIA_PREVIEW_MAX_BYTES) {
+        if ((_isMedia && _fsize > MEDIA_PREVIEW_MAX_BYTES)
+            || (_previewAsSvg(_mt0, _ext0) && _fsize > SVG_PREVIEW_MAX_BYTES)) {
             _renderPreviewTooLarge(bodyEl, _fsize);
             return;
         }
@@ -15800,9 +15813,13 @@ async function openFilePreview(fileId, fileName, mime) {
             // zoom control that only ever transforms the <img> -- never the page.
             const wrap = document.createElement('div');
             wrap.className = 'preview-zoom';
+            if (_previewAsSvg(type, ext) && blob.size > SVG_PREVIEW_MAX_BYTES) {
+                _renderPreviewTooLarge(bodyEl, blob.size);
+                return;
+            }
             const img = document.createElement('img');
             img.className = 'preview-media';
-            if (type.includes('svg') || ext === 'svg') {
+            if (_previewAsSvg(type, ext)) {
                 img.src = await _blobToDataUrl(new Blob([blob], { type: 'image/svg+xml' }));
             } else {
                 _previewUrl = URL.createObjectURL(new Blob([blob], { type: _previewBlobType('image', type, ext) }));
@@ -15856,6 +15873,10 @@ async function openFilePreview(fileId, fileName, mime) {
 
 function closeFilePreview() {
     if (_previewUrl) { URL.revokeObjectURL(_previewUrl); _previewUrl = null; }
+    // Drop what the preview drew too: an SVG's data: address is a copy of the whole file, and a
+    // video would otherwise keep playing behind the closed dialog.
+    const body = document.getElementById('file-preview-body');
+    if (body) { body.replaceChildren(); body.classList.remove('preview-has-image'); }
 }
 
 // Rename vault item (file or folder)
