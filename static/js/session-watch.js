@@ -21,7 +21,8 @@
 
     const WARN_SECONDS = 60;
     const RING = 2 * Math.PI * 52;   // the ring's circumference (r=52 in a 120-unit box)
-    const ARRIVAL_KEY = 'authTokenAt';   // "<ms the token arrived>:<the token's tail>", beside the token
+    const ARRIVAL_KEY = 'authTokenAt';   // "<ms the token arrived>:<the token's tail>", beside the token; a
+                                         // leading "~" marks a guess the server has not confirmed yet
 
     let deadline = null;             // ms on this device's clock at which the session ends
     let timer = null;                // opens the dialog WARN_SECONDS before the deadline
@@ -32,6 +33,7 @@
     let closingOurselves = false;    // the dialog is being hidden by this module, not by the person
     let armedFor = null;             // the token whose own arming is in force (its tail); null once anything
                                      // else armed: a correction from the server applies only while it is
+    const askedFor = new Set();      // tokens (tails) whose arrival this load has asked the server about
 
     function claimsOf(token) {
         try {
@@ -43,20 +45,23 @@
 
     function tailOf(token) { return String(token).slice(-24); }
 
-    // When this token arrived on this device, as stored for the same token; null when none is stored.
+    // When this token arrived on this device, as stored for the same token: { ms, guessed } (guessed: the
+    // server has not confirmed it yet); null when none is stored.
     function storedArrival(token) {
         let stored = null;
         try { stored = storage.getItem(ARRIVAL_KEY); } catch (_) {}
         if (stored) {
-            const at = stored.indexOf(':');
-            const ms = Number(stored.slice(0, at));
-            if (at > 0 && Number.isFinite(ms) && stored.slice(at + 1) === tailOf(token)) return ms;
+            const guessed = stored.charAt(0) === '~';
+            const text = guessed ? stored.slice(1) : stored;
+            const at = text.indexOf(':');
+            const ms = Number(text.slice(0, at));
+            if (at > 0 && Number.isFinite(ms) && text.slice(at + 1) === tailOf(token)) return { ms, guessed };
         }
         return null;
     }
 
-    function rememberArrival(token, ms) {
-        try { storage.setItem(ARRIVAL_KEY, Math.round(ms) + ':' + tailOf(token)); } catch (_) {}
+    function rememberArrival(token, ms, guessed) {
+        try { storage.setItem(ARRIVAL_KEY, (guessed ? '~' : '') + Math.round(ms) + ':' + tailOf(token)); } catch (_) {}
     }
 
     // A token with no stored arrival: the time it has left as the server counts it, carried onto this
@@ -87,17 +92,22 @@
         if (!claims || !claims.exp) { disarm(); return false; }
         temporary = !!claims.is_temporary;
         const lifetimeMs = (claims.exp - (claims.iat || claims.exp)) * 1000;
-        let arrival = storedArrival(token);
-        const known = arrival !== null;
-        if (!known) {
-            // Armed at once as if it had just arrived (stored, so a second arming of the same token on this
-            // load asks nothing more), then corrected from the server.
+        const stored = storedArrival(token);
+        let arrival;
+        if (stored) arrival = stored.ms;
+        else {
+            // Armed at once as if it had just arrived, stored as a guess, then corrected from the server. Until
+            // the server has confirmed it, a later load asks again; this load asks once.
             arrival = Date.now();
-            rememberArrival(token, arrival);
+            rememberArrival(token, arrival, true);
         }
         const armed = armAt(lifetimeMs > 0 ? arrival + lifetimeMs : Date.now());
-        armedFor = tailOf(token);
-        if (!known && lifetimeMs > 0) correctFromServer(token, claims);
+        const tail = tailOf(token);
+        armedFor = tail;
+        if ((!stored || stored.guessed) && lifetimeMs > 0 && !askedFor.has(tail)) {
+            askedFor.add(tail);
+            correctFromServer(token, claims);
+        }
         return armed;
     }
 
