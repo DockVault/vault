@@ -14533,6 +14533,8 @@ def _valid_link_token_copy(blob) -> bool:
 
 class LinkTokenCopyBody(BaseModel):
     token_enc: str
+    # Upload links only: the SHA-256 (hex) of the address the copy is of, which the browser holds.
+    token_hash: Optional[str] = None
 
 
 def _link_owner_or_404(db, model, link_id, current_user):
@@ -15414,7 +15416,7 @@ def _receiver_public_dict(r, tag=None, stored_bytes=None, files_in_vault=None) -
         "max_uploads": r.max_uploads,
         "upload_count": r.upload_count,
         "message": getattr(r, "message", None) or None,
-        "has_token_copy": r.token_enc is not None,   # presence flag only; the blob is never listed
+        "has_token_copy": _receiver_copy_is_current(r),   # presence flag only; the blob is never listed
         "max_file_bytes": r.max_file_bytes,
         "max_total_bytes": r.max_total_bytes,
         "retention_days": r.retention_days,
@@ -15815,8 +15817,10 @@ async def replace_receiver_link(
     # The owner's stored re-copy, if any, is of the URL that has just stopped working: a "Copy link
     # again" that handed it out would hand out a dead link, and the write-once slot would never take
     # a copy of the new one. Set to nothing in the same transaction as the new hash, so the slot is
-    # free for the browser to store the replacement.
+    # free for the browser to store the replacement. (A copy of the old address that lands after this,
+    # from a page opened before, carries the old mark and is refused: _store_receiver_token_copy.)
     r.token_enc = None
+    r.token_enc_for = None
     db.commit()
 
     # Replacing a link is an access change: the old URL stops working and a new bearer credential
@@ -16101,15 +16105,7 @@ async def put_receiver_token_copy(
     _valid_link_token_copy), as for public and note links: write-once, owner-only on an interactive
     session, while the link still works (paused counts; revoked, expired or exhausted does not)."""
     r = _receiver_owner_or_404(db, receiver_id, current_user)
-    if r.token_enc is not None:
-        raise HTTPException(status_code=409, detail="A re-copy is already stored for this link.")
-    if _receiver_status(r) not in ("active", "paused"):
-        raise HTTPException(status_code=409, detail="This link is no longer active.")
-    if not _valid_link_token_copy(payload.token_enc):
-        raise HTTPException(status_code=400, detail="Malformed re-copy blob.")
-    r.token_enc = payload.token_enc
-    db.commit()
-    return {"stored": True}
+    return _store_receiver_token_copy(db, r, payload)
 
 
 @app.get("/receivers/{receiver_id}/token-copy")
@@ -16118,9 +16114,39 @@ async def get_receiver_token_copy(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """The stored re-copy, for the owner's browser to unwrap; gone with the link (uniform 404)."""
     r = _receiver_owner_or_404(db, receiver_id, current_user)
-    if _receiver_status(r) not in ("active", "paused") or not r.token_enc:
+    if _receiver_status(r) not in ("active", "paused") or not _receiver_copy_is_current(r):
         raise HTTPException(status_code=404, detail="Not found.")
     return {"token_enc": r.token_enc}
+
+
+def _receiver_copy_mark(token_hash) -> Optional[str]:
+    text = str(token_hash or "").strip().lower()
+    return text[:16] if len(text) >= 16 and all(c in "0123456789abcdef" for c in text) else None
+
+
+def _receiver_copy_is_current(r) -> bool:
+    """A stored copy counts only while it is of the link's present address."""
+    return bool(r.token_enc) and r.token_enc_for is not None and r.token_enc_for == _receiver_copy_mark(r.token_hash)
+
+
+def _store_receiver_token_copy(db, r, payload) -> dict:
+    # Write-once like the other links' copies, but a copy of a replaced address is no copy: its slot takes
+    # the copy of the present one. The browser names the address its copy is of; a copy of an address
+    # that is not the link's own (a page opened before the link was replaced) is refused.
+    if _receiver_copy_is_current(r):
+        raise HTTPException(status_code=409, detail="A re-copy is already stored for this link.")
+    if _receiver_status(r) not in ("active", "paused"):
+        raise HTTPException(status_code=409, detail="This link is no longer active.")
+    if not _valid_link_token_copy(payload.token_enc):
+        raise HTTPException(status_code=400, detail="Malformed re-copy blob.")
+    mark = _receiver_copy_mark(payload.token_hash)
+    if mark is None:
+        raise HTTPException(status_code=400, detail="Name the address this copy is of.")
+    if mark != _receiver_copy_mark(r.token_hash):
+        raise HTTPException(status_code=409, detail="This copy is of an address the link no longer has.")
+    r.token_enc, r.token_enc_for = payload.token_enc, mark
+    db.commit()
+    return {"stored": True}
 
 
 def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
@@ -27316,6 +27342,8 @@ END $$;""",
             # links have). Nullable, no default; an older release ignores them.
             "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS message TEXT",
             "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS token_enc TEXT",
+            # Which address that copy is of (an upload link's address can be replaced). Nullable.
+            "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS token_enc_for VARCHAR(16)",
             "ALTER TABLE public_links ADD COLUMN IF NOT EXISTS message TEXT",
             "ALTER TABLE note_public_links ADD COLUMN IF NOT EXISTS message TEXT",
         ]

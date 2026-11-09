@@ -21757,8 +21757,14 @@ async function _saveLinkReCopy(kind, link) {
         const ownerId = link.owner_id || (currentUser && currentUser.id);
         const blob = await eccLib().wrapLinkTokenV2(link.token, ownerPub, { linkId: link.id, ownerId });
         const base = kind === 'note' ? '/note-links/' : kind === 'receiver' ? '/receivers/' : '/public-links/';
+        const body = { token_enc: blob };
+        if (kind === 'receiver') {
+            // An upload link's address can be replaced: name the address this copy is of.
+            const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(link.token));
+            body.token_hash = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+        }
         await apiRequest(base + link.id + '/token-copy',
-            { method: 'PUT', body: JSON.stringify({ token_enc: blob }), silent: true });
+            { method: 'PUT', body: JSON.stringify(body), silent: true });
         return { saved: true };
     } catch (_e) {
         return { saved: false, reason: 'error' };   // network / shape 400 / import error

@@ -2115,6 +2115,10 @@ class Receiver(Base):
     message = Column(Text, nullable=True)
     # Owner-encrypted re-copy of the URL token (see NoteLink.token_enc). Opaque, client-wrapped.
     token_enc = Column(Text, nullable=True)
+    # The first 16 characters of the hash of the address the copy is of. An upload link's address can be
+    # replaced; a copy whose mark is not the link's own is of an address that no longer works, and counts
+    # as no copy at all.
+    token_enc_for = Column(String(16), nullable=True)
 
     __table_args__ = (
         Index('idx_receiver_owner', 'owner_id'),

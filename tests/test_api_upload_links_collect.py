@@ -147,35 +147,47 @@ def test_a_protected_links_message_is_behind_its_code(admin, receivers_enabled):
 def test_the_owner_can_store_and_read_a_re_copy_of_the_link(admin, receivers_enabled):
     rec = _mk_receiver(admin)
     import base64
+    import hashlib
     # A well-formed container header ("DVZ2", version 2, kind 6), opaque beyond that: the server checks the shape only.
     raw = b"DVZ2" + bytes([0x02, 0x06, 0, 0]) + b"\x00" * 140
     blob = base64.b64encode(raw).decode()
-    assert admin.get(f"/receivers/{rec['id']}/token-copy").status_code == 404
-    put = admin.put(f"/receivers/{rec['id']}/token-copy", json={"token_enc": blob})
+
+    def copy_of(token):
+        return {"token_enc": blob, "token_hash": hashlib.sha256(token.encode()).hexdigest()}
+
+    url = f"/receivers/{rec['id']}/token-copy"
+    assert admin.get(url).status_code == 404
+    # The copy names the address it is of.
+    assert admin.put(url, json={"token_enc": blob}).status_code == 400
+    put = admin.put(url, json=copy_of(rec["token"]))
     assert put.status_code == 200, put.text
-    assert admin.get(f"/receivers/{rec['id']}/token-copy").json()["token_enc"] == blob
-    assert admin.put(f"/receivers/{rec['id']}/token-copy", json={"token_enc": blob}).status_code == 409   # write-once
+    assert admin.get(url).json()["token_enc"] == blob
+    assert admin.put(url, json=copy_of(rec["token"])).status_code == 409   # write-once
     mine = next(r for r in admin.get("/receivers").json()["receivers"] if r["id"] == rec["id"])
     assert mine["has_token_copy"] is True
     # Replacing the link retires the re-copy with the URL it was a copy of: the card stops offering a dead
     # link, and the write-once slot is free for a copy of the new one.
-    assert admin.post(f"/receivers/{rec['id']}/replace-link").status_code == 200
-    assert admin.get(f"/receivers/{rec['id']}/token-copy").status_code == 404
+    replaced = admin.post(f"/receivers/{rec['id']}/replace-link")
+    assert replaced.status_code == 200
+    assert admin.get(url).status_code == 404
     mine = next(r for r in admin.get("/receivers").json()["receivers"] if r["id"] == rec["id"])
     assert mine["has_token_copy"] is False
-    put = admin.put(f"/receivers/{rec['id']}/token-copy", json={"token_enc": blob})
+    # A page opened before the replacement still holds the old address: its copy is refused.
+    stale = admin.put(url, json=copy_of(rec["token"]))
+    assert stale.status_code == 409 and "no longer has" in stale.text, stale.text
+    put = admin.put(url, json=copy_of(replaced.json()["token"]))
     assert put.status_code == 200, put.text
-    assert admin.get(f"/receivers/{rec['id']}/token-copy").json()["token_enc"] == blob
+    assert admin.get(url).json()["token_enc"] == blob
     # Someone else gets the uniform 404; a revoked link's copy is gone.
     u = admin.create_user(role="user")
     try:
         from conftest import ApiClient
         c = ApiClient(); c.login(u["_username"], u["_password"])
-        assert c.get(f"/receivers/{rec['id']}/token-copy").status_code == 404
+        assert c.get(url).status_code == 404
     finally:
         admin.delete_user(u["id"])
     admin.post(f"/receivers/{rec['id']}/revoke")
-    assert admin.get(f"/receivers/{rec['id']}/token-copy").status_code == 404
+    assert admin.get(url).status_code == 404
 
 
 def test_public_and_note_links_carry_the_message_to_their_pages(admin):
