@@ -255,6 +255,7 @@ CHANGES_AN_ACCOUNT = {
     ("POST", "/permissions/users/{user_id}/grant"),
     ("DELETE", "/permissions/users/{user_id}/revoke/{group_name}"),
     ("POST", "/admin/credential-requests/{change_id}/approve"),
+    ("POST", "/admin/sso/admin-requests/{request_id}/approve"),
     ("POST", "/users"),
     ("POST", "/invites"),
     ("POST", "/invites/{invite_id}/resend"),     # makes the invitation anew: a new link to an account to be
@@ -264,6 +265,7 @@ CHANGES_AN_ACCOUNT = {
 NOT_THE_ACCOUNT = {
     ("POST", "/shares/{share_id}/claims/{user_id}/revoke"): "a share's claim, not the account",
     ("DELETE", "/groups/{group_id}/members/{user_id}"): "a department's membership, not the account",
+    ("POST", "/admin/sso/admin-requests/{request_id}/deny"): "a held administrator request is closed; the account is unchanged",
     ("DELETE", "/vaults/{vault_id}/permissions/{user_id}"): "a vault's access, not the account",
     ("DELETE", "/ecc/vaults/{vault_id}/members/{user_id}"): "a zero-knowledge vault's key, not the account",
     ("PUT", "/vaults/{vault_id}/password"): "a vault's password, not an account's",

@@ -37,6 +37,10 @@ NOT_RECORDED = {
         "issues a challenge for the sign-in's second step; the answer is recorded",
     ("app/api/api_server.py", "POST /auth/passkeys/step-up/options"):
         "issues a challenge for a step-up; the step-up records its outcome",
+    ("app/api/sso_router.py", "POST /auth/sso/{provider_id}/start"):
+        "writes the login state and answers the provider's address; the callback records the sign-in or its refusal",
+    ("app/api/sso_router.py", "POST /users/me/identities/{provider_id}/start"):
+        "starts a link; the link is recorded when the tab that started it claims it",
     ("app/api/api_server.py", "POST /auth/second-factor/challenge"):
         "only lists the methods a step-up accepts; the step-up itself is recorded when it fails",
     ("app/api/api_server.py", "POST /users/me/second-factor/totp/enroll"):
