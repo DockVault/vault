@@ -1,4 +1,4 @@
-/* Business tables (static/js/tables.js): sortable headers, the table search box, and the density choice.
+/* Tables (static/js/tables.js): sortable headers, the table search box, and the density choice.
    The sort marker is drawn only on headers the library made sortable (data-sort-col): the files table draws its own. */
 .data-table th.sortable { cursor: pointer; user-select: none; }
 .data-table th.sortable:focus-visible { outline: 2px solid var(--brand-secondary); outline-offset: -2px; }

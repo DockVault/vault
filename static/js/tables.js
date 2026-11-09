@@ -1,4 +1,4 @@
-// Business tables: sortable headers, a search box, and a density the person chooses, remembered per account.
+// Tables: sortable headers, a search box, and a density the person chooses, remembered per account.
 //
 //   Tables.enhance(table, {key, search: inputEl | true, skip: [colIndex...]})
 //       Makes every titled header of `table` sortable (click or Enter/Space; aria-sort says which way), sorting

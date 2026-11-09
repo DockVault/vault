@@ -1,5 +1,5 @@
-"""Business tables (static/js/tables.js): sortable headers with aria-sort, a search box, columns a business
-reads first, and a density the person chooses, remembered for the account.
+"""Tables (static/js/tables.js): sortable headers with aria-sort, a search box, the columns people
+look for first, and a density the person chooses, remembered for the account.
 
 Users gains Last sign-in and Created; a vault's members gain Granted by; the Shared cards say who shared, when
 and until when; the administrators' link tables gain Created and Last used; the temporary credentials table
