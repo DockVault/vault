@@ -424,12 +424,32 @@ def test_a_refusal_that_the_sign_in_must_come_through_a_provider_counts_nothing(
     def provider_only(db, result):
         raise s.ProviderOnly(message)
     monkeypatch.setattr(s, "finish", provider_only)
+    row.backup_state = False                                   # the key has been backed up since it was registered
+    commits = h.db.log.count(("commit",))
     status, body = h.sign_in(auth, username="alice", sign_count=4, flags=FLAG.UP | FLAG.UV | FLAG.BE | FLAG.BS)
     assert status == 403 and body["detail"] == message, body
     assert row.sign_count == 4 and row.backup_state is True and row.last_used_at is None
+    assert h.db.log.count(("commit",)) > commits             # kept, not left to be rolled back
     assert len(given_back) == 1 and h.failures == []
     from app.core.models import ActiveSession
     assert h.db.rows_of(ActiveSession) == []
+
+
+def test_any_other_refusal_of_the_pipeline_keeps_its_count(monkeypatch):
+    """Only the provider-only refusal gives the attempt back: an inactive account, a missing first proof or any other
+    refusal of the pipeline stays counted, and the key's counter is not moved by it."""
+    from fastapi import HTTPException
+    from app.services import auth_service as A
+    from app.services import sign_in as s
+    alice = _user()
+    h = Harness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    given_back = []
+    monkeypatch.setattr(A.AuthService, "_give_back", classmethod(lambda cls, throttle: given_back.append(throttle)))
+    monkeypatch.setattr(s, "finish", lambda db, result: (_ for _ in ()).throw(
+        HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")))
+    status, body = h.sign_in(auth, username="alice", sign_count=6)
+    assert status == 401 and given_back == [] and row.sign_count == 0
 
 
 def test_without_a_public_address_the_routes_say_so_and_the_policy_hides_the_button(monkeypatch):
