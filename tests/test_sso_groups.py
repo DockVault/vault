@@ -177,7 +177,7 @@ def test_a_user_or_external_role_follows_the_group_and_never_demotes_an_administ
     from app.core.models import RoleEnum
     _sign_in(h, p, groups=["ext"])
     assert h.role_sets == [("alice", "external", None)] and alice.role == RoleEnum.EXTERNAL
-    assert ("sso_role_changed", "success", {"provider_id": str(p.id), "from": "user", "to": "external", "demoted": False}) in h.audits
+    assert ("sso_role_changed", "success", {"provider_id": str(p.id), "from_role": "user", "to_role": "external", "demoted": False}) in h.audits
     assert h.status_notices == [("alice", "single sign-on", ("user", "external"), ["old-permission"])]
     # The same again: applied once.
     _sign_in(h, p, groups=["ext"])
@@ -231,6 +231,32 @@ def test_an_administrator_group_opens_one_held_request_and_grants_nothing(monkey
     request.decided_at = datetime.utcnow() - timedelta(days=8)
     _sign_in(h, p, groups=["admins"])
     assert len(h.requests()) == 2 and h.requests()[-1].state == "held"
+
+
+def test_an_approvals_grant_stamped_a_second_before_the_decision_is_still_the_approvals(monkeypatch):
+    bob, root = _user("bob", role="admin"), _user("root", role="admin")
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p], identities=[_identity(bob, p)])
+    h.mapping(p, "admins", role="admin")
+    h.mapping(p, "staff", role="user")
+    from app.core.models import RoleEnum
+    decided = datetime.utcnow() - timedelta(days=10)
+    _request_for(h, p, bob, state="approved", decided_by=root.id, decided_at=decided)
+    _grant(h, bob, decided - timedelta(seconds=1), granted_by_id=root.id)
+    _sign_in(h, p, groups=["staff"])
+    assert bob.role == RoleEnum.USER and len(h.role_sets) == 1
+
+
+def test_the_lazy_expiry_touches_only_a_row_still_held():
+    """The memory store runs no two sessions at once: the guard is pinned in the source. The expiry is one UPDATE
+    whose WHERE repeats the state and the time, so a decision that landed meanwhile is never overwritten."""
+    import inspect
+    from app.services import sso_groups
+    source = inspect.getsource(sso_groups.requests)
+    update = source[source.index(".update("):]
+    where = source[source.index("filter(SsoAdminRequest.id == r.id"):source.index(".update(")]
+    assert "SsoAdminRequest.state == HELD" in where and "SsoAdminRequest.expires_at <= now" in where
+    assert "synchronize_session=False" in update
 
 
 def test_a_decision_reads_the_request_locked_after_the_step_up():
@@ -379,9 +405,19 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     request.state = "held"
     h.step_ups.clear()
     monkeypatch.setattr(sso_admin_router, "_step_up", lambda db, user, http_request: h.step_ups.append(user.username))
-    # Approved: the step-up, then the promotion path with the approver as the grantor, the announcements.
+    # Approved: the step-up, then the promotion path with the approver as the grantor, the announcements; the
+    # decision takes the grant record's moment, so the demotion rule finds exactly this grant.
+    from app.core.models import AdminGrant
+    grant_moment = datetime.utcnow() - timedelta(seconds=3)
+
+    def record_grant(db, user, *, by, by_name=None, inherited=None):
+        h.grants_recorded.append((user.username, by.username))
+        h.db.rows_of(AdminGrant).append(types.SimpleNamespace(user_id=user.id, granted_at=grant_moment,
+                                                              granted_by_id=by.id, lineage=[]))
+    monkeypatch.setattr(S, "_record_admin_grant", record_grant)
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
     assert status == 200, body
+    assert request.decided_at == grant_moment
     assert h.step_ups == ["root"] and h.grants_recorded == [("bob", "root")] and bob.role == RoleEnum.ADMIN
     assert h.role_sets == [("bob", "admin", "root")] and h.announced == [("bob", "root", "promoted")] and h.handed == [{"user_id": bob.id}]
     assert h.status_notices == [("bob", "root", ("user", "admin"), ["old-permission"])]
@@ -440,7 +476,7 @@ def test_an_administrator_made_by_the_mapping_is_demoted_when_the_group_is_gone_
     _sign_in(h, p, groups=["staff"])
     assert bob.role == RoleEnum.USER and h.role_sets == [("bob", "user", None)] and h.forgotten == [str(bob.id)]
     assert h.lost[0] == ("bob", "demoted", None) and ("told", "lost") in h.lost
-    assert ("sso_role_changed", "success", {"provider_id": str(p.id), "from": "admin", "to": "user", "demoted": True}) in h.audits
+    assert ("sso_role_changed", "success", {"provider_id": str(p.id), "from_role": "admin", "to_role": "user", "demoted": True}) in h.audits
     assert h.status_notices[-1] == ("bob", "single sign-on", ("admin", "user"), ["old-permission"])
     assert approval.state == "demoted"                                           # the approval is spent
     # An administrator made by hand (no approved request) keeps the role whatever the token says.
@@ -467,11 +503,12 @@ def test_a_stale_approval_demotes_nobody_made_an_administrator_since(monkeypatch
     _grant(h, bob, decided + timedelta(seconds=1), granted_by_id=other.id)
     _sign_in(h, p, groups=["staff"])
     assert bob.role == RoleEnum.ADMIN and h.role_sets == []
-    # ... nor one by the approver minutes later.
-    h.db.rows_of(AdminGrant).clear()
-    _grant(h, bob, decided + timedelta(minutes=5), granted_by_id=root.id)
-    _sign_in(h, p, groups=["staff"])
-    assert bob.role == RoleEnum.ADMIN and h.role_sets == []
+    # ... nor one by the approver seconds or minutes later.
+    for later in (timedelta(seconds=10), timedelta(minutes=5)):
+        h.db.rows_of(AdminGrant).clear()
+        _grant(h, bob, decided + later, granted_by_id=root.id)
+        _sign_in(h, p, groups=["staff"])
+        assert bob.role == RoleEnum.ADMIN and h.role_sets == []
     # The approval of another provider's mapping does not count for this one.
     h.db.rows_of(AdminGrant).clear()
     _grant(h, bob, decided + timedelta(seconds=1), granted_by_id=root.id)

@@ -131,6 +131,12 @@ def test_no_reset_link_and_no_password_change_for_an_sso_only_account(monkeypatc
     assert status == 404, body
     status, body, _ = _call(S, "POST", "/reset/some-token", {"new_password": "a-new-password-1"})
     assert status == 404 and refused == [("alice", "sso_only")] and alice.password_hash == "x", body
+    # An administrator cannot set it a password or turn its SFTP password sign-in on, at the route.
+    status, body, _ = _call(S, "PATCH", f"/users/{alice.id}", {"password": "a-new-password-1"})
+    assert status == 409 and "provider" in body["detail"], body
+    status, body, _ = _call(S, "PATCH", f"/users/{alice.id}", {"sftp_password_auth": True})
+    assert status == 409 and "SSH key" in body["detail"], body
+    assert alice.password_hash == "x" and alice.sftp_password_auth is True
     # The account cannot set a password.
     h.current_user = alice
     status, body, _ = _call(S, "PATCH", "/users/me", {"current_password": "pw", "new_password": "a-new-password-1"})

@@ -1769,6 +1769,14 @@ class AuthService:
         """Terminate a session."""
         session.is_active = False
         self.db.commit()
+        # A session that has run out makes no provider logout: its logout hint (an encrypted ID token with the
+        # person's claims) is dropped. Best effort, on its own: the session is already ended above.
+        try:
+            from app.services import sign_in
+            if sign_in.forget_provider_logout_hints(self.db, [session.id]):
+                self.db.commit()
+        except Exception:  # noqa: BLE001
+            self.db.rollback()
     
     def _terminate_existing_sessions(self, user_id: uuid.UUID, commit: bool = True):
         """Mark the account's other web sessions inactive (never a temporary credential's, never an

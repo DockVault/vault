@@ -111,6 +111,7 @@ class Handover:
     provider_sid: Optional[str] = None
     provider_sub: Optional[str] = None
     provider_logout_hint_enc: Optional[str] = None
+    provider_auth_time: Optional[int] = None          # when the provider said the person authenticated; None if it did not say
     created_at: int = field(default_factory=lambda: int(time.time()))
     # How many times the account's sessions had been ended when the proof read the account
     # (app/services/sign_in.py, in_the_accounts_turn). A record without it matches no account.
@@ -225,6 +226,8 @@ def from_result(result, *, verifier_hash: Optional[str] = None, code_challenge: 
         auth_time=int(result.auth_time.timestamp()) if getattr(result, "auth_time", None) is not None else None,
         provider_sid=getattr(result, "provider_sid", None), provider_sub=getattr(result, "provider_sub", None),
         provider_logout_hint_enc=_encrypted(getattr(result, "provider_logout_hint", None)),
+        provider_auth_time=(int(result.provider_auth_time.timestamp())
+                            if getattr(result, "provider_auth_time", None) is not None else None),
     )
 
 
@@ -286,4 +289,7 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
     )
     if isinstance(handover.auth_time, int) and not isinstance(handover.auth_time, bool) and 0 <= handover.auth_time < 2 ** 33:
         result.auth_time = datetime.fromtimestamp(handover.auth_time, tz=timezone.utc)
+    at = handover.provider_auth_time
+    if isinstance(at, int) and not isinstance(at, bool) and 0 <= at < 2 ** 33:
+        result.provider_auth_time = datetime.fromtimestamp(at, tz=timezone.utc)
     return result

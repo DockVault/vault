@@ -242,6 +242,9 @@ _IDENTIFIER_KEYS = (
     # here is the name of an image an administrator uploaded, which every administrator sees in Email Studio
     "profile_id", "promoted_default", "template_id", "action_key", "enabled", "resource_id", "filename",
     "content_type", "byte_size",
+    # single sign-on: a role before and after the group mappings applied it, whether the change was a demotion, the
+    # provider's group a held administrator request came from (a group name as the provider's token carries it)
+    "from_role", "to_role", "demoted", "provider_group",
 )
 
 DETAIL_KEYS: Dict[str, str] = {key: IDENTIFIER for key in _IDENTIFIER_KEYS}
@@ -259,6 +262,8 @@ DETAIL_KEYS.update({
     "error": ERROR,
     # how many messages an email from a template went to, was sent, failed or could not be built for
     "recipients": COUNT, "attempted": COUNT, "sent": COUNT, "failed": COUNT, "errors": COUNT,
+    # how many vault sessions a provider's back-channel logout ended
+    "sessions": COUNT,
     # what changed on a settings save or an account: the setting's or field's name, then its old and new
     # value; an account's email address is an email address
     "changes": NESTED,

@@ -80,10 +80,17 @@ def test_a_fresh_provider_sign_in_meets_the_password_part_once(monkeypatch):
     assert h.receipts == [(str(alice.id), "admin.retention.write", "sess-hash")]
     status, body = h.step_up(method="idp_reauth")
     assert status == 403 and "Confirm with your organisation" in body["detail"]
-    # Staged for one action: another action does not take it.
+    # Staged for one action and one session: another action, or another session of the account, does not take it.
     status, location, _ = _stepped_up_url(h, p, auth_time=int(time.time()) - 5)
     h.finish_reauth(location)
     assert h.step_up(action="admin.auth_policy.write", method="idp_reauth")[0] == 403
+    h.session_hash = "another-session"
+    assert h.step_up(method="idp_reauth")[0] == 403
+    h.session_hash = "sess-hash"
+    # A provider disabled meanwhile confirms nobody; enabled again, the staged proof stands.
+    p.state = "disabled"
+    assert h.step_up(method="idp_reauth")[0] == 403
+    p.state = "enabled"
     assert h.step_up(method="idp_reauth")[0] == 200
     # The password still works as before.
     assert h.step_up(method="password", password="pw")[0] == 200
@@ -99,8 +106,11 @@ def test_the_provider_must_be_linked_and_tested_with_auth_time(monkeypatch):
     assert h.start_reauth(p, action="not.an.action")[0] == 404
     # A staged proof cannot be faked by calling the step-up route with the method when nothing is offered.
     assert h.step_up(method="idp_reauth")[0] == 403
-    # Disabled provider: not offered even with the identity and the evidence.
+    # Another account's identity on the provider is not this account's.
     from app.core.models import ExternalIdentity
+    h.db.rows_of(ExternalIdentity).append(_identity(_user("other"), p, subject="s-other"))
+    assert h.start_reauth(p)[0] == 404
+    # Disabled provider: not offered even with the identity and the evidence.
     h.db.rows_of(ExternalIdentity).append(_identity(alice, p))
     p.state = "disabled"
     assert h.start_reauth(p)[0] == 404

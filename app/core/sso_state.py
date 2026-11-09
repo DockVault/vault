@@ -279,14 +279,43 @@ def take_reauth(session_hash: str, action: str, *, redis=None) -> bool:
         raise Unavailable(str(exc)) from exc
 
 
-def seen_logout_jti(jti: str, ttl_seconds: int, *, redis=None) -> bool:
-    """Record a back-channel logout token's id for ``ttl_seconds`` and say whether it was already recorded (a
-    replayed token). Without the store the token is treated as seen: a logout is never honoured twice, and the
-    provider retries."""
+def seen_logout_jti(jti: str, ttl_seconds: int, *, scope: str, redis=None) -> bool:
+    """Record a back-channel logout token's id for ``ttl_seconds`` under ``scope`` (the provider row's id: two
+    providers may issue the same id) and say whether it was already recorded (a replayed token). Without the store,
+    :class:`Unavailable`: the caller answers that the logout failed, so the provider may try again, instead of
+    calling the token invalid."""
     import hashlib
-    key = LOGOUT_JTI_PREFIX + hashlib.sha256(str(jti).encode("utf-8")).hexdigest()
+    key = LOGOUT_JTI_PREFIX + hashlib.sha256(f"{scope}:{jti}".encode("utf-8")).hexdigest()
     try:
         fresh = _redis(redis).set(key, "1", nx=True, ex=max(1, int(ttl_seconds)))
-    except Exception:  # noqa: BLE001
-        return True
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable("the sign-in state store cannot be reached") from exc
     return not bool(fresh)
+
+
+LOGOUT_HINT_PREFIX = "sso:logout-hint:"
+
+
+def stage_logout_hint(pending_id: str, hint_enc: str, ttl_seconds: int, *, redis=None) -> None:
+    """Keep a pending sign-in's provider logout hint (the ID token, already encrypted) for the step that
+    completes it, for the pending login's life. Raises :class:`Unavailable` without the store."""
+    import hashlib
+    key = LOGOUT_HINT_PREFIX + hashlib.sha256(str(pending_id).encode("utf-8")).hexdigest()
+    try:
+        _redis(redis).set(key, hint_enc, ex=max(1, int(ttl_seconds)))
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable("the sign-in state store cannot be reached") from exc
+
+
+def read_logout_hint(pending_id: str, *, redis=None) -> Optional[str]:
+    """The staged hint for a pending login, still encrypted, or None. Read, not spent: a wrong password at the
+    step that follows leaves it for the retry; it goes with the pending login's life."""
+    import hashlib
+    key = LOGOUT_HINT_PREFIX + hashlib.sha256(str(pending_id).encode("utf-8")).hexdigest()
+    try:
+        raw = _redis(redis).get(key)
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable("the sign-in state store cannot be reached") from exc
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return raw if isinstance(raw, str) and raw else None

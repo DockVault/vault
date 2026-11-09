@@ -591,8 +591,8 @@ def verify_logout_token(provider: ProviderConfig, discovery: Discovery, token: s
         raise OidcError(TOKEN_INVALID, "not a back-channel logout event")
     if "nonce" in claims:
         raise OidcError(TOKEN_INVALID, "a logout token carries no nonce")
-    if not (isinstance(claims.get("sid"), str) or isinstance(claims.get("sub"), str)):
-        raise OidcError(TOKEN_INVALID, "neither sid nor sub")
+    if not any(isinstance(claims.get(name), str) and claims.get(name) for name in ("sid", "sub")):
+        raise OidcError(TOKEN_INVALID, "neither sid nor sub")             # an empty string names nothing
     if abs(now - claims["iat"]) > LOGOUT_TOKEN_FRESHNESS_SECONDS + SKEW_SECONDS:
         raise OidcError(TOKEN_INVALID, "logout token is not fresh")
     jti = claims.get("jti")

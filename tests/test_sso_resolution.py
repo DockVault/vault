@@ -163,6 +163,7 @@ def test_an_invitation_start_is_refused_for_a_token_that_cannot_be_accepted(monk
     ("administrator_without_password", "invitation_unusable", "administrator_on_password_less_provider"),
     ("subject_pinned_elsewhere", "already_linked", "subject_linked_elsewhere"),
     ("claim_lost", "invitation_unusable", "claim_lost"),
+    ("resent", "invitation_unusable", "not_pending"),
 ])
 def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account(monkeypatch, arrange, reason, detail):
     root = _user("root", role="admin")
@@ -181,8 +182,14 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
     state, _ = h.state_of(out["authorization_url"])
     now = datetime.utcnow()
     from app.core.models import RoleEnum, SystemSetting
+    resent = None
     if arrange == "revoked":
         inv.revoked_at = now
+    elif arrange == "resent":
+        # Resent between the start and the callback: the resend revokes the old row and makes a new one; the
+        # acceptance started with the old link is refused, and the new invitation stays pending.
+        inv.revoked_at = now
+        _token2, resent = h.invite(created_by=root.id)
     elif arrange == "expired":
         inv.expires_at = now - timedelta(seconds=1)
     elif arrange == "accepted_meanwhile":
@@ -212,6 +219,8 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
                for a in h.audits), h.audits
     if arrange == "subject_pinned_elsewhere":
         assert inv.accepted_at is None                                 # still pending: the person may be invited again
+    if resent is not None:
+        assert resent.accepted_at is None and resent.revoked_at is None and resent.accepted_user_id is None
 
 
 @pytest.mark.parametrize("arrange, expected", [

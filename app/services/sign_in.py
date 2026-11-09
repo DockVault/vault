@@ -127,6 +127,7 @@ class SignInResult:
     provider_sid: Optional[str] = None
     provider_sub: Optional[str] = None
     provider_logout_hint: Optional[str] = None      # the ID token, for the provider's own logout; only when wanted
+    provider_auth_time: Optional[datetime] = None   # when the provider says the person authenticated (its session)
     # A passkey: whether the authenticator verified the person (the UV flag), and whether the policy lets
     # this person sign in with a user-verified passkey alone.
     user_verified: bool = False
@@ -268,6 +269,9 @@ def read_pre_auth(payload: dict, pending: PendingLogin) -> None:
     sid, sub = payload.get("idp_sid"), payload.get("idp_sub")
     pending._provider_sid = sid if isinstance(sid, str) else None
     pending._provider_sub = sub if isinstance(sub, str) else None
+    at = payload.get("idp_auth_time")
+    pending._provider_auth_time = (datetime.fromtimestamp(at, tz=timezone.utc)
+                                   if isinstance(at, int) and not isinstance(at, bool) and 0 <= at < 2 ** 33 else None)
 
 
 def methods_so_far(pending: Optional[PendingLogin]) -> List[str]:
@@ -438,8 +442,20 @@ def drop_the_session_the_proof_made(db, result: "SignInResult") -> None:
 
 
 def provider_session_of(pending: Optional[PendingLogin]) -> dict:
-    """What the pending login's provider sign-in remembers for the provider's logouts, as result fields."""
-    return {"provider_sid": getattr(pending, "_provider_sid", None), "provider_sub": getattr(pending, "_provider_sub", None)}
+    """What the pending login's provider sign-in remembers for the provider's logouts, as result fields: the
+    provider's session id, subject and authentication time from the pre-authentication token, and the logout hint
+    staged for it (read back encrypted from the store, opened here; nothing when the store or the key has none)."""
+    fields = {"provider_sid": getattr(pending, "_provider_sid", None), "provider_sub": getattr(pending, "_provider_sub", None),
+              "provider_auth_time": getattr(pending, "_provider_auth_time", None), "provider_logout_hint": None}
+    if pending is not None and getattr(pending, "_provider_id", None) and getattr(pending, "id", None) is not None:
+        try:
+            from app.core import sso_state
+            from app.core.security import decrypt_secret
+            staged = sso_state.read_logout_hint(str(pending.id))
+            fields["provider_logout_hint"] = decrypt_secret(staged) if staged else None
+        except Exception:  # noqa: BLE001 -- the hint is a convenience for the provider's logout, never a refusal
+            fields["provider_logout_hint"] = None
+    return fields
 
 
 def delete_session_by_token(db, session_token: Optional[str]) -> None:
@@ -548,6 +564,18 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
             claims["idp_sid"] = result.provider_sid
         if result.provider_sub:
             claims["idp_sub"] = result.provider_sub
+        if result.provider_auth_time is not None:
+            claims["idp_auth_time"] = int(result.provider_auth_time.timestamp())
+        if result.provider_logout_hint:
+            # The provider's logout hint waits for the step that completes the sign-in, encrypted, for the pending
+            # login's life; a store that cannot take it costs the provider's own logout, nothing else.
+            try:
+                from app.core import sso_state
+                from app.core.security import encrypt_secret
+                sso_state.stage_logout_hint(str(pending.id), encrypt_secret(result.provider_logout_hint),
+                                            PRE_AUTH_TTL_MINUTES * 60)
+            except Exception:  # noqa: BLE001
+                pass
     if result.provider_mfa_trusted:
         # The trusted provider MFA counts at the end of the sign-in too (an administrator's password stage
         # after it), so the fact travels with the stage.
@@ -814,7 +842,8 @@ def _record_provider_session(db, result: SignInResult, session_token: Optional[s
         row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(session_token)).first()
         if row is None:
             return
-        auth_time = result.auth_time.astimezone(timezone.utc).replace(tzinfo=None) if result.auth_time.tzinfo else result.auth_time
+        at = result.provider_auth_time or result.auth_time
+        auth_time = at.astimezone(timezone.utc).replace(tzinfo=None) if at.tzinfo else at
         db.add(SsoSession(session_id=row.id, provider_id=uuid.UUID(str(result.provider_id)),
                           idp_sid=(result.provider_sid or None), idp_sub=(result.provider_sub or None),
                           auth_time=auth_time,
@@ -822,6 +851,18 @@ def _record_provider_session(db, result: SignInResult, session_token: Optional[s
         db.commit()
     except Exception:  # noqa: BLE001 -- the record is a record, never a refusal
         db.rollback()
+
+
+def forget_provider_logout_hints(db, session_ids) -> int:
+    """Drop the provider logout hints (the encrypted ID tokens) kept for the given sessions: a session that has
+    ended has no provider logout to make, and the token's claims are personal data. In the caller's transaction;
+    returns how many rows changed."""
+    from app.core.models import SsoSession
+    ids = [i for i in session_ids if i is not None]
+    if not ids:
+        return 0
+    return db.query(SsoSession).filter(SsoSession.session_id.in_(ids), SsoSession.id_token_enc.isnot(None)).update(
+        {SsoSession.id_token_enc: None}, synchronize_session=False)
 
 
 def _stamp_identity(db, result: SignInResult) -> None:

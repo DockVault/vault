@@ -8871,14 +8871,17 @@ async def second_factor_step_up(
         by_provider = ((body.password_method or "").lower() == "idp_reauth"
                        or ((body.method or "").lower() == "idp_reauth" and not req["otp"]))
         if by_provider:
-            # A fresh sign-in at the linked provider, staged by this tab for this action: spent here, once.
+            # A fresh sign-in at the linked provider, staged by this tab for this action: spent here, once, and only
+            # while a provider still offers it (a provider disabled meanwhile confirms nobody, and the proof keeps).
             from app.core import sso_state
             from app.services import sso_sign_in
-            try:
-                staged = sso_state.take_reauth(session_hash, body.action)
-            except sso_state.Unavailable:
-                staged = False
-            if not staged or not sso_sign_in.reauth_available(db, current_user):
+            staged = False
+            if sso_sign_in.reauth_available(db, current_user):
+                try:
+                    staged = sso_state.take_reauth(session_hash, body.action)
+                except sso_state.Unavailable:
+                    staged = False
+            if not staged:
                 _audit_change(db, current_user, "step_up_password_failed", "user", current_user.id,
                               {"step_up": body.action, "method": "idp_reauth"}, status="failed")
                 raise HTTPException(status_code=403, detail="Confirm with your organisation's sign-in first, then try again.")
@@ -9628,6 +9631,9 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             'session_id': str(s.id),
             'terminated_by': actor_username,
         }, actor_username)
+    if handled_ids:
+        # An ended session makes no provider logout: its logout hint (the encrypted ID token) goes with it.
+        sign_in.forget_provider_logout_hints(db, handled_ids)
     if durable and temp_credential_id is None:
         # The regular sessions already inactive but never revoked (see the docstring), in one
         # statement: an account can hold a month of them. A temporary credential's token is refused
@@ -27525,8 +27531,15 @@ def sign_out(
                 }
             })
     from app.services import sso_sign_in
-    return {"signed_out": True, "session_ended": ended,
-            "provider_logout_url": sso_sign_in.provider_logout_url(db, session) if ended else None}
+    logout_url = sso_sign_in.provider_logout_url(db, session) if ended else None
+    if ended:
+        # The hint served this one sign-out; the session is over, so the token's claims are not kept.
+        try:
+            sign_in.forget_provider_logout_hints(db, [session.id])
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+    return {"signed_out": True, "session_ended": ended, "provider_logout_url": logout_url}
 
 
 @app.get("/api/monitoring/metrics")

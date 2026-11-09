@@ -26,6 +26,9 @@ class FakeRedis:
         self.getdel_calls = getattr(self, "getdel_calls", 0) + 1
         return self.rows.pop(key, None)
 
+    def get(self, key):
+        return self.rows.get(key)
+
     def zadd(self, key, mapping):
         self.zsets.setdefault(key, {}).update(mapping)
 
@@ -203,3 +206,33 @@ def test_a_finished_link_or_test_waits_under_a_one_time_code():
     assert st.take_handover(st.store_handover(staged, redis=r), redis=r) == staged
     with pytest.raises(st.Unavailable):
         st.store_handover(record, redis=type("Down", (), {"set": lambda *a, **k: (_ for _ in ()).throw(ConnectionError())})())
+
+
+def test_a_logout_tokens_id_is_remembered_once_per_provider_and_never_guessed_without_the_store():
+    st = _mod()
+    r = FakeRedis()
+    assert st.seen_logout_jti("j1", 120, scope="p1", redis=r) is False
+    assert st.seen_logout_jti("j1", 120, scope="p1", redis=r) is True                  # a replay
+    assert st.seen_logout_jti("j1", 120, scope="p2", redis=r) is False                 # another provider's own id
+    (key, *_rest) = sorted(r.rows)
+    assert key.startswith(st.LOGOUT_JTI_PREFIX) and "j1" not in key and r.ttl[key] == 120
+    down = type("Down", (), {"set": lambda *a, **k: (_ for _ in ()).throw(ConnectionError())})()
+    with pytest.raises(st.Unavailable):
+        st.seen_logout_jti("j2", 120, scope="p1", redis=down)                         # not "seen": the caller answers failed
+
+
+def test_a_pending_sign_ins_logout_hint_waits_encrypted_for_the_step_that_completes_it():
+    st = _mod()
+    r = FakeRedis()
+    assert st.read_logout_hint("pending-1", redis=r) is None
+    st.stage_logout_hint("pending-1", "enc:token", 600, redis=r)
+    (key,) = r.rows
+    assert key.startswith(st.LOGOUT_HINT_PREFIX) and "pending-1" not in key and r.ttl[key] == 600
+    assert st.read_logout_hint("pending-1", redis=r) == "enc:token"
+    assert st.read_logout_hint("pending-1", redis=r) == "enc:token"                   # read, not spent (a retry)
+    down = type("Down", (), {"set": lambda *a, **k: (_ for _ in ()).throw(ConnectionError()),
+                             "get": lambda *a, **k: (_ for _ in ()).throw(ConnectionError())})()
+    with pytest.raises(st.Unavailable):
+        st.stage_logout_hint("pending-2", "enc:x", 600, redis=down)
+    with pytest.raises(st.Unavailable):
+        st.read_logout_hint("pending-2", redis=down)

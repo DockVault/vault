@@ -66,7 +66,7 @@ class Applied:
     left: List[str] = field(default_factory=list)
     joined_ids: List[str] = field(default_factory=list)
     left_ids: List[str] = field(default_factory=list)
-    role: Optional[tuple] = None                           # (old, new) when the role changed
+    role_change: Optional[tuple] = None                    # (old, new) when the role changed
     permissions_removed: list = field(default_factory=list)
     request: object = None                                 # the held administrator request opened now
     demoted: bool = False
@@ -76,7 +76,7 @@ class Applied:
 
     @property
     def changed(self) -> bool:
-        return bool(self.joined or self.left or self.role or self.request is not None or self.demoted)
+        return bool(self.joined or self.left or self.role_change or self.request is not None or self.demoted)
 
 
 # --------------------------------------------------------------------------- at the sign-in
@@ -126,7 +126,7 @@ def apply(db, row, user, answer) -> Applied:
     if lesser is not None and getattr(user.role, "value", user.role) != lesser:
         old = getattr(user.role, "value", user.role)
         applied.permissions_removed = _api()._set_role(db, user, RoleEnum(lesser), actor=None)
-        applied.role = (old, lesser)
+        applied.role_change = (old, lesser)
     return applied
 
 
@@ -206,7 +206,7 @@ def _demote(db, row, user, roles, applied: Applied) -> None:
     admin_grants.forget(db, user.id)
     new_role = RoleEnum.EXTERNAL if ("external" in roles and "user" not in roles) else RoleEnum.USER
     applied.permissions_removed = api._set_role(db, user, new_role, actor=None)
-    applied.role = ("admin", new_role.value)
+    applied.role_change = ("admin", new_role.value)
     applied.demoted = True
     for request in _approvals_of(db, user, row):
         request.state = DEMOTED                 # the approval is spent: a later role is somebody else's doing
@@ -284,11 +284,12 @@ def tell(db, row, user, applied: Applied, *, client_ip) -> None:
     for gid in applied.left_ids:
         api._audit_access_change(db, None, "group_member_removed", "group", gid,
                                  {"user_id": str(user.id), "via": "single_sign_on", "provider_id": pid})
-    if applied.role is not None:
+    if applied.role_change is not None:
         _audit(db, "sso_role_changed", user=user, ip=client_ip,
-               details={"provider_id": pid, "from": applied.role[0], "to": applied.role[1], "demoted": applied.demoted})
+               details={"provider_id": pid, "from_role": applied.role_change[0], "to_role": applied.role_change[1],
+                        "demoted": applied.demoted})
         try:
-            api._notify_account_status_changes(db, user, by_name=BY_NAME, role=applied.role,
+            api._notify_account_status_changes(db, user, by_name=BY_NAME, role=applied.role_change,
                                                permissions_removed=applied.permissions_removed)
         except Exception as exc:  # noqa: BLE001
             log.info("sso role notice skipped: %s", type(exc).__name__)
@@ -299,7 +300,7 @@ def tell(db, row, user, applied: Applied, *, client_ip) -> None:
             log.info("sso lost-standing notice skipped: %s", type(exc).__name__)
     if applied.kept_last_admin:
         _audit(db, "sso_role_changed", user=user, ip=client_ip, status_="failure",
-               details={"provider_id": pid, "from": "admin", "to": "admin", "reason": "last_administrator"})
+               details={"provider_id": pid, "from_role": "admin", "to_role": "admin", "reason": "last_administrator"})
         try:
             admins = [str(a.id) for a in api._active_admins(db)]
             api._notify_users(admins, "sso_role_kept", title="An administrator kept the role",

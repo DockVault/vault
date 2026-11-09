@@ -36,6 +36,9 @@ log = logging.getLogger("dockvault.sso")
 
 START_LIMIT = 30                     # starts per address per START_WINDOW, beside the state store's abandoned cap
 START_WINDOW = 300
+LOGOUT_LIMIT = 600                 # back-channel logouts per provider per source address and window: a provider
+                                   # signing out many people at once is machine-to-machine, not a person
+
 FINISH_LIMIT = 30                    # handover claims per address per FINISH_WINDOW
 FINISH_WINDOW = 300
 
@@ -364,19 +367,23 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
     """Where the provider says a person signed out of it (OpenID Connect back-channel logout, a form with
     ``logout_token``): the token is verified as an ID token with the logout event, honoured once by its id, and the
     vault sessions it names (by the provider's session id, else by the subject) are ended, those and no others.
-    200 on success; 400 with ``{"error": "invalid_request"}`` otherwise, never a body that says why."""
+    200 on success; 400 with ``{"error": "invalid_request"}`` for a token that is not valid, never a body that says
+    why; 501 with ``{"error": "logout_failed"}`` when the vault could not act on a token (the limiter, the store, the
+    provider's keys unreachable), the code the specification gives a failed logout, so the provider may try again."""
     api = _api()
     client_ip = api.get_client_ip(request)
     from app.core import sign_in_lockout
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
+    invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
+    failed = JSONResponse(status_code=501, content={"error": "logout_failed"})
     try:
-        allowed, _, _reset = _rl.check_rate_limit(identifier=sign_in_lockout.source_of(client_ip), limit=START_LIMIT,
-                                                  window=START_WINDOW, prefix="sso_backchannel", fail_open=False)
+        allowed, _, _reset = _rl.check_rate_limit(
+            identifier=f"{sign_in_lockout.source_of(client_ip)}:{str(provider_id)[:64]}", limit=LOGOUT_LIMIT,
+            window=START_WINDOW, prefix="sso_backchannel", fail_open=False)
     except RateLimiterUnavailable:
         allowed = False
-    invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
     if not allowed:
-        return invalid
+        return failed
     try:
         form = await request.form()
         token = form.get("logout_token")
@@ -390,19 +397,28 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         return invalid
     try:
         provider = sso.provider_config(row)
-        discovery = oc.discover(provider)
-        claims = oc.verify_logout_token(provider, discovery, token, seen_jti=sso_state.seen_logout_jti)
+        discovery = oc.discover(provider, fetch=oc.fetch_json)
+        claims = oc.verify_logout_token(provider, discovery, token, fetch=oc.fetch_json,
+                                        seen_jti=lambda jti, ttl: sso_state.seen_logout_jti(jti, ttl, scope=str(row.id)))
+    except sso_state.Unavailable:
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": str(row.id), "reason": "store_unavailable"})
+        return failed
     except (sso.Refusal, oc.OidcError) as exc:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": str(row.id), "reason": exc.code})
-        return invalid
+        return failed if exc.code == oc.TEMPORARILY_UNAVAILABLE else invalid
     from app.core.models import SsoSession
     sid, sub = claims.get("sid"), claims.get("sub")
     query = db.query(SsoSession).filter(SsoSession.provider_id == row.id)
     if isinstance(sid, str) and sid:
         query, by = query.filter(SsoSession.idp_sid == sid), "sid"
+    elif isinstance(sub, str) and sub:
+        query, by = query.filter(SsoSession.idp_sub == sub), "sub"
     else:
-        query, by = query.filter(SsoSession.idp_sub == str(sub)), "sub"
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": str(row.id), "reason": "no_identifier"})
+        return invalid
     session_ids = [s.session_id for s in query.all()]
     ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout", durable=True) if session_ids else 0
     db.commit()

@@ -726,7 +726,7 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
     return SignInResult(user, [], client_ip, provider_id=provider_id, provider_mfa_trusted=mfa_trusted(row, answer),
-                        auth_time=answer.auth_time or datetime.now(timezone.utc),
+                        auth_time=answer.auth_time or datetime.now(timezone.utc), provider_auth_time=answer.auth_time,
                         provider_sid=answer.sid, provider_sub=answer.subject,
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)
 
@@ -746,11 +746,33 @@ def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:
         raise Refusal(REAUTH_NO_MFA)
 
 
+_HAS_IDENTITIES: set = set()
+
+
+def _has_identities(db) -> bool:
+    """Whether the database has the identities table (a database built only with the tables a test needs may not;
+    a memory stand-in with no engine is asked directly). Remembered for the engine once found."""
+    get_bind = getattr(db, "get_bind", None)
+    if get_bind is None:
+        return True
+    bind = get_bind()
+    engine = getattr(bind, "engine", bind)
+    if engine in _HAS_IDENTITIES:
+        return True
+    from sqlalchemy import inspect
+    if inspect(bind).has_table("external_identities"):
+        _HAS_IDENTITIES.add(engine)
+        return True
+    return False
+
+
 def reauth_available(db, user) -> bool:
     """Whether a provider re-authentication may be offered to ``user`` for a step-up: an enabled provider the
     account has an identity on, whose last test sign-in carried ``auth_time`` (without it no freshness can be
-    judged)."""
+    judged). False where the database holds no identities at all."""
     from app.core.models import ExternalIdentity, SsoProvider
+    if user is None or getattr(user, "id", None) is None or not _has_identities(db):
+        return False
     rows = db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all()
     for identity in rows:
         provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
@@ -783,13 +805,14 @@ def provider_logout_url(db, session_row) -> Optional[str]:
         row = db.query(SsoProvider).filter(SsoProvider.id == sso_session.provider_id).first()
         if row is None or not policy_of(row)["sso_idp_logout"]:
             return None
-        discovery = oc.discover(provider_config(row))
+        discovery = oc.discover(provider_config(row), fetch=oc.fetch_json)
         if not discovery.end_session_endpoint:
             return None
         import secrets
         query = urlencode({"id_token_hint": decrypt_secret(sso_session.id_token_enc),
                            "post_logout_redirect_uri": public_base_url() + "/", "state": secrets.token_urlsafe(16)})
-        return f"{discovery.end_session_endpoint}?{query}"
+        separator = "&" if "?" in discovery.end_session_endpoint else "?"
+        return f"{discovery.end_session_endpoint}{separator}{query}"
     except Exception:  # noqa: BLE001
         return None
 
