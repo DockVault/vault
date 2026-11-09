@@ -87,6 +87,11 @@ def emails(monkeypatch):
         return True
 
     monkeypatch.setattr(email_actions, "send_action_email", capture)
+
+    # The upload notice sends through the background helper (a thread of its own); captured here at the call.
+    def fire(db_, key, *, email, username=None, action_context=None):
+        sent.append((key, {"email": email, "username": username}, dict(action_context or {})))
+    monkeypatch.setattr(api, "_fire_action_email", fire)
     return sent
 
 
@@ -310,3 +315,14 @@ def test_an_email_with_no_address_goes_out_without_a_link():
         html, _ = email_sanitize.render_for_send(body, context=without, load_resource=lambda _r: None)
         assert "<a " not in html and 'href=' not in html, html
         assert text in html and "A file arrived." in html
+
+
+def test_the_upload_email_is_sent_off_the_request_through_the_background_helper():
+    """The upload notice's email goes through _fire_action_email (its enabled check, then SMTP on a thread
+    of its own), never send_action_email on the anonymous upload's event loop."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(api._tell_receiver_owner))
+    called = {(c.func.id if isinstance(c.func, ast.Name) else getattr(c.func, "attr", None))
+              for c in ast.walk(tree) if isinstance(c, ast.Call)}
+    assert "_fire_action_email" in called and "send_action_email" not in called

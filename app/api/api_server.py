@@ -16118,15 +16118,15 @@ def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
             f"A file arrived on {label}. Open its vault to see everything received.",
             target="#uploadlinks/drops", dedup_prefix=f"receiver_upload:{receiver.id}:{bucket}", once=True)
         if notified and owner.email:
-            from app.core.email_actions import send_action_email
             # The link is built from the configured public address only, never from this request's Host:
             # the request is the anonymous uploader's. With no address configured the email carries no link.
+            # Sent on a thread of its own (_fire_action_email), never on the event loop of the upload that is
+            # still holding its transfer slot.
             base = _public_base_url(None)
-            send_action_email(db, "receiver_upload_received",
-                              recipient={"email": owner.email, "username": owner.username},
-                              action_context={"link": f"{base}/#uploadlinks/drops" if base else "",
-                                              "change": f"A file arrived on your upload link {label} on "
-                                                        f"{_brand_name(db) or 'the vault'}."})
+            _fire_action_email(db, "receiver_upload_received", email=owner.email, username=owner.username,
+                               action_context={"link": f"{base}/#uploadlinks/drops" if base else "",
+                                               "change": f"A file arrived on your upload link {label} on "
+                                                         f"{_brand_name(db) or 'the vault'}."})
     except Exception:  # noqa: BLE001 - telling the owner never fails the upload
         pass
 
