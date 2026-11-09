@@ -1095,6 +1095,7 @@ class UserResponse(BaseModel):
     is_locked: bool
     sftp_enabled: bool = True
     sftp_password_auth: bool = True
+    sso_only: Optional[bool] = None       # signs in only through its identity provider
     # The account's storage override in bytes: null = inherits the deployment default,
     # -1 = exempt, otherwise an exact budget. The effective number (and what the account has
     # already allocated) comes from /users/{id}/storage.
@@ -6354,6 +6355,8 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
     base_url = _public_base_url()
     if enabled and _smtp_configured(db) and base_url:
         user = _resolve_reset_user(db, body.identifier)
+        if user is not None and getattr(user, "sso_only", False):
+            user = None            # signs in only through its provider: no link, the same answer as for anyone
         if user is not None:
             # Background the mint+send so a resolved identifier can't be told apart from an unknown one
             # by response timing (both do only the resolution query on the request path).
@@ -7534,6 +7537,10 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    if getattr(user, "sso_only", False):
+        raise HTTPException(status_code=409, detail=(
+            "This account signs in only through its organisation's provider and holds no password. Allow password "
+            "sign-in on the provider, or unlink the account, before sending a reset link."))
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not (user.email or "").strip():
         raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
@@ -7584,6 +7591,10 @@ async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    if getattr(user, "sso_only", False):
+        raise HTTPException(status_code=409, detail=(
+            "This account signs in only through its organisation's provider and holds no password. Allow password "
+            "sign-in on the provider, or unlink the account, before sending a reset link."))
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not getattr(user, "is_active", True):
         raise HTTPException(status_code=400,
@@ -7674,6 +7685,9 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     user = db.query(User).filter(User.id == r.user_id).first()
     if user is None:
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
+    if getattr(user, "sso_only", False):
+        _refuse_reset_link(db, r, user, "sso_only", ip=ip)
         raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     # A link someone else made is judged again as its maker and the account stand now, under a share lock
     # on both rows until the password is set: refused exactly like an unknown one, revoked, and recorded
@@ -10876,6 +10890,9 @@ async def update_own_account(
     email_supplied = "email" in body.model_fields_set
     new_email = normalize_email(body.email) if email_supplied else None
     changing_email = email_supplied and new_email != user.email
+    if body.new_password is not None and getattr(user, "sso_only", False):
+        raise HTTPException(status_code=409, detail=(
+            "This account signs in only through its organisation's provider and has no password of its own to change."))
     sensitive = body.new_password is not None or changing_email
     if sensitive:
         if not body.current_password or not user.password_hash or not verify_password(body.current_password, user.password_hash):

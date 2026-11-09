@@ -22,14 +22,19 @@ DEFAULTS = {
     "sso_link_by_email": False,
     "sso_admin_mapping": False,           # a group may raise an administrator request (never the role itself)
     "sso_use_signup_domains": False,      # the account policy's sign-up domain list as a restriction too
+    "sso_trust_idp_mfa": False,           # a token with an accepted amr or acr value counts as the second factor
+    "sso_accepted_amr": [],
+    "sso_accepted_acr": [],
+    "sso_requested_acr": "",              # sent as acr_values when set
     "sso_allowed_tenants": [],            # Entra: the token's tid must be one of these
     "sso_allowed_domains": [],            # Google Workspace: hd, else the verified email's domain
     "sso_required_groups": [],            # at least one of these in the groups claim
 }
 _ENUMS = {"sso_account_creation": ACCOUNT_CREATION_VALUES, "sso_default_role": DEFAULT_ROLE_VALUES,
           "sso_password_login": PASSWORD_LOGIN_VALUES}
-_BOOLS = ("sso_link_by_email", "sso_admin_mapping", "sso_use_signup_domains")
-_LISTS = ("sso_allowed_tenants", "sso_allowed_domains", "sso_required_groups")
+_BOOLS = ("sso_link_by_email", "sso_admin_mapping", "sso_use_signup_domains", "sso_trust_idp_mfa")
+_LISTS = ("sso_allowed_tenants", "sso_allowed_domains", "sso_required_groups", "sso_accepted_amr", "sso_accepted_acr")
+_STRS = ("sso_requested_acr",)
 MAX_LIST_ITEMS = 200
 MAX_ITEM_LENGTH = 255
 
@@ -63,7 +68,21 @@ def effective(stored) -> dict:
             policy[key] = stored[key]
     for key in _LISTS:
         policy[key] = _clean_list(stored.get(key), lower=(key == "sso_allowed_domains"))
+    for key in _STRS:
+        value = stored.get(key)
+        policy[key] = value.strip()[:MAX_ITEM_LENGTH] if isinstance(value, str) else ""
     return policy
+
+
+def mfa_trusted(policy: dict, amr, acr) -> bool:
+    """Whether the token's ``amr`` values or ``acr`` value count as the second factor under this policy: trust on, and
+    an accepted value present. Nothing is trusted by default."""
+    if not policy["sso_trust_idp_mfa"]:
+        return False
+    values = {str(v) for v in amr} if isinstance(amr, (list, tuple, set)) else set()
+    if values & set(policy["sso_accepted_amr"]):
+        return True
+    return isinstance(acr, str) and acr in set(policy["sso_accepted_acr"])
 
 
 def signup_domain_gate(account_policy: Optional[dict]) -> tuple:

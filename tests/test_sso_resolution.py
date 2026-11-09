@@ -340,7 +340,32 @@ def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_
     assert location.startswith("/#sso=") and len(h.identities()) == 1
 
 
-@pytest.mark.parametrize("arrange", ["off", "unverified", "administrator", "inactive", "unrestricted", "has_identity",
+@pytest.mark.parametrize("kind, arrange", [
+    ("administrator", "role"),
+    ("auditor_right", "proposed"),
+    ("auditor_right", "active"),
+    ("auditor_right", "suspended"),
+])
+def test_a_privileged_account_is_never_linked_by_its_verified_email(monkeypatch, kind, arrange):
+    bob = _user("bob", role="admin" if arrange == "role" else "user")
+    p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [bob], [p])
+    if arrange != "role":
+        from app.core.models import AuditorGrant
+        h.db.rows_of(AuditorGrant).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=bob.id, status=arrange))
+    location, _ = _sign_in(h, p, email="bob@example.test")
+    assert location == "/#sso-error=restricted", location
+    assert h.identities() == [] and h.codes() == [] and h.notices == []
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "restricted"
+               and a[2].get("detail") == f"privileged_account:{kind}" for a in h.audits), h.audits
+    # An ended grant is no standing: the account links.
+    if arrange != "role":
+        h.db.rows_of(AuditorGrant)[0].status = "ended"
+        location, _ = _sign_in(h, p, email="bob@example.test")
+        assert location.startswith("/#sso=") and len(h.identities()) == 1
+
+
+@pytest.mark.parametrize("arrange", ["off", "unverified", "inactive", "unrestricted", "has_identity",
                                      "no_match", "two_accounts", "address_outside_the_domain_list"])
 def test_linking_by_email_happens_in_no_other_case(monkeypatch, arrange):
     policy = {"sso_link_by_email": True, "sso_allowed_tenants": ["t1"]}
@@ -350,7 +375,7 @@ def test_linking_by_email_happens_in_no_other_case(monkeypatch, arrange):
         policy = {"sso_link_by_email": True}
     elif arrange == "address_outside_the_domain_list":
         policy = {"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]}
-    bob, p = _user("bob", role="admin" if arrange == "administrator" else "user"), _provider(policy=policy)
+    bob, p = _user("bob"), _provider(policy=policy)
     if arrange == "inactive":
         bob.is_active = False
     if arrange == "address_outside_the_domain_list":
@@ -479,6 +504,47 @@ def test_a_test_sign_in_says_what_account_it_would_make(monkeypatch):
     assert status == 200, body
     assert p.last_test["would"] == "create the account alice.e at the first sign-in and sign it in"
     assert h.users_named("alice.e") == [] and h.identities() == []        # a test makes nothing
+
+
+# --------------------------------------------------------------------------- the provider's MFA
+
+@pytest.mark.parametrize("policy, claims, trusted", [
+    ({}, {"amr": ["pwd", "mfa"], "acr": "2"}, False),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, {"amr": ["pwd", "mfa"]}, True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, {"amr": ["pwd"]}, False),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_acr": ["2"]}, {"acr": "2"}, True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_acr": ["2"]}, {"acr": "1"}, False),
+])
+def test_the_providers_mfa_is_the_second_factor_only_when_the_policy_trusts_the_values(monkeypatch, policy, claims, trusted):
+    alice, p = _user(), _provider(policy=policy)
+    h = Resolving(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    location, _ = _sign_in(h, p, **claims)
+    assert location.startswith("/#sso="), location
+    status, body = h.finish(location)
+    assert status == 200, body
+    token = _claims(body["access_token"])
+    assert ("mfa_at" in token) is trusted and token["amr"] == []
+
+
+def test_the_requested_acr_rides_in_the_authorization_request_and_the_test_reports_the_trust(monkeypatch):
+    root = _user("root", role="admin")
+    p = _provider(policy={"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"], "sso_requested_acr": "urn:example:mfa"})
+    h = Resolving(monkeypatch, [root], [p])
+    status, out = h.start(p)
+    assert status == 200 and "acr_values=urn%3Aexample%3Amfa" in out["authorization_url"], out
+    from app.core import sso_state
+    from app.services import sso_sign_in as sso
+    url = sso.start(p, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
+                    user_id=root.id, session_hash="sess-hash")
+    state, _ = h.state_of(url)
+    h.claims_override = {"amr": ["pwd", "mfa"]}
+    status, location, _ = h.callback(p, state)
+    status, body = h.finish_test(p, location)
+    assert status == 200 and p.last_test["mfa_trusted"] is True and p.last_test["amr"] == ["pwd", "mfa"]
+    from app.core.models import SsoProvider
+    q = _provider(name="plain")
+    h.db.rows_of(SsoProvider).append(q)
+    assert "acr_values" not in h.start(q)[1]["authorization_url"]
 
 
 # --------------------------------------------------------------------------- the restriction comes first

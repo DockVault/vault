@@ -123,6 +123,26 @@ def test_an_address_is_admitted_only_from_a_listed_domain(stored, email, admitte
     assert P.address_admitted(P.effective(stored), email) is admitted
 
 
+@pytest.mark.parametrize("stored, amr, acr, trusted", [
+    ({}, ["pwd", "mfa"], "2", False),                                                    # nothing trusted by default
+    ({"sso_trust_idp_mfa": True}, ["pwd", "mfa"], "2", False),                           # trust on, nothing accepted
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, ["pwd", "mfa"], None, True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, ["pwd"], None, False),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_acr": ["2"]}, [], "2", True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_acr": ["2"]}, [], "1", False),
+    ({"sso_trust_idp_mfa": False, "sso_accepted_amr": ["mfa"]}, ["mfa"], None, False),  # values without trust
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, "mfa", None, False),      # a string is not a list
+])
+def test_the_providers_mfa_counts_only_when_trusted_and_an_accepted_value_is_there(stored, amr, acr, trusted):
+    assert P.mfa_trusted(P.effective(stored), amr, acr) is trusted
+
+
+def test_the_requested_acr_is_a_bounded_string():
+    assert P.effective({"sso_requested_acr": "  urn:mace:incommon:iap:silver "})["sso_requested_acr"] == "urn:mace:incommon:iap:silver"
+    assert P.effective({"sso_requested_acr": 7})["sso_requested_acr"] == ""
+    assert len(P.effective({"sso_requested_acr": "x" * 400})["sso_requested_acr"]) == P.MAX_ITEM_LENGTH
+
+
 def test_an_exclusion_wins_over_a_missing_claim():
     stored = {"sso_allowed_tenants": ["t-1"], "sso_required_groups": ["g"]}
     assert _judge(stored, tenant_id="t-2", groups=None) == P.RESTRICTED

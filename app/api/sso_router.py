@@ -268,7 +268,8 @@ async def sign_in_callback(
             found = sso.resolve_account(db, row, answer, login=login)
         except sso.Refusal as exc:
             db.rollback()          # nothing of a refused resolution may ride on the audit row's commit
-            _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
+            _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure",
+                   details={**details, "reason": exc.code, **({"detail": exc.detail} if exc.detail else {})})
             if invitation_id:
                 api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip,
                                           reason=exc.detail or exc.code)
@@ -295,7 +296,7 @@ async def sign_in_callback(
                 _record_resolution(db, row, found, client_ip=client_ip, details=details)
         sso_groups.tell(db, row, user, applied, client_ip=client_ip)
         from app.core import sign_in_codes
-        result = sso.pipeline_result(db, user, answer, provider_id=login.provider_id, client_ip=client_ip)
+        result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip)
         try:
             handover_code = sign_in_codes.store(sign_in_codes.from_result(
                 result, verifier_hash=login.verifier_hash, code_challenge=login.code_challenge,

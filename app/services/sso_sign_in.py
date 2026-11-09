@@ -148,9 +148,10 @@ def start(row, *, purpose: str, source: str, client_ip: Optional[str], verifier_
     state = sso_state.begin(provider_id=str(row.id), purpose=purpose, source=source, client_ip=client_ip,
                             verifier_hash=verifier_hash, code_challenge=code_challenge, return_to=return_to,
                             user_id=user_id, session_hash=session_hash, step_up_action=step_up_action, extras=extras)
+    requested_acr = policy_of(row)["sso_requested_acr"] or None
     return oc.authorization_url(provider, discovery, redirect_uri=redirect_uri(row.id), state=state.state,
                                 nonce=state.nonce, code_verifier=state.code_verifier, reauthenticate=reauthenticate,
-                                login_hint=login_hint, resolve=resolve)
+                                acr_values=requested_acr, login_hint=login_hint, resolve=resolve)
 
 
 # --------------------------------------------------------------------------- the callback
@@ -317,6 +318,12 @@ def restriction_of(db, row, answer: ProviderAnswer) -> Optional[str]:
                                   email_verified=answer.email_verified, hosted_domain=answer.hosted_domain,
                                   groups=answer.groups, groups_overage=answer.groups_overage,
                                   account_policy=account_policy)
+
+
+def mfa_trusted(row, answer: ProviderAnswer) -> bool:
+    """Whether the provider's token counts as the second factor under the provider's policy (trust on, and an
+    accepted ``amr`` or ``acr`` value present); nothing is trusted by default."""
+    return sso_policy.mfa_trusted(policy_of(row), answer.amr, answer.acr)
 
 
 def restriction_refusal(db, row, answer: ProviderAnswer) -> None:
@@ -488,8 +495,9 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     restricted (the save-time rule's condition, held here too so a hand-edited row never widens the door), the
     address verified, owned by exactly one active account that is not an administrator and has no identity on
     this provider yet."""
+    from app.core import privileged_accounts
     from app.core.email_identity import find_user_by_email
-    from app.core.models import ExternalIdentity, RoleEnum
+    from app.core.models import ExternalIdentity
     api = _api()
     account_policy = api._account_policy(db) if policy["sso_use_signup_domains"] else None
     if not sso_policy.is_restricted(policy, account_policy):
@@ -498,8 +506,13 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     if email is None or not sso_policy.address_admitted(policy, email):
         return None                  # the hosted-domain claim admits the sign-in; the address must be on the list too
     user = find_user_by_email(db, email)
-    if user is None or getattr(user, "role", None) == RoleEnum.ADMIN or not account_usable(user):
+    if user is None or not account_usable(user):
         return None
+    kind = privileged_accounts.kind(db, user)
+    if kind is not None:
+        # An administrator, or an account with the auditor right (open), reaches other people's vaults: a takeover of
+        # its address at the provider must not reach it silently. It links only from its own profile, under step-up.
+        raise Refusal(RESTRICTED, f"privileged_account:{kind}")
     if db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
                                             ExternalIdentity.user_id == user.id).first() is not None:
         return None          # the account's identity on this provider is another one: an administrator sorts it out
@@ -623,7 +636,12 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
                     "would": (f"create the account {name} at the first sign-in and sign it in" if name
                               else "refuse: no usable username could be made from the provider's answer")}
         return {"restriction": "passes", "would": "refuse: account creation at the first sign-in needs a restricted provider"}
-    match = _email_match(db, row, answer, policy)
+    try:
+        match = _email_match(db, row, answer, policy)
+    except Refusal as refused:
+        return {"restriction": "passes", "would": "refuse: the account that owns this address is " + (
+            "an administrator" if refused.detail.endswith("administrator") else "holding the auditor right") +
+            "; it links only from its own signed-in profile"}
     if match is not None:
         return {"restriction": "passes",
                 "would": f"link the account {match.username} by its verified email address and sign it in"}
@@ -674,7 +692,7 @@ def test_summary(db, row, answer: ProviderAnswer, tester) -> dict:
         "auth_time_present": answer.auth_time is not None, "amr": answer.amr, "acr": answer.acr,
         "email_verified": answer.email_verified, "email_present": answer.email is not None,
         "groups": _group_names(row, answer), "subject_length": len(answer.subject),
-        **would_do(db, row, answer, tester),
+        "mfa_trusted": mfa_trusted(row, answer), **would_do(db, row, answer, tester),
     }
 
 
@@ -682,11 +700,12 @@ def _group_names(row, answer: ProviderAnswer) -> list:
     return sorted(answer.groups or [])[:200]
 
 
-def pipeline_result(db, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str]):
+def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str]):
     """The pipeline's result for a provider sign-in: the provider is the first proof (``amr`` carries what the
-    vault proved itself, nothing from the provider); the provider's own MFA is trusted by its item, not here."""
+    vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
+    provider's policy trusts the values the token carried."""
     from app.services.sign_in import SignInResult
-    return SignInResult(user, [], client_ip, provider_id=provider_id, provider_mfa_trusted=False,
+    return SignInResult(user, [], client_ip, provider_id=provider_id, provider_mfa_trusted=mfa_trusted(row, answer),
                         auth_time=answer.auth_time or datetime.now(timezone.utc))
 
 
