@@ -333,3 +333,37 @@ def test_the_file_link_and_note_link_pages_fit_a_phone(page: Page, admin, public
         assert page.evaluate("() => document.documentElement.scrollWidth") <= 391
     finally:
         admin.delete_vault(v["id"])
+
+
+@pytest.fixture
+def pending_invitation(admin, people):
+    """Invitations on, and one pending invitation with a long name and address, made by the test's administrator."""
+    a, _u, _v = people
+    keys = ("invite_enabled", "email_requirement", "signup_email_domain_mode")
+    before = admin.get("/settings").json()
+    admin.put("/settings", json={"invite_enabled": True, "email_requirement": "optional", "signup_email_domain_mode": "off"})
+    ca = ApiClient(); ca.login(a["_username"], a["_password"])
+    name = "invited" + unique("")[1:13]
+    r = ca.post("/invites", json={"username": name, "email": f"{name}.someone.with.a.long.address@example.com", "role": "user"})
+    assert r.status_code in (200, 201), r.text
+    inv = r.json()
+    try:
+        yield inv
+    finally:
+        admin.delete(f"/invites/{inv['id']}")
+        admin.put("/settings", json={k: before.get(k) for k in keys})
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+@pytest.mark.parametrize("width", ["tablet", "small-laptop"])
+def test_the_users_page_with_a_pending_invitation_does_not_scroll_sideways(page: Page, people, pending_invitation, skin, width):
+    a, _u, _v = people
+    _login(page, a, skin, WIDTHS[width])
+    assert _go(page, "users")
+    row = page.locator(f'#invites-list .invite-row[data-invite-id="{pending_invitation["id"]}"]')
+    expect(row).to_be_visible(timeout=15000)
+    bad = page.evaluate(OVERFLOW_JS)
+    assert bad == [], bad
+    # The invitations scroll inside their own box, which is no wider than the screen.
+    box = page.locator("#invites-list").bounding_box()
+    assert box and box["x"] >= 0 and box["x"] + box["width"] <= WIDTHS[width][0] + 1, box
