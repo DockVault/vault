@@ -87,5 +87,5 @@ def test_both_tables_show_the_uses_cell():
     for table in ("renderMyPublicLinks", "renderAdminPublicLinks"):
         body = _function(table)
         assert body.count("tr.appendChild(_pflUsesCell(l));") == 1, table
-        assert ("'Expires', 'Uses', ''" in body or "'Expires', 'Uses', 'Created', 'Last used', ''" in body) \
+        assert ("'Expires', 'Uses', ''" in body or "['Expires', 'expires'], ['Uses', 'uses'], ['Created'" in body) \
             and "'Downloads'" not in body, table
