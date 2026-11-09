@@ -660,7 +660,8 @@ class AuthService:
             # The account signs in only through its identity provider (app/core/sso_only.py). Judged after the
             # hash check so the door's timing says nothing; the same generic answer, the reason in the audit log.
             self.db.commit()
-            raise InvalidCredentialsError("Account signs in only through its identity provider")
+            from app.services.sign_in import PROVIDER_ONLY_REASON
+            raise InvalidCredentialsError(PROVIDER_ONLY_REASON)
         if account_locked(user):
             self.db.commit()
             raise AccountLockedError("Account is locked", locked_until=user.locked_until,

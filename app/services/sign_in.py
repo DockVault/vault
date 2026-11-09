@@ -603,6 +603,40 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
     return PendingStep(stage=stage, body=body)
 
 
+# The reason an account that signs in only through its identity provider is refused at a door that is not the
+# provider: the password door (app/services/auth_service.py) and every other first proof here record the same text.
+PROVIDER_ONLY_REASON = "Account signs in only through its identity provider"
+
+
+class ProviderOnly(HTTPException):
+    """The account signs in only through its organisation's identity provider and this sign-in did not come through
+    it: a passkey, or any other first proof, does not stand in for the provider (a leaver disabled at the provider
+    must lose access at the next sign-in). 403 with a message naming the provider's button."""
+
+    def __init__(self, message: str):
+        super().__init__(status_code=403, detail=message)
+
+
+def refuse_without_the_provider(db, result: SignInResult) -> None:
+    """Refuse a sign-in of an account that signs in only through its provider (``users.sso_only``) when this sign-in
+    did not come through a provider: one audit row with the password door's reason, nothing counted (the proof was
+    good), and :class:`ProviderOnly`. A sign-in that came through the provider carries it in ``provider_id`` (also at
+    the second step, from the pending login), so the account's passkey still serves as its second factor there."""
+    user = result.user
+    if result.is_temporary or result.provider_id or not getattr(user, "sso_only", False):
+        return
+    from app.api import api_server as api
+    from app.core import sso_only
+    message = sso_only.provider_only_message(db, user)
+    passkey = bool(set(result.methods) & {HARDWARE_KEY, SOFTWARE_KEY})
+    try:
+        api.AuditLogger(db).log_login_failure(user.username, result.client_ip, PROVIDER_ONLY_REASON, account=user,
+                                              login_identifier="passkey" if passkey else "username")
+    except Exception:  # noqa: BLE001 -- the refusal stands without its row
+        db.rollback()
+    raise ProviderOnly(message)
+
+
 @a_refusal_leaves_no_session
 def finish(db, result: SignInResult):
     """Finish a sign-in or hold it for its next step: a :class:`SignedIn` or a :class:`PendingStep`.
@@ -617,6 +651,7 @@ def finish(db, result: SignInResult):
         stage = DONE
     else:
         refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
+        refuse_without_the_provider(db, result)
         in_effect = api._login_second_factor_in_effect(db, user)
         enrollment_pending = bool(in_effect) and api._second_factor_effective(db, user)["state"] == "pending"
         # A role that must hold a passkey: the grace runs from the first sign-in under the requirement; past it the
