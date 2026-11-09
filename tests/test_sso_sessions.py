@@ -262,81 +262,152 @@ def test_every_bad_logout_token_is_the_same_400_and_ends_nothing(monkeypatch, sp
     assert all("subject-1" not in str(a[2].get("reason", "")) for a in h.audits if isinstance(a[2], dict))
 
 
-def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_token(monkeypatch):
-    """The specification's 400 says the token was invalid and the provider does not retry; a limiter refusal, a
-    store outage, a provider whose keys cannot be fetched, a configuration the vault cannot read, or every slot in
-    use is 501, the logout failed, so it may."""
+def test_the_back_channel_limiter_keeps_a_bucket_per_provider_and_source_and_a_trace_of_what_it_refused(monkeypatch):
+    """A bucket per source for each provider and one shared by every id with no provider behind it, failing closed; a
+    known provider's refused logout recorded once per window for each source (another source's flood does not use the
+    trace up), nothing written when the counter of those traces cannot be asked, nothing for an unknown id."""
     alice, p = _user(), _provider()
     h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
     _signed_in(h, p, sid="s-1")
     token = h.logout_token(sid="s-1", sub="subject-1")
     from app.api import sso_router
-    from app.core import sign_in_lockout, sso_state
-    from app.core.rate_limiter import rate_limiter as RL
-    from app.services import oidc_client as oc
-    from app.services import sso_sign_in as sso
+    from app.core import sign_in_lockout
+    from app.core.rate_limiter import RateLimiterUnavailable, rate_limiter as RL
     source = sign_in_lockout.source_of("203.0.113.9")
     asked, noted = [], []
     real = RL.check_rate_limit
+    note_down = []
 
     def refusing(*a, **kw):
         if kw.get("prefix") == "sso_backchannel":
-            asked.append((kw.get("identifier"), kw.get("limit")))
+            asked.append((kw.get("identifier"), kw.get("limit"), kw.get("window"), kw.get("fail_open")))
             return (False, 0, 10)
         if kw.get("prefix") == "sso_backchannel_refused":
-            noted.append(kw.get("identifier"))
+            if note_down:
+                raise RateLimiterUnavailable("down")
+            noted.append((kw.get("identifier"), kw.get("limit"), kw.get("window"), kw.get("fail_open")))
             return (len(noted) == 1, 0, 10)
         return real(*a, **kw)
     monkeypatch.setattr(RL, "check_rate_limit", refusing)
     assert h.logout(p, token) == (501, {"error": "logout_failed"})
     assert h.logout(p, token) == (501, {"error": "logout_failed"})
-    # A bucket per source for each provider, sized for a provider signing many people out; one shared by every id
-    # with no provider behind it.
-    assert asked == [(f"{source}:{p.id}", sso_router.LOGOUT_LIMIT)] * 2 and sso_router.LOGOUT_LIMIT >= 600
-    h.logout(types.SimpleNamespace(id=uuid.uuid4()), token)
-    h.logout(types.SimpleNamespace(id=uuid.uuid4()), token)
-    assert asked[-2:] == [(f"{source}:unknown", sso_router.LOGOUT_LIMIT)] * 2
-    # A known provider's refused logout leaves one trace per window; an unknown id leaves none.
+    window = sso_router.START_WINDOW
+    assert asked == [(f"{source}:{p.id}", sso_router.LOGOUT_LIMIT, window, False)] * 2 and sso_router.LOGOUT_LIMIT >= 600
+    assert noted == [(f"{p.id}:{source}", 1, window, False)] * 2
     limited = [a for a in h.audits if a[0] == "sso_backchannel_logout" and a[2].get("reason") == "rate_limited"]
     assert limited == [("sso_backchannel_logout", "failure", {"provider_id": str(p.id), "reason": "rate_limited"})]
-    assert noted == [str(p.id), str(p.id)]
-    monkeypatch.setattr(RL, "check_rate_limit", real)
+    h.logout(types.SimpleNamespace(id=uuid.uuid4()), token)
+    h.logout(types.SimpleNamespace(id=uuid.uuid4()), token)
+    assert [a[0] for a in asked[-2:]] == [f"{source}:unknown"] * 2 and len(noted) == 2
+    # The counter of traces down: nothing is written (a flood during an outage writes no row per request).
+    note_down.append(True)
+    before = len(h.audits)
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    assert len(h.audits) == before
+
+
+def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_token(monkeypatch):
+    """The specification's 400 says the token is not valid and the provider does not retry; everything the vault
+    could not act on is 501, the logout failed, so it may: the state store down, the provider unreachable (and not
+    asked again for a while), its address refused, its discovery no longer fitting, its keys not fetched, a
+    configuration the vault cannot read, anything unexpected while verifying, every slot busy past a short wait. A
+    token whose own issuer is wrong is the token's fault: 400."""
+    import asyncio
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    token = h.logout_token(sid="s-1", sub="subject-1")
+    from app.api import sso_router
+    from app.core import sso_state
+    from app.services import oidc_client as oc
+    from app.services import sso_sign_in as sso
+
+    def reasons():
+        return [a[2].get("reason") for a in h.audits if a[0] == "sso_backchannel_logout" and a[1] == "failure"]
+    failed = (501, {"error": "logout_failed"})
     # The state store down.
     real_seen = sso_state.seen_logout_jti
     monkeypatch.setattr(sso_state, "seen_logout_jti", lambda *a, **k: (_ for _ in ()).throw(sso_state.Unavailable("down")))
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
-    assert any(a[0] == "sso_backchannel_logout" and a[1] == "failure" and a[2].get("reason") == "store_unavailable" for a in h.audits)
+    assert h.logout(p, token) == failed and reasons()[-1] == "store_unavailable"
     monkeypatch.setattr(sso_state, "seen_logout_jti", real_seen)
-    # The provider unreachable: and asked again only after a short pause, not on every request meanwhile.
+    # The provider unreachable, then not asked again for a short while.
     monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
     serving = oc.fetch_json
     fetched = []
     monkeypatch.setattr(oc, "fetch_json", lambda *a, **k: fetched.append(1) or (_ for _ in ()).throw(
         oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")))
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
-    assert any(a[0] == "sso_backchannel_logout" and a[1] == "failure" and a[2].get("reason") == "temporarily_unavailable" for a in h.audits)
+    assert h.logout(p, token) == failed and reasons()[-1] == "temporarily_unavailable"
     monkeypatch.setattr(oc, "fetch_json", serving)
-    assert h.logout(p, token) == (501, {"error": "logout_failed"}) and len(fetched) == 1
-    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())                     # the pause has passed
-    # The vault cannot read its own configuration of the provider.
-    real_config = sso.provider_config
-    monkeypatch.setattr(sso, "provider_config", lambda row: (_ for _ in ()).throw(sso.Refusal(oc.PROVIDER_ERROR, "secret")))
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
-    monkeypatch.setattr(sso, "provider_config", real_config)
-    # A provider whose discovery no longer fits what the vault was configured with.
+    assert h.logout(p, token) == failed and len(fetched) == 1
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
+    # Its address refused (a private one, not allowed for this provider).
+    monkeypatch.setattr(oc, "_resolve", lambda host: ["10.0.0.7"])
+    assert h.logout(p, token) == failed and reasons()[-1] == "endpoint_refused"
+    monkeypatch.setattr(oc, "_resolve", lambda host: ["8.8.8.8"])
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
+    # Its discovery no longer fitting what the vault was configured with.
     h.discovery_overrides["issuer"] = "https://elsewhere.example.com"
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    assert h.logout(p, token) == failed and reasons()[-1] == "issuer_mismatch"
     h.discovery_overrides.pop("issuer")
     monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
-    # Every verification slot in use: answered at once, the provider retries.
-    import asyncio
+    # Its keys not fetched.
+    monkeypatch.setattr(oc, "fetch_json", lambda url, *a, **k: (_ for _ in ()).throw(oc.OidcError(oc.PROVIDER_ERROR, "not JSON"))
+                        if url.endswith("/certs") else serving(url, *a, **k))
+    assert h.logout(p, token) == failed and reasons()[-1] == "provider_error"
+    monkeypatch.setattr(oc, "fetch_json", serving)
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
+    # A configuration the vault cannot read.
+    real_config = sso.provider_config
+    monkeypatch.setattr(sso, "provider_config", lambda row: (_ for _ in ()).throw(sso.Refusal("secret_unreadable", "secret")))
+    assert h.logout(p, token) == failed and reasons()[-1] == "secret_unreadable"
+    monkeypatch.setattr(sso, "provider_config", real_config)
+    # Anything unexpected while verifying.
+    real_verify = oc.verify_logout_token
+    monkeypatch.setattr(oc, "verify_logout_token", lambda *a, **k: (_ for _ in ()).throw(ValueError("a key the library cannot read")))
+    assert h.logout(p, token) == failed and reasons()[-1] == "verification_error"
+    monkeypatch.setattr(oc, "verify_logout_token", real_verify)
+    # Every slot busy past a short wait: recorded once per window.
     monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", asyncio.Semaphore(0))
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    monkeypatch.setattr(sso_router, "BACKCHANNEL_WAIT_SECONDS", 0.05)
+    assert h.logout(p, token) == failed and reasons()[-1] == "busy"
     monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", asyncio.Semaphore(sso_router.BACKCHANNEL_CONCURRENCY))
+    assert 1 <= sso_router.BACKCHANNEL_CONCURRENCY <= 8 and sso_router.BACKCHANNEL_WAIT_SECONDS <= 10
+    # A token whose own issuer is wrong: the token's fault.
+    wrong = h.logout_token(sid="s-1", sub="subject-1", iss="https://elsewhere.example.com")
+    assert h.logout(p, wrong) == (400, {"error": "invalid_request"}) and reasons()[-1] == "issuer_mismatch"
     # None of the failures spent the token: the provider's retry ends the session.
     assert all(s.is_active for s in h.active_sessions())
     status, body = h.logout(p, token)
     assert status == 200 and not [s for s in h.active_sessions() if s.is_active], body
+
+
+def test_the_back_channel_logout_gives_its_connection_back_before_the_network_work(monkeypatch):
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    from app.services import oidc_client as oc
+    events = []
+    real_rollback, real_discover = h.db.rollback, oc.discover
+    monkeypatch.setattr(h.db, "rollback", lambda: events.append("rollback") or real_rollback())
+    monkeypatch.setattr(oc, "discover", lambda *a, **k: events.append("discover") or real_discover(*a, **k))
+    assert h.logout(p, h.logout_token(sid="s-1", sub="subject-1"))[0] == 200
+    assert "rollback" in events and events.index("rollback") < events.index("discover"), events
+
+
+def test_a_session_that_cannot_be_read_counts_as_live():
+    """After a failed commit the token is forgotten when a named session is still live; a read that fails counts as
+    live (the provider's retry then ends the sessions: the safer side)."""
+    set_bare_api_env()
+    from app.api import sso_router
+    rolled = []
+
+    class Broken:
+        def query(self, *a, **k):
+            raise RuntimeError("the connection is gone")
+
+        def rollback(self):
+            rolled.append(True)
+    assert sso_router._a_session_is_live(Broken(), [uuid.uuid4()]) is True and rolled == [True]
 
 
 def test_the_hint_cleanup_asks_whether_the_table_exists():
@@ -534,9 +605,11 @@ def test_the_back_channel_logout_fetches_the_providers_keys_off_the_event_loop()
     source = inspect.getsource(sso_router.backchannel_logout)
     assert source.count("await run_in_threadpool(verify)") == 1
     assert 'identifier=f"{source}:{scope or \'unknown\'}"' in source
-    # The database connection goes back to the pool before the network work.
-    assert source.index("db.rollback()") < source.index("run_in_threadpool(verify)")
-    assert source.index("_BACKCHANNEL_SLOTS.locked()") < source.index("run_in_threadpool(verify)")
+    # The database connection goes back to the pool before the body is read or anything waits; a slot is taken, with
+    # a bounded wait, before the network work and given back whatever happens.
+    assert source.index("db.rollback()") < source.index("await request.form()") < source.index("_BACKCHANNEL_SLOTS.acquire()")
+    assert source.index("_BACKCHANNEL_SLOTS.acquire()") < source.index("run_in_threadpool(verify)")
+    assert source.count("_BACKCHANNEL_SLOTS.release()") == 1 and "finally:\n        _BACKCHANNEL_SLOTS.release()" in source
 
 
 def test_the_table_check_asks_the_sessions_own_connection():

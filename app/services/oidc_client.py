@@ -44,6 +44,14 @@ MAX_TOKEN_BYTES = 16 * 1024
 MAX_SUBJECT_LENGTH = 255
 CACHE_SECONDS = 3600
 DISCOVERY_FAILURE_SECONDS = 30   # a provider that could not be reached is not asked again for this long
+# The failures remembered for that long: the network, and an address that could not be resolved or is refused.
+REMEMBERED_FAILURES = frozenset({"temporarily_unavailable", "endpoint_refused"})
+
+
+def _where(*parts: str) -> str:
+    """A short digest of what a cached answer was fetched for, so an answer is never served for another address or
+    issuer configured later under the same provider id."""
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 JWKS_REFETCH_INTERVAL_SECONDS = 60
 LOGOUT_TOKEN_FRESHNESS_SECONDS = 120
 BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
@@ -299,21 +307,23 @@ def discover(provider: ProviderConfig, *, fetch: Callable = fetch_json, cache: O
     an allowed signing algorithm, ``S256`` when the document lists methods; every endpoint under the endpoint
     rule. Cached an hour."""
     cache = _cache(cache)
-    key = f"sso:disc:{provider.id}"
+    url = discovery_url(provider)
+    where = _where(provider.issuer, url)
+    key = f"sso:disc:{provider.id}:{where}"
     if not refresh:
         cached = cache.get(key, now)
         if cached is not None:
             return cached
-    url = discovery_url(provider)
-    check_endpoint(url, private_network=provider.private_network, resolve=resolve)
-    failed_key = f"sso:disc-failed:{provider.id}"
+    failed_key = f"sso:disc-failed:{provider.id}:{where}"
     if not refresh and cache.get(failed_key, now) is not None:
-        # Unreachable moments ago: every request in the meantime would wait out the same timeout.
+        # Unreachable moments ago (the network, or a name that would not resolve): every request in the meantime
+        # would wait out the same timeout, the name lookup included.
         raise OidcError(TEMPORARILY_UNAVAILABLE, "the provider could not be reached moments ago")
     try:
+        check_endpoint(url, private_network=provider.private_network, resolve=resolve)
         doc = fetch(url)
     except OidcError as exc:
-        if exc.code == TEMPORARILY_UNAVAILABLE:
+        if exc.code in REMEMBERED_FAILURES:
             cache.set(failed_key, True, DISCOVERY_FAILURE_SECONDS, now)
         raise
     issuer = doc.get("issuer")
@@ -376,20 +386,33 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
                  now: Optional[float] = None) -> Dict[str, dict]:
     """The provider's signing keys by ``kid`` (RSA or EC, for signing, with a key id), cached an hour. When a
     token names a ``kid`` the cache does not hold, the set is fetched again once, at most once a minute per
-    provider; a key still unknown then is a refusal for the caller."""
+    provider; a key still unknown after that fetch is a refusal for the caller. A key unknown while a refetch is
+    throttled, or while the key set could not be fetched moments ago, is not the token's fault: that answers
+    ``TEMPORARILY_UNAVAILABLE`` (the key may be newer than the last fetch)."""
     cache = _cache(cache)
-    key = f"sso:jwks:{provider.id}"
+    where = _where(discovery.jwks_uri)
+    key = f"sso:jwks:{provider.id}:{where}"
     keys = cache.get(key, now)
     if keys is not None and (kid is None or kid in keys):
         return keys
-    if keys is not None and kid is not None:
-        last = cache.get(f"sso:jwks-refetch:{provider.id}", now)
-        if last is not None:
-            return keys
-        cache.set(f"sso:jwks-refetch:{provider.id}", True, JWKS_REFETCH_INTERVAL_SECONDS, now)
-    check_endpoint(discovery.jwks_uri, private_network=provider.private_network, resolve=resolve)
-    keys = _usable_keys(fetch(discovery.jwks_uri))
+    failed_key = f"sso:jwks-failed:{provider.id}:{where}"
+    if cache.get(failed_key, now) is not None:
+        raise OidcError(TEMPORARILY_UNAVAILABLE, "the provider's keys could not be fetched moments ago")
+    refetch_key = f"sso:jwks-refetch:{provider.id}:{where}"
+    refetching = keys is not None and kid is not None
+    if refetching and cache.get(refetch_key, now) is not None:
+        raise OidcError(TEMPORARILY_UNAVAILABLE, "the provider's keys were fetched moments ago without that key")
+    try:
+        check_endpoint(discovery.jwks_uri, private_network=provider.private_network, resolve=resolve)
+        keys = _usable_keys(fetch(discovery.jwks_uri))
+    except OidcError as exc:
+        if exc.code in REMEMBERED_FAILURES:
+            cache.set(failed_key, True, DISCOVERY_FAILURE_SECONDS, now)
+        raise
     cache.set(key, keys, CACHE_SECONDS, now)
+    if refetching:
+        # Only a fetch that succeeded throttles the next one: a failed refetch must not leave real keys unknown.
+        cache.set(refetch_key, True, JWKS_REFETCH_INTERVAL_SECONDS, now)
     return keys
 
 

@@ -210,21 +210,75 @@ def test_only_signing_keys_with_an_id_are_kept_and_an_unknown_kid_refetches_once
     keys = oc.signing_keys(_provider(oc), d, fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW)
     assert set(keys) == {"rsa1", "ec1"}
     fetched = len(fetch.calls)
-    # A known kid: no fetch. An unknown one: one refetch, then not again for a minute.
+    # A known kid: no fetch. An unknown one: one refetch (still unknown: the caller refuses the token), then not again
+    # for a minute, during which an unknown key is not the token's fault: the key may be newer than the last fetch.
     oc.signing_keys(_provider(oc), d, kid="rsa1", fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW + 1)
     assert len(fetch.calls) == fetched
-    oc.signing_keys(_provider(oc), d, kid="nope", fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW + 2)
+    assert "nope" not in oc.signing_keys(_provider(oc), d, kid="nope", fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW + 2)
     assert len(fetch.calls) == fetched + 1
-    oc.signing_keys(_provider(oc), d, kid="nope", fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW + 30)
-    assert len(fetch.calls) == fetched + 1
+    with pytest.raises(oc.OidcError) as e:
+        oc.signing_keys(_provider(oc), d, kid="nope", fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW + 30)
+    assert e.value.code == oc.TEMPORARILY_UNAVAILABLE and len(fetch.calls) == fetched + 1
     oc.signing_keys(_provider(oc), d, kid="nope", fetch=fetch, cache=cache, resolve=_PUBLIC, now=NOW + 70)
     assert len(fetch.calls) == fetched + 2
     # The limiter holds without a caller's cache too (the process's own): five unknown kids, one fetch after the first.
     fetch3 = _fetch_for(signer)
     oc.signing_keys(_provider(oc, id="p2"), d, fetch=fetch3, resolve=_PUBLIC, now=NOW)
     for i in range(5):
-        oc.signing_keys(_provider(oc, id="p2"), d, kid="nope", fetch=fetch3, resolve=_PUBLIC, now=NOW + 1 + i)
+        try:
+            oc.signing_keys(_provider(oc, id="p2"), d, kid="nope", fetch=fetch3, resolve=_PUBLIC, now=NOW + 1 + i)
+        except oc.OidcError as exc:
+            assert exc.code == oc.TEMPORARILY_UNAVAILABLE and i > 0
     assert len(fetch3.calls) == 2
+
+
+def test_a_key_fetch_that_failed_neither_throttles_the_next_nor_is_retried_at_once():
+    """Only a refetch that succeeded throttles the next one; a fetch that failed on the network is remembered for a
+    short while (the same answer, without fetching), then tried again."""
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    cache = oc.Cache()
+    oc.signing_keys(_provider(oc), d, fetch=_fetch_for(signer), cache=cache, resolve=_PUBLIC, now=NOW)
+    calls = []
+
+    def down(url, **kw):
+        calls.append(url)
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")
+    with pytest.raises(oc.OidcError):
+        oc.signing_keys(_provider(oc), d, kid="new", fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 1)
+    with pytest.raises(oc.OidcError) as e:
+        oc.signing_keys(_provider(oc), d, kid="new", fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 5)
+    assert e.value.code == oc.TEMPORARILY_UNAVAILABLE and len(calls) == 1
+    # After the pause, and with no throttle left behind by the failed refetch, the new key is fetched.
+    rotated = _fetch_for(signer, jwks={"keys": signer.jwks()["keys"] + [{**signer.jwks()["keys"][0], "kid": "new"}]})
+    keys = oc.signing_keys(_provider(oc), d, kid="new", fetch=rotated, cache=cache, resolve=_PUBLIC, now=NOW + 32)
+    assert "new" in keys
+
+
+def test_cached_answers_belong_to_the_address_and_issuer_they_were_fetched_for():
+    """A provider row pointed at another issuer, discovery address or key set does not get the old answers, however
+    recently they were cached under the same id."""
+    oc = _oc()
+    signer = Signer()
+    cache = oc.Cache()
+    first = _fetch_for(signer)
+    oc.discover(_provider(oc), fetch=first, cache=cache, resolve=_PUBLIC, now=NOW)
+    seen = len(first.calls)
+    oc.discover(_provider(oc), fetch=first, cache=cache, resolve=_PUBLIC, now=NOW + 1)
+    assert len(first.calls) == seen                                           # the same provider: cached
+    moved = _fetch_for(signer)
+    oc.discover(_provider(oc, discovery_url=ISSUER + "/other/.well-known/openid-configuration"), fetch=moved,
+                cache=cache, resolve=_PUBLIC, now=NOW + 2)
+    assert len(moved.calls) == 1                                              # another address: asked again
+    d = _disc(oc, signer)
+    keys_first = _fetch_for(signer)
+    oc.signing_keys(_provider(oc), d, fetch=keys_first, cache=cache, resolve=_PUBLIC, now=NOW)
+    import dataclasses
+    elsewhere = dataclasses.replace(d, jwks_uri=ISSUER + "/other/certs")
+    keys_moved = _fetch_for(signer)
+    oc.signing_keys(_provider(oc), elsewhere, fetch=keys_moved, cache=cache, resolve=_PUBLIC, now=NOW + 1)
+    assert len(keys_moved.calls) == 1                                         # another key-set address: fetched again
 
 
 # --------------------------------------------------------------------------- the request and the exchange
@@ -624,18 +678,42 @@ def test_a_provider_that_cannot_be_reached_is_not_asked_again_for_a_short_while(
             oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW)
         assert e.value.code == oc.TEMPORARILY_UNAVAILABLE
     assert len(calls) == 1
+    # A short while: within 30 seconds, not the hour a good answer is kept.
+    assert 0 < oc.DISCOVERY_FAILURE_SECONDS <= 60
+    with pytest.raises(oc.OidcError):
+        oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + 29)
+    assert len(calls) == 1
+    # Another provider is not held back by this one's failure.
+    other = _fetch_for(signer)
+    oc.discover(_provider(oc, id="p-other"), fetch=other, cache=cache, resolve=_PUBLIC, now=NOW + 29)
+    assert len(other.calls) == 1
     # After the pause it is asked again, and an answer is cached as before.
     up = _fetch_for(signer)
-    found = oc.discover(_provider(oc), fetch=up, cache=cache, resolve=_PUBLIC, now=NOW + oc.DISCOVERY_FAILURE_SECONDS + 1)
+    found = oc.discover(_provider(oc), fetch=up, cache=cache, resolve=_PUBLIC, now=NOW + 31)
     assert found.issuer == ISSUER
-    # An answer that is not a document is not remembered as unreachable: the next request asks again.
+    # A refresh asks however recently it failed (each failure is remembered again).
+    for later in (40, 41):
+        with pytest.raises(oc.OidcError):
+            oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW + later, refresh=True)
+    assert len(calls) == 3
+    # A name that would not resolve, or an address refused, is remembered too, and the name is not looked up again.
+    cache3, looked_up = oc.Cache(), []
+
+    def private(host):
+        looked_up.append(host)
+        return ["10.0.0.7"]
+    for _ in range(2):
+        with pytest.raises(oc.OidcError):
+            oc.discover(_provider(oc, id="p3"), fetch=_fetch_for(signer), cache=cache3, resolve=private, now=NOW)
+    assert len(looked_up) == 1
+    # An answer that is not a document (a page instead of JSON) is not remembered: the next request asks again.
     cache2, wrong = oc.Cache(), []
 
     def not_a_document(url, **kw):
         wrong.append(url)
-        raise oc.OidcError(oc.DISCOVERY_INVALID, "not JSON")
+        raise oc.OidcError(oc.PROVIDER_ERROR, "not JSON")
     for _ in range(2):
         with pytest.raises(oc.OidcError) as e:
             oc.discover(_provider(oc), fetch=not_a_document, cache=cache2, resolve=_PUBLIC, now=NOW)
-        assert e.value.code == oc.DISCOVERY_INVALID
+        assert e.value.code == oc.PROVIDER_ERROR
     assert len(wrong) == 2
