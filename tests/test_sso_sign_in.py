@@ -210,6 +210,7 @@ class Harness:
                 return {"token_type": "Bearer", "id_token": self.id_token(), "access_token": "at"}
             raise AssertionError(url)
         monkeypatch.setattr(oc, "fetch_json", fetch)
+        self.provider_fetch = fetch
         # The vault's own machinery, observed.
         monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, user: False)
         monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {"state": "optional", "in_effect": False,
@@ -665,3 +666,238 @@ def test_a_providers_time_claim_is_bounded_before_the_platform_sees_it():
     assert sso._as_time(2 ** 33 - 1) is not None
     for bad in (-5, -1, 2 ** 33, 2 ** 40, 10 ** 11, True, False, "yesterday", None, float("nan"), float("inf")):
         assert sso._as_time(bad) is None, bad
+
+
+# --------------------------------------------------------------------------- the provider's part, off the event loop
+
+async def _request(S, method, url, body=None):
+    """One request through the app on the running loop: (status, body, the loop time it finished)."""
+    import asyncio
+    out, chunks = {}, []
+    path, _, query = url.partition("?")
+    scope = {"type": "http", "http_version": "1.1", "method": method, "path": path, "raw_path": path.encode(),
+             "query_string": query.encode(), "headers": [(b"content-type", b"application/json")],
+             "client": ("203.0.113.9", 1234), "server": ("testserver", 80), "scheme": "https"}
+    payload = json.dumps(body).encode() if body is not None else b""
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    async def send(msg):
+        if msg["type"] == "http.response.start":
+            out["status"] = msg["status"]
+        elif msg["type"] == "http.response.body":
+            chunks.append(msg.get("body", b""))
+    await S.app(scope, receive, send)
+    return out["status"], b"".join(chunks), asyncio.get_running_loop().time()
+
+
+def _slow_fetch(h, monkeypatch, *, slow: str, seconds: float, release=None):
+    """The harness's provider, with the endpoint ``slow`` (a URL suffix) answering after ``seconds`` (or when
+    ``release`` is set); every fetch records the thread it ran on."""
+    import threading
+    from app.services import oidc_client as oc
+    inner = h.provider_fetch
+    h.fetch_threads = []
+
+    def fetch(url, **kw):
+        h.fetch_threads.append((url.rsplit("/", 1)[-1], threading.current_thread().name))
+        if url.endswith(slow):
+            (release or threading.Event()).wait(seconds)
+        return inner(url, **kw)
+    monkeypatch.setattr(oc, "fetch_json", fetch)
+
+
+def test_the_provider_is_called_off_the_event_loop_in_its_own_pool(monkeypatch):
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _slow_fetch(h, monkeypatch, slow="nothing", seconds=0)
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert status == 302 and location.startswith("/#sso="), location
+    names = [name for name, _ in h.fetch_threads]
+    assert "openid-configuration" in names and "token" in names and "certs" in names, names
+    # Every fetch ran in the provider pool: none on the loop's thread, none in the pool password sign-ins use.
+    assert all(thread.startswith("sso-provider") for _, thread in h.fetch_threads), h.fetch_threads
+
+
+def test_the_loop_answers_other_requests_while_a_provider_is_slow(monkeypatch):
+    import asyncio
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p])
+    _slow_fetch(h, monkeypatch, slow="openid-configuration", seconds=0.8)
+
+    async def both():
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        slow = asyncio.ensure_future(_request(h.S, "POST", f"/auth/sso/{p.id}/start", {"verifier_hash": _h("tab")}))
+        await asyncio.sleep(0.1)
+        quick = await _request(h.S, "GET", "/auth/sso/reasons")
+        slow = await slow
+        return began, quick, slow
+    began, quick, slow = run_coroutine(both(), timeout=30)
+    assert quick[0] == 200 and slow[0] == 200, (quick[:2], slow[:2])
+    # The other request was answered while the provider was still thinking, not after it.
+    assert quick[2] < slow[2] and quick[2] - began < 0.75 and slow[2] - began >= 0.8
+
+
+def test_a_provider_that_does_not_answer_in_time_is_temporarily_unavailable(monkeypatch):
+    import threading
+    from app.api import sso_router
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    monkeypatch.setattr(sso_router, "PROVIDER_WAIT_SECONDS", 0.3)
+    releases = []
+    try:
+        # The start: discovery hangs. A 503 with the reason, in a bounded time, and no state made.
+        releases.append(threading.Event())
+        _slow_fetch(h, monkeypatch, slow="openid-configuration", seconds=5, release=releases[-1])
+        began = time.monotonic()
+        status, out = h.start(p)
+        assert status == 503 and out["detail"]["reason"] == "temporarily_unavailable", out
+        assert time.monotonic() - began < 2
+        assert not any(k.startswith("sso:state:") for k in h.redis.rows)
+        # The callback: discovery answers, the token endpoint hangs. A reason in the fragment and a refusal row.
+        releases[-1].set()
+        _slow_fetch(h, monkeypatch, slow="nothing", seconds=0)
+        status, out = h.start(p)
+        assert status == 200, out
+        state, _ = h.state_of(out["authorization_url"])
+        releases.append(threading.Event())
+        _slow_fetch(h, monkeypatch, slow="/token", seconds=5, release=releases[-1])
+        began = time.monotonic()
+        status, location, _ = h.callback(p, state)
+        assert status == 302 and location == "/#sso-error=temporarily_unavailable", location
+        assert time.monotonic() - began < 2
+        assert ("sso_sign_in_refused", "failure",
+                {"provider_id": str(p.id), "purpose": "sign_in", "reason": "temporarily_unavailable"}) in h.audits
+    finally:
+        for release in releases:
+            release.set()
+
+
+def test_calls_that_outlive_their_request_never_queue_the_next_ones(monkeypatch):
+    import threading
+    from app.api import sso_router
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p])
+    _slow_fetch(h, monkeypatch, slow="nothing", seconds=0)
+    full = threading.BoundedSemaphore(1)
+    assert full.acquire(blocking=False)
+    monkeypatch.setattr(sso_router, "_provider_threads", full)
+    began = time.monotonic()
+    status, out = h.start(p)
+    assert status == 503 and out["detail"]["reason"] == "temporarily_unavailable", out
+    assert time.monotonic() - began < 1 and h.fetch_threads == []
+    # A place freed is a place used, and the call gives it back when it ends.
+    full.release()
+    status, out = h.start(p)
+    assert status == 200, out
+    assert full.acquire(blocking=False)
+    assert sso_router.PROVIDER_THREADS >= 4 and 5 <= sso_router.PROVIDER_WAIT_SECONDS <= 30
+
+
+def test_the_routes_that_reach_the_provider_hold_a_sign_in_slot_and_a_full_house_spends_no_state(monkeypatch):
+    import asyncio
+    import app.core.auth_offload as ao
+    from app.api import sso_router
+    from fastapi.routing import APIRoute
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    monkeypatch.setattr(ao, "SLOT_ACQUIRE_TIMEOUT_SECONDS", 0.1)
+    # The start (an API call) answers the house's 503; the callback (a browser navigation) a redirect into the app,
+    # with the state not spent. A semaphore a loop waited on belongs to that loop: one for each request here.
+    monkeypatch.setattr(ao, "_auth_slots", asyncio.Semaphore(0))
+    status, out = h.start(p)
+    assert status == 503, out
+    monkeypatch.setattr(ao, "_auth_slots", asyncio.Semaphore(0))
+    status, location, _ = h.callback(p, state)
+    assert status == 302 and location == "/#sso-error=temporarily_unavailable", location
+    assert "sso:state:" + state in h.redis.rows
+    # With a slot free the same callback finishes, and gives its slot back.
+    slots = asyncio.Semaphore(1)
+    monkeypatch.setattr(ao, "_auth_slots", slots)
+    status, location, _ = h.callback(p, state)
+    assert status == 302 and location.startswith("/#sso="), location
+    assert h.finish(location)[0] == 200
+    assert not slots.locked()
+
+    # The callback's slot is given back as its dependency exits, not later by the loop's clean-up of a generator.
+    async def held_then_left():
+        gen = sso_router._callback_slot()
+        assert await gen.__anext__() is True and slots.locked()
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+        return slots.locked()
+    monkeypatch.setattr(ao, "_auth_slots", slots)
+    assert run_coroutine(held_then_left(), timeout=10) is False
+    # Each route that reaches the provider takes the slot first, before the database session.
+    wanted = {"start_sign_in", "sign_in_callback", "start_reauth", "start_link"}
+    seen = set()
+    for route in sso_router.router.routes:
+        if isinstance(route, APIRoute) and route.endpoint.__name__ in wanted:
+            first = route.dependant.dependencies[0].call
+            assert first in (ao.auth_offload_slot, sso_router._callback_slot), (route.path, first)
+            seen.add(route.endpoint.__name__)
+    assert seen == wanted
+
+
+def test_no_route_calls_the_provider_on_the_event_loop():
+    """Structural: inside every async route of the single sign-on router, a call that reaches the provider is made in
+    a function handed off the loop (a lambda or a nested function), never directly; the sign-out, which may read the
+    provider's discovery, is a plain function, which the framework runs in its thread pool."""
+    import ast
+    import inspect
+    from app.api import sso_router
+    reaching = {("sso", "start"), ("sso", "verified_answer"), ("sso", "provider_logout_url"), ("oc", "discover"),
+                ("oc", "exchange_code"), ("oc", "verify_id_token"), ("oc", "verify_logout_token"),
+                ("oc", "signing_keys"), ("oc", "userinfo"), ("oc", "fetch_json")}
+    tree = ast.parse(inspect.getsource(sso_router))
+    direct = []
+
+    def walk(node, deferred):
+        for child in ast.iter_child_nodes(node):
+            func = child.func if isinstance(child, ast.Call) else None
+            if not deferred and isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                    and (func.value.id, func.attr) in reaching:
+                direct.append((func.value.id + "." + func.attr, child.lineno))
+            walk(child, deferred or isinstance(child, (ast.Lambda, ast.FunctionDef)))
+    routes = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)]
+    assert len(routes) >= 8
+    for route in routes:
+        walk(route, False)
+    assert direct == [], direct
+    assert not inspect.iscoroutinefunction(_api().sign_out)
+
+
+def test_a_sign_in_goes_through_while_the_provider_cannot_serve_its_discovery_or_keys(monkeypatch, caplog):
+    import logging
+    from app.services import oidc_client as oc
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert h.finish(location)[0] == 200
+    # The hour's copies lapse, and the provider's discovery and keys fail; its token endpoint still answers.
+    for key in [k for k in oc._DEFAULT_CACHE._rows if k.startswith(("sso:disc:", "sso:jwks:"))]:
+        oc._DEFAULT_CACHE.clear(key)
+    inner = h.provider_fetch
+
+    def broken(url, **kw):
+        if url.endswith(("openid-configuration", "/certs")):
+            raise oc.OidcError(oc.PROVIDER_ERROR, "the provider answered 500")
+        return inner(url, **kw)
+    monkeypatch.setattr(oc, "fetch_json", broken)
+    caplog.set_level(logging.WARNING, logger="dockvault.sso")
+    status, out = h.start(p)
+    assert status == 200, out
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert status == 302 and location.startswith("/#sso="), location
+    assert h.finish(location)[0] == 200
+    warned = [r.getMessage() for r in caplog.records if "could not be fetched" in r.getMessage()]
+    assert any("discovery document" in w for w in warned) and any("key set" in w for w in warned), warned

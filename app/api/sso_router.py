@@ -14,8 +14,11 @@ the callback is public and an error answer there is unsigned, so a refusal never
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -26,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.api.user_management_api import get_current_user, require_interactive_admin
 from app.core import sso_state
+from app.core.auth_offload import auth_offload_slot
 from app.core.database import get_db
 from app.core.models import ExternalIdentity, SsoProvider, User
 from app.services import oidc_client as oc
@@ -57,6 +61,65 @@ class _ProviderUnusable(Exception):
 
 FINISH_LIMIT = 30                    # handover claims per address per FINISH_WINDOW
 FINISH_WINDOW = 300
+
+# The provider's part of a start or a callback (discovery, the code exchange, the ID token's keys) runs off the event
+# loop. Each route that reaches the provider holds one of the house's sign-in slots (app/core/auth_offload.py) from
+# its first dependency, so the database connections such requests hold are the ones the pool already counts; the
+# calls themselves run in a pool of their own, so a provider that hangs never holds the threads password sign-ins use.
+PROVIDER_WAIT_SECONDS = 20.0          # the longest a person waits for the provider's part of one request; past it the
+                                      # answer is temporarily unavailable (each fetch also stops at its own 10 s)
+PROVIDER_THREADS = 8                  # provider calls running at once, per process; beyond, temporarily unavailable
+_provider_pool = ThreadPoolExecutor(max_workers=PROVIDER_THREADS, thread_name_prefix="sso-provider")
+_provider_threads = threading.BoundedSemaphore(PROVIDER_THREADS)
+
+
+async def _provider_call(fn, *args, deadline: float, **kwargs):
+    """Run ``fn(*args, **kwargs)``, work that reaches the provider, in the provider pool, off the event loop; once
+    ``deadline`` (the loop's clock) passes, :class:`oc.OidcError` ``temporarily_unavailable``. A call that ran out of
+    time is not stopped (Python cannot stop a thread): its fetches end by their own timeouts and it keeps its place
+    in the pool until then, so calls that outlive their request never queue the next ones; when every place is taken
+    the answer is temporarily unavailable at once."""
+    if not _provider_threads.acquire(blocking=False):
+        log.warning("sso: every provider call is in use; answered temporarily unavailable")
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "every provider call is in use")
+    ctx = contextvars.copy_context()
+
+    def work():
+        try:
+            return ctx.run(fn, *args, **kwargs)
+        finally:
+            _provider_threads.release()
+    loop = asyncio.get_running_loop()
+    try:
+        future = loop.run_in_executor(_provider_pool, work)
+    except BaseException:
+        _provider_threads.release()
+        raise
+    try:
+        return await asyncio.wait_for(future, timeout=max(0.0, deadline - loop.time()))
+    except asyncio.TimeoutError:
+        log.warning("sso: the provider did not answer within %s s; answered temporarily unavailable",
+                    PROVIDER_WAIT_SECONDS)
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "the provider did not answer in time") from None
+
+
+def _provider_deadline() -> float:
+    return asyncio.get_running_loop().time() + PROVIDER_WAIT_SECONDS
+
+
+async def _callback_slot():
+    """The house's sign-in slot for the provider's callback, which a browser navigates to: when every slot stays
+    taken the route answers with a redirect into the web app (the state not yet spent), not a JSON page."""
+    held = auth_offload_slot()
+    try:
+        await held.__anext__()
+    except HTTPException:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        await held.aclose()          # auth_offload_slot's own finally gives the slot back
 
 
 class SsoStartRequest(BaseModel):
@@ -181,6 +244,7 @@ async def start_sign_in(
     provider_id: str,
     body: SsoStartRequest,
     request: Request,
+    _offload_slot: None = Depends(auth_offload_slot),
     db: Session = Depends(get_db),
 ):
     """Start a single sign-on: the login state is made and the provider's authorization URL answered. The body
@@ -206,10 +270,10 @@ async def start_sign_in(
         extras = {"invitation_id": str(_invitation_for_start(db, body.invitation, client_ip).id)}
     from app.core import sign_in_lockout
     try:
-        url = sso.start(row, purpose=purpose,
-                        source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
-                        verifier_hash=body.verifier_hash, code_challenge=body.code_challenge, return_to=body.return_to,
-                        extras=extras)
+        url = await _provider_call(sso.start, row, purpose=purpose,
+                                   source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
+                                   verifier_hash=body.verifier_hash, code_challenge=body.code_challenge,
+                                   return_to=body.return_to, extras=extras, deadline=_provider_deadline())
     except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
         raise _refused_start(exc)
     return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
@@ -230,6 +294,7 @@ async def sign_in_callback(
     code: Optional[str] = None,
     iss: Optional[str] = None,
     error: Optional[str] = None,
+    slot_held: bool = Depends(_callback_slot),
     db: Session = Depends(get_db),
 ):
     """Where the provider sends the browser back. The state is spent first (one use, whatever follows); the
@@ -237,6 +302,8 @@ async def sign_in_callback(
     a provider ``error`` is a refusal with no consequence for any account. Then the code exchange, the token
     checks and the purpose's own step. The answer is always a redirect into the web app: a one-time code for a
     sign-in, a confirmation for a link, a reason otherwise."""
+    if not slot_held:
+        return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)       # the state is not spent: a reload may finish
     api = _api()
     client_ip = api.get_client_ip(request)
     try:
@@ -263,8 +330,10 @@ async def sign_in_callback(
         return _redirect("sso-error=" + why)
     # RFC 9207: a provider that advertises the iss parameter must send it, and it must be the issuer; one that
     # does not advertise it is held to it whenever it does send it.
+    # The provider's part, off the event loop, bounded together.
+    deadline = _provider_deadline()
     try:
-        discovery = oc.discover(sso.provider_config(row))
+        discovery = await _provider_call(lambda: oc.discover(sso.provider_config(row)), deadline=deadline)
     except (sso.Refusal, oc.OidcError) as exc:
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
         return _redirect("sso-error=" + exc.code)
@@ -272,7 +341,7 @@ async def sign_in_callback(
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": oc.ISSUER_MISMATCH})
         return _redirect("sso-error=" + oc.ISSUER_MISMATCH)
     try:
-        answer = sso.verified_answer(row, login, code=code)
+        answer = await _provider_call(sso.verified_answer, row, login, code=code, deadline=deadline)
     except (sso.Refusal, oc.OidcError) as exc:
         log.info("sso callback refused for provider %s: %s", login.provider_id, exc)
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
@@ -542,6 +611,7 @@ async def start_reauth(
     provider_id: str,
     body: SsoReauthStartRequest,
     request: Request,
+    _offload_slot: None = Depends(auth_offload_slot),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -566,9 +636,11 @@ async def start_reauth(
         raise HTTPException(status_code=404, detail="Your account has no identity on this provider.")
     from app.core import sign_in_lockout
     try:
-        url = sso.start(row, purpose=sso_state.STEP_UP, source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
-                        verifier_hash=body.verifier_hash, user_id=current_user.id, session_hash=api._current_session_hash(request),
-                        step_up_action=body.action, reauthenticate=True, login_hint=identity.email_at_link or None)
+        url = await _provider_call(
+            sso.start, row, purpose=sso_state.STEP_UP, source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
+            verifier_hash=body.verifier_hash, user_id=current_user.id, session_hash=api._current_session_hash(request),
+            step_up_action=body.action, reauthenticate=True, login_hint=identity.email_at_link or None,
+            deadline=_provider_deadline())
     except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
         raise _refused_start(exc)
     return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
@@ -779,6 +851,7 @@ async def start_link(
     provider_id: str,
     body: SsoLinkStartRequest,
     request: Request,
+    _offload_slot: None = Depends(auth_offload_slot),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -810,9 +883,9 @@ async def start_link(
                                                      "message": "Your account is already linked to this provider."})
     from app.core import sign_in_lockout
     try:
-        url = sso.start(row, purpose=sso_state.LINK, source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
-                        verifier_hash=body.verifier_hash, user_id=current_user.id,
-                        session_hash=api._current_session_hash(request))
+        url = await _provider_call(sso.start, row, purpose=sso_state.LINK, source=sign_in_lockout.source_of(client_ip),
+                                   client_ip=client_ip, verifier_hash=body.verifier_hash, user_id=current_user.id,
+                                   session_hash=api._current_session_hash(request), deadline=_provider_deadline())
     except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
         raise _refused_start(exc)
     return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
