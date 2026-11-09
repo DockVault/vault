@@ -13071,22 +13071,38 @@ def _extend_expiry(db, request, current_user, *, item, kind, id_key, owner_id, b
         raise HTTPException(status_code=404, detail="Not found.")
     new = _parse_new_expiry(body.expires_at)
     now = datetime.utcnow()
+    current = item.expires_at
+    if current is None:
+        raise HTTPException(status_code=400, detail=f"This {kind} never expires; there is nothing to extend.")
     if new <= now:
         raise HTTPException(status_code=400, detail="The new expiry must be in the future.")
-    current = item.expires_at
-    if current is not None and new <= current:
+    if new <= current:
         raise HTTPException(status_code=400, detail="The new expiry must be later than the current one.")
     if ceiling is not None and new > ceiling:
         raise HTTPException(status_code=400, detail=(
-            f"This {kind}'s type allows an expiry no later than {ceiling.replace(microsecond=0).isoformat()}Z."))
+            f"This {kind}'s type allows an expiry no later than {_readable_utc(ceiling)}."))
     if new - now > timedelta(days=_EXTEND_LONG_DAYS):
         _extend_long_step_up(db, current_user, request)
     item.expires_at = new
     db.commit()
-    details = {id_key: str(item.id), "previous_expiry": current.isoformat() + "Z" if current else None,
+    details = {id_key: str(item.id), "previous_expiry": current.isoformat() + "Z",
                "new_expiry": new.isoformat() + "Z", "by_admin": owner_id != current_user.id}
     details.update(extra or {})
     return details
+
+
+def _readable_utc(dt) -> str:
+    """A date and time a person can read, in UTC: "16 Nov 2026, 01:44 UTC"."""
+    return dt.strftime("%d %b %Y, %H:%M UTC").lstrip("0")
+
+
+def _extend_answer(full: dict, *, item, ceiling, by_owner: bool) -> dict:
+    """What an extension answers: the maker gets the item as their own list shows it; anyone else (an
+    administrator) gets only the id, the new expiry and the ceiling, never the item's content."""
+    tail = {"ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+    if by_owner:
+        return {**full, **tail}
+    return {"id": str(item.id), "expires_at": item.expires_at.isoformat() if item.expires_at else None, **tail}
 
 
 def _record_extension(action_call) -> None:
@@ -13107,25 +13123,56 @@ def _ceiling(created_at, minutes=None, hours=None):
     return None
 
 
+def _link_type_for_extension(tag, kind: str):
+    """A link's type (its tag) must still exist for its expiry to move: the type holds the ceiling. A tag
+    with no maximum lifetime sets no ceiling."""
+    if tag is None:
+        raise HTTPException(status_code=400, detail=f"This {kind}'s type no longer exists, so its expiry cannot be moved.")
+    return tag
+
+
 @app.post("/shares/{share_id}/extend")
 async def extend_share(share_id: uuid.UUID, body: ExtendExpiryBody, request: Request,
                        current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Move a share's expiry later: its maker or an administrator, within the tag's ceiling counted from
-    the share's creation, recorded; more than a week from now needs the account's second factor."""
+    """Move a share's expiry later: its maker or an administrator, within the ceiling the share's type
+    set when the share was made, recorded; more than a week from now needs the account's second factor.
+    What its making checked is checked again: sharing is on, the maker still reads the vault, the type is
+    active and still admits the maker, and the type lets its makers choose a lifetime. An expired share
+    stays expired."""
     share = db.query(Share).filter(Share.id == share_id).first()
     if share is None or not _may_extend(db, current_user, share.creator_id):
         raise HTTPException(status_code=404, detail="Not found.")
-    if share.status != "active":
+    if _share_effective_status(share) != "active":
         raise HTTPException(status_code=400, detail="Only an active share can be extended.")
+    if not _sharing_enabled(db):
+        raise HTTPException(status_code=403, detail="Sharing is disabled on this deployment.")
+    snapshot = share.tag_policy_snapshot if isinstance(share.tag_policy_snapshot, dict) else {}
+    if snapshot.get("allow_custom") is False:
+        raise HTTPException(status_code=400, detail="This share's type sets the lifetime itself; it cannot be extended.")
     tag = db.query(ShareTag).filter(ShareTag.id == share.tag_id).first()
-    ceiling = _ceiling(share.created_at, minutes=tag.max_lifetime_minutes) if tag else None
+    maker = db.query(User).filter(User.id == share.creator_id).first()
+    if (maker is None or not maker.is_active
+            or not PermissionService(db).can_access_vault(maker, share.vault_id, VaultPermissionEnum.READ)):
+        raise HTTPException(status_code=400, detail=(
+            "The share's maker no longer has access to this vault, so it cannot be extended; make a new share."))
+    if tag is None or not tag.is_active:
+        raise HTTPException(status_code=400, detail="This share's type is inactive; the share cannot be extended.")
+    allowlist = {"is_active": tag.is_active, "blocked_user_ids": tag.blocked_user_ids,
+                 "allowed_user_ids": tag.allowed_user_ids, "allowed_department_ids": tag.allowed_department_ids,
+                 "auto_enroll_new_users": tag.auto_enroll_new_users}
+    if not sharing_policy.user_can_create_with_tag(allowlist, maker.id, _user_group_ids(db, maker.id)):
+        raise HTTPException(status_code=400, detail=(
+            "This share's type no longer admits its maker, so the share cannot be extended."))
+    # The ceiling the share was made under; a type widened since does not widen the shares before it.
+    ceiling = _ceiling(share.created_at, minutes=snapshot.get("max_lifetime_minutes") or tag.max_lifetime_minutes)
     details = _extend_expiry(db, request, current_user, item=share, kind="share", id_key="share_id",
                              owner_id=share.creator_id, body=body, ceiling=ceiling,
                              extra={"vault_id": str(share.vault_id)})
     _record_extension(lambda: AuditLogger(db).log_action(
         action="share_extended", status="success", user=current_user, resource_type="share",
         resource_id=str(share.id), ip_address=get_client_ip(request), details=details))
-    return {**_share_dict(db, share), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+    by_owner = share.creator_id == current_user.id
+    return _extend_answer(_share_dict(db, share) if by_owner else {}, item=share, ceiling=ceiling, by_owner=by_owner)
 
 
 @app.post("/public-links/{link_id}/extend")
@@ -13134,16 +13181,20 @@ async def extend_public_link(link_id: uuid.UUID, body: ExtendExpiryBody, request
     link = db.query(PublicLink).filter(PublicLink.id == link_id).first()
     if link is None or not _may_extend(db, current_user, link.owner_id):
         raise HTTPException(status_code=404, detail="Not found.")
-    if link.revoked:
-        raise HTTPException(status_code=400, detail="A revoked link cannot be extended.")
-    tag = db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None
-    ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
+    status = _notelink_status(link)   # the same lifecycle fields as a note link
+    if status != "active":
+        raise HTTPException(status_code=400, detail=f"Only an active public link can be extended; this one is {status}.")
+    tag = _link_type_for_extension(
+        db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None, "public link")
+    ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=link, kind="public link", id_key="link_id",
                              owner_id=link.owner_id, body=body, ceiling=ceiling)
     _record_extension(lambda: AuditLogger(db).log_action(
         action="public_link_extended", status="success", user=current_user, resource_type="public_link",
         resource_id=str(link.id), ip_address=get_client_ip(request), details=details))
-    return {**_publiclink_public_dict(link, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+    by_owner = link.owner_id == current_user.id
+    return _extend_answer(_publiclink_public_dict(link, tag) if by_owner else {}, item=link, ceiling=ceiling,
+                          by_owner=by_owner)
 
 
 @app.post("/note-links/{link_id}/extend")
@@ -13152,16 +13203,21 @@ async def extend_note_link(link_id: uuid.UUID, body: ExtendExpiryBody, request: 
     link = db.query(NoteLink).filter(NoteLink.id == link_id).first()
     if link is None or not _may_extend(db, current_user, link.owner_id):
         raise HTTPException(status_code=404, detail="Not found.")
-    if link.revoked:
-        raise HTTPException(status_code=400, detail="A revoked link cannot be extended.")
-    tag = db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None
-    ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
+    status = _notelink_status(link)
+    if status != "active":
+        raise HTTPException(status_code=400, detail=f"Only an active note link can be extended; this one is {status}.")
+    tag = _link_type_for_extension(
+        db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None, "note link")
+    ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=link, kind="note link", id_key="link_id",
                              owner_id=link.owner_id, body=body, ceiling=ceiling)
     _record_extension(lambda: AuditLogger(db).log_action(
         action="note_link_extended", status="success", user=current_user, resource_type="note_link",
         resource_id=str(link.id), ip_address=get_client_ip(request), details=details))
-    return {**_notelink_public_dict(link, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+    # An administrator never receives the note's content: the maker's view is for the maker alone.
+    by_owner = link.owner_id == current_user.id
+    return _extend_answer(_notelink_public_dict(link, tag) if by_owner else {}, item=link, ceiling=ceiling,
+                          by_owner=by_owner)
 
 
 @app.post("/receivers/{receiver_id}/extend")
@@ -13170,16 +13226,20 @@ async def extend_receiver(receiver_id: uuid.UUID, body: ExtendExpiryBody, reques
     r = db.query(Receiver).filter(Receiver.id == receiver_id).first()
     if r is None or not _may_extend(db, current_user, r.owner_id):
         raise HTTPException(status_code=404, detail="Not found.")
-    if r.revoked:
-        raise HTTPException(status_code=400, detail="A revoked upload link cannot be extended.")
-    tag = db.query(ReceiverTag).filter(ReceiverTag.id == r.tag_id).first() if r.tag_id else None
-    ceiling = _ceiling(r.created_at, hours=tag.max_ttl_hours) if tag and tag.max_ttl_hours else None
+    status = _receiver_status(r)
+    if status not in ("active", "paused"):
+        raise HTTPException(status_code=400, detail=f"Only an active or paused upload link can be extended; this one is {status}.")
+    tag = _link_type_for_extension(
+        db.query(ReceiverTag).filter(ReceiverTag.id == r.tag_id).first() if r.tag_id else None, "upload link")
+    ceiling = _ceiling(r.created_at, hours=tag.max_ttl_hours) if tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=r, kind="upload link", id_key="receiver_id",
                              owner_id=r.owner_id, body=body, ceiling=ceiling)
     _record_extension(lambda: AuditLogger(db).log_action(
         action="receiver_extended", status="success", user=current_user, resource_type="receiver",
         resource_id=str(r.id), ip_address=get_client_ip(request), details=details))
-    return {**_receiver_public_dict(r, tag), "ceiling": ceiling.isoformat() + "Z" if ceiling else None}
+    by_owner = r.owner_id == current_user.id
+    return _extend_answer(_receiver_public_dict(r, tag) if by_owner else {}, item=r, ceiling=ceiling,
+                          by_owner=by_owner)
 
 
 # ---- reminders before an expiry --------------------------------------------------------------------------------

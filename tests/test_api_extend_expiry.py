@@ -135,3 +135,114 @@ def test_a_temporary_credential_cannot_extend(admin, sharing_on):
         assert t.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(datetime.utcnow() + timedelta(hours=2))}).status_code in (403, 404)
     finally:
         admin.delete_vault(v["id"])
+
+
+def test_an_administrator_who_extends_another_persons_note_link_gets_no_content(admin):
+    settings_before = admin.get("/settings").json()
+    admin.put("/settings", json={"public_note_links_enabled": True, "public_note_link_user_cap": 50})
+    owner = admin.create_user(role="user")
+    co = ApiClient(); co.login(owner["_username"], owner["_password"])
+    try:
+        tag = admin.post("/note-link-tags", json={"name": unique("nl"), "min_token_len": 6, "require_secret": "none",
+                                                  "auto_enroll_new_users": True, "allowed_targets": ["note"],
+                                                  "default_ttl_hours": 24, "max_ttl_hours": 72})
+        if tag.status_code != 200:
+            pytest.skip(f"no note-link tag here: {tag.status_code} {tag.text[:100]}")
+        note = co.post("/notes", json={"title": "salary review", "body": "PRIVATE-BODY the door code"}).json()
+        link = co.post("/note-links", json={"note_id": note["id"], "tag_id": tag.json()["id"], "ttl_hours": 24})
+        assert link.status_code in (200, 201), link.text
+        was = _parse(link.json()["expires_at"])
+        # An administrator may move the expiry, and learns nothing of the note from the answer.
+        r = admin.post(f"/note-links/{link.json()['id']}/extend", json={"expires_at": _iso(was + timedelta(hours=1))})
+        assert r.status_code == 200, r.text
+        assert set(r.json()) == {"id", "expires_at", "ceiling"}, r.json()
+        assert "PRIVATE-BODY" not in r.text and "salary" not in r.text
+        # The maker gets their own view back, body included.
+        r = co.post(f"/note-links/{link.json()['id']}/extend", json={"expires_at": _iso(was + timedelta(hours=2))})
+        assert r.status_code == 200, r.text
+        assert r.json()["body"].startswith("PRIVATE-BODY") and r.json()["ceiling"]
+    finally:
+        admin.delete_user(owner["id"])
+        admin.put("/settings", json={k: settings_before.get(k) for k in
+                                     ("public_note_links_enabled", "public_note_link_user_cap")})
+
+
+def test_a_share_whose_maker_lost_the_vault_cannot_be_extended(admin, sharing_on):
+    tag = admin.post("/share-tags", json={"name": unique("lost"), "allowed_audiences": ["anyone_internal"],
+                                          "max_recipients_cap": 10, "auto_enroll_new_users": True,
+                                          "max_lifetime_minutes": 10 * 24 * 60, "default_lifetime_minutes": 24 * 60}).json()
+    maker = admin.create_user(role="user")
+    cm = ApiClient(); cm.login(maker["_username"], maker["_password"])
+    v = admin.create_vault(name=unique("lostv"))
+    try:
+        assert admin.post(f"/vaults/{v['id']}/permissions", json={"user_id": maker["id"], "level": "read"}).status_code == 200
+        share = cm.post("/shares", json={"vault_id": v["id"], "tag_id": tag["id"], "target_type": "vault",
+                                         "claim_audience": "anyone_internal", "lifetime_minutes": 24 * 60})
+        assert share.status_code == 200, share.text
+        later = _iso(_parse(share.json()["expires_at"]) + timedelta(days=2))
+        assert admin.delete(f"/vaults/{v['id']}/permissions/{maker['id']}").status_code == 200
+        # Neither the maker nor an administrator can lengthen a share its maker could not make today.
+        r = cm.post(f"/shares/{share.json()['id']}/extend", json={"expires_at": later})
+        assert r.status_code == 400 and "no longer has access" in r.text, r.text
+        r = admin.post(f"/shares/{share.json()['id']}/extend", json={"expires_at": later})
+        assert r.status_code == 400 and "no longer has access" in r.text, r.text
+    finally:
+        admin.delete_vault(v["id"])
+        admin.delete_user(maker["id"])
+
+
+def test_an_expired_share_stays_expired_and_a_locked_lifetime_or_a_widened_type_does_not_move(admin, sharing_on):
+    tag = admin.post("/share-tags", json={"name": unique("exp"), "allowed_audiences": ["anyone_internal"],
+                                          "max_recipients_cap": 10, "auto_enroll_new_users": True,
+                                          "max_lifetime_minutes": 2 * 24 * 60, "default_lifetime_minutes": 24 * 60}).json()
+    locked = admin.post("/share-tags", json={"name": unique("lock"), "allowed_audiences": ["anyone_internal"],
+                                             "max_recipients_cap": 10, "auto_enroll_new_users": True, "allow_custom": False,
+                                             "max_lifetime_minutes": 10 * 24 * 60, "default_lifetime_minutes": 24 * 60}).json()
+    v = admin.create_vault(name=unique("expv"))
+    try:
+        share = admin.post("/shares", json={"vault_id": v["id"], "tag_id": tag["id"], "target_type": "vault",
+                                            "claim_audience": "anyone_internal", "lifetime_minutes": 24 * 60}).json()
+        # The type is widened afterwards: the share keeps the ceiling it was made under.
+        assert admin.patch(f"/share-tags/{tag['id']}", json={"max_lifetime_minutes": 20 * 24 * 60}).status_code == 200
+        r = admin.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(datetime.utcnow() + timedelta(days=10))})
+        assert r.status_code == 400 and "no later than" in r.text, r.text
+        r = admin.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(datetime.utcnow() + timedelta(hours=36))})
+        assert r.status_code == 200, r.text
+        # Past its expiry, untouched by anyone, it stays expired.
+        _psql(f"UPDATE shares SET expires_at = now() - interval '1 minute' WHERE id = '{share['id']}'")
+        r = admin.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(datetime.utcnow() + timedelta(hours=40))})
+        assert r.status_code == 400 and "active share" in r.text, r.text
+        # A type whose makers cannot choose a lifetime gives them no extension either.
+        fixed = admin.post("/shares", json={"vault_id": v["id"], "tag_id": locked["id"], "target_type": "vault",
+                                            "claim_audience": "anyone_internal"}).json()
+        r = admin.post(f"/shares/{fixed['id']}/extend", json={"expires_at": _iso(datetime.utcnow() + timedelta(days=3))})
+        assert r.status_code == 400 and "sets the lifetime" in r.text, r.text
+    finally:
+        admin.delete_vault(v["id"])
+
+
+def test_a_long_extension_needs_the_second_factor_of_an_enrolled_account(admin, sharing_on):
+    from _sf_helpers import enroll_totp, step_up_receipt
+    tag = admin.post("/share-tags", json={"name": unique("far"), "allowed_audiences": ["anyone_internal"],
+                                          "max_recipients_cap": 10, "auto_enroll_new_users": True,
+                                          "max_lifetime_minutes": 90 * 24 * 60, "default_lifetime_minutes": 24 * 60}).json()
+    maker = admin.create_user(role="user")
+    cm = ApiClient(); cm.login(maker["_username"], maker["_password"])
+    v = cm.create_vault(name=unique("farv"))
+    try:
+        _secret, codes = enroll_totp(maker, cm)
+        share = cm.post("/shares", json={"vault_id": v["id"], "tag_id": tag["id"], "target_type": "vault",
+                                         "claim_audience": "anyone_internal", "lifetime_minutes": 24 * 60}).json()
+        # Within a week: nothing asked of the same enrolled account.
+        r = cm.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(datetime.utcnow() + timedelta(days=3))})
+        assert r.status_code == 200, r.text
+        far = _iso(datetime.utcnow() + timedelta(days=30))
+        r = cm.post(f"/shares/{share['id']}/extend", json={"expires_at": far})
+        assert r.status_code == 403 and "step_up_required" in r.text, r.text
+        r = cm.post(f"/shares/{share['id']}/extend", json={"expires_at": far},
+                    headers={"X-Second-Factor": step_up_receipt(cm, action="link.extend_long", recovery_codes=codes)})
+        assert r.status_code == 200, r.text
+        assert _parse(r.json()["expires_at"]) == _parse(far)
+    finally:
+        cm.delete_vault(v["id"])
+        admin.delete_user(maker["id"])
