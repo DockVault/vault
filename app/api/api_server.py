@@ -11924,6 +11924,7 @@ PASSKEY_CHALLENGE_WINDOW = 600
 
 
 class PasskeySignInOptionsRequest(BaseModel):
+    # Accepted for older clients and ignored: the options never depend on who is named (see the route).
     username: Optional[str] = Field(default=None, max_length=320)
 
 
@@ -11952,21 +11953,6 @@ def _passkey_limit_challenge(client_ip: str) -> None:
     if not allowed:
         raise HTTPException(status_code=429, detail="Too many requests. Try again later.",
                             headers={"Retry-After": str(retry_after_seconds(reset, PASSKEY_CHALLENGE_WINDOW))})
-
-
-def _passkey_account_for(db, username):
-    """The account a sign-in names, by the deployment's identifier policy (username, email, or either), or None.
-    Never raises and never tells the caller which case it was."""
-    if not isinstance(username, str) or not username.strip():
-        return None
-    from app.core.email_identity import find_user_by_email
-    policy = _login_identifier(db)
-    if policy == "email":
-        return find_user_by_email(db, username)
-    user = db.query(User).filter(User.username == username).first()
-    if user is None and policy == "either":
-        user = find_user_by_email(db, username)
-    return user
 
 
 def _passkey_passwordless_allowed(db, user) -> bool:
@@ -12037,10 +12023,10 @@ async def passkey_sign_in_options(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """A challenge for signing in with a passkey. With a username, ``allowCredentials`` lists that account's
-    keys when the account exists and has keys; in every other case (no name, an unknown name, a name without
-    keys) it is an empty list and the browser offers the person's discoverable keys. The three cases are
-    indistinguishable to the caller."""
+    """A challenge for signing in with a passkey, the same for every caller: ``allowCredentials`` is always empty, so
+    the browser offers the person's discoverable keys. A typed username is ignored and no account is looked up, so
+    the answer never tells whether a name exists or holds passkeys. A key that is not discoverable does not sign in
+    alone; it still serves as the second factor after the password, where the account is known."""
     from app.core import webauthn_challenges
     from app.services import webauthn_service as ws
     client_ip = get_client_ip(request)
@@ -12049,17 +12035,11 @@ async def passkey_sign_in_options(
     if rp is None:
         raise HTTPException(status_code=409, detail="Passkeys are not available on this deployment.")
     policy = _passkey_policy(db)
-    allow = []
-    user = _passkey_account_for(db, body.username)
-    if user is not None:
-        allow = [(c.credential_id, tuple(c.transports or ())) for c in _passkeys_of(db, user.id)]
     try:
-        challenge = webauthn_challenges.issue(
-            webauthn_challenges.SIGN_IN, user_id=str(user.id) if user is not None and allow else None,
-            allow_ids=[ws.b64url(cid) for cid, _t in allow])
+        challenge = webauthn_challenges.issue(webauthn_challenges.SIGN_IN, user_id=None, allow_ids=[])
     except webauthn_challenges.Unavailable:
         raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
-    options = ws.authentication_options(rp, policy, challenge=challenge.challenge_bytes, allow=allow)
+    options = ws.authentication_options(rp, policy, challenge=challenge.challenge_bytes, allow=[])
     return {"challenge_id": challenge.id, "options": options, "expires_in": webauthn_challenges.TTL_SECONDS}
 
 

@@ -3,6 +3,7 @@ real routes (the challenge in Redis, the row in Postgres), the key is listed, re
 administrator's removal goes through the two-person rule, and a second-factor reset retires every key. Needs a
 stack whose configured address (the first ALLOWED_HOSTS entry) is the address the test opens (the relying party is
 bound to it); skipped otherwise."""
+import json
 import os
 import uuid
 
@@ -135,11 +136,12 @@ def test_a_passkey_signs_a_user_in_and_an_administrator_goes_on_to_the_password(
     r, auth = _register(client, "sign-in key")
     assert r.status_code == 201, r.text
     anon = ApiClient()
-    # The challenge, with the account's key offered by name; the assertion; a session with amr hwk and mfa_at.
+    # The challenge (the same for everyone: no key offered, a typed name ignored); the assertion with the key's own
+    # user handle; a session with amr hwk and mfa_at.
     r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/options", json={"username": client.username}, timeout=15)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert len(body["options"]["publicKey"]["allowCredentials"]) == 1
+    assert body["options"]["publicKey"]["allowCredentials"] == []
     credential = auth.get_assertion(body["options"], _public_url(), sign_count=1)
     r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/verify",
                           json={"challenge_id": body["challenge_id"], "credential": credential}, timeout=15)
@@ -166,10 +168,17 @@ def test_a_passkey_signs_a_user_in_and_an_administrator_goes_on_to_the_password(
     r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/verify",
                           json={"challenge_id": body["challenge_id"], "credential": credential}, timeout=15)
     assert r.status_code == 401 and r.json()["detail"] == "That passkey was not accepted."
-    # An unknown name and a name without keys get the same shape as a known one.
-    for name in ("nobody-" + uid[:8], admin.user["username"] if getattr(admin, "user", None) else "admin"):
-        r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/options", json={"username": name}, timeout=15)
+    # An unknown name, a name without keys, a name with keys and no name: one answer apart from the challenge.
+    shapes = []
+    for name in ("nobody-" + uid[:8], admin.user["username"] if getattr(admin, "user", None) else "admin",
+                 client.username, None):
+        r = anon.session.post(f"{anon.base_url}/auth/passkeys/sign-in/options",
+                              json={"username": name} if name else {}, timeout=15)
         assert r.status_code == 200 and r.json()["options"]["publicKey"]["allowCredentials"] == []
+        pk = dict(r.json()["options"]["publicKey"])
+        pk.pop("challenge")
+        shapes.append((sorted(r.json()), json.dumps(pk, sort_keys=True)))
+    assert len(set((tuple(a), b) for a, b in shapes)) == 1
     # The sign-in page may show the passkey button.
     assert anon.session.get(f"{anon.base_url}/auth/policy", timeout=15).json()["methods"]["passkeys"] is True
 

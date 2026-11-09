@@ -182,40 +182,48 @@ class Harness:
 
 # --------------------------------------------------------------------------- the challenge
 
-def test_the_challenge_answer_has_one_shape_for_every_name(monkeypatch):
+def test_the_options_are_the_same_for_every_caller_and_look_nobody_up(monkeypatch):
+    """No name, an unknown name, a known name without passkeys, a known name with passkeys (by username and by email
+    under every identifier policy): one answer, apart from the challenge. allowCredentials is always empty, the key
+    sets are equal, and the route reads no account and no passkey, so it cannot tell anyone which names exist or hold
+    passkeys."""
     alice, bob = _user(), _user("bob")
     h = Harness(monkeypatch, [alice, bob])
     auth, row = h.enroll(alice)
-    for name in (None, "nobody", "bob"):            # no name, an unknown name, a name without keys
-        status, body = h.options(name)
-        assert status == 200, body
+    from app.core.models import User, WebAuthnCredential
+    read = []
+    real_query = h.db.query
+
+    def query(*entities):
+        read.append(entities)
+        return real_query(*entities)
+    monkeypatch.setattr(h.db, "query", query)
+    answers = []
+    for policy in ("username", "email", "either"):
+        monkeypatch.setattr(h.S, "_login_identifier", lambda db, policy=policy: policy)
+        for name in (None, "nobody", "bob", "alice", "alice@example.test"):
+            status, body = h.options(name)
+            assert status == 200, body
+            answers.append(body)
+    first = answers[0]
+    for body in answers:
         pk = body["options"]["publicKey"]
         assert pk["allowCredentials"] == [] and pk["rpId"] == RP_ID and pk["userVerification"] == "required"
-        assert set(body) == {"challenge_id", "options", "expires_in"} and body["expires_in"] == 300
-    status, body = h.options("alice")
-    allowed = body["options"]["publicKey"]["allowCredentials"]
-    assert len(allowed) == 1 and allowed[0]["transports"] == ["internal"]
-    # The challenge remembers whose keys it offered; one without a name is bound to no account.
-    stored = [json.loads(v) for v in h.redis.rows.values()]
-    assert sorted(s["user_id"] is not None for s in stored) == [False, False, False, True]
-    assert all(s["purpose"] == "sign_in" for s in stored)
+        assert set(body) == set(first) == {"challenge_id", "options", "expires_in"} and body["expires_in"] == 300
+        assert set(body["options"]) == set(first["options"]) and set(pk) == set(first["options"]["publicKey"])
+        same = {k: v for k, v in pk.items() if k != "challenge"}
+        assert same == {k: v for k, v in first["options"]["publicKey"].items() if k != "challenge"}
+    assert len({body["options"]["publicKey"]["challenge"] for body in answers}) == len(answers)
+    assert not [e for e in read if User in e or WebAuthnCredential in e], read
+    # Every challenge is bound to nobody and offers nothing.
+    stored = [json.loads(v) for k, v in h.redis.rows.items() if "challenge" in k or v.startswith("{")]
+    stored = [s for s in stored if s.get("purpose") == "sign_in"]
+    assert len(stored) == len(answers) and all(s["user_id"] is None and s["allow_ids"] == [] for s in stored)
     # Its own limiter, not the login throttle.
-    assert h.limiter.count("passkey_challenge") == 4
-
-
-def test_a_retired_key_is_not_offered_and_a_name_is_read_by_the_identifier_policy(monkeypatch):
-    alice = _user()
-    h = Harness(monkeypatch, [alice])
-    auth, row = h.enroll(alice)
-    row.retired_at = datetime.utcnow()
-    assert h.options("alice")[1]["options"]["publicKey"]["allowCredentials"] == []
-    row.retired_at = None
-    monkeypatch.setattr(h.S, "_login_identifier", lambda db: "either")
-    from app.core import email_identity
-    monkeypatch.setattr(email_identity, "find_user_by_email", lambda db, email: alice if email == alice.email else None)
-    assert len(h.options("alice@example.test")[1]["options"]["publicKey"]["allowCredentials"]) == 1
-    monkeypatch.setattr(h.S, "_login_identifier", lambda db: "username")
-    assert h.options("alice@example.test")[1]["options"]["publicKey"]["allowCredentials"] == []
+    assert h.limiter.count("passkey_challenge") == len(answers)
+    # A known name with keys signs in through the same answer, by the key's own user handle.
+    status, body = h.sign_in(auth, username="bob")
+    assert status == 200, body
 
 
 # --------------------------------------------------------------------------- the table
@@ -370,13 +378,7 @@ def test_a_known_keys_failure_counts_against_its_account(monkeypatch):
     assert status == 401
     assert h.failures == [("alice", "passkey refused: sign_count_regressed", "passkey")] and h.counted == ["alice"]
     assert row.sign_count == 5 and row.last_used_at is None
-    # A challenge made for bob's keys answered with alice's key.
     bauth, brow = h.enroll(bob)
-    status, body = h.options("bob")
-    credential = auth.get_assertion(body["options"], ORIGIN, sign_count=9)
-    status, out = _call(h.S, "POST", "/auth/passkeys/sign-in/verify", {"challenge_id": body["challenge_id"], "credential": credential})
-    assert status == 401 and h.failures[-1] == ("alice", "passkey of another account", "passkey")
-    assert h.counted == ["alice"]            # no proof was made: the address paid, not alice
     # A discoverable sign-in whose user handle names someone else.
     status, body = h.options()
     credential = auth.get_assertion(body["options"], ORIGIN, sign_count=10, user_handle_override=bob.id.bytes)

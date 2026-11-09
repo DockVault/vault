@@ -1931,10 +1931,9 @@ async function _passkeySignIn({ conditional = false } = {}) {
     if (conditional) _passkeyOffer = controller;
     else if (errorDiv) errorDiv.style.display = 'none';
     try {
-        const typed = conditional ? '' : ((document.getElementById('username') || {}).value || '').trim();
+        // No username is sent: the options are the same for everyone and the authenticator offers its own keys.
         const start = await fetch(`${API_BASE}/auth/passkeys/sign-in/options`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(typed ? { username: typed } : {})
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({})
         });
         if (!current()) return;
         if (!start.ok) {
