@@ -113,6 +113,16 @@ def test_single_sign_on_takes_the_vaults_rule_unless_the_providers_mfa_is_truste
     assert _due(["recovery"], factor_in_effect=True, enrollment_pending=True, **sso) == s.DONE
     # ... unless the account became an administrator meanwhile: then the password still follows.
     assert _due(["totp"], role="admin", factor_in_effect=True, **sso) == s.STAGE_PASSWORD
+    # A passkey after the provider is the second kind too, verified by the person or not: the provider proved who
+    # they are, and an account that signs in only through its provider has no password to give.
+    assert _due(["hwk"], factor_in_effect=True, **sso) == s.DONE
+    assert _due(["swk"], factor_in_effect=True, enrollment_pending=True, **sso) == s.DONE
+    assert _due(["hwk"], **sso) == s.DONE
+    assert _due(["hwk"], role="admin", factor_in_effect=True, user_verified=True, passwordless_allowed=True,
+                **sso) == s.STAGE_PASSWORD
+    # Without a provider the passkey is the first proof, and its own row answers.
+    assert _due(["hwk"], factor_in_effect=True) == s.STAGE_PASSWORD
+    assert _due(["hwk"], factor_in_effect=True, user_verified=True, passwordless_allowed=True) == s.DONE
     # An administrator's password after a trusted provider MFA: done, no code on top.
     assert _due(["pwd"], role="admin", factor_in_effect=True, provider_mfa_trusted=True, **sso) == s.DONE
 

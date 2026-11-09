@@ -129,12 +129,12 @@ def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, e
 
     * a temporary credential: done (it has its own validity window and no factor);
     * no password yet, and the person is an administrator: the password, always;
-    * no password yet, a passkey: done when the authenticator verified the person and the policy allows
-      a passkey alone for them; otherwise the password (a possession factor needs a knowledge factor,
-      never a second possession factor);
     * no password yet, an identity provider: done when the provider's MFA is trusted and was present, or
-      when the vault's own code (an authenticator or recovery code) was already given after the provider;
-      otherwise the vault's own rule below;
+      when the vault's own second factor (an authenticator or recovery code, or a passkey) was already given
+      after the provider, which proved who the person is; otherwise the vault's own rule below;
+    * no password yet, a passkey as the first proof (no provider): done when the authenticator verified the
+      person and the policy allows a passkey alone for them; otherwise the password (a possession factor
+      needs a knowledge factor, never a second possession factor);
     * the password and a second kind (a code, a recovery code, a passkey), or the password and a trusted
       provider MFA: done;
     * the password alone: the vault's rule, as today: nothing when no factor is in effect, enrollment
@@ -150,10 +150,12 @@ def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, e
     if not has_password:
         if getattr(user, "role", None) == RoleEnum.ADMIN:
             return STAGE_PASSWORD
-        if has_passkey:
+        if provider_id:
+            # The provider proved who the person is; a code or a passkey given after it is the second kind.
+            if provider_mfa_trusted or (methods & SECOND_KINDS):
+                return DONE
+        elif has_passkey:
             return DONE if (user_verified and passwordless_allowed) else STAGE_PASSWORD
-        if provider_mfa_trusted or (methods & CODES):
-            return DONE
     elif (methods & SECOND_KINDS) or (provider_id and provider_mfa_trusted):
         return DONE
     if not factor_in_effect:
