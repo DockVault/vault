@@ -408,6 +408,30 @@ def test_an_inactive_account_is_refused_by_the_pipeline_after_the_proof(monkeypa
     assert h.db.rows_of(ActiveSession) == []
 
 
+def test_a_refusal_that_the_sign_in_must_come_through_a_provider_counts_nothing(monkeypatch):
+    """When the pipeline refuses the account because it signs in only through its provider, the passkey's proof was
+    good: the key keeps its counter and flags, the throttle gives the attempt back, no failure is recorded here (the
+    pipeline writes the one row), no session is made, and the 403 carries the pipeline's message."""
+    from app.services import auth_service as A
+    from app.services import sign_in as s
+    alice = _user()
+    h = Harness(monkeypatch, [alice])
+    auth, row = h.enroll(alice, backup_eligible=True)
+    given_back = []
+    monkeypatch.setattr(A.AuthService, "_give_back", classmethod(lambda cls, throttle: given_back.append(throttle)))
+    message = "Your organisation signs this account in through Contoso."
+
+    def provider_only(db, result):
+        raise s.ProviderOnly(message)
+    monkeypatch.setattr(s, "finish", provider_only)
+    status, body = h.sign_in(auth, username="alice", sign_count=4, flags=FLAG.UP | FLAG.UV | FLAG.BE | FLAG.BS)
+    assert status == 403 and body["detail"] == message, body
+    assert row.sign_count == 4 and row.backup_state is True and row.last_used_at is None
+    assert len(given_back) == 1 and h.failures == []
+    from app.core.models import ActiveSession
+    assert h.db.rows_of(ActiveSession) == []
+
+
 def test_without_a_public_address_the_routes_say_so_and_the_policy_hides_the_button(monkeypatch):
     alice = _user()
     h = Harness(monkeypatch, [alice])

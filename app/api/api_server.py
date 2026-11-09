@@ -12136,6 +12136,15 @@ async def passkey_sign_in_verify(
         outcome = sign_in.finish(db, result)
     except AccountLockedError as locked:
         raise _sign_in_lock_refusal(locked)
+    except sign_in.ProviderOnly:
+        # The account signs in only through its provider: the proof was good, so the key keeps its counter and
+        # flags (a copied key is still told apart) and the throttle gives the attempt back; the refusal, its message
+        # and its audit row are the pipeline's.
+        row.sign_count = assertion.sign_count
+        row.backup_state = assertion.bs
+        db.commit()
+        AuthService._give_back(throttle)
+        raise
     # The proof was accepted and the sign-in is whole or held for its next step: the key records it, and the
     # throttle gives the attempt back.
     row.sign_count = assertion.sign_count

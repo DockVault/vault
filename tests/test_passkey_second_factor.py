@@ -164,6 +164,8 @@ def test_after_a_provider_sign_in_the_passkey_is_the_second_step_also_for_a_prov
     a passkey standing in for the provider is refused for such an account, never this."""
     alice = _user(sso_only=True, password_hash="unusable")
     h = Harness(monkeypatch, [alice])
+    # A second factor in effect, so the sign-in table decides the step (a provider then a passkey: done).
+    monkeypatch.setattr(h.S, "_login_second_factor_in_effect", lambda db, user: True)
     auth, row = h.enroll(alice)
     pending, headers = h.pending_for(alice, methods=(), provider="provider-1")
     status, body = _call_h(h.S, "POST", "/auth/second-factor/passkey/options", None, headers)
