@@ -135,6 +135,25 @@ def test_a_web_sign_in_marks_only_the_earlier_web_sessions(Session, account):
                     ("web", False, False), ("web", True, False)], rows
 
 
+def test_an_ssh_key_session_stamps_the_last_sign_in_time(Session, account):
+    """The SSH-key door makes no password check, so nothing else stamps the account's last sign-in."""
+    from datetime import datetime, timezone
+    uid, _name = account
+    s = Session()
+    try:
+        assert s.get(User, uid).last_login is None
+    finally:
+        s.close()
+    _key_session(Session, uid)
+    s = Session()
+    try:
+        stamped = s.get(User, uid).last_login
+    finally:
+        s.close()
+    assert stamped is not None
+    assert abs((datetime.now(timezone.utc) - stamped.replace(tzinfo=timezone.utc)).total_seconds()) < 60
+
+
 def test_the_default_channel_is_the_web(Session, account):
     uid, name = account
     s = Session()

@@ -384,6 +384,14 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
             user, None, result.client_ip, expires_at=datetime.now(timezone.utc) + SESSION_ROW_LIFETIME,
             channel=auth.WEB)
     now = datetime.now(timezone.utc)
+    # The account's last sign-in, the one the Users page shows and a dormant-account rule reads: every door stamps
+    # it here (the password door stamped it before any second factor; a passkey or a provider sign-in has no other
+    # place). Never a reason to refuse a sign-in that is whole.
+    try:
+        user.last_login = now
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
     claims = {
         "sub": str(user.id), "username": user.username, "session_token": session_token,
         "is_temporary": result.is_temporary, "amr": list(result.methods),

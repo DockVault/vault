@@ -1701,7 +1701,9 @@ class AuthService:
         private key before this is called). Like an SFTP password sign-in, this does NOT
         terminate the user's other sessions, so a service account may hold concurrent
         SFTP connections. Revoked like any session (lock/deactivate publishes a
-        force-close; the SFTP layer re-checks is_active/is_locked every op)."""
+        force-close; the SFTP layer re-checks is_active/is_locked every op). Stamps the account's last
+        sign-in like every other door (committed with the session row)."""
+        user.last_login = datetime.now(timezone.utc)
         return self._create_session(user, None, ip_address, channel=self.SFTP)
 
     def _create_session(

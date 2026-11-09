@@ -312,6 +312,15 @@ def _complete(user, methods, quiet_records, **kw):
     return signed, _claims(signed.access_token)
 
 
+def test_a_finished_sign_in_stamps_the_accounts_last_sign_in_time(quiet_records):
+    """Every door: a passkey alone, a provider alone, and the password path that already made the session."""
+    for methods, kw in ((["hwk"], {}), ([], {"provider_id": "p1"}), (["pwd", "totp"], {"session_token": "sess-pwd"})):
+        user = _user()
+        user.last_login = None
+        _complete(user, methods, quiet_records, **kw)
+        assert user.last_login is not None and abs((user.last_login - datetime.now(timezone.utc)).total_seconds()) < 60
+
+
 def test_a_finished_token_carries_the_claims_it_always_did_plus_the_proofs(quiet_records):
     user = _user()
     signed, claims = _complete(user, ["pwd"], quiet_records, session_token="sess-1")
