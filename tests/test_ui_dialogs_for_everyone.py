@@ -35,7 +35,7 @@ def test_every_dialog_on_the_page_has_a_role_and_a_name(page: Page, person):
     is filled when it opens, the Activity event's, names it then)."""
     _login(page, person)
     unnamed = page.evaluate(
-        "() => [...document.querySelectorAll('.modal')].filter(d => d.getAttribute('role') !== 'dialog'"
+        "() => [...document.querySelectorAll('.modal')].filter(d => !['dialog', 'alertdialog'].includes(d.getAttribute('role'))"
         "  || d.getAttribute('aria-modal') !== 'true'"
         "  || !((d.getAttribute('aria-labelledby') && document.getElementById(d.getAttribute('aria-labelledby')))"
         "        || d.getAttribute('aria-label')))"

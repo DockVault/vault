@@ -2,8 +2,9 @@
 
 A minute before the session ends a dialog with a count-down ring opens, focusing no button (a stray Enter
 chooses nothing); it can be closed without choosing and the count goes on; "Stay signed in" renews the
-token (the old one is refused from then on); doing nothing signs the person out, and the sign-in screen says
-why.
+token (the old one is refused from then on), and so does closing the warning; doing nothing signs the person
+out, and the sign-in screen says why. It opens over any other dialog, measures the session's life on this
+device's own clock, and offers a temporary credential no renewal.
 """
 import pytest
 import requests
@@ -34,6 +35,15 @@ def _stored_token(page: Page):
     return page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')")
 
 
+def _new_token(page: Page, than: str) -> str:
+    """The token stored once the renewal the page asked for has come back (the request is sent at once; the
+    answer arrives a moment later)."""
+    page.wait_for_function(
+        "t => (localStorage.getItem('authToken') || sessionStorage.getItem('authToken')) !== t", arg=than,
+        timeout=10000)
+    return _stored_token(page)
+
+
 def test_the_warning_focuses_nothing_can_be_dismissed_and_stay_renews_the_token(page: Page, person):
     _login(page, person)
     old = _stored_token(page)
@@ -54,12 +64,6 @@ def test_the_warning_focuses_nothing_can_be_dismissed_and_stay_renews_the_token(
     assert int(page.locator("#session-expiry-seconds").inner_text()) < seconds
     offset = page.evaluate("() => parseFloat(document.getElementById('session-ring-fill').style.strokeDashoffset)")
     assert offset > 0
-    # Escape closes it without choosing; the count goes on and the dialog can come back.
-    page.keyboard.press("Escape")
-    expect(modal).to_be_hidden()
-    expect(page.locator("#dashboard-screen")).to_be_visible()
-    page.evaluate("() => SessionWatch.show()")
-    expect(modal).to_be_visible()
     # Stay: a new token, the dialog gone, the old token refused.
     with page.expect_request(lambda r: r.url.endswith("/auth/session/extend") and r.method == "POST"):
         page.click("#session-stay")
@@ -67,6 +71,16 @@ def test_the_warning_focuses_nothing_can_be_dismissed_and_stay_renews_the_token(
     expect(page.locator("#toast-container")).to_contain_text("You stay signed in")
     new = _stored_token(page)
     assert new and new != old
+    # Closing the warning with Escape counts as staying too: a person who dismisses it is present.
+    page.evaluate("() => SessionWatch.armAt(Date.now() + 61000)")
+    expect(modal).to_be_visible(timeout=10000)
+    with page.expect_request(lambda r: r.url.endswith("/auth/session/extend") and r.method == "POST"):
+        page.keyboard.press("Escape")
+    expect(modal).to_be_hidden(timeout=10000)
+    expect(page.locator("#dashboard-screen")).to_be_visible()
+    newer = _new_token(page, new)
+    assert newer and newer != new
+    old, new = new, newer
     assert requests.get(f"{BASE_URL}/users/me", headers={"Authorization": f"Bearer {old}"}, timeout=15).status_code == 401
     assert requests.get(f"{BASE_URL}/users/me", headers={"Authorization": f"Bearer {new}"}, timeout=15).status_code == 200
     # The page still works on the new token.
@@ -74,12 +88,20 @@ def test_the_warning_focuses_nothing_can_be_dismissed_and_stay_renews_the_token(
     expect(page.locator("#vaults-section")).to_be_visible()
 
 
-def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, person):
-    _login(page, person)
-    page.evaluate("() => SessionWatch.armAt(Date.now() + 61500)")
-    expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=10000)
-    expect(page.locator("#login-screen")).to_be_visible(timeout=75000)
-    expect(page.locator("#login-error")).to_contain_text("Your session ended")
+def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, admin, person):
+    # A session that really ends: two minutes. The page counts down on its own clock and, at zero, the server
+    # (which refuses the expired token) has the last word.
+    before = admin.get("/settings").json().get("session_timeout") or 0
+    assert admin.put("/settings", json={"session_timeout": 2}).status_code in (200, 204)
+    try:
+        _login(page, person)
+    finally:
+        admin.put("/settings", json={"session_timeout": before})
+    assert page.evaluate("() => SessionWatch.remaining()") <= 120
+    expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=75000)
+    expect(page.locator("#login-screen")).to_be_visible(timeout=90000)
+    expect(page.locator("#login-error")).to_contain_text("Your session ended because nobody chose to stay")
+    assert page.get_attribute("#login-error", "role") == "alert"
     expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
 
 
@@ -105,3 +127,81 @@ def test_another_tab_of_the_same_browser_carries_on_after_a_renewal(page: Page, 
     expect(other.locator("#login-screen")).to_be_hidden()
     other.close()
 
+
+
+def test_the_warning_opens_over_an_open_dialog_and_gets_the_keys(page: Page, person):
+    _login(page, person)
+    old = _stored_token(page)
+    page.evaluate("() => openModal('note-editor-modal')")
+    expect(page.locator("#note-editor-modal.active")).to_be_visible()
+    page.evaluate("() => SessionWatch.armAt(Date.now() + 61000)")
+    modal = page.locator("#session-expiry-modal.active")
+    expect(modal).to_be_visible(timeout=10000)
+    # What is under the pointer at the Stay button is the warning itself, not the dialog beneath.
+    assert page.evaluate("""() => {
+        const b = document.getElementById('session-stay').getBoundingClientRect();
+        const hit = document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+        return !!(hit && hit.closest('#session-expiry-modal'));
+    }""")
+    assert page.evaluate("() => parseInt(getComputedStyle(document.getElementById('session-expiry-modal')).zIndex, 10) > 1000")
+    # Keys reach the warning: focus is inside it, and Escape acts on it (which counts as staying signed in)...
+    assert page.evaluate("() => !!document.activeElement.closest('#session-expiry-modal')")
+    with page.expect_request(lambda r: r.url.endswith("/auth/session/extend") and r.method == "POST"):
+        page.keyboard.press("Escape")
+    expect(modal).to_be_hidden(timeout=10000)
+    # ...while the dialog the person was in is still open, with what they typed.
+    expect(page.locator("#note-editor-modal.active")).to_be_visible()
+    assert _new_token(page, old) != old
+
+
+def test_a_device_clock_far_ahead_does_not_end_the_session(page: Page, person):
+    page.goto("/")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    # This device's clock runs five hours ahead of the server's, longer than any token the stack hands out.
+    page.evaluate("() => { const real = Date.now.bind(Date); Date.now = () => real() + 300 * 60 * 1000; }")
+    page.fill("#username", person["_username"])
+    page.fill("#password", person["_password"])
+    page.click("#login-form button[type=submit]")
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    page.wait_for_timeout(2500)
+    # Nothing fired: the lifetime is measured on this device from the token's arrival.
+    expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
+    expect(page.locator("#login-screen")).to_be_hidden()
+    assert page.evaluate("() => SessionWatch.remaining()") > 60 * 60
+    # Even a count that reaches zero here asks the server, which still accepts the token: no sign-out.
+    page.evaluate("() => SessionWatch.armAt(Date.now() + 1500)")
+    page.wait_for_timeout(4000)
+    expect(page.locator("#login-screen")).to_be_hidden()
+    expect(page.locator("#dashboard-screen")).to_be_visible()
+    assert page.evaluate("() => SessionWatch.remaining()") > 60 * 60
+    # And a clock behind the server's changes nothing either.
+    page.evaluate("() => { const real = Date.now.bind(Date); Date.now = () => real() - 600 * 60 * 1000; }")
+    page.evaluate("() => SessionWatch.armFromToken(authToken)")
+    page.wait_for_timeout(1500)
+    expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
+    expect(page.locator("#dashboard-screen")).to_be_visible()
+
+
+def test_a_temporary_credential_is_warned_about_its_end_and_offered_no_renewal(page: Page, admin):
+    v = admin.create_vault(name="warn-temp")
+    try:
+        scope = {"v": 1, "pages": ["vaults"], "caps": [], "vault_caps_default": ["vault.see_info", "vault.see_files"], "temp": {}}
+        tc = admin.post("/auth/temp-credentials", json={"validity_minutes": 30, "scope": scope,
+                                                        "vault_access_mode": "all", "selected_vaults": []})
+        assert tc.status_code == 200, tc.text
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.fill("#username", tc.json()["temp_username"])
+        page.fill("#password", tc.json()["credential"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        page.wait_for_function("() => window.SessionWatch && SessionWatch.isTemporary()", timeout=10000)
+        # Timed to the credential's end (30 minutes), not the token's longer life.
+        assert page.evaluate("() => SessionWatch.remaining()") <= 31 * 60
+        page.evaluate("() => SessionWatch.armAt(Date.now() + 61000)")
+        expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=10000)
+        expect(page.locator("#session-stay")).to_be_hidden()
+        expect(page.locator("#session-expiry-text")).to_contain_text("temporary access")
+        expect(page.locator("#session-signout")).to_be_visible()
+    finally:
+        admin.delete_vault(v["id"])

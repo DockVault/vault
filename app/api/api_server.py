@@ -405,6 +405,12 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
 # expires_at is set a margin above this so cleanup_expired_sessions can age abandoned rows out.
 SESSION_TIMEOUT_MAX_MINUTES = 30 * 24 * 60  # 30 days
 
+# How long "Stay signed in" may keep one sign-in going, counted from the sign-in itself, in hours. The
+# administrator's session_renewal_max_hours overrides the default, from the session timeout up to 30 days;
+# a renewal at or past the limit is refused and the person signs in again (see _renewal_terms).
+SESSION_RENEWAL_DEFAULT_HOURS = 12
+SESSION_RENEWAL_MAX_HOURS = 30 * 24
+
 
 # The URL-secret redaction (invite/reset/share tokens in the path or landing-page query) lives in a
 # small stdlib-only module so it is unit-testable offline and shared by the in-app sink AND the uvicorn
@@ -4320,6 +4326,20 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         raise HTTPException(
             status_code=400,
             detail=f"session_timeout must be at most {SESSION_TIMEOUT_MAX_MINUTES} minutes (30 days)")
+    # session_renewal_max_hours bounds how long "Stay signed in" keeps one sign-in going: 0/absent = the
+    # default (SESSION_RENEWAL_DEFAULT_HOURS), else from the session timeout in effect up to 30 days.
+    rh = payload.get("session_renewal_max_hours")
+    if rh is not None:
+        if isinstance(rh, bool) or not isinstance(rh, int) or rh < 0:
+            raise HTTPException(status_code=400, detail="session_renewal_max_hours must be a non-negative integer")
+        if rh > SESSION_RENEWAL_MAX_HOURS:
+            raise HTTPException(status_code=400, detail=(
+                f"session_renewal_max_hours must be at most {SESSION_RENEWAL_MAX_HOURS} hours (30 days)"))
+        timeout_minutes = (st if isinstance(st, int) and not isinstance(st, bool) and st > 0
+                           else _setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+        if rh and rh * 60 < timeout_minutes:
+            raise HTTPException(status_code=400, detail=(
+                f"session_renewal_max_hours must be at least the session timeout ({timeout_minutes} minutes)"))
 
     # Temporary Vault Passcode policy. The master switch, the custom-passcode toggle + its complexity
     # toggles, the one-time/single-vault defaults, and whether ZK vaults may sit in a temp credential's
@@ -8592,6 +8612,22 @@ async def login(
         )
 
 
+def _temp_session_end(db, user) -> Optional[str]:
+    """When a temporary credential's session ends for good (the credential's own end, whichever of its two
+    limits comes first), ISO UTC, or None when it is not known."""
+    from app.core.models import ActiveSession, TemporaryCredential
+    from app.core.session_hash_utils import hash_session_token
+    token = getattr(user, "_session_token", None)
+    if not token:
+        return None
+    row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(token)).first()
+    if row is None or row.temp_credential_id is None:
+        return None
+    cred = db.query(TemporaryCredential).filter(TemporaryCredential.id == row.temp_credential_id).first()
+    ends = [t for t in ((cred.deactivate_at, cred.expires_at) if cred is not None else ()) if t is not None]
+    return (min(ends).replace(microsecond=0).isoformat() + "Z") if ends else None
+
+
 @app.get("/auth/session")
 async def get_session_access(
     current_user: User = Depends(get_current_user),
@@ -8646,6 +8682,9 @@ async def get_session_access(
         "role": current_user.role.value if current_user.role is not None else None,
         "accessible_sections": sections,
     }
+    if resp["is_temp_session"]:
+        # When the credential itself ends: the page warns before that, and offers no renewal.
+        resp["temp_ends_at"] = _temp_session_end(db, current_user)
     if scoped:
         # Effective capabilities, so the frontend can also hide ACTION controls the
         # scope forbids (not just nav) — matching require_cap / require_vault_cap:
@@ -25242,26 +25281,102 @@ def _end_web_session(db, session_token: str, user_id=None):
     return session, ended
 
 
+def _session_renewal_limit(db) -> timedelta:
+    """How long one sign-in may be kept going by renewals, counted from the sign-in: the administrator's
+    session_renewal_max_hours (default SESSION_RENEWAL_DEFAULT_HOURS), never shorter than the session
+    timeout nor longer than SESSION_RENEWAL_MAX_HOURS."""
+    timeout = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+    hours = _setting_int(db, "session_renewal_max_hours", SESSION_RENEWAL_DEFAULT_HOURS)
+    return max(timedelta(hours=min(hours, SESSION_RENEWAL_MAX_HOURS)), timeout)
+
+
+# The identity claims a renewal carries unchanged from the token it replaces: how the person signed in
+# (amr), when the second factor was proved (mfa_at), when the sign-in happened (auth_time) and, for a
+# sign-in through an outside identity provider, which one (idp). The sign-in path owns what each means;
+# a renewal only keeps them.
+RENEWAL_CLAIMS = ("amr", "mfa_at", "auth_time", "idp")
+
+
+def _amr_has_second_factor(amr) -> bool:
+    return isinstance(amr, (list, tuple)) and any(str(m) and str(m) != "pwd" for m in amr)
+
+
+def _renewal_terms(db, user, old: dict, now: datetime = None):
+    """Whether this sign-in may be renewed now, and on what terms: (auth_time, expires_at).
+
+    auth_time is the original sign-in (the old token's auth_time, else its iat), carried through every
+    renewal. A sign-in is renewed only up to the renewal limit counted from auth_time, and only while the
+    way the person signed in still satisfies the sign-in rules: an account that now needs a second factor
+    at sign-in is refused when its token shows none. The new token's life is the session timeout, cut at
+    the limit. Raises HTTPException(403) with the sentence to show when the renewal is refused; nothing
+    has changed by then."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        auth_time = int(old.get("auth_time") or old.get("iat"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=403, detail="This session cannot be renewed; sign in again.")
+    limit_end = datetime.fromtimestamp(auth_time, tz=timezone.utc) + _session_renewal_limit(db)
+    if now >= limit_end - timedelta(seconds=5):
+        raise HTTPException(status_code=403, detail=(
+            "You have been signed in for as long as this vault allows at a stretch; sign in again."))
+    if _login_second_factor_in_effect(db, user) and not _amr_has_second_factor(old.get("amr")):
+        raise HTTPException(status_code=403, detail="Signing in now needs your second factor; sign in again.")
+    timeout = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+    return auth_time, min(now + timeout, limit_end)
+
+
+def _renewed_token(user, old: dict, session_token: str, auth_time: int, expires_at: datetime, now: datetime = None) -> str:
+    """The token of a renewed session: the one place a renewal mints one. The identity claims of the old
+    token travel unchanged (RENEWAL_CLAIMS); auth_time is the original sign-in."""
+    now = now or datetime.now(timezone.utc)
+    claims = {"sub": str(user.id), "username": user.username, "session_token": session_token,
+              "is_temporary": False}
+    for carried in RENEWAL_CLAIMS:
+        if carried in old:
+            claims[carried] = old[carried]
+    claims["auth_time"] = auth_time
+    return create_access_token(data=claims, expires_delta=expires_at - now)
+
+
+def _carry_session_marks(db, old_row, new_session_token: str) -> None:
+    """What the person proved in the old session travels to the new one: the release of the zero-knowledge
+    envelope after an emailed code, so a renewal does not ask for another code."""
+    released = getattr(old_row, "zk_envelope_released_at", None) if old_row is not None else None
+    if released is None:
+        return
+    from app.core.models import ActiveSession
+    from app.core.session_hash_utils import hash_session_token
+    db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(new_session_token)).update(
+        {ActiveSession.zk_envelope_released_at: released}, synchronize_session=False)
+    db.commit()
+
+
 @app.post("/auth/session/extend")
 async def extend_session(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Stay signed in: a new token for the same account, with the same lifetime a sign-in gets, and the
-    session behind the old token ended at once (its row revoked, its token denylisted for the rest of its
-    life), so the request that asked cannot be replayed: the old token is refused everywhere from here on,
-    and only the browser that asked holds the new one. A temporary credential's session is not extended."""
+    """Stay signed in: a new token for the same account, and the session behind the old token ended at
+    once (its row revoked, its token denylisted for the rest of its life), so the request that asked cannot
+    be replayed: the old token is refused everywhere from here on, and only the browser that asked holds
+    the new one. The sign-in itself is not renewed without limit: every token carries auth_time, the
+    original sign-in, and a renewal is refused once the renewal limit counted from it is reached, or when
+    the account now needs a second factor its token does not show (_renewal_terms). A temporary
+    credential's session is not extended."""
     token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     payload = verify_access_token(token) or {}
     old_session = payload.get("session_token")
     if not old_session or payload.get("is_temporary") or getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="This session cannot be extended; sign in again when it ends.")
+    now = datetime.now(timezone.utc)
+    # Refused before anything ends: a refusal leaves the session as it was, to run out on its own.
+    auth_time, expires_at = _renewal_terms(db, current_user, payload, now)
     client_ip = get_client_ip(request)
     # The old session ends first, durably and at once, and only the call that ended it mints the new one: two
     # requests with the same token, however they are served, yield one new session, and a replay carries a
     # dead token.
-    _row, ended = _end_web_session(db, old_session, user_id=current_user.id)
+    old_row, ended = _end_web_session(db, old_session, user_id=current_user.id)
     if not ended:
         raise HTTPException(status_code=401, detail="This session has already ended.")
     import time as _time
@@ -25269,24 +25384,22 @@ async def extend_session(
     _ttl = int(payload.get("exp", 0) - _time.time())
     denylist_token(old_session, _ttl if _ttl > 0 else 1800)
     auth_service = AuthService(db)
-    session_expires_at = datetime.now(timezone.utc) + timedelta(days=31)
-    new_session = auth_service._create_session(current_user, None, client_ip, expires_at=session_expires_at,
+    new_session = auth_service._create_session(current_user, None, client_ip, expires_at=now + timedelta(days=31),
                                                channel=auth_service.WEB)
-    _expires = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
-    claims = {"sub": str(current_user.id), "username": current_user.username, "session_token": new_session,
-              "is_temporary": False}
-    for carried in ("amr", "mfa_at"):   # how this person signed in travels with the session
-        if carried in payload:
-            claims[carried] = payload[carried]
-    access_token = create_access_token(data=claims, expires_delta=_expires)
+    _carry_session_marks(db, old_row, new_session)
+    access_token = _renewed_token(current_user, payload, new_session, auth_time, expires_at, now)
     try:
+        from app.core.session_hash_utils import hash_session_token
         AuditLogger(db).log_action(action="session_extended", status="success", user=current_user,
-                                   ip_address=client_ip, details={})
+                                   ip_address=client_ip, details={
+                                       "ended_session": hash_session_token(old_session)[:8],
+                                       "new_session": hash_session_token(new_session)[:8],
+                                       "signed_in_at": datetime.fromtimestamp(auth_time, tz=timezone.utc)
+                                       .replace(microsecond=0).isoformat().replace("+00:00", "Z")})
     except Exception:  # noqa: BLE001
         pass
-    expires_at = (datetime.now(timezone.utc) + _expires).replace(microsecond=0)
     return {"access_token": access_token, "token_type": "bearer",
-            "expires_at": expires_at.isoformat().replace("+00:00", "Z")}
+            "expires_at": expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")}
 
 
 @app.post("/api/logout")

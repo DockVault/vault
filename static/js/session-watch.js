@@ -1,22 +1,32 @@
 // A minute before the signed-in session ends, the page asks whether to stay (static/js/session-watch.js).
 //
-// The session's end is the token's own expiry (the exp claim), read when the token is stored and again
-// after it is renewed. Sixty seconds before it, a dialog with a count-down ring opens. It does not focus a
-// button, so a key pressed by accident (Enter, Space) chooses nothing, and it can be closed with Escape or a
-// click beside it without choosing: the count goes on and, at zero, the person is signed out. "Stay signed
-// in" asks the server for a new token (POST /auth/session/extend); the server ends the old session at once,
-// so the request cannot be replayed, and the page stores the new token and arms itself again. Clicking
-// "Sign out" signs out now. All text is written with textContent.
+// The session's end is measured on this device's own clock: the token's lifetime (exp - iat) counted
+// from the moment the token arrived here, which is kept in storage so a reload measures the same way.
+// The server's clock and this device's may differ, so the device never ends a session on its own:
+// when the count reaches zero the page asks the server, and signs out only when the server refuses the
+// token. Sixty seconds before the end, a dialog with a count-down ring opens above everything else. It
+// does not focus a button, so a key pressed by accident (Enter, Space) chooses nothing. Closing it with
+// Escape, the x or a click beside it counts as "stay": a person who dismisses the warning is present.
+// "Stay signed in" asks the server for a new token (POST /auth/session/extend); the server ends the old
+// session at once, so the request cannot be replayed, and the page stores the new token and arms itself
+// again. A refusal (the sign-in's renewal limit reached, a second factor now required, a temporary
+// credential) signs out with the server's sentence. A temporary credential's session is never renewed:
+// its warning is timed to whichever ends first, the token or the credential, and offers only "Sign out".
+// All text is written with textContent.
 (function () {
     'use strict';
 
     const WARN_SECONDS = 60;
     const RING = 2 * Math.PI * 52;   // the ring's circumference (r=52 in a 120-unit box)
+    const ARRIVAL_KEY = 'authTokenAt';   // "<ms the token arrived>:<the token's tail>", beside the token
 
-    let deadline = null;             // ms since the epoch at which the session ends
+    let deadline = null;             // ms on this device's clock at which the session ends
     let timer = null;                // opens the dialog WARN_SECONDS before the deadline
     let ticker = null;               // redraws the count while the dialog is armed
     let busy = false;
+    let checking = false;
+    let temporary = false;           // a temporary credential's session: no renewal offered
+    let closingOurselves = false;    // the dialog is being hidden by this module, not by the person
 
     function claimsOf(token) {
         try {
@@ -26,15 +36,56 @@
 
     function el(id) { return document.getElementById(id); }
 
-    // Arm from a token's expiry; false when the token says nothing about it.
+    function tailOf(token) { return String(token).slice(-24); }
+
+    // When this token arrived on this device: the stored moment for the same token, else now (a token not
+    // seen before is one that just arrived), stored for the next reload.
+    function arrivalOf(token) {
+        let stored = null;
+        try { stored = storage.getItem(ARRIVAL_KEY); } catch (_) {}
+        if (stored) {
+            const at = stored.indexOf(':');
+            const ms = Number(stored.slice(0, at));
+            if (at > 0 && Number.isFinite(ms) && stored.slice(at + 1) === tailOf(token)) return ms;
+        }
+        const now = Date.now();
+        try { storage.setItem(ARRIVAL_KEY, now + ':' + tailOf(token)); } catch (_) {}
+        return now;
+    }
+
+    function forgetArrival() {
+        try { storage.removeItem(ARRIVAL_KEY); } catch (_) {}
+    }
+
+    // Arm from a token: its lifetime, counted from its arrival on this device. False when the token says
+    // nothing about its end.
     function armFromToken(token) {
         const claims = token ? claimsOf(token) : null;
         if (!claims || !claims.exp) { disarm(); return false; }
-        return armAt(claims.exp * 1000);
+        temporary = !!claims.is_temporary;
+        const lifetimeMs = (claims.exp - (claims.iat || claims.exp)) * 1000;
+        const end = lifetimeMs > 0 ? arrivalOf(token) + lifetimeMs : Date.now();
+        return armAt(end);
     }
 
+    // A temporary credential's session: timed to whichever ends first, the token or the credential
+    // (``endsAt``: the server's ISO time of the credential's end), and never renewed.
+    function armTemporary(endsAt) {
+        temporary = true;
+        const credentialEnd = endsAt ? Date.parse(endsAt) : NaN;
+        if (Number.isFinite(credentialEnd) && (!deadline || credentialEnd < deadline)) {
+            // Read on the server's clock; the shorter reading wins, and the server has the last word at zero.
+            armAt(credentialEnd);
+        } else if (deadline) {
+            draw();
+        }
+        return true;
+    }
+
+    // Arm for a deadline on this device's clock. The kind of session (a temporary credential's, which is
+    // never renewed) is kept: only a sign-out, or a token of another kind, changes it.
     function armAt(ms) {
-        disarm();
+        disarm({ keepKind: true });
         deadline = Number(ms);
         if (!Number.isFinite(deadline)) { deadline = null; return false; }
         schedule();
@@ -50,11 +101,12 @@
         timer = setTimeout(show, wait);
     }
 
-    function disarm() {
+    function disarm(opts) {
         if (timer) clearTimeout(timer);
         if (ticker) clearInterval(ticker);
         timer = ticker = null;
         deadline = null;
+        if (!(opts && opts.keepKind)) temporary = false;
         hide();
     }
 
@@ -75,7 +127,11 @@
 
     function hide() {
         const modal = el('session-expiry-modal');
-        if (modal) modal.classList.remove('active');
+        if (!modal || !modal.classList.contains('active')) return;
+        closingOurselves = true;
+        modal.classList.remove('active');
+        // The class change is observed after this call returns: the flag outlives it by a tick.
+        setTimeout(() => { closingOurselves = false; }, 0);
     }
 
     function draw() {
@@ -87,10 +143,20 @@
             fill.style.strokeDasharray = String(RING);
             fill.style.strokeDashoffset = String(RING * (1 - Math.min(1, s / WARN_SECONDS)));
         }
+        const stayBtn = el('session-stay');
+        if (stayBtn) stayBtn.hidden = temporary;
         const text = el('session-expiry-text');
-        if (text) text.textContent = s > 0
-            ? `Your session ends in ${s} second${s === 1 ? '' : 's'}. Stay signed in, or sign out now. If you do nothing, you are signed out when the count reaches zero.`
-            : 'Your session has ended.';
+        if (!text) return;
+        const seconds = `${s} second${s === 1 ? '' : 's'}`;
+        if (temporary) {
+            text.textContent = s > 0
+                ? `Your temporary access ends in ${seconds}. This credential cannot be used again; ask for a new one if you need more time.`
+                : 'Your temporary access has ended.';
+        } else {
+            text.textContent = s > 0
+                ? `Your session ends in ${seconds}. Stay signed in, or sign out now. Closing this counts as staying; if you do nothing, you are signed out when the count reaches zero.`
+                : 'Your session has ended.';
+        }
     }
 
     function tick() {
@@ -99,22 +165,56 @@
         if (remaining() <= 0) expire();
     }
 
-    function expire() {
+    // The count reached zero on this device's clock: the server decides. Refused: signed out, with the
+    // reason on the sign-in screen. Still accepted (this device's clock runs ahead of the server's): armed
+    // again from the server's own reading of the time left, and the dialog waits for the real end.
+    async function expire() {
+        if (checking) return;
+        checking = true;
+        if (ticker) clearInterval(ticker);
+        ticker = null;
+        try {
+            const res = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${authToken}` } });
+            if (res.status === 401) {
+                signOutWithNote(temporary
+                    ? 'Your temporary access ended. Ask for a new credential if you need more time.'
+                    : 'Your session ended because nobody chose to stay signed in. Sign in again.');
+                return;
+            }
+            const claims = claimsOf(authToken);
+            const serverNow = Date.parse(res.headers.get('Date') || '');
+            if (res.ok && claims && claims.exp && Number.isFinite(serverNow)) {
+                // The token's end as the server counts it, carried onto this device's clock.
+                const left = claims.exp * 1000 - serverNow;
+                if (left > 0) { armAt(Date.now() + left); return; }
+            }
+            // No answer to go by: asked again shortly; the server, not this clock, ends the session.
+            armAt(Date.now() + 30000);
+        } catch (_) {
+            armAt(Date.now() + 30000);
+        } finally {
+            checking = false;
+        }
+    }
+
+    function signOutWithNote(sentence) {
         disarm();
+        forgetArrival();
         if (typeof logout === 'function') logout();
         // The sign-in screen says why, once the sign-out has drawn it.
         setTimeout(() => {
             const note = el('login-error');
             if (note) {
                 note.className = 'alert alert-warning mt-md';
-                note.textContent = 'Your session ended because you were away. Sign in again.';
+                note.setAttribute('role', 'alert');
+                note.textContent = sentence;
                 note.style.display = 'block';
             }
         }, 400);
     }
 
     async function stay() {
-        if (busy) return;
+        if (busy || temporary) return;
         busy = true;
         const btn = el('session-stay');
         if (btn) btn.disabled = true;
@@ -130,7 +230,14 @@
             if (typeof _tellOtherTabsRenewed === 'function') _tellOtherTabsRenewed(previous);
             if (typeof showSuccess === 'function') showSuccess('You stay signed in.');
         } catch (e) {
-            if (typeof showError === 'function') showError('Could not extend the session. Sign in again when it ends.');
+            if (e && e.status === 403) {
+                // The server will not renew this sign-in (its limit, a second factor now required): it ends
+                // when the token does, and the person signs in again; said on the sign-in screen.
+                signOutWithNote(e.message || 'This session could not be renewed. Sign in again.');
+            } else {
+                if (typeof showError === 'function') showError('Could not extend the session right now. Try again, or sign in again when it ends.');
+                show();
+            }
         } finally {
             busy = false;
             if (btn) btn.disabled = false;
@@ -139,17 +246,39 @@
 
     function signOut() {
         disarm();
+        forgetArrival();
         if (typeof logout === 'function') logout();
+    }
+
+    // The dialog closed by the person (Escape, the x, a click beside it) while the count still ran: they
+    // are present, so that is "stay". A temporary credential's dialog closes and its count goes on.
+    function closedByPerson() {
+        if (closingOurselves || !deadline || temporary) return;
+        stay();
     }
 
     let wired = false;
     function wire() {
         if (wired) return;
         wired = true;
+        const modal = el('session-expiry-modal');
         const stayBtn = el('session-stay');
         const outBtn = el('session-signout');
         if (stayBtn) stayBtn.addEventListener('click', stay);
         if (outBtn) outBtn.addEventListener('click', signOut);
+        // The x closes this dialog alone, whatever else is open under it: it gets its own listener in
+        // place of the page-wide one that closes every dialog.
+        const x = modal ? modal.querySelector('.close-modal-btn') : null;
+        if (x) {
+            const own = x.cloneNode(true);
+            x.replaceWith(own);
+            own.addEventListener('click', (e) => { e.preventDefault(); e.stopImmediatePropagation(); hide(); closedByPerson(); });
+        }
+        if (modal && typeof MutationObserver === 'function') {
+            new MutationObserver(() => {
+                if (!modal.classList.contains('active')) closedByPerson();
+            }).observe(modal, { attributes: true, attributeFilter: ['class'] });
+        }
         // A tab that slept past the warning draws the truth when it wakes.
         document.addEventListener('visibilitychange', () => { if (!document.hidden && deadline) tick(); });
     }
@@ -162,5 +291,6 @@
         return true;
     }
 
-    window.SessionWatch = { armFromToken, armAt, disarm, show, remaining, adopt, WARN_SECONDS };
+    window.SessionWatch = { armFromToken, armTemporary, armAt, disarm, show, remaining, adopt, forgetArrival,
+                            isTemporary: () => temporary, WARN_SECONDS };
 })();

@@ -148,16 +148,25 @@
         return Array.from(document.querySelectorAll('.modal.active')).filter(isOpen);
     }
 
-    // The top dialog: the one opened last (a dialog never seen opening, such as one built already
-    // open by a script, counts as later than any seen one, in page order).
+    // The top dialog: the one painted over the others (the highest z-index), and among those the one
+    // opened last (a dialog never seen opening, such as one built already open by a script, counts as
+    // later than any seen one, in page order). Paint order and this order agree, so a dialog raised above
+    // the rest (the session warning, the step-up) is also the one Escape and the Tab trap act on.
+    function layerOf(d) {
+        const z = parseInt(window.getComputedStyle(d).zIndex, 10);
+        return Number.isFinite(z) ? z : 0;
+    }
+
     function top() {
         const all = open();
         if (!all.length) return null;
         let best = null;
+        let bestLayer = -Infinity;
         let bestKey = -1;
         all.forEach((d, index) => {
+            const layer = layerOf(d);
             const key = openedAt.has(d) ? openedAt.get(d) : Number.MAX_SAFE_INTEGER - all.length + index;
-            if (key >= bestKey) { bestKey = key; best = d; }
+            if (layer > bestLayer || (layer === bestLayer && key >= bestKey)) { bestLayer = layer; bestKey = key; best = d; }
         });
         return best;
     }

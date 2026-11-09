@@ -372,6 +372,12 @@
     }
 }
 
+/* The stay-or-sign-out warning opens over whatever dialog the person is in: above the dialog layer
+   (1000), on the layer the step-up dialog uses, so it is seen and gets the keys. */
+#session-expiry-modal.modal {
+    z-index: 1100;
+}
+
 .modal-content {
     background: var(--surface-0);
     border-radius: var(--radius-xl);

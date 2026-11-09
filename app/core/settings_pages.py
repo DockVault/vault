@@ -51,6 +51,7 @@ FIELDS: dict[str, tuple] = {
         ("password_min_length", E, "0.6.0"),
         ("password_requirements", E, "0.6.0"),
         ("session_timeout", A, "0.6.0"),
+        ("session_renewal_max_hours", A, "0.35.0"),
         ("mfa_mode", E, "0.20.0"),
         ("mfa_sftp_policy", A, "0.20.0"),
         ("mfa_email_ttl", A, "0.20.0"),

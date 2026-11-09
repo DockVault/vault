@@ -145,6 +145,8 @@ _IDENTIFIER_KEYS = (
     "group_id", "link_id", "made_by_id", "new_file_id", "new_folder_id", "note_id", "owner_id",
     "public_link_id", "receiver_id", "recipient_user_id", "revoked_user_id", "session_id", "share_id",
     "share_ids", "source_vault_id", "tag_id", "target_id", "target_user_id", "temp_credential_id", "user_id",
+    # a renewed sign-in: the short form of the session it ended and the one it made, and when the sign-in was
+    "ended_session", "new_session", "signed_in_at",
     "user_ids", "vault_id", "vault_ids", "members", "opened_by_temp_credential_id", "record_id", "alert_id",
     # accounts, and who acted (real usernames, which administrators see on the Users page)
     "username", "target_username", "target_user", "created_username", "deleted_username", "updated_username",

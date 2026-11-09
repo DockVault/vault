@@ -1163,7 +1163,7 @@
 
                 <!-- A minute before the session ends: stay or sign out (static/js/session-watch.js). No button takes
                      focus when it opens (data-no-autofocus), so a key pressed by accident chooses nothing. -->
-                <div id="session-expiry-modal" class="modal" data-no-autofocus>
+                <div id="session-expiry-modal" class="modal" data-no-autofocus role="alertdialog" aria-describedby="session-expiry-text">
                     <div class="modal-content session-expiry" style="max-width: 420px;" tabindex="-1">
                         <div class="modal-header">
                             <h3>Still there?</h3>
@@ -1177,7 +1177,7 @@
                                 </svg>
                                 <div class="ring-number" id="session-expiry-seconds">60</div>
                             </div>
-                            <p class="text-secondary" id="session-expiry-text">Your session ends in a minute. Stay signed in, or sign out now. If you do nothing, you are signed out when the count reaches zero.</p>
+                            <p class="text-secondary" id="session-expiry-text">Your session ends in a minute. Stay signed in, or sign out now. Closing this counts as staying; if you do nothing, you are signed out when the count reaches zero.</p>
                         </div>
                         <div class="modal-footer">
                             <button type="button" class="btn btn-secondary" id="session-signout">Sign out</button>
@@ -2033,7 +2033,12 @@
                                 <div data-setting="session_timeout" class="form-group">
                                     <label for="setting-session-timeout">Session Timeout (minutes)</label>
                                     <input type="number" id="setting-session-timeout" class="form-control" placeholder="Deployment default" min="5" max="43200">
-                                    <small class="text-secondary">How long a sign-in lasts, 5 minutes to 43200 (30 days). Overrides <code>JWT_ACCESS_TOKEN_EXPIRE_MINUTES</code>. <strong>Blank = use the deployment's value.</strong> A longer sign-in stays usable longer if a device is lost or a session is stolen, so keep it as short as your people tolerate.</small>
+                                    <small class="text-secondary">How long a sign-in lasts before the page asks whether to stay signed in: 5 to 43200 minutes (30 days), blank for the deployment's <code>JWT_ACCESS_TOKEN_EXPIRE_MINUTES</code>. Staying signed in is bounded by the limit below.</small>
+                                </div>
+                                <div data-setting="session_renewal_max_hours" class="form-group">
+                                    <label for="setting-session-renewal-max">Stay signed in for at most (hours)</label>
+                                    <input type="number" id="setting-session-renewal-max" class="form-control" placeholder="12" min="1" max="720">
+                                    <small class="text-secondary">How long someone may keep staying signed in, counted from their sign-in: from the session timeout up to 720 hours (30 days), blank for 12 hours. Past it the sign-in ends and the person signs in again.</small>
                                 </div>
                                 <p class="text-secondary text-sm" style="margin-top:4px;">Login, lockout, vault-unlock, SFTP and API rate limits are configured in <strong>Rate limits</strong> at the bottom of this tab.</p>
                             </div>

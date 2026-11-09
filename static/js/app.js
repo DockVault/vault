@@ -272,6 +272,9 @@ async function loadSessionAccess() {
         });
         if (!r.ok) throw new Error(`session probe ${r.status}`);
         sessionAccess = await r.json();
+        if (sessionAccess && sessionAccess.is_temp_session && window.SessionWatch) {
+            SessionWatch.armTemporary(sessionAccess.temp_ends_at);
+        }
     } catch (e) {
         // Fail CLOSED: if we couldn't fetch the precise allowlist but we KNOW this
         // is a temp session, still hide the admin surfaces it can never have, and
@@ -1056,6 +1059,9 @@ function navOpenWhileDeciding(item, section) {
 
 // Update profile UI with user information
 function updateProfileUI(user) {
+    // Every way of signing in reaches here with the token stored: the stay-or-sign-out warning is armed
+    // from it (static/js/session-watch.js), once per token.
+    if (window.SessionWatch && authToken) SessionWatch.armFromToken(authToken);
     // Get initials from username
     const initials = user.username.substring(0, 2).toUpperCase();
     
@@ -1664,7 +1670,6 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
         // Store token with storage helper (handles private mode)
         storage.setItem('authToken', authToken);
-        if (window.SessionWatch) SessionWatch.armFromToken(authToken);   // the stay-or-sign-out warning
         
         // FIXED: Use user data from login response (login endpoint returns user object)
         currentUser = data.user;
@@ -1835,7 +1840,6 @@ async function finishSecondFactorLogin(accessToken) {
         _replaceAfterSignIn();
         return;
     }
-    if (window.SessionWatch) SessionWatch.armFromToken(accessToken);
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
     _openOnlyTheHashThePageCameWith();
@@ -2689,6 +2693,7 @@ function logout(how, reason) {
     // another tab (above).
     if (!anotherSessionStored) {
         storage.removeItem('authToken');
+        storage.removeItem('authTokenAt');
         storage.removeItem('currentUser');
         storage.removeItem('userPermissions');
         storage.removeItem('isScopedTemp');
@@ -9453,6 +9458,7 @@ async function loadSettings() {
         // Changes" then PERSISTED 5, dropping an operator who set RATE_LIMIT_LOGIN_ATTEMPTS=50 in .env
         // back to 5 without touching a field. Same footgun as the old `|| 1` share lifetime.
         document.getElementById('setting-session-timeout').value = (settings.session_timeout > 0) ? settings.session_timeout : '';
+        document.getElementById('setting-session-renewal-max').value = (settings.session_renewal_max_hours > 0) ? settings.session_renewal_max_hours : '';
         // Every rate limit (login / lockout / vault-unlock / SFTP / API) renders from the structured
         // rate_limit_settings feed: a read-only deployment value + an optional custom override.
         renderRateLimitSettings(settings.rate_limit_settings || [], !!settings.rate_limit_api_enabled);
@@ -9603,6 +9609,7 @@ async function saveAllSettings() {
             // Blank -> 0 (keep the deployment's env value); the backend ignores 0. NEVER substitute
             // the shipped default here — that is what silently overrode a configured .env limit.
             session_timeout: parseInt(document.getElementById('setting-session-timeout').value) || 0,
+            session_renewal_max_hours: parseInt(document.getElementById('setting-session-renewal-max').value) || 0,
             // Rate limits (login / lockout / vault-unlock / SFTP / API) are saved by their own
             // "Save rate limits" button (see saveRateLimits) — not bundled into this whole-page save.
 
