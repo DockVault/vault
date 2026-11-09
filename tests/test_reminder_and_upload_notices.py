@@ -1,0 +1,175 @@
+"""The two notices written to the maker of a thing without them asking: the reminder before a share or a link
+expires (the sweep's _tell_about_expiry) and the word that a file arrived on an upload link (the upload's
+_tell_receiver_owner), offline on a real (SQLite) database, with the mail captured.
+
+Each names the thing by its kind only (a share of a vault, a folder or a file; a public link and its tag; a note
+link; an upload link and its label) and deep-links to the page that manages it. Neither puts a vault's name, a
+note's title or a file's name into the notice's title or text, nor into what the email is given: those names are
+sealed at rest, and the notice's columns and the mail are in the clear. The matching live tests
+(tests/test_api_expiry_reminders.py, tests/test_api_upload_links_collect.py) drive the routes on a running stack.
+"""
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy.orm import Session as _Session
+
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
+
+from app.api import api_server as api  # noqa: E402
+from app.core import database, email_actions, expiry_reminders  # noqa: E402
+from app.core import models as m  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+NOW = datetime.utcnow().replace(microsecond=0)
+SECRET_VAULT = "Project Falcon acquisition"
+SECRET_NOTE = "Board minutes, not for circulation"
+SECRET_FILE = "Board pack, third quarter.xlsx"
+
+
+@pytest.fixture
+def db(monkeypatch):
+    """A database the helpers reach the way the web process does (get_db_context), with no live socket."""
+    from _kept_db import kept_database
+    with kept_database() as (make, _engine):
+        @contextmanager
+        def ctx():
+            s = make()
+            try:
+                yield s
+                s.commit()
+            except Exception:
+                s.rollback()
+                raise
+            finally:
+                s.close()
+
+        monkeypatch.setattr(database, "get_db_context", ctx)
+        monkeypatch.setattr(api, "_fire_offloop", lambda *a, **k: None)
+        session = make()
+        yield session
+        session.close()
+
+
+@pytest.fixture(autouse=True)
+def _ids_given_as_text():
+    # Postgres's driver takes a UUID given as text, which is how the helpers hand over a recipient; SQLite's
+    # binding does not. Coerce at flush, as the driver would.
+    def coerce(session, _ctx, _instances):
+        for obj in session.new:
+            v = getattr(obj, "user_id", None)
+            if isinstance(v, str):
+                obj.user_id = uuid.UUID(v)
+
+    sa.event.listen(_Session, "before_flush", coerce)
+    yield
+    sa.event.remove(_Session, "before_flush", coerce)
+
+
+@pytest.fixture
+def emails(monkeypatch):
+    """Every email handed to send_action_email, as (key, recipient, action_context)."""
+    sent = []
+
+    def capture(db_, key, *, recipient, action_context=None, **_kw):
+        sent.append((key, recipient, dict(action_context or {})))
+        return True
+
+    monkeypatch.setattr(email_actions, "send_action_email", capture)
+    return sent
+
+
+@pytest.fixture
+def owner(db):
+    u = m.User(username="olga", email="olga@example.test", password_hash="x", role=m.RoleEnum.USER,
+               is_active=True, is_locked=False)
+    db.add(u)
+    db.commit()
+    return u
+
+
+def vault(db, owner, name=SECRET_VAULT):
+    v = m.Vault(id=uuid.uuid4(), name=name, owner_id=owner.id, type="standard", file_count=0, total_size_bytes=0)
+    db.add(v)
+    db.commit()
+    return v
+
+
+def share(db, owner, v, *, expires_at, target_type="folder"):
+    tag = m.ShareTag(name=f"Normal {uuid.uuid4().hex[:6]}")
+    db.add(tag)
+    db.commit()
+    s = m.Share(creator_id=owner.id, vault_id=v.id, tag_id=tag.id, target_type=target_type,
+                claim_audience="anyone_internal", audience_user_ids=[], audience_department_ids=[],
+                expires_at=expires_at, created_at=NOW - timedelta(days=5), view_only=False, status="active")
+    db.add(s)
+    db.commit()
+    return s
+
+
+def note_link(db, owner, *, expires_at):
+    link = m.NoteLink(owner_id=owner.id, token_len=20, title_snapshot=SECRET_NOTE, body_snapshot="the minutes",
+                      expires_at=expires_at, created_at=NOW - timedelta(days=5))
+    db.add(link)
+    db.commit()
+    return link
+
+
+def notices(db, kind, owner):
+    db.expire_all()
+    return (db.query(m.Notification).filter(m.Notification.user_id == owner.id, m.Notification.type == kind)
+            .order_by(m.Notification.created_at).all())
+
+
+def everything_said(rows, emails):
+    """Every string a reader of the database or of the mailbox would see."""
+    out = [r.title for r in rows] + [r.body or "" for r in rows]
+    for _key, recipient, context in emails:
+        out += [str(v) for v in context.values()] + [str(v) for v in recipient.values()]
+    return out
+
+
+# --------------------------------------------------------------------------- named by kind, never by a sealed name
+
+def test_a_reminder_names_the_kind_of_thing_never_the_vault_or_the_note(db, owner, emails):
+    v = vault(db, owner)
+    soon = NOW + timedelta(hours=20)
+    share(db, owner, v, expires_at=soon)
+    note_link(db, owner, expires_at=soon)
+
+    items = {i["kind"]: i for i in expiry_reminders.due(db, now=NOW)}
+    assert set(items) == {"share", "note_link"}
+    for item in items.values():
+        assert api._tell_about_expiry(item) is True
+
+    rows = notices(db, "expiry_reminder", owner)
+    assert len(rows) == 2 and len(emails) == 2
+    for text in everything_said(rows, emails) + [i["title"] for i in items.values()]:
+        assert SECRET_VAULT not in text, "the sealed vault name reached a notice or an email"
+        assert SECRET_NOTE not in text, "the sealed note title reached a notice or an email"
+    by_target = {r.target: r for r in rows}
+    assert by_target["#shared/by-me"].title.startswith("Your share of a folder expires ")
+    assert by_target["#notes/shared"].title.startswith("Your note link expires ")
+    assert {e[0] for e in emails} == {"expiry_reminder"}
+    assert sorted(e[2]["link"].rsplit("/#", 1)[-1].lstrip("#") for e in emails) == ["notes/shared", "shared/by-me"]
+
+
+def test_an_upload_notice_names_the_link_never_the_file(db, owner, emails):
+    receiver = SimpleNamespace(id=uuid.uuid4(), label="Signed contracts")
+    file = SimpleNamespace(original_name=SECRET_FILE)
+    api._tell_receiver_owner(db, None, receiver, owner, None, file)
+
+    rows = notices(db, "receiver_upload", owner)
+    assert len(rows) == 1 and len(emails) == 1
+    for text in everything_said(rows, emails):
+        assert SECRET_FILE not in text, "the uploaded file's name reached a notice or an email"
+    assert rows[0].title == "Files received on Signed contracts" and rows[0].target == "#uploadlinks/drops"
+    assert rows[0].body.startswith("A file arrived on Signed contracts.")
+    assert emails[0][0] == "receiver_upload_received" and emails[0][1]["email"] == "olga@example.test"
+    assert "your upload link Signed contracts" in emails[0][2]["change"]

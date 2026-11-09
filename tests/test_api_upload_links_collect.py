@@ -88,8 +88,10 @@ def test_the_owner_is_told_once_an_hour_per_link(admin, receivers_enabled):
     notes = [n for n in admin.get("/notifications").json()["notifications"]
              if n.get("type") == "receiver_upload" and label in (n.get("title") or "")]
     assert len(notes) == 1, notes
-    assert notes[0]["target"] == "#uploadlinks"
-    assert "a.txt" in (notes[0].get("body") or "")
+    assert notes[0]["target"] == "#uploadlinks/drops"
+    # The notice names the link's label, never the uploaded file: a file's name is sealed at rest.
+    body = notes[0].get("body") or ""
+    assert body.startswith(f"A file arrived on {label}.") and "a.txt" not in body and "b.txt" not in body
 
 
 def test_the_message_and_the_brand_reach_the_upload_page(admin, receivers_enabled):

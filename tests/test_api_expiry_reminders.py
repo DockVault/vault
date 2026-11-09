@@ -2,7 +2,8 @@
 
 A share or a link that expires within two days earns its maker one in-app notice per thing and expiry date;
 a second sweep writes nothing more; moving the expiry to another day earns one more. The sweep is run here
-through the API container's own interpreter, as the loop runs it.
+through the API container's own interpreter, as the loop runs it. What is due, and how it is named, is
+tested offline in tests/test_expiry_reminders_unit.py.
 """
 import os
 import subprocess
@@ -50,7 +51,9 @@ def test_the_maker_is_reminded_once_per_expiry_date(admin, sharing_on):
         _sweep()
         mine = [n for n in co.get("/notifications").json()["notifications"] if n["type"] == "expiry_reminder"]
         assert len(mine) == 1, mine
-        assert v["name"] in mine[0]["title"] and "expires" in mine[0]["title"] and mine[0]["target"] == "#shared"
+        # Named by its kind, never by the vault's sealed name; leads to the maker's own shares.
+        assert mine[0]["title"].startswith("Your share of a vault expires ") and mine[0]["target"] == "#shared/by-me"
+        assert v["name"] not in mine[0]["title"] and v["name"] not in (mine[0].get("body") or "")
         # The next sweep adds nothing for the same thing and date.
         _sweep()
         assert len([n for n in co.get("/notifications").json()["notifications"] if n["type"] == "expiry_reminder"]) == 1
@@ -69,17 +72,3 @@ def test_the_maker_is_reminded_once_per_expiry_date(admin, sharing_on):
     finally:
         co.delete_vault(v["id"])
         admin.delete_user(owner["id"])
-
-
-def test_the_sweep_names_what_is_due_without_file_names():
-    """The module decides what is due from the rows alone; its titles never hold a file's name."""
-    import inspect
-    from app.core import expiry_reminders
-    src = inspect.getsource(expiry_reminders.due)
-    assert "original_name" not in src and "File" not in src.replace("NoteLinkTag", "")
-    assert expiry_reminders.dedup_key({"kind": "share", "id": "x", "expires_at": datetime(2026, 1, 2, 3)}) == \
-        "expiry_reminder:share:x:2026-01-02"
-    now = datetime(2026, 1, 1, 12)
-    assert expiry_reminders.in_words(now + timedelta(minutes=30), now) == "within the hour"
-    assert expiry_reminders.in_words(now + timedelta(hours=5), now) == "in about 5 hours"
-    assert expiry_reminders.in_words(now + timedelta(hours=47), now) == "in about 1 day"

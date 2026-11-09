@@ -13315,7 +13315,7 @@ def _tell_about_expiry(item: dict) -> bool:
         from app.core.database import get_db_context
         from app.core.email_actions import send_action_email
         with get_db_context() as db:
-            owner = db.query(User).filter(User.id == item["owner_id"]).first()
+            owner = db.query(User).filter(User.id == uuid.UUID(str(item["owner_id"]))).first()
             if owner is not None and owner.email:
                 base = _public_base_url(None)
                 send_action_email(db, "expiry_reminder", recipient={"email": owner.email, "username": owner.username},
@@ -16006,22 +16006,25 @@ def _free_name_in_root(db, vault, name: str) -> str:
 
 def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
     """The owner learns of an upload: an in-app notice, one an hour per link (the files are all in the
-    link's vault), and, when that notice was new and mail is set up, the optional email. Best-effort."""
+    link's vault), and, when that notice was new and mail is set up, the optional email. Best-effort.
+
+    Neither names the file: a file's name is sealed at rest, and the notice's columns and the mail are
+    plaintext. The link's label is the owner's own plain name for it and may be named."""
     try:
         label = receiver.label or "an upload link"
         bucket = datetime.utcnow().strftime("%Y%m%d%H")
         notified = _notify_users(
             [owner.id], "receiver_upload", f"Files received on {label}",
-            f"{file.original_name} arrived on your upload link. Open its vault to see everything received.",
-            target="#uploadlinks", dedup_prefix=f"receiver_upload:{receiver.id}:{bucket}")
+            f"A file arrived on {label}. Open its vault to see everything received.",
+            target="#uploadlinks/drops", dedup_prefix=f"receiver_upload:{receiver.id}:{bucket}")
         if notified and owner.email:
             from app.core.email_actions import send_action_email
             base = _public_base_url(request) if request is not None else ""
             send_action_email(db, "receiver_upload_received",
                               recipient={"email": owner.email, "username": owner.username},
-                              action_context={"link": f"{base}/#uploadlinks",
-                                              "change": f"Someone uploaded {file.original_name or 'a file'} through "
-                                                        f"your upload link {label} on {_brand_name(db) or 'the vault'}."})
+                              action_context={"link": f"{base}/#uploadlinks/drops",
+                                              "change": f"A file arrived on your upload link {label} on "
+                                                        f"{_brand_name(db) or 'the vault'}."})
     except Exception:  # noqa: BLE001 - telling the owner never fails the upload
         pass
 
