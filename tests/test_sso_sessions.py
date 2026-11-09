@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from _bare_api_env import set_bare_api_env
 from test_oidc_client import CLIENT, ISSUER
 from test_sso_resolution import Resolving, _sign_in
 from test_sso_sign_in import _call, _claims, _identity, _provider, _user
@@ -294,6 +295,26 @@ def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_toke
     assert all(s.is_active for s in h.active_sessions())
     status, body = h.logout(p, token)
     assert status == 200 and not [s for s in h.active_sessions() if s.is_active], body
+
+
+def test_the_hint_cleanup_asks_whether_the_table_exists():
+    """A database without the provider-session table (one a test builds with only the tables it needs, or a store
+    the boot has not reached yet) gives nothing to clean and no error: the revocation that asked goes on."""
+    set_bare_api_env()
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.services import sign_in
+    engine = create_engine("sqlite://")
+    db = sessionmaker(bind=engine)()
+    try:
+        assert sign_in.table_present(db, "sso_sessions") is False
+        assert sign_in.forget_provider_logout_hints(db, [uuid.uuid4()]) == 0
+        from app.core.models import SsoSession
+        SsoSession.__table__.create(engine)
+        assert sign_in.table_present(db, "sso_sessions") is True
+        assert sign_in.forget_provider_logout_hints(db, [uuid.uuid4()]) == 0
+    finally:
+        db.close()
 
 
 def test_an_ended_session_keeps_no_logout_hint(monkeypatch):

@@ -746,24 +746,10 @@ def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:
         raise Refusal(REAUTH_NO_MFA)
 
 
-_HAS_IDENTITIES: set = set()
-
-
 def _has_identities(db) -> bool:
-    """Whether the database has the identities table (a database built only with the tables a test needs may not;
-    a memory stand-in with no engine is asked directly). Remembered for the engine once found."""
-    get_bind = getattr(db, "get_bind", None)
-    if get_bind is None:
-        return True
-    bind = get_bind()
-    engine = getattr(bind, "engine", bind)
-    if engine in _HAS_IDENTITIES:
-        return True
-    from sqlalchemy import inspect
-    if inspect(bind).has_table("external_identities"):
-        _HAS_IDENTITIES.add(engine)
-        return True
-    return False
+    """Whether the database has the identities table (a database built only with the tables a test needs may not)."""
+    from app.services import sign_in
+    return sign_in.table_present(db, "external_identities")
 
 
 def reauth_available(db, user) -> bool:

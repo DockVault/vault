@@ -859,10 +859,31 @@ def forget_provider_logout_hints(db, session_ids) -> int:
     returns how many rows changed."""
     from app.core.models import SsoSession
     ids = [i for i in session_ids if i is not None]
-    if not ids:
+    if not ids or not table_present(db, "sso_sessions"):
         return 0
     return db.query(SsoSession).filter(SsoSession.session_id.in_(ids), SsoSession.id_token_enc.isnot(None)).update(
         {SsoSession.id_token_enc: None}, synchronize_session=False)
+
+
+_TABLES_PRESENT: set = set()
+
+
+def table_present(db, name: str) -> bool:
+    """Whether the database has the table ``name``: a database built with only the tables a test needs may not, and
+    a query there would fail (and abort a real transaction). A stand-in with no engine answers for itself. Remembered
+    per engine once found."""
+    get_bind = getattr(db, "get_bind", None)
+    if get_bind is None:
+        return True
+    bind = get_bind()
+    engine = getattr(bind, "engine", bind)
+    if (engine, name) in _TABLES_PRESENT:
+        return True
+    from sqlalchemy import inspect
+    if inspect(bind).has_table(name):
+        _TABLES_PRESENT.add((engine, name))
+        return True
+    return False
 
 
 def _stamp_identity(db, result: SignInResult) -> None:
