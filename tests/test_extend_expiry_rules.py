@@ -184,3 +184,15 @@ def test_the_ceiling_is_named_in_words_a_person_can_read(db):
         _extend(db, maker, _item(), datetime.utcnow() + timedelta(days=3), ceiling=ceiling)
     assert refused.value.status_code == 400 and api._readable_utc(ceiling) in refused.value.detail
     assert "T0" not in refused.value.detail and "T1" not in refused.value.detail and "T2" not in refused.value.detail   # no raw timestamp
+
+
+@pytest.mark.parametrize("raw", ["9999-12-31T23:59:59-01:00", "0001-01-01T00:00:00+01:00", "not a date", None])
+def test_an_expiry_that_cannot_be_read_or_moved_to_utc_is_refused_as_a_bad_request(raw):
+    with pytest.raises(HTTPException) as refused:
+        api._parse_new_expiry(raw)
+    assert refused.value.status_code == 400 and "date and time" in refused.value.detail
+
+
+def test_an_expiry_with_an_offset_is_stored_in_utc():
+    assert api._parse_new_expiry("2027-05-01T12:30:15.5+02:00") == datetime(2027, 5, 1, 10, 30, 15)
+    assert api._parse_new_expiry("2027-05-01T12:30:15Z") == datetime(2027, 5, 1, 12, 30, 15)

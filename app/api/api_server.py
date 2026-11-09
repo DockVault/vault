@@ -13172,10 +13172,11 @@ def _parse_new_expiry(raw) -> datetime:
     try:
         text = str(raw or "").strip().replace("Z", "+00:00")
         dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            # A date at the very end of the calendar can step past it when moved to UTC.
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     except Exception:
         raise HTTPException(status_code=400, detail="Give the new expiry as a date and time.")
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.replace(microsecond=0)
 
 
