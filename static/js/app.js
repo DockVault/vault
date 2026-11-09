@@ -15394,6 +15394,36 @@ async function _downloadFile(fileId, fileName) {
 // nothing decrypted is ever written to disk.
 let _previewUrl = null;
 
+// The type a preview's object URL is minted under. It keeps the stored type only when that type
+// is of the element's own kind and can never be a page: an image, video or audio type with no
+// SVG, XML or HTML in it. Otherwise the type comes from the extension, and failing that from a
+// type the browser only downloads. The <img>, <video> and <audio> elements read the bytes
+// themselves, so a corrected type changes nothing they show; it only stops the same address
+// running as a document of this origin when it is opened in a tab of its own.
+const _PREVIEW_TYPE_BY_EXT = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+    bmp: 'image/bmp', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+    mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac',
+};
+function _previewBlobType(kind, type, ext) {
+    const t = String(type || '').split(';')[0].trim().toLowerCase();
+    if (t.startsWith(kind + '/') && /^[a-z]+\/[a-z0-9.+-]+$/.test(t) && !/svg|xml|html/.test(t)) return t;
+    const byExt = _PREVIEW_TYPE_BY_EXT[ext];
+    return byExt && byExt.startsWith(kind + '/') ? byExt : 'application/octet-stream';
+}
+
+// A data: address for an SVG preview. An SVG document can carry script, and a blob: address of
+// it would run that script with this origin if opened in a tab of its own; a data: document has
+// an opaque origin, and inside an <img> no SVG script runs at all.
+function _blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error('read failed'));
+        reader.readAsDataURL(blob);
+    });
+}
+
 // Build the little in-preview zoom toolbar (- / level / + / reset). Labels are set via
 // textContent, so nothing here is a markup sink.
 function buildZoomControls() {
@@ -15743,10 +15773,12 @@ async function openFilePreview(fileId, fileName, mime) {
         const isVideo = type.startsWith('video/') || ['mp4', 'webm', 'mov'].includes(ext);
         const isAudio = type.startsWith('audio/') || ['mp3', 'wav', 'flac'].includes(ext);
         const isText = type.startsWith('text/') || ['txt', 'md', 'json', 'csv', 'log', 'xml', 'yml', 'yaml', 'js', 'css', 'html', 'py', 'sh', 'ini'].includes(ext);
-        // For a PDF, re-mint the blob under a FIXED application/pdf type: an
-        // untrusted stored MIME can otherwise coerce the <iframe> into a scriptable HTML/XHTML/SVG
-        // document. Forcing application/pdf lets the browser only route it to its isolated PDF viewer.
-        _previewUrl = URL.createObjectURL(isPdf ? new Blob([blob], { type: 'application/pdf' }) : blob);
+        // The stored MIME is whatever the uploader's browser sent, and a blob: address opened as a
+        // page of its own runs with this origin and none of the page's CSP. So no branch below
+        // ever mints an object URL under the stored type: each re-mints under a type that cannot
+        // run as a page (see _previewBlobType), a PDF always under application/pdf, and an SVG,
+        // which can carry script under its own type, is shown from a data: address instead, which
+        // has no origin to run in. Text never becomes a URL at all.
 
         if (isText && blob.size < 2 * 1024 * 1024) {
             const pre = document.createElement('pre');
@@ -15770,7 +15802,12 @@ async function openFilePreview(fileId, fileName, mime) {
             wrap.className = 'preview-zoom';
             const img = document.createElement('img');
             img.className = 'preview-media';
-            img.src = _previewUrl;
+            if (type.includes('svg') || ext === 'svg') {
+                img.src = await _blobToDataUrl(new Blob([blob], { type: 'image/svg+xml' }));
+            } else {
+                _previewUrl = URL.createObjectURL(new Blob([blob], { type: _previewBlobType('image', type, ext) }));
+                img.src = _previewUrl;
+            }
             img.alt = fileName;
             img.draggable = false;
             const controls = buildZoomControls();
@@ -15781,6 +15818,10 @@ async function openFilePreview(fileId, fileName, mime) {
         } else if (isPdf || isVideo || isAudio) {
             const tag = isPdf ? 'iframe' : isVideo ? 'video' : 'audio';
             const el = document.createElement(tag);
+            // A PDF goes only to the browser's isolated PDF viewer under a fixed application/pdf;
+            // a stored HTML, XHTML or SVG type would otherwise make the frame a scriptable page.
+            _previewUrl = URL.createObjectURL(new Blob([blob], {
+                type: isPdf ? 'application/pdf' : _previewBlobType(tag, type, ext) }));
             el.src = _previewUrl;
             if (isPdf) {
                 el.className = 'preview-frame'; el.title = fileName;
