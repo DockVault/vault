@@ -148,3 +148,31 @@ def test_an_unlimited_share_counts_nothing(admin, sharing, temp_user_client):
         assert (me["preview_count"], me["download_count"]) == (0, 0)
     finally:
         admin.delete_vault(vault["id"])
+
+
+def test_a_preview_of_svg_or_html_is_plain_text_under_a_sandbox_and_a_download_is_not(admin):
+    v = admin.create_vault(name=unique("pvsafe"))
+    try:
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+        html = b"<html><body><script>alert(2)</script></body></html>"
+        for name, content, mime in (("x.svg", svg, "image/svg+xml"), ("x.html", html, "text/html")):
+            r = admin.post(f"/vaults/{v['id']}/files", files=[("files", (name, content, mime))])
+            assert r.status_code == 200, r.text
+            fid = next(f["id"] for f in admin.get(f"/vaults/{v['id']}/files").json()["items"] if f["name"] == name)
+            p = admin.get(f"/vaults/{v['id']}/files/{fid}/preview")
+            assert p.status_code == 200, p.text
+            assert p.headers["content-type"].startswith("text/plain"), (name, p.headers["content-type"])
+            assert p.headers["content-security-policy"] == "default-src 'none'; sandbox"
+            assert p.headers["x-content-type-options"] == "nosniff"
+            assert p.content == content
+            # A ranged preview is answered the same way.
+            rp = admin.get(f"/vaults/{v['id']}/files/{fid}/preview", headers={"Range": "bytes=0-9"})
+            if rp.status_code == 206:
+                assert rp.headers["content-type"].startswith("text/plain")
+                assert rp.headers["content-security-policy"] == "default-src 'none'; sandbox"
+            # A download keeps the stored type and saves the file.
+            d = admin.get(f"/vaults/{v['id']}/files/{fid}/download")
+            assert d.status_code == 200 and "attachment" in d.headers.get("content-disposition", "")
+            assert d.headers["content-type"].startswith(mime)
+    finally:
+        admin.delete_vault(v["id"])

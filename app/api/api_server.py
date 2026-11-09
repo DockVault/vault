@@ -20753,6 +20753,25 @@ def _is_media_token(text: str) -> bool:
     return bool(text) and all(c in _MEDIA_TOKEN_CHARS for c in text)
 
 
+# What a preview answer always carries: a document opened from it runs nothing and loads nothing, and the
+# browser never guesses another type than the one sent.
+_PREVIEW_HEADERS = {"Content-Security-Policy": "default-src 'none'; sandbox", "X-Content-Type-Options": "nosniff"}
+# Types a browser would run as a document of the vault's own origin when opened from the preview's address:
+# a preview serves them as text.
+_ACTIVE_ESSENCES = {"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+                    "text/xsl", "application/xslt+xml", "application/xml-dtd", "text/vtt", "multipart/x-mixed-replace"}
+
+
+def _preview_media_type(value: Optional[str]) -> str:
+    """The type a preview is served with: the stored type made safe (_safe_media_type), except that HTML,
+    XHTML, SVG and every XML type are served as plain text, so their bytes are shown and never run."""
+    safe = _safe_media_type(value)
+    essence = safe.partition(";")[0].strip().lower()
+    if essence in _ACTIVE_ESSENCES or essence.endswith("+xml") or essence.endswith("/xml"):
+        return "text/plain; charset=utf-8"
+    return safe
+
+
 def _safe_media_type(value: Optional[str]) -> str:
     """A stored MIME type reduced to something that can be put in a header.
 
@@ -23321,7 +23340,8 @@ async def preview_file(
     db: Session = Depends(get_db),
     x_vault_password: Optional[str] = Header(None),
 ):
-    """The file's bytes for the browser to show, not to save: served inline and never cached, recorded
+    """The file's bytes for the browser to show, not to save: served inline and never cached, under a
+    sandboxing Content-Security-Policy, HTML, XHTML, SVG and any XML type as plain text, recorded
     as a preview (file_previewed, file_preview_completed, share_previewed), and for a share recipient
     counted apart from downloads against the same per-recipient cap.
 
@@ -23893,6 +23913,7 @@ async def _serve_file(vault_id, file_id, request, file_password, current_user, d
                 # A preview is for the screen, never for a cache (a shared browser, a proxy).
                 'Cache-Control': 'no-store' if is_preview else 'no-cache',
                 'X-Operation-ID': operation_id,
+                **(_PREVIEW_HEADERS if is_preview else {}),
             }
             if etag:
                 # Conditional, because a row stored without a checksum has no tag to send and a
@@ -23904,7 +23925,7 @@ async def _serve_file(vault_id, file_id, request, file_password, current_user, d
             streaming_response = StreamingResponse(
                 range_streamer(wanted),
                 status_code=status.HTTP_206_PARTIAL_CONTENT,
-                media_type=_safe_media_type(mime_type),
+                media_type=_preview_media_type(mime_type) if is_preview else _safe_media_type(mime_type),
                 headers=range_headers,
             )
             # `transfer_slot` deliberately NOT cleared. The generator's teardown reads the
@@ -23920,6 +23941,7 @@ async def _serve_file(vault_id, file_id, request, file_password, current_user, d
             # A preview is for the screen, never for a cache (a shared browser, a proxy).
             'Cache-Control': 'no-store' if is_preview else 'no-cache',
             'X-Operation-ID': operation_id,
+            **(_PREVIEW_HEADERS if is_preview else {}),
         }
         if rangeable:
             # Advertised only where it is true. Claiming it for a file that would answer a range
@@ -23932,7 +23954,7 @@ async def _serve_file(vault_id, file_id, request, file_password, current_user, d
 
         streaming_response = StreamingResponse(
             file_streamer(),
-            media_type=_safe_media_type(mime_type),
+            media_type=_preview_media_type(mime_type) if is_preview else _safe_media_type(mime_type),
             headers=headers,
         )
         return streaming_response
