@@ -11643,9 +11643,14 @@ async def passkey_register_options(
     except webauthn_challenges.Unavailable:
         raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
     now = datetime.utcnow()
-    options = ws.registration_options(rp, policy, challenge=challenge.challenge_bytes, user_id=ws.user_handle_for(user.id),
-                                      username=user.username, display_name=None,
-                                      existing=[(c.credential_id, tuple(c.transports or ())) for c in existing])
+    try:
+        options = ws.registration_options(rp, policy, challenge=challenge.challenge_bytes, user_id=ws.user_handle_for(user.id),
+                                          username=user.username, display_name=None,
+                                          existing=[(c.credential_id, tuple(c.transports or ())) for c in existing])
+    except ws.Refused as refused:
+        raise HTTPException(status_code=400, detail={
+            "reason": refused.code,
+            "message": "Passkey registration is not available right now. Contact your administrator."})
     return {"challenge_id": challenge.id, "options": options, "expires_in": webauthn_challenges.TTL_SECONDS,
             "provisional": _passkey_provisional_until(db, user.id, now) is not None}
 
@@ -12163,6 +12168,8 @@ def _passkey_assert(db, user, *, purpose: str, challenge_id, credential, policy)
     synced flag and last use are recorded on success."""
     from app.core import webauthn_challenges
     from app.services import webauthn_service as ws
+    if not _passkeys_enabled(db):
+        raise HTTPException(status_code=409, detail="Passkeys are turned off on this deployment.")
     try:
         challenge = webauthn_challenges.take(challenge_id, purpose=purpose)
     except webauthn_challenges.Unavailable:
@@ -12194,6 +12201,8 @@ def _passkey_challenge_for(db, user, *, purpose: str, request) -> dict:
     from app.core import sign_in_lockout, webauthn_challenges
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     from app.services import webauthn_service as ws
+    if not _passkeys_enabled(db):
+        raise HTTPException(status_code=409, detail="Passkeys are turned off on this deployment.")
     client_ip = get_client_ip(request)
     try:
         allowed, _, reset = _rl.check_rate_limit(identifier=sign_in_lockout.source_of(client_ip),
@@ -12313,6 +12322,8 @@ async def passkey_second_factor_verify(
                             detail="Too many attempts; please wait a few minutes.",
                             headers={"Retry-After": str(retry_after_seconds(reset, 300))})
     sign_in.too_many_attempts(db, pending)
+    if not _passkeys_enabled(db):
+        raise HTTPException(status_code=409, detail="Passkeys are turned off on this deployment.")
     if "passkey" not in _sf_login_methods(db, user):
         sign_in.count_failed_attempt(db, pending)
         raise HTTPException(status_code=401, detail="That passkey was not accepted.")

@@ -194,9 +194,11 @@ def policy():
     from app.services.webauthn_service import PasskeyPolicy
     direct = attestation() == DIRECT
     anchors = trust_anchors() if direct else ()
+    # Direct attestation stays direct when the anchors cannot be read (the file gone or garbage after the save): the
+    # service then refuses every registration (attestation_unverifiable) rather than taking keys unverified.
     return PasskeyPolicy(require_uv=require_uv(), allowed_algs=allowed_alg_codes(),
-                         attestation=DIRECT if (direct and anchors) else NONE,
-                         allowed_aaguids=allowed_aaguids() if (direct and anchors) else (), trust_anchors=anchors)
+                         attestation=DIRECT if direct else NONE,
+                         allowed_aaguids=allowed_aaguids() if direct else (), trust_anchors=anchors)
 
 
 # --------------------------------------------------------------------------- the requirement and its grace
@@ -320,20 +322,23 @@ def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) ->
 
 
 def _last_administrator_refusal(db, grace: int) -> Optional[str]:
-    """Refuse a requirement on administrators that would leave none able to sign in: every active administrator
-    holds no passkey, has no clearance, and has a grace that has already run out (or would, with the new
-    grace). An administrator whose grace has not started yet is protected by the window."""
+    """Refuse a requirement on administrators that would leave none able to sign in: every administrator who can
+    act (active, not locked) holds no passkey whose algorithm still signs in, has no clearance, and has a grace
+    that has already run out (or would, with the new grace). An administrator whose grace has not started yet is
+    protected by the window; one who cannot sign in anyway protects nobody."""
+    from app.core import last_admin
     from app.core.models import RoleEnum, User, WebAuthnCredential
     now = datetime.utcnow()
-    admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
+    admins = [a for a in db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
+              if last_admin.can_administer(a)]
     if not admins:
         return None
     for admin in admins:
         if getattr(admin, "passkey_requirement_cleared_at", None) is not None:
             return None
-        has_key = db.query(WebAuthnCredential.id).filter(WebAuthnCredential.user_id == admin.id,
-                                                         WebAuthnCredential.retired_at.is_(None)).first() is not None
-        if has_key:
+        keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == admin.id,
+                                                   WebAuthnCredential.retired_at.is_(None)).all()
+        if any(algorithm_usable(db, getattr(k, "cose_alg", None), now=now)[0] for k in keys):
             return None
         since = getattr(admin, "passkey_required_since", None)
         if since is None or now <= since + timedelta(days=grace):

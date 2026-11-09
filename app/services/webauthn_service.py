@@ -168,10 +168,12 @@ def _state(challenge: bytes, policy: PasskeyPolicy) -> dict:
     return {"challenge": websafe_encode(challenge), "user_verification": _uv_requirement(policy).value}
 
 
-def _check_policy(policy: PasskeyPolicy) -> None:
+def _check_policy(policy: PasskeyPolicy, *, registration: bool = True) -> None:
+    """A policy the service can act on. Direct attestation without anchors refuses a registration (nothing could
+    verify the authenticator's statement); an assertion reads no attestation, so it is judged without that rule."""
     if policy.attestation not in (ATTESTATION_NONE, ATTESTATION_DIRECT):
         raise ValueError(f"not an attestation setting: {policy.attestation!r}")
-    if policy.attestation == ATTESTATION_DIRECT and not policy.trust_anchors:
+    if registration and policy.attestation == ATTESTATION_DIRECT and not policy.trust_anchors:
         raise Refused("attestation_unverifiable", "direct attestation needs trust anchors")
     if not policy.allowed_algs:
         raise ValueError("at least one algorithm must be allowed")
@@ -254,7 +256,7 @@ def authentication_options(rp: RelyingParty, policy: PasskeyPolicy, *, challenge
     """The options a browser gives ``PublicKeyCredential.parseRequestOptionsFromJSON``: the relying-party id,
     the challenge, user verification per policy, and the offered credentials (an empty list lets the browser
     offer the person's discoverable keys)."""
-    _check_policy(policy)
+    _check_policy(policy, registration=False)
     server = _server(rp, policy)
     options, _ = server.authenticate_begin(credentials=_descriptors(allow), user_verification=_uv_requirement(policy),
                                            challenge=challenge)
@@ -270,7 +272,7 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
     ``allow_ids`` are the ids the ceremony offered; when the list is empty (a discoverable sign-in) the user
     handle must name the key's owner.
     """
-    _check_policy(policy)
+    _check_policy(policy, registration=False)
     if not isinstance(credential, dict) or credential.get("type") != "public-key":
         raise Refused("malformed", "not a public-key credential")
     try:

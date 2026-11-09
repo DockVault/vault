@@ -518,6 +518,11 @@ def finish(db, result: SignInResult):
                                       provider_id=result.provider_id)
         except NoFirstProof:
             raise HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")
+        if passkey.overdue and stage != STAGE_PASSWORD and not (set(result.methods) & PASSKEYS):
+            # The table may be done (the password with a code, a provider's trusted MFA): the passkey the role must
+            # hold is still missing, and past the grace the sign-in stops at its enrollment whatever else was proved.
+            # Only an administrator's password step comes first.
+            stage = ENROLL
     if stage == DONE:
         return complete_sign_in(db, result)
     if result.session_token:

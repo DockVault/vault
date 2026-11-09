@@ -100,14 +100,24 @@ def get_managed_settings(current_user: User = Depends(require_interactive_admin)
     audit_integrity.read_view(db.get_bind())
     from app.core import audit_archive, audit_chain_pending
     pending, pending_chain = audit_chain_pending.listed(db)
-    return {"settings": with_chain(registry.describe()), "locked": sorted(registry.locked_tokens()),
+    return {"settings": with_chain(listed_specs()), "locked": sorted(registry.locked_tokens()),
             "reduction_delay_days": registry.resolve(setting_changes.DELAY_KEY),
             "pending": pending, "pending_chain": pending_chain, "archive": audit_archive.summary()}
 
 
+# Pages whose settings have a route of their own, with guards these routes know nothing of (the Sign-in page's
+# passkey settings: app/api/sign_in_settings_router.py, under its own fixed step-up). Neither listed nor written here.
+OWN_ROUTE_PAGES = ("sign_in",)
+
+
+def listed_specs() -> list:
+    """The rows this panel shows: every setting but those of a page with its own route."""
+    return [row for row in registry.describe() if row["page"] not in OWN_ROUTE_PAGES]
+
+
 def spec_or_404(key: str) -> registry.SettingSpec:
     spec = registry.spec_for(key)
-    if spec is None:
+    if spec is None or spec.page in OWN_ROUTE_PAGES:
         raise HTTPException(status_code=404, detail=f"{key} is not a managed setting")
     return spec
 

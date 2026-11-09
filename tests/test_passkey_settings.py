@@ -59,8 +59,10 @@ def test_the_policy_is_built_from_the_settings(monkeypatch):
                                        wss.ALLOWED_AAGUIDS: ["0" * 32]})
     monkeypatch.setattr(wss, "trust_anchors", lambda: ())
     policy = wss.policy()
-    # Direct without anchors falls back to none: the setting cannot be saved that way, and a stale one is harmless.
-    assert policy.require_uv is False and policy.allowed_algs == (-257,) and policy.attestation == "none" and policy.allowed_aaguids == ()
+    # Direct without anchors stays direct (the service refuses registrations): a bundle gone after the save never
+    # turns attestation off by itself.
+    assert policy.require_uv is False and policy.allowed_algs == (-257,) and policy.attestation == "direct"
+    assert policy.allowed_aaguids == ("0" * 32,) and policy.trust_anchors == ()
     monkeypatch.setattr(wss, "trust_anchors", lambda: (b"der",))
     policy = wss.policy()
     assert policy.attestation == "direct" and policy.allowed_aaguids == ("0" * 32,) and policy.trust_anchors == (b"der",)
@@ -155,9 +157,21 @@ def test_the_guards_at_save(monkeypatch):
     _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"]})
     assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)
     assert wss.save_refusal(db, wss.GRACE_DAYS, 60) is None                      # a longer grace covers root again
-    db.rows_of(WebAuthnCredential).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, retired_at=None))
+    db.rows_of(WebAuthnCredential).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, retired_at=None, cose_alg=-7))
     assert wss.save_refusal(db, wss.GRACE_DAYS, 7) is None                       # an administrator holds a key
+    # ...one whose algorithm still signs in: a key of an algorithm removed for good protects nobody.
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"], wss.ALLOWED_ALGS: ["RS256"]})
+    assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"]})
     db.rows_of(WebAuthnCredential).clear()
+    # An administrator who cannot sign in (locked by an administrator) protects nobody either.
+    bob = _user("bob", role="admin", passkey_required_since=None, passkey_requirement_cleared_at=None, is_locked=True,
+                locked_until=None)
+    db.rows_of(User).append(bob)
+    assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)        # bob's unstarted grace does not count
+    bob.is_locked = False
+    assert wss.save_refusal(db, wss.GRACE_DAYS, 7) is None
+    db.rows_of(User).remove(bob)
     root.passkey_requirement_cleared_at = datetime.utcnow()
     assert wss.save_refusal(db, wss.GRACE_DAYS, 7) is None                       # or was cleared by the operator
 
@@ -219,7 +233,7 @@ def test_the_settings_route_lists_and_writes_under_the_step_up(monkeypatch):
     assert _call(S, "PUT", "/settings/sign-in/webauthn_sign_in", {"value": ["admin"]})[0] == 400
     assert _call(S, "PUT", "/settings/sign-in/webauthn_attestation", {"value": "direct"})[0] == 400
     assert _call(S, "PUT", "/settings/sign-in/not_a_setting", {"value": 1})[0] == 404
-    assert _call(S, "PUT", "/settings/sign-in/log_components", {"value": 1})[0] == 404      # another page's setting
+    assert _call(S, "PUT", "/settings/sign-in/audit_max_days", {"value": 400})[0] == 404     # another page's setting
     assert stepped == [] and requested == []
     # A good value: the step-up, the change with its audit row, the refresh, the announcement.
     status, body = _call(S, "PUT", "/settings/sign-in/webauthn_require_uv", {"value": False})

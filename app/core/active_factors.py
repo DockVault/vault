@@ -43,8 +43,11 @@ def _passkey_count(db, user_id) -> int:
     """How many usable passkeys the account holds: registered and not retired by an administrator's reset. A
     provisional one (registered soon after an administrator changed the account's sign-in details) counts
     here, as a factor for signing in; the compliance step-ups ask about it separately."""
+    from app.core import webauthn_settings
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
+    if not webauthn_settings.enabled():
+        return 0          # passkeys turned off: the rows stay (reversible), but none counts as a factor
     if not has_table(db, WebAuthnCredential.__tablename__):
         return 0
     return db.query(WebAuthnCredential.id).filter(
