@@ -285,6 +285,21 @@ def test_the_pending_invitations_are_a_table_the_library_enhances_and_leave_revo
     assert "innerHTML" not in body
 
 
+def test_send_again_is_offered_to_the_administrator_who_sent_the_invitation_only():
+    # The server refuses a resend by anyone else; the row offers it to the maker alone, and Revoke to every
+    # administrator who may manage users.
+    app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    body = app[app.index("function _inviteRow(inv, canManage) {"):app.index("function _refocusInviteResend(")]
+    mine = body.index("String(inv.created_by) === String(currentUser.id)")
+    guard = body.index("if (mine) {", mine)
+    resend = body.index("invite-resend", guard)
+    revoke = body.index("invite-revoke")
+    assert body.count("invite-resend") == 1
+    assert mine < guard < resend < revoke
+    # Revoke is outside the maker's branch: it follows the branch's closing brace.
+    assert body.index("        }\n", resend) < revoke
+
+
 def test_the_upload_links_admin_table_shows_when_each_link_was_last_used():
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     body = app[app.index("function renderAdminReceivers(data) {"):]

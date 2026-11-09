@@ -6000,10 +6000,15 @@ function _inviteRow(inv, canManage) {
     row.appendChild(_whenCell(inv.expires_at));
     const actions = _el('td', 'invite-actions');
     if (canManage && inv.status === 'pending') {
-        const again = _el('button', 'btn btn-sm btn-secondary invite-resend', 'Send again');
-        again.type = 'button';
-        again.addEventListener('click', () => resendInvite(inv));
-        actions.appendChild(again);
+        // Only the administrator who sent the invitation may send it again (the server refuses anyone else);
+        // any administrator may revoke it.
+        const mine = !!(currentUser && inv.created_by != null && String(inv.created_by) === String(currentUser.id));
+        if (mine) {
+            const again = _el('button', 'btn btn-sm btn-secondary invite-resend', 'Send again');
+            again.type = 'button';
+            again.addEventListener('click', () => resendInvite(inv));
+            actions.appendChild(again);
+        }
         const revoke = _el('button', 'btn btn-sm btn-secondary invite-revoke', 'Revoke');
         revoke.type = 'button';
         revoke.addEventListener('click', () => revokeInvite(inv.id));

@@ -76,3 +76,19 @@ def test_a_pending_invitation_can_be_sent_again_from_its_row(page: Page, admin, 
             if x["username"] == inv["username"] and x["status"] == "pending":
                 admin.delete(f"/invites/{x['id']}")
         admin.delete(f"/invites/{inv['id']}")
+
+
+def test_an_invitation_sent_by_another_administrator_offers_revoke_but_not_send_again(page: Page, admin, invites_on):
+    # The server lets only the administrator who sent an invitation send it again; the row says the same.
+    inv = admin.post("/invites", json={"username": unique("theirs"), "role": "user"}).json()
+    other = admin.create_user(role="admin")
+    try:
+        _login_admin(page, {"username": other["_username"], "password": other["_password"]})
+        page.click('.sidebar-item[data-section="users"]')
+        row = page.locator(f'#invites-list .invite-row[data-invite-id="{inv["id"]}"]')
+        expect(row).to_be_visible(timeout=10000)
+        expect(row.locator("button.invite-revoke")).to_be_visible()
+        expect(row.locator("button.invite-resend")).to_have_count(0)
+    finally:
+        admin.delete(f"/invites/{inv['id']}")
+        admin.delete_user(other["id"])
