@@ -1,0 +1,116 @@
+"""A single sign-on provider's policy (app/core/sso_policy.py): the defaults, what a wrong shape becomes, when a
+provider counts as restricted, and the restriction's three verdicts (admits, excludes, cannot tell) for the
+tenant, domain, group and sign-up-domain rules. Pure."""
+import pytest
+
+from app.core import sso_policy as P
+
+pytestmark = pytest.mark.unit
+
+
+def test_the_defaults_are_the_designs_and_a_wrong_shape_falls_back_to_them():
+    assert P.effective(None) == P.DEFAULTS and P.effective("junk") == P.DEFAULTS and P.effective([]) == P.DEFAULTS
+    assert P.effective(None) is not P.DEFAULTS and P.effective(None)["sso_allowed_tenants"] is not P.DEFAULTS["sso_allowed_tenants"]
+    got = P.effective({"sso_account_creation": "anyone", "sso_default_role": "admin", "sso_password_login": "never",
+                       "sso_link_by_email": "yes", "sso_use_signup_domains": 1, "sso_allowed_tenants": "t1",
+                       "sso_allowed_domains": [" Example.TEST ", "", 7, None, "x" * 300], "sso_required_groups": {"a": 1},
+                       "something_else": True})
+    assert got["sso_account_creation"] == "invite_only" and got["sso_default_role"] == "user"
+    assert got["sso_password_login"] == "allowed" and got["sso_link_by_email"] is False and got["sso_use_signup_domains"] is False
+    assert got["sso_allowed_tenants"] == [] and got["sso_allowed_domains"] == ["example.test"] and got["sso_required_groups"] == []
+    assert "something_else" not in got
+    kept = P.effective({"sso_account_creation": "jit", "sso_default_role": "external", "sso_password_login": "disabled",
+                        "sso_link_by_email": True, "sso_required_groups": ["Vault Users", 5]})
+    assert kept["sso_account_creation"] == "jit" and kept["sso_default_role"] == "external"
+    assert kept["sso_password_login"] == "disabled" and kept["sso_link_by_email"] is True
+    assert kept["sso_required_groups"] == ["Vault Users"]          # a group is a string; a number is dropped
+    assert len(P.effective({"sso_allowed_tenants": ["t"] * 500})["sso_allowed_tenants"]) == P.MAX_LIST_ITEMS
+
+
+@pytest.mark.parametrize("stored, account_policy, restricted", [
+    ({}, None, False),
+    ({"sso_allowed_tenants": ["t1"]}, None, True),
+    ({"sso_allowed_domains": ["example.test"]}, None, True),
+    ({"sso_required_groups": ["g"]}, None, True),
+    ({"sso_use_signup_domains": True}, {"signup_email_domain_mode": "allowlist", "signup_email_domains": ["example.test"]}, True),
+    ({"sso_use_signup_domains": True}, {"signup_email_domain_mode": "denylist", "signup_email_domains": ["evil.test"]}, False),
+    ({"sso_use_signup_domains": True}, {"signup_email_domain_mode": "allowlist", "signup_email_domains": []}, False),
+    ({"sso_use_signup_domains": True}, {"signup_email_domain_mode": "off", "signup_email_domains": ["example.test"]}, False),
+    ({"sso_use_signup_domains": False}, {"signup_email_domain_mode": "allowlist", "signup_email_domains": ["example.test"]}, False),
+    ({"sso_link_by_email": True, "sso_account_creation": "jit"}, None, False),
+])
+def test_a_provider_is_restricted_only_by_a_list_that_names_who_gets_in(stored, account_policy, restricted):
+    assert P.is_restricted(P.effective(stored), account_policy) is restricted
+
+
+def _judge(stored, **answer):
+    fields = dict(tenant_id=None, email=None, email_verified=False, hosted_domain=None, groups=None, groups_overage=False,
+                  account_policy=None)
+    fields.update(answer)
+    return P.restriction(P.effective(stored), **fields)
+
+
+def test_no_restriction_admits_everyone():
+    assert _judge({}) is None
+    assert _judge({}, tenant_id="other", email="x@evil.test", email_verified=True, groups=[]) is None
+
+
+@pytest.mark.parametrize("answer, verdict", [
+    ({"tenant_id": "T-1"}, None),                                   # case does not matter for a tenant id
+    ({"tenant_id": "t-2"}, P.RESTRICTED),
+    ({"tenant_id": None}, P.RESTRICTION_CLAIM_MISSING),
+    ({"tenant_id": "  "}, P.RESTRICTION_CLAIM_MISSING),
+    ({"tenant_id": 42}, P.RESTRICTION_CLAIM_MISSING),
+])
+def test_the_tenant_rule(answer, verdict):
+    assert _judge({"sso_allowed_tenants": ["t-1"]}, **answer) == verdict
+
+
+@pytest.mark.parametrize("answer, verdict", [
+    ({"hosted_domain": "Example.TEST"}, None),
+    ({"hosted_domain": "other.test", "email": "a@example.test", "email_verified": True}, P.RESTRICTED),   # hd wins
+    ({"email": "a@example.test", "email_verified": True}, None),
+    ({"email": "a@EXAMPLE.test", "email_verified": True}, None),
+    ({"email": "a@sub.example.test", "email_verified": True}, P.RESTRICTED),   # exactly the listed domain
+    ({"email": "a@gmail.com", "email_verified": True}, P.RESTRICTED),         # a consumer account: no hd, wrong domain
+    ({"email": "a@example.test", "email_verified": False}, P.RESTRICTION_CLAIM_MISSING),
+    ({}, P.RESTRICTION_CLAIM_MISSING),
+    ({"email": "no-at-sign", "email_verified": True}, P.RESTRICTION_CLAIM_MISSING),
+])
+def test_the_domain_rule(answer, verdict):
+    assert _judge({"sso_allowed_domains": ["example.test"]}, **answer) == verdict
+
+
+@pytest.mark.parametrize("answer, verdict", [
+    ({"groups": ["Vault Users", "Other"]}, None),
+    ({"groups": [123]}, None),                                      # a numeric group id matches its string
+    ({"groups": ["Other"]}, P.RESTRICTED),
+    ({"groups": []}, P.RESTRICTED),                                 # the claim is there and names none of them
+    ({"groups": None}, P.RESTRICTION_CLAIM_MISSING),
+    ({"groups": None, "groups_overage": True}, P.RESTRICTION_CLAIM_MISSING),
+    ({"groups": ["Vault Users"], "groups_overage": True}, P.RESTRICTION_CLAIM_MISSING),   # a marker is never trusted
+])
+def test_the_group_rule_and_the_overage_marker(answer, verdict):
+    assert _judge({"sso_required_groups": ["Vault Users", "123"]}, **answer) == verdict
+
+
+@pytest.mark.parametrize("mode, domains, answer, verdict", [
+    ("allowlist", ["example.test"], {"email": "a@example.test", "email_verified": True}, None),
+    ("allowlist", ["example.test"], {"email": "a@other.test", "email_verified": True}, P.RESTRICTED),
+    ("allowlist", ["example.test"], {"email": "a@example.test", "email_verified": False}, P.RESTRICTION_CLAIM_MISSING),
+    ("denylist", ["evil.test"], {"email": "a@x.evil.test", "email_verified": True}, P.RESTRICTED),
+    ("denylist", ["evil.test"], {"email": "a@good.test", "email_verified": True}, None),
+    ("off", ["example.test"], {}, None),                            # ticked but the list is off: nothing to judge
+])
+def test_the_sign_up_domain_list_as_a_restriction(mode, domains, answer, verdict):
+    pol = {"signup_email_domain_mode": mode, "signup_email_domains": domains}
+    assert _judge({"sso_use_signup_domains": True}, account_policy=pol, **answer) == verdict
+    assert _judge({"sso_use_signup_domains": False}, account_policy=pol, **answer) is None
+
+
+def test_an_exclusion_wins_over_a_missing_claim():
+    stored = {"sso_allowed_tenants": ["t-1"], "sso_required_groups": ["g"]}
+    assert _judge(stored, tenant_id="t-2", groups=None) == P.RESTRICTED
+    assert _judge(stored, tenant_id=None, groups=["other"]) == P.RESTRICTED
+    assert _judge(stored, tenant_id=None, groups=None) == P.RESTRICTION_CLAIM_MISSING
+    assert _judge(stored, tenant_id="t-1", groups=["g"]) is None

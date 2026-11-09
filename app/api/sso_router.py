@@ -43,6 +43,8 @@ class SsoStartRequest(BaseModel):
     verifier_hash: Optional[str] = Field(default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     code_challenge: Optional[str] = Field(default=None, min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     return_to: Optional[str] = Field(default=None, max_length=40)
+    # An invitation being accepted through the provider: the invited account is made at the callback.
+    invitation: Optional[str] = Field(default=None, min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class SsoLinkStartRequest(BaseModel):
@@ -97,16 +99,54 @@ def _refused_start(exc) -> HTTPException:
     return HTTPException(status_code=http, detail={"reason": code, "message": sso.reason_text(code)})
 
 
-def _audit(db, action: str, *, user=None, ip, details: dict, status_: str = "success") -> None:
+def _audit(db, action: str, *, user=None, ip, details: dict, status_: str = "success", resource_type=None,
+           resource_id=None) -> None:
     try:
         from app.services.audit_logger import AuditLogger
-        AuditLogger(db).log_action(action=action, status=status_, user=user, ip_address=ip, details=details)
+        AuditLogger(db).log_action(action=action, status=status_, user=user, ip_address=ip, details=details,
+                                   resource_type=resource_type, resource_id=resource_id)
     except Exception:      # noqa: BLE001 -- a refusal or a link stands without its row
         pass
 
 
 def _redirect(fragment: str) -> RedirectResponse:
     return RedirectResponse(url="/#" + fragment, status_code=302)
+
+
+def _invitation_for_start(db, token: str, client_ip: str):
+    """The pending invitation a token names, for a sign-in that accepts it through a provider: looked up as the
+    password acceptance looks it up (the same limiter per token prefix, the same checks, the same generic
+    refusal, the same audit row), so a guessed token learns nothing more here than there."""
+    api = _api()
+    from app.core import invitations
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable, retry_after_seconds
+    prefix = invitations.token_prefix(token)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=prefix, limit=5, window=60, prefix="invite_accept_prefix",
+                                                 fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many requests.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, 60))})
+    if not invitations.pepper_ok(api._invite_pepper()):
+        raise HTTPException(status_code=503,
+                            detail="Invitations are unavailable: the invite-token secret is not configured.")
+    inv = api._resolve_valid_invite(db, token)
+    if inv is None or not api._invitation_inviter_can_act(db, inv) or api._username_kept(inv.username):
+        api._audit_accept_failure(db, prefix, client_ip, reason="sso_start_unresolved")
+        raise HTTPException(status_code=404, detail={"reason": sso.INVITATION_UNUSABLE,
+                                                     "message": sso.reason_text(sso.INVITATION_UNUSABLE)})
+    return inv
+
+
+def _invitation_prefix(db, invitation_id) -> str:
+    from app.core.models import AccountInvitation
+    try:
+        row = db.query(AccountInvitation).filter(AccountInvitation.id == uuid.UUID(str(invitation_id))).first()
+    except ValueError:
+        return ""
+    return getattr(row, "token_prefix", None) or ""
 
 
 # --------------------------------------------------------------------------- public
@@ -130,14 +170,27 @@ async def start_sign_in(
     if row is None:
         raise HTTPException(status_code=404, detail={"reason": sso.PROVIDER_DISABLED,
                                                      "message": sso.reason_text(sso.PROVIDER_DISABLED)})
+    extras = None
+    if body.invitation:
+        if body.code_challenge:
+            raise HTTPException(status_code=400, detail="An invitation is accepted in the browser, not in an app.")
+        extras = {"invitation_id": str(_invitation_for_start(db, body.invitation, client_ip).id)}
     from app.core import sign_in_lockout
     try:
         url = sso.start(row, purpose=sso_state.APP if body.code_challenge and not body.verifier_hash else sso_state.SIGN_IN,
                         source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
-                        verifier_hash=body.verifier_hash, code_challenge=body.code_challenge, return_to=body.return_to)
+                        verifier_hash=body.verifier_hash, code_challenge=body.code_challenge, return_to=body.return_to,
+                        extras=extras)
     except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
         raise _refused_start(exc)
     return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
+
+
+@router.get("/auth/sso/reasons")
+async def sign_in_reasons():
+    """PUBLIC: every reason the callback can send the sign-in page in its ``#sso-error=<reason>`` fragment, with
+    the words the page shows for it. The page shows these and never a provider's own text."""
+    return {"reasons": dict(sso.REASON_TEXTS)}
 
 
 @router.get("/auth/sso/{provider_id}/callback")
@@ -195,13 +248,40 @@ async def sign_in_callback(
         log.info("sso callback refused for provider %s: %s", login.provider_id, exc)
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
         return _redirect("sso-error=" + exc.code)
-
-    if login.purpose in (sso_state.SIGN_IN, sso_state.APP):
+    # The provider's restriction (tenant, domain, group, the sign-up domain list) is judged before who the person
+    # is, known identity included; a test reports it instead of refusing.
+    if login.purpose != sso_state.TEST:
         try:
-            user, identity = sso.resolve_account(db, row, answer)
+            sso.restriction_refusal(db, row, answer)
         except sso.Refusal as exc:
             _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
             return _redirect("sso-error=" + exc.code)
+
+    if login.purpose in (sso_state.SIGN_IN, sso_state.APP):
+        invitation_id = login.extras.get("invitation_id") if isinstance(login.extras, dict) else None
+        try:
+            found = sso.resolve_account(db, row, answer, login=login)
+        except sso.Refusal as exc:
+            _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
+            if invitation_id:
+                api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip,
+                                          reason=exc.detail or exc.code)
+            return _redirect("sso-error=" + exc.code)
+        user = found.user
+        if found.created or found.linked_now:
+            # The account, its identity and the claimed invitation stand before any code is handed out: a store
+            # that fails afterwards costs the person one more sign-in, never an account without its identity.
+            from sqlalchemy.exc import IntegrityError
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                code_ = sso.INVITATION_UNUSABLE if found.invitation is not None else sso.NO_ACCOUNT
+                _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": code_})
+                if invitation_id:
+                    api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip, reason="commit_conflict")
+                return _redirect("sso-error=" + code_)
+            _record_resolution(db, row, found, client_ip=client_ip, details=details)
         from app.core import sign_in_codes
         result = sso.pipeline_result(db, user, answer, provider_id=login.provider_id, client_ip=client_ip)
         try:
@@ -245,6 +325,32 @@ async def sign_in_callback(
     except sso_state.Unavailable:
         return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
     return _redirect(("sso-linked=" if login.purpose == sso_state.LINK else "sso-test=") + handover)
+
+
+def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
+    """After the commit: the audit rows and notices for an account made from an invitation or linked by its
+    verified email at this sign-in. Best effort, like every notice."""
+    api = _api()
+    user = found.user
+    label = (row.label or row.name) if row is not None else "single sign-on"
+    if found.invitation is not None:
+        inv = found.invitation
+        _audit(db, "account_invitation_accepted", user=user, ip=client_ip, resource_type="account_invitation",
+               resource_id=str(inv.id), details={"username": user.username, "role": str(user.role),
+                                                 "token_prefix": inv.token_prefix, "method": "sso",
+                                                 "provider_id": details.get("provider_id")})
+        try:
+            from app.core.models import RoleEnum
+            if user.role == RoleEnum.ADMIN:
+                api._announce_admin_granted(db, user, by_name=found.inviter_name, how="invited")
+            api._fire_action_email(db, "account_welcome", email=user.email, username=user.username)
+        except Exception as exc:  # noqa: BLE001
+            log.info("sso invitation notices skipped: %s", type(exc).__name__)
+    _audit(db, "sso_identity_linked", user=user, ip=client_ip,
+           details={"provider_id": details.get("provider_id"), "linked_by": found.linked_by})
+    if found.linked_by == "self":
+        _tell_owner(db, user, row, "A sign-in method was added",
+                    f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address.")
 
 
 def _claim_handover(db, request, current_user, body: SsoHandoverFinishRequest, *, purpose: str):
