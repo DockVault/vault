@@ -108,8 +108,12 @@ def test_the_message_and_the_brand_reach_the_upload_page(admin, receivers_enable
     assert anon.get("/receivers/nosuchtoken000/page").status_code == 404
     assert admin.post(f"/receivers/{rec['id']}/revoke").status_code == 200
     assert anon.get(f"/receivers/{rec['token']}/page").status_code == 404
+    # A message too long is refused before anything is made: the drop vault is committed first, so a message
+    # checked after it left a vault with no link behind.
+    vaults_before = len(admin.get("/vaults").json())
     r = admin.post("/receivers", json={"tag_id": _mk_tag(admin)["id"], "max_total_bytes": 10 * _MB, "message": "x" * 501})
     assert r.status_code == 400 and "500" in r.text
+    assert len(admin.get("/vaults").json()) == vaults_before
 
 
 def test_the_owner_can_store_and_read_a_re_copy_of_the_link(admin, receivers_enabled):

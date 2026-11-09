@@ -15466,6 +15466,10 @@ async def create_receiver(
         raise HTTPException(status_code=400,
                             detail="Choose a total size for this upload link (max_total_bytes).")
     _enforce_vault_size(db, current_user, int(total_bytes))
+    # The owner's message is checked here, with the rest of the request, and not where the row is
+    # built: the drop vault below is committed first, so a message refused after it would leave a
+    # vault with no link, in the owner's list and counting against their vault cap, on every retry.
+    message = _link_message(payload.message)
 
     password_hash = hash_password(pol["secret_value"]) if pol["secret_value"] is not None else None
     now = datetime.utcnow()
@@ -15505,7 +15509,7 @@ async def create_receiver(
         secret_kind=pol["secret_kind"], password_hash=password_hash, envelope=None,
         expires_at=expires_at, max_uploads=pol["max_uploads"],
         max_file_bytes=pol["max_file_bytes"], max_total_bytes=int(total_bytes),
-        retention_days=pol["retention_days"], message=_link_message(payload.message))
+        retention_days=pol["retention_days"], message=message)
     db.add(receiver)
     try:
         db.commit()
