@@ -112,6 +112,66 @@ def test_an_upload_link_follows_its_owner(state):
     assert (got == (vault, owner)) if serves else (got is None), state
 
 
+@pytest.fixture
+def upload_page(monkeypatch):
+    """Call the real GET /receivers/{token}/page handler with the rate limiter and the feature switch out
+    of the way, for a link of `owner` into `vault` (None: the drop vault is gone)."""
+    monkeypatch.setattr(R.rate_limiter, "check_rate_limit", lambda *a, **k: (True, 0, 0))
+    monkeypatch.setattr(S, "get_client_ip", lambda request: "192.0.2.10")
+    monkeypatch.setattr(S.receiver_policy, "public_receivers_enabled", lambda blob: True)
+
+    def page(owner, vault="standard", secret_kind="none", message="Send the signed pages."):
+        token = "tok-" + uuid.uuid4().hex
+        rows = {S.User: owner}
+        if vault is not None:
+            rows[S.Vault] = types.SimpleNamespace(id=uuid.uuid4(), type=vault)
+        rows[S.Receiver] = types.SimpleNamespace(
+            id=uuid.uuid4(), token_hash=S._receiver_token_hash(token), owner_id=owner.id,
+            vault_id=rows[S.Vault].id if vault is not None else uuid.uuid4(),
+            revoked=False, expires_at=None, max_uploads=None, upload_count=0, paused=False,
+            secret_kind=secret_kind, message=message)
+        return run_coroutine(S.receiver_upload_page_info(token, None, _FakeDB(rows)))
+
+    return page
+
+
+@pytest.mark.parametrize("state", sorted(OWNER_STATES))
+def test_an_upload_links_page_follows_its_owner(state, upload_page):
+    """The page route is asked before anything is sent, so it must answer as the upload itself would: a
+    missing link's 404 for a locked or deactivated owner, and nothing (not even a code prompt) that says
+    the link is still there."""
+    fields, serves = OWNER_STATES[state]
+    owner = _owner(**fields)
+    if serves:
+        assert upload_page(owner)["secret_kind"] == "none"
+        return
+    with pytest.raises(HTTPException) as refused:
+        upload_page(owner, secret_kind="pin")
+    assert refused.value.status_code == 404
+    assert refused.value.detail == "This upload link is not available.", "must read exactly as a missing link"
+
+
+def test_an_upload_links_page_is_gone_with_its_drop_vault(upload_page):
+    with pytest.raises(HTTPException) as refused:
+        upload_page(_owner(), vault=None)
+    assert refused.value.status_code == 404
+    with pytest.raises(HTTPException) as refused:
+        upload_page(_owner(), vault="zero_knowledge")
+    assert refused.value.status_code == 404
+
+
+def test_a_protected_upload_links_page_keeps_the_message_behind_the_code(upload_page):
+    """As the public file and note pages do: the owner's message is for whoever has the code, and the
+    session open returns it once the code is accepted. A link without a code shows it at once."""
+    plain = upload_page(_owner(), secret_kind="none")
+    assert plain["message"] == "Send the signed pages." and plain["secret_kind"] == "none"
+    for kind in ("pin", "password"):
+        guarded = upload_page(_owner(), secret_kind=kind)
+        assert guarded["secret_kind"] == kind
+        assert guarded["message"] is None, kind
+        assert set(guarded) == {"brand", "message", "secret_kind"}, "nothing else leaks past the code"
+
+
 @pytest.mark.parametrize("state", sorted(OWNER_STATES))
 def test_a_file_link_follows_its_owner(state, monkeypatch):
     class _Allowed:

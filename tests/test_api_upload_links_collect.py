@@ -116,6 +116,25 @@ def test_the_message_and_the_brand_reach_the_upload_page(admin, receivers_enable
     assert len(admin.get("/vaults").json()) == vaults_before
 
 
+def test_a_protected_links_message_is_behind_its_code(admin, receivers_enabled):
+    """The page of a PIN or password link shows only the brand and that a code is asked for; the owner's
+    message comes with the session the accepted code opens, as the public file and note pages keep theirs."""
+    tag = _mk_tag(admin, require_secret="pin", min_pin_len=4)
+    rec = _mk_receiver(admin, tag_id=tag["id"], pin="4321", message="Send the signed pages.")
+    anon = admin.clone_anonymous()
+    page = anon.get(f"/receivers/{rec['token']}/page")
+    assert page.status_code == 200, page.text
+    assert page.json()["secret_kind"] == "pin" and page.json()["message"] is None
+    assert "Send the signed" not in page.text
+    wrong = anon.post(f"/receivers/{rec['token']}/upload-session",
+                      json={"filename": "a.txt", "total_size": 1, "total_chunks": 1, "secret": "0000"})
+    assert wrong.status_code == 401 and "Send the signed" not in wrong.text
+    opened = anon.post(f"/receivers/{rec['token']}/upload-session",
+                       json={"filename": "a.txt", "total_size": 1, "total_chunks": 1, "secret": "4321"})
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["message"] == "Send the signed pages."
+
+
 def test_the_owner_can_store_and_read_a_re_copy_of_the_link(admin, receivers_enabled):
     rec = _mk_receiver(admin)
     import base64

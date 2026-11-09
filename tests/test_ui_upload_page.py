@@ -85,6 +85,26 @@ def test_the_page_takes_several_files_and_gives_a_receipt(page: Page, admin, lin
     expect(page.locator("#receipt-rows tr").last.locator(".renamed")).to_have_text("sent as one.txt")
 
 
+def test_a_protected_link_shows_the_owners_message_once_the_code_is_accepted(page: Page, admin, receivers_enabled):
+    tag = admin.post("/receiver-tags", json={"name": unique("rtag"), "min_token_len": 6, "require_secret": "pin",
+                                             "min_pin_len": 4, "max_total_bytes_cap": 100 * _MB,
+                                             "auto_enroll_new_users": True}).json()
+    rec = admin.post("/receivers", json={"tag_id": tag["id"], "max_total_bytes": 10 * _MB, "label": unique("Drop"),
+                                         "pin": "4321", "message": "Please send the signed pages."})
+    assert rec.status_code == 200, rec.text
+    page.goto(f"/u/{rec.json()['token']}")
+    expect(page.locator("#form")).to_be_visible(timeout=15000)
+    expect(page.locator("#secret-input")).to_be_visible()
+    # Before the code: the brand and the prompt, and no message anywhere on the page.
+    expect(page.locator("#owner-message")).to_be_hidden()
+    assert "Please send the signed pages." not in page.content()
+    page.set_input_files("#file-input", files=[{"name": "one.txt", "mimeType": "text/plain", "buffer": b"one"}])
+    page.fill("#secret-input", "4321")
+    page.click("#upload-btn")
+    expect(page.locator("#owner-message")).to_have_text("Please send the signed pages.", timeout=15000)
+    expect(page.locator("#receipt")).to_be_visible(timeout=20000)
+
+
 def test_the_owner_triages_the_drop_vault_into_a_vault(page: Page, admin, admin_creds, link):
     anon = admin.clone_anonymous()
     for name in ("a.txt", "b.txt"):

@@ -228,6 +228,9 @@ def test_an_upload_link_stops_with_its_owner(admin, owner, links_on, tags, chang
                         headers={"Content-Type": "application/octet-stream"})
 
     def check(expected):
+        # The page asks this before anything is sent; it must say what the upload would.
+        page = anon.get(f"/receivers/{token}/page")
+        assert page.status_code == expected, (expected, page.status_code, page.text)
         r = open_session()
         assert r.status_code == expected, (expected, r.status_code, r.text)
         if expected == 200:

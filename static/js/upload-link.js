@@ -1,11 +1,12 @@
 /* Anonymous receiver ("Upload link") page.
  *
  * Reads the token from /u/{token}. First asks GET /receivers/{token}/page what the page may show before
- * anything is sent (the deployment's name, the owner's message, whether a code is asked for). Takes
- * several files, chosen or dropped, and sends them one after another: each opens an upload session
- * (POST /receivers/{token}/upload-session), streams its bytes in fixed-size chunks (PUT .../chunks/{i})
- * and finalizes (POST .../complete). A secret-protected link first gets a 401 {error:"secret_required"};
- * the page then prompts for the PIN/password and retries. A file whose name was already taken is stored
+ * anything is sent (the deployment's name, whether a code is asked for, and the owner's message when the
+ * link asks for no code). Takes several files, chosen or dropped, and sends them one after another: each
+ * opens an upload session (POST /receivers/{token}/upload-session), streams its bytes in fixed-size chunks
+ * (PUT .../chunks/{i}) and finalizes (POST .../complete). A secret-protected link first gets a 401
+ * {error:"secret_required"}; the page then prompts for the PIN/password and retries, and the owner's
+ * message arrives with the first session the accepted code opens. A file whose name was already taken is stored
  * under a new name the server chooses, and the receipt says so. When everything chosen has been sent, a
  * receipt lists each file with its size, the time and a reference the owner can find it by. All status
  * text is written with textContent only; no inline handlers (strict CSP). */
@@ -64,10 +65,15 @@
     return fetch("/receivers/" + encodeURIComponent(token) + "/page", { headers: { "Accept": "application/json" } });
   }
 
+  function showOwnerMessage(text) {
+    var m = $("owner-message");
+    if (!text) { return; }
+    m.textContent = text; m.classList.remove("hidden");
+  }
+
   function applyPageInfo(info) {
     if (info && info.brand) { $("brand").textContent = info.brand + " · Upload files"; document.title = info.brand + " · Upload files"; }
-    var m = $("owner-message");
-    if (info && info.message) { m.textContent = info.message; m.classList.remove("hidden"); }
+    showOwnerMessage(info && info.message);
     if (info && info.secret_kind && info.secret_kind !== "none") { promptSecret(info.secret_kind, null); }
   }
 
@@ -168,6 +174,7 @@
     if (resp.status !== 200) { setState(q, "Could not start", "error"); return "failed"; }
 
     var sess = await resp.json();
+    showOwnerMessage(sess.message);   // a protected link's message, now that its code has been accepted
     var sid = sess.session_id;
     var total = Math.max(1, Math.ceil(file.size / CHUNK));
     for (var i = 0; i < total; i++) {

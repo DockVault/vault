@@ -15927,9 +15927,12 @@ class ReceiverUploadOpen(BaseModel):
 
 @app.get("/receivers/{token}/page")
 async def receiver_upload_page_info(token: str, request: Request, db: Session = Depends(get_db)):
-    """PUBLIC: what the upload page shows before anything is sent: the deployment's name, the owner's
-    message and whether the link asks for a code. Rate-limited like opening an upload; a missing or
-    unusable link returns the uniform 404 (no oracle)."""
+    """PUBLIC: what the upload page shows before anything is sent: the deployment's name, whether the
+    link asks for a code, and, for a link that asks for none, the owner's message. A link with a PIN or
+    password keeps its message behind the code (the public file and note pages do the same): it comes
+    back from the upload-session open, once the code has been accepted. Rate-limited like opening an
+    upload; a missing or unusable link, or one whose owner is locked or deactivated or whose drop vault
+    is gone, returns the uniform 404 (no oracle)."""
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     client_ip = get_client_ip(request)
     if not token or len(token) > _PUBLINK_TOKEN_MAX_INPUT:
@@ -15948,7 +15951,13 @@ async def receiver_upload_page_info(token: str, request: Request, db: Session = 
     receiver = db.query(Receiver).filter(Receiver.token_hash == _receiver_token_hash(token)).first()
     if receiver is None or _receiver_status(receiver) != "active":
         raise HTTPException(status_code=404, detail="This upload link is not available.")
-    return {"brand": _brand_name(db), "message": receiver.message or None, "secret_kind": receiver.secret_kind}
+    # As every other anonymous request: a link whose owner an administrator has locked or deactivated,
+    # or whose drop vault is gone, answers exactly as a missing link does. Answering with the brand, the
+    # message or a code prompt would tell a token holder the link is still there.
+    if _receiver_resolve_live(db, receiver) is None:
+        raise HTTPException(status_code=404, detail="This upload link is not available.")
+    message = (receiver.message or None) if receiver.secret_kind == "none" else None
+    return {"brand": _brand_name(db), "message": message, "secret_kind": receiver.secret_kind}
 
 
 def _receiver_owner_or_404(db, receiver_id, current_user):
@@ -16218,6 +16227,9 @@ async def open_receiver_upload_session(
         "total_chunks": session.total_chunks,
         "received_chunks": [],
         "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+        # The owner's message, here behind the secret gate above: for a link with a code, this is where
+        # the page learns it (GET .../page gives it only for a link without one).
+        "message": receiver.message or None,
     }
 
 
