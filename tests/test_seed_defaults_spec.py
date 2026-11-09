@@ -29,7 +29,7 @@ def test_a_client_delivery_link_tag_is_seeded():
     assert tag["auto_enroll_new_users"] is True
     # Every seeded tag still validates as a tag.
     for t in p.DEFAULT_NOTE_LINK_TAGS:
-        p.validate_tag_data(dict(t)) if hasattr(p, "validate_tag_data") else None
+        p.validate_tag_fields(dict(t))
 
 
 def test_a_long_extension_is_a_fixed_step_up_that_the_routes_guard():

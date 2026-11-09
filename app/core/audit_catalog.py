@@ -174,7 +174,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("note_link_delete", "public_links", "Note link deleted", "info"),
     AuditAction("note_link_redeem", "public_links", "Note link opened", "info"),
     AuditAction("note_link_revoke", "public_links", "Note link revoked", "info"),
-    AuditAction("note_link_extended", "public_links", "Note link expiry extended", "info"),
+    AuditAction("note_link_extended", "public_links", "Note link expiry extended", "notice"),
     AuditAction("public_link_admin_revoke", "public_links", "Public link revoked by an admin", "notice"),
     AuditAction("public_link_admin_revoke_all", "public_links", "All public links revoked by an admin", "warning"),
     AuditAction("public_link_create", "public_links", "Public link created", "notice"),
@@ -183,7 +183,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("public_link_download_completed", "public_links", "Public link download finished", "info"),
     AuditAction("public_link_redeem", "public_links", "Public link opened", "info"),
     AuditAction("public_link_revoke", "public_links", "Public link revoked", "info"),
-    AuditAction("public_link_extended", "public_links", "Public link expiry extended", "info"),
+    AuditAction("public_link_extended", "public_links", "Public link expiry extended", "notice"),
     # The server could not start a download it had granted (the stored file missing or unreadable, no
     # transfer slot free): the use the link's redeem spent was given back.
     AuditAction("public_link_use_refunded", "public_links", "Public link use given back after a failed download",
