@@ -11,7 +11,8 @@
 //     here is left out of "What's waiting for you" (the notice about it is the same thing, said twice).
 //     Each row's full title is its tooltip, for a title the lane cuts short.
 //   * for an administrator, a "Get started" checklist (email set up and a test send passed, a public
-//     address, the second-factor policy decided, a backup recorded) that goes away once done or dismissed.
+//     address, the second-factor policy decided, backups set up, on the administrator's word) that goes
+//     away once done or dismissed.
 //
 // Everything is built with createElement and textContent: a name or a label is never HTML. Every request is
 // silent and tolerated: a page that cannot be read leaves its rows out, nothing else breaks.
@@ -266,9 +267,11 @@
         { key: 'second_factor', label: 'The second-factor policy decided',
           hint: 'Settings > Security: require a second factor, or keep it optional on purpose.',
           go: () => openSettingsPage('security'), ack: { second_factor_decided: true }, ackLabel: 'Keep it optional' },
-        { key: 'backup', label: 'A backup recorded',
-          hint: 'Back up the data and record it here, so the first restore is not the first try.',
-          ack: { backup_recorded: true }, ackLabel: 'I recorded a backup' },
+        // DockVault keeps no record of backup runs: this is ticked on the administrator's word alone.
+        { key: 'backup', label: 'Backups set up',
+          hint: 'Back up on the host (dockvault.py backup) and try a restore once. DockVault cannot see backups '
+              + 'taken on the host, so this is ticked on your word.',
+          ack: { backup_recorded: true }, ackLabel: 'I have set up backups' },
     ];
 
     async function post(body) {

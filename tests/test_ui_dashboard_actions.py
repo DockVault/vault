@@ -118,6 +118,11 @@ def test_the_get_started_checklist_ticks_what_is_recorded_and_can_be_dismissed(p
     expect(card.locator(".get-started-item")).to_have_count(4)
     backup = card.locator('.get-started-item[data-check="backup"]')
     assert "is-done" not in (backup.get_attribute("class") or "")
+    # The vault keeps no record of backup runs, and says so: the item is ticked on the administrator's word.
+    expect(backup.locator(".get-started-label")).to_have_text("Backups set up")
+    expect(backup.locator(".get-started-hint")).to_contain_text("dockvault.py backup")
+    expect(backup.locator(".get-started-hint")).to_contain_text("DockVault cannot see backups taken on the host")
+    expect(backup.locator("button.get-started-ack")).to_have_text("I have set up backups")
     backup.locator("button.get-started-ack").click()
     expect(card.locator('.get-started-item[data-check="backup"]')).to_have_class("get-started-item is-done", timeout=10000)
     assert admin.get("/admin/get-started").json()["items"]["backup"] is True
