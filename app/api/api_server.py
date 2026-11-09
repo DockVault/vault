@@ -13248,11 +13248,30 @@ def _ceiling(created_at, minutes=None, hours=None):
     return None
 
 
-def _link_type_for_extension(tag, kind: str):
-    """A link's type (its tag) must still exist for its expiry to move: the type holds the ceiling. A tag
-    with no maximum lifetime sets no ceiling."""
+def _link_type_for_extension(db, tag, kind: str, owner_id, enabled: bool):
+    """What making a link checked, checked again before its expiry moves, as replacing an upload link's address
+    does: the feature is on, the link's type (its tag) exists and is active, and its maker is still an account
+    that may publish links (_link_owner_if_live) and that the type admits. Returns the tag.
+
+    The ceiling then follows the type's maximum as it is now: a link's policy is its tag's current one, so an
+    administrator who shortens a type's maximum shortens how far its links can still be moved. A share keeps
+    the limits it was made under instead (_share_ceiling). A tag with no maximum lifetime sets no ceiling."""
+    if not enabled:
+        raise HTTPException(status_code=403, detail=f"{kind[0].upper() + kind[1:]}s are disabled on this deployment.")
     if tag is None:
         raise HTTPException(status_code=400, detail=f"This {kind}'s type no longer exists, so its expiry cannot be moved.")
+    if not tag.is_active:
+        raise HTTPException(status_code=400, detail=f"This {kind}'s type is inactive; it cannot be extended.")
+    maker = _link_owner_if_live(db, owner_id)
+    if maker is None:
+        raise HTTPException(status_code=400, detail=(
+            f"This {kind}'s maker can no longer publish links, so it cannot be extended."))
+    allowlist = {"is_active": tag.is_active, "blocked_user_ids": tag.blocked_user_ids,
+                 "allowed_user_ids": tag.allowed_user_ids, "allowed_department_ids": tag.allowed_department_ids,
+                 "auto_enroll_new_users": tag.auto_enroll_new_users}
+    if not sharing_policy.user_can_create_with_tag(allowlist, maker.id, _user_group_ids(db, maker.id)):
+        raise HTTPException(status_code=400, detail=(
+            f"This {kind}'s type no longer admits its maker, so it cannot be extended."))
     return tag
 
 
@@ -13332,7 +13351,8 @@ async def extend_public_link(link_id: uuid.UUID, body: ExtendExpiryBody, request
     if status != "active":
         raise HTTPException(status_code=400, detail=f"Only an active public link can be extended; this one is {status}.")
     tag = _link_type_for_extension(
-        db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None, "public link")
+        db, db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None,
+        "public link", link.owner_id, note_link_policy.public_file_links_enabled(_global_settings_blob(db)))
     ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=link, kind="public link", id_key="link_id",
                              owner_id=link.owner_id, body=body, ceiling=ceiling)
@@ -13354,7 +13374,8 @@ async def extend_note_link(link_id: uuid.UUID, body: ExtendExpiryBody, request: 
     if status != "active":
         raise HTTPException(status_code=400, detail=f"Only an active note link can be extended; this one is {status}.")
     tag = _link_type_for_extension(
-        db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None, "note link")
+        db, db.query(NoteLinkTag).filter(NoteLinkTag.id == link.tag_id).first() if link.tag_id else None,
+        "note link", link.owner_id, note_link_policy.public_note_links_enabled(_global_settings_blob(db)))
     ceiling = _ceiling(link.created_at, hours=tag.max_ttl_hours) if tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=link, kind="note link", id_key="link_id",
                              owner_id=link.owner_id, body=body, ceiling=ceiling)
@@ -13377,7 +13398,8 @@ async def extend_receiver(receiver_id: uuid.UUID, body: ExtendExpiryBody, reques
     if status not in ("active", "paused"):
         raise HTTPException(status_code=400, detail=f"Only an active or paused upload link can be extended; this one is {status}.")
     tag = _link_type_for_extension(
-        db.query(ReceiverTag).filter(ReceiverTag.id == r.tag_id).first() if r.tag_id else None, "upload link")
+        db, db.query(ReceiverTag).filter(ReceiverTag.id == r.tag_id).first() if r.tag_id else None,
+        "upload link", r.owner_id, receiver_policy.public_receivers_enabled(_global_settings_blob(db)))
     ceiling = _ceiling(r.created_at, hours=tag.max_ttl_hours) if tag.max_ttl_hours else None
     details = _extend_expiry(db, request, current_user, item=r, kind="upload link", id_key="receiver_id",
                              owner_id=r.owner_id, body=body, ceiling=ceiling)

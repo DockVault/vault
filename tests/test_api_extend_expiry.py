@@ -69,6 +69,7 @@ def test_a_share_is_extended_within_its_tags_ceiling_and_recorded(admin, admin_c
         assert cx.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(before + timedelta(days=5))}).status_code == 404
         r = admin.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(before + timedelta(days=5))})
         assert r.status_code == 200, r.text
+        assert set(r.json()) == {"id", "expires_at", "ceiling"}, r.json()   # nothing of the maker's share
         rows = _psql("SELECT details::text FROM audit_logs WHERE action='share_extended' "
                      f"AND details::text LIKE '%{share['id']}%' ORDER BY timestamp")
         assert rows.count("\n") + 1 == 2 and '"by_admin": true' in rows and '"new_expiry"' in rows
@@ -305,3 +306,64 @@ def test_every_item_carries_its_extend_ceiling_and_a_refusal_reads_as_a_date(adm
         admin.delete_vault(v["id"])
         admin.put("/settings", json={k: settings_before.get(k) for k in
                                      ("public_receivers_enabled", "public_receiver_user_cap", "public_file_links_enabled")})
+
+
+def test_an_administrator_who_extends_a_users_public_or_upload_link_gets_only_the_expiry(admin):
+    settings_before = admin.get("/settings").json()
+    admin.put("/settings", json={"public_receivers_enabled": True, "public_receiver_user_cap": 50,
+                                 "public_file_links_enabled": True})
+    owner = admin.create_user(role="user")
+    co = ApiClient(); co.login(owner["_username"], owner["_password"])
+    v = co.create_vault(name=unique("adminext"))
+    try:
+        rtag = admin.post("/receiver-tags", json={"name": unique("rt"), "min_token_len": 6, "require_secret": "none",
+                                                  "max_total_bytes_cap": 100 * _MB, "auto_enroll_new_users": True,
+                                                  "default_ttl_hours": 24, "max_ttl_hours": 72}).json()
+        rec = co.post("/receivers", json={"tag_id": rtag["id"], "max_total_bytes": 10 * _MB, "ttl_hours": 24,
+                                          "label": "Client returns"})
+        assert rec.status_code in (200, 201), rec.text
+        r = admin.post(f"/receivers/{rec.json()['id']}/extend",
+                       json={"expires_at": _iso(_parse(rec.json()["expires_at"]) + timedelta(hours=1))})
+        assert r.status_code == 200, r.text
+        assert set(r.json()) == {"id", "expires_at", "ceiling"}, r.json()
+        fid = co.post(f"/vaults/{v['id']}/files", files=[("files", ("a.txt", b"x", "text/plain"))]).json()["files"][0]["id"]
+        ltag = admin.post("/note-link-tags", json={"name": unique("lt"), "auto_enroll_new_users": True,
+                                                   "allowed_targets": ["file", "folder", "note"],
+                                                   "default_ttl_hours": 24, "max_ttl_hours": 48})
+        if ltag.status_code != 200:
+            pytest.skip(f"no link tag here: {ltag.status_code} {ltag.text[:100]}")
+        link = co.post("/public-links", json={"vault_id": v["id"], "target_type": "file", "target_file_id": fid,
+                                               "tag_id": ltag.json()["id"], "ttl_hours": 24})
+        assert link.status_code == 200, link.text
+        r = admin.post(f"/public-links/{link.json()['id']}/extend",
+                       json={"expires_at": _iso(_parse(link.json()["expires_at"]) + timedelta(hours=1))})
+        assert r.status_code == 200, r.text
+        assert set(r.json()) == {"id", "expires_at", "ceiling"}, r.json()
+    finally:
+        co.delete_vault(v["id"])
+        admin.delete_user(owner["id"])
+        admin.put("/settings", json={k: settings_before.get(k) for k in
+                                     ("public_receivers_enabled", "public_receiver_user_cap", "public_file_links_enabled")})
+
+
+def test_a_link_is_extended_only_while_it_could_still_be_made(admin):
+    settings_before = admin.get("/settings").json()
+    admin.put("/settings", json={"public_receivers_enabled": True, "public_receiver_user_cap": 50})
+    try:
+        rtag = admin.post("/receiver-tags", json={"name": unique("rr"), "min_token_len": 6, "require_secret": "none",
+                                                  "max_total_bytes_cap": 100 * _MB, "auto_enroll_new_users": True,
+                                                  "default_ttl_hours": 24, "max_ttl_hours": 72}).json()
+        rec = admin.post("/receivers", json={"tag_id": rtag["id"], "max_total_bytes": 10 * _MB, "ttl_hours": 24}).json()
+        later = _iso(_parse(rec["expires_at"]) + timedelta(hours=2))
+        # Upload links switched off: the feature's own refusal.
+        admin.put("/settings", json={"public_receivers_enabled": False})
+        r = admin.post(f"/receivers/{rec['id']}/extend", json={"expires_at": later})
+        assert r.status_code == 403 and "disabled on this deployment" in r.text, r.text
+        admin.put("/settings", json={"public_receivers_enabled": True})
+        # The link's type retired: no longer extended.
+        assert admin.delete(f"/receiver-tags/{rtag['id']}").status_code in (200, 204)
+        r = admin.post(f"/receivers/{rec['id']}/extend", json={"expires_at": later})
+        assert r.status_code == 400 and "inactive" in r.text, r.text
+    finally:
+        admin.put("/settings", json={k: settings_before.get(k) for k in
+                                     ("public_receivers_enabled", "public_receiver_user_cap")})
