@@ -264,45 +264,75 @@ def test_every_bad_logout_token_is_the_same_400_and_ends_nothing(monkeypatch, sp
 
 def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_token(monkeypatch):
     """The specification's 400 says the token was invalid and the provider does not retry; a limiter refusal, a
-    store outage or a provider whose keys cannot be fetched is 501, the logout failed, so it may."""
+    store outage, a provider whose keys cannot be fetched, a configuration the vault cannot read, or every slot in
+    use is 501, the logout failed, so it may."""
     alice, p = _user(), _provider()
     h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
     _signed_in(h, p, sid="s-1")
     token = h.logout_token(sid="s-1", sub="subject-1")
-    from app.core import sso_state
+    from app.api import sso_router
+    from app.core import sign_in_lockout, sso_state
     from app.core.rate_limiter import rate_limiter as RL
     from app.services import oidc_client as oc
-    asked = []
+    from app.services import sso_sign_in as sso
+    source = sign_in_lockout.source_of("203.0.113.9")
+    asked, noted = [], []
     real = RL.check_rate_limit
 
     def refusing(*a, **kw):
         if kw.get("prefix") == "sso_backchannel":
             asked.append((kw.get("identifier"), kw.get("limit")))
             return (False, 0, 10)
+        if kw.get("prefix") == "sso_backchannel_refused":
+            noted.append(kw.get("identifier"))
+            return (len(noted) == 1, 0, 10)
         return real(*a, **kw)
     monkeypatch.setattr(RL, "check_rate_limit", refusing)
-    status, body = h.logout(p, token)
-    assert (status, body) == (501, {"error": "logout_failed"})
-    # One bucket per source, whatever provider id the address names, sized for a provider signing many people out.
-    from app.api import sso_router
-    from app.core import sign_in_lockout
-    assert asked == [(sign_in_lockout.source_of("203.0.113.9"), sso_router.LOGOUT_LIMIT)] and sso_router.LOGOUT_LIMIT >= 600
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    # A bucket per source for each provider, sized for a provider signing many people out; one shared by every id
+    # with no provider behind it.
+    assert asked == [(f"{source}:{p.id}", sso_router.LOGOUT_LIMIT)] * 2 and sso_router.LOGOUT_LIMIT >= 600
     h.logout(types.SimpleNamespace(id=uuid.uuid4()), token)
-    assert asked[-1][0] == sign_in_lockout.source_of("203.0.113.9")
+    h.logout(types.SimpleNamespace(id=uuid.uuid4()), token)
+    assert asked[-2:] == [(f"{source}:unknown", sso_router.LOGOUT_LIMIT)] * 2
+    # A known provider's refused logout leaves one trace per window; an unknown id leaves none.
+    limited = [a for a in h.audits if a[0] == "sso_backchannel_logout" and a[2].get("reason") == "rate_limited"]
+    assert limited == [("sso_backchannel_logout", "failure", {"provider_id": str(p.id), "reason": "rate_limited"})]
+    assert noted == [str(p.id), str(p.id)]
     monkeypatch.setattr(RL, "check_rate_limit", real)
+    # The state store down.
     real_seen = sso_state.seen_logout_jti
     monkeypatch.setattr(sso_state, "seen_logout_jti", lambda *a, **k: (_ for _ in ()).throw(sso_state.Unavailable("down")))
-    status, body = h.logout(p, token)
-    assert (status, body) == (501, {"error": "logout_failed"})
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
     assert any(a[0] == "sso_backchannel_logout" and a[1] == "failure" and a[2].get("reason") == "store_unavailable" for a in h.audits)
     monkeypatch.setattr(sso_state, "seen_logout_jti", real_seen)
+    # The provider unreachable: and asked again only after a short pause, not on every request meanwhile.
     monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
     serving = oc.fetch_json
-    monkeypatch.setattr(oc, "fetch_json", lambda *a, **k: (_ for _ in ()).throw(oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")))
-    status, body = h.logout(p, token)
-    assert (status, body) == (501, {"error": "logout_failed"})
+    fetched = []
+    monkeypatch.setattr(oc, "fetch_json", lambda *a, **k: fetched.append(1) or (_ for _ in ()).throw(
+        oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")))
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
     assert any(a[0] == "sso_backchannel_logout" and a[1] == "failure" and a[2].get("reason") == "temporarily_unavailable" for a in h.audits)
     monkeypatch.setattr(oc, "fetch_json", serving)
+    assert h.logout(p, token) == (501, {"error": "logout_failed"}) and len(fetched) == 1
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())                     # the pause has passed
+    # The vault cannot read its own configuration of the provider.
+    real_config = sso.provider_config
+    monkeypatch.setattr(sso, "provider_config", lambda row: (_ for _ in ()).throw(sso.Refusal(oc.PROVIDER_ERROR, "secret")))
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    monkeypatch.setattr(sso, "provider_config", real_config)
+    # A provider whose discovery no longer fits what the vault was configured with.
+    h.discovery_overrides["issuer"] = "https://elsewhere.example.com"
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    h.discovery_overrides.pop("issuer")
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
+    # Every verification slot in use: answered at once, the provider retries.
+    import asyncio
+    monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", asyncio.Semaphore(0))
+    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", asyncio.Semaphore(sso_router.BACKCHANNEL_CONCURRENCY))
     # None of the failures spent the token: the provider's retry ends the session.
     assert all(s.is_active for s in h.active_sessions())
     status, body = h.logout(p, token)
@@ -342,17 +372,9 @@ def test_an_ended_session_keeps_no_logout_hint(monkeypatch):
     assert rows["s-1"].id_token_enc is None and rows["s-2"].id_token_enc.startswith("enc:")
     h.S._revoke_sessions(h.db, user_id=alice.id, durable=True, except_session_token=None)
     assert rows["s-2"].id_token_enc is None and rows["s-3"].id_token_enc is None
-    # A session that ran out, ended by the clean-up.
-    from datetime import timezone
-    from app.core.models import TemporaryCredential
+    # (A session that simply runs out keeps its hint until the retention prune deletes the session's row, and the
+    # record with it: the web app's idle clean-up marks sessions inactive, not revoked, and they may still work.)
     from app.services import auth_service as A
-    h.db.tables.setdefault(TemporaryCredential, [])
-    _signed_in(h, p, sid="s-4")
-    row4 = [r for r in h.sso_sessions() if r.idp_sid == "s-4"][0]
-    session4 = [s for s in h.active_sessions() if s.id == row4.session_id][0]
-    session4.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
-    A.AuthService(h.db).cleanup_expired_sessions()
-    assert session4.is_active is False and row4.id_token_enc is None
     # A session a password sign-in elsewhere marked inactive is not revoked and keeps working: it keeps its hint, so
     # its own sign-out still offers the provider's logout.
     _signed_in(h, p, sid="s-5")
@@ -418,6 +440,70 @@ def test_a_logout_that_could_not_be_applied_does_not_spend_the_token(monkeypatch
     assert status == 200 and not [s for s in h.active_sessions() if s.is_active], body
 
 
+def test_a_commit_that_fails_spends_the_token_only_when_the_logout_took_effect(monkeypatch):
+    """A failed commit may still have reached the database. The token is forgotten (the provider's retry works) only
+    when a session it named is still live; when they are all ended, it stays spent, so a replay cannot end sessions
+    made later."""
+    from app.core.models import ActiveSession
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    (session,) = h.active_sessions()
+    through, real_commit, real_rollback = h.S._revoke_sessions, h.db.commit, h.db.rollback
+    armed, faults = [], [True, False, True]   # the commit after the first and the third revocation fails
+
+    def revoke(db, **kw):
+        armed.append(faults.pop(0) if faults else False)
+        return through(db, **kw)
+
+    def commit():
+        if armed and armed[-1]:
+            armed[-1] = False
+            raise RuntimeError("the connection dropped during the commit")
+        return real_commit()
+    monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
+    monkeypatch.setattr(h.db, "commit", commit)
+    # The commit did not reach the database: the rollback brings the session back, the token is not spent.
+    reverted = []
+
+    def rollback_the_database():
+        if session.revoked and not reverted:
+            reverted.append(True)
+            session.is_active, session.revoked = True, False
+        return real_rollback()
+    monkeypatch.setattr(h.db, "rollback", rollback_the_database)
+    token = h.logout_token(sid="s-1", sub="subject-1")
+    assert h.logout(p, token) == (501, {"error": "logout_failed"}) and session.is_active and not session.revoked
+    status, body = h.logout(p, token)
+    assert status == 200 and session.revoked is True, body
+    # The commit reached the database although it raised: the session is ended, and the token stays spent.
+    monkeypatch.setattr(h.db, "rollback", real_rollback)
+    _signed_in(h, p, sid="s-2")
+    token2 = h.logout_token(sid="s-2", sub="subject-1")
+    assert h.logout(p, token2) == (501, {"error": "logout_failed"})
+    second = [s for s in h.active_sessions() if s is not session][0]
+    assert second.revoked is True
+    assert h.logout(p, token2) == (400, {"error": "invalid_request"})                # a replay, refused
+
+
+def test_a_failed_revocation_is_rolled_back_before_anything_is_recorded(monkeypatch):
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    from app.api import sso_router
+    events = []
+    real_rollback, real_audit = h.db.rollback, sso_router._audit
+    monkeypatch.setattr(h.db, "rollback", lambda: events.append("rollback") or real_rollback())
+    monkeypatch.setattr(sso_router, "_audit", lambda db, action, **kw: events.append(("audit", kw.get("details", {}).get("reason")))
+                        or real_audit(db, action, **kw))
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: events.append("revoke") or (_ for _ in ()).throw(
+        RuntimeError("down")))
+    events.clear()
+    assert h.logout(p, h.logout_token(sid="s-1", sub="subject-1")) == (501, {"error": "logout_failed"})
+    after = events[events.index("revoke") + 1:]
+    assert after == ["rollback", ("audit", "revocation_failed")], events
+
+
 def test_an_empty_session_id_falls_back_to_the_subject(monkeypatch):
     alice, p = _user(), _provider()
     h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
@@ -447,7 +533,26 @@ def test_the_back_channel_logout_fetches_the_providers_keys_off_the_event_loop()
     from app.api import sso_router
     source = inspect.getsource(sso_router.backchannel_logout)
     assert source.count("await run_in_threadpool(verify)") == 1
-    assert "identifier=sign_in_lockout.source_of(client_ip)," in source
+    assert 'identifier=f"{source}:{scope or \'unknown\'}"' in source
+    # The database connection goes back to the pool before the network work.
+    assert source.index("db.rollback()") < source.index("run_in_threadpool(verify)")
+    assert source.index("_BACKCHANNEL_SLOTS.locked()") < source.index("run_in_threadpool(verify)")
+
+
+def test_the_table_check_asks_the_sessions_own_connection():
+    import inspect
+    set_bare_api_env()
+    from app.services import sign_in
+    source = inspect.getsource(sign_in.table_present)
+    assert source.count("inspect(connection)") == 1 and "db.connection()" in source
+
+
+def test_the_provider_logout_hint_is_never_in_the_results_text_form():
+    set_bare_api_env()
+    from app.services import sign_in as s
+    result = s.SignInResult(types.SimpleNamespace(id=uuid.uuid4(), username="alice"), [], None,
+                            provider_logout_hint="eyJ.the-id-token.sig")
+    assert "the-id-token" not in repr(result)
 
 
 # --------------------------------------------------------------------------- the provider's logout at sign-out

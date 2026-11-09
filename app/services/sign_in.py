@@ -126,7 +126,8 @@ class SignInResult:
     # the ID token (plain here, encrypted at rest) when the provider logout option wants it.
     provider_sid: Optional[str] = None
     provider_sub: Optional[str] = None
-    provider_logout_hint: Optional[str] = None      # the ID token, for the provider's own logout; only when wanted
+    # The ID token, for the provider's own logout; only when wanted. Never in the result's text form.
+    provider_logout_hint: Optional[str] = field(default=None, repr=False)
     provider_auth_time: Optional[datetime] = None   # when the provider says the person authenticated (its session)
     # A passkey: whether the authenticator verified the person (the UV flag), and whether the policy lets
     # this person sign in with a user-verified passkey alone.

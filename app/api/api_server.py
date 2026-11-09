@@ -9629,8 +9629,10 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             'session_id': str(s.id),
             'terminated_by': actor_username,
         }, actor_username)
-    if handled_ids:
-        # An ended session makes no provider logout: its logout hint (the encrypted ID token) goes with it.
+    if handled_ids and durable:
+        # A revoked session makes no provider logout: its logout hint (the encrypted ID token) goes with it. Not for
+        # a revocation that is not durable (turning SFTP off): its web sessions are marked inactive, not revoked, and
+        # keep working, so their own sign-out still offers the provider's logout.
         sign_in.forget_provider_logout_hints(db, handled_ids)
     if durable and temp_credential_id is None:
         # The regular sessions already inactive but never revoked (see the docstring), in one

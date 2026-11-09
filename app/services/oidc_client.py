@@ -43,6 +43,7 @@ MAX_BODY_BYTES = 256 * 1024
 MAX_TOKEN_BYTES = 16 * 1024
 MAX_SUBJECT_LENGTH = 255
 CACHE_SECONDS = 3600
+DISCOVERY_FAILURE_SECONDS = 30   # a provider that could not be reached is not asked again for this long
 JWKS_REFETCH_INTERVAL_SECONDS = 60
 LOGOUT_TOKEN_FRESHNESS_SECONDS = 120
 BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
@@ -305,7 +306,16 @@ def discover(provider: ProviderConfig, *, fetch: Callable = fetch_json, cache: O
             return cached
     url = discovery_url(provider)
     check_endpoint(url, private_network=provider.private_network, resolve=resolve)
-    doc = fetch(url)
+    failed_key = f"sso:disc-failed:{provider.id}"
+    if not refresh and cache.get(failed_key, now) is not None:
+        # Unreachable moments ago: every request in the meantime would wait out the same timeout.
+        raise OidcError(TEMPORARILY_UNAVAILABLE, "the provider could not be reached moments ago")
+    try:
+        doc = fetch(url)
+    except OidcError as exc:
+        if exc.code == TEMPORARILY_UNAVAILABLE:
+            cache.set(failed_key, True, DISCOVERY_FAILURE_SECONDS, now)
+        raise
     issuer = doc.get("issuer")
     if not isinstance(issuer, str) or issuer != provider.issuer:
         raise OidcError(ISSUER_MISMATCH, "the discovery document's issuer is not the configured one")

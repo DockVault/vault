@@ -608,3 +608,34 @@ def test_every_address_the_vault_calls_or_sends_a_browser_to_is_vetted_at_use():
     with pytest.raises(oc.OidcError) as e:
         oc.discover(_provider(oc), fetch=_fetch_for(signer), cache=oc.Cache(), resolve=private, now=NOW)
     assert e.value.code == "endpoint_refused"
+
+
+def test_a_provider_that_cannot_be_reached_is_not_asked_again_for_a_short_while():
+    oc = _oc()
+    signer = Signer()
+    cache = oc.Cache()
+    calls = []
+
+    def down(url, **kw):
+        calls.append(url)
+        raise oc.OidcError(oc.TEMPORARILY_UNAVAILABLE, "down")
+    for _ in range(3):
+        with pytest.raises(oc.OidcError) as e:
+            oc.discover(_provider(oc), fetch=down, cache=cache, resolve=_PUBLIC, now=NOW)
+        assert e.value.code == oc.TEMPORARILY_UNAVAILABLE
+    assert len(calls) == 1
+    # After the pause it is asked again, and an answer is cached as before.
+    up = _fetch_for(signer)
+    found = oc.discover(_provider(oc), fetch=up, cache=cache, resolve=_PUBLIC, now=NOW + oc.DISCOVERY_FAILURE_SECONDS + 1)
+    assert found.issuer == ISSUER
+    # An answer that is not a document is not remembered as unreachable: the next request asks again.
+    cache2, wrong = oc.Cache(), []
+
+    def not_a_document(url, **kw):
+        wrong.append(url)
+        raise oc.OidcError(oc.DISCOVERY_INVALID, "not JSON")
+    for _ in range(2):
+        with pytest.raises(oc.OidcError) as e:
+            oc.discover(_provider(oc), fetch=not_a_document, cache=cache2, resolve=_PUBLIC, now=NOW)
+        assert e.value.code == oc.DISCOVERY_INVALID
+    assert len(wrong) == 2

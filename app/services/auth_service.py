@@ -1687,16 +1687,6 @@ class AuthService:
         
         for session in expired_sessions:
             self._terminate_session(session)
-        # A session that has run out makes no provider logout: its logout hint (an encrypted ID token with the
-        # person's claims) is dropped. Not in _terminate_session: a password sign-in elsewhere marks the account's
-        # other web sessions inactive through it, and those keep working until they are revoked or run out.
-        if expired_sessions:
-            try:
-                from app.services import sign_in
-                if sign_in.forget_provider_logout_hints(self.db, [s.id for s in expired_sessions]):
-                    self.db.commit()
-            except Exception:  # noqa: BLE001
-                self.db.rollback()
         
         # Deactivate temporary credentials after validity period
         expired_temp_creds = self.db.query(TemporaryCredential).filter(

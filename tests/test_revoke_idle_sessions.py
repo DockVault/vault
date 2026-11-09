@@ -128,7 +128,9 @@ def _hint_of(db, row_id):
 def test_every_session_a_revocation_ends_drops_its_provider_logout_hint(db, published):
     """The hint (an encrypted ID token kept for the provider's own logout at sign-out) goes with every session a
     durable revocation ends: the live ones and, in the second pass, the idle ones it revokes. Another account's and
-    a temporary credential's rows are untouched; a revocation that is not durable leaves an idle session alone."""
+    a temporary credential's rows are untouched, and so is the session the caller keeps. A revocation that is not
+    durable (turning SFTP off) marks web sessions inactive without revoking them, and they keep working: their hints
+    stay."""
     user, other = uuid.uuid4(), uuid.uuid4()
     live = _row(db, user, active=True)
     idle = _row(db, user, active=False)
@@ -139,13 +141,23 @@ def test_every_session_a_revocation_ends_drops_its_provider_logout_hint(db, publ
     assert _revoke(db, user_id=user) == 2
     assert _hint_of(db, live) is None and _hint_of(db, idle) is None
     assert _hint_of(db, temp_idle) == "enc:the-id-token" and _hint_of(db, someone_else) == "enc:the-id-token"
-    # Not durable: the live session ends and its hint goes; an idle one is not revoked and keeps it.
+    # Not durable: nothing is revoked, so every hint stays.
     third = uuid.uuid4()
     live3, idle3 = _row(db, third, active=True), _row(db, third, active=False)
     _hint(db, live3)
     _hint(db, idle3)
     assert _revoke(db, user_id=third, durable=False) == 1
-    assert _hint_of(db, live3) is None and _hint_of(db, idle3) == "enc:the-id-token"
+    assert _state(db, live3) == (False, False)
+    assert _hint_of(db, live3) == "enc:the-id-token" and _hint_of(db, idle3) == "enc:the-id-token"
+    # The caller's own session, kept by a durable revocation, keeps its hint; the others lose theirs.
+    fourth = uuid.uuid4()
+    mine = _row(db, fourth, active=True, token="my-token")
+    other_live, other_idle = _row(db, fourth, active=True), _row(db, fourth, active=False)
+    for row in (mine, other_live, other_idle):
+        _hint(db, row)
+    assert _revoke(db, user_id=fourth, except_session_token="my-token") == 2      # the live one and the idle one
+    assert _state(db, mine) == (True, False) and _hint_of(db, mine) == "enc:the-id-token"
+    assert _hint_of(db, other_live) is None and _hint_of(db, other_idle) is None
 
 
 def test_a_session_the_cleanup_ends_meanwhile_is_revoked_and_counted_once(db, monkeypatch):

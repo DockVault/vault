@@ -13,6 +13,7 @@ the callback is public and an error answer there is unsigned, so a refusal never
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -36,8 +37,13 @@ log = logging.getLogger("dockvault.sso")
 
 START_LIMIT = 30                     # starts per address per START_WINDOW, beside the state store's abandoned cap
 START_WINDOW = 300
-LOGOUT_LIMIT = 600                 # back-channel logouts per provider per source address and window: a provider
-                                   # signing out many people at once is machine-to-machine, not a person
+LOGOUT_LIMIT = 600                 # back-channel logouts per source address and window, for each provider (and one
+                                   # bucket for every id with no provider): signing many people out is not a person
+BACKCHANNEL_CONCURRENCY = 4         # back-channel verifications in flight at once; beyond it, 501 and the provider retries
+_BACKCHANNEL_SLOTS = asyncio.Semaphore(BACKCHANNEL_CONCURRENCY)
+# The refusals that say the token itself is not valid (400, the provider does not retry); everything else the vault
+# could not act on is a failed logout (501).
+TOKEN_REFUSALS = frozenset({oc.TOKEN_INVALID, oc.NONCE_MISMATCH})
 
 FINISH_LIMIT = 30                    # handover claims per address per FINISH_WINDOW
 FINISH_WINDOW = 300
@@ -362,6 +368,31 @@ async def sign_in_callback(
     return _redirect(fragment + handover)
 
 
+def _note_refused_logout(db, scope: str, client_ip) -> None:
+    """A known provider's logout refused by the limiter is recorded, at most once per window and provider, so a
+    dropped logout leaves a trace without letting a flood write a row per request."""
+    from app.core.rate_limiter import rate_limiter as _rl
+    try:
+        allowed, _, _reset = _rl.check_rate_limit(identifier=scope, limit=1, window=START_WINDOW,
+                                                  prefix="sso_backchannel_refused", fail_open=False)
+    except Exception:  # noqa: BLE001
+        return
+    if allowed:
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": "rate_limited"})
+
+
+def _a_session_is_live(db, session_ids) -> bool:
+    """Whether a session among ``session_ids`` is still not revoked (True when that cannot be read)."""
+    from app.core.models import ActiveSession
+    try:
+        return db.query(ActiveSession.id).filter(ActiveSession.id.in_(list(session_ids)),
+                                                 ActiveSession.revoked == False).first() is not None  # noqa: E712
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        return True
+
+
 @router.post("/auth/sso/{provider_id}/backchannel-logout")
 async def backchannel_logout(provider_id: str, request: Request, db: Session = Depends(get_db)):
     """Where the provider says a person signed out of it (OpenID Connect back-channel logout, a form with
@@ -373,43 +404,59 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
     api = _api()
     client_ip = api.get_client_ip(request)
     from app.core import sign_in_lockout
+    from app.core.models import SsoSession
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
     failed = JSONResponse(status_code=501, content={"error": "logout_failed"})
+    source = sign_in_lockout.source_of(client_ip)
+    row = _provider(db, provider_id)
+    scope = str(row.id) if row is not None else None
     try:
-        # One bucket per source, whatever the address names: a path with a new provider id each time gets no bucket
-        # of its own.
+        # A bucket per source for each provider, and one per source for every id with no provider behind it: a stream
+        # of made-up ids gets no buckets of its own and does not spend a real provider's.
         allowed, _, _reset = _rl.check_rate_limit(
-            identifier=sign_in_lockout.source_of(client_ip), limit=LOGOUT_LIMIT,
+            identifier=f"{source}:{scope or 'unknown'}", limit=LOGOUT_LIMIT,
             window=START_WINDOW, prefix="sso_backchannel", fail_open=False)
     except RateLimiterUnavailable:
         allowed = False
     if not allowed:
+        if scope is not None:
+            _note_refused_logout(db, scope, client_ip)
         return failed
+    if row is None:
+        return invalid                     # no provider by that id: nothing to record (the address is anyone's to type)
     try:
         form = await request.form()
         token = form.get("logout_token")
     except Exception:  # noqa: BLE001
         token = None
-    row = _provider(db, provider_id)
-    if row is None:
-        return invalid                     # no provider by that id: nothing to record (the address is anyone's to type)
-    scope = str(row.id)
     if getattr(row, "kind", None) != "oidc" or not isinstance(token, str) or not token \
             or not sso.policy_of(row)["sso_backchannel_logout"]:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": "not_accepted"})
         return invalid
+    row_id = row.id
     try:
         provider = sso.provider_config(row)
+    except sso.Refusal as exc:
+        # The vault cannot read its own configuration of the provider: the logout failed, not the token.
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": exc.code})
+        return failed
+    # The database connection goes back to the pool before the network work; the rest of the request takes another.
+    db.rollback()
+    if _BACKCHANNEL_SLOTS.locked():
+        return failed                      # as many verifications in flight as allowed: the provider retries
 
-        def verify():
-            # The provider's discovery and keys are fetched over the network: off the event loop.
-            discovery = oc.discover(provider, fetch=oc.fetch_json)
-            return oc.verify_logout_token(provider, discovery, token, fetch=oc.fetch_json,
-                                          seen_jti=lambda jti, ttl: sso_state.seen_logout_jti(jti, ttl, scope=scope))
-        from starlette.concurrency import run_in_threadpool
-        claims = await run_in_threadpool(verify)
+    def verify():
+        # The provider's discovery and keys are fetched over the network: in the thread pool, not on the event loop.
+        discovery = oc.discover(provider, fetch=oc.fetch_json)
+        return oc.verify_logout_token(provider, discovery, token, fetch=oc.fetch_json,
+                                      seen_jti=lambda jti, ttl: sso_state.seen_logout_jti(jti, ttl, scope=scope))
+    try:
+        async with _BACKCHANNEL_SLOTS:
+            from starlette.concurrency import run_in_threadpool
+            claims = await run_in_threadpool(verify)
     except sso_state.Unavailable:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": "store_unavailable"})
@@ -417,10 +464,9 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
     except (sso.Refusal, oc.OidcError) as exc:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": exc.code})
-        return failed if exc.code == oc.TEMPORARILY_UNAVAILABLE else invalid
-    from app.core.models import SsoSession
+        return invalid if exc.code in TOKEN_REFUSALS else failed
     sid, sub = claims.get("sid"), claims.get("sub")
-    query = db.query(SsoSession).filter(SsoSession.provider_id == row.id)
+    query = db.query(SsoSession).filter(SsoSession.provider_id == row_id)
     if isinstance(sid, str) and sid:
         query, by = query.filter(SsoSession.idp_sid == sid), "sid"
     elif isinstance(sub, str) and sub:
@@ -429,15 +475,27 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": "no_identifier"})
         return invalid
+    session_ids = []
     try:
         session_ids = [s.session_id for s in query.all()]
         ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
                                      durable=True) if session_ids else 0
-        db.commit()
-    except Exception as exc:  # noqa: BLE001 -- the logout failed: the token is not spent, so the provider's retry works
+    except Exception as exc:  # noqa: BLE001 -- nothing was applied: the token is not spent, so the provider's retry works
         db.rollback()
         sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
         log.warning("sso back-channel logout not applied: %s", type(exc).__name__)
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": "revocation_failed"})
+        return failed
+    try:
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        # A failed commit may still have reached the database: the token is forgotten only when a session it named is
+        # still live, so a replay can never end sessions made after a logout that did take effect.
+        if session_ids and _a_session_is_live(db, session_ids):
+            sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
+        log.warning("sso back-channel logout commit failed: %s", type(exc).__name__)
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": "revocation_failed"})
         return failed
