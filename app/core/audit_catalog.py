@@ -75,6 +75,7 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("sso_identity_linked", "sign_in", "Organisation identity linked", "notice"),
     AuditAction("sso_identity_unlinked", "sign_in", "Organisation identity unlinked", "notice"),
     AuditAction("sso_provider_tested", "sign_in", "Single sign-on provider tested", "notice"),
+    AuditAction("sso_groups_missing", "sign_in", "Single sign-on token without group information", "warning"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),
     # By an administrator or by the server's operator on the host: the label names neither.
@@ -95,6 +96,11 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("account_self_signup", "accounts", "Account created by sign-up", "notice"),
     AuditAction("account_self_signup_failed", "accounts", "Sign-up refused", "warning"),
     AuditAction("sso_account_created", "accounts", "Account created by single sign-on", "notice"),
+    AuditAction("sso_role_changed", "accounts", "Role set by a single sign-on group", "notice"),
+    AuditAction("sso_admin_requested", "accounts", "Administrator role requested by a single sign-on group", "notice"),
+    AuditAction("sso_admin_approved", "accounts", "Single sign-on administrator request approved", "notice"),
+    AuditAction("sso_admin_denied", "accounts", "Single sign-on administrator request denied", "notice"),
+    AuditAction("sso_admin_expired", "accounts", "Single sign-on administrator request expired", "info"),
     # A second change to someone's sign-in details within 14 days is held for another administrator's
     # approval. Short enough to read whole in a phone's row.
     AuditAction("credential_change_approval_refused", "accounts", "Approval refused (not independent)",

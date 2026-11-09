@@ -136,8 +136,9 @@ class Harness:
         from app.core import rate_limiter as R
         from app.core import sign_in_codes, sign_in_lockout, sso_state
         from app.core.database import get_db
-        from app.core.models import (AccountInvitation, ActiveSession, ExternalIdentity, PendingLogin, SecondFactorAction,
-                                     SecondFactorEnrollment, SsoProvider, SystemSetting, User)
+        from app.core.models import (AccountInvitation, ActiveSession, AdminGrant, CredentialChange, ExternalIdentity, Group,
+                                     PendingLogin, SecondFactorAction, SecondFactorEnrollment, SsoAdminRequest,
+                                     SsoGroupMapping, SsoProvider, SystemSetting, User)
         from app.api import sso_router
         from app.api.user_management_api import get_current_user as umg, require_interactive_admin as uma
         from app.services import oidc_client as oc
@@ -147,7 +148,8 @@ class Harness:
         self.providers = list(providers)
         self.db = DB({User: list(users), SsoProvider: self.providers, ExternalIdentity: list(identities), PendingLogin: [],
                       ActiveSession: [], SystemSetting: [], SecondFactorEnrollment: [], SecondFactorAction: [],
-                      AccountInvitation: list(invitations)})
+                      AccountInvitation: list(invitations), SsoGroupMapping: [], SsoAdminRequest: [], Group: [],
+                      AdminGrant: [], CredentialChange: []})
         self.current_user = users[0] if users else None
         monkeypatch.setitem(S.app.dependency_overrides, get_db, lambda: self.db)
         monkeypatch.setitem(S.app.dependency_overrides, umg, lambda: self.current_user)

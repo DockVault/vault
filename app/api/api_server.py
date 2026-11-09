@@ -850,6 +850,9 @@ app.include_router(sign_in_settings_router)
 # Single sign-on: the start, the provider's callback, a person's own identities (app/api/sso_router.py).
 from app.api.sso_router import router as sso_router  # noqa: E402
 app.include_router(sso_router)
+# The held administrator requests a provider group raises (app/api/sso_admin_router.py).
+from app.api.sso_admin_router import router as sso_admin_router  # noqa: E402
+app.include_router(sso_admin_router)
 # Compliance access: the auditor right, cases, legal holds and their step-ups.
 from app.api.compliance_router import router as compliance_router  # noqa: E402
 app.include_router(compliance_router)

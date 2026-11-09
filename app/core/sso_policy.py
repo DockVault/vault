@@ -20,6 +20,7 @@ DEFAULTS = {
     "sso_default_role": "user",
     "sso_password_login": "allowed",
     "sso_link_by_email": False,
+    "sso_admin_mapping": False,           # a group may raise an administrator request (never the role itself)
     "sso_use_signup_domains": False,      # the account policy's sign-up domain list as a restriction too
     "sso_allowed_tenants": [],            # Entra: the token's tid must be one of these
     "sso_allowed_domains": [],            # Google Workspace: hd, else the verified email's domain
@@ -27,7 +28,7 @@ DEFAULTS = {
 }
 _ENUMS = {"sso_account_creation": ACCOUNT_CREATION_VALUES, "sso_default_role": DEFAULT_ROLE_VALUES,
           "sso_password_login": PASSWORD_LOGIN_VALUES}
-_BOOLS = ("sso_link_by_email", "sso_use_signup_domains")
+_BOOLS = ("sso_link_by_email", "sso_admin_mapping", "sso_use_signup_domains")
 _LISTS = ("sso_allowed_tenants", "sso_allowed_domains", "sso_required_groups")
 MAX_LIST_ITEMS = 200
 MAX_ITEM_LENGTH = 255

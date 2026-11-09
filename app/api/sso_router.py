@@ -28,6 +28,7 @@ from app.core import sso_state
 from app.core.database import get_db
 from app.core.models import ExternalIdentity, SsoProvider, User
 from app.services import oidc_client as oc
+from app.services import sso_groups
 from app.services import sso_sign_in as sso
 
 router = APIRouter(tags=["Single sign-on"])
@@ -273,9 +274,13 @@ async def sign_in_callback(
                                           reason=exc.detail or exc.code)
             return _redirect("sso-error=" + exc.code)
         user = found.user
-        if found.created or found.linked_now:
-            # The account, its identity and the claimed invitation stand before any code is handed out: a store
-            # that fails afterwards costs the person one more sign-in, never an account without its identity.
+        # The provider's groups into departments and roles, for this token (a held request for the administrator
+        # role, never the role itself).
+        applied = sso_groups.apply(db, row, user, answer)
+        if found.created or found.linked_now or applied.changed:
+            # The account, its identity, the claimed invitation and the memberships stand before any code is handed
+            # out: a store that fails afterwards costs the person one more sign-in, never an account without its
+            # identity.
             from sqlalchemy.exc import IntegrityError
             try:
                 db.commit()
@@ -286,7 +291,9 @@ async def sign_in_callback(
                 if invitation_id:
                     api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip, reason="commit_conflict")
                 return _redirect("sso-error=" + code_)
-            _record_resolution(db, row, found, client_ip=client_ip, details=details)
+            if found.created or found.linked_now:
+                _record_resolution(db, row, found, client_ip=client_ip, details=details)
+        sso_groups.tell(db, row, user, applied, client_ip=client_ip)
         from app.core import sign_in_codes
         result = sso.pipeline_result(db, user, answer, provider_id=login.provider_id, client_ip=client_ip)
         try:
