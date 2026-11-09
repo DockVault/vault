@@ -157,7 +157,7 @@ def test_with_the_password_a_longer_limit_goes_through(db, admin, routed):
 
 def test_the_second_factor_policy_and_a_longer_limit_are_saved_separately(db, admin, routed):
     with pytest.raises(HTTPException) as refused:
-        _save(db, admin, {"mfa_mode": "optional", "session_timeout": 240})
+        _save(db, admin, {"mfa_mode": "required", "session_timeout": 240})
     assert refused.value.status_code == 400 and "separately" in refused.value.detail
 
 
@@ -174,3 +174,34 @@ def test_a_limit_saved_with_a_cleared_timeout_is_checked_against_the_default_tha
     with pytest.raises(HTTPException) as refused:
         api._validate_settings_payload({"session_timeout": 600, "session_renewal_max_hours": 2}, db)
     assert refused.value.status_code == 400 and "at least the session timeout" in refused.value.detail
+
+
+def test_a_longer_limit_still_meets_the_matrix_rule_for_an_ordinary_save(db, admin):
+    # The matrix asks for the second factor on settings saves and this administrator has none: an ordinary
+    # save is refused enroll_required, and so is one that also lengthens the timeout, before any password.
+    db.add(SecondFactorAction(key="admin.settings.write", require_otp=True, require_password=False))
+    db.commit()
+    for payload in ({"app_name": "x"}, {"session_timeout": 120, "app_name": "x"}, {"session_timeout": 120}):
+        with pytest.raises(HTTPException) as refused:
+            _save(db, admin, payload)
+        assert refused.value.status_code == 403, payload
+        assert refused.value.detail["reason"] == "enroll_required", (payload, refused.value.detail)
+        assert refused.value.detail["action"] == "admin.settings.write", payload
+
+
+def test_a_whole_page_save_that_sends_the_second_factor_policy_back_unchanged_may_lengthen_the_timeout(db, admin):
+    # The settings page sends every key; the policy as it is in force is no change to it.
+    from app.core import second_factor_policy as pol
+    unchanged = dict(pol.effective_policy({}))
+    with pytest.raises(HTTPException) as refused:
+        _save(db, admin, {**unchanged, "session_timeout": 120})
+    assert refused.value.detail["reason"] == "step_up_required" and refused.value.detail["action"] == ACTION
+
+
+@pytest.mark.parametrize("changed", [{"mfa_mode": "required"}, {"mfa_mode": "nonsense"}, {"mfa_email_code_ttl_minutes": "5"},
+                                     {"mfa_allowed_methods": ["totp", "email"]}, {"mfa_required_user_ids": ["u-1"]}])
+def test_a_changed_or_unreadable_policy_value_counts_as_a_change(changed):
+    from app.core import second_factor_policy as pol
+    assert api._changes_second_factor_policy({}, {**pol.effective_policy({}), **changed})
+    assert not api._changes_second_factor_policy({}, dict(pol.effective_policy({})))
+    assert not api._changes_second_factor_policy({}, {"app_name": "x"})

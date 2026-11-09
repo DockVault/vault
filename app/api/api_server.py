@@ -4584,6 +4584,21 @@ def _sf_step_up_methods(db, user, req, has_active) -> list:
     return methods
 
 
+def _refuse_unenrolled(action, req):
+    if req["must_enroll"]:
+        raise HTTPException(status_code=403, detail={
+            "second_factor_required": True, "action": action, "reason": "enroll_required", "methods": []})
+
+
+def _refuse_if_must_enroll(db, user, action):
+    """Refuse (403 enroll_required) when `action`'s policy needs a second factor this account has not set up.
+    Reads the policy only: no receipt is asked for or spent."""
+    if getattr(user, "_is_temp_session", False):
+        return
+    req, _ = _sf_requirement_for(db, user, action)
+    _refuse_unenrolled(action, req)
+
+
 def _enforce_step_up(db, user, request, action):
     """Raise 403 second_factor_required unless the caller has satisfied `action`'s step-up for THIS
     session. A temp session has its own scope gate and never satisfies an account step-up here."""
@@ -4593,9 +4608,7 @@ def _enforce_step_up(db, user, request, action):
     req, has_active = _sf_requirement_for(db, user, action)
     if not (req["password"] or req["otp"] or req["must_enroll"]):
         return
-    if req["must_enroll"]:
-        raise HTTPException(status_code=403, detail={
-            "second_factor_required": True, "action": action, "reason": "enroll_required", "methods": []})
+    _refuse_unenrolled(action, req)
     receipt = request.headers.get("X-Second-Factor")
     session_hash = _current_session_hash(request)
     if not (receipt and sf.consume_step_up_receipt(db, user=user, action=action,
@@ -4657,6 +4670,21 @@ from app.core import fixed_step_up as _fixed_step_up  # noqa: E402 - the guard r
 _session_limits_step_up = _fixed_step_up.guard("admin.session_limits.write")
 
 
+def _changes_second_factor_policy(stored: dict, payload: dict) -> bool:
+    """Whether a settings save changes the second-factor policy: a policy key it holds whose value is not the
+    one in force. A whole-page save sends every key back as it was, which changes nothing; any other value
+    (a new one, or one that is not valid) counts as a change, and the save is under that policy's step-up."""
+    from app.core import second_factor_policy as pol
+    current = pol.effective_policy(stored)
+
+    def same(key, value):
+        if isinstance(value, list) and isinstance(current[key], list):
+            return [str(x) for x in value] == [str(x) for x in current[key]]
+        return value == current[key] and type(value) is type(current[key])
+
+    return any(key in payload and not same(key, payload[key]) for key in pol.DEFAULTS)
+
+
 def _loosens_session_limits(stored: dict, payload: dict) -> bool:
     """Whether a settings save makes a sign-in able to last longer: the effective session timeout or the
     effective renewal limit after the save is longer than before it (a raised value, or one cleared to a
@@ -4691,15 +4719,18 @@ async def update_settings(
     #  * a save that LOOSENS how long a sign-in may last (a longer session timeout or renewal limit, set or
     #    cleared to a longer default) requires admin.session_limits.write instead: the password every
     #    time, and the second factor whenever the account has one. Tightening needs nothing more.
-    from app.core import second_factor_policy as _sfpol_gate
-    changes_second_factor = any(k in payload for k in _sfpol_gate.DEFAULTS)
-    loosens_sessions = _loosens_session_limits(_global_settings_blob(db), payload)
+    stored_settings = _global_settings_blob(db)
+    changes_second_factor = _changes_second_factor_policy(stored_settings, payload)
+    loosens_sessions = _loosens_session_limits(stored_settings, payload)
     if changes_second_factor and loosens_sessions:
         raise HTTPException(status_code=400, detail=(
             "Save the second-factor policy and the session limits separately: each needs its own confirmation."))
     if changes_second_factor:
         _enforce_step_up(db, current_user, request, "account.second_factor")
     elif loosens_sessions:
+        # The save may hold any other setting too (the page sends them all), so the matrix's rule for an
+        # ordinary save still holds: an administrator who must set up a second factor first is refused here.
+        _refuse_if_must_enroll(db, current_user, "admin.settings.write")
         _session_limits_step_up(db, current_user, request)
     else:
         _enforce_step_up(db, current_user, request, "admin.settings.write")
