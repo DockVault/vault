@@ -1124,6 +1124,9 @@ class UserResponse(BaseModel):
     # ({kind, label, by, at, window_ends}), or None. Until window_ends, a further change needs a
     # second administrator's approval. Filled in by the admin users list.
     credential_change: Optional[Dict[str, Any]] = None
+    # Single sign-on freshness, for an account a provider asks to sign in again: when its SSH keys, temporary
+    # credentials and devices pause (or paused), through which provider, and whether the provider refused it.
+    sso_freshness: Optional[Dict[str, Any]] = None
     # The account's current password was set by someone else ({by: their username or None, at}), or None
     # (app/core/password_origin.py). Filled in by the admin users list, for the promote dialog's warning.
     password_set_by_other: Optional[Dict[str, Any]] = None
@@ -10899,9 +10902,12 @@ async def list_users(
     blocks = sign_in_lockout.blocks_by_user(db, [u.id for u in users])
     setters = dict(db.query(User.id, User.username).filter(
         User.id.in_({u.password_set_by for u in users if u.password_set_by is not None})).all())
+    from app.services import sso_freshness
+    freshness = sso_freshness.standing_of(db)
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
+        item.sso_freshness = freshness.get(str(user.id))
         item.second_factor_enabled = user.id in mfa_user_ids
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
         item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))

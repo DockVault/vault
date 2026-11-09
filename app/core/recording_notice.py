@@ -119,7 +119,7 @@ STORES = (
           table="webauthn_credentials"),
     Store("external_identities", "Your link to an identity provider: who the provider says you are (its identifier "
           "for you), the email address and name it sent when the link was made, and when you last signed in through "
-          "it.", lambda: "Until you or an administrator unlink it, or your account is deleted.",
+          "it, and when it last refused you.", lambda: "Until you or an administrator unlink it, or your account is deleted.",
           table="external_identities"),
     Store("sso_sessions", "For a session signed in through an identity provider: the provider's session identifier "
           "and its identifier for you, when the provider signed you in, and, when the provider sign-out option is "

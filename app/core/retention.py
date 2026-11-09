@@ -603,6 +603,16 @@ def run_value_removals(p: Pass) -> JobResult:
     return audit_value_removal.run_job(p)
 
 
+def run_sso_freshness(p: Pass) -> JobResult:
+    """Single sign-on freshness (app/services/sso_freshness.py): the warning five days before an account's SSH keys,
+    temporary credentials and devices pause for want of a sign-in through its identity provider, and the notice when
+    they do. Nothing is paused here: the rule is read at each use, so a sign-in restores them at once."""
+    from app.services import sso_freshness
+    with p.transaction() as db:
+        sso_freshness.sweep(db, p.now)
+    return JobResult()
+
+
 def archive_audit_rows(p: Pass) -> JobResult:
     """Audit days older than the row window, moved whole into compressed daily blocks once checked against
     their seals (app/core/audit_archive.py). Deletes nothing, so the hold does not stop it."""
@@ -623,6 +633,8 @@ JOBS: list[Job] = [
         run_compliance_cases),
     Job("legal_holds", "Legal holds: lapses, review prompts, and the purge of what released holds kept",
         run_legal_holds),
+    Job("sso_freshness", "Single sign-on freshness: the warning before keys pause, and the notice when they do",
+        run_sso_freshness),
     Job("owner_notices", "Notices to vaults' owners outside a case, once delivered and past the record floor",
         prune_owner_notices, held=True),
     Job("rate_limit_records", "Sign-in throttle records", prune_rate_limit_records),

@@ -2511,6 +2511,11 @@ class SFTPServer(paramiko.ServerInterface):
                         return paramiko.AUTH_FAILED
                 except _PolicyUnreadable:
                     return paramiko.AUTH_FAILED
+                # Single sign-on freshness: the keys of an account whose sign-in through its provider has lapsed,
+                # or that the provider refused, wait for the next sign-in there.
+                from app.services import sso_freshness
+                if sso_freshness.lapsed(db, user.id) is not None:
+                    return paramiko.AUTH_FAILED
                 from app.core.models import UserSSHKey
                 matched = None
                 for k in db.query(UserSSHKey).filter(UserSSHKey.user_id == user.id).all():
@@ -2552,6 +2557,9 @@ class SFTPServer(paramiko.ServerInterface):
                     if u is None or not u.is_active or account_locked(u) or not u.sftp_enabled:
                         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
                     if sign_in_lockout.lock_in_force(db, u.id, self.client_address) is not None:
+                        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+                    from app.services import sso_freshness
+                    if sso_freshness.lapsed(db, u.id) is not None:
                         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
                     self.session_token = AuthService(db).create_sftp_key_session(
                         u, self.client_address)

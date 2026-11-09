@@ -3885,7 +3885,8 @@ class ExternalIdentity(Base):
     which). One account per subject at a provider, one subject per account at a provider. The email
     address and display name are those the provider sent when the link was made; ``linked_by`` says how
     the link came to be (the person, an invitation, account creation at first sign-in, an
-    administrator). ``last_sign_in_at`` is what the freshness rule reads.
+    administrator). ``last_sign_in_at`` and ``refused_at`` (when the provider's verified token last excluded the
+    person) are what the freshness rule reads (app/services/sso_freshness.py).
 
     A NEW table; rows cascade with the account and with the provider."""
     __tablename__ = 'external_identities'
@@ -3902,6 +3903,7 @@ class ExternalIdentity(Base):
     linked_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     linked_by = Column(String(16), nullable=False)                   # self | invitation | jit | admin
     last_sign_in_at = Column(DateTime, nullable=True)
+    refused_at = Column(DateTime, nullable=True)
 
     user = relationship('User', backref=backref('external_identities', cascade='all, delete-orphan',
                                                 passive_deletes=True))

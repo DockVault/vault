@@ -32,7 +32,9 @@ from app.core import sso_state
 from app.core.auth_offload import auth_offload_slot
 from app.core.database import get_db
 from app.core.models import ExternalIdentity, SsoProvider, User
+from app.core import sso_policy
 from app.services import oidc_client as oc
+from app.services import sso_freshness
 from app.services import sso_groups
 from app.services import sso_sign_in as sso
 
@@ -352,6 +354,15 @@ async def sign_in_callback(
         try:
             sso.restriction_refusal(db, row, answer)
         except sso.Refusal as exc:
+            if exc.code == sso_policy.RESTRICTED:
+                # Proof from the provider (a verified token whose claim leaves the person out), never a missing claim
+                # or an overage marker: a known identity's access ends when the provider's policy says so.
+                try:
+                    sso_freshness.end_access_on_refusal(db, row, answer, client_ip=client_ip)
+                except Exception as end_exc:  # noqa: BLE001 -- the refusal stands; the failure is said
+                    db.rollback()
+                    log.error("sso refusal could not end access for provider %s: %s", login.provider_id,
+                              type(end_exc).__name__)
             _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
             return _redirect("sso-error=" + exc.code)
 

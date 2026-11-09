@@ -1,0 +1,360 @@
+"""Single sign-on freshness (app/services/sso_freshness.py): an account linked to a provider keeps its SSH keys,
+temporary credentials and devices only while it keeps signing in there; the provider's verified refusal pauses them
+at once; the daily sweep warns five days before and tells when they pause; the administrators' user list shows the
+due date. Offline: an in-memory store, the clock the test's."""
+import types
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from _bare_api_env import set_bare_api_env
+from _memory_db import MemoryDB
+
+set_bare_api_env()
+
+from app.core.models import ExternalIdentity, SsoProvider, User  # noqa: E402
+from app.services import sso_freshness as F  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+NOW = datetime(2026, 11, 9, 12, 0, 0)
+DAY = timedelta(days=1)
+
+
+def _user(name="alice", **extra):
+    fields = dict(id=uuid.uuid4(), username=name, email=f"{name}@example.test", is_active=True)
+    fields.update(extra)
+    return types.SimpleNamespace(**fields)
+
+
+def _provider(days=30, *, name="contoso", state="enabled", **policy):
+    stored = {"sso_freshness_days": days, **policy} if days is not None else dict(policy)
+    return types.SimpleNamespace(id=uuid.uuid4(), name=name, label="Sign in with " + name.title(), state=state,
+                                 kind="oidc", policy=stored)
+
+
+def _identity(user, provider, *, signed_in=None, linked=None, refused=None):
+    return types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, provider_id=provider.id,
+                                 last_sign_in_at=signed_in, linked_at=linked or NOW - 100 * DAY, refused_at=refused)
+
+
+def _db(users=(), providers=(), identities=()):
+    return MemoryDB({User: list(users), SsoProvider: list(providers), ExternalIdentity: list(identities)})
+
+
+# --------------------------------------------------------------------------- the rule
+
+def test_an_account_is_fresh_while_its_last_provider_sign_in_is_younger_than_the_window():
+    alice, p = _user(), _provider(30)
+    i = _identity(alice, p, signed_in=NOW - 30 * DAY + timedelta(seconds=1))
+    db = _db([alice], [p], [i])
+    assert F.lapsed(db, alice.id, now=NOW) is None
+    found, = F.deadlines(db, alice.id)
+    assert found.due == i.last_sign_in_at + 30 * DAY and found.provider_name == "contoso" and not found.refused
+    assert found.identity_id == str(i.id) and found.user_id == str(alice.id) and found.provider_id == str(p.id)
+    assert F.due_date(db, alice.id) == found.due
+    i.last_sign_in_at = NOW - 30 * DAY
+    assert F.lapsed(db, alice.id, now=NOW).identity_id == str(i.id)
+    # Never signed in since the link: the link is when the window starts.
+    i.last_sign_in_at, i.linked_at = None, NOW - 10 * DAY
+    assert F.lapsed(db, alice.id, now=NOW) is None
+    i.linked_at = NOW - 31 * DAY
+    assert F.lapsed(db, alice.id, now=NOW) is not None
+    # The default window is 30 days.
+    p.policy = {}
+    assert F.deadlines(db, alice.id)[0].due == i.linked_at + 30 * DAY
+
+
+def test_a_provider_that_is_off_or_not_enabled_asks_nothing_and_others_are_untouched():
+    alice, bob, p = _user(), _user("bob"), _provider(30)
+    i = _identity(alice, p, signed_in=NOW - 90 * DAY)
+    db = _db([alice, bob], [p], [i])
+    assert F.lapsed(db, alice.id, now=NOW) is not None
+    assert F.lapsed(db, bob.id, now=NOW) is None and F.due_date(db, bob.id) is None
+    p.policy = {"sso_freshness_days": 0}
+    assert F.lapsed(db, alice.id, now=NOW) is None and F.deadlines(db, alice.id) == []
+    p.policy = {"sso_freshness_days": 30}
+    for state in ("disabled", "draft"):
+        p.state = state
+        assert F.lapsed(db, alice.id, now=NOW) is None, state
+    assert F.lapsed(_db(), alice.id, now=NOW) is None and F.lapsed(db, None, now=NOW) is None
+
+
+def test_a_refusal_pauses_at_once_whatever_the_window_and_a_later_admitted_sign_in_answers_it():
+    alice, p = _user(), _provider(30)
+    i = _identity(alice, p, signed_in=NOW - DAY, refused=NOW - timedelta(hours=1))
+    db = _db([alice], [p], [i])
+    found = F.lapsed(db, alice.id, now=NOW)
+    assert found is not None and found.refused
+    # With the window off the refusal still counts.
+    p.policy = {"sso_freshness_days": 0}
+    found = F.lapsed(db, alice.id, now=NOW)
+    assert found is not None and found.refused and found.due == i.refused_at
+    # A sign-in the provider admitted after the refusal answers it.
+    i.last_sign_in_at = NOW - timedelta(minutes=5)
+    assert F.lapsed(db, alice.id, now=NOW) is None
+    p.policy = {"sso_freshness_days": 30}
+    assert F.lapsed(db, alice.id, now=NOW) is None
+    # A refusal with no sign-in since the link counts.
+    i.last_sign_in_at = None
+    assert F.lapsed(db, alice.id, now=NOW).refused
+
+
+def test_each_provider_asks_on_its_own():
+    alice, a, b = _user(), _provider(30, name="contoso"), _provider(7, name="fabrikam")
+    ia = _identity(alice, a, signed_in=NOW - DAY)
+    ib = _identity(alice, b, signed_in=NOW - 8 * DAY)
+    db = _db([alice], [a, b], [ia, ib])
+    found = F.lapsed(db, alice.id, now=NOW)
+    assert found is not None and found.provider_name == "fabrikam"
+    assert [d.provider_name for d in F.deadlines(db, alice.id)] == ["fabrikam", "contoso"]
+    assert F.refusal_text(found).startswith("Sign in through fabrikam again")
+    ib.last_sign_in_at = NOW - DAY
+    assert F.lapsed(db, alice.id, now=NOW) is None
+
+
+def test_the_user_list_shows_the_deadline_that_matters_most():
+    alice, bob, carol, dave = _user(), _user("bob"), _user("carol"), _user("dave")
+    a, b = _provider(30, name="contoso"), _provider(10, name="fabrikam")
+    db = _db([alice, bob, carol, dave], [a, b], [
+        _identity(alice, a, signed_in=NOW - DAY), _identity(alice, b, signed_in=NOW - 2 * DAY),
+        _identity(bob, a, signed_in=NOW - 40 * DAY), _identity(bob, b, signed_in=NOW - DAY),
+        _identity(carol, a, signed_in=NOW - 40 * DAY), _identity(carol, b, signed_in=NOW, refused=NOW + DAY)])
+    standing = F.standing_of(db, now=NOW)
+    assert standing[str(alice.id)] == {"due": (NOW + 8 * DAY).isoformat() + "Z", "provider": "fabrikam",
+                                       "lapsed": False, "refused": False}
+    assert standing[str(bob.id)]["provider"] == "contoso" and standing[str(bob.id)]["lapsed"] is True
+    assert standing[str(carol.id)]["provider"] == "fabrikam" and standing[str(carol.id)]["refused"] is True
+    assert str(dave.id) not in standing
+
+
+# --------------------------------------------------------------------------- the sweep
+
+@pytest.fixture
+def told(monkeypatch):
+    """The notices (deduplicated as the real ones are), the emails and the audit rows the sweep writes."""
+    import app.api.api_server as S
+    import app.services.audit_logger as al
+    out = types.SimpleNamespace(notices=[], emails=[], audits=[], seen=set(), admins=[])
+
+    def notify(ids, ntype, title=None, body=None, target=None, dedup_prefix=None):
+        sent = []
+        for uid in ids:
+            key = f"{dedup_prefix}:{uid}"
+            if key in out.seen:
+                continue
+            out.seen.add(key)
+            out.notices.append((str(uid), ntype, title, body, target))
+            sent.append(str(uid))
+        return sent
+
+    class _Audit:
+        def __init__(self, db):
+            pass
+
+        def build_row(self, **kw):
+            out.audits.append((kw["action"], kw["user"].username, dict(kw["details"])))
+            return types.SimpleNamespace(**kw)
+    monkeypatch.setattr(S, "_notify_users", notify)
+    monkeypatch.setattr(S, "_fire_action_email", lambda db, key, *, email, username=None, action_context=None:
+                        out.emails.append((key, email, dict(action_context or {}))))
+    monkeypatch.setattr(S, "_active_admins", lambda db: out.admins)
+    monkeypatch.setattr(al, "AuditLogger", _Audit)
+    return out
+
+
+def test_the_sweep_warns_five_days_before_once_and_tells_once_when_keys_pause(told):
+    admin = _user("root")
+    told.admins.append(admin)
+    alice, bob, carol, dave, erin, frank = (_user(n) for n in ("alice", "bob", "carol", "dave", "erin", "frank"))
+    erin.is_active = False
+    p, off = _provider(30), _provider(0, name="fabrikam")
+    ia = _identity(alice, p, signed_in=NOW - 27 * DAY)                 # due in 3 days: warned
+    ib = _identity(bob, p, signed_in=NOW - 20 * DAY)                   # due in 10 days: nothing yet
+    ic = _identity(carol, p, signed_in=NOW - 31 * DAY)                 # lapsed a day ago
+    idd = _identity(dave, p, signed_in=NOW - 31 * DAY, refused=NOW - 2 * DAY)   # refused: told when it happened
+    ie = _identity(erin, p, signed_in=NOW - 31 * DAY)                  # inactive: nothing
+    i_off = _identity(frank, off, signed_in=NOW - 300 * DAY)           # the provider asks nothing
+    db = _db([admin, alice, bob, carol, dave, erin, frank], [p, off], [ia, ib, ic, idd, ie, i_off])
+    assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 1}
+    due_a = (NOW + 3 * DAY).strftime("%d %B %Y, %H:%M UTC")
+    assert (str(alice.id), F.WARNED, f"Sign in through contoso by {due_a}") == told.notices[0][:3]
+    assert told.emails == [("sso_freshness_warning", "alice@example.test", {"provider": "contoso", "when": due_a})]
+    assert (str(carol.id), F.EXPIRED, "Your SSH keys and temporary credentials are paused") == told.notices[1][:3]
+    assert told.notices[1][3].startswith("Sign in through contoso again")
+    wave = told.notices[2]
+    assert wave[0] == str(admin.id) and wave[2].startswith("1 account") and "carol" in wave[3] and wave[4] == "#users"
+    assert len(told.notices) == 3
+    assert [(a, u) for a, u, _ in told.audits] == [(F.WARNED, "alice"), (F.EXPIRED, "carol")]
+    assert told.audits[0][2] == {"provider_id": str(p.id), "identity_id": str(ia.id),
+                                 "expires_at": (NOW + 3 * DAY).isoformat() + "Z"}
+    # The next pass, an hour later: nothing new to tell, nothing recorded again.
+    assert F.sweep(db, NOW + timedelta(hours=1)) == {"warned": 0, "lapsed": 0}
+    assert len(told.notices) == 3 and len(told.emails) == 1 and len(told.audits) == 2
+    # Alice signs in through the provider: a new deadline, warned about again when it comes near.
+    ia.last_sign_in_at = NOW + DAY
+    assert F.sweep(db, NOW + 27 * DAY) == {"warned": 1, "lapsed": 1}     # bob lapses meanwhile
+    assert told.emails[-1][2]["when"] == (NOW + 31 * DAY).strftime("%d %B %Y, %H:%M UTC")
+
+
+def test_the_sweep_sends_no_email_to_an_account_without_an_address(told):
+    alice, p = _user(email=None), _provider(30)
+    db = _db([alice], [p], [_identity(alice, p, signed_in=NOW - 26 * DAY)])
+    assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 0}
+    assert told.emails == [] and len(told.notices) == 1
+
+
+def test_the_sweep_is_a_job_of_the_pruner():
+    from app.core import retention
+    job, = [j for j in retention.JOBS if j.name == "sso_freshness"]
+    assert job.run is retention.run_sso_freshness and not job.held
+
+
+# --------------------------------------------------------------------------- where it is enforced
+
+def _lapsed_for(user_id):
+    return F.Deadline(identity_id="i", user_id=str(user_id), provider_id="p", provider_name="contoso",
+                      due=NOW, refused=False)
+
+
+def test_a_temporary_credential_of_a_lapsed_account_is_refused_and_not_spent(monkeypatch):
+    from app.services import auth_service as A
+    later = datetime.now(timezone.utc) + timedelta(hours=1)
+    owner = types.SimpleNamespace(id=uuid.uuid4(), is_active=True, is_locked=False, locked_until=None, role=None)
+    cred = types.SimpleNamespace(id=uuid.uuid4(), device_id=None, credential_hash="h", is_active=True, is_used=False,
+                                 expires_at=later, deactivate_at=None, user=owner)
+    claims = []
+
+    from app.core.models import TemporaryCredential
+
+    class _Q:
+        def __init__(self, entity):
+            self.entity = entity
+
+        def filter(self, *a, **k):
+            return self
+
+        def first(self):
+            return cred if self.entity is TemporaryCredential else None
+
+        def update(self, *a, **k):
+            claims.append(1)
+            return 1
+
+    svc = A.AuthService.__new__(A.AuthService)
+    svc.db = types.SimpleNamespace(query=lambda entity, *a: _Q(entity), commit=lambda: None, add=lambda row: None)
+    svc._check_rate_limit = svc._check_username_rate_limit = lambda *a, **k: None
+    failures = []
+    svc._record_failed_login = lambda name, ip: failures.append(name)
+    svc._create_session = lambda *a, **k: "session-token"
+    monkeypatch.setattr(A, "verify_temporary_credential", lambda *a, **k: True)
+    monkeypatch.setattr("app.core.temp_scope.attach_scope", lambda *a, **k: None)
+    monkeypatch.setattr(F, "lapsed", lambda db, user_id, now=None: _lapsed_for(user_id))
+    for door in (True, False):
+        with pytest.raises(A.FreshnessLapsedError):
+            svc.authenticate_temporary_credential("temp_x", "cred", "203.0.113.9", allow_device_credential=door)
+    assert issubclass(A.FreshnessLapsedError, A.InvalidCredentialsError)      # answered like a wrong credential
+    assert claims == [] and failures == ["temp_x", "temp_x"]
+    monkeypatch.setattr(F, "lapsed", lambda db, user_id, now=None: None)
+    user, token = svc.authenticate_temporary_credential("temp_x", "cred", "203.0.113.9")
+    assert user is owner and claims == [1]
+
+
+def test_no_temporary_credential_is_minted_for_a_lapsed_account(monkeypatch):
+    from fastapi import HTTPException
+    from app.services import auth_service as A
+    svc = A.AuthService.__new__(A.AuthService)
+    svc.db = object()
+    seen = []
+    monkeypatch.setattr(F, "lapsed", lambda db, user_id, now=None: seen.append(user_id) or _lapsed_for(user_id))
+    uid = uuid.uuid4()
+    with pytest.raises(HTTPException) as e:
+        svc.create_temporary_credential(uid)
+    assert e.value.status_code == 403 and e.value.detail["reason"] == "sso_freshness_lapsed"
+    assert e.value.detail["message"].startswith("Sign in through contoso again") and seen == [uid]
+
+
+def test_ssh_keys_of_a_lapsed_account_are_refused_at_authentication_and_at_the_channel(monkeypatch):
+    import paramiko
+    from app.sftp import sftp_server as S
+    key_b64 = "AAAAC3NzaC1lZDI1NTE5AAAAIFreshnessKeyFreshnessKeyFreshnessKey0"
+    alice = types.SimpleNamespace(id=uuid.uuid4(), username="alice", sftp_enabled=True, is_active=True,
+                                  is_locked=False, locked_until=None)
+    stored = types.SimpleNamespace(id=uuid.uuid4(), public_key=f"ssh-ed25519 {key_b64} laptop", last_used=None)
+
+    class _Q:
+        def __init__(self, entity):
+            self.entity = entity
+
+        def filter(self, *a, **k):
+            return self
+
+        def first(self):
+            return alice if self.entity is User else stored
+
+        def all(self):
+            return [stored]
+
+    db = types.SimpleNamespace(query=lambda entity, *a: _Q(entity), commit=lambda: None)
+
+    @contextmanager
+    def ctx():
+        yield db
+    monkeypatch.setattr(S, "get_db_context", ctx)
+    monkeypatch.setattr(S, "_sftp_key_throttled", lambda ip, username: False)
+    monkeypatch.setattr(S, "_sftp_key_clear", lambda ip, username: None)
+    monkeypatch.setattr(S, "_user_requires_temp_cred_for_sftp", lambda db, user, fail_closed=True: False)
+    import app.core.sign_in_lockout as lockout
+    monkeypatch.setattr(lockout, "lock_in_force", lambda db, user_id, address, **kw: None)
+    key = types.SimpleNamespace(get_base64=lambda: key_b64)
+    monkeypatch.setattr(F, "lapsed", lambda db, user_id, now=None: _lapsed_for(user_id))
+    assert S.SFTPServer("203.0.113.9").check_auth_publickey("alice", key) == paramiko.AUTH_FAILED
+    server = S.SFTPServer("203.0.113.9")
+    server.user_id, server.session_token = alice.id, None
+    assert server.check_channel_request("session", 1) == paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+    assert server.session_token is None
+    monkeypatch.setattr(F, "lapsed", lambda db, user_id, now=None: None)
+    assert S.SFTPServer("203.0.113.9").check_auth_publickey("alice", key) == paramiko.AUTH_SUCCESSFUL
+
+
+def test_no_device_sync_credential_is_minted_for_a_lapsed_account(monkeypatch):
+    from fastapi import HTTPException
+    from app.core.models import Device, DeviceGrant, Vault
+    from app.services import auth_service as A
+    owner = types.SimpleNamespace(id=uuid.uuid4(), is_active=True, is_locked=False, locked_until=None, role=None)
+    device = types.SimpleNamespace(id=uuid.uuid4(), user_id=owner.id, is_active=True, suspended=False, expires_at=None)
+    vault_id = uuid.uuid4()
+    rows = {Device: device, DeviceGrant: types.SimpleNamespace(vault_password_fingerprint=None),
+            Vault: types.SimpleNamespace(id=vault_id, type="standard", password_hash=None), User: owner}
+
+    class _Q:
+        def __init__(self, entity):
+            self.entity = entity
+
+        def filter(self, *a, **k):
+            return self
+
+        def populate_existing(self):
+            return self
+
+        def with_for_update(self, **k):
+            return self
+
+        def first(self):
+            return rows.get(self.entity)
+
+    svc = A.AuthService.__new__(A.AuthService)
+    svc.db = types.SimpleNamespace(query=lambda entity, *a: _Q(entity))
+    monkeypatch.setattr(F, "lapsed", lambda db, user_id, now=None: _lapsed_for(user_id))
+    with pytest.raises(HTTPException) as e:
+        svc.mint_device_sync_credential(device, vault_id)
+    assert e.value.status_code == 403 and e.value.detail["reason"] == "sso-freshness-lapsed"
+    assert e.value.detail["message"].startswith("Sign in through contoso again")
+    # Fresh: the mint goes past the check (here to the next predicate, which this stand-in does not satisfy).
+    monkeypatch.setattr(F, "lapsed", lambda db, user_id, now=None: None)
+    with pytest.raises(Exception) as e:
+        svc.mint_device_sync_credential(device, vault_id)
+    assert getattr(e.value, "detail", {}) == {} or e.value.detail.get("reason") != "sso-freshness-lapsed"
+

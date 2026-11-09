@@ -305,6 +305,13 @@ class InvalidCredentialsError(AuthenticationError):
     pass
 
 
+class FreshnessLapsedError(InvalidCredentialsError):
+    """A temporary credential (or a device's sync credential) of an account whose sign-in through its single sign-on
+    provider has lapsed, or that the provider refused (app/services/sso_freshness.py). Answered like a wrong
+    credential; the credential is not spent, and works again after a sign-in through the provider."""
+    pass
+
+
 class AccountLockedError(AuthenticationError):
     """Raised when a sign-in is refused by a lock. Carries locked_until (None = no end) and scope:
     "administrator" (an administrator's lock), "timed" (a timed lock on the account row, from before
@@ -346,7 +353,8 @@ def _device_mint_refusal(reason: str, http_status: int = status.HTTP_403_FORBIDD
     """A typed refusal from the device mint. The `reason` is the single upstream source of the
     honest state the desktop renders: 'grant-needs-reproof' (a rotation voided the proof — re-prove
     once, NEVER a hard deny and NEVER a limiter burn) and 'device-revoked'/'device-expired' are
-    DISTINCT recoverable/terminal states; 'no-grant'/'vault-not-standard'/'account-inactive' are
+    DISTINCT recoverable/terminal states ('sso-freshness-lapsed', recoverable by a sign-in through the account's
+    identity provider, carries its own message); 'no-grant'/'vault-not-standard'/'account-inactive' are
     should-never-happen guards an honest desktop never reaches, so they need no distinct copy. No
     password is ever tested on any of these paths, so none touches the vault-password rate limiter
     and none is a 400/429."""
@@ -838,6 +846,12 @@ class AuthService:
         if user is None or not user.is_active or admin_locked(user):
             self._record_failed_login(temp_username, ip_address)
             raise InvalidCredentialsError("Invalid temporary credentials")
+        # Single sign-on freshness: the account's sign-in through its provider has lapsed, or the provider refused
+        # the person. Before the claim, so the credential is not spent and works again after that sign-in.
+        from app.services import sso_freshness
+        if sso_freshness.lapsed(self.db, getattr(user, "id", None)) is not None:
+            self._record_failed_login(temp_username, ip_address)
+            raise FreshnessLapsedError("the account's sign-in through its identity provider has lapsed")
 
         # Atomically claim the one-time credential. A conditional UPDATE guarded by
         # rowcount (UPDATE ... WHERE is_used = false) takes a row lock, so two
@@ -912,7 +926,8 @@ class AuthService:
         passcode_same_for_all: bool = False,
     ) -> dict:
         """
-        Create temporary one-time credentials for a user.
+        Create temporary one-time credentials for a user. Refused (403, ``sso_freshness_lapsed``) while the account's
+        sign-in through its single sign-on provider has lapsed or the provider refused the person.
 
         ⚠️ SECURITY NOTE: Password is returned ONLY ONCE in this response.
         It is hashed with bcrypt and stored as credential_hash.
@@ -932,6 +947,11 @@ class AuthService:
         Returns:
             Dictionary with temporary credentials information
         """
+        from app.services import sso_freshness
+        lapse = sso_freshness.lapsed(self.db, user_id)
+        if lapse is not None:
+            raise HTTPException(status_code=403, detail={"reason": "sso_freshness_lapsed",
+                                                         "message": sso_freshness.refusal_text(lapse)})
         # Resolve the effective lifetimes, honoring caller overrides over the
         # configured defaults.
         if validity_minutes is not None and validity_minutes > 0:
@@ -1544,6 +1564,13 @@ class AuthService:
         owner = self.db.query(User).filter(User.id == device.user_id).first()
         if owner is None or not owner.is_active or admin_locked(owner):
             raise _device_mint_refusal("account-inactive")
+        # The owning account's sign-in through its single sign-on provider has lapsed, or the provider refused the
+        # person: recoverable by that sign-in, so its own reason (the message names the provider).
+        from app.services import sso_freshness
+        lapse = sso_freshness.lapsed(self.db, getattr(owner, "id", None))
+        if lapse is not None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail={"reason": "sso-freshness-lapsed", "message": sso_freshness.refusal_text(lapse)})
 
         # Predicate 5 (the grant is still proven). The grant's frozen fingerprint must still equal
         # the vault's LIVE password fingerprint; a server-side add/change/rotation of the vault

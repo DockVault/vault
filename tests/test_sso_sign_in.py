@@ -231,6 +231,10 @@ class Harness:
 
             def log_action(_self, **kw):
                 self.audits.append((kw.get("action"), kw.get("status"), dict(kw.get("details") or {})))
+
+            def build_row(_self, **kw):
+                self.audits.append((kw.get("action"), kw.get("status"), dict(kw.get("details") or {})))
+                return types.SimpleNamespace(**kw)
         import app.services.audit_logger as al
         monkeypatch.setattr(al, "AuditLogger", _Audit)
         monkeypatch.setattr(S, "AuditLogger", _Audit)
@@ -901,3 +905,72 @@ def test_a_sign_in_goes_through_while_the_provider_cannot_serve_its_discovery_or
     assert h.finish(location)[0] == 200
     warned = [r.getMessage() for r in caplog.records if "could not be fetched" in r.getMessage()]
     assert any("discovery document" in w for w in warned) and any("key set" in w for w in warned), warned
+
+
+# --------------------------------------------------------------------------- a refusal at the provider ends access
+
+def _refusal_world(monkeypatch, **policy):
+    alice, root = _user(), _user("root", role="admin")
+    p = _provider(policy={"sso_required_groups": ["vault-users"], **policy})
+    identity = _identity(alice, p, refused_at=None)
+    h = Harness(monkeypatch, [alice, root], [p], identities=[identity])
+    h.revoked = []
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: h.revoked.append(kw) or 2)
+    monkeypatch.setattr(h.S, "_active_admins", lambda db: [root])
+
+    def callback_with(**claims):
+        h.claims_override = claims
+        status, out = h.start(p)
+        state, _ = h.state_of(out["authorization_url"])
+        return h.callback(p, state)[1]
+    return h, alice, root, p, identity, callback_with
+
+
+def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provider_admits_it(monkeypatch):
+    from app.services import sso_freshness as F
+    h, alice, root, p, identity, callback_with = _refusal_world(monkeypatch)
+    # A missing claim refuses the sign-in and ends nothing: it is not proof.
+    assert callback_with(groups=...) == "/#sso-error=restriction_claim_missing"
+    assert identity.refused_at is None and h.revoked == []
+    # A verified token whose groups leave the person out ends their access.
+    assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
+    assert identity.refused_at is not None
+    assert h.revoked == [{"user_id": alice.id, "actor_username": "system", "durable": True}]
+    assert ("sso_access_ended_by_refusal", "success",
+            {"provider_id": str(p.id), "identity_id": str(identity.id), "sessions": 2}) in h.audits
+    assert ("sso_sign_in_refused", "failure",
+            {"provider_id": str(p.id), "purpose": "sign_in", "reason": "restricted"}) in h.audits
+    assert ([str(root.id)], "contoso refused alice: access ended") in h.notices
+    assert F.lapsed(h.db, alice.id) is not None
+    # A sign-in the provider admits answers the refusal.
+    location = callback_with(groups=["vault-users"])
+    assert location.startswith("/#sso="), location
+    assert h.finish(location)[0] == 200
+    assert F.lapsed(h.db, alice.id) is None
+
+
+def test_a_refusal_ends_nothing_when_the_option_is_off_or_the_subject_is_nobodys(monkeypatch):
+    h, alice, root, p, identity, callback_with = _refusal_world(monkeypatch, sso_refusal_ends_access=False)
+    assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
+    assert identity.refused_at is None and h.revoked == []
+    assert not any(a == "sso_access_ended_by_refusal" for a, _, _ in h.audits)
+    p.policy = {"sso_required_groups": ["vault-users"]}
+    assert callback_with(groups=["sales"], sub="somebody-else") == "/#sso-error=restricted"
+    assert identity.refused_at is None and h.revoked == []
+
+
+def test_the_administrators_user_list_shows_when_keys_pause(monkeypatch):
+    from datetime import timedelta
+    listed = dict(password_set_by=None, password_set_by_other_at=None)
+    root, alice, bob = _user("root", role="admin", **listed), _user(**listed), _user("bob", **listed)
+    p = _provider(policy={"sso_freshness_days": 30})
+    signed_in = datetime.utcnow() - timedelta(days=10)
+    h = Harness(monkeypatch, [root, alice, bob], [p], identities=[_identity(alice, p, last_sign_in_at=signed_in)])
+    import app.core.endpoint_permissions as ep
+    monkeypatch.setattr(ep, "check_endpoint_permission", lambda *a, **k: None)
+    rows = [r.model_dump() for r in run_coroutine(h.S.list_users(current_user=root, db=h.db))]
+    by_name = {r["username"]: r for r in rows}
+    assert by_name["alice"]["sso_freshness"] == {"due": (signed_in + timedelta(days=30)).isoformat() + "Z",
+                                                 "provider": "contoso", "lapsed": False, "refused": False}
+    assert by_name["bob"]["sso_freshness"] is None and by_name["root"]["sso_freshness"] is None
+

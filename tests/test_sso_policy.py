@@ -27,6 +27,17 @@ def test_the_defaults_are_the_designs_and_a_wrong_shape_falls_back_to_them():
     assert len(P.effective({"sso_allowed_tenants": ["t"] * 500})["sso_allowed_tenants"]) == P.MAX_LIST_ITEMS
 
 
+def test_freshness_is_thirty_days_by_default_and_refusal_ends_access_is_on():
+    assert P.DEFAULTS["sso_freshness_days"] == 30 and P.DEFAULTS["sso_refusal_ends_access"] is True
+    for kept in (0, 1, 30, P.FRESHNESS_DAYS_MAX):
+        assert P.effective({"sso_freshness_days": kept})["sso_freshness_days"] == kept
+    # A count of days, whole and within a year; anything else is the default, never off by accident.
+    for wrong in (-1, P.FRESHNESS_DAYS_MAX + 1, 7.5, "30", None, True, False, [30]):
+        assert P.effective({"sso_freshness_days": wrong})["sso_freshness_days"] == 30, wrong
+    assert P.effective({"sso_refusal_ends_access": False})["sso_refusal_ends_access"] is False
+    assert P.effective({"sso_refusal_ends_access": 0})["sso_refusal_ends_access"] is True
+
+
 @pytest.mark.parametrize("stored, account_policy, restricted", [
     ({}, None, False),
     ({"sso_allowed_tenants": ["t1"]}, None, True),

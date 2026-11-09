@@ -31,11 +31,16 @@ DEFAULTS = {
     "sso_allowed_tenants": [],            # Entra: the token's tid must be one of these
     "sso_allowed_domains": [],            # Google Workspace: hd, else the verified email's domain
     "sso_required_groups": [],            # at least one of these in the groups claim
+    "sso_freshness_days": 30,             # an account linked here keeps its SSH keys and temporary credentials only
+                                          # while its last sign-in here is younger than this; 0 = off
+    "sso_refusal_ends_access": True,      # a verified token that excludes a known identity ends the account's access
 }
 _ENUMS = {"sso_account_creation": ACCOUNT_CREATION_VALUES, "sso_default_role": DEFAULT_ROLE_VALUES,
           "sso_password_login": PASSWORD_LOGIN_VALUES}
 _BOOLS = ("sso_link_by_email", "sso_admin_mapping", "sso_use_signup_domains", "sso_trust_idp_mfa",
-          "sso_backchannel_logout", "sso_idp_logout")
+          "sso_backchannel_logout", "sso_idp_logout", "sso_refusal_ends_access")
+FRESHNESS_DAYS_MAX = 365
+_INTS = {"sso_freshness_days": (0, FRESHNESS_DAYS_MAX)}
 _LISTS = ("sso_allowed_tenants", "sso_allowed_domains", "sso_required_groups", "sso_accepted_amr", "sso_accepted_acr")
 _STRS = ("sso_requested_acr",)
 MAX_LIST_ITEMS = 200
@@ -69,6 +74,10 @@ def effective(stored) -> dict:
     for key in _BOOLS:
         if isinstance(stored.get(key), bool):
             policy[key] = stored[key]
+    for key, (low, high) in _INTS.items():
+        value = stored.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+            policy[key] = value
     for key in _LISTS:
         policy[key] = _clean_list(stored.get(key), lower=(key == "sso_allowed_domains"))
     for key in _STRS:

@@ -250,6 +250,19 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "sso_freshness_warning": {
+        "name": "Sign in through your organisation",
+        "subject": "Sign in through {{action.provider}} by {{action.when}}",
+        "body_html": (
+            "<h2>Sign in through your organisation</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>Sign in to {{vault.name}} through {{action.provider}} by {{action.when}}. If you do not, your SSH "
+            "keys, temporary credentials and devices pause then, and a sign-in through {{action.provider}} "
+            "restores them.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "compliance_access_notice": {
         "name": "Access to your vaults",
         "subject": "Access to your vaults: case {{action.code}}",
@@ -379,6 +392,10 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("auditor_right", "The auditor right",
      "Sent to every administrator and to the account when the auditor right is proposed, granted, turned down, "
      "revoked, suspended, ended, reconfirmed, or lapses or expires -- says what, when and by whom.", SYSTEM),
+    ("sso_freshness_warning", "Sign in through your organisation",
+     "Sent to a person whose account is linked to an identity provider five days before their SSH keys, temporary "
+     "credentials and devices pause for want of a sign-in through it -- names the provider and the date. Its wording "
+     "is fixed: it cannot be changed or turned off.", LOCKED),
     ("compliance_access_notice", "Access to your vaults",
      "Sent to a vault's owner when an investigation may open their vaults, is extended, narrowed, ends or is "
      "closed, when a legal hold on their vaults is placed, confirmed, released, restored or lapses, and when files "
