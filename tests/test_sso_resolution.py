@@ -115,9 +115,10 @@ def test_an_invitation_is_accepted_through_the_provider(monkeypatch):
     assert status == 404 and out["detail"]["reason"] == "invitation_unusable"
 
 
-@pytest.mark.parametrize("arrange", ["unknown", "expired", "revoked", "accepted", "invitations_off", "inviter_demoted", "app"])
+@pytest.mark.parametrize("arrange", ["unknown", "expired", "revoked", "accepted", "invitations_off", "inviter_demoted", "app",
+                                     "reserved_name", "provider_disabled"])
 def test_an_invitation_start_is_refused_for_a_token_that_cannot_be_accepted(monkeypatch, arrange):
-    root, p = _user("root", role="admin"), _provider()
+    root, p = _user("root", role="admin"), _provider(state="disabled" if arrange == "provider_disabled" else "enabled")
     h = Resolving(monkeypatch, [root], [p], account_policy={"invite_enabled": False} if arrange == "invitations_off" else None)
     token, inv = h.invite(created_by=root.id, role="admin" if arrange == "inviter_demoted" else "user")
     now = datetime.utcnow()
@@ -132,9 +133,15 @@ def test_an_invitation_start_is_refused_for_a_token_that_cannot_be_accepted(monk
     elif arrange == "inviter_demoted":
         from app.core.models import RoleEnum
         root.role = RoleEnum.USER
+    elif arrange == "reserved_name":
+        inv.username = "erased-7"
     if arrange == "app":
         status, out, _ = _call(h.S, "POST", f"/auth/sso/{p.id}/start", {"code_challenge": "c" * 43, "invitation": token})
         assert status == 400 and "browser" in out["detail"]
+    elif arrange == "provider_disabled":
+        # The provider is judged first: a token is not looked at (nor its limiter spent) for one that cannot serve.
+        status, out = h.start(p, invitation=token)
+        assert status == 404 and out["detail"]["reason"] == "provider_disabled" and "invite_accept_prefix" not in h.limiter
     else:
         status, out = h.start(p, invitation=token)
         assert status == 404 and out["detail"]["reason"] == "invitation_unusable", out
@@ -150,11 +157,26 @@ def test_an_invitation_start_is_refused_for_a_token_that_cannot_be_accepted(monk
     ("inviter_demoted", "invitation_unusable", "inviter_not_admin"),
     ("user_cap", "account_limit", "user_cap"),
     ("no_verified_email", "email_required", "email_required"),
+    ("reserved_name", "invitation_unusable", "username_reserved"),
+    ("invitation_address_in_use", "invitation_unusable", "email_in_use"),
+    ("username_is_an_address", "invitation_unusable", "username_email_conflict"),
+    ("administrator_without_password", "invitation_unusable", "administrator_on_password_less_provider"),
+    ("subject_pinned_elsewhere", "already_linked", "subject_linked_elsewhere"),
+    ("claim_lost", "invitation_unusable", "claim_lost"),
 ])
 def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account(monkeypatch, arrange, reason, detail):
-    root, p = _user("root", role="admin"), _provider()
-    h = Resolving(monkeypatch, [root], [p])
-    token, inv = h.invite(created_by=root.id, role="admin" if arrange == "inviter_demoted" else "user")
+    root = _user("root", role="admin")
+    p = _provider(policy={"sso_password_login": "disabled"} if arrange == "administrator_without_password" else None)
+    users = [root]
+    if arrange == "invitation_address_in_use":
+        users.append(_user("holder", email="taken@example.test"))
+    if arrange == "username_is_an_address":
+        users.append(_user("holder", email="newbie"))
+    identities = [_identity(_user("other"), p, tenant_id="t1")] if arrange == "subject_pinned_elsewhere" else []
+    h = Resolving(monkeypatch, users, [p], identities=identities)
+    admin_role = arrange in ("inviter_demoted", "administrator_without_password", "claim_lost")
+    token, inv = h.invite(created_by=root.id, role="admin" if admin_role else "user",
+                          email="taken@example.test" if arrange == "invitation_address_in_use" else None)
     status, out = h.start(p, invitation=token)
     state, _ = h.state_of(out["authorization_url"])
     now = datetime.utcnow()
@@ -173,13 +195,23 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
         monkeypatch.setattr(h.S.settings, "plan_max_users", 1)
     elif arrange == "no_verified_email":
         h.claims_override = {"email_verified": False}
+    elif arrange == "reserved_name":
+        inv.username = "erased-7"
+    elif arrange == "subject_pinned_elsewhere":
+        h.claims_override = {"tid": "t2"}
+    elif arrange == "claim_lost":
+        # Revoked between the inviter's locked read and the atomic claim: the claim finds no pending row.
+        h.db.on_lock.append(lambda: setattr(inv, "revoked_at", datetime.utcnow()))
     status, location, _ = h.callback(p, state)
     assert location == f"/#sso-error={reason}", location
-    assert h.users_named("newbie") == [] and h.identities() == [] and h.codes() == []
+    assert h.users_named("newbie") == [] and len(h.identities()) == len(identities) and h.codes() == []
+    assert ("commit",) not in h.db.log                                 # nothing of the attempt was committed
     assert inv.accepted_user_id is None or arrange == "accepted_meanwhile"
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == reason for a in h.audits), h.audits
     assert any(a[0] == "account_invitation_accept_failed" and a[2] == {"token_prefix": inv.token_prefix, "reason": detail}
                for a in h.audits), h.audits
+    if arrange == "subject_pinned_elsewhere":
+        assert inv.accepted_at is None                                 # still pending: the person may be invited again
 
 
 @pytest.mark.parametrize("arrange, expected", [
@@ -188,10 +220,16 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
     ("claim_unverified_optional", None),
     ("claim_domain_denied_optional", None),
     ("claim_in_use_optional", None),
+    ("claim_not_an_address_optional", None),          # "root": the stored shape has one '@' with both sides
+    ("claim_too_long_optional", None),                 # longer than the column
+    ("claim_non_ascii_optional", None),
+    ("claim_two_ats_optional", None),
+    ("claim_outside_the_domain_list_optional", None),  # hd admits the sign-in; the address is from another domain
 ])
 def test_the_new_accounts_address_is_the_invitations_else_the_providers_verified_one_when_the_policy_admits_it(
         monkeypatch, arrange, expected):
-    root, p = _user("root", role="admin"), _provider()
+    root = _user("root", role="admin")
+    p = _provider(policy={"sso_allowed_domains": ["example.test"]} if arrange == "claim_outside_the_domain_list_optional" else None)
     policy = None
     if arrange.endswith("_optional"):
         policy = {"email_requirement": "optional"}
@@ -201,6 +239,16 @@ def test_the_new_accounts_address_is_the_invitations_else_the_providers_verified
     h = Resolving(monkeypatch, users, [p], account_policy=policy)
     token, inv = h.invite(created_by=root.id, email="invited@example.test" if arrange == "invitation_address" else None)
     claims = {"email_verified": False} if arrange == "claim_unverified_optional" else {}
+    if arrange == "claim_not_an_address_optional":
+        claims = {"email": "root"}
+    elif arrange == "claim_too_long_optional":
+        claims = {"email": "a" * 250 + "@example.test"}
+    elif arrange == "claim_non_ascii_optional":
+        claims = {"email": "\u00e5lice@example.test"}
+    elif arrange == "claim_two_ats_optional":
+        claims = {"email": "a@evil.test@example.test"}
+    elif arrange == "claim_outside_the_domain_list_optional":
+        claims = {"hd": "example.test", "email": "alice@victim.test"}
     location, _ = _sign_in(h, p, token, **claims)
     assert location.startswith("/#sso="), location
     (user,) = h.users_named("newbie")
@@ -208,7 +256,7 @@ def test_the_new_accounts_address_is_the_invitations_else_the_providers_verified
 
 
 def test_an_administrators_invitation_records_the_grant_keeps_a_password_and_is_announced(monkeypatch):
-    root, p = _user("root", role="admin"), _provider(policy={"sso_password_login": "disabled"})
+    root, p = _user("root", role="admin"), _provider()
     h = Resolving(monkeypatch, [root], [p])
     token, inv = h.invite(created_by=root.id, role="admin", inviter_lineage=[str(uuid.uuid4())])
     location, _ = _sign_in(h, p, token)
@@ -218,6 +266,39 @@ def test_an_administrators_invitation_records_the_grant_keeps_a_password_and_is_
     assert user.role == RoleEnum.ADMIN
     assert user.sso_only is False and user.sftp_password_auth is True       # an administrator always keeps a password
     assert h.admin_grants == [("newbie", "root", inv.inviter_lineage)] and h.announcements == [("newbie", "root", "invited")]
+
+
+def test_every_new_account_gets_a_password_hash_of_its_own_that_nobody_knows(monkeypatch):
+    root, p = _user("root", role="admin"), _provider()
+    h = Resolving(monkeypatch, [root], [p])
+    token1, _ = h.invite(username="first", created_by=root.id)
+    token2, _ = h.invite(username="second", created_by=root.id)
+    _sign_in(h, p, token1)
+    _sign_in(h, p, token2, sub="subject-2", email="second@example.test")
+    (first,), (second,) = h.users_named("first"), h.users_named("second")
+    assert first.password_hash != second.password_hash
+    assert first.password_hash.startswith("argon2:") and first.password_hash != "argon2:" + _h("")
+    assert len(first.password_hash) == len("argon2:") + 64          # a hash of a random secret, no plain text
+
+
+def test_the_account_stands_when_the_code_store_fails_afterwards(monkeypatch):
+    root, p = _user("root", role="admin"), _provider()
+    h = Resolving(monkeypatch, [root], [p])
+    token, inv = h.invite(created_by=root.id)
+    from app.core import sign_in_codes
+
+    def unavailable(*a, **kw):
+        raise sign_in_codes.Unavailable()
+    real_store = sign_in_codes.store
+    monkeypatch.setattr(sign_in_codes, "store", unavailable)
+    location, _ = _sign_in(h, p, token)
+    assert location == "/#sso-error=temporarily_unavailable", location
+    (user,) = h.users_named("newbie")
+    assert inv.accepted_user_id == user.id and ("commit",) in h.db.log and len(h.identities()) == 1
+    # The next sign-in finds the identity: one account, one sign-in more.
+    monkeypatch.setattr(sign_in_codes, "store", real_store)
+    location, _ = _sign_in(h, p)
+    assert location.startswith("/#sso=") and len(h.users_named("newbie")) == 1 and h.finish(location)[0] == 200
 
 
 @pytest.mark.parametrize("password_login, sso_only", [("allowed", False), ("disabled", True)])
@@ -260,16 +341,20 @@ def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_
 
 
 @pytest.mark.parametrize("arrange", ["off", "unverified", "administrator", "inactive", "unrestricted", "has_identity",
-                                     "no_match", "two_accounts"])
+                                     "no_match", "two_accounts", "address_outside_the_domain_list"])
 def test_linking_by_email_happens_in_no_other_case(monkeypatch, arrange):
     policy = {"sso_link_by_email": True, "sso_allowed_tenants": ["t1"]}
     if arrange == "off":
         policy = {"sso_allowed_tenants": ["t1"]}
     elif arrange == "unrestricted":
         policy = {"sso_link_by_email": True}
+    elif arrange == "address_outside_the_domain_list":
+        policy = {"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]}
     bob, p = _user("bob", role="admin" if arrange == "administrator" else "user"), _provider(policy=policy)
     if arrange == "inactive":
         bob.is_active = False
+    if arrange == "address_outside_the_domain_list":
+        bob.email = "bob@victim.test"           # the hosted domain admits the sign-in; this address is not on the list
     users = [bob] + ([_user("bobby", email="Bob@example.test")] if arrange == "two_accounts" else [])
     identities = [_identity(bob, p, subject="another-subject")] if arrange == "has_identity" else []
     h = Resolving(monkeypatch, users, [p], identities=identities)
@@ -278,6 +363,8 @@ def test_linking_by_email_happens_in_no_other_case(monkeypatch, arrange):
         claims["email_verified"] = False
     if arrange == "no_match":
         claims["email"] = "nobody@example.test"
+    if arrange == "address_outside_the_domain_list":
+        claims = {"hd": "example.test", "email": "bob@victim.test"}
     location, _ = _sign_in(h, p, **claims)
     assert location == "/#sso-error=no_account", location
     assert len(h.identities()) == len(identities) and h.codes() == [] and h.notices == []
@@ -404,6 +491,9 @@ def test_a_test_sign_in_says_what_account_it_would_make(monkeypatch):
     ({"sso_required_groups": ["g"]}, {"_claim_names": {"groups": "src1"}}, "restriction_claim_missing"),
     ({"sso_required_groups": ["g"]}, {"groups": ["h"]}, "restricted"),
     ({"sso_required_groups": ["g"]}, {"groups": ["g", "h"]}, None),
+    ({"sso_required_groups": ["g"]}, {"groups": ["g"], "_claim_names": {"groups": "src1"}}, "restriction_claim_missing"),
+    ({"sso_allowed_tenants": ["t1"]}, {"tid": "x" * 600}, "restriction_claim_missing"),      # longer than a tenant id
+    ({"sso_allowed_tenants": ["t1"]}, {"tid": " T1 "}, None),
     ({"sso_use_signup_domains": True}, {"email": "alice@other.test"}, "restricted"),
     ({"sso_use_signup_domains": True}, {}, None),
 ])
@@ -418,6 +508,26 @@ def test_the_restriction_is_judged_before_who_the_person_is(monkeypatch, policy,
     assert location == f"/#sso-error={reason}", location
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == reason for a in h.audits), h.audits
     assert h.codes() == [] and all(a[0] != "login_success" for a in h.audits)
+
+
+def test_the_restriction_holds_for_an_app_sign_in_too(monkeypatch):
+    alice, p = _user(), _provider(policy={"sso_allowed_tenants": ["t1"]})
+    h = Resolving(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    status, out, _ = _call(h.S, "POST", f"/auth/sso/{p.id}/start", {"code_challenge": "c" * 43})
+    assert status == 200, out
+    state, record = h.state_of(out["authorization_url"])
+    assert record["purpose"] == "app"
+    h.claims_override = {"tid": "t2"}
+    assert h.callback(p, state)[1] == "/#sso-error=restricted" and h.codes() == []
+
+
+def test_a_pinned_tenant_is_matched_whole_and_without_case(monkeypatch):
+    alice, p = _user(), _provider()
+    h = Resolving(monkeypatch, [alice], [p], identities=[_identity(alice, p, tenant_id="t1")])
+    location, _ = _sign_in(h, p, tid=" T1 ")
+    assert location.startswith("/#sso="), location
+    assert _sign_in(h, p, tid="t10")[0] == "/#sso-error=no_account"
+    assert _sign_in(h, p, tid="t")[0] == "/#sso-error=no_account"
 
 
 def test_the_restriction_holds_for_a_link_and_for_an_invitation_too(monkeypatch):

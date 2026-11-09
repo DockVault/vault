@@ -206,7 +206,8 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     display = claims.get(name_name)
     display = display.strip()[:255] if isinstance(display, str) and display.strip() else None
     tenant = claims.get(tenant_name)
-    tenant = tenant if isinstance(tenant, str) and tenant else None
+    tenant = tenant.strip() if isinstance(tenant, str) else None
+    tenant = tenant if tenant and len(tenant) <= 255 else None      # the column's width; longer is no tenant id
     auth_time = _as_time(claims.get("auth_time"))
     amr = claims.get("amr")
     amr = [a for a in amr if isinstance(a, str)] if isinstance(amr, list) else []
@@ -218,7 +219,7 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     groups = ([str(g)[:255] for g in raw_groups if isinstance(g, (str, int)) and not isinstance(g, bool)][:1000]
               if isinstance(raw_groups, list) else None)
     names = claims.get("_claim_names")
-    overage = groups is None and isinstance(names, dict) and groups_name in names
+    overage = isinstance(names, dict) and groups_name in names     # a marker makes any list beside it partial
     return ProviderAnswer(claims=claims, subject=str(claims["sub"]), issuer=str(claims["iss"]), tenant_id=tenant,
                           email=email, email_verified=claims.get(verified_name) is True, display_name=display,
                           auth_time=auth_time, amr=amr, acr=acr if isinstance(acr, str) else None,
@@ -248,9 +249,34 @@ def known_identity(db, row, answer: ProviderAnswer):
                                                  ExternalIdentity.subject == answer.subject).first()
     if identity is None:
         return None
-    if identity.tenant_id and identity.tenant_id != answer.tenant_id:
+    if identity.tenant_id and (answer.tenant_id or "").lower() != identity.tenant_id.strip().lower():
         return None
     return identity
+
+
+def subject_owner(db, row, answer: ProviderAnswer):
+    """The identity row holding this provider's subject under any tenant, or None: the table keys on the provider
+    and the subject alone, so a subject pinned to another tenant can belong to nobody else."""
+    from app.core.models import ExternalIdentity
+    return db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id,
+                                             ExternalIdentity.subject == answer.subject).first()
+
+
+def usable_email(value) -> Optional[str]:
+    """A provider's address claim in the shape the vault stores (one '@' with something on each side, ASCII, at most
+    255 characters, folded), or None. The schema that validates an address at the forms is not on this path, so
+    the shape is held here; an address that fails it is treated as absent."""
+    from app.core.account_policy import signup_email_is_ascii
+    from app.core.email_identity import normalize_email
+    if not isinstance(value, str):
+        return None
+    email = normalize_email(value)
+    if email is None or email.count("@") != 1 or len(email) > 255 or not signup_email_is_ascii(email):
+        return None
+    local, domain = email.split("@")
+    if not local or not domain or any(ch.isspace() for ch in email):
+        return None
+    return email
 
 
 def account_usable(user) -> bool:
@@ -357,8 +383,6 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     import secrets
     import uuid as _uuid
     from sqlalchemy.exc import IntegrityError
-    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
-    from app.core.email_identity import email_in_use, normalize_email
     from app.core.endpoint_permissions import grant_default_permissions_for_role
     from app.core.models import RoleEnum, User
     from app.core.security import hash_password
@@ -366,13 +390,9 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     account_policy = api._account_policy(db)
     if not sso_policy.is_restricted(policy, account_policy):
         return None
-    email = normalize_email(answer.email) if answer.email_verified else None
-    if email is not None and not (
-            signup_email_is_ascii(email)
-            and email_allowed_by_domain_gate(email, account_policy.get("signup_email_domain_mode"),
-                                             account_policy.get("signup_email_domains"))
-            and not email_in_use(db, email) and not api._email_has_pending_invite(db, email)):
-        email = None
+    if subject_owner(db, row, answer) is not None:
+        raise Refusal(ALREADY_LINKED, "subject_linked_elsewhere")     # the same subject, pinned to another tenant
+    email = _admitted_address(db, answer, policy, account_policy)
     if email is None and account_policy.get("email_requirement") == "required":
         raise Refusal(EMAIL_REQUIRED, "email_required")
     try:
@@ -399,6 +419,24 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     return Resolution(user, identity, created=True, linked_now=True, linked_by="jit")
 
 
+def _admitted_address(db, answer: ProviderAnswer, policy: dict, account_policy: dict) -> Optional[str]:
+    """The provider's verified address when a new account may carry it: in the stored shape, on the provider's domain
+    list when one is set, admitted by the account policy's sign-up domain list, and nobody's yet (no account, no
+    pending invitation). None otherwise: the account is made without an address, or refused when one is required."""
+    from app.core.account_policy import email_allowed_by_domain_gate
+    from app.core.email_identity import email_in_use
+    api = _api()
+    email = usable_email(answer.email) if answer.email_verified else None
+    if email is None or not sso_policy.address_admitted(policy, email):
+        return None
+    if not email_allowed_by_domain_gate(email, account_policy.get("signup_email_domain_mode"),
+                                        account_policy.get("signup_email_domains")):
+        return None
+    if email_in_use(db, email) or api._email_has_pending_invite(db, email):
+        return None
+    return email
+
+
 def username_for(db, row, answer: ProviderAnswer) -> Optional[str]:
     """The username a new account gets: the provider's username claim when it passes the account rules, else the
     verified address's local part, else the subject shortened; on a collision a numeric suffix (``-2``, ``-3``).
@@ -407,8 +445,9 @@ def username_for(db, row, answer: ProviderAnswer) -> Optional[str]:
     preferred = answer.claims.get(claim_name(row, "username", "preferred_username"))
     if isinstance(preferred, str):
         candidates.append(preferred)
-    if answer.email_verified and isinstance(answer.email, str) and "@" in answer.email:
-        candidates.append(answer.email.rsplit("@", 1)[0])
+    email = usable_email(answer.email) if answer.email_verified else None
+    if email is not None:
+        candidates.append(email.rsplit("@", 1)[0])
     candidates.append(answer.subject)
     for raw in candidates:
         base = _username_base(raw)
@@ -455,9 +494,10 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     account_policy = api._account_policy(db) if policy["sso_use_signup_domains"] else None
     if not sso_policy.is_restricted(policy, account_policy):
         return None
-    if not (answer.email_verified and answer.email):
-        return None
-    user = find_user_by_email(db, answer.email)
+    email = usable_email(answer.email) if answer.email_verified else None
+    if email is None or not sso_policy.address_admitted(policy, email):
+        return None                  # the hosted-domain claim admits the sign-in; the address must be on the list too
+    user = find_user_by_email(db, email)
     if user is None or getattr(user, "role", None) == RoleEnum.ADMIN or not account_usable(user):
         return None
     if db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
@@ -484,8 +524,7 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
     import secrets
     import uuid as _uuid
     from sqlalchemy.exc import IntegrityError
-    from app.core.account_policy import email_allowed_by_domain_gate, signup_email_is_ascii
-    from app.core.email_identity import email_in_use, normalize_email
+    from app.core.email_identity import email_in_use
     from app.core.endpoint_permissions import grant_default_permissions_for_role
     from app.core.models import AccountInvitation, RoleEnum, User
     from app.core.security import hash_password
@@ -505,18 +544,15 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
         raise Refusal(INVITATION_UNUSABLE, "inviter_not_admin")
     if api._username_kept(inv.username):
         raise Refusal(INVITATION_UNUSABLE, "username_reserved")
+    if subject_owner(db, row, answer) is not None:
+        raise Refusal(ALREADY_LINKED, "subject_linked_elsewhere")     # the same subject, pinned to another tenant
+    policy = policy_of(row)
     if inv.email:
         if email_in_use(db, inv.email):
             raise Refusal(INVITATION_UNUSABLE, "email_in_use")
         email = inv.email
     else:
-        email = normalize_email(answer.email) if answer.email_verified else None
-        if email is not None and not (
-                signup_email_is_ascii(email)
-                and email_allowed_by_domain_gate(email, account_policy.get("signup_email_domain_mode"),
-                                                 account_policy.get("signup_email_domains"))
-                and not email_in_use(db, email) and not api._email_has_pending_invite(db, email)):
-            email = None
+        email = _admitted_address(db, answer, policy, account_policy)
         if email is None and account_policy.get("email_requirement") == "required":
             raise Refusal(EMAIL_REQUIRED, "email_required")
     try:
@@ -529,8 +565,11 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
         role = RoleEnum(inv.role)
     except ValueError:
         raise Refusal(INVITATION_UNUSABLE, "bad_role")
-    policy = policy_of(row)
-    sso_only = policy["sso_password_login"] == "disabled" and role != RoleEnum.ADMIN   # an administrator keeps a password
+    if role == RoleEnum.ADMIN and policy["sso_password_login"] == "disabled":
+        # No administrator is ever linked to a provider whose people hold no password (the save of that setting
+        # refuses while one is linked); an administrator's invitation goes through another provider or the form.
+        raise Refusal(INVITATION_UNUSABLE, "administrator_on_password_less_provider")
+    sso_only = policy["sso_password_login"] == "disabled"
     user = User(id=_uuid.uuid4(), username=inv.username, email=email,
                 password_hash=hash_password(secrets.token_urlsafe(32)),
                 role=role, created_by=inv.created_by, created_at=now, updated_at=now, is_active=True, is_locked=False,
@@ -595,9 +634,9 @@ def link_refusal(db, row, user, answer: ProviderAnswer) -> None:
     """Raise :class:`Refusal` when ``answer``'s identity cannot be linked to ``user``: it already belongs to
     another account, or the account already has an identity on this provider."""
     from app.core.models import ExternalIdentity
-    existing = known_identity(db, row, answer)
-    if existing is not None and existing.user_id != user.id:
-        raise Refusal(ALREADY_LINKED)
+    existing = subject_owner(db, row, answer)
+    if existing is not None and (existing.user_id != user.id or known_identity(db, row, answer) is None):
+        raise Refusal(ALREADY_LINKED)         # another account's, or this account's under another tenant
     if existing is None and db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
                                                                   ExternalIdentity.user_id == user.id).first() is not None:
         raise Refusal(NOT_THIS_ACCOUNT, "this account already has an identity on the provider")
@@ -607,11 +646,11 @@ def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str):
     """Link ``answer``'s identity to ``user``: refused when the subject already belongs to another account, or
     the account already has an identity on this provider. In the caller's transaction."""
     from app.core.models import ExternalIdentity
-    existing = known_identity(db, row, answer)
+    existing = subject_owner(db, row, answer)
     if existing is not None:
-        if existing.user_id == user.id:
+        if existing.user_id == user.id and known_identity(db, row, answer) is not None:
             return existing
-        raise Refusal(ALREADY_LINKED)
+        raise Refusal(ALREADY_LINKED)         # another account's, or this account's under another tenant
     mine = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id,
                                              ExternalIdentity.user_id == user.id).first()
     if mine is not None:

@@ -58,6 +58,7 @@ def test_no_restriction_admits_everyone():
 @pytest.mark.parametrize("answer, verdict", [
     ({"tenant_id": "T-1"}, None),                                   # case does not matter for a tenant id
     ({"tenant_id": "t-2"}, P.RESTRICTED),
+    ({"tenant_id": "t-10"}, P.RESTRICTED),                          # the whole id, never a prefix
     ({"tenant_id": None}, P.RESTRICTION_CLAIM_MISSING),
     ({"tenant_id": "  "}, P.RESTRICTION_CLAIM_MISSING),
     ({"tenant_id": 42}, P.RESTRICTION_CLAIM_MISSING),
@@ -76,6 +77,7 @@ def test_the_tenant_rule(answer, verdict):
     ({"email": "a@example.test", "email_verified": False}, P.RESTRICTION_CLAIM_MISSING),
     ({}, P.RESTRICTION_CLAIM_MISSING),
     ({"email": "no-at-sign", "email_verified": True}, P.RESTRICTION_CLAIM_MISSING),
+    ({"email": "a@evil.test@example.test", "email_verified": True}, P.RESTRICTION_CLAIM_MISSING),   # not an address
 ])
 def test_the_domain_rule(answer, verdict):
     assert _judge({"sso_allowed_domains": ["example.test"]}, **answer) == verdict
@@ -106,6 +108,19 @@ def test_the_sign_up_domain_list_as_a_restriction(mode, domains, answer, verdict
     pol = {"signup_email_domain_mode": mode, "signup_email_domains": domains}
     assert _judge({"sso_use_signup_domains": True}, account_policy=pol, **answer) == verdict
     assert _judge({"sso_use_signup_domains": False}, account_policy=pol, **answer) is None
+
+
+@pytest.mark.parametrize("stored, email, admitted", [
+    ({}, "a@anywhere.test", True),
+    ({"sso_allowed_domains": ["example.test"]}, "a@example.test", True),
+    ({"sso_allowed_domains": ["example.test"]}, "a@Example.TEST", True),
+    ({"sso_allowed_domains": ["example.test"]}, "a@victim.test", False),
+    ({"sso_allowed_domains": ["example.test"]}, "a@sub.example.test", False),
+    ({"sso_allowed_domains": ["example.test"]}, "a@evil.test@example.test", False),
+    ({"sso_allowed_domains": ["example.test"]}, None, False),
+])
+def test_an_address_is_admitted_only_from_a_listed_domain(stored, email, admitted):
+    assert P.address_admitted(P.effective(stored), email) is admitted
 
 
 def test_an_exclusion_wins_over_a_missing_claim():

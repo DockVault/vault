@@ -170,6 +170,10 @@ async def start_sign_in(
     if row is None:
         raise HTTPException(status_code=404, detail={"reason": sso.PROVIDER_DISABLED,
                                                      "message": sso.reason_text(sso.PROVIDER_DISABLED)})
+    purpose = sso_state.APP if body.code_challenge and not body.verifier_hash else sso_state.SIGN_IN
+    why = sso.usable_for(row, purpose)
+    if why is not None:
+        raise _refused_start(sso.Refusal(why))      # before any invitation is looked up for a provider that cannot serve
     extras = None
     if body.invitation:
         if body.code_challenge:
@@ -177,7 +181,7 @@ async def start_sign_in(
         extras = {"invitation_id": str(_invitation_for_start(db, body.invitation, client_ip).id)}
     from app.core import sign_in_lockout
     try:
-        url = sso.start(row, purpose=sso_state.APP if body.code_challenge and not body.verifier_hash else sso_state.SIGN_IN,
+        url = sso.start(row, purpose=purpose,
                         source=sign_in_lockout.source_of(client_ip), client_ip=client_ip,
                         verifier_hash=body.verifier_hash, code_challenge=body.code_challenge, return_to=body.return_to,
                         extras=extras)
@@ -262,6 +266,7 @@ async def sign_in_callback(
         try:
             found = sso.resolve_account(db, row, answer, login=login)
         except sso.Refusal as exc:
+            db.rollback()          # nothing of a refused resolution may ride on the audit row's commit
             _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
             if invitation_id:
                 api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip,

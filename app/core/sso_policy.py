@@ -116,11 +116,20 @@ def restriction(policy: dict, *, tenant_id, email, email_verified: bool, hosted_
         mode, listed = signup_domain_gate(account_policy)
         if mode != "off":
             from app.core.account_policy import email_allowed_by_domain_gate
-            if not (email_verified and isinstance(email, str) and "@" in email):
+            if not (email_verified and isinstance(email, str) and email.count("@") == 1):
                 missing = True
             elif not email_allowed_by_domain_gate(email, mode, listed):
                 return RESTRICTED
     return RESTRICTION_CLAIM_MISSING if missing else None
+
+
+def address_admitted(policy: dict, email: str) -> bool:
+    """Whether an address may be stored on, or link, an account under this provider: when a domain list is set, the
+    address's own domain must be on it (the hosted-domain claim admits the sign-in, not another domain's address)."""
+    domains = policy["sso_allowed_domains"]
+    if not domains or not isinstance(email, str) or email.count("@") != 1:
+        return not domains
+    return email.rsplit("@", 1)[1].strip().lower() in set(domains)
 
 
 def _domain_of(hosted_domain, email, email_verified) -> Optional[str]:
@@ -128,6 +137,6 @@ def _domain_of(hosted_domain, email, email_verified) -> Optional[str]:
     email's; a consumer account has neither, or an address whose domain the list does not name."""
     if isinstance(hosted_domain, str) and hosted_domain.strip():
         return hosted_domain.strip().lower()
-    if email_verified and isinstance(email, str) and "@" in email:
+    if email_verified and isinstance(email, str) and email.count("@") == 1:
         return email.rsplit("@", 1)[1].strip().lower() or None
     return None

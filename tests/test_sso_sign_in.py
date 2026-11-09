@@ -33,9 +33,29 @@ def _api():
 
 
 class DB(MemoryDB):
+    """The memory store with rows filed on add, and a rollback that takes back what was added since the last
+    commit (as the database would), so a refused resolution leaves no account behind in a test either."""
+
+    def __init__(self, tables=None):
+        super().__init__(tables)
+        self._uncommitted = []
+
     def add(self, obj):
         super().add(obj)
         self.rows_of(type(obj)).append(obj)
+        self._uncommitted.append(obj)
+
+    def commit(self):
+        super().commit()
+        self._uncommitted = []
+
+    def rollback(self):
+        super().rollback()
+        for obj in self._uncommitted:
+            rows = self.rows_of(type(obj))
+            if obj in rows:
+                rows.remove(obj)
+        self._uncommitted = []
 
 
 def _call(S, method, url, body=None, headers=None):
