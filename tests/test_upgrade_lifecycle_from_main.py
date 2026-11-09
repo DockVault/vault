@@ -232,6 +232,18 @@ def test_a_line_note_reads_the_merged_period():
     assert dv.line_support_note({"versions": {}}, "0.33.1") == ""
 
 
+def test_the_tool_and_the_app_count_a_support_period_by_the_same_day_in_utc(monkeypatch):
+    # 23:30 UTC on a line's last day, which is already the next day on a host east of UTC: the tool read the
+    # host's local date, so it told such a host the fixes had ended while the app still said they continue.
+    import time
+    late = time.struct_time((2027, 5, 9, 23, 30, 0, 6, 129, 0))
+    monkeypatch.setattr(time, "gmtime", lambda *a: late)
+    merged = {"versions": {}, "lines": {"0.33": {"security_fixes_until": "2027-05-09"}}}
+    assert dv._today() == "2027-05-09"
+    assert dv.line_support_note(merged, "0.33.1") == "security fixes until 2027-05-09"
+    assert U.line_status("0.33.1", merged, None)["ended"] is False
+
+
 def test_the_tool_and_the_app_read_release_lines_the_same_way():
     # The synthetic matrix of a fix on two lines. main's copy words one reference differently and
     # brings the 0.33 line's end forward; the bundled copy is the one 0.33.1 shipped.
