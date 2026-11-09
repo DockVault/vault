@@ -1728,8 +1728,9 @@ def _user_for_token(token, db) -> User:
     is_temporary = payload.get("is_temporary", False)
     temp_cred = None  # the TemporaryCredential row backing a temp session
 
-    # Every token this server mints carries a session_token (login is the ONLY issuer —
-    # app/api/api_server.py create_access_token call site). A token WITHOUT one can only be a forgery
+    # Every session token this server mints carries a session_token (the sign-in steps, and a renewal
+    # through _renewed_token); the pre-authentication token of a two-step sign-in has none and is meant to
+    # be refused here. Any other token WITHOUT one can only be a forgery
     # or a stripped/legacy token, and it would bypass every revocation check below (all gated
     # on session_token). Reject it so leaked/forged tokens remain revocable.
     if not session_token:
@@ -4738,8 +4739,10 @@ def _get_started_view(db: Session) -> dict:
     row = db.query(SystemSetting).filter(SystemSetting.key == _GET_STARTED_KEY).first()
     acks = dict(row.value) if (row and row.value) else {}
     email_ready = _smtp_configured(db)
-    tested = bool(db.query(AuditLog.id).filter(AuditLog.action == "test_email_sent",
-                                               AuditLog.status == "success").first())
+    # A passed test send is kept in the checklist's own row (the audit row it also writes is moved to the
+    # archive after a while); a deployment that sent one before the row knew of it is read from the log.
+    tested = bool(acks.get("test_email_sent_at")) or bool(db.query(AuditLog.id).filter(
+        AuditLog.action == "test_email_sent", AuditLog.status == "success").first())
     mode = _sfpol_gs.effective_policy(_global_settings_blob(db)).get("mfa_mode")
     items = {
         "email": bool(email_ready and tested),
@@ -4775,7 +4778,7 @@ async def update_get_started(
     acks = dict(row.value) if (row and row.value) else {}
     now = datetime.utcnow().isoformat()
     if payload.get("reset") is True:
-        acks = {}
+        acks = {k: v for k, v in acks.items() if k == "test_email_sent_at"}
     for key, stamp in allowed.items():
         if payload.get(key) is True:
             acks[stamp] = now
@@ -4912,7 +4915,27 @@ async def send_test_email(
         )
     except Exception:
         pass
+    _record_test_email_sent(db)
     return {"message": f"Test email sent to {to_addr}"}
+
+
+def _record_test_email_sent(db: Session) -> None:
+    """The Get-started list's email item: a test message went out. Kept in the list's own row, so the item
+    stays done after the audit row is archived. Best-effort."""
+    from app.core.models import SystemSetting
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _GET_STARTED_KEY).first()
+        acks = dict(row.value) if (row and row.value) else {}
+        if acks.get("test_email_sent_at"):
+            return
+        acks["test_email_sent_at"] = datetime.utcnow().isoformat()
+        if row is None:
+            db.add(SystemSetting(key=_GET_STARTED_KEY, value=acks))
+        else:
+            row.value = acks
+        db.commit()
+    except Exception:  # noqa: BLE001 - the message was sent; the checklist reads the log as well
+        db.rollback()
 
 
 # ===========================================================================
@@ -5453,7 +5476,14 @@ async def resend_invite(
     # The old invitation is revoked and a new one made in its place, in one transaction: every path that
     # reads an invitation refuses a revoked one, so the old link dies at once, an acceptance already begun
     # with it included; the record of the acceptance then names the link that was used.
-    inv.revoked_at = now
+    # Revoked by one conditional UPDATE: of two resends at once only one finds it still pending, so one
+    # name never has two live invitations.
+    claimed = db.query(AccountInvitation).filter(
+        AccountInvitation.id == inv.id, AccountInvitation.revoked_at.is_(None),
+        AccountInvitation.accepted_at.is_(None)).update({AccountInvitation.revoked_at: now}, synchronize_session=False)
+    if claimed != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This invitation was just sent again or changed; reload the list.")
     made = AccountInvitation(
         username=inv.username, email=inv.email, role=inv.role,
         token_prefix=prefix, token_hash=invitations.hash_invite_token(plaintext, pepper),
