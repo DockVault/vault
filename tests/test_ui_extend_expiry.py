@@ -20,6 +20,14 @@ def _login(page: Page, username: str, password: str):
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
 
 
+def _local_input(page: Page, days: int) -> str:
+    """Now plus `days`, as a datetime-local field takes it (local time, to the minute), on the page's clock."""
+    return page.evaluate(
+        "days => { const d = new Date(Date.now() + days * 86400000); const p = n => String(n).padStart(2, '0');"
+        " return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }",
+        days)
+
+
 @pytest.fixture
 def features_on(admin):
     before = admin.get("/settings").json()
@@ -47,8 +55,9 @@ def test_a_share_is_extended_from_its_card(page: Page, admin, admin_creds, featu
         modal = page.locator("#extend-expiry-modal.active")
         expect(modal).to_be_visible()
         expect(page.locator("#extend-expiry-title")).to_contain_text("Extend the share of " + v["name"])
-        # Past the ceiling: refused with the server's words, the dialog stays.
-        page.fill("#extend-expiry-until", "2040-01-01T10:00")
+        # Past the ceiling (ten days for this tag; 400 days from now, read on the page's own clock): refused
+        # with the server's words, the dialog stays.
+        page.fill("#extend-expiry-until", _local_input(page, days=400))
         page.click("#extend-expiry-save")
         expect(page.locator("#extend-expiry-error")).to_contain_text("no later than")
         expect(modal).to_be_visible()
