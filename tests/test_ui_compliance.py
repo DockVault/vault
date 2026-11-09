@@ -613,3 +613,81 @@ def test_a_legal_hold_is_placed_confirmed_and_released_in_the_browser(browser: B
         forget_cases([c for c in cid.split(",") if c], [held])
         _awake(olga_c)
         olga_c.delete_vault(held)
+
+
+# --------------------------------------------------------------------------- the addresses the viewer draws from
+
+RAN = "SCRIPT-RAN"
+XHTML = (f'<html xmlns="http://www.w3.org/1999/xhtml"><head><title>quiet</title></head>'
+         f"<body><script>document.title = '{RAN}';</script></body></html>")
+
+
+@pytest.fixture(scope="module")
+def typed_world(admin):
+    """A case on a vault that holds a page its uploader called a picture, the same page called a video, and a real
+    picture."""
+    with two_admins(admin) as admins:
+        uma, uma_c, codes = new_auditor_account(admin)
+        grant_right(admins, uma["id"])
+        olga, olga_c, vid = owner_with_vault(admin)
+        _upload(olga_c, vid, "a-page-called-a-picture.img", XHTML.encode(), "image/x-thing+xml")
+        _upload(olga_c, vid, "b-page-called-a-video.vid", XHTML.encode(), "video/x-thing+xml")
+        _upload(olga_c, vid, "c-picture.png", _png(), "image/png")
+        case = approved_case(admins, (uma, uma_c, codes), [vid])
+        try:
+            yield {"uma": uma, "codes": codes, "case": case}
+        finally:
+            forget_cases([case["id"]], [vid])
+            forget_grants(uma["id"])
+
+
+def _open_alone(page: Page, address: str) -> Page:
+    """Open an address in a new tab of the same browser, as a person pasting it would."""
+    tab = page.context.new_page()
+    tab.goto(address, wait_until="load", timeout=10000)
+    tab.wait_for_timeout(500)
+    return tab
+
+
+def test_a_page_stored_as_a_picture_or_a_video_never_runs_from_the_viewers_address(browser: Browser, typed_world):
+    page = _page(browser, "v2")
+    try:
+        _login(page, typed_world["uma"], typed_world["codes"])
+        # Control: this browser runs an XHTML object address opened on its own, with the vault's origin, so the
+        # checks below can fail.
+        address = page.evaluate("(x) => URL.createObjectURL(new Blob([x], { type: 'application/xhtml+xml' }))", XHTML)
+        tab = _open_alone(page, address)
+        try:
+            assert tab.title() == RAN, "control: this browser no longer runs an XHTML object address"
+            assert tab.evaluate("() => location.origin") == page.evaluate("() => location.origin")
+        finally:
+            tab.close()
+        _compliance(page)
+        page.locator(f'.cmp-case-row[data-case-id="{typed_world["case"]["id"]}"]').click()
+        page.locator(".cmp-open-ws").click()
+        rows = page.locator(".cmp-file-row")
+        expect(rows).to_have_count(3, timeout=15000)
+        viewer = page.locator(".cmp-ws-viewer")
+        # The page called a picture, then called a video: shown as its text, never drawn from an address.
+        for index in (0, 1):
+            rows.nth(index).click()
+            expect(viewer.locator(".cmp-viewer-text")).to_contain_text("document.title", timeout=15000)
+            expect(viewer.locator(".cmp-viewer-img, .cmp-viewer-media")).to_have_count(0)
+            assert page.title() != RAN
+        # The real picture still shows, drawn from an address made under its own type, which opens as a picture.
+        rows.nth(2).click()
+        img = viewer.locator(".cmp-viewer-img")
+        expect(img).to_be_visible(timeout=15000)
+        page.wait_for_function("() => { const i = document.querySelector('.cmp-viewer-img');"
+                               " return i && i.complete && i.naturalWidth === 2; }", timeout=15000)
+        src = img.get_attribute("src") or ""
+        assert src.startswith("blob:"), src
+        tab = _open_alone(page, src)
+        try:
+            assert tab.evaluate("() => document.contentType") == "image/png"
+            assert tab.title() != RAN
+        finally:
+            tab.close()
+        assert _errors(page) == [], _errors(page)
+    finally:
+        _close(page)

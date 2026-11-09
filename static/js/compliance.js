@@ -1912,6 +1912,15 @@
         else if (e.key === 'Escape' && WS.screen === 'file') { setScreen('list'); }
     }
 
+    // The type a picture, video or sound is shown under: the answer's type only when it is plainly of that kind and
+    // nothing a browser could run as a page (no SVG, XML or HTML), else a type no browser opens as a page. The
+    // address of what is shown can be opened in a tab of its own, with the vault's origin.
+    function viewerBlobType(kind, type) {
+        const t = String(type || '').split(';')[0].trim().toLowerCase();
+        return t.startsWith(kind + '/') && /^[a-z]+\/[a-z0-9.+-]+$/.test(t) && !/svg|xml|html/.test(t)
+            ? t : 'application/octet-stream';
+    }
+
     function watermark(box) {
         const who = (signedInUser() && signedInUser().username) || '';
         const mark = el('div', 'cmp-watermark');
@@ -1965,7 +1974,7 @@
         stage.replaceChildren();
         const isPdf = type === 'application/pdf' || ext === 'pdf';
         if (type.startsWith('image/') && type !== 'image/svg+xml') {
-            WS.url = URL.createObjectURL(blob);
+            WS.url = URL.createObjectURL(new Blob([blob], { type: viewerBlobType('image', type) }));
             const img = el('img', 'cmp-viewer-img');
             img.alt = fileLabel(f);
             img.src = WS.url;
@@ -1978,7 +1987,7 @@
             frame.src = WS.url;
             stage.appendChild(frame);
         } else if (type.startsWith('video/') || type.startsWith('audio/')) {
-            WS.url = URL.createObjectURL(blob);
+            WS.url = URL.createObjectURL(new Blob([blob], { type: viewerBlobType(type.startsWith('video/') ? 'video' : 'audio', type) }));
             const media = el(type.startsWith('video/') ? 'video' : 'audio', 'cmp-viewer-media');
             media.controls = true;
             media.src = WS.url;
@@ -2112,7 +2121,7 @@
         }
         const blob = await resp.blob();
         if (asked !== signIns) return;
-        const url = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(new Blob([blob], { type: 'application/zip' }));
         const a = el('a');
         a.href = url;
         a.download = name;
