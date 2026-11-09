@@ -48,15 +48,18 @@ class Harness(SignInHarness):
         from app.core import security
         monkeypatch.setattr(security, "verify_password", lambda plain, hashed: plain == "pw" and hashed == "x")
 
-    def pending_for(self, user, methods=("pwd",)):
+    def pending_for(self, user, methods=("pwd",), provider=None):
         from app.core.models import PendingLogin
         from app.core.security import create_access_token
         pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, consumed_at=None, attempts=0,
                                         enrollment_required=False,
                                         expires_at=datetime.now(timezone.utc) + timedelta(minutes=3))
         self.db.rows_of(PendingLogin).append(pending)
-        token = create_access_token({"sub": str(user.id), "username": user.username, "pre_auth": str(pending.id),
-                                     "stage": "second_factor", "methods_so_far": list(methods)})
+        claims = {"sub": str(user.id), "username": user.username, "pre_auth": str(pending.id),
+                  "stage": "second_factor", "methods_so_far": list(methods)}
+        if provider is not None:
+            claims["idp"] = provider            # the sign-in came through an identity provider
+        token = create_access_token(claims)
         return pending, {"Authorization": f"Bearer {token}"}
 
     def step_up_with_passkey(self, auth, action, *, password="pw", flags=FLAG.UP | FLAG.UV, sign_count=3):
@@ -155,6 +158,25 @@ def test_a_wrong_assertion_at_the_second_step_counts_against_the_pending_login(m
     assert _call_h(h2.S, "POST", "/auth/second-factor/passkey/options", None, headers2)[0] == 400
 
 
+def test_after_a_provider_sign_in_the_passkey_is_the_second_step_also_for_a_provider_only_account(monkeypatch):
+    """An account that signs in only through its identity provider holds no usable password; after the provider its
+    passkey finishes the second step (the provider proved who the person is), and the token names the provider. Only
+    a passkey standing in for the provider is refused for such an account, never this."""
+    alice = _user(sso_only=True, password_hash="unusable")
+    h = Harness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    pending, headers = h.pending_for(alice, methods=(), provider="provider-1")
+    status, body = _call_h(h.S, "POST", "/auth/second-factor/passkey/options", None, headers)
+    assert status == 200, body
+    credential = auth.get_assertion(body["options"], ORIGIN, sign_count=1)
+    status, body = _call_h(h.S, "POST", "/auth/second-factor/passkey/verify",
+                           {"challenge_id": body["challenge_id"], "credential": credential}, headers)
+    assert status == 200 and body.get("access_token"), body
+    claims = _claims(body["access_token"])
+    assert claims["amr"] == ["hwk"] and claims["idp"] == "provider-1"
+    assert pending.consumed_at is not None and row.sign_count == 1
+
+
 # --------------------------------------------------------------------------- the step-up
 
 def test_a_passkey_only_account_proves_a_step_up_with_its_passkey(monkeypatch):
@@ -173,6 +195,19 @@ def test_a_passkey_only_account_proves_a_step_up_with_its_passkey(monkeypatch):
     # A receipt is spent by one use.
     status, out = _call_h(h.S, "DELETE", f"/users/me/passkeys/{row.id}", None, {"X-Second-Factor": receipt})
     assert status in (403, 404)
+
+
+def test_a_provider_only_account_proves_the_step_ups_factor_part_with_its_passkey(monkeypatch):
+    """The step-up never asks whether the account signs in only through its provider: its passkey proves the factor
+    part as anyone's does."""
+    alice = _user(sso_only=True, password_hash="unusable")
+    h = Harness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    status, body = _call(h.S, "POST", "/auth/second-factor/challenge", {"action": "account.second_factor"})
+    assert status == 200 and body["methods"] == ["passkey"], body
+    status, body = h.step_up_with_passkey(auth, "account.second_factor")
+    assert status == 200 and "receipt" in body, body
+    assert h.receipts[body["receipt"]] == (str(alice.id), "account.second_factor", "sess-1", f"passkey:{row.id}")
 
 
 def test_a_passkey_step_up_is_refused_when_the_assertion_is_wrong_or_the_method_not_offered(monkeypatch):
