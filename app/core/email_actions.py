@@ -341,7 +341,8 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("receiver_upload_received", "Files received on an upload link",
      "Optional — tell the owner of an upload link when files arrive on it (once an hour per link).", OPTIONAL),
     ("expiry_reminder", "Something you shared is about to expire",
-     "Optional — remind the maker of a share or a link two days before it expires.", OPTIONAL),
+     "Optional — remind the maker of a share or a link two days before it expires (one made for less than two "
+     "days is not reminded).", OPTIONAL),
     ("vault_member_added", "Added to a vault",
      "Optional — notify a user when they're added to a vault or team.", OPTIONAL),
     ("temp_credential_issued", "Temporary credential issued",

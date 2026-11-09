@@ -1,8 +1,9 @@
 """What is due a reminder before it expires (app/core/expiry_reminders.py), offline on a real (SQLite)
 database, and the module's pure helpers.
 
-A share, a public link, a note link or an upload link that expires within the window is due once per thing
-and expiry date. Each is named by its kind only: a vault's name, a note's title and a file's name are sealed
+A share, a public link, a note link or an upload link that expires within the window, still works and was
+made for longer than the window is due once per thing and expiry date; one made for less is not (its maker
+chose that lifetime minutes ago), nor is a link whose uses or uploads are spent. Each is named by its kind only: a vault's name, a note's title and a file's name are sealed
 at rest, and a notice is written in the clear, so none of them is read here. Each item leads to the page in
 the web app that manages the thing. tests/test_api_expiry_reminders.py runs the sweep through the web
 container, as the loop runs it.
@@ -142,3 +143,38 @@ def test_each_kind_is_named_by_its_kind_and_leads_to_its_page(db):
     public_link(db, olga, v, expires_at=soon)
     titles = sorted(i["title"] for i in expiry_reminders.due(db, now=NOW))
     assert "Your share of a vault" in titles and "Your public link" in titles
+
+
+# --------------------------------------------------------------------------- made for longer than the window
+
+def test_a_thing_made_for_less_than_the_window_is_not_reminded(db):
+    olga = user(db)
+    v = vault(db, olga)
+    soon = NOW + timedelta(hours=20)
+    short = share(db, olga, v, expires_at=soon, created_at=NOW - timedelta(minutes=10))     # a one-day share
+    long = share(db, olga, v, expires_at=soon, created_at=NOW - timedelta(days=5))          # in its last two days
+    edge = share(db, olga, v, expires_at=soon, created_at=soon - WINDOW)                     # made a window before
+    note_link(db, olga, expires_at=soon, created_at=NOW - timedelta(hours=1))
+    public_link(db, olga, v, expires_at=soon, created_at=soon - WINDOW + timedelta(seconds=1))
+    receiver(db, olga, vault(db, olga, name="k2p9x"), expires_at=soon, created_at=NOW - timedelta(hours=23))
+
+    due = {(i["kind"], i["id"]) for i in expiry_reminders.due(db, now=NOW)}
+    assert due == {("share", str(long.id)), ("share", str(edge.id))}, due
+    assert ("share", str(short.id)) not in due
+
+
+def test_a_spent_link_is_not_reminded(db):
+    olga = user(db)
+    v = vault(db, olga)
+    soon = NOW + timedelta(hours=20)
+    spent_public = public_link(db, olga, v, expires_at=soon, max_uses=3, use_count=3)
+    open_public = public_link(db, olga, v, expires_at=soon, max_uses=3, use_count=2)
+    unlimited_public = public_link(db, olga, v, expires_at=soon, max_uses=None, use_count=99)
+    spent_note = note_link(db, olga, expires_at=soon, max_uses=1, use_count=1)
+    open_note = note_link(db, olga, expires_at=soon, max_uses=2, use_count=1)
+    spent_drop = receiver(db, olga, vault(db, olga, name="a1"), expires_at=soon, max_uploads=5, upload_count=5)
+    open_drop = receiver(db, olga, vault(db, olga, name="a2"), expires_at=soon, max_uploads=5, upload_count=4)
+
+    due = {i["id"] for i in expiry_reminders.due(db, now=NOW)}
+    assert due == {str(x.id) for x in (open_public, unlimited_public, open_note, open_drop)}, due
+    assert not due & {str(x.id) for x in (spent_public, spent_note, spent_drop)}
