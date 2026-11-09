@@ -246,3 +246,62 @@ def test_a_long_extension_needs_the_second_factor_of_an_enrolled_account(admin, 
     finally:
         cm.delete_vault(v["id"])
         admin.delete_user(maker["id"])
+
+
+def test_every_item_carries_its_extend_ceiling_and_a_refusal_reads_as_a_date(admin, sharing_on):
+    """The share, public link, note link and upload link dicts carry extend_ceiling (creation plus the tag's
+    maximum) so the web app can offer only dates the server accepts; a refusal names the ceiling as a person
+    reads it, not as an ISO string."""
+    import re
+    settings_before = admin.get("/settings").json()
+    admin.put("/settings", json={"public_receivers_enabled": True, "public_receiver_user_cap": 50,
+                                 "public_file_links_enabled": True})
+    stag = admin.post("/share-tags", json={"name": unique("ceil"), "allowed_audiences": ["anyone_internal"],
+                                           "max_recipients_cap": 10, "auto_enroll_new_users": True,
+                                           "max_lifetime_minutes": 7 * 24 * 60, "default_lifetime_minutes": 24 * 60}).json()
+    v = admin.create_vault(name=unique("ceil"))
+    try:
+        share = admin.post("/shares", json={"vault_id": v["id"], "tag_id": stag["id"], "target_type": "vault",
+                                            "claim_audience": "anyone_internal"}).json()
+        listed = admin.get("/shares").json()
+        mine = next(s for s in (listed if isinstance(listed, list) else listed.get("shares", [])) if s["id"] == share["id"])
+        created = _parse(mine["created_at"])
+        assert mine["extend_ceiling"], mine
+        assert _parse(mine["extend_ceiling"]) == (created + timedelta(days=7)).replace(microsecond=0)
+        # The week the dialog used to suggest is past this ceiling: refused, and the refusal reads as a date.
+        over = admin.post(f"/shares/{share['id']}/extend", json={"expires_at": _iso(_parse(mine["expires_at"]) + timedelta(days=7))})
+        assert over.status_code == 400, over.text
+        assert re.search(r"no later than \d{1,2} [A-Z][a-z]{2} \d{4}, \d{2}:\d{2} UTC\.", over.json()["detail"]), over.text
+        assert not re.search(r"\d{4}-\d{2}-\d{2}T", over.json()["detail"])   # no raw timestamp
+        # The ceiling itself is accepted.
+        ok = admin.post(f"/shares/{share['id']}/extend", json={"expires_at": mine["extend_ceiling"] + "Z"})
+        assert ok.status_code == 200, ok.text
+
+        rtag = admin.post("/receiver-tags", json={"name": unique("rt"), "min_token_len": 6, "require_secret": "none",
+                                                  "max_total_bytes_cap": 100 * _MB, "auto_enroll_new_users": True,
+                                                  "default_ttl_hours": 24, "max_ttl_hours": 72}).json()
+        rec = admin.post("/receivers", json={"tag_id": rtag["id"], "max_total_bytes": 10 * _MB, "ttl_hours": 24}).json()
+        rec_listed = next(r for r in admin.get("/receivers").json()["receivers"] if r["id"] == rec["id"])
+        assert _parse(rec_listed["extend_ceiling"]) == (_parse(rec_listed["created_at"]) + timedelta(hours=72)).replace(microsecond=0)
+        assert rec_listed["files_in_vault"] == 0
+
+        fid = admin.post(f"/vaults/{v['id']}/files", files=[("files", ("a.txt", b"x", "text/plain"))]).json()["files"][0]["id"]
+        ltag = admin.post("/note-link-tags", json={"name": unique("lt"), "auto_enroll_new_users": True,
+                                                   "allowed_targets": ["file", "folder", "note"],
+                                                   "default_ttl_hours": 24, "max_ttl_hours": 48})
+        if ltag.status_code != 200:
+            pytest.skip(f"no link tag here: {ltag.status_code} {ltag.text[:100]}")
+        link = admin.post("/public-links", json={"vault_id": v["id"], "target_type": "file", "target_file_id": fid,
+                                                  "tag_id": ltag.json()["id"], "ttl_hours": 24}).json()
+        link_listed = next(l for l in admin.get("/public-links").json()["links"] if l["id"] == link["id"])
+        assert _parse(link_listed["extend_ceiling"]) == (_parse(link_listed["created_at"]) + timedelta(hours=48)).replace(microsecond=0)
+
+        note = admin.post("/notes", json={"title": unique("n"), "body": "ceiling"}).json()
+        nlink = admin.post("/note-links", json={"note_id": note["id"], "tag_id": ltag.json()["id"], "ttl_hours": 24})
+        if nlink.status_code == 200:
+            nl = next(l for l in admin.get("/note-links").json()["links"] if l["id"] == nlink.json()["id"])
+            assert _parse(nl["extend_ceiling"]) == (_parse(nl["created_at"]) + timedelta(hours=48)).replace(microsecond=0)
+    finally:
+        admin.delete_vault(v["id"])
+        admin.put("/settings", json={k: settings_before.get(k) for k in
+                                     ("public_receivers_enabled", "public_receiver_user_cap", "public_file_links_enabled")})

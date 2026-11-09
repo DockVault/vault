@@ -1197,10 +1197,10 @@
                             <p id="extend-expiry-current" class="text-secondary mb-md"></p>
                             <div class="form-group">
                                 <label for="extend-expiry-until">New expiry</label>
-                                <input type="datetime-local" id="extend-expiry-until" class="form-control">
-                                <small class="form-help">Later than now and than the current expiry, and within what the type allows. More than a week ahead asks for your second factor when you have one.</small>
+                                <input type="datetime-local" id="extend-expiry-until" class="form-control" aria-describedby="extend-expiry-help extend-expiry-current">
+                                <small class="form-help" id="extend-expiry-help">Later than now and than the current expiry, and within what the type allows. More than a week ahead asks for your second factor when you have one.</small>
                             </div>
-                            <p id="extend-expiry-error" class="text-sm" style="color:var(--danger,#dc2626);" hidden></p>
+                            <p id="extend-expiry-error" class="text-sm" style="color:var(--danger,#dc2626);" role="alert" hidden></p>
                         </div>
                         <div class="modal-footer">
                             <button type="button" class="close-modal-btn btn btn-secondary">Cancel</button>

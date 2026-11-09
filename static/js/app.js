@@ -3734,9 +3734,11 @@ function _sharedByMeCard(sh) {
 
     const actions = _el('div', 'flex items-center gap-sm');
     if (active) {
-        const extendBtn = _el('button', 'btn btn-sm btn-secondary share-extend', 'Extend'); extendBtn.type = 'button';
-        extendBtn.addEventListener('click', () => openExtendExpiry('share', sh.id, sh.expires_at, 'the share of ' + title, () => loadSharedByMe()));
-        actions.appendChild(extendBtn);
+        if (_canExtendExpiry(sh)) {
+            const extendBtn = _el('button', 'btn btn-sm btn-secondary share-extend', 'Extend'); extendBtn.type = 'button';
+            extendBtn.addEventListener('click', () => openExtendExpiry('share', sh.id, sh.expires_at, 'the share of ' + title, () => loadSharedByMe(), sh.extend_ceiling));
+            actions.appendChild(extendBtn);
+        }
         const revokeBtn = _el('button', 'btn btn-sm', 'Revoke'); revokeBtn.type = 'button'; revokeBtn.style.color = '#dc2626';
         revokeBtn.addEventListener('click', () => revokeShare(sh.id, title));
         actions.appendChild(revokeBtn);
@@ -12634,18 +12636,41 @@ function _toLocalInputValue(d) {
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function openExtendExpiry(kind, id, currentIso, label, onDone) {
+// True while an item's expiry can still move later: it has no ceiling (extend_ceiling, from the server: its
+// creation plus its type's maximum), or its expiry is at least a minute short of it (the dialog works in
+// minutes). An item already at its ceiling is offered no Extend: every date would be refused.
+function _canExtendExpiry(item) {
+    if (!item) return false;
+    const ceiling = parseServerTime(item.extend_ceiling);
+    const current = parseServerTime(item.expires_at);
+    if (!ceiling || !current) return true;
+    return ceiling.getTime() - current.getTime() >= 60000;
+}
+
+// The dialog. `ceilingIso` is the item's extend_ceiling: the suggestion (a week later) is clamped to it, the
+// input will not go past it, and it is shown in the viewer's own time, so the date offered is one the
+// server accepts.
+function openExtendExpiry(kind, id, currentIso, label, onDone, ceilingIso) {
     _extendPending = { kind, id, onDone };
     const current = parseServerTime(currentIso);
+    const ceiling = parseServerTime(ceilingIso);
     const base = current && !isNaN(current) && current > new Date() ? current : new Date();
     const suggested = new Date();
     suggested.setTime(base.getTime() + 7 * 86400000);   // a week later than now or than the current expiry
+    if (ceiling && suggested.getTime() > ceiling.getTime()) suggested.setTime(ceiling.getTime());
     const title = document.getElementById('extend-expiry-title');
     if (title) title.textContent = 'Extend ' + (label || 'this');
     const cur = document.getElementById('extend-expiry-current');
-    if (cur) cur.textContent = current && !isNaN(current) ? ('Expires now: ' + formatServerTime(currentIso) + '.') : 'No expiry is set now.';
+    if (cur) {
+        cur.textContent = (current && !isNaN(current) ? ('Expires now: ' + formatServerTime(currentIso) + '.') : 'No expiry is set now.')
+            + (ceiling ? (' Its type allows no later than ' + formatServerTime(ceilingIso) + '.') : '');
+    }
     const input = document.getElementById('extend-expiry-until');
-    if (input) { input.value = _toLocalInputValue(suggested); input.min = _toLocalInputValue(new Date()); }
+    if (input) {
+        input.value = _toLocalInputValue(suggested);
+        input.min = _toLocalInputValue(new Date());
+        if (ceiling) input.max = _toLocalInputValue(ceiling); else input.removeAttribute('max');
+    }
     const err = document.getElementById('extend-expiry-error');
     if (err) err.hidden = true;
     if (!state._extendWired) {
@@ -21460,9 +21485,9 @@ function _noteLinkCard(l) {
             actions.appendChild(_el('span', 'text-tertiary text-xs link-recopy-hint',
                 'Set up your encryption key to be able to see links again.'));
         }
-        if (l.status === 'active' && l.expires_at) {
+        if (l.status === 'active' && l.expires_at && _canExtendExpiry(l)) {
             const extend = _el('button', 'btn btn-ghost btn-sm link-extend', 'Extend'); extend.type = 'button';
-            extend.addEventListener('click', () => openExtendExpiry('note', l.id, l.expires_at, 'this note link', () => loadNotes()));
+            extend.addEventListener('click', () => openExtendExpiry('note', l.id, l.expires_at, 'this note link', () => loadNotes(), l.extend_ceiling));
             actions.appendChild(extend);
         }
         const revoke = _el('button', 'btn btn-ghost btn-sm', 'Revoke');
@@ -22230,9 +22255,9 @@ function renderMyPublicLinks(links) {
             actTd.appendChild(_el('span', 'text-tertiary text-xs link-recopy-hint',
                 'Set up your encryption key to be able to see links again.'));
         }
-        if (l.status === 'active' && l.expires_at) {
+        if (l.status === 'active' && l.expires_at && _canExtendExpiry(l)) {
             const extend = _el('button', 'btn btn-ghost btn-sm link-extend', 'Extend'); extend.type = 'button';
-            extend.addEventListener('click', () => openExtendExpiry('public', l.id, l.expires_at, 'this public link', () => loadMyPublicLinks()));
+            extend.addEventListener('click', () => openExtendExpiry('public', l.id, l.expires_at, 'this public link', () => loadMyPublicLinks(), l.extend_ceiling));
             actTd.appendChild(extend);
         }
         if (l.status === 'active') {
@@ -22473,10 +22498,10 @@ function renderReceiverVaults(receivers) {
             replace.addEventListener('click', () => rcReplaceLink(r));
             actions.appendChild(replace);
         }
-        if ((r.status === 'active' || r.status === 'paused') && r.expires_at) {
+        if ((r.status === 'active' || r.status === 'paused') && r.expires_at && _canExtendExpiry(r)) {
             const extend = _el('button', 'btn btn-secondary btn-sm link-extend', 'Extend'); extend.type = 'button';
             extend.title = 'Move this upload link\u2019s expiry later';
-            extend.addEventListener('click', () => openExtendExpiry('receiver', r.id, r.expires_at, 'this upload link', () => loadMyReceivers()));
+            extend.addEventListener('click', () => openExtendExpiry('receiver', r.id, r.expires_at, 'this upload link', () => loadMyReceivers(), r.extend_ceiling));
             actions.appendChild(extend);
         }
         actions.appendChild(open); actions.appendChild(info); card.appendChild(actions);

@@ -13056,6 +13056,8 @@ def _notelink_public_dict(link, tag=None) -> dict:
         "message": getattr(link, "message", None) or None,
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
+        # The latest expiry this link's type allows (creation plus the tag's maximum); None: no ceiling.
+        "extend_ceiling": _ceiling_iso(_tag_hours_ceiling(link, tag)),
     }
 
 
@@ -13219,6 +13221,28 @@ def _link_type_for_extension(tag, kind: str):
     return tag
 
 
+def _ceiling_iso(ceiling) -> Optional[str]:
+    """The latest expiry an item's type allows, as the item dicts carry it (``extend_ceiling``), so the
+    web app can offer only dates the server accepts. None: no ceiling."""
+    return ceiling.replace(microsecond=0).isoformat() if ceiling is not None else None
+
+
+def _tag_hours_ceiling(item, tag):
+    """The ceiling of a public link, note link or upload link: its creation plus its tag's maximum."""
+    return _ceiling(item.created_at, hours=tag.max_ttl_hours) if tag and getattr(tag, "max_ttl_hours", None) else None
+
+
+def _share_ceiling(share, tag):
+    """The latest expiry a share may be moved to, as the extend route counts it: its creation plus the maximum
+    its type had when the share was made (the type's live maximum for a share made before that was kept). A
+    type that fixes the lifetime allows no move: the ceiling is the current expiry."""
+    snapshot = share.tag_policy_snapshot if isinstance(share.tag_policy_snapshot, dict) else {}
+    if snapshot.get("allow_custom") is False:
+        return share.expires_at
+    minutes = snapshot.get("max_lifetime_minutes") or (tag.max_lifetime_minutes if tag else None)
+    return _ceiling(share.created_at, minutes=minutes) if minutes else None
+
+
 @app.post("/shares/{share_id}/extend")
 async def extend_share(share_id: uuid.UUID, body: ExtendExpiryBody, request: Request,
                        current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -13252,7 +13276,7 @@ async def extend_share(share_id: uuid.UUID, body: ExtendExpiryBody, request: Req
         raise HTTPException(status_code=400, detail=(
             "This share's type no longer admits its maker, so the share cannot be extended."))
     # The ceiling the share was made under; a type widened since does not widen the shares before it.
-    ceiling = _ceiling(share.created_at, minutes=snapshot.get("max_lifetime_minutes") or tag.max_lifetime_minutes)
+    ceiling = _share_ceiling(share, tag)
     details = _extend_expiry(db, request, current_user, item=share, kind="share", id_key="share_id",
                              owner_id=share.creator_id, body=body, ceiling=ceiling,
                              extra={"vault_id": str(share.vault_id)})
@@ -14222,6 +14246,8 @@ def _publiclink_public_dict(link, tag=None) -> dict:
         "status": _notelink_status(link),
         "created_at": link.created_at.isoformat() if link.created_at else None,
         "last_used_at": link.last_used_at.isoformat() if link.last_used_at else None,
+        # The latest expiry this link's type allows (creation plus the tag's maximum); None: no ceiling.
+        "extend_ceiling": _ceiling_iso(_tag_hours_ceiling(link, tag)),
     }
 
 
@@ -15305,7 +15331,7 @@ def _audit_change(db, actor, action, resource_type, resource_id, details=None, s
             pass
 
 
-def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
+def _receiver_public_dict(r, tag=None, stored_bytes=None, files_in_vault=None) -> dict:
     """Owner-facing view of a receiver. NEVER includes the token (stored hashed; the plaintext URL is
     shown only once, in the create response).
 
@@ -15351,6 +15377,11 @@ def _receiver_public_dict(r, tag=None, stored_bytes=None) -> dict:
         # max_total_bytes. None when the caller could not supply it, so a reader can tell "nothing
         # stored" from "not known" instead of drawing an empty ring over missing data.
         "stored_bytes": int(stored_bytes) if stored_bytes is not None else None,
+        # How many files the drop vault holds NOW (upload_count counts every upload ever received, so it
+        # never goes down when the owner moves the files out). None when the caller did not supply it.
+        "files_in_vault": int(files_in_vault) if files_in_vault is not None else None,
+        # The latest expiry this link's type allows (creation plus the tag's maximum); None: no ceiling.
+        "extend_ceiling": _ceiling_iso(_tag_hours_ceiling(r, tag)),
     }
 
 
@@ -15581,8 +15612,15 @@ async def list_receivers(
     stored = dict(
         db.query(Vault.id, Vault.total_size_bytes).filter(Vault.id.in_(vault_ids)).all()
     ) if vault_ids else {}
+    # The files each drop vault holds now, one GROUP BY for the page: what is still there to look at,
+    # unlike upload_count, which only ever grows.
+    from sqlalchemy import func as _func
+    held = dict(
+        db.query(File.vault_id, _func.count(File.id)).filter(File.vault_id.in_(vault_ids), file_expiry.live_clause())
+        .group_by(File.vault_id).all()
+    ) if vault_ids else {}
     return {"receivers": [
-        _receiver_public_dict(r, tags.get(r.tag_id), stored.get(r.vault_id) or 0) for r in rows
+        _receiver_public_dict(r, tags.get(r.tag_id), stored.get(r.vault_id) or 0, held.get(r.vault_id, 0)) for r in rows
     ]}
 
 
@@ -16689,15 +16727,22 @@ def _share_effective_status(share: Share) -> str:
     return share.status
 
 
-def _share_dict(db: Session, share: Share, claim_counts: dict = None) -> dict:
+def _share_dict(db: Session, share: Share, claim_counts: dict = None, tags: dict = None) -> dict:
     """Creator-facing view of a share ('Shared by me'). NEVER includes the link token (shown once at
     create); only whether a link exists. `claim_counts` is an optional precomputed {share_id: count} map
-    so a list view avoids an N+1 COUNT per share."""
+    so a list view avoids an N+1 COUNT per share; `tags` an optional preloaded {tag_id: ShareTag} map for
+    the same reason (the tag's maximum lifetime gives the share's extend ceiling)."""
     if claim_counts is not None:
         claim_count = claim_counts.get(str(share.id), 0)
     else:
         claim_count = db.query(ShareClaim).filter(
             ShareClaim.share_id == share.id, ShareClaim.revoked.is_(False)).count()
+    # The latest expiry the share may be moved to, as the extend route counts it (_share_ceiling).
+    if tags is not None:
+        tag = tags.get(share.tag_id)
+    else:
+        tag = db.query(ShareTag).filter(ShareTag.id == share.tag_id).first() if share.tag_id else None
+    ceiling = _share_ceiling(share, tag)
     # Display names for the management cards. tag_name comes from the creation snapshot (survives a
     # later tag rename/deactivation); target_name is the folder/file name (Standard-vault plaintext
     # the creator authored). vault_name for the item label.
@@ -16732,6 +16777,7 @@ def _share_dict(db: Session, share: Share, claim_counts: dict = None) -> dict:
         "status": _share_effective_status(share),
         "claim_count": claim_count,
         "created_at": share.created_at.isoformat() if share.created_at else None,
+        "extend_ceiling": _ceiling_iso(ceiling),
     }
 
 
@@ -16939,7 +16985,9 @@ async def list_my_shares(
         rows = db.query(ShareClaim.share_id, _func.count(ShareClaim.id)).filter(
             ShareClaim.share_id.in_(ids), ShareClaim.revoked.is_(False)).group_by(ShareClaim.share_id).all()
         counts = {str(sid): c for sid, c in rows}
-    return [_share_dict(db, s, claim_counts=counts) for s in shares]
+    tag_ids = {s.tag_id for s in shares if s.tag_id}
+    tags = {t.id: t for t in db.query(ShareTag).filter(ShareTag.id.in_(tag_ids)).all()} if tag_ids else {}
+    return [_share_dict(db, s, claim_counts=counts, tags=tags) for s in shares]
 
 
 def _load_manageable_share(db: Session, share_id, current_user: User) -> Share:
