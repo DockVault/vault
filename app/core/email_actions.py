@@ -126,6 +126,20 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "receiver_upload_received": {
+        "name": "Files received on an upload link",
+        "subject": "Files arrived on your upload link on {{vault.name}}",
+        "body_html": (
+            "<h2>Files arrived on your upload link</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>Someone uploaded <strong>{{action.file}}</strong> through your upload link "
+            "<strong>{{action.label}}</strong> on {{vault.name}}. More files sent within the hour are not "
+            "announced again; they are all in the link's vault.</p>"
+            "<p><a href=\"{{action.link}}\">Open your upload links</a></p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "vault_member_added": {
         "name": "Added to a vault",
         "subject": "You were added to a vault on {{vault.name}}",
@@ -313,6 +327,8 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Optional — notify a user when their account signs in.", OPTIONAL),
     ("share_created", "File / folder shared",
      "Optional — notify a recipient when something is shared with them.", OPTIONAL),
+    ("receiver_upload_received", "Files received on an upload link",
+     "Optional — tell the owner of an upload link when files arrive on it (once an hour per link).", OPTIONAL),
     ("vault_member_added", "Added to a vault",
      "Optional — notify a user when they're added to a vault or team.", OPTIONAL),
     ("temp_credential_issued", "Temporary credential issued",
