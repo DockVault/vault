@@ -78,6 +78,9 @@ FIXED_STEP_UP_ACTIONS: dict = {
     # Extending a share or a link by more than a week (app/api/api_server.py, the extend routes): whenever the
     # account has a second factor enrolled, the extension needs it; an account without one is not asked.
     "link.extend_long": ("Extend a share or a link by more than a week", "factor_when_enrolled"),
+    # Letting a sign-in last longer (PUT /settings: a longer session timeout or "Stay signed in" limit): the
+    # password every time, plus any second factor the account has enrolled, as for how long records are kept.
+    "admin.session_limits.write": ("Let a sign-in last longer", "password_always"),
 }
 
 # The steps of compliance access (app/api/compliance_router.py), each under the compliance policy: the password

@@ -29,7 +29,12 @@ Treat `.env` and the backups as the most sensitive things you hold.
   the internal network; set `REDIS_PASSWORD` and `ALLOWED_HOSTS`.
 - **Require a second factor for administrators.** Every compliance step asks for the password and an
   authenticator or recovery code whatever the step-up settings say, but the rest of an administrator's work follows
-  the step-up matrix in Settings.
+  the step-up matrix in Settings. A few changes always ask for the password, and the second factor when the
+  administrator has one, whatever the matrix says: how long records are kept, what the audit log records,
+  acknowledging its integrity warnings, and letting a sign-in last longer (a longer session timeout or "Stay
+  signed in" limit).
+- **Keep sign-ins short.** Session Timeout is how long a sign-in lasts before the page asks whether to stay
+  signed in; "Stay signed in for at most" (24 hours by default) is how long staying can keep one sign-in going.
 - **Configure email.** Owners are told of access to their vaults in the app always, and by email only when the
   vault can send email; an owner who seldom signs in learns of it by email.
 - **State a contact** in Settings (the recording notice's contact): it is the address every notice to a vault's

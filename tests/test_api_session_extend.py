@@ -122,20 +122,27 @@ def test_a_renewal_is_refused_once_the_account_needs_a_second_factor_its_token_d
         admin.delete_user(u["id"])
 
 
-def test_the_renewal_limit_setting_is_bounded_by_the_timeout_and_thirty_days(admin):
+def test_the_renewal_limit_setting_is_bounded_by_the_timeout_and_thirty_days(admin, admin_creds):
+    from _sf_helpers import put_settings_with_password
+    pw = admin_creds["password"]
     before = admin.get("/settings").json()
     try:
-        assert admin.put("/settings", json={"session_renewal_max_hours": 721}).status_code == 400
+        # A longer limit without the password is refused before its value is looked at; a shorter one is not.
+        refused = admin.put("/settings", json={"session_renewal_max_hours": 48})
+        assert refused.status_code == 403 and "step_up_required" in refused.text, refused.text
         assert admin.put("/settings", json={"session_renewal_max_hours": "x"}).status_code == 400
         assert admin.put("/settings", json={"session_renewal_max_hours": -1}).status_code == 400
-        r = admin.put("/settings", json={"session_timeout": 180, "session_renewal_max_hours": 2})
+        assert put_settings_with_password(admin, pw, {"session_renewal_max_hours": 721}).status_code == 400
+        r = put_settings_with_password(admin, pw, {"session_timeout": 180, "session_renewal_max_hours": 2})
         assert r.status_code == 400 and "at least the session timeout" in r.text, r.text
-        assert admin.put("/settings", json={"session_timeout": 180, "session_renewal_max_hours": 3}).status_code in (200, 204)
+        assert put_settings_with_password(admin, pw, {"session_timeout": 180,
+                                                      "session_renewal_max_hours": 3}).status_code in (200, 204)
         assert admin.get("/settings").json()["session_renewal_max_hours"] == 3
-        assert admin.put("/settings", json={"session_renewal_max_hours": 0}).status_code in (200, 204)
+        # Back to the default limit (24 hours): longer than 3, so the password again.
+        assert put_settings_with_password(admin, pw, {"session_renewal_max_hours": 0}).status_code in (200, 204)
     finally:
-        admin.put("/settings", json={"session_timeout": before.get("session_timeout") or 0,
-                                     "session_renewal_max_hours": before.get("session_renewal_max_hours") or 0})
+        put_settings_with_password(admin, pw, {"session_timeout": before.get("session_timeout") or 0,
+                                               "session_renewal_max_hours": before.get("session_renewal_max_hours") or 0})
 
 
 def test_a_temporary_credentials_session_knows_when_its_credential_ends(admin):

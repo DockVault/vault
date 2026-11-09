@@ -633,3 +633,7 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
 - Shares: how many times each claim previewed a file (`share_claims.preview_count`), counted against the
   share's download limit; a preview is recorded as a preview.
 - The upload page's own rate-limit key in the cache (`receiver_page:<address>`).
+- Sign-in length: the "Stay signed in for at most" setting (`session_renewal_max_hours` in the general settings,
+  24 hours by default). A save that lets a sign-in last longer (a longer session timeout or renewal limit) asks
+  for the administrator's password, and their second factor when they have one, as a fixed step-up
+  (`admin.session_limits.write`); the step-up and the save are recorded in the audit log as any other.

@@ -56,3 +56,16 @@ def set_action_require_otp(admin, action, value):
         r.raise_for_status()
     finally:
         admin.delete_user(ta["id"])
+
+
+SESSION_LIMITS_ACTION = "admin.session_limits.write"
+
+
+def put_settings_with_password(client, password, body):
+    """PUT /settings with a fresh password step-up for letting a sign-in last longer (a longer session timeout
+    or "Stay signed in" limit needs one; a receipt is spent by the save that carries it, even when the save is
+    refused for its values)."""
+    r = client.post("/auth/second-factor/step-up",
+                    json={"action": SESSION_LIMITS_ACTION, "method": "password", "code": password})
+    r.raise_for_status()
+    return client.put("/settings", json=body, headers={"X-Second-Factor": r.json()["receipt"]})

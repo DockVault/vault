@@ -4343,8 +4343,11 @@ def _validate_settings_payload(payload: dict, db: Session) -> None:
         if rh > SESSION_RENEWAL_MAX_HOURS:
             raise HTTPException(status_code=400, detail=(
                 f"session_renewal_max_hours must be at most {SESSION_RENEWAL_MAX_HOURS} hours (30 days)"))
-        timeout_minutes = (st if isinstance(st, int) and not isinstance(st, bool) and st > 0
-                           else _setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
+        if "session_timeout" in payload:      # set, or cleared to the deployment's default, in this save
+            timeout_minutes = (st if isinstance(st, int) and not isinstance(st, bool) and st > 0
+                               else settings.jwt_access_token_expire_minutes)
+        else:
+            timeout_minutes = _setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes)
         if rh and rh * 60 < timeout_minutes:
             raise HTTPException(status_code=400, detail=(
                 f"session_renewal_max_hours must be at least the session timeout ({timeout_minutes} minutes)"))
@@ -4650,6 +4653,21 @@ def _settings_changes_for_audit(existing: dict, merged: dict) -> dict:
             for key in sorted(merged) if existing.get(key) != merged.get(key)}
 
 
+from app.core import fixed_step_up as _fixed_step_up  # noqa: E402 - the guard registers at import
+_session_limits_step_up = _fixed_step_up.guard("admin.session_limits.write")
+
+
+def _loosens_session_limits(stored: dict, payload: dict) -> bool:
+    """Whether a settings save makes a sign-in able to last longer: the effective session timeout or the
+    effective renewal limit after the save is longer than before it (a raised value, or one cleared to a
+    longer default)."""
+    if not any(k in (payload or {}) for k in ("session_timeout", "session_renewal_max_hours")):
+        return False
+    before = _session_limits(stored or {})
+    after = _session_limits({**(stored or {}), **payload})
+    return after[0] > before[0] or after[1] > before[1]
+
+
 @app.put("/settings")
 async def update_settings(
     payload: dict,
@@ -4670,9 +4688,19 @@ async def update_settings(
     #    they always keep an OTP to loosen it again and can never lock themselves out;
     #  * any other settings write requires admin.settings.write (default require_otp OFF — a no-op
     #    until an admin opts in, so ordinary saves are untouched).
+    #  * a save that LOOSENS how long a sign-in may last (a longer session timeout or renewal limit, set or
+    #    cleared to a longer default) requires admin.session_limits.write instead: the password every
+    #    time, and the second factor whenever the account has one. Tightening needs nothing more.
     from app.core import second_factor_policy as _sfpol_gate
-    if any(k in payload for k in _sfpol_gate.DEFAULTS):
+    changes_second_factor = any(k in payload for k in _sfpol_gate.DEFAULTS)
+    loosens_sessions = _loosens_session_limits(_global_settings_blob(db), payload)
+    if changes_second_factor and loosens_sessions:
+        raise HTTPException(status_code=400, detail=(
+            "Save the second-factor policy and the session limits separately: each needs its own confirmation."))
+    if changes_second_factor:
         _enforce_step_up(db, current_user, request, "account.second_factor")
+    elif loosens_sessions:
+        _session_limits_step_up(db, current_user, request)
     else:
         _enforce_step_up(db, current_user, request, "admin.settings.write")
     _validate_settings_payload(payload, db)
@@ -25441,13 +25469,29 @@ def _end_web_session(db, session_token: str, user_id=None):
     return session, ended
 
 
+def _positive_int(values: dict, key: str, default: int) -> int:
+    """A positive integer from a settings dict, or ``default`` when absent, not positive or unreadable (the
+    rule _setting_int applies to the stored settings)."""
+    try:
+        n = int(values.get(key))
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
+
+
+def _session_limits(values: dict) -> tuple:
+    """(the session timeout, the renewal limit) a settings dict gives, as timedeltas: the timeout is the
+    administrator's session_timeout or the deployment's JWT_ACCESS_TOKEN_EXPIRE_MINUTES; the limit is
+    session_renewal_max_hours (default SESSION_RENEWAL_DEFAULT_HOURS), never shorter than the timeout nor
+    longer than SESSION_RENEWAL_MAX_HOURS."""
+    timeout = timedelta(minutes=_positive_int(values, "session_timeout", settings.jwt_access_token_expire_minutes))
+    hours = _positive_int(values, "session_renewal_max_hours", SESSION_RENEWAL_DEFAULT_HOURS)
+    return timeout, max(timedelta(hours=min(hours, SESSION_RENEWAL_MAX_HOURS)), timeout)
+
+
 def _session_renewal_limit(db) -> timedelta:
-    """How long one sign-in may be kept going by renewals, counted from the sign-in: the administrator's
-    session_renewal_max_hours (default SESSION_RENEWAL_DEFAULT_HOURS), never shorter than the session
-    timeout nor longer than SESSION_RENEWAL_MAX_HOURS."""
-    timeout = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
-    hours = _setting_int(db, "session_renewal_max_hours", SESSION_RENEWAL_DEFAULT_HOURS)
-    return max(timedelta(hours=min(hours, SESSION_RENEWAL_MAX_HOURS)), timeout)
+    """How long one sign-in may be kept going by renewals, counted from the sign-in (_session_limits)."""
+    return _session_limits(_global_settings_blob(db))[1]
 
 
 # The identity claims a renewal carries unchanged from the token it replaces: how the person signed in
