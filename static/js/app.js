@@ -23420,6 +23420,8 @@ function closeModal() {
         if (typeof _stepUpSettle === 'function') _stepUpSettle(null);
         return;
     }
+    // A dialog opened from inside another (lifted over it by dialogs.js) closes alone: the one under it stays.
+    if (window.Dialogs && typeof window.Dialogs.closeLifted === 'function' && window.Dialogs.closeLifted()) return;
     document.querySelectorAll('.modal').forEach(modal => {
         modal.classList.remove('active');
     });

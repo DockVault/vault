@@ -13,6 +13,12 @@
 // did (closeModal: the preview's decrypted bytes are freed, credential fields are emptied, a pending
 // step-up is cancelled); a dialog closed while another stands under it leaves that one standing.
 //
+// A dialog opened from inside another (Extend from the list of your public links, say) is lifted just
+// above every dialog already open, so it is painted on top and takes the clicks and the keys, whatever
+// its place in the page; its own close buttons then close it alone (closeModal asks closeLifted), and on
+// closing it returns to its own layer. The lift stays below the session warning's layer, which is above
+// every dialog whatever is open.
+//
 // The dialogs are found by class and watched for their 'active' class, so one added later, or built by a
 // script, behaves the same without registering. Nothing here reads a dialog's text.
 (function () {
@@ -20,6 +26,8 @@
 
     const snapshots = new WeakMap();  // dialog -> its fields' values when it opened
     const openers = new WeakMap();    // dialog -> the element that had focus when it opened
+    const lifted = new WeakMap();     // dialog -> its own inline z-index, while it is lifted over others
+    const LIFT_CEILING = 10000;       // a lift stays under this, so the session warning (10500) stays on top
     let labelCounter = 0;
 
     const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), '
@@ -102,7 +110,36 @@
         });
     }
 
+    // Lift `dialog` above the other open dialogs when one of them is on its layer or above (and below the
+    // ceiling): it was opened from inside one of them, and must be the one seen and used.
+    function liftOver(dialog) {
+        const others = open().filter((d) => d !== dialog).map(layerOf).filter((z) => z < LIFT_CEILING);
+        if (!others.length) return;
+        const highest = Math.max(...others);
+        if (layerOf(dialog) > highest) return;
+        lifted.set(dialog, dialog.style.zIndex);
+        dialog.style.zIndex = String(Math.min(highest + 1, LIFT_CEILING - 1));
+    }
+
+    function settle(dialog) {
+        if (!lifted.has(dialog)) return;
+        dialog.style.zIndex = lifted.get(dialog);
+        lifted.delete(dialog);
+    }
+
+    // Close the top dialog when it is one lifted over another, and only it. closeModal asks this first, so
+    // the Cancel and close buttons of a dialog opened from inside another leave that other one open.
+    function closeLifted() {
+        const dialog = top();
+        if (!dialog || !lifted.has(dialog)) return false;
+        dialog.classList.remove('active');
+        settle(dialog);
+        if (typeof clearCredentialInputsOnClose === 'function') clearCredentialInputsOnClose();
+        return true;
+    }
+
     function opened(dialog) {
+        liftOver(dialog);
         snapshot(dialog);
         label(dialog);
         // Scrolled to the top: the scroller is the dialog's body where it has one, else its content box.
@@ -123,6 +160,7 @@
     }
 
     function closed(dialog) {
+        settle(dialog);
         focusBack(dialog);
     }
 
@@ -237,5 +275,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
     else start();
 
-    window.Dialogs = { top, closeTop, backdropClick, backdropRelease, hasEdits, focusables, label };
+    window.Dialogs = { top, closeTop, closeLifted, backdropClick, backdropRelease, hasEdits, focusables, label };
 })();

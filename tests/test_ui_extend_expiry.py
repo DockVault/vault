@@ -166,3 +166,58 @@ def test_the_dialog_is_described_and_a_refusal_is_announced(page: Page, admin_cr
     expect(page.locator("#extend-expiry-help")).to_be_visible()
     expect(page.locator("#extend-expiry-error")).to_have_attribute("role", "alert")
     page.keyboard.press("Escape")
+
+
+@pytest.fixture
+def a_public_link(admin):
+    before = admin.get("/settings").json()
+    admin.put("/settings", json={"public_file_links_enabled": True})
+    v = admin.create_vault(name=unique("ExtLayer"))
+    try:
+        fid = admin.post(f"/vaults/{v['id']}/files", files=[("files", ("a.txt", b"x", "text/plain"))]).json()["files"][0]["id"]
+        tag = admin.post("/note-link-tags", json={"name": unique("el"), "auto_enroll_new_users": True,
+                                                  "allowed_targets": ["file", "folder", "note"],
+                                                  "default_ttl_hours": 24, "max_ttl_hours": 72})
+        assert tag.status_code == 200, tag.text
+        link = admin.post("/public-links", json={"vault_id": v["id"], "target_type": "file", "target_file_id": fid,
+                                                  "tag_id": tag.json()["id"], "ttl_hours": 24})
+        assert link.status_code == 200, link.text
+        yield link.json()
+    finally:
+        admin.delete_vault(v["id"])
+        admin.put("/settings", json={"public_file_links_enabled": before.get("public_file_links_enabled")})
+
+
+def test_extend_opened_from_the_public_links_list_is_on_top_and_closes_alone(page: Page, admin_creds, a_public_link):
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.evaluate("() => openPublicLinksManage()")
+    manage = page.locator("#public-links-manage-modal.active")
+    expect(manage).to_be_visible(timeout=10000)
+    row = page.locator(f'#public-links-manage-modal tr[data-link-id="{a_public_link["id"]}"]')
+    expect(row).to_be_visible(timeout=15000)
+    row.locator("button.link-extend").click()
+    expect(page.locator("#extend-expiry-modal.active")).to_be_visible()
+    # Painted on top: what is under the Extend button's centre is the button, and focus is inside its dialog.
+    save = page.locator("#extend-expiry-save")
+    box = save.bounding_box()
+    hit = page.evaluate("([x, y]) => { const e = document.elementFromPoint(x, y); return e && e.id; }",
+                        [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2])
+    assert hit == "extend-expiry-save", hit
+    assert page.evaluate("() => document.getElementById('extend-expiry-modal').contains(document.activeElement)")
+    assert page.evaluate("() => Dialogs.top() && Dialogs.top().id") == "extend-expiry-modal"
+    # Tab stays in the Extend dialog.
+    for _ in range(6):
+        page.keyboard.press("Tab")
+        assert page.evaluate("() => document.getElementById('extend-expiry-modal').contains(document.activeElement)")
+    # Cancel closes the Extend dialog alone: the list it came from stays, back on its own layer.
+    page.locator("#extend-expiry-modal .btn-secondary.close-modal-btn").click()
+    expect(page.locator("#extend-expiry-modal.active")).to_have_count(0)
+    expect(manage).to_be_visible()
+    assert page.evaluate("() => document.getElementById('extend-expiry-modal').style.zIndex") == ""
+    # Opened again and extended: the list stays open and shows the new expiry.
+    row.locator("button.link-extend").click()
+    expect(page.locator("#extend-expiry-modal.active")).to_be_visible()
+    page.fill("#extend-expiry-until", _local_input(page, days=2))
+    page.click("#extend-expiry-save")
+    expect(page.locator("#extend-expiry-modal.active")).to_have_count(0, timeout=10000)
+    expect(manage).to_be_visible()

@@ -163,20 +163,25 @@ def test_escape_on_the_step_up_settles_it_as_cancelled_and_leaves_the_dialog_und
     assert page.evaluate("() => window.__receipt") is None
 
 
-def test_on_one_layer_escape_closes_the_dialog_painted_on_top_not_the_one_opened_last(page: Page, person):
-    """Two dialogs on the same layer: the browser paints the one later in the page on top, whatever order they
-    opened in, so Escape acts on that one. Here the confirm (late in the page) opens first and the note editor
-    (early in the page) second; the confirm is what the person sees, and what Escape closes."""
+def test_a_dialog_opened_over_another_on_its_layer_is_lifted_over_it_and_escape_closes_it_first(page: Page, person):
+    """Two dialogs on the same layer: the one opened second is lifted over the first, whatever their order in the
+    page, so it is what the person sees and what Escape acts on. Here the confirm (late in the page) opens first
+    and the note editor (early in the page, so painted under it without the lift) second: the editor is on top,
+    Escape closes it and the confirm stays unanswered; Escape again answers the confirm as cancelled."""
     _login(page, person)
     _ask(page)
     page.evaluate("() => openModal('note-editor-modal')")
     expect(page.locator("#note-editor-modal.active")).to_be_visible()
     assert page.evaluate("""() => {
-        const b = document.querySelector('#confirm-modal .modal-content').getBoundingClientRect();
+        const b = document.querySelector('#note-editor-modal .modal-content').getBoundingClientRect();
         const hit = document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
-        return !!(hit && hit.closest('#confirm-modal'));
-    }"""), "the confirm is not painted on top, so the case is not the one meant"
+        return !!(hit && hit.closest('#note-editor-modal'));
+    }"""), "the editor opened second is not painted on top"
+    page.keyboard.press("Escape")
+    expect(page.locator("#note-editor-modal.active")).to_be_hidden()
+    expect(page.locator(f"{CONFIRM}.active")).to_be_visible()
+    assert page.evaluate("() => window.__answer") == "pending"
+    assert page.evaluate("() => document.getElementById('note-editor-modal').style.zIndex") == ""
     page.keyboard.press("Escape")
     expect(page.locator(f"{CONFIRM}.active")).to_be_hidden()
     assert page.evaluate("() => window.__answer") is False
-    expect(page.locator("#note-editor-modal.active")).to_be_visible()
