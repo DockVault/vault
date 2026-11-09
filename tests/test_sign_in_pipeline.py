@@ -127,6 +127,13 @@ def test_single_sign_on_takes_the_vaults_rule_unless_the_providers_mfa_is_truste
     assert _due(["pwd"], role="admin", factor_in_effect=True, provider_mfa_trusted=True, **sso) == s.DONE
 
 
+def test_the_refusal_of_a_sign_in_that_must_come_through_a_provider_is_a_403_with_its_message():
+    s = _sign_in()
+    refused = s.ProviderOnly("Use your organisation's sign-in.")
+    assert isinstance(refused, HTTPException) and refused.status_code == 403
+    assert refused.detail == "Use your organisation's sign-in."
+
+
 def test_a_sign_in_needs_a_first_proof():
     """A code alone, or nothing at all, proves nothing about who the person is: the table refuses to answer,
     and the pipeline turns that into a refusal, never a session."""

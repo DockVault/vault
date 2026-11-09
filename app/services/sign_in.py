@@ -115,6 +115,15 @@ class NoFirstProof(ValueError):
     programming error, never a sign-in."""
 
 
+class ProviderOnly(HTTPException):
+    """The account signs in only through its organisation's identity provider and this sign-in did not come through
+    it: 403 with a message naming what to use instead. Raised by :func:`finish` after the proof was checked, so a
+    route that finishes a sign-in can recognise it: the proof was good, nothing of it counts as a failed attempt."""
+
+    def __init__(self, message: str):
+        super().__init__(status_code=403, detail=message)
+
+
 def second_factor_due(user, methods: Iterable[str], *, factor_in_effect: bool, enrollment_pending: bool,
                       passwordless_allowed: bool = False, user_verified: bool = False,
                       provider_mfa_trusted: bool = False, provider_id: Optional[str] = None,
