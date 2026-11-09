@@ -35,7 +35,7 @@ def test_every_activity_read_leaves_the_log_as_it_was(admin):
         "/activity/events/{event_id}": [{}],
         "/activity/summary": [{"range": "24h"}, {"range": "7d"}, {"range": "30d"},
                               {"range": "all", "tz": "Europe/Athens"},
-                              {"range": "custom", "range_from": "2026-01-01", "user": "admin",
+                              {"range": "custom", "range_from": "2026-01-01", "range_to": "2026-06-01", "user": "admin",
                                "category": "sign_in", "ip": "192.0.2.1", "to_date": "2026-06-01"}],
         "/activity/now": [{}],
         "/activity/usernames": [{"q": "a"}],
