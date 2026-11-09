@@ -6,6 +6,10 @@ token (the old one is refused from then on), and so does closing the warning; do
 out, and the sign-in screen says why. It opens over any other dialog, measures the session's life on this
 device's own clock, and offers a temporary credential no renewal.
 """
+import base64
+import json
+from email.utils import parsedate_to_datetime
+
 import pytest
 import requests
 from playwright.sync_api import Page, expect
@@ -199,6 +203,46 @@ def test_a_device_clock_far_ahead_does_not_end_the_session(page: Page, person):
     page.wait_for_timeout(1500)
     expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
     expect(page.locator("#dashboard-screen")).to_be_visible()
+
+
+def _claims(token: str) -> dict:
+    part = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+
+
+def _server_left(token: str) -> float:
+    """The seconds the token has left, as the server counts them (its Date header against the token's exp)."""
+    r = requests.get(f"{BASE_URL}/users/me", headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    assert r.status_code == 200
+    return _claims(token)["exp"] - parsedate_to_datetime(r.headers["Date"]).timestamp()
+
+
+def test_a_token_with_no_stored_arrival_is_timed_by_the_server(page: Page, person):
+    """A token held from before its arrival was stored (the first load after an upgrade) is not taken for one
+    that just arrived: the time it has left comes from the server, whatever this device's clock says, and the
+    arrival that implies is stored so a reload agrees."""
+    _login(page, person)
+    token = _stored_token(page)
+    claims = _claims(token)
+    lifetime = claims["exp"] - claims["iat"]
+    # The token ages, so one taken for just arrived would read about twenty seconds more than the server.
+    page.wait_for_timeout(20000)
+    page.evaluate("() => { localStorage.removeItem('authTokenAt'); sessionStorage.removeItem('authTokenAt'); }")
+    # This device's clock runs two hours ahead, from the reload on.
+    page.add_init_script("(() => { const real = Date.now.bind(Date); Date.now = () => real() + 2 * 3600 * 1000; })()")
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    page.wait_for_function("full => SessionWatch.remaining() > 0 && SessionWatch.remaining() < full - 10",
+                           arg=lifetime, timeout=10000)
+    left = page.evaluate("() => SessionWatch.remaining()")
+    assert abs(left - _server_left(token)) <= 4, (left, lifetime)
+    assert page.evaluate("() => !!(localStorage.getItem('authTokenAt') || sessionStorage.getItem('authTokenAt'))")
+    # A reload reads the stored arrival and agrees, with no second correction needed.
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    page.wait_for_function("() => SessionWatch.remaining() > 0", timeout=10000)
+    left = page.evaluate("() => SessionWatch.remaining()")
+    assert abs(left - _server_left(token)) <= 4, (left, lifetime)
 
 
 def test_a_temporary_credential_is_warned_about_its_end_and_offered_no_renewal(page: Page, admin):

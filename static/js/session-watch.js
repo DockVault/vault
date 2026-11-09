@@ -2,10 +2,13 @@
 //
 // The session's end is measured on this device's own clock: the token's lifetime (exp - iat) counted
 // from the moment the token arrived here, which is kept in storage so a reload measures the same way.
-// The server's clock and this device's may differ, so the device never ends a session on its own:
-// when the count reaches zero the page asks the server, and signs out only when the server refuses the
-// token. Sixty seconds before the end, a dialog with a count-down ring opens above everything else. It
-// does not focus a button, so a key pressed by accident (Enter, Space) chooses nothing. Closing it with
+// A token with no stored arrival (one that just arrived, or one held from before the arrival was kept)
+// is armed at once as if it had just arrived, then corrected from the server: the time it has left is
+// read on the server's clock (the token's exp against the Date of a /users/me answer), carried onto
+// this device's clock, and the arrival that implies is stored. The server's clock and this device's may
+// differ, so the device never ends a session on its own: when the count reaches zero the page asks the
+// server, and signs out only when the server refuses the token. Sixty seconds before the end, a dialog
+// with a count-down ring opens above everything else. It does not focus a button, so a key pressed by accident (Enter, Space) chooses nothing. Closing it with
 // Escape, the x or a click beside it counts as "stay": a person who dismisses the warning is present.
 // "Stay signed in" asks the server for a new token (POST /auth/session/extend); the server ends the old
 // session at once, so the request cannot be replayed, and the page stores the new token and arms itself
@@ -27,6 +30,8 @@
     let checking = false;
     let temporary = false;           // a temporary credential's session: no renewal offered
     let closingOurselves = false;    // the dialog is being hidden by this module, not by the person
+    let armedFor = null;             // the token whose own arming is in force (its tail); null once anything
+                                     // else armed: a correction from the server applies only while it is
 
     function claimsOf(token) {
         try {
@@ -38,9 +43,8 @@
 
     function tailOf(token) { return String(token).slice(-24); }
 
-    // When this token arrived on this device: the stored moment for the same token, else now (a token not
-    // seen before is one that just arrived), stored for the next reload.
-    function arrivalOf(token) {
+    // When this token arrived on this device, as stored for the same token; null when none is stored.
+    function storedArrival(token) {
         let stored = null;
         try { stored = storage.getItem(ARRIVAL_KEY); } catch (_) {}
         if (stored) {
@@ -48,9 +52,28 @@
             const ms = Number(stored.slice(0, at));
             if (at > 0 && Number.isFinite(ms) && stored.slice(at + 1) === tailOf(token)) return ms;
         }
-        const now = Date.now();
-        try { storage.setItem(ARRIVAL_KEY, now + ':' + tailOf(token)); } catch (_) {}
-        return now;
+        return null;
+    }
+
+    function rememberArrival(token, ms) {
+        try { storage.setItem(ARRIVAL_KEY, Math.round(ms) + ':' + tailOf(token)); } catch (_) {}
+    }
+
+    // A token with no stored arrival: the time it has left as the server counts it, carried onto this
+    // device's clock, as expire() does. Its arrival is stored from that, so a reload agrees. When the server
+    // does not answer, the local arming stands.
+    async function correctFromServer(token, claims) {
+        const tail = tailOf(token);
+        try {
+            const res = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${token}` } });
+            const serverNow = Date.parse(res.headers.get('Date') || '');
+            if (!res.ok || !Number.isFinite(serverNow)) return;
+            if (armedFor !== tail || authToken !== token) return;   // armed since from something else
+            const issuedMs = (claims.iat || claims.exp) * 1000;
+            rememberArrival(token, Date.now() - (serverNow - issuedMs));
+            armAt(Date.now() + (claims.exp * 1000 - serverNow));
+            armedFor = tail;
+        } catch (_) { /* the local arming stands */ }
     }
 
     function forgetArrival() {
@@ -64,8 +87,18 @@
         if (!claims || !claims.exp) { disarm(); return false; }
         temporary = !!claims.is_temporary;
         const lifetimeMs = (claims.exp - (claims.iat || claims.exp)) * 1000;
-        const end = lifetimeMs > 0 ? arrivalOf(token) + lifetimeMs : Date.now();
-        return armAt(end);
+        let arrival = storedArrival(token);
+        const known = arrival !== null;
+        if (!known) {
+            // Armed at once as if it had just arrived (stored, so a second arming of the same token on this
+            // load asks nothing more), then corrected from the server.
+            arrival = Date.now();
+            rememberArrival(token, arrival);
+        }
+        const armed = armAt(lifetimeMs > 0 ? arrival + lifetimeMs : Date.now());
+        armedFor = tailOf(token);
+        if (!known && lifetimeMs > 0) correctFromServer(token, claims);
+        return armed;
     }
 
     // A temporary credential's session: timed to whichever ends first, the token or the credential
@@ -106,6 +139,7 @@
         if (ticker) clearInterval(ticker);
         timer = ticker = null;
         deadline = null;
+        armedFor = null;
         if (!(opts && opts.keepKind)) temporary = false;
         hide();
     }
