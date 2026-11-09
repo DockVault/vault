@@ -77,9 +77,9 @@ console.log(JSON.stringify({ before, after, again: SessionWatch.remaining(), ask
 """)
     assert out["before"] == 1800            # armed at once as if just arrived
     assert out["asked"] == 1                # then asked the server
-    assert 1198 <= out["after"] <= 1201, out   # the server's count: twenty minutes left
+    assert 1198 <= out["after"] <= 1199, out   # twenty minutes left by the server, a second early at most
     assert 599 <= out["arrivalAgo"] <= 602, out
-    assert out["askedAgain"] == 0 and 1198 <= out["again"] <= 1201, out
+    assert out["askedAgain"] == 0 and 1198 <= out["again"] <= 1199, out
 
 
 def test_a_stored_arrival_is_used_and_nothing_is_asked():
@@ -155,4 +155,4 @@ console.log(JSON.stringify({ guessed, askedOnThisLoad, asked: asked.length, conf
     assert out["askedOnThisLoad"] == 1, out
     assert out["asked"] == 2, out
     assert not out["confirmed"].startswith("~"), out
-    assert 1198 <= out["left"] <= 1201, out
+    assert 1198 <= out["left"] <= 1199, out

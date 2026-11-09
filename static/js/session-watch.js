@@ -74,9 +74,13 @@
             const serverNow = Date.parse(res.headers.get('Date') || '');
             if (!res.ok || !Number.isFinite(serverNow)) return;
             if (armedFor !== tail || authToken !== token) return;   // armed since from something else
+            // The Date header counts whole seconds and was written before the answer travelled here: the
+            // server's clock now is at least a second past it. Taking that later moment ends the count a
+            // little early, never after the token itself has run out.
+            const serverNowLatest = serverNow + 1000;
             const issuedMs = (claims.iat || claims.exp) * 1000;
-            rememberArrival(token, Date.now() - (serverNow - issuedMs));
-            armAt(Date.now() + (claims.exp * 1000 - serverNow));
+            rememberArrival(token, Date.now() - (serverNowLatest - issuedMs));
+            armAt(Date.now() + (claims.exp * 1000 - serverNowLatest));
             armedFor = tail;
         } catch (_) { /* the local arming stands */ }
     }

@@ -104,6 +104,7 @@ def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, adm
         # Back to the longer timeout: that save asks for the administrator's password.
         restored = put_settings_allowing_longer_sessions(admin, admin_creds["password"], {"session_timeout": before})
         assert restored.status_code in (200, 204), restored.text
+    # Two minutes at most: the count read from the server's clock errs early, never late.
     assert page.evaluate("() => SessionWatch.remaining()") <= 120
     expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=75000)
     expect(page.locator("#login-screen")).to_be_visible(timeout=90000)
