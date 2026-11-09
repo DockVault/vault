@@ -70,8 +70,10 @@ def _settings(db, **values):
     db.commit()
 
 
-def _old(signed_in_ago_seconds, **more):
-    now = int(datetime.now(timezone.utc).timestamp())
+def _old(signed_in_ago_seconds, now=None, **more):
+    """An old token's claims, signed in `signed_in_ago_seconds` before `now` (the test's own moment, so the
+    limit is counted from the same instant the renewal is judged at; the current time when not given)."""
+    now = int((now or datetime.now(timezone.utc)).timestamp())
     claims = {"sub": "x", "session_token": "s", "is_temporary": False, "iat": now - signed_in_ago_seconds,
               "exp": now + 60}
     claims.update(more)
@@ -87,17 +89,17 @@ def _refusal(fn, *args, **kw):
 def test_the_default_limit_is_a_day_from_the_sign_in(db):
     user = _user(db)
     now = datetime.now(timezone.utc)
-    auth_time, expires_at = api._renewal_terms(db, user, _old(23 * HOUR), now)
-    assert auth_time == _old(23 * HOUR)["iat"]
+    auth_time, expires_at = api._renewal_terms(db, user, _old(23 * HOUR, now), now)
+    assert auth_time == _old(23 * HOUR, now)["iat"]
     # The session timeout (30 minutes here) is shorter than what is left of the limit.
     assert abs((expires_at - now).total_seconds() - 30 * 60) < 5
     # Twenty minutes before the limit the new token ends at the limit, not after it.
-    _, expires_at = api._renewal_terms(db, user, _old(24 * HOUR - 20 * 60), now)
+    _, expires_at = api._renewal_terms(db, user, _old(24 * HOUR - 20 * 60, now), now)
     assert abs((expires_at - now).total_seconds() - 20 * 60) < 5
-    refused = _refusal(api._renewal_terms, db, user, _old(24 * HOUR + 1), now)
+    refused = _refusal(api._renewal_terms, db, user, _old(24 * HOUR + 1, now), now)
     assert refused.status_code == 403 and "as long as this vault allows" in refused.detail
     # At the limit, with nothing left to hand out, the renewal is refused too.
-    assert _refusal(api._renewal_terms, db, user, _old(24 * HOUR - 2), now).status_code == 403
+    assert _refusal(api._renewal_terms, db, user, _old(24 * HOUR - 2, now), now).status_code == 403
 
 
 def test_auth_time_outlives_every_renewal_and_wins_over_iat(db):
@@ -149,7 +151,7 @@ def test_an_account_that_now_needs_a_second_factor_is_refused_unless_its_token_s
 def test_the_renewed_token_carries_the_identity_claims_and_the_sign_in_time(db):
     user = _user(db)
     now = datetime.now(timezone.utc)
-    old = _old(2 * HOUR, amr=["pwd", "totp"], mfa_at=1700000000, idp="corp", nonce="dropped")
+    old = _old(2 * HOUR, now, amr=["pwd", "totp"], mfa_at=1700000000, idp="corp", nonce="dropped")
     auth_time, expires_at = api._renewal_terms(db, user, old, now)
     token = api._renewed_token(user, old, "new-session-token", auth_time, expires_at, now)
     claims = jwt.decode(token, options={"verify_signature": False})
