@@ -3,6 +3,8 @@
 The page is pre-auth, so it learns the policy from the public /auth/login-policy endpoint and updates
 the label + the input's autocomplete accordingly. Asserted for each mode, with no console errors.
 """
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -31,19 +33,22 @@ def test_username_mode_label(page: Page, admin, restore_login_policy):
     expect(label).to_have_text("Email")
     label, inp = _label_for(page, "username", admin)
     expect(label).to_have_text("Username")
-    expect(inp).to_have_attribute("autocomplete", "username")
+    # With passkeys offered the field also says webauthn, so the browser offers passkeys from it.
+    expect(inp).to_have_attribute("autocomplete", re.compile(r"^username( webauthn)?$"))
 
 
 def test_email_mode_label(page: Page, admin, restore_login_policy):
     label, inp = _label_for(page, "email", admin)
     expect(label).to_have_text("Email")
-    expect(inp).to_have_attribute("autocomplete", "email")
+    # With passkeys offered the field also says webauthn, so the browser offers passkeys from it.
+    expect(inp).to_have_attribute("autocomplete", re.compile(r"^email( webauthn)?$"))
 
 
 def test_either_mode_label(page: Page, admin, restore_login_policy):
     label, inp = _label_for(page, "either", admin)
     expect(label).to_have_text("Username or email")
-    expect(inp).to_have_attribute("autocomplete", "username")
+    # With passkeys offered the field also says webauthn, so the browser offers passkeys from it.
+    expect(inp).to_have_attribute("autocomplete", re.compile(r"^username( webauthn)?$"))
 
 
 def test_no_console_errors_applying_the_label(page: Page, admin, restore_login_policy):

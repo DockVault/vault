@@ -1221,6 +1221,7 @@ async function applyLoginPolicyLabel() {
         }
         _initSignupAffordance(policy);
         _initForgotAffordance(policy);
+        _initPasskeySignIn(policy);
     } catch (_) { /* keep the static fallback */ }
 }
 // A page that replaced a tab told of a sign-out in another tab asks for the sign-in screen's policy when it is next
@@ -1718,12 +1719,14 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     // From here until the app is shown or the sign-in fails (its second step included), the page is not replaced
     // under the person signing in (_replacePageAfterSignOut).
     _signingIn = true;
+    _stopPasskeyOffer();          // a password sent supersedes any passkey sign-in under way
     try {
+        const headers = { 'Content-Type': 'application/json' };
+        // A sign-in a passkey started, waiting for its password: the stage's token says which account.
+        if (_passwordStage) headers['Authorization'] = `Bearer ${_passwordStage.token}`;
         const response = await fetch(`${API_BASE}/auth/login`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers,
             body: JSON.stringify({
                 username: username,
                 password: password
@@ -1736,6 +1739,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         }
         
         const data = await response.json();
+        _endPasswordStage();
 
         // Two-step login: an account with the second factor in effect (or one the policy requires to
         // enroll) gets NO session from the password step. Hand off to the second-factor card /
@@ -1822,6 +1826,155 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     }
 });
 
+// ----------------------------------------------------------------------------------------------------------------
+// Passkeys at sign-in (static/js/passkeys.js does the ceremonies). When the vault offers passkeys (/auth/policy's
+// methods.passkeys) and the browser can use them: a "Sign in with a passkey" button, and the browser's offer of the
+// person's passkeys on the username field (conditional mediation), which waits until one is chosen. A passkey sign-in
+// answers as the password form does: a session (finished through enterAuthedSession), the second-factor card, or the
+// password step, when the passkey is not the whole sign-in (an administrator's, or one that did not verify the
+// person): the form comes back with the account's name filled in and its password asked, under the stage's token.
+
+let _passkeyOffer = null;          // the AbortController of the waiting offer on the username field
+let _passwordStage = null;         // {token, username} while a passkey's sign-in waits for its password
+let _passkeyFlow = 0;              // the latest passkey sign-in: only it may change the page (an offer the browser
+                                   // completes on its own must not race the button or a password being typed)
+
+function _stopPasskeyOffer() {
+    _passkeyFlow++;                // whatever passkey sign-in is under way no longer speaks for the page
+    if (_passkeyOffer) { try { _passkeyOffer.abort(); } catch (_) {} }
+    _passkeyOffer = null;
+}
+
+async function _initPasskeySignIn(policy) {
+    const button = document.getElementById('passkey-sign-in-btn');
+    const on = !!(policy && policy.methods && policy.methods.passkeys) && !!window.Passkeys && Passkeys.supported();
+    if (button) button.style.display = on ? '' : 'none';
+    if (!on) return;
+    if (button && !button.dataset.wired) {
+        button.dataset.wired = '1';
+        button.addEventListener('click', () => { _passkeySignIn({ conditional: false }); });
+    }
+    const input = document.getElementById('username');
+    if (input && !/\bwebauthn\b/.test(input.getAttribute('autocomplete') || '')) {
+        input.setAttribute('autocomplete', ((input.getAttribute('autocomplete') || 'username') + ' webauthn').trim());
+    }
+    // The offer starts when the person comes to the username field, and only in a browser that has used or added a
+    // passkey here (_passkeyUsedHere): each offer asks the server for a challenge, and an office behind one address
+    // shares the budget for those. Anyone else has the button, which also marks the browser once it works.
+    if (input && !input.dataset.passkeyOffer && _passkeyUsedHere() && await Passkeys.conditionalAvailable()) {
+        input.dataset.passkeyOffer = '1';
+        input.addEventListener('focus', () => {
+            if (!_passwordStage && !_passkeyOffer) _passkeySignIn({ conditional: true });
+        });
+    }
+    // A field that already has the cursor (the page put it there) gets its offer now: no focus event will come.
+    if (input && input.dataset.passkeyOffer && document.activeElement === input && !_passwordStage && !_passkeyOffer) {
+        _passkeySignIn({ conditional: true });
+    }
+}
+
+const PASSKEY_USED_HERE = 'passkeyUsedHere';
+
+function _passkeyUsedHere() {
+    try { return storage.getItem(PASSKEY_USED_HERE) === '1'; } catch (_) { return false; }
+}
+
+function _markPasskeyUsedHere() {
+    try { storage.setItem(PASSKEY_USED_HERE, '1'); } catch (_) {}
+}
+
+function _loginNote(text) {
+    let note = document.getElementById('login-stage-note');
+    const form = document.getElementById('login-form');
+    if (!note && form) {
+        note = _el('p', 'text-secondary text-sm mb-md'); note.id = 'login-stage-note'; note.setAttribute('role', 'status');
+        form.insertBefore(note, form.firstChild);
+    }
+    if (note) { note.textContent = text || ''; note.style.display = text ? '' : 'none'; }
+}
+
+function _showLoginError(message) {
+    const errorDiv = document.getElementById('login-error');
+    if (!errorDiv) return;
+    errorDiv.className = 'alert alert-error mt-md';
+    errorDiv.textContent = message;
+    errorDiv.style.display = 'block';
+}
+
+// conditional: the offer on the username field (silent: a cancelled or aborted offer shows nothing).
+async function _passkeySignIn({ conditional = false } = {}) {
+    const errorDiv = document.getElementById('login-error');
+    _stopPasskeyOffer();
+    const flow = ++_passkeyFlow;
+    const current = () => flow === _passkeyFlow;
+    const controller = new AbortController();
+    if (conditional) _passkeyOffer = controller;
+    else if (errorDiv) errorDiv.style.display = 'none';
+    try {
+        const typed = conditional ? '' : ((document.getElementById('username') || {}).value || '').trim();
+        const start = await fetch(`${API_BASE}/auth/passkeys/sign-in/options`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(typed ? { username: typed } : {})
+        });
+        if (!current()) return;
+        if (!start.ok) {
+            if (!conditional) {
+                const e = await start.json().catch(() => ({}));
+                _showLoginError((e && typeof e.detail === 'string') ? e.detail : 'Passkey sign-in is not available right now.');
+            }
+            return;
+        }
+        const { challenge_id, options } = await start.json();
+        const credential = await Passkeys.get(options, { conditional, signal: controller.signal });
+        if (!current()) return;
+        const resp = await fetch(`${API_BASE}/auth/passkeys/sign-in/verify`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge_id, credential })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!current()) return;
+        if (!resp.ok) {
+            const detail = data && data.detail;
+            _showLoginError(typeof detail === 'string' ? detail : (detail && detail.message) || 'That passkey was not accepted.');
+            return;
+        }
+        _markPasskeyUsedHere();
+        await _passkeySignInAnswer(data);
+    } catch (error) {
+        if (!current() || (window.Passkeys && Passkeys.cancelled(error))) return;
+        if (!conditional) _showLoginError(window.Passkeys ? Passkeys.failureText(error) : 'The passkey did not work.');
+    } finally {
+        if (_passkeyOffer === controller) _passkeyOffer = null;
+    }
+}
+
+async function _passkeySignInAnswer(data) {
+    if (data.second_factor_required && data.stage === 'password') { _beginPasswordStage(data); return; }
+    if (data.second_factor_required) { beginSecondFactor(data); return; }
+    const form = document.getElementById('login-form');
+    if (form) form.reset();
+    await finishSecondFactorLogin(data.access_token);
+}
+
+function _beginPasswordStage(data) {
+    _passwordStage = { token: data.pre_auth_token, username: data.username || '' };
+    const input = document.getElementById('username');
+    if (input) { input.value = _passwordStage.username; input.readOnly = true; }
+    const button = document.getElementById('passkey-sign-in-btn');
+    if (button) button.style.display = 'none';
+    _loginNote('Your passkey was accepted. Enter your password to finish signing in.');
+    const pw = document.getElementById('password');
+    if (pw) { pw.value = ''; pw.focus(); }
+}
+
+function _endPasswordStage() {
+    if (!_passwordStage) return;
+    _passwordStage = null;
+    const input = document.getElementById('username');
+    if (input) input.readOnly = false;
+    _loginNote('');
+}
+
 // The sign-in button says the page is still loading until every script has run (index.html), and a sign-in sent
 // before then is held by auth-boot.js. From here the page can sign in: the button says so, and a held sign-in is
 // sent, once, with what the fields hold now. Sent a turn later, so every script's own start-up has run first.
@@ -1863,6 +2016,7 @@ function _sfError(node, msg) {
 function _sfRestoreLoginForm(policyWhenShown) {
     // A second step given up (Back to sign in, a cancel, a pre-sign-in token that ran out) ends that sign-in.
     _signInEnded();
+    _endPasswordStage();
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
     const form = document.getElementById('login-form');
@@ -1936,8 +2090,10 @@ async function finishSecondFactorLogin(accessToken) {
 
 function renderVerifyCard(box, opts) {
     const preAuthToken = opts.preAuthToken;
-    const methods = opts.methods || ['totp', 'recovery'];
-    const primary = methods[0] || 'totp';   // the enrolled method (totp today; email is future)
+    const offered = opts.methods || ['totp', 'recovery'];
+    const withPasskey = offered.includes('passkey') && !!window.Passkeys && Passkeys.supported();
+    const methods = offered.filter(m => m !== 'passkey');
+    const primary = methods.find(m => m !== 'recovery') || (methods.length ? 'recovery' : 'totp');
     let mode = primary;                      // 'totp' | 'email' | 'recovery'
 
     box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Two-factor authentication'));
@@ -1991,9 +2147,50 @@ function renderVerifyCard(box, opts) {
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
     back.addEventListener('click', (e) => { e.preventDefault(); _sfCancel(preAuthToken); });
 
-    box.appendChild(desc); box.appendChild(grp); box.appendChild(err);
-    box.appendChild(verify); box.appendChild(toggle); box.appendChild(back);
-    applyMode();
+    let passkey = null;
+    if (withPasskey) {
+        passkey = _el('button', 'btn btn-secondary btn-block mt-sm', 'Use a passkey');
+        passkey.type = 'button';
+        passkey.addEventListener('click', async () => {
+            err.style.display = 'none';
+            passkey.disabled = true;
+            try {
+                const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${preAuthToken}` };
+                const start = await fetch(`${API_BASE}/auth/second-factor/passkey/options`, { method: 'POST', headers });
+                if (!start.ok) {
+                    const e = await start.json().catch(() => ({}));
+                    _sfError(err, (e && typeof e.detail === 'string') ? e.detail : 'Your passkey cannot be used right now.');
+                    return;
+                }
+                const { challenge_id, options } = await start.json();
+                const credential = await Passkeys.get(options);
+                const resp = await fetch(`${API_BASE}/auth/second-factor/passkey/verify`, {
+                    method: 'POST', headers, body: JSON.stringify({ challenge_id, credential })
+                });
+                const d = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    _sfError(err, (d && typeof d.detail === 'string') ? d.detail : 'That passkey was not accepted.');
+                    return;
+                }
+                _markPasskeyUsedHere();
+                await finishSecondFactorLogin(d.access_token);
+            } catch (e) {
+                if (!Passkeys.cancelled(e)) _sfError(err, Passkeys.failureText(e));
+            } finally {
+                passkey.disabled = false;
+            }
+        });
+    }
+    const hasCode = methods.length > 0;
+    if (hasCode) { box.appendChild(desc); box.appendChild(grp); }
+    else box.appendChild(_el('p', 'text-secondary text-sm mb-md', 'Confirm it is you with your passkey.'));
+    box.appendChild(err);
+    if (hasCode) box.appendChild(verify);
+    if (passkey) box.appendChild(passkey);
+    if (hasCode && methods.some(m => m !== 'recovery')) box.appendChild(toggle);
+    box.appendChild(back);
+    if (hasCode) applyMode();
+    else if (passkey) passkey.focus();
 }
 
 function renderEnrollmentWizard(box, opts) {
@@ -2159,6 +2356,7 @@ function _buildStepUpBody(action, methods) {
     const otpMethod = methods.find(m => m === 'totp' || m === 'email') || null;
     const hasRecovery = methods.includes('recovery');
     const hasPassword = methods.includes('password');
+    const hasPasskey = methods.includes('passkey') && !!window.Passkeys && Passkeys.supported();
     let otpMode = otpMethod ? 'otp' : (hasRecovery ? 'recovery' : null);   // 'otp' | 'recovery'
 
     body.appendChild(_el('p', 'text-secondary text-sm mb-md', 'This action needs an extra confirmation.'));
@@ -2180,6 +2378,48 @@ function _buildStepUpBody(action, methods) {
         g.appendChild(_el('label', 'text-sm', 'Account password'));
         pwInput = _el('input', 'form-control'); pwInput.type = 'password'; pwInput.id = 'stepup-password-input'; pwInput.autocomplete = 'current-password';
         g.appendChild(pwInput); body.appendChild(g);
+    }
+
+    if (hasPasskey) {
+        const passkey = _el('button', 'btn btn-secondary btn-sm mt-sm', 'Use a passkey');
+        passkey.type = 'button';
+        passkey.id = 'stepup-passkey-btn';
+        body.appendChild(passkey);
+        passkey.addEventListener('click', async () => {
+            const password = pwInput ? (pwInput.value || '') : null;
+            if (pwInput && !password) { _sfError(err, 'Enter your account password.'); return; }
+            err.style.display = 'none';
+            passkey.disabled = true;
+            try {
+                const auth = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` };
+                const start = await fetch(`${API_BASE}/auth/passkeys/step-up/options`, { method: 'POST', headers: auth });
+                if (!start.ok) {
+                    const e = await start.json().catch(() => ({}));
+                    _sfError(err, (e && typeof e.detail === 'string') ? e.detail : 'Your passkey cannot be used right now.');
+                    return;
+                }
+                const { challenge_id, options } = await start.json();
+                const credential = await Passkeys.get(options);
+                const payload = { action, method: 'passkey', challenge_id, credential };
+                if (pwInput) payload.password = password;
+                const resp = await fetch(`${API_BASE}/auth/second-factor/step-up`, {
+                    method: 'POST', headers: auth, body: JSON.stringify(payload)
+                });
+                if (!resp.ok) {
+                    const e = await resp.json().catch(() => ({}));
+                    _sfError(err, (e && typeof e.detail === 'string') ? e.detail : 'That was not accepted. Try again.');
+                    return;
+                }
+                const d = await resp.json();
+                _markPasskeyUsedHere();
+                _stepUpSettle(d.receipt || null);   // settle BEFORE closing so closeModal's settle(null) is a no-op
+                closeModal();
+            } catch (e) {
+                if (!Passkeys.cancelled(e)) _sfError(err, Passkeys.failureText(e));
+            } finally {
+                passkey.disabled = false;
+            }
+        });
     }
 
     const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert'); body.appendChild(err);
@@ -6919,6 +7159,143 @@ function _usHideEmailCodeRow() {
 // Disable + regenerate hit account.second_factor-gated endpoints; apiRequest surfaces the step-up modal
 // automatically, so the user must prove their current factor to change it.
 
+// ============================================================================
+// ACCOUNT SETTINGS: passkeys (static/js/passkeys.js does the ceremonies)
+// ============================================================================
+// Adding, renaming, removing and confirming a passkey ride the account.second_factor step-up: apiRequest shows the
+// step-up dialog when the server asks for it. An account with no factor yet proves its password to add its first.
+// The section shows only when the vault offers passkeys (the list answers) and this browser can make one.
+
+function _passkeyWhen(iso) {
+    if (!iso) return null;
+    try { return new Date(iso).toLocaleDateString(); } catch (_) { return null; }
+}
+
+async function renderAccountPasskeys() {
+    const section = document.getElementById('us-passkeys-section');
+    const body = document.getElementById('us-passkeys-body');
+    if (!section || !body) return;
+    let data;
+    try { data = await apiRequest('/users/me/passkeys', { silent: true }); }
+    catch (_) { section.style.display = 'none'; return; }
+    section.style.display = '';
+    body.replaceChildren();
+    const keys = (data && data.passkeys) || [];
+    const limit = (data && data.limit) || 0;
+    if (!keys.length) {
+        body.appendChild(_el('p', 'text-secondary text-sm mb-sm',
+            'No passkeys yet. A passkey signs you in with this device\'s screen lock or a security key, and can confirm '
+            + 'it is you in place of a code.'));
+    }
+    const list = _el('div', 'passkey-list');
+    for (const key of keys) {
+        const row = _el('div', 'passkey-row flex items-center gap-sm mb-sm');
+        row.dataset.passkeyId = key.id;
+        const text = _el('div', 'flex-1');
+        text.appendChild(_el('div', 'text-sm font-bold', key.label || 'Passkey'));
+        const bits = ['Added ' + (_passkeyWhen(key.created_at) || 'earlier'),
+            key.last_used_at ? 'last used ' + _passkeyWhen(key.last_used_at) : 'never used',
+            key.synced ? 'synced across devices' : 'on one device'];
+        text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
+        if (key.provisional) {
+            text.appendChild(_el('div', 'text-warning text-xs', 'Waiting for your confirmation until '
+                + (_passkeyWhen(key.provisional_until) || 'its provisional period ends')
+                + ': an administrator changed your sign-in details recently.'));
+        }
+        row.appendChild(text);
+        if (key.provisional) {
+            const confirm = _el('button', 'btn btn-secondary btn-sm', 'Confirm');
+            confirm.addEventListener('click', async () => {
+                try {
+                    await apiRequest('/users/me/passkeys/' + encodeURIComponent(key.id) + '/confirm', { method: 'POST' });
+                    showSuccess('Passkey confirmed.');
+                } catch (e) { showError(e.message || 'The passkey was not confirmed.'); }
+                renderAccountPasskeys();
+            });
+            row.appendChild(confirm);
+        }
+        const rename = _el('button', 'btn btn-secondary btn-sm', 'Rename');
+        rename.addEventListener('click', async () => {
+            const label = await showPrompt('A name for this passkey, so you can tell it apart.', 'Rename passkey',
+                { defaultValue: key.label || '' });
+            if (label == null) return;
+            try {
+                await apiRequest('/users/me/passkeys/' + encodeURIComponent(key.id), {
+                    method: 'PATCH', body: JSON.stringify({ label })
+                });
+            } catch (e) { showError(e.message || 'The passkey was not renamed.'); }
+            renderAccountPasskeys();
+        });
+        const remove = _el('button', 'btn btn-danger btn-sm', 'Remove');
+        remove.addEventListener('click', async () => {
+            const ok = await showConfirm('Remove the passkey "' + (key.label || 'Passkey') + '"? It will no longer sign you '
+                + 'in or confirm it is you.', 'Remove passkey', null, 'Remove');
+            if (!ok) return;
+            try {
+                await apiRequest('/users/me/passkeys/' + encodeURIComponent(key.id), { method: 'DELETE' });
+                showSuccess('Passkey removed.');
+            } catch (e) { showError(e.message || 'The passkey was not removed.'); }
+            renderAccountPasskeys();
+        });
+        row.appendChild(rename);
+        row.appendChild(remove);
+        list.appendChild(row);
+    }
+    body.appendChild(list);
+    if (!(window.Passkeys && Passkeys.supported())) {
+        body.appendChild(_el('p', 'text-secondary text-sm', 'This browser cannot make a passkey here.'));
+        return;
+    }
+    if (limit && keys.length >= limit) {
+        body.appendChild(_el('p', 'text-secondary text-sm', 'You hold as many passkeys as an account may. Remove one to add another.'));
+        return;
+    }
+    const add = _el('button', 'btn btn-primary btn-sm', 'Add a passkey');
+    add.id = 'us-passkey-add';
+    add.addEventListener('click', async () => {
+        add.disabled = true;
+        try { await _addPasskey(); } finally { add.disabled = false; }
+        renderAccountPasskeys();
+    });
+    body.appendChild(add);
+}
+
+async function _addPasskey() {
+    let password = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        let start;
+        try {
+            start = await apiRequest('/users/me/passkeys/register/options', {
+                method: 'POST', silent: true, body: JSON.stringify(password ? { current_password: password } : {})
+            });
+        } catch (e) {
+            const message = (e && e.message) || '';
+            // An account with no factor yet proves its password, as for the first authenticator app.
+            if (attempt === 0 && /password is required/i.test(message)) {
+                password = await showPrompt('Enter your account password to add your first passkey.', 'Confirm it is you',
+                    { password: true });
+                if (!password) return;
+                continue;
+            }
+            showError(message || 'A passkey cannot be added right now.');
+            return;
+        }
+        let credential;
+        try { credential = await Passkeys.create(start.options); }
+        catch (e) { if (!Passkeys.cancelled(e)) showError(Passkeys.failureText(e)); return; }
+        const label = await showPrompt('A name for this passkey, so you can tell it apart (for example, this laptop).',
+            'Name your passkey', { defaultValue: '' });
+        try {
+            await apiRequest('/users/me/passkeys/register/verify', {
+                method: 'POST', body: JSON.stringify({ challenge_id: start.challenge_id, credential, label: label || null })
+            });
+            _markPasskeyUsedHere();
+            showSuccess(start.provisional ? 'Passkey added. Confirm it with a factor you already had.' : 'Passkey added.');
+        } catch (e) { showError(e.message || 'The passkey was not added.'); }
+        return;
+    }
+}
+
 async function renderAccount2FA() {
     const body = document.getElementById('us-2fa-body');
     if (!body) return;
@@ -7029,6 +7406,7 @@ function openUserSettingsModal() {
             .forEach(el => el.setAttribute('data-user-id', String(currentUser.id)));
         loadUserSshKeys(currentUser.id, modal);
         renderAccount2FA();   // populate the Two-factor section from GET /users/me/second-factor
+        renderAccountPasskeys();
     }
     const tm = window.themeManager;
     const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';

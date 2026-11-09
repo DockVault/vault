@@ -131,6 +131,8 @@
                              so, and it is sent once, as soon as the page is ready. -->
                         <button type="submit" id="login-submit" class="btn btn-primary btn-block" aria-describedby="login-loading-note"><svg class="icon" aria-hidden="true"><use href="#i-login"/></svg> <span id="login-submit-label">Loading&hellip;</span></button>
                         <div id="login-loading-note" class="text-secondary" role="status" aria-live="polite" style="font-size: 0.9em;"></div>
+                        <!-- Shown by app.js when the vault offers passkeys (/auth/policy) and this browser can use them. -->
+                        <button type="button" id="passkey-sign-in-btn" class="btn btn-secondary btn-block mt-sm" style="display: none;">Sign in with a passkey</button>
                     </form>
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>
@@ -3883,6 +3885,12 @@
                                 <div id="us-2fa-body"></div>
                             </div>
 
+                            <!-- Filled by app.js (renderAccountPasskeys) when the vault offers passkeys. -->
+                            <div class="us-section us-credential" id="us-passkeys-section" style="display: none;">
+                                <h4 class="us-section-title">Passkeys</h4>
+                                <div id="us-passkeys-body"></div>
+                            </div>
+
                             <div class="us-section us-credential">
                                 <h4 class="us-section-title">SFTP</h4>
                                 <label class="checkbox-row"><input type="checkbox" id="us-sftp-enabled"><span>SFTP access enabled</span></label>
@@ -4384,6 +4392,7 @@
     <script src="/static/js/dialogs.js?v=20261117a"></script>
     <script src="/static/js/people.js?v=20261117a"></script>
     <script src="/static/js/tables.js?v=20261117a"></script>
+    <script src="/static/js/passkeys.js?v=20261117a"></script>
     <script src="/static/js/app.js?v=20261118a"></script>
     <script src="/static/js/dashboard-actions.js?v=20261117a"></script>
     <script src="/static/js/session-watch.js?v=20261117a"></script>
