@@ -49,11 +49,22 @@ def test_a_retired_key_never_signs_in(monkeypatch):
 
 
 def test_a_key_named_against_another_accounts_challenge_is_never_counted_against_its_owner(monkeypatch):
+    """The sign-in options never bind a challenge to an account. Should a sign-in challenge ever be bound (here to bob,
+    offering bob's key, written into the store by hand), alice's key answering it is refused and the address pays,
+    not alice."""
+    import base64
+    import json
+    from app.core.webauthn_challenges import KEY_PREFIX
     alice, bob = _user(), _user("bob")
     h = Harness(monkeypatch, [alice, bob])
     auth, row = h.enroll(alice)
     bauth, brow = h.enroll(bob)
-    status, body = h.options("bob")                    # bob's challenge...
+    status, body = h.options("bob")
+    key = KEY_PREFIX + body["challenge_id"]
+    stored = json.loads(h.redis.rows[key])
+    assert stored["user_id"] is None and stored["allow_ids"] == []       # the route binds nothing
+    stored.update(user_id=str(bob.id), allow_ids=[base64.urlsafe_b64encode(brow.credential_id).rstrip(b"=").decode()])
+    h.redis.rows[key] = json.dumps(stored)                               # bob's challenge...
     credential = auth.get_assertion(body["options"], ORIGIN, sign_count=1)   # ...answered with alice's public id
     status, out = _call(h.S, "POST", "/auth/passkeys/sign-in/verify", {"challenge_id": body["challenge_id"], "credential": credential})
     assert status == 401 and h.failures[-1] == ("alice", "passkey of another account", "passkey")
