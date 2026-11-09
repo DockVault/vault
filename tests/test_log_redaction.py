@@ -99,6 +99,7 @@ SECRET_TARGETS = [
     (f"/receivers/{TOKEN}/upload-session", "/receivers/<redacted>/upload-session"),
     (f"/receivers/{TOKEN}/upload-session/s1/chunks/0", "/receivers/<redacted>/upload-session/s1/chunks/0"),
     (f"/receivers/{TOKEN}/upload-session/s1/complete", "/receivers/<redacted>/upload-session/s1/complete"),
+    (f"/receivers/{TOKEN}/page", "/receivers/<redacted>/page"),
 ]
 
 # Routes on the same prefixes that carry a database id, not a secret: they stay readable.

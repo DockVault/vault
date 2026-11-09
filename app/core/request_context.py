@@ -24,6 +24,7 @@ _LINK_ROUTES = (
     ("public_link", "/public-links/", "/download/"),
     ("upload_link", "/u/", None),
     ("upload_link", "/receivers/", "/upload-session"),
+    ("upload_link", "/receivers/", "/page"),
 )
 
 MAX_USER_AGENT = 512    # audit_logs.user_agent

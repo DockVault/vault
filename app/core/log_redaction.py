@@ -44,6 +44,7 @@ SECRET_PATH_ROUTES = [
     ("/public-links/", "/download/"),           # GET /public-links/{token}/download/{file_id}
     ("/u/", None),                              # GET /u/{upload-link-token} (public page)
     ("/receivers/", "/upload-session"),         # /receivers/{token}/upload-session[/...]
+    ("/receivers/", "/page"),                   # GET /receivers/{token}/page (what the upload page shows)
 ]
 
 _SEGMENT = r"[^/\s?#\"']+"
