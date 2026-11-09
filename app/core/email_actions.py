@@ -140,6 +140,19 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "expiry_reminder": {
+        "name": "Something you shared is about to expire",
+        "subject": "{{action.item}} expires {{action.expires}}",
+        "body_html": (
+            "<h2>Something you shared is about to expire</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.item}} on {{vault.name}} expires {{action.expires}}. If people still need it, extend it; "
+            "otherwise nothing needs doing.</p>"
+            "<p><a href=\"{{action.link}}\">Open {{vault.name}}</a></p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "vault_member_added": {
         "name": "Added to a vault",
         "subject": "You were added to a vault on {{vault.name}}",
@@ -329,6 +342,8 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Optional — notify a recipient when something is shared with them.", OPTIONAL),
     ("receiver_upload_received", "Files received on an upload link",
      "Optional — tell the owner of an upload link when files arrive on it (once an hour per link).", OPTIONAL),
+    ("expiry_reminder", "Something you shared is about to expire",
+     "Optional — remind the maker of a share or a link two days before it expires.", OPTIONAL),
     ("vault_member_added", "Added to a vault",
      "Optional — notify a user when they're added to a vault or team.", OPTIONAL),
     ("temp_credential_issued", "Temporary credential issued",
