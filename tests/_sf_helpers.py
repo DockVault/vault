@@ -61,11 +61,41 @@ def set_action_require_otp(admin, action, value):
 SESSION_LIMITS_ACTION = "admin.session_limits.write"
 
 
+def put_settings_allowing_longer_sessions(client, password, body):
+    """PUT /settings, confirming with the password only when the save lets a sign-in last longer (the server
+    refuses it with step_up_required otherwise). For restoring settings a test changed."""
+    r = client.put("/settings", json=body)
+    if r.status_code == 403 and "step_up_required" in r.text:
+        r = put_settings_with_password(client, password, body)
+    return r
+
+
 def put_settings_with_password(client, password, body):
     """PUT /settings with a fresh password step-up for letting a sign-in last longer (a longer session timeout
     or "Stay signed in" limit needs one; a receipt is spent by the save that carries it, even when the save is
-    refused for its values)."""
+    refused for its values).
+
+    A step-up is limited to ten an account in five minutes. A run of tests that all confirm as the one
+    administrator reaches that, so when the limit answers, the save is made by a short-lived second
+    administrator confirming with its own password: the same rule, proven the same way."""
     r = client.post("/auth/second-factor/step-up",
                     json={"action": SESSION_LIMITS_ACTION, "method": "password", "code": password})
+    if r.status_code == 429:
+        return _put_settings_as_a_second_administrator(client, body)
     r.raise_for_status()
     return client.put("/settings", json=body, headers={"X-Second-Factor": r.json()["receipt"]})
+
+
+def _put_settings_as_a_second_administrator(client, body):
+    from conftest import ApiClient
+
+    other = client.create_user(role="admin")
+    try:
+        second = ApiClient()
+        second.login(other["_username"], other["_password"])
+        r = second.post("/auth/second-factor/step-up",
+                        json={"action": SESSION_LIMITS_ACTION, "method": "password", "code": other["_password"]})
+        r.raise_for_status()
+        return second.put("/settings", json=body, headers={"X-Second-Factor": r.json()["receipt"]})
+    finally:
+        client.delete_user(other["id"])

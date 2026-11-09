@@ -15,6 +15,7 @@ import requests
 from playwright.sync_api import Page, expect
 
 from conftest import BASE_URL
+from _sf_helpers import put_settings_allowing_longer_sessions
 
 pytestmark = pytest.mark.ui
 
@@ -92,7 +93,7 @@ def test_the_warning_focuses_nothing_can_be_dismissed_and_stay_renews_the_token(
     expect(page.locator("#vaults-section")).to_be_visible()
 
 
-def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, admin, person):
+def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, admin, admin_creds, person):
     # A session that really ends: two minutes. The page counts down on its own clock and, at zero, the server
     # (which refuses the expired token) has the last word.
     before = admin.get("/settings").json().get("session_timeout") or 0
@@ -100,7 +101,9 @@ def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, adm
     try:
         _login(page, person)
     finally:
-        admin.put("/settings", json={"session_timeout": before})
+        # Back to the longer timeout: that save asks for the administrator's password.
+        restored = put_settings_allowing_longer_sessions(admin, admin_creds["password"], {"session_timeout": before})
+        assert restored.status_code in (200, 204), restored.text
     assert page.evaluate("() => SessionWatch.remaining()") <= 120
     expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=75000)
     expect(page.locator("#login-screen")).to_be_visible(timeout=90000)

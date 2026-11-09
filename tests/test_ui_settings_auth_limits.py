@@ -16,6 +16,7 @@ Two surfaces enforce this:
 import pytest
 from playwright.sync_api import Page, expect
 from _settings_ui import show_advanced
+from _sf_helpers import put_settings_allowing_longer_sessions
 
 pytestmark = pytest.mark.ui
 
@@ -93,15 +94,20 @@ def fresh_admin(admin):
 
 
 @pytest.fixture
-def restore_limits(admin):
+def restore_limits(admin, admin_creds):
     """Always hand the deployment back its env defaults (stored 0), whatever the test did. A small
-    max_login_attempts left behind would throttle every later test from their shared address."""
+    max_login_attempts left behind would throttle every later test from their shared address. (Back to the
+    default session timeout can be a longer one, which asks for the administrator's password.)"""
     yield
-    admin.put("/settings", json={k: 0 for k in (SAVE_ALL_ENV_KEYS + RATE_LIMIT_KEYS)})
+    r = put_settings_allowing_longer_sessions(admin, admin_creds["password"],
+                                              {k: 0 for k in (SAVE_ALL_ENV_KEYS + RATE_LIMIT_KEYS)})
+    assert r.status_code in (200, 204), r.text
 
 
-def test_stored_zero_renders_blank_and_no_spurious_custom(page: Page, admin, fresh_admin, restore_limits):
-    admin.put("/settings", json={k: 0 for k in (SAVE_ALL_ENV_KEYS + RATE_LIMIT_KEYS)})
+def test_stored_zero_renders_blank_and_no_spurious_custom(page: Page, admin, admin_creds, fresh_admin, restore_limits):
+    r = put_settings_allowing_longer_sessions(admin, admin_creds["password"],
+                                              {k: 0 for k in (SAVE_ALL_ENV_KEYS + RATE_LIMIT_KEYS)})
+    assert r.status_code in (200, 204), r.text
 
     _login(page, fresh_admin["_username"], fresh_admin["_password"])
     _open_settings(page, _sentinel_value(admin))
