@@ -9,7 +9,8 @@ address (an opaque origin), and never turns text into a URL at all.
 
 These tests run the SHIPPED code, lifted verbatim from ``static/js/app.js``, under Node: the type
 rule on its own, and the whole ``openFilePreview`` against a stand-in page over every combination of
-stored type, extension, vault kind and size. Opening the preview's address in a tab of its own is
+stored type, extension, vault kind and size, with the download allowed and refused (a view-only
+share recipient previews and never downloads). Opening the preview's address in a tab of its own is
 the UI lane (``test_ui_preview_object_urls.py``).
 """
 import json
@@ -120,6 +121,8 @@ LIFTED = "\n".join([
 
 STAGE = r"""
 const minted = [], srcs = [], fetched = []; let branch = null, _previewUrl = null;
+let canDownload = true;
+const vaultCapAllowed = (cap) => cap !== 'file.download' || canDownload;
 class El {
   constructor(tag) { this.tagName = tag; this.children = []; this.style = {}; this.attrs = {};
     const cls = new Set(); this.classList = { add: (c) => cls.add(c), remove: (c) => cls.delete(c),
@@ -129,8 +132,9 @@ class El {
   setAttribute(k, v) { this.attrs[k] = v; } append(...c) { this.children.push(...c); }
   appendChild(c) { this.children.push(c); } replaceChildren(...c) { this.children = c; }
 }
-const bodyEl = new El('div');
-global.document = { getElementById: (id) => id === 'file-preview-body' ? bodyEl : new El('x'),
+const bodyEl = new El('div'), downloadEl = new El('button');
+global.document = { getElementById: (id) => id === 'file-preview-body' ? bodyEl
+                      : id === 'file-preview-download' ? downloadEl : new El('x'),
                     createElement: (t) => new El(t) };
 global.FileReader = class { readAsDataURL(b) { b.arrayBuffer().then((buf) => {
   this.result = 'data:' + b.type + ';base64,' + Buffer.from(buf).toString('base64'); this.onload(); }); } };
@@ -150,15 +154,16 @@ const buildZoomControls = () => ({ el: new El('div') }), setupImageZoom = () => 
 const isCodedCryptoError = () => false, safeMessageForCode = () => '', downloadFile = () => {};
 const failures = [];
 console.error = (...a) => failures.push(a.map(String).join(' '));
-async function run(name, mime, size, zk, bytes) {
+async function run(name, mime, size, zk, bytes, download = true) {
   minted.length = 0; srcs.length = 0; fetched.length = 0; branch = null; failures.length = 0;
+  canDownload = download; downloadEl.style.display = 'unset';
   state.currentVault.type = zk ? 'zero_knowledge' : 'standard';
   state.currentFiles = [{ id: 'f', size }];
   global.fetch = async (u) => { fetched.push(u); return { ok: true,
     blob: async () => new Blob([bytes], { type: String(mime).replace(/[^\x20-\x7e]/g, '') }) }; };
   await openFilePreview('f', name, mime);
-  return { name, mime, size, zk, branch, minted: [...minted], srcs: srcs.map((s) => s.join(' ')),
-           fetched: fetched.length, failures: [...failures] };
+  return { name, mime, size, zk, download, branch, minted: [...minted], srcs: srcs.map((s) => s.join(' ')),
+           fetched: fetched.length, urls: [...fetched], button: downloadEl.style.display, failures: [...failures] };
 }
 """
 
@@ -181,12 +186,14 @@ def test_no_combination_mints_an_address_a_browser_could_run_as_a_page():
     rows = _walk(
         f"const MIMES = {json.dumps(MIMES)}, EXTS = {json.dumps(EXTS)}, PAGE = {json.dumps(PAGE)};\n"
         "const rows = [];\n"
-        "for (const zk of [false, true]) for (const big of [false, true]) for (const mime of MIMES) for (const ext of EXTS) {\n"
+        "for (const download of [true, false]) for (const zk of [false, true]) for (const big of [false, true])\n"
+        "for (const mime of MIMES) for (const ext of EXTS) {\n"
         "  const size = big ? 3 * 1024 * 1024 : PAGE.length;\n"
-        "  rows.push(await run(ext ? 'file.' + ext : 'file', mime, size, zk, big ? Buffer.alloc(size, 'a') : Buffer.from(PAGE)));\n"
+        "  const r = await run(ext ? 'file.' + ext : 'file', mime, size, zk, big ? Buffer.alloc(size, 'a') : Buffer.from(PAGE), download);\n"
+        "  delete r.urls; r.previewOnly = fetched.every((u) => String(u).endsWith('/preview')); rows.push(r);\n"
         "}\n"
         "process.stdout.write(JSON.stringify(rows));")
-    assert len(rows) == 2 * 2 * len(MIMES) * len(EXTS)
+    assert len(rows) == 2 * 2 * 2 * len(MIMES) * len(EXTS)
     bad = []
     for r in rows:
         assert not r["failures"], r
@@ -196,6 +203,12 @@ def test_no_combination_mints_an_address_a_browser_could_run_as_a_page():
         bad += [(r["name"], r["mime"], s[:60]) for s in r["srcs"]
                 if not (s.split(" ", 1)[1].startswith(("blob:https://vault/", "data:image/svg+xml;")))]
     assert not bad, bad[:20]
+    # Whatever is previewed is read from the preview route, never the download route.
+    assert all(r["previewOnly"] for r in rows if r["fetched"]), [r["name"] for r in rows if not r["previewOnly"]][:5]
+    # Without the download: no rendered document (it comes from the download path), and no Download button.
+    refused = [r for r in rows if not r["download"]]
+    assert refused and all(r["branch"] != "renderable" and r["button"] == "none" for r in refused)
+    assert all(r["button"] == "" for r in rows if r["download"])
     # The walk reached every kind of preview, so the property above is not vacuous.
     assert {r["branch"] for r in rows} >= {None, "renderable"}
     tags = {s.split(" ", 1)[0] for r in rows for s in r["srcs"]}
@@ -266,3 +279,17 @@ def test_every_object_url_in_the_preview_takes_a_type_of_its_own():
         "new Blob([blob], {\n                type: isPdf ? 'application/pdf' : _previewBlobType(tag, type, ext) })",
     }
     assert len(args) == 2 and set(args) == allowed, args
+
+
+def test_without_the_download_a_document_is_shown_as_its_text_and_read_from_the_preview_route():
+    out = _walk(
+        "const b = Buffer.from('# Notes'), o = {};\n"
+        "o.allowed = await run('a.md', 'text/markdown', 7, false, b, true);\n"
+        "o.refused = await run('a.md', 'text/markdown', 7, false, b, false);\n"
+        "o.picture = await run('a.png', 'image/png', 1, false, Buffer.from('x'), false);\n"
+        "process.stdout.write(JSON.stringify(o));")
+    assert out["allowed"]["branch"] == "renderable" and out["allowed"]["button"] == ""
+    assert out["refused"]["branch"] is None and out["refused"]["button"] == "none"
+    assert out["picture"]["minted"] == ["image/png"] and out["picture"]["button"] == "none"
+    for r in out.values():
+        assert r["urls"] and all(u.endswith("/preview") for u in r["urls"]), r["urls"]
