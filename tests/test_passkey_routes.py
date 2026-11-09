@@ -158,6 +158,24 @@ def _clean_overrides():
 
 # --------------------------------------------------------------------------- registration
 
+def test_a_passkey_is_registered_only_by_its_own_account(monkeypatch):
+    """No route registers a passkey for someone else, and the options always name the caller's own account as the
+    key's user: an administrator adds nothing to another account's keys."""
+    root = _user("root", role="admin")
+    h = RouteHarness(monkeypatch, root) if False else Harness(monkeypatch, root)
+    other = uuid.uuid4()
+    for path in (f"/users/{other}/passkeys/register/options", f"/users/{other}/passkeys/register/verify"):
+        status, body = _call(h.S, "POST", path, {"current_password": "pw"})
+        assert status in (404, 405), (path, status, body)
+    status, body = _call(h.S, "POST", "/users/me/passkeys/register/options", {"current_password": "pw"})
+    assert status == 200, body
+    from app.services import webauthn_service as ws
+    import base64
+    handle = body["options"]["publicKey"]["user"]["id"]
+    assert base64.urlsafe_b64decode(handle + "=" * (-len(handle) % 4)) == ws.user_handle_for(root.id)
+    assert body["options"]["publicKey"]["user"]["name"] == "root"
+
+
 def test_a_first_passkey_is_proved_by_the_password_and_registered_end_to_end(monkeypatch):
     h = Harness(monkeypatch, _user())
     status, body = _call(h.S, "POST", "/users/me/passkeys/register/options", {})

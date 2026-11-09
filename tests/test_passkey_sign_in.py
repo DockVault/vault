@@ -31,6 +31,9 @@ def _api():
 class DB(MemoryDB):
     def add(self, obj):
         super().add(obj)
+        # A row gets its id as a flush would give it (the model's default), so a token can name it.
+        if getattr(obj, "id", None) is None and hasattr(type(obj), "id"):
+            obj.id = uuid.uuid4()
         self.rows_of(type(obj)).append(obj)
 
 
@@ -251,6 +254,75 @@ def test_an_administrator_always_adds_the_password(monkeypatch):
     (pending,) = h.db.rows_of(PendingLogin)
     assert pending.user_id == root.id
     assert h.audits == [] or all(a[0] != "success" for a in h.audits)
+    # A wrong password at that stage counts against the account's lockouts like one typed at the form, and
+    # against the pending login's own cap; the token is still usable until the cap.
+    from app.core import security
+    monkeypatch.setattr(security, "verify_password", lambda plain, hashed: plain == "pw" and hashed == "x")
+    from app.services import auth_service as A
+    monkeypatch.setattr(A, "verify_password", lambda plain, hashed: plain == "pw" and hashed == "x")
+    from app.core import sign_in_lockout
+    # The memory store has no advisory lock and no lockout rows: the lockouts' own writes are stand-ins here; what
+    # the pin wants is that the stage goes through the service, which counts a wrong password against the account.
+    for name in ("take_turn", "end_administrators_open_locks", "clear_after_success"):
+        monkeypatch.setattr(sign_in_lockout, name, lambda *a, **k: None)
+    monkeypatch.setattr(sign_in_lockout, "release_expired", lambda *a, **k: 0)
+    monkeypatch.setattr(sign_in_lockout, "phantom_attempt", lambda *a, **k: None)
+    headers = {"Authorization": f"Bearer {body['pre_auth_token']}"}
+    status, wrong = _call_h(h.S, "POST", "/auth/login", {"username": "root", "password": "nope"}, headers)
+    assert status == 401, wrong
+    assert h.counted == ["root"] and pending.attempts == 1 and pending.consumed_at is None
+    status, right = _call_h(h.S, "POST", "/auth/login", {"username": "root", "password": "pw"}, headers)
+    assert status == 200 and "access_token" in right, right
+    assert _claims(right["access_token"])["amr"] == ["hwk", "pwd"] and pending.consumed_at is not None
+
+
+def test_a_key_registered_at_another_address_is_refused_and_kept(monkeypatch):
+    """The relying-party id is the public address's host: a key made at one address never signs in at another, and
+    the rows stay (a host name change strands them until it is changed back; nothing is deleted)."""
+    alice = _user()
+    h = Harness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(rp_id="other.example.test",
+                                                                          origin="https://other.example.test", name="DockVault"))
+    status, body = h.sign_in(auth, username="alice")
+    assert status == 401 and "access_token" not in body, body
+    assert h.failures and row.retired_at is None and h.db.rows_of(type(row)) == [row]
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(rp_id=RP_ID, origin=ORIGIN, name="DockVault"))
+    status, body = h.sign_in(auth, username="alice", sign_count=2)
+    assert status == 200 and "access_token" in body, body
+
+
+def _call_h(S, method, path, body=None, headers=None):
+    """The module's caller, with headers."""
+    import json
+    from _async_run import run_coroutine
+    out = {}
+
+    async def _drive():
+        hdrs = [(b"content-type", b"application/json")]
+        for k, v in (headers or {}).items():
+            hdrs.append((k.lower().encode(), v.encode()))
+        scope = {"type": "http", "http_version": "1.1", "method": method, "path": path, "raw_path": path.encode(),
+                 "query_string": b"", "headers": hdrs, "client": ("203.0.113.9", 1234), "server": ("testserver", 80),
+                 "scheme": "https"}
+        payload = json.dumps(body).encode() if body is not None else b""
+        chunks = []
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        async def send(msg):
+            if msg["type"] == "http.response.start":
+                out["status"] = msg["status"]
+            elif msg["type"] == "http.response.body":
+                chunks.append(msg.get("body", b""))
+
+        await S.app(scope, receive, send)
+        out["body"] = json.loads(b"".join(chunks) or b"null")
+
+    run_coroutine(_drive(), timeout=30)
+    return out["status"], out["body"]
 
 
 def test_an_auditor_and_a_key_without_user_verification_add_the_password(monkeypatch):
