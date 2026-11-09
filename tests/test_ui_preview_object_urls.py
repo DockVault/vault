@@ -63,16 +63,22 @@ def _preview(page: Page, vault_id: str, name: str, mime: str, content: bytes) ->
     return media.get_attribute("src") or ""
 
 
-def _minted_type(page: Page, address: str) -> str:
-    return page.evaluate("async (u) => (await (await fetch(u)).blob()).type", address)
-
-
 def _open_alone(page: Page, address: str):
     """Open an address in a new tab of the same browser, as a person pasting it would."""
     tab = page.context.new_page()
     tab.goto(address, wait_until="load", timeout=10000)
     tab.wait_for_timeout(500)
     return tab
+
+
+def _minted_type(page: Page, address: str) -> str:
+    """The type the browser gives the address's document when it is opened on its own. (The page's
+    own CSP refuses a fetch() of a blob: address, so the type is read from the opened document.)"""
+    tab = _open_alone(page, address)
+    try:
+        return tab.evaluate("() => document.contentType")
+    finally:
+        tab.close()
 
 
 def _control(page: Page):
@@ -83,6 +89,7 @@ def _control(page: Page):
     tab = _open_alone(page, address)
     try:
         assert tab.title() == RAN, "control: this browser no longer runs an XHTML object URL"
+        assert tab.evaluate("() => document.contentType") == "application/xhtml+xml"
         assert tab.evaluate("() => location.origin") == page.evaluate("() => location.origin")
     finally:
         tab.close()
