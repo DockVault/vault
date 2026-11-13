@@ -10,6 +10,8 @@ as a status), and once the page is ready it is sent, once, with what the fields 
 These tests hold app.js back (a route that is not answered) to make the page slow, in both skins, at desktop
 and at phone width.
 """
+from urllib.parse import parse_qsl, unquote, urlsplit
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -18,6 +20,33 @@ pytestmark = pytest.mark.ui
 PHONE = {"width": 390, "height": 844}
 DESKTOP = {"width": 1280, "height": 800}
 NOTE = "The page is still loading. You will be signed in as soon as it is ready."
+
+
+def _typed_in_address(url: str, username: str, password: str) -> bool:
+    """Whether something typed into the sign-in form is in ``url`` the way a form sent by the browser itself
+    puts it there: as the value of a parameter of the query or of the fragment. The password, which nothing
+    else is called, counts anywhere in the address. A route whose own name holds the same letters as the
+    username (/admin/... for the administrator "admin") is not something typed."""
+    parts = urlsplit(url)
+    values = [v for _k, v in parse_qsl(parts.query, keep_blank_values=True)]
+    values += [v for _k, v in parse_qsl(parts.fragment, keep_blank_values=True)]
+    return password in unquote(url) or username in values or password in values
+
+
+@pytest.mark.parametrize("url, found", [
+    ("http://vault.test/?username=admin&password=The-Pass-1", True),     # the form sent as a GET
+    ("http://vault.test/?username=admin", True),
+    ("http://vault.test/users/me?as=admin", True),
+    ("http://vault.test/#username=admin", True),
+    ("http://vault.test/files/The-Pass-1", True),
+    ("http://vault.test/x?p=The%2DPass%2D1", True),
+    ("http://vault.test/admin/get-started", False),
+    ("http://vault.test/admin/credential-requests?limit=5", False),
+    ("http://vault.test/static/js/admin.js?v=20260101a", False),
+    ("http://vault.test/users/search?q=administrator", False),
+])
+def test_what_counts_as_something_typed_in_an_address(url, found):
+    assert _typed_in_address(url, "admin", "The-Pass-1") is found
 
 
 class _SlowPage:
@@ -117,8 +146,8 @@ def test_a_sign_in_sent_while_the_page_loads_is_held_said_so_and_sent_once(page:
     page.wait_for_timeout(1000)
     assert len(s.logins) == 1, s.logins
     assert admin_creds["password"] in s.logins[0], "the sign-in sent was not the one typed"
-    typed = (admin_creds["username"], admin_creds["password"])
-    assert [u for u in s.urls if any(t in u for t in typed)] == [], "something typed went into an address"
+    leaked = [u for u in s.urls if _typed_in_address(u, admin_creds["username"], admin_creds["password"])]
+    assert leaked == [], "something typed went into an address"
     assert page.url.split("#")[0] == s.home
 
 
