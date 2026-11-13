@@ -1027,7 +1027,8 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
     2. The renewal takes the account's turn at its sessions (``_sessions_turn``, which every revocation of an
        account's sessions takes too) and reads the old session under it, locked. A session that has ended, or is
        not this account's, is refused here with nothing made.
-    3. In that same transaction the new session row is made and the old one is ended, and both are committed
+    3. In that same transaction the new session row is made, what the old one remembers of an identity
+       provider's sign-in moves to it (``carry_renewed_provider_session``) and the old one is ended, all committed
        together. Nothing sees the old session ended with the new one not yet there, or the new one while the old
        still stands. A revocation of the account's sessions (a password change, a sign-out everywhere) comes wholly
        before the renewal, which then finds its session ended and makes nothing, or wholly after it, and ends the
@@ -1058,6 +1059,7 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
         auth = AuthService(db)
         new_session = auth._create_session(user, None, client_ip, expires_at=now + SESSION_ROW_LIFETIME,
                                            channel=auth.WEB, commit=False)
+        carry_renewed_provider_session(db, old_row, new_session)
         # Ends the old session and commits: the new session and the old one's end become visible together.
         _row, ended = api._end_web_session(db, old_session, user_id=user_id)
     except BaseException:
@@ -1096,7 +1098,13 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
     proofs were written on it names none and was made with the password: it is read as one.
 
     A role that must hold a passkey, past its grace, with none on the account: the next sign-in stops at the
-    enrollment, so the renewal is refused, whatever the old token shows (a passkey it was made with is gone)."""
+    enrollment, so the renewal is refused, whatever the old token shows (a passkey it was made with is gone).
+
+    An account that signs in only through its identity provider, with a session that did not come through one
+    (made before the account became provider-only): refused, with what to use instead. A session that came through
+    a provider (the token's ``idp``) is renewed only while that sign-in could be made again: the identity still
+    linked, the provider turned on, no refusal by the provider in force and its freshness window not run out
+    (``sso_sign_in.renewal_refusal``)."""
     from app.api import api_server as api
     proofs = old.get("amr")
     methods = ({PASSWORD} if proofs is None
@@ -1110,6 +1118,36 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
     if api._passkey_requirement(db, user).overdue:
         raise HTTPException(status_code=403, detail=(
             "Your role must hold a passkey now. Sign in again: you will be asked to add one."))
+    provider_id = old.get("idp")
+    if not provider_id:
+        if getattr(user, "sso_only", False):
+            from app.core import sso_only
+            raise HTTPException(status_code=403, detail=sso_only.provider_only_message(db, user))
+        return
+    from app.services import sso_sign_in
+    sentence = sso_sign_in.renewal_refusal(db, user, provider_id)
+    if sentence:
+        raise HTTPException(status_code=403, detail=sentence)
+
+
+def carry_renewed_provider_session(db, old_row, new_session: str) -> None:
+    """The new session of a renewal takes over what the old one remembers of the provider's sign-in: the provider's
+    session id and subject (so the provider's back-channel logout finds the new session), its authentication time
+    and the logout hint, which the old session gives up (once ended it makes no provider logout). Written in the
+    renewal's own transaction and not committed here: the record moves with the session, so a logout that names
+    the provider's session finds the live one, whichever of the two that is. Raises when the record is there and
+    cannot be copied: the renewal fails as a whole and the old session stands."""
+    if old_row is None or not table_present(db, "sso_sessions"):
+        return
+    from app.core.models import ActiveSession, SsoSession
+    kept = db.query(SsoSession).filter(SsoSession.session_id == old_row.id).first()
+    if kept is None:
+        return
+    new_row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(new_session)).first()
+    db.add(SsoSession(session_id=new_row.id, provider_id=kept.provider_id, idp_sid=kept.idp_sid,
+                      idp_sub=kept.idp_sub, auth_time=kept.auth_time, id_token_enc=kept.id_token_enc))
+    kept.id_token_enc = None
+    db.flush()
 
 
 def read_password_stage(payload: Optional[dict], db):

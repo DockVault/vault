@@ -1024,7 +1024,8 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
     # A verified token whose groups leave the person out ends their access.
     assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
     assert identity.refused_at is not None
-    assert h.revoked == [{"user_id": alice.id, "actor_username": "system", "durable": True}]
+    # Twice: the look that ends the sessions, and a second one once the refusal is committed.
+    assert h.revoked == [{"user_id": alice.id, "actor_username": "system", "durable": True}] * 2
     assert ("sso_access_ended_by_refusal", "success",
             {"provider_id": str(p.id), "identity_id": str(identity.id), "sessions": 2}) in h.audits
     assert ("sso_sign_in_refused", "failure",
@@ -1041,6 +1042,27 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
     assert location.startswith("/#sso="), location
     assert h.finish(location)[0] == 200
     assert F.lapsed(h.db, alice.id) is None
+
+
+def test_a_refusal_looks_for_the_accounts_sessions_again_once_it_is_committed(monkeypatch):
+    """A renewal ("Stay signed in") under way while the refusal ran may commit its new session after the refusal's
+    look. The refusal is committed first, so a renewal that has not made its session yet refuses itself, and then
+    the account's sessions are asked for once more; what that look ends is committed too."""
+    h, alice, root, p, identity, callback_with = _refusal_world(monkeypatch)
+    order = []
+    monkeypatch.setattr(h.S, "_revoke_sessions",
+                        lambda db, **kw: order.append(("revoke", identity.refused_at is not None)) or 1)
+    real_commit = h.db.commit
+
+    def commit():
+        order.append(("commit", identity.refused_at is not None))
+        return real_commit()
+    monkeypatch.setattr(h.db, "commit", commit)
+    assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
+    looks = [i for i, (what, _) in enumerate(order) if what == "revoke"]
+    assert len(looks) == 2
+    assert ("commit", True) in order[looks[0] + 1:looks[1]], order
+    assert ("commit", True) in order[looks[1] + 1:], order
 
 
 def test_a_refusal_ends_nothing_when_the_option_is_off_or_the_subject_is_nobodys(monkeypatch):

@@ -325,12 +325,13 @@ def test_a_second_factor_the_account_now_needs_is_shown_by_the_tokens_methods_or
 # --------------------------------------------------------------------------- the records
 
 def test_the_renewal_is_recorded_once_and_the_old_token_is_refused_for_the_rest_of_its_life(db, denylisted):
-    user, old = _signed_in(db, amr=["pwd", "totp"], mfa_at=123, idp="the-provider")
+    # (A session that came through an identity provider is renewed by that provider's rules: its own tests.)
+    user, old = _signed_in(db, amr=["pwd", "totp"], mfa_at=123)
     renewed = sign_in.renew(db, user, old, client_ip="203.0.113.9")
     claims = jwt.decode(renewed.access_token, options={"verify_signature": False})
     # How the person signed in travels unchanged; the sign-in time is the original one.
-    assert (claims["amr"], claims["mfa_at"], claims["idp"], claims["auth_time"]) == (
-        ["pwd", "totp"], 123, "the-provider", old["auth_time"])
+    assert (claims["amr"], claims["mfa_at"], claims["auth_time"]) == (["pwd", "totp"], 123, old["auth_time"])
+    assert "idp" not in claims
     assert renewed.expires_at > datetime.now(timezone.utc)
     # The old token is denylisted for what is left of its life (about a minute here), never the new one.
     assert len(denylisted) == 1 and denylisted[0][0] == OLD and 0 < denylisted[0][1] <= 60
@@ -353,6 +354,17 @@ def test_what_the_person_proved_in_the_old_session_is_carried_once_the_renewal_i
     monkeypatch.setattr(api, "_carry_session_marks", carry)
     sign_in.renew(db, user, old, client_ip="127.0.0.1")
     assert seen == [[(False, False), (True, True)]]
+
+
+def test_a_session_that_names_a_provider_nothing_vouches_for_is_not_renewed(db):
+    """This database has no identity provider tables: a token that says it came through one is refused, not waved
+    through."""
+    user, old = _signed_in(db, idp="3f0e9c3a-5d0e-4b53-9d6e-0f6f4c0d7a11")
+    with pytest.raises(HTTPException) as refused:
+        sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    assert refused.value.status_code == 403 and "no longer linked" in refused.value.detail
+    rows = _rows(db)
+    assert len(rows) == 1 and not rows[0].revoked
 
 
 def test_the_route_hands_the_renewal_to_the_pipeline_off_the_event_loop(db, monkeypatch):

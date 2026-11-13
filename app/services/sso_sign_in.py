@@ -773,6 +773,37 @@ def reauth_offered(row) -> bool:
             and isinstance(last_test, dict) and last_test.get("auth_time_present") is True)
 
 
+def renewal_refusal(db, user, provider_id) -> Optional[str]:
+    """Why a session that came through the provider ``provider_id`` (its token's ``idp``) is not renewed, as the
+    sentence the sign-in screen shows, or None when it may be. A renewal keeps the provider's sign-in going, so it
+    needs what that sign-in would need now: the identity still linked, the provider turned on, no refusal by the
+    provider in force and its freshness window not run out (app/services/sso_freshness.py). A record that cannot be
+    read (no such provider, a database without the tables) is a refusal: nothing vouches for the session."""
+    import uuid
+    from app.core.models import ExternalIdentity, SsoProvider
+    from app.services import sign_in, sso_freshness
+    unlinked = ("Your account is no longer linked to the identity provider this sign-in came through. Sign in again.")
+    try:
+        row_id = uuid.UUID(str(provider_id))
+    except (TypeError, ValueError):
+        return unlinked
+    if not (sign_in.table_present(db, "external_identities") and sign_in.table_present(db, "sso_providers")):
+        return unlinked
+    identity = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row_id,
+                                                 ExternalIdentity.user_id == user.id).first()
+    if identity is None:
+        return unlinked
+    provider = db.query(SsoProvider).filter(SsoProvider.id == row_id).first()
+    name = ((getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
+            or "your identity provider")
+    if provider is None or getattr(provider, "state", None) != "enabled":
+        return f"Signing in through {name} is turned off. Sign in again another way, or ask an administrator."
+    found = sso_freshness.deadline_of(identity, provider)
+    if found is not None and (found.refused or found.due <= datetime.utcnow()):
+        return f"Sign in through {name} again to stay signed in."
+    return None
+
+
 def provider_logout_url(db, session_row) -> Optional[str]:
     """Where the browser goes after a vault sign-out when the session's provider wants its own logout: the
     provider's end-session address with the ID token as the hint and the vault's sign-in page to come back to.

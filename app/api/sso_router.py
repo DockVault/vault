@@ -494,6 +494,11 @@ def _a_session_is_live(db, session_ids) -> bool:
         return True
 
 
+# How many more times a back-channel logout asks which sessions the provider's token names, after ending the ones it
+# first found: each further look is made only while the one before found a session it had not seen.
+BACKCHANNEL_MORE_LOOKS = 3
+
+
 @router.post("/auth/sso/{provider_id}/backchannel-logout")
 async def backchannel_logout(provider_id: str, request: Request, db: Session = Depends(get_db)):
     """Where the provider says a person signed out of it (OpenID Connect back-channel logout, a form with
@@ -619,6 +624,24 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         if session_ids and _a_session_is_live(db, session_ids):
             sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
         log.warning("sso back-channel logout commit failed: %s", type(exc).__name__)
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": "revocation_failed"})
+        return failed
+    # A renewal ("Stay signed in") makes its new session, with the provider's session copied to it, before it ends
+    # the old one. One that was under way while this ran may have committed a session the look above could not
+    # see, so the question is asked again, until a look finds nothing new.
+    try:
+        for _look in range(BACKCHANNEL_MORE_LOOKS):
+            more = [s.session_id for s in query.all() if s.session_id not in session_ids]
+            if not more:
+                break
+            ended += api._revoke_sessions(db, session_ids=more, actor_username="provider logout", durable=True)
+            db.commit()
+            session_ids = session_ids + more
+    except Exception as exc:  # noqa: BLE001 -- the sessions first seen are ended; the provider's retry ends the rest
+        db.rollback()
+        sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
+        log.warning("sso back-channel logout second look failed: %s", type(exc).__name__)
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": "revocation_failed"})
         return failed

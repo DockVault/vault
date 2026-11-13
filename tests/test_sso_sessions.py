@@ -552,6 +552,101 @@ def test_a_logout_that_could_not_be_applied_does_not_spend_the_token(monkeypatch
     assert status == 200 and not [s for s in h.active_sessions() if s.is_active], body
 
 
+def _renewal_made_meanwhile(h, user, like):
+    """A session a renewal committed while a logout ran: a new session row with the provider's session copied."""
+    from app.core.models import ActiveSession, SsoSession
+    new = ActiveSession(session_token=uuid.uuid4().hex, user_id=user.id, ip_address="127.0.0.1")
+    h.db.add(new)
+    h.db.add(SsoSession(session_id=new.id, provider_id=like.provider_id, idp_sid=like.idp_sid, idp_sub=like.idp_sub,
+                        auth_time=like.auth_time, id_token_enc=None))
+    return new
+
+
+def test_a_logout_looks_again_for_a_session_a_renewal_made_while_it_ran(monkeypatch):
+    """A renewal ("Stay signed in") makes its new session, with the provider's session copied to it, before it ends
+    the old one. A logout whose first look came before that session was committed asks again after ending what it
+    found, and ends the new session too."""
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    old, kept = h.active_sessions()[0], h.sso_sessions()[0]
+    through = h.S._revoke_sessions
+    late = []
+
+    def revoke(db, **kw):
+        out = through(db, **kw)
+        if not late:
+            late.append(_renewal_made_meanwhile(h, alice, kept))
+        return out
+    monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
+    status, body = h.logout(p, h.logout_token(sid="s-1", sub="subject-1"))
+    assert (status, body) == (200, {})
+    assert late[0].is_active is False and late[0].revoked is True and old.is_active is False
+    assert [kw["session_ids"] for kw in h.revoked] == [[old.id], [late[0].id]]
+    assert any(a[0] == "sso_backchannel_logout" and a[1] == "success" and a[2]["sessions"] == 2 for a in h.audits), h.audits
+
+
+def test_a_logout_stops_looking_after_a_few_looks_and_with_nothing_new_asks_once_more_only(monkeypatch):
+    from app.api import sso_router
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    kept = h.sso_sessions()[0]
+    # Nothing new: the sessions are asked for once more and nothing more is ended.
+    asked = []
+    real_query = h.db.query
+
+    def query(*entities):
+        asked.append(entities)
+        return real_query(*entities)
+    monkeypatch.setattr(h.db, "query", query)
+    status, _ = h.logout(p, h.logout_token(sid="s-1", sub="subject-1"))
+    assert status == 200 and len(h.revoked) == 1
+    monkeypatch.setattr(h.db, "query", real_query)
+    # A session appearing at every look (it cannot happen: a renewal comes once a session): the looks are bounded.
+    _signed_in(h, p, sid="s-2")
+    kept = [r for r in h.sso_sessions() if r.idp_sid == "s-2"][0]
+    h.revoked.clear()
+    through = h.S._revoke_sessions
+
+    def revoke(db, **kw):
+        out = through(db, **kw)
+        _renewal_made_meanwhile(h, alice, kept)
+        return out
+    monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
+    status, _ = h.logout(p, h.logout_token(sid="s-2", sub="subject-1"))
+    assert status == 200 and len(h.revoked) == 1 + sso_router.BACKCHANNEL_MORE_LOOKS
+
+
+def test_a_second_look_that_fails_does_not_spend_the_token(monkeypatch):
+    """The sessions first found are ended; the look after them fails. The answer is 501 and the token's id is
+    forgotten, so the provider's retry ends the session the renewal made."""
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    old, kept = h.active_sessions()[0], h.sso_sessions()[0]
+    token = h.logout_token(sid="s-1", sub="subject-1")
+    through = h.S._revoke_sessions
+    calls, late = [], []
+
+    def revoke(db, **kw):
+        calls.append(kw)
+        if len(calls) == 2:
+            raise RuntimeError("the database went away")
+        out = through(db, **kw)
+        if not late:
+            late.append(_renewal_made_meanwhile(h, alice, kept))
+        return out
+    monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
+    status, body = h.logout(p, token)
+    assert (status, body) == (501, {"error": "logout_failed"})
+    assert old.is_active is False and late[0].is_active is True
+    assert any(a[0] == "sso_backchannel_logout" and a[1] == "failure" and a[2].get("reason") == "revocation_failed"
+               for a in h.audits), h.audits
+    status, body = h.logout(p, token)
+    assert status == 200 and late[0].is_active is False
+
+
 def test_a_commit_that_fails_spends_the_token_only_when_the_logout_took_effect(monkeypatch):
     """A failed commit may still have reached the database. The token is forgotten (the provider's retry works) only
     when a session it named is still live; when they are all ended, it stays spent, so a replay cannot end sessions
