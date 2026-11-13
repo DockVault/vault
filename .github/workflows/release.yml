@@ -60,8 +60,10 @@ jobs:
             --repository-owner "$REPOSITORY_OWNER" \
             --github-output "$GITHUB_OUTPUT"
 
-  # Every job of the Tests workflow, not one of them: the full suite and the configuration
-  # scenarios run there as two jobs on two stacks, and this call succeeds only when both have.
+  # Every job of the Tests workflow, not one of them: the suite runs there as the offline lane and
+  # six shards on six stacks, joined by a job that checks every test ran exactly once, beside the
+  # configuration scenarios on a stack of their own, and this call succeeds only when all of them
+  # have.
   tests:
     name: Required full Docker integration
     needs: validate

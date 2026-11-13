@@ -60,13 +60,19 @@ _SCENARIO_STEPS = (
 _LAST_SETUP_STEP = "Verify Chromium launches against the API"
 
 
-def test_preflight_blocks_expensive_integration_work():
-    caller = _WORKFLOW.split("  preflight:", 1)[1].split("  integration:", 1)[0]
-    integration = _WORKFLOW.split("  integration:", 1)[1]
+def test_preflight_comes_before_the_scenarios_and_the_suite_report_needs_it():
+    """Strict collection and the offline lane run in preflight, with no stack and no browser. The
+    scenarios wait for it. The shards do not: they start beside it, so a shard's failure is known in
+    about half an hour whatever the offline lane does. Nothing passes without preflight for that:
+    the job that reports on the suite needs it, takes the collected count from it, and reads the
+    offline lane's report."""
+    jobs = yaml.safe_load(_WORKFLOW)["jobs"]
 
-    assert "uses: ./.github/workflows/preflight.yml" in caller
+    assert jobs["preflight"]["uses"] == "./.github/workflows/preflight.yml"
+    assert jobs["scenarios"]["needs"] == "preflight"
+    assert "needs" not in jobs["integration"]
+    assert "preflight" in jobs["suite-report"]["needs"]
     assert "workflow_call:" in _PREFLIGHT
-    assert "needs: preflight" in integration
     assert "--collect-only -q" in _PREFLIGHT
     assert '-m "unit and not docker" --maxfail=1' in _PREFLIGHT
     assert "docker compose" not in _PREFLIGHT
@@ -75,16 +81,17 @@ def test_preflight_blocks_expensive_integration_work():
 
 def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
     """The reconfiguring scenarios (six then) used to follow the suite in one job and one 60-minute cap,
-    which the suite plus 0.33.0's new tests would have run out. They now run in a second job, beside
-    the suite, on a stack of their own. What must hold for that to be the same check, not a weaker one:
+    which the suite plus 0.33.0's new tests would have run out. They now run in a job of their own,
+    beside the suite's shards, on a stack of their own. What must hold for that to be the same check,
+    not a weaker one:
 
-    - both jobs build the stack with the same setup, step for step, so a scenario still starts
-      from the stack the suite runs on;
-    - every scenario is in the new job and none is left behind in the suite's;
-    - both jobs need only preflight (in parallel, not one after the other) and neither can be
-      skipped, because a release publishes only when every job of this workflow succeeded;
+    - a shard and the scenarios build the stack with the same setup, step for step, so a scenario
+      still starts from the stack the suite runs on;
+    - every scenario is in the scenarios' job and none is left behind in a shard;
+    - neither job can be skipped, because a release publishes only when every job of this workflow
+      succeeded, and neither waits for the other;
     - each job keeps its own logs, teardown and uniquely named failure pictures;
-    - the suite's cap is 240 minutes.
+    - a shard's cap is 60 minutes.
     """
     import yaml
 
@@ -92,10 +99,10 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
     suite, scenarios = jobs["integration"], jobs["scenarios"]
 
     for job in (suite, scenarios):
-        assert job["needs"] == "preflight"
         assert "if" not in job                   # a skipped job counts as passed for publication
         assert job["runs-on"] == "ubuntu-latest"
-    assert suite["timeout-minutes"] == 240
+    assert "needs" not in suite and scenarios["needs"] == "preflight"
+    assert suite["timeout-minutes"] == 60
     assert 15 <= scenarios["timeout-minutes"] <= 45
 
     def names(job):
@@ -112,18 +119,17 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
     assert scenario_names[cut_scenarios:cut_scenarios + len(_SCENARIO_STEPS)] == list(_SCENARIO_STEPS)
     for name in _SCENARIO_STEPS:
         assert name not in suite_names
-    # The suite, its report and its count audit stay in the suite's job only.
+    # The shard's tests and its report stay in the shard's job only, straight after the setup.
     for name in (
-        "Run the full test suite",
-        "Keep the test report (durations + results)",
-        "Audit the successful full report",
+        "Run this shard of the suite",
+        "Keep the shard's report (durations + results)",
     ):
         assert name in suite_names and name not in scenario_names
-    assert suite_names[cut_suite:cut_suite + 3] == [
-        "Run the full test suite",
-        "Keep the test report (durations + results)",
-        "Audit the successful full report",
+    assert suite_names[cut_suite:cut_suite + 2] == [
+        "Run this shard of the suite",
+        "Keep the shard's report (durations + results)",
     ]
+    assert len(suite_names) == cut_suite + 5
 
     # Each job ends by keeping its failure picture and logs, then tearing its own stack down.
     artifacts = []
@@ -142,8 +148,13 @@ def test_the_configuration_scenarios_run_in_their_own_job_on_the_same_stack():
             s["with"]["name"] for s in job["steps"]
             if s.get("uses", "").startswith("actions/upload-artifact@")
         ]
-    # Artifact names are unique within a run: a second upload under a taken name fails its step.
-    assert len(artifacts) == len(set(artifacts)) == 3
+    # Artifact names are unique within a run: a second upload under a taken name fails its step. The
+    # shards are one job run six times, so each of their names carries the shard's number.
+    assert artifacts == [
+        "lane-results-shard-${{ matrix.shard }}",
+        "ui-failure-screenshots-shard-${{ matrix.shard }}",
+        "ui-failure-screenshots-scenarios",
+    ]
 
 
 def _size_step_run() -> str:
@@ -166,7 +177,7 @@ def test_the_size_accounting_runs_once_more_without_the_storage_ceiling():
     removes the line, recreates the API, refuses to go on while the deployment still has a maximum or a live
     limit, runs tests/test_vault_size_accounting.py with a report, and puts the ceiling back after it."""
     for job in ("integration", "scenarios"):
-        assert 'echo "MAX_STORAGE_GB=64"' in _job_text(job, "scenarios" if job == "integration" else None)
+        assert 'echo "MAX_STORAGE_GB=64"' in _job_text(job, "scenarios" if job == "integration" else "suite-report")
     run = _size_step_run()
     removed = run.index("sed -i '/^MAX_STORAGE_GB=/d' .env\n")
     recreated = run.index("docker compose up -d --force-recreate vault-api\n", removed)
@@ -314,10 +325,10 @@ def test_fast_host_pytest_job_installs_the_cross_platform_locked_environment():
         (_PREFLIGHT, "python -m pytest --collect-only -q"),
         (
             _job_text("integration", "scenarios"),
-            "python -m pytest --maxfail=1 --junitxml=pytest-results.xml",
+            "python -m pytest @shard-files.txt",
         ),
         (
-            _job_text("scenarios", None),
+            _job_text("scenarios", "suite-report"),
             "python -m pytest tests/test_transfer_admission_live.py",
         ),
     ],
@@ -354,9 +365,12 @@ def test_linux_host_pytest_jobs_layer_the_hash_locked_production_environment(
 
 def test_full_suite_exit_and_result_count_are_authoritative():
     assert "|| true" not in _WORKFLOW
-    assert "python -m pytest --maxfail=1 --junitxml=pytest-results.xml" in _WORKFLOW
+    assert ('python -m pytest @shard-files.txt -m "not (unit and not docker)" --maxfail=25 '
+            "--junitxml=suite-results.xml") in _WORKFLOW
     assert '--expected-total "${{ needs.preflight.outputs.test-count }}"' in _WORKFLOW
     assert "MIN_TESTS_ACTUALLY_RUN" not in _WORKFLOW
+    # No step of the suite's jobs or of the Fast lanes may fail without failing its job.
+    assert "continue-on-error" not in _WORKFLOW and "continue-on-error" not in _FAST_WORKFLOW
 
 
 def test_missing_services_and_browser_fail_closed():
@@ -367,7 +381,7 @@ def test_missing_services_and_browser_fail_closed():
     )
     browser_gate = _step(
         "Verify Chromium launches against the API",
-        "Run the full test suite",
+        "Run this shard of the suite",
     )
 
     assert "::error::Vault never reported healthy" in api_gate and "exit 1" in api_gate
@@ -384,11 +398,11 @@ def test_disposable_ci_enables_outage_and_same_commit_guards():
 
 def test_the_full_suite_runs_the_streaming_sftp_tests_and_nothing_else_changes():
     """tests/test_sftp_streaming_upload.py is skipped unless VAULT_SFTP_STREAMING=1, and CI never set it,
-    so the streaming upload tests never ran there. The full suite's command sets it, after the SFTP
+    so the streaming upload tests never ran there. Each shard's command sets it, after the SFTP
     container says it streams (the shipped default); nothing else in the workflow sees it: not a job's or
     a step's env, not GITHUB_ENV, not another command."""
     jobs = yaml.safe_load(_WORKFLOW)["jobs"]
-    [step] = [s for s in jobs["integration"]["steps"] if s.get("name") == "Run the full test suite"]
+    [step] = [s for s in jobs["integration"]["steps"] if s.get("name") == "Run this shard of the suite"]
     assert "env" not in step
     lines = [line.strip() for line in step["run"].splitlines() if line.strip()]
     assert lines == [
@@ -396,8 +410,9 @@ def test_the_full_suite_runs_the_streaming_sftp_tests_and_nothing_else_changes()
         "streaming=\"$(docker compose exec -T vault-sftp python -c 'from app.core.config import Settings; "
         "print(Settings().sftp_streaming_upload)')\"",
         'test "$streaming" = "True"',
-        "VAULT_SFTP_STREAMING=1 python -m pytest --maxfail=1 --junitxml=pytest-results.xml "
-        "-o faulthandler_timeout=300",
+        "python .github/scripts/suite_shards.py files --shard ${{ matrix.shard }} > shard-files.txt",
+        'VAULT_SFTP_STREAMING=1 python -m pytest @shard-files.txt -m "not (unit and not docker)" '
+        "--maxfail=25 --junitxml=suite-results.xml -o faulthandler_timeout=300",
     ]
     commands = [line.strip() for line in _WORKFLOW.splitlines()
                 if "VAULT_SFTP_STREAMING" in line and not line.strip().startswith("#")]
@@ -413,13 +428,13 @@ def test_the_full_suite_runs_the_streaming_sftp_tests_and_nothing_else_changes()
 @pytest.mark.parametrize("given, answer", [(None, "True"), ("true", "True"), ("false", "False"),
                                            ("0", "False")])
 def test_the_streaming_check_reads_what_the_container_was_given(given, answer):
-    """The full suite's step asks the SFTP container whether it streams before it turns the streaming
+    """A shard's step asks the SFTP container whether it streams before it turns the streaming
     tests on. The question must read the environment, as the server does when it starts, or it can never
     say no: the module-level `settings` object holds the defaults until a server fills it in, so a check
     that read it answered True even with SFTP_STREAMING_UPLOAD=false. Here the step's own Python runs
     with each value, and a container given false must answer False (which then fails the step)."""
     jobs = yaml.safe_load(_WORKFLOW)["jobs"]
-    [step] = [s for s in jobs["integration"]["steps"] if s.get("name") == "Run the full test suite"]
+    [step] = [s for s in jobs["integration"]["steps"] if s.get("name") == "Run this shard of the suite"]
     [line] = [x.strip() for x in step["run"].splitlines() if x.strip().startswith("streaming=")]
     program = line.split("python -c '", 1)[1].rsplit("')\"", 1)[0]
     assert "'" not in program and program.startswith("from app.core.config import "), program
