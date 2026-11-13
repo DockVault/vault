@@ -1190,12 +1190,8 @@ def unlock_my_vault_names(vault_id: uuid.UUID, body: OwnerUnlock, request: Reque
 # refusal is recorded (case_access_refused) and answered with its reason: 404 where the answer would say whether
 # something exists that the caller may not see, 403 otherwise, 429 past the view rate.
 
-# Types a browser would run if one were ever opened as a page: their bytes are sent as text.
-# Types a browser would run as a document of the vault's own origin, or as a script: a case's file is served as
-# text under any of them, and under every other XML type (any type ending in +xml or /xml).
-_ACTIVE_TYPES = ("text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
-                 "text/xsl", "application/xslt+xml", "application/xml-dtd", "text/vtt", "multipart/x-mixed-replace",
-                 "text/javascript", "application/javascript", "application/ecmascript", "text/ecmascript")
+# A case's file is served as text under any type a browser would run as a document of the vault's own origin, or
+# as a script. Which types those are is the server's one list of them (app/api/api_server.py _browser_runs).
 _CONTENT_CSP = "default-src 'none'; sandbox"
 
 
@@ -1263,12 +1259,9 @@ def case_file_info(case_id: uuid.UUID, file_id: uuid.UUID, request: Request,
 
 
 def _content_type(mime: Optional[str]) -> str:
-    from app.api.api_server import _safe_media_type
+    from app.api.api_server import _browser_runs, _safe_media_type
     safe = _safe_media_type(mime)
-    essence = safe.split(";")[0].strip().lower()
-    if essence in _ACTIVE_TYPES or essence.endswith("+xml") or essence.endswith("/xml"):
-        return "text/plain; charset=utf-8"
-    return safe
+    return "text/plain; charset=utf-8" if _browser_runs(safe) else safe
 
 
 def _inline(name: Optional[str]) -> str:

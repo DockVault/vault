@@ -14373,7 +14373,9 @@ async def download_public_link(
     The access line keeps only the parameter's name, and the link's token in the path is masked; the
     page and this response send at most the origin in a Referer (_referrer_policy). A refusal of the
     query form is a small page the browser can show; the header form keeps the JSON body. The redeem
-    that minted the grant spent the link's use (see _serve_public_link_download)."""
+    that minted the grant spent the link's use (see _serve_public_link_download). The file is an
+    attachment, never under a type a browser runs: another page can name this address, but only to
+    have the file saved."""
     if x_download_grant is not None or grant is None:
         return await _serve_public_link_download(token, file_id, request, db, x_download_grant)
     try:
@@ -14523,8 +14525,13 @@ async def _serve_public_link_download(token, file_id, request, db, presented_gra
             "Content-Length": str(download.total_length),
             "Cache-Control": "no-store",
             "X-Robots-Tag": "noindex, nofollow",
+            # This address needs no sign-in, so any page can name it. The answer is never of a type a browser
+            # runs (_download_media_type), is not to be read as any other type, and runs nothing if it is
+            # ever opened as a page.
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": _NOTHING_RUNS_POLICY,
         }
-        media_type = _safe_media_type(mime_type)
+        media_type = _download_media_type(mime_type)
     except HTTPException:
         raise
     except asyncio.CancelledError:
@@ -20093,6 +20100,68 @@ def _safe_media_type(value: Optional[str]) -> str:
             return "application/octet-stream"
 
     return text
+
+
+# The types a browser runs, or applies to the page that names them, when it is handed one by its address. This is
+# the one list of them: a case's content route (app/api/compliance_router.py) reads it too.
+#
+#   Pages: HTML, a stream of parts each laid out as a page, and every XML type (a browser lays any of them out,
+#   and runs the script of an XHTML or SVG element inside). The XML types are also matched by their shape, in
+#   _browser_runs.
+#   What a page applies when it names it: a style sheet, a transform for an XML page, a text track, a compiled
+#   module, a bundle of responses.
+#   Scripts: the JavaScript MIME types of the WHATWG MIME Sniffing standard. Once sniffing is off they are the only
+#   types a script element runs, and with or without it the only ones a module, a worker or a service worker
+#   loads. With them, the two VBScript types Internet Explorer ran.
+#
+# A JSON type is not here, because a browser never runs one: a script element and a module import both refuse it,
+# and a JSON module (an import that says `with { type: "json" }`) is only parsed, as data for a script that is
+# already running. Nor is plain text, a PDF, a picture, a video or a sound: none of them is run, and once sniffing
+# is off none of them is taken for a script or a style sheet.
+_BROWSER_RUN_TYPES = frozenset({
+    "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml", "application/xml-dtd",
+    "multipart/x-mixed-replace",
+    "text/css", "text/xsl", "text/xslt", "application/xslt+xml", "text/vtt", "application/wasm",
+    "application/webbundle",
+    "application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript",
+    "text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+    "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript",
+    "text/x-ecmascript", "text/x-javascript",
+    "text/vbscript", "text/vbs",
+})
+_SCRIPT_LANGUAGE_NAMES = ("javascript", "ecmascript", "jscript", "livescript", "vbscript")
+_NOTHING_RUNS_POLICY = "default-src 'none'; sandbox"
+
+
+def _browser_runs(media_type: Optional[str]) -> bool:
+    """Whether a browser would run an answer sent under this type, or apply it to the page that names it.
+
+    A stored type is whatever its uploader wrote, so the list is not matched against the type alone. A listed
+    type counts wherever it stands in the value, a parameter included, since not every reader takes the type
+    from the same place; so does the name of a script language in a spelling the list does not have; and so
+    does every XML type, which is known by its shape rather than by a list (xml, or anything+xml).
+    """
+    value = (media_type or "").lower()
+    if any(listed in value for listed in _BROWSER_RUN_TYPES):
+        return True
+    if any(name in value for name in _SCRIPT_LANGUAGE_NAMES):
+        return True
+    subtype = value.partition(";")[0].strip().partition("/")[2]
+    return subtype == "xml" or subtype.endswith("+xml")
+
+
+def _download_media_type(value: Optional[str]) -> str:
+    """The type a stored file is sent under from an address that can be asked for without signing in.
+
+    Such an address can be named by any page: as the source of a script, a style sheet, a frame. A stored type
+    is what the file's uploader claimed, so under a type a browser runs, the file would run as part of this
+    origin for a page that named it, and a policy that lets a page take its scripts from this origin only
+    would let it through. Those types are sent as plain bytes instead. The file is saved under its own name
+    either way (the answer is an attachment), so a download does not change. Sniffing must be off on the
+    same answer (X-Content-Type-Options: nosniff): without it a script element would still run plain bytes.
+    """
+    safe = _safe_media_type(value)
+    return "application/octet-stream" if _browser_runs(safe) else safe
 
 
 def _content_disposition(file_name: str) -> str:

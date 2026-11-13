@@ -265,7 +265,13 @@ first use (single winner, like the OTP service), the `file_id` must lie inside t
 `require_scope` uses for temp credentials and share claims), and the response is built with
 `BoundedDownload` / `verified_stream` (`app/services/download_stream.py`) under a
 `transfer_admission` slot, exactly as the authenticated download is. `Content-Disposition` goes
-through the existing filename hardening. One redemption = one use = one grant = one download; a
+through the existing filename hardening. The address needs no sign-in, so any page can name it (as a
+script's source, a style sheet, a frame), and a stored MIME type is whatever its uploader claimed. A
+type a browser runs or applies (every JavaScript type, a style sheet, HTML, SVG and every other XML
+type, WebAssembly and the like: `_download_media_type`) is therefore sent as
+`application/octet-stream`; every answer is an attachment with `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: default-src 'none'; sandbox`. The file is saved under its own name either
+way. One redemption = one use = one grant = one download; a
 folder link therefore counts one use per file fetched (Q3 again). The redeem spends the use, so the
 download does not ask whether the link has a use left: a link capped at N delivers N downloads. A
 redeem whose conditional update finds the use already gone (a concurrent redeem took it) deletes the
