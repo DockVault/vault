@@ -469,6 +469,36 @@ def test_every_typed_answer_of_the_api_is_one_of_the_known_ones():
     assert {name: typed for name, typed in found.items() if typed} == TYPED_ANSWERS
 
 
+def _names_the_type_header(tree):
+    """Every expression that holds the name of the Content-Type header, as text or as bytes."""
+    def is_the_name(node):
+        return (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+                and node.value.lower() in ("content-type", b"content-type"))
+
+    return sorted(ast.unparse(node) for node in ast.walk(tree)
+                  if any(is_the_name(child) for child in ast.iter_child_nodes(node)))
+
+
+def test_no_answer_is_typed_outside_that_list_or_through_a_header_of_its_own():
+    """The list above reads the API's modules for answers that are given a type. Outside them one answer is, a
+    JSON one. And no answer anywhere has a Content-Type written into its headers, where it would take the place
+    of the type the answer was given and stand outside the list: the header is named in two places only, the
+    middleware reading the type of an answer, and the fixed JSON refusal of a request body that is too large."""
+    typed, named = {}, {}
+    for path in sorted((ROOT / "app").rglob("*.py")):
+        where = path.relative_to(ROOT / "app").as_posix()
+        if path.parent != API and _typed_answers(path):
+            typed[where] = _typed_answers(path)
+        found = _names_the_type_header(ast.parse(path.read_text(encoding="utf-8")))
+        if found:
+            named[where] = found
+    assert typed == {"core/response_hash_utils.py": ["'application/json'"]}
+    assert named == {
+        "api/api_server.py": ["response.headers.get('content-type', '')"],
+        "core/body_limit.py": ["(b'content-type', b'application/json')"],
+    }
+
+
 def test_the_two_pictures_typed_by_the_server_take_no_type_from_their_uploader():
     """The answers above that hold stored bytes and do not go through the rule: each is a picture an administrator
     uploaded, typed by the server from the picture's own bytes."""
