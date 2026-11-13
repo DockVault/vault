@@ -33,6 +33,9 @@ const PENDING = new Map();
 /** The path the page navigates to. Deliberately unlikely to collide with a real route. */
 const SINK_PREFIX = '/__dv_sink__/';
 
+/** The type every download is answered under: one a browser only saves, never runs. */
+const SINK_CONTENT_TYPE = 'application/octet-stream';
+
 /**
  * A slot expires if the browser never asks for it. Without this, a page that asks for a download
  * and then errors before triggering it leaks the slot — and with it the port, for as long as the
@@ -56,8 +59,6 @@ self.addEventListener('message', event => {
     // view of what the name is supposed to be, so the conservative choice is the right one.
     const name = String(data.filename || 'download').replace(/[\r\n"\\]/g, '_').slice(0, 200);
     const size = Number.isSafeInteger(data.size) && data.size >= 0 ? data.size : null;
-    const mime = /^[\w.+-]+\/[\w.+-]+$/.test(String(data.mime || ''))
-        ? String(data.mime) : 'application/octet-stream';
 
     let controllerRef = null;
     let slot = null;
@@ -105,7 +106,7 @@ self.addEventListener('message', event => {
         }
     };
 
-    slot = { stream, name, size, mime, port, at: Date.now() };
+    slot = { stream, name, size, port, at: Date.now() };
     PENDING.set(id, slot);
     // `reportsTaken` tells the page this worker says when the browser has asked for the slot, so the
     // page can tell a download that never started from one that did. A page talking to an older
@@ -141,7 +142,11 @@ self.addEventListener('fetch', event => {
     try { slot.port.postMessage({ type: 'dv-sink-taken' }); } catch (_) { /* page gone */ }
 
     const headers = {
-        'Content-Type': slot.mime,
+        // Always plain bytes, whatever type the page says the file has. That type is what the file's
+        // uploader claimed, and this address is one of the origin's own: under a script's or a page's
+        // type, another page of the origin could name it and have it run. The browser saves the file
+        // under the name below, so it does not need the type.
+        'Content-Type': SINK_CONTENT_TYPE,
         'Content-Disposition': `attachment; filename="${slot.name}"`,
         // The page knows the plaintext length before it starts, so the browser can show progress
         // and detect a short body. Omitted when it does not.
