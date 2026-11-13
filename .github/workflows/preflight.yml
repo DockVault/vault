@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: ""
+      offline_report_artifact:
+        description: Artifact name to keep the offline lane's JUnit report under; empty keeps no report
+        required: false
+        type: string
+        default: ""
     outputs:
       test-count:
         description: Strictly collected test count for downstream result accounting
@@ -169,7 +174,21 @@ jobs:
           echo "test_count=$(cat test-count.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Run the offline fast lane
-        run: python -m pytest -m "unit and not docker" --maxfail=1
+        run: python -m pytest -m "unit and not docker" --maxfail=1 --junitxml=offline-results.xml
+
+      # The Tests workflow runs the other tests in shards and joins this lane's report with theirs,
+      # to show by name that every collected test ran exactly once. It asks for the report by naming
+      # an artifact; a caller that names none keeps none. The name is the caller's because a release
+      # calls this workflow twice in one run (from Tests and from the setup scenarios), and a second
+      # upload under a name already taken fails its step. Kept on a failure too.
+      - name: Keep the offline lane's report
+        if: ${{ always() && inputs.offline_report_artifact != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.offline_report_artifact }}
+          path: offline-results.xml
+          if-no-files-found: warn
+          retention-days: 14
 
       # Undefined names, and nothing else. A name used only inside a function body is not
       # resolved until that body runs, so a missing import in a test that needs a container

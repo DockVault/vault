@@ -229,11 +229,13 @@ def test_publish_waits_for_both_same_commit_reusable_gates():
 
 
 def test_publication_needs_the_suite_and_the_configuration_scenarios():
-    """The Tests workflow runs its stack in two jobs: the suite, and the configuration scenarios that
-    used to follow it. The release's `tests` job calls that whole workflow, and a called workflow
-    succeeds only when every job in it does, so `needs: tests` holds publication for both -- as long
-    as neither job can be skipped on a tag (a skipped job counts as a pass) and neither one runs
-    only after the other has passed (a scenario must not quietly depend on the suite's leftovers)."""
+    """The Tests workflow runs its stack in two kinds of job: the suite's shards, and the
+    configuration scenarios that used to follow the suite. The release's `tests` job calls that whole
+    workflow, and a called workflow succeeds only when every job in it does, so `needs: tests` holds
+    publication for all of them -- as long as none can be skipped on a tag (a skipped job counts as a
+    pass) and neither kind runs only after the other has passed (a scenario must not quietly depend
+    on the suite's leftovers). The job that joins the shards' reports with the offline lane's is held
+    to the same: its only condition is one that always runs it."""
     import yaml
 
     release = yaml.safe_load(_WORKFLOW)["jobs"]
@@ -248,7 +250,17 @@ def test_publication_needs_the_suite_and_the_configuration_scenarios():
     assert stack_jobs == {"integration", "scenarios"}
     for name in stack_jobs:
         assert "if" not in jobs[name], name
-        assert jobs[name]["needs"] == "preflight", name
+    assert "needs" not in jobs["integration"]
+    assert jobs["scenarios"]["needs"] == "preflight"
+    assert set(jobs["suite-report"]["needs"]) >= {"preflight", "integration"}
+    # Nothing a release's call would skip: the only conditions are ones a tag satisfies, and the
+    # report job's, which runs it always.
+    assert {name: job["if"] for name, job in jobs.items() if "if" in job} == {
+        "image-scan": "github.event_name != 'pull_request'",
+        "fast": "github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')",
+        "proxy-matrix": "github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')",
+        "suite-report": "${{ always() }}",
+    }
     scenario_runs = " ".join(step.get("run", "") for step in jobs["scenarios"]["steps"])
     for scenario_file in (
         "tests/test_transfer_admission_live.py",

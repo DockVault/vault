@@ -82,4 +82,17 @@ jobs:
         run: python -m py_compile dockvault.py
 
       - name: Run the offline fast lane
-        run: python -m pytest -m "unit and not docker" --maxfail=1
+        run: python -m pytest -m "unit and not docker" --maxfail=1 --junitxml=fast-results.xml
+
+      # Kept so that a run can show, by name, that a new or changed test ran on this system
+      # (.github/scripts/changed_tests_ran.py reads it in the Tests workflow): the Windows lane is
+      # the only place the suite runs on Windows, and a test that lane skips or never collects is
+      # green in every other lane. Kept on a failure too.
+      - name: Keep the lane's report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lane-results-fast-${{ matrix.os }}
+          path: fast-results.xml
+          if-no-files-found: warn
+          retention-days: 14
