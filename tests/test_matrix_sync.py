@@ -285,17 +285,17 @@ def _advisory(title: str, fixed_in: str) -> dict:
 
 
 def _across_the_boundary() -> dict:
-    """0.26.0, 0.27.0 and 0.28.0, all affected by one advisory that 0.29.0 fixes."""
-    ref = {"advisory": "an-issue", "title": "An issue", "fixed_in": "0.29.0"}
+    """0.31.0, 0.32.0 and 0.33.0, all affected by one advisory that 0.34.0 fixes."""
+    ref = {"advisory": "an-issue", "title": "An issue", "fixed_in": "0.34.0"}
     versions = {ver: _entry(f"2026-01-0{day}", secure=False, vulnerabilities=[dict(ref)])
-                for day, ver in enumerate(("0.26.0", "0.27.0", "0.28.0"), start=1)}
-    versions["0.29.0"] = _entry("2026-01-04")
+                for day, ver in enumerate(("0.31.0", "0.32.0", "0.33.0"), start=1)}
+    versions["0.34.0"] = _entry("2026-01-04")
     return {
         "schema_version": 3, "about": "fixture",
         "kinds": {"direct": "one step", "blocked": "do not"},
-        "advisories": {"an-issue": _advisory("An issue", "0.29.0")},
+        "advisories": {"an-issue": _advisory("An issue", "0.34.0")},
         "versions": versions,
-        "edges": [_edge("0.26.0", "0.27.0"), _edge("0.27.0", "0.28.0"), _edge("0.28.0", "0.29.0")],
+        "edges": [_edge("0.31.0", "0.32.0"), _edge("0.32.0", "0.33.0"), _edge("0.33.0", "0.34.0")],
     }
 
 
@@ -305,12 +305,12 @@ def test_compacting_shortens_only_the_references_below_the_boundary():
     result, shortened = _SYNC.compact(data)
 
     assert shortened == 1
-    assert result["versions"]["0.26.0"]["vulnerabilities"] == [{"advisory": "an-issue"}]
-    for ver in ("0.27.0", "0.28.0"):
+    assert result["versions"]["0.31.0"]["vulnerabilities"] == [{"advisory": "an-issue"}]
+    for ver in ("0.32.0", "0.33.0"):
         assert result["versions"][ver] == data["versions"][ver]
     # Nothing else moves: the advisory, the flags, the edges, the order of the versions.
     unshortened = copy.deepcopy(result)
-    unshortened["versions"]["0.26.0"]["vulnerabilities"] = data["versions"]["0.26.0"]["vulnerabilities"]
+    unshortened["versions"]["0.31.0"]["vulnerabilities"] = data["versions"]["0.31.0"]["vulnerabilities"]
     assert _SYNC.render(unshortened) == _SYNC.render(data)
 
 
@@ -324,9 +324,9 @@ def test_compacting_twice_changes_nothing_the_second_time():
 def test_a_reference_that_disagrees_with_its_advisory_is_reported_not_shortened():
     # Shortening would hide the disagreement; the file has a mistake to fix first.
     data = _across_the_boundary()
-    data["versions"]["0.26.0"]["vulnerabilities"][0]["title"] = "An issue, differently worded"
+    data["versions"]["0.31.0"]["vulnerabilities"][0]["title"] = "An issue, differently worded"
 
-    with pytest.raises(_SYNC.MatrixSyncError, match=r"not valid: .*versions\[0\.26\.0\]"):
+    with pytest.raises(_SYNC.MatrixSyncError, match=r"not valid: .*versions\[0\.31\.0\]"):
         _SYNC.compact(data)
 
 
@@ -350,9 +350,9 @@ def test_the_compact_command_writes_the_shortened_file(tmp_path, capsys):
     assert _SYNC.main(["compact", str(source), "--output", str(tmp_path / "out.json")]) == 0
     assert source.read_bytes() == before
     out = capsys.readouterr().out
-    assert "shortened 1 reference(s) below 0.27.0" in out
+    assert "shortened 1 reference(s) below 0.32.0" in out
     written = json.loads((tmp_path / "out.json").read_bytes())
-    assert written["versions"]["0.26.0"]["vulnerabilities"] == [{"advisory": "an-issue"}]
+    assert written["versions"]["0.31.0"]["vulnerabilities"] == [{"advisory": "an-issue"}]
 
     assert _SYNC.main(["compact", str(source)]) == 0
     assert source.read_bytes() == (tmp_path / "out.json").read_bytes()
@@ -360,7 +360,7 @@ def test_the_compact_command_writes_the_shortened_file(tmp_path, capsys):
 
 def test_the_compact_command_writes_nothing_when_it_refuses(tmp_path, capsys):
     data = _across_the_boundary()
-    data["versions"]["0.26.0"]["vulnerabilities"][0]["fixed_in"] = "0.28.0"
+    data["versions"]["0.31.0"]["vulnerabilities"][0]["fixed_in"] = "0.33.0"
     source = tmp_path / "matrix.json"
     source.write_bytes(_SYNC.render(data))
     before = source.read_bytes()
