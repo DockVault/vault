@@ -326,3 +326,12 @@ def test_the_host_tool_knows_the_clearance():
     import dockvault
     assert "clear-passkey-requirement" in host_operator.ACTIONS
     assert "clear-passkey-requirement" in dict(dockvault.ACCOUNT_ACTIONS)
+
+
+def test_the_settings_routes_name_the_setting_and_no_path_parameter_reads_as_a_secret():
+    """A path parameter named key, token, code, secret or claim is taken to hold a secret and must be masked in
+    every log. These routes name a setting, which is no secret, so the parameter is not named as one."""
+    from app.api import sign_in_settings_router
+    paths = sorted({route.path for route in sign_in_settings_router.router.routes})
+    assert paths == ["/settings/sign-in", "/settings/sign-in/{setting}"]
+

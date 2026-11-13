@@ -2,7 +2,7 @@
 ``admin.auth_policy.write`` (the password every time, plus the account's second factor when it has one).
 
 ``GET /settings/sign-in`` lists the settings with their values in force, the deployment's lock on each, and the
-readiness of the public address passkeys are bound to; ``PUT /settings/sign-in/{key}`` changes one, after the
+readiness of the public address passkeys are bound to; ``PUT /settings/sign-in/{setting}`` changes one, after the
 registry's own checks and the passkey guards (app/core/webauthn_settings.save_refusal), with its audit row in
 the same transaction; every administrator is told. A change applies at once (none of these settings deletes
 records). Removing a signature algorithm is remembered, so existing keys of it stay usable for 30 days.
@@ -49,13 +49,17 @@ def get_sign_in_settings(current_user: User = Depends(require_interactive_admin)
             "trust_anchors": len(ws_settings.trust_anchors()), "step_up": ws_settings.STEP_UP_ACTION}
 
 
-@router.put("/settings/sign-in/{key}")
-def put_sign_in_setting(key: str, body: SignInValue, request: Request,
+@router.put("/settings/sign-in/{setting}")
+def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
                         current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """Change one passkey setting: the registry's bounds and the deployment's lock, then the passkey guards (never
     'admin' among the passwordless roles; a requirement needs a usable public address; direct attestation needs
     anchors; no requirement that leaves no administrator able to sign in), then the step-up, then the change with
-    its audit row. ``null`` returns the setting to the deployment's value."""
+    its audit row. ``null`` returns the setting to the deployment's value.
+
+    The path names the setting (``webauthn_mode``): a name, not a secret, so its parameter is not called a key (a
+    path parameter named so is taken to hold a secret and masked in every log)."""
+    key = setting
     limit_statements(db)
     spec = _spec_or_404(key)
     why = refusal(spec, body.value) or ws_settings.save_refusal(db, key, body.value)
