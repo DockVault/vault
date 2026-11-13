@@ -43,12 +43,17 @@ PW = "TestPassw0rd!123"
 @pytest.fixture
 def restore_login_policy(admin):
     """Snapshot the keys these tests mutate (the login mode and the throttle ceiling) and put them
-    back — leaving a small throttle would 429 the rest of the run."""
-    keys = ("login_identifier", "max_login_attempts")
+    back — leaving a small throttle would 429 the rest of the run.
+
+    A deployment that never set the ceiling reports none, and the settings route refuses none: 0 puts
+    the ceiling back on the deployment's default. The answer is checked, because a refused restore
+    leaves the email mode and the small ceiling to every test after this file."""
     before = admin.get("/settings").json()
-    snap = {k: before.get(k) for k in keys}
+    snap = {"login_identifier": before.get("login_identifier"),
+            "max_login_attempts": before.get("max_login_attempts") or 0}
     yield
-    admin.put("/settings", json=snap)
+    restored = admin.put("/settings", json=snap)
+    assert restored.status_code == 200, f"the sign-in policy was not put back: {restored.status_code} {restored.text}"
 
 
 def _set_mode(admin, mode):
