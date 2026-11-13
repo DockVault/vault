@@ -742,8 +742,9 @@ def test_the_loop_answers_other_requests_while_a_provider_is_slow(monkeypatch):
         return began, quick, slow
     began, quick, slow = run_coroutine(both(), timeout=30)
     assert quick[0] == 200 and slow[0] == 200, (quick[:2], slow[:2])
-    # The other request was answered while the provider was still thinking, not after it.
-    assert quick[2] < slow[2] and slow[2] - began >= 1.5
+    # The other request was answered while the provider was still thinking, not after it. The slow one took the
+    # provider's delay (a sleep may come back a little early on a coarse timer, so the bound sits under it).
+    assert quick[2] < slow[2] and slow[2] - began >= 1.4
 
 
 def test_a_provider_that_does_not_answer_in_time_is_temporarily_unavailable(monkeypatch):
