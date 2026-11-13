@@ -183,6 +183,20 @@ def test_a_shards_time_limit_is_twice_what_the_recorded_times_need():
     assert limit <= 90
 
 
+def test_the_readme_runs_a_shard_with_the_shards_own_command():
+    """tests/README.md shows how to run one shard against a local stack, in PowerShell. It shows the
+    shard's own marker expression and failure limit, and it writes the file list with an encoding
+    pytest can read: Windows PowerShell's `>` writes UTF-16 or a byte-order mark first, and pytest
+    then looks for a file of that name and runs nothing."""
+    readme = (_ROOT / "tests" / "README.md").read_text(encoding="utf-8")
+    (command,) = _pytest_commands(_SHARD)
+    (limit,) = [word for word in command.split() if word.startswith("--maxfail=")]
+    assert f'python -m pytest "@shard-files.txt" -m "{_expression(command)}" {limit}\n' in readme
+    assert ("python .github/scripts/suite_shards.py files --shard 3 | Out-File -Encoding ascii shard-files.txt\n"
+            in readme)
+    assert re.search(r"suite_shards\.py files --shard \d+ *>", readme) is None
+
+
 # --- every lane's report -----------------------------------------------------------------------
 
 

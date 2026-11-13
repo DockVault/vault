@@ -175,9 +175,13 @@ test file needs no entry, and adding or deleting a file moves no other file.
 python .github/scripts/suite_shards.py balance
 
 # run one shard's stack tests against a local stack, as CI does
-python .github/scripts/suite_shards.py files --shard 3 > shard-files.txt
+python .github/scripts/suite_shards.py files --shard 3 | Out-File -Encoding ascii shard-files.txt
 python -m pytest "@shard-files.txt" -m "not (unit and not docker)" --maxfail=25
 ```
+
+The list is written with `Out-File -Encoding ascii`, not with `>`: in Windows PowerShell `>` writes
+UTF-16 or puts a byte-order mark first, and pytest then looks for a file whose name starts with
+that mark. In a POSIX shell, `> shard-files.txt` is fine.
 
 The report job prints how long each shard really took. When they have drifted apart, record the
 times again from that run's `pytest-results` artifact:
