@@ -25779,43 +25779,13 @@ async def extend_session(
     the new one. The sign-in itself is not renewed without limit: every token carries auth_time, the
     original sign-in, and a renewal is refused once the renewal limit counted from it is reached, or when
     the account now needs a second factor its token does not show (_renewal_terms). A temporary
-    credential's session is not extended."""
+    credential's session is not extended. The renewal itself is the sign-in pipeline's (sign_in.renew): a
+    refusal before anything changes, the new session made before the old one is ended, one winner."""
     token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     payload = verify_access_token(token) or {}
-    old_session = payload.get("session_token")
-    if not old_session or payload.get("is_temporary") or getattr(current_user, "_is_temp_session", False):
-        raise HTTPException(status_code=403, detail="This session cannot be extended; sign in again when it ends.")
-    now = datetime.now(timezone.utc)
-    # Refused before anything ends: a refusal leaves the session as it was, to run out on its own.
-    auth_time, expires_at = _renewal_terms(db, current_user, payload, now)
-    client_ip = get_client_ip(request)
-    # The old session ends first, durably and at once, and only the call that ended it mints the new one: two
-    # requests with the same token, however they are served, yield one new session, and a replay carries a
-    # dead token.
-    old_row, ended = _end_web_session(db, old_session, user_id=current_user.id)
-    if not ended:
-        raise HTTPException(status_code=401, detail="This session has already ended.")
-    import time as _time
-    from app.services.auth_service import denylist_token
-    _ttl = int(payload.get("exp", 0) - _time.time())
-    denylist_token(old_session, _ttl if _ttl > 0 else 1800)
-    auth_service = AuthService(db)
-    new_session = auth_service._create_session(current_user, None, client_ip, expires_at=now + timedelta(days=31),
-                                               channel=auth_service.WEB)
-    _carry_session_marks(db, old_row, new_session)
-    access_token = _renewed_token(current_user, payload, new_session, auth_time, expires_at, now)
-    try:
-        from app.core.session_hash_utils import hash_session_token
-        AuditLogger(db).log_action(action="session_extended", status="success", user=current_user,
-                                   ip_address=client_ip, details={
-                                       "ended_session": hash_session_token(old_session)[:8],
-                                       "new_session": hash_session_token(new_session)[:8],
-                                       "signed_in_at": datetime.fromtimestamp(auth_time, tz=timezone.utc)
-                                       .replace(microsecond=0).isoformat().replace("+00:00", "Z")})
-    except Exception:  # noqa: BLE001
-        pass
-    return {"access_token": access_token, "token_type": "bearer",
-            "expires_at": expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")}
+    renewed = sign_in.renew(db, current_user, payload, client_ip=get_client_ip(request))
+    return {"access_token": renewed.access_token, "token_type": "bearer",
+            "expires_at": renewed.expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")}
 
 
 @app.post("/api/logout")
