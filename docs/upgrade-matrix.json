@@ -378,7 +378,7 @@
       "title": "A file opened from its preview could run as a page with the vault's origin",
       "description": "The file preview showed pictures, video and audio from an address the browser made under the type stored with the file, which is the type its uploader claimed (over SFTP, the type its name suggests). A member who could upload to a vault could store a web page under a picture's or a video's name, or an SVG picture that carries script. The preview of the first showed nothing, and the SVG showed as an ordinary picture. When another member opened that preview's address in a tab of its own (the browser's \"open image in new tab\" or \"open video in new tab\", or the address pasted or dragged into a tab), the file ran as a page with the vault's origin. Depending on how the tab is opened, the browser gives it the vault page's content policy or none. With none, the page's own script ran. Under the vault page's policy a page's own script is stopped, but a script served from the vault's address is accepted: from 0.34.0 a public file link's download address could be asked for without a header and answered under the type its uploader claimed, so it could serve as such a script, though only with a download grant less than a minute old that was made for the person's own network address. In 0.34.0 the compliance case viewer did the same for a picture, video or sound whose type its server did not already send as text, such as an image type ending in +xml. 0.33.7 and 0.34.1 make every such address under a type a browser only shows or saves; 0.34.1 also answers a public download that a browser would run as plain bytes, under a policy that runs nothing.",
       "impact": "Script chosen by one member of a vault runs in the browser of another signed-in person with the vault's origin. It can read that person's sign-in and act as them while the session lasts: read, change and delete what they can reach, and with an administrator's session administer the deployment. It can also leave ways back in that outlast the session, such as an SSH key, a temporary credential, a public link or an upload link on that person's account. The person has to open the preview in a tab of its own; previewing alone runs nothing.",
-      "remediation": "Upgrade to 0.34.1, or to 0.33.7 on the 0.33 line, and reload browser tabs that were open before the upgrade. If a member may have opened such a file in a tab of its own, end their sessions (Users, Terminate Sessions) or have them change their password, which also ends them. Then check the audit log for what was done in their name, and remove any SSH key, temporary credential, public link or upload link on their account that they did not make.",
+      "remediation": "Upgrade to 0.34.2 (0.34.1 first held the fix on its line, but was not published), or to 0.33.7 on the 0.33 line, and reload browser tabs that were open before the upgrade. If a member may have opened such a file in a tab of its own, end their sessions (Users, Terminate Sessions) or have them change their password, which also ends them. Then check the audit log for what was done in their name, and remove any SSH key, temporary credential, public link or upload link on their account that they did not make.",
       "mitigation": "Until you upgrade: do not open a file's preview in a tab of its own, by the browser's menu, by dragging it or by pasting its address, and give the right to upload only to people you trust with the vault.",
       "severity": "high",
       "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:A/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
@@ -4703,7 +4703,15 @@
     },
     "0.34.1": {
       "released": "2026-11-13",
-      "notes": "Security release, one advisory (stored-file-opened-from-a-preview-runs-as-a-page, high). Upgrade, then reload browser tabs that were open before the upgrade; with SFTP in its own container, update it together with the web container. A file stored as a web page under a picture's or a video's name, or an SVG picture that carries script, could run with the vault's origin when another member opened its preview in a tab of its own. Previews, the compliance case viewer and the files the web app saves now reach the browser under a type it only shows or saves, and a public file link's download that a browser would run is answered as plain bytes. The advisory says what to check if someone may have opened such a file. The 0.33 line has the fix in 0.33.7. Also in this release: the administrators' items in the sidebar show only to an administrator, the web app no longer asks the administrators' routes from other people's pages (so the audit record holds fewer refused administrator actions), and an item that waits for an answer after sign-in opens instead of sending you to the dashboard; Settings saves only after the settings loaded; an unlocked zero-knowledge vault shows its name in its header and on the dashboard; a vault's Permissions tab lists an owner's or manager's own departments; creating a vault asks for the type first and keeps what was typed; the administrators' forms judge a password by the deployment's policy, as the server does; dialogs open at the top, and Escape or a click outside closes only the top one; selecting files no longer moves the rows; a preview is recorded as a preview (file_previewed, then file_preview_completed), not as a download, so a search or export of downloads no longer counts previews; and the help texts say what view-only shares, log components, allow-lists and alert delivery do today (a deployment made before this release keeps the old description of its Confidential (Read) share tag: edit it if you kept that tag). python dockvault.py update counts a line's support period by the day in UTC, as the app does. Image scanners report CVE-2026-119170 (high) against the image's Python 3.14.10; it needs OpenSSL in FIPS mode, which the image's OpenSSL cannot be in, and the release attaches a VEX document that says so. No stored data changes its shape, so going back to 0.34.0 needs no restore; 0.34.0 lists the preview rows as \"Other (legacy)\", and going back brings the security issue back. Upgrade from 0.34.0, or from 0.33.7 under the conditions of the step from 0.33.x into the 0.34 line (take a backup first).",
+      "notes": "Not published. This release was tagged on 2026-11-13, but its build stopped at the dependency check, which that evening began to report CVE-2026-128089 in dnspython 2.9.1 (a flaw in reading DNS zone files, which the vault never does). No image and no download exist for it. 0.34.2 is this release with dnspython 2.9.2: use 0.34.2.",
+      "support": {
+        "eol": true,
+        "secure": true
+      }
+    },
+    "0.34.2": {
+      "released": "2026-11-14",
+      "notes": "Security release, one advisory (stored-file-opened-from-a-preview-runs-as-a-page, high): this is the release that fixes it on the 0.34 line. 0.34.1 held the same changes and was tagged the day before, but it was not published: its build stopped at the dependency check, which had begun to report CVE-2026-128089 in dnspython 2.9.1 (a flaw in reading DNS zone files, which the vault never does). 0.34.2 differs from it only by dnspython 2.9.2. Upgrade, then reload browser tabs that were open before the upgrade; with SFTP in its own container, update it together with the web container. A file stored as a web page under a picture's or a video's name, or an SVG picture that carries script, could run with the vault's origin when another member opened its preview in a tab of its own. Previews, the compliance case viewer and the files the web app saves now reach the browser under a type it only shows or saves, and a public file link's download that a browser would run is answered as plain bytes. The advisory says what to check if someone may have opened such a file. The 0.33 line has the fix in 0.33.7. Also in this release: the administrators' items in the sidebar show only to an administrator, the web app no longer asks the administrators' routes from other people's pages (so the audit record holds fewer refused administrator actions), and an item that waits for an answer after sign-in opens instead of sending you to the dashboard; Settings saves only after the settings loaded; an unlocked zero-knowledge vault shows its name in its header and on the dashboard; a vault's Permissions tab lists an owner's or manager's own departments; creating a vault asks for the type first and keeps what was typed; the administrators' forms judge a password by the deployment's policy, as the server does; dialogs open at the top, and Escape or a click outside closes only the top one; selecting files no longer moves the rows; a preview is recorded as a preview (file_previewed, then file_preview_completed), not as a download, so a search or export of downloads no longer counts previews; and the help texts say what view-only shares, log components, allow-lists and alert delivery do today (a deployment made before this release keeps the old description of its Confidential (Read) share tag: edit it if you kept that tag). python dockvault.py update counts a line's support period by the day in UTC, as the app does. Image scanners report CVE-2026-119170 (high) against the image's Python 3.14.10; it needs OpenSSL in FIPS mode, which the image's OpenSSL cannot be in, and the release attaches a VEX document that says so. No stored data changes its shape, so going back to 0.34.0 needs no restore; 0.34.0 lists the preview rows as \"Other (legacy)\", and going back brings the security issue back. Upgrade from 0.34.0, or from 0.33.7 under the conditions of the step from 0.33.x into the 0.34 line (take a backup first).",
       "support": {
         "eol": false,
         "secure": true
@@ -5242,7 +5250,7 @@
     },
     {
       "from": "0.33.7",
-      "to": "0.34.1",
+      "to": "0.34.2",
       "kind": "direct",
       "reversible": true,
       "requires_backup": true,
@@ -5328,6 +5336,20 @@
     {
       "from": "0.34.0",
       "to": "0.34.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.1",
+      "to": "0.34.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.0",
+      "to": "0.34.2",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
