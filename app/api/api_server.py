@@ -20106,8 +20106,8 @@ def _safe_media_type(value: Optional[str]) -> str:
 # the one list of them: a case's content route (app/api/compliance_router.py) reads it too.
 #
 #   Pages: HTML, a stream of parts each laid out as a page, and every XML type (a browser lays any of them out,
-#   and runs the script of an XHTML or SVG element inside). The XML types are also matched by their shape, in
-#   _browser_runs.
+#   and runs the script of an XHTML or SVG element inside). The XML types are also matched by their shape
+#   (_BROWSER_RUN_SHAPES).
 #   What a page applies when it names it: a style sheet, a transform for an XML page, a text track, a compiled
 #   module, a bundle of responses.
 #   Scripts: the JavaScript MIME types of the WHATWG MIME Sniffing standard. Once sniffing is off they are the only
@@ -20130,24 +20130,26 @@ _BROWSER_RUN_TYPES = frozenset({
     "text/vbscript", "text/vbs",
 })
 _SCRIPT_LANGUAGE_NAMES = ("javascript", "ecmascript", "jscript", "livescript", "vbscript")
+# An XML type is known by its shape rather than by a list: its subtype is xml, or ends in +xml. Either way the
+# type has one of these in it, so a value that has one anywhere is taken for an XML type.
+_BROWSER_RUN_SHAPES = ("/xml", "+xml")
 _NOTHING_RUNS_POLICY = "default-src 'none'; sandbox"
 
 
 def _browser_runs(media_type: Optional[str]) -> bool:
     """Whether a browser would run an answer sent under this type, or apply it to the page that names it.
 
-    A stored type is whatever its uploader wrote, so the list is not matched against the type alone. A listed
-    type counts wherever it stands in the value, a parameter included, since not every reader takes the type
-    from the same place; so does the name of a script language in a spelling the list does not have; and so
-    does every XML type, which is known by its shape rather than by a list (xml, or anything+xml).
+    A stored type is whatever its uploader wrote, so nothing is matched against the type alone. A listed type
+    counts wherever it stands in the value, a parameter included, since not every reader takes the type from
+    the same place; so does the name of a script language in a spelling the list does not have; and so does
+    the shape of an XML type.
     """
     value = (media_type or "").lower()
     if any(listed in value for listed in _BROWSER_RUN_TYPES):
         return True
     if any(name in value for name in _SCRIPT_LANGUAGE_NAMES):
         return True
-    subtype = value.partition(";")[0].strip().partition("/")[2]
-    return subtype == "xml" or subtype.endswith("+xml")
+    return any(shape in value for shape in _BROWSER_RUN_SHAPES)
 
 
 def _download_media_type(value: Optional[str]) -> str:

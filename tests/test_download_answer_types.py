@@ -70,6 +70,9 @@ RUN = JAVASCRIPT + [
     "application/vnd.mozilla.xul+xml", "application/mathml+xml", "image/x-thing+xml", "video/x-thing+xml",
     "audio/x-thing+xml", "APPLICATION/X-THING+XML", "x-made-up/xml", "application/xml-dtd",
     "application/xml-external-parsed-entity", "text/xml-external-parsed-entity",
+    # an XML type known only by its shape, with a parameter after it, and named anywhere else in the value
+    "application/rss+xml; charset=utf-8", "application/atom+xml ;charset=utf-8", "X-Made-Up/XML ; q=1",
+    'image/png; x="application/rss+xml"', 'image/png; x="a, x-made-up/xml "', 'video/mp4; note="image/x-thing+xml"',
     # a listed type named anywhere in the value
     'image/png; x="text/html"', 'text/plain; note="application/javascript"', 'image/png; type="text/css"',
     'video/webm; codecs="vp8, text/javascript"', "application/octet-stream; kind=javascript",
@@ -131,6 +134,20 @@ def test_the_list_holds_every_javascript_type_of_the_standard_and_changes_only_o
         "text/vbscript", "text/vbs",
     }
     assert S._SCRIPT_LANGUAGE_NAMES == ("javascript", "ecmascript", "jscript", "livescript", "vbscript")
+    assert S._BROWSER_RUN_SHAPES == ("/xml", "+xml")
+
+
+@pytest.mark.parametrize("subtype", ["xml", "rss+xml", "x-thing+xml", "vnd.example.record+xml"])
+@pytest.mark.parametrize("kind", ["application", "text", "image", "video", "audio", "x-made-up"])
+def test_every_xml_type_has_the_shape_the_rule_looks_for(kind, subtype):
+    """An XML type is one whose subtype is xml or ends in +xml. The rule looks for what such a type always has in
+    it, anywhere in the stored value, so no way of writing one around it is left."""
+    xml = f"{kind}/{subtype}"
+    for stored in (xml, xml.upper(), f"{xml}; charset=utf-8", f"{xml} ;charset=utf-8", f'image/png; x="{xml}"',
+                   f'image/png; x="a, {xml} "', f"text/plain; a='; b=\"', {xml} \""):
+        assert S._safe_media_type(stored) == stored.strip(), "the value must be one that can be stored and sent"
+        assert S._download_media_type(stored) == BYTES, stored
+        assert cr._content_type(stored) == TEXT, stored
 
 
 def test_no_answer_of_the_rule_is_ever_one_a_browser_runs():
@@ -306,6 +323,7 @@ RUN_AS_STORED = [
     ("page.html", "text/html"), ("page.xhtml", "application/xhtml+xml"), ("picture.png", "image/svg+xml"),
     ("clip.mp4", "video/x-thing+xml"), ("feed.xml", "application/rss+xml"), ("sheet.xsl", "text/xsl"),
     ("cues.vtt", "text/vtt"), ("picture.png", 'image/png; x="text/html"'),
+    ("picture.png", 'image/png; x="application/rss+xml"'), ("feed.xml", "application/rss+xml ; charset=utf-8"),
 ]
 
 
