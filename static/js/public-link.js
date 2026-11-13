@@ -84,7 +84,12 @@
         if (r.status !== 200) { throw new Error("unavailable"); }
         return r.blob();
       }).then(function (blob) {
-        var url = URL.createObjectURL(blob);
+        // Saved from an address made under a type a browser only saves, never the type the answer
+        // came with, which is whatever the file's uploader claimed: a browser that does not honour
+        // the link's download attribute opens the address instead, and under a page's type that
+        // would be a page of this origin. The link carries the file's own name, so its type is not
+        // needed to save it.
+        var url = URL.createObjectURL(new Blob([blob], { type: "application/octet-stream" }));
         var a = document.createElement("a");
         a.href = url; a.download = name || "download";
         document.body.appendChild(a); a.click(); a.remove();
