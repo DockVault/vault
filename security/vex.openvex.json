@@ -4,5 +4,23 @@
   "author": "DockVault maintainers",
   "timestamp": "__GENERATED_AT__",
   "version": 1,
-  "statements": []
+  "statements": [
+    {
+      "vulnerability": {"name": "CVE-2026-119170"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.10"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:generic/python@3.14.10"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-119170 is a regression in Python 3.14.10 in how the hashlib module enforces the algorithms OpenSSL allows in FIPS mode; it affects only a Python whose OpenSSL runs in FIPS mode. OpenSSL in the DockVault image cannot run in FIPS mode: the image ships no FIPS provider (/usr/lib/ossl-modules holds only legacy.so), its /etc/ssl/openssl.cnf enables none, neither the image nor its Compose files set OPENSSL_CONF or OPENSSL_MODULES, and nothing in the application enables FIPS mode, so _hashlib.get_fips_mode() returns 0 and the code with the flaw never runs. The statement is bound to Python 3.14.10 and ends when the base image moves to a Python release without the flaw. Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    }
+  ]
 }
