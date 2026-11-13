@@ -58,6 +58,15 @@ lanes: Python on Windows and Ubuntu with only the test lock installed. Every oth
 production lock on top, so a test that imports a package only the production lock carries passes
 there and fails only here. Pull requests and pushes to `main` run the Fast workflow on their own.
 
+The Tests workflow runs the suite in lanes: strict collection and the offline tests in the preflight
+job, and the tests that need a stack in six shards, each on a disposable stack built from the commit
+under test. A last job joins every lane's JUnit report and fails unless each collected test is in
+exactly one of them, by name, and then applies the result audit (no failure, the collected count,
+the skip ceiling). The same job checks that the tests of every test file changed since the last
+release tag ran in their lanes, the Windows lane included whenever the Fast lanes are part of the
+run. A release's call succeeds only when every shard, the configuration scenarios and that job
+have. `tests/README.md` describes the lanes.
+
 The same runs, and every pull request, also run the proxy matrix
 (`.github/scripts/proxy_matrix.py`): the candidate image behind real nginx (plain and TLS), two nginx
 in a chain, HAProxy with `option forwardfor`, and an nginx inside the API's own network namespace,

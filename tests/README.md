@@ -149,6 +149,62 @@ The real-Docker management-tool tests are opt-in locally:
 tests\.venv\Scripts\python -m pytest -m docker
 ```
 
+## How CI runs the suite
+
+CI runs every collected test once, split into lanes. Each lane writes a JUnit report.
+
+| Lane | Where | What it runs |
+|------|-------|--------------|
+| Offline | `preflight.yml`, on Linux with the production lock | `-m "unit and not docker"`, stopping at the first failure |
+| Fast | `fast-tests.yml`, on Linux and on Windows with the test lock only | the same expression |
+| Shards | `tests.yml`, job `integration`: six jobs, each on a stack of its own | `-m "not (unit and not docker)"`, which is everything the offline lane leaves out; a shard stops after 25 failures and does not stop the others |
+| Scenarios | `tests.yml`, job `scenarios` | the few files that need a reconfigured stack, a second time |
+| Report | `tests.yml`, job `suite-report` | no tests: it joins the reports and checks them |
+
+A test marked `docker` runs in a shard whatever else it is marked, since the offline lane leaves it
+out. The offline tests are not run again in the shards.
+
+**Which shard a file runs in.** `.github/suite-shards.json` records how many seconds the stack
+tests of each test file took in one full run. `.github/scripts/suite_shards.py` deals the listed
+files out, heaviest first, each to the shard that is lightest so far. A file it does not list (a
+new file, or one whose tests are all offline) goes to the shard a hash of its path gives. So a new
+test file needs no entry, and adding or deleting a file moves no other file.
+
+```powershell
+# each shard's file count and recorded time
+python .github/scripts/suite_shards.py balance
+
+# run one shard's stack tests against a local stack, as CI does
+python .github/scripts/suite_shards.py files --shard 3 > shard-files.txt
+python -m pytest "@shard-files.txt" -m "not (unit and not docker)" --maxfail=25
+```
+
+The report job prints how long each shard really took. When they have drifted apart, record the
+times again from that run's `pytest-results` artifact:
+
+```powershell
+python .github/scripts/suite_shards.py record pytest-results.xml
+```
+
+**Every test ran exactly once.** The report job collects the suite, downloads the offline lane's
+report and the six shards', and runs `.github/scripts/join_suite_reports.py`: every collected test
+must be in exactly one report, by name. It fails on a test in two reports, a test in none, a
+missing report, and a report case the collection does not list. The joined report is kept as the
+`pytest-results` artifact and goes through the audit the single full-suite job's report went
+through (`pytest_result_audit.py`: no failure, the collected count, at most 15% skipped).
+
+**Changed tests ran in their lanes.** The same job runs `.github/scripts/changed_tests_ran.py`: for
+every test file added or changed since the last release tag, each offline test must be in the
+report of every offline lane of the run, and each stack test in a shard's. A manual run on a
+release candidate and a release's own run include the Fast lanes, so there a changed offline test
+must be in the Windows lane's report as well. A skip counts when the report shows its reason, and
+the job prints each one.
+
+So a test that cannot run on one system is skipped there with a reason
+(`pytest.mark.skipif(..., reason=...)`, or `pytest.param(..., marks=...)` for one parameter).
+Leaving it out of a parametrization on that system fails the check, because the names are the
+ones collected on Linux.
+
 ## Config (env vars, all optional)
 
 | Var | Default |
