@@ -198,6 +198,32 @@ def test_a_live_test_that_fails_in_a_fixture_counts_as_failed(tmp_path, fails_in
     assert "test_runs_after_it" not in _outcomes(done)
 
 
+def test_a_live_test_that_did_not_fail_does_not_ask(tmp_path):
+    """Only a failure asks. A test that skips itself, one that is marked to be skipped and one that
+    fails as it is expected to are no sign of a stack that has gone."""
+    done, asked = _run(tmp_path, """
+        import pytest
+
+        def test_skips_itself():
+            pytest.skip("not for this deployment")
+
+        @pytest.mark.skip(reason="not yet")
+        def test_is_marked_to_be_skipped():
+            pass
+
+        @pytest.mark.xfail(reason="known")
+        def test_fails_as_expected():
+            assert False
+
+        def test_runs_after_them():
+            pass
+    """, ["healthy"])
+    assert _outcomes(done) == {"test_skips_itself": "SKIPPED", "test_is_marked_to_be_skipped": "SKIPPED",
+                               "test_fails_as_expected": "XFAIL", "test_runs_after_them": "PASSED"}, done.stdout
+    assert done.returncode == 0
+    assert asked == [HEALTH]                        # the one before the first live test
+
+
 def test_a_run_of_unit_tests_alone_never_asks(tmp_path):
     done, asked = _run(tmp_path, """
         import pytest
@@ -281,4 +307,30 @@ def test_a_live_test_that_fails_where_no_stack_ever_answered_does_not_end_the_ru
                                "test_uses_the_stack_after_it": "SKIPPED"}, done.stdout
     assert done.returncode == TESTS_FAILED
     assert asked == [HEALTH]                        # by the last test, before it was skipped
+    assert "is gone" not in done.stdout + done.stderr
+
+
+def test_nor_does_one_that_fails_after_a_live_test_was_skipped_for_want_of_a_stack(tmp_path):
+    """The same failure, later in the run: a live test before it has asked for the stack and was skipped
+    because none answered. Asking is not being answered, so this is still a run with no stack."""
+    done, asked = _run(tmp_path, """
+        import pytest
+
+        def test_uses_the_stack():
+            pass
+
+        @pytest.fixture(scope="module")
+        def signed_in():
+            raise ConnectionError("nothing listens there")
+
+        def test_needs_a_sign_in(signed_in):
+            pass
+
+        def test_uses_the_stack_after_it():
+            pass
+    """, ["silent"])
+    assert _outcomes(done) == {"test_uses_the_stack": "SKIPPED", "test_needs_a_sign_in": "ERROR",
+                               "test_uses_the_stack_after_it": "SKIPPED"}, done.stdout
+    assert done.returncode == TESTS_FAILED
+    assert asked == [HEALTH]                        # by the first test, before it was skipped
     assert "is gone" not in done.stdout + done.stderr
