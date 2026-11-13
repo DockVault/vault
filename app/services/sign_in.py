@@ -675,7 +675,8 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
     sign-in, a second factor the account now needs); the one helper that mints (``_renewed_token``) carries how the
     person signed in. This function owns the order:
 
-    1. A refusal comes before anything changes: the session is left as it was, to run out on its own.
+    1. A refusal comes before anything changes (the renewal rules, then the rules of the other ways in,
+       ``refuse_renewal_by_the_sign_in_rules``): the session is left as it was, to run out on its own.
     2. The renewal takes the account's turn at its sessions (``_sessions_turn``, which every revocation of an
        account's sessions takes too) and reads the old session under it, locked. A session that has ended, or is
        not this account's, is refused here with nothing made.
@@ -698,6 +699,7 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
     if not old_session or old.get("is_temporary") or getattr(user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="This session cannot be extended; sign in again when it ends.")
     auth_time, expires_at = api._renewal_terms(db, user, old, now)
+    refuse_renewal_by_the_sign_in_rules(db, user, old)
     ended_already = HTTPException(status_code=401, detail="This session has already ended.")
     user_id = user.id
     try:
@@ -732,6 +734,20 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
     except Exception:  # noqa: BLE001 -- the renewal stands without its row
         pass
     return Renewed(access_token=access_token, expires_at=expires_at)
+
+
+def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
+    """A renewal keeps a sign-in going, so it is refused when signing in now would not end where that sign-in did:
+    the person signs in again and meets the rule there. The renewal rules refuse an account that now needs a second
+    factor its token does not show; this adds the rules of the other ways in. Raises HTTPException(403) with the
+    sentence the sign-in screen shows; nothing has changed by then.
+
+    A role that must hold a passkey, past its grace, with none on the account: the next sign-in stops at the
+    enrollment, so the renewal is refused, whatever the old token shows (a passkey it was made with is gone)."""
+    from app.api import api_server as api
+    if api._passkey_requirement(db, user).overdue:
+        raise HTTPException(status_code=403, detail=(
+            "Your role must hold a passkey now. Sign in again: you will be asked to add one."))
 
 
 def read_password_stage(payload: Optional[dict], db):

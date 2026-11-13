@@ -379,3 +379,55 @@ def test_the_route_hands_the_renewal_to_the_pipeline_off_the_event_loop(db, monk
     # It may wait for the account's turn, so it does not run on the loop's thread.
     assert calls[0][3] != loop_thread[0]
     assert answer == {"access_token": "the-new-token", "token_type": "bearer", "expires_at": "2030-01-02T03:04:05Z"}
+
+
+# --------------------------------------------------------------------------- a passkey the role must hold
+
+def _passkey_rule(monkeypatch, *, roles=("user",), grace=7, held=0):
+    from app.core import active_factors, webauthn_settings
+    monkeypatch.setattr(webauthn_settings, "mode", lambda: webauthn_settings.REQUIRED_FOR_ROLES)
+    monkeypatch.setattr(webauthn_settings, "required_roles", lambda: tuple(roles))
+    monkeypatch.setattr(webauthn_settings, "grace_days", lambda: grace)
+    monkeypatch.setattr(active_factors, "_passkey_count", lambda db, user_id: held)
+
+
+def test_a_role_past_its_passkey_grace_is_not_renewed_and_is_told_how_to_sign_in_again(db, monkeypatch):
+    user, old = _signed_in(db)
+    _passkey_rule(monkeypatch)
+    user.passkey_required_since = datetime.utcnow() - timedelta(days=8)
+    db.commit()
+    made = []
+    monkeypatch.setattr(auth_service.AuthService, "_create_session", lambda *a, **k: made.append(1) or "x")
+    with pytest.raises(HTTPException) as refused:
+        sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    assert refused.value.status_code == 403
+    assert refused.value.detail == "Your role must hold a passkey now. Sign in again: you will be asked to add one."
+    rows = _rows(db)
+    assert made == [] and len(rows) == 1 and not rows[0].revoked and rows[0].is_active
+    # A token that shows a passkey changes nothing: the account holds none now.
+    with pytest.raises(HTTPException) as refused:
+        sign_in.renew(db, user, {**old, "amr": ["hwk"]}, client_ip="127.0.0.1")
+    assert refused.value.status_code == 403 and made == []
+
+
+@pytest.mark.parametrize("case", ["within the grace", "the grace not started", "holds a passkey", "cleared by the operator",
+                                  "another role", "passkeys not required"])
+def test_the_passkey_rule_refuses_nothing_else(db, monkeypatch, case):
+    user, old = _signed_in(db)
+    _passkey_rule(monkeypatch, held=1 if case == "holds a passkey" else 0,
+                  roles=("admin",) if case == "another role" else ("user",))
+    user.passkey_required_since = datetime.utcnow() - timedelta(days=8)
+    if case == "within the grace":
+        user.passkey_required_since = datetime.utcnow() - timedelta(days=6)
+    elif case == "the grace not started":
+        user.passkey_required_since = None
+    elif case == "cleared by the operator":
+        user.passkey_requirement_cleared_at = datetime.utcnow()
+    elif case == "passkeys not required":
+        from app.core import webauthn_settings
+        monkeypatch.setattr(webauthn_settings, "mode", lambda: webauthn_settings.OPTIONAL)
+    db.commit()
+    if case == "holds a passkey":
+        old = {**old, "amr": ["pwd", "hwk"]}        # a passkey is a second factor, so the token must show one
+    renewed = sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    assert renewed.access_token and len(_rows(db)) == 2
