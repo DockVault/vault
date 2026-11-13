@@ -214,6 +214,20 @@ def test_one_report_listing_a_test_twice_is_refused(tmp_path, capsys):
     assert "1 test(s) are in a report more than once: tests/test_c.py::test_four (shard-2, shard-2)" in err
 
 
+def test_two_collected_tests_a_report_names_alike_are_refused(tmp_path, capsys):
+    """A report names a test by its file's path with dots, its classes and its name, so a test in a
+    class and a test in a file inside a directory of the first file's name are written the same. One
+    case in a report would then stand for both, and the other could be missing unseen: the join says
+    so instead of counting them as one."""
+    ids = ["tests/test_a.py::TestThing::test_two", "tests/test_a/TestThing.py::test_two", "tests/test_c.py::test_four"]
+    same = ("tests.test_a.TestThing", "test_two")
+    code, out, err = _run(tmp_path, capsys, {"offline": _report(tmp_path, "offline", same, _FOUR)}, ids)
+
+    assert code == 1 and "OK" not in out
+    assert err.strip() == ("::error::tests/test_a.py::TestThing::test_two and tests/test_a/TestThing.py::test_two "
+                           "have the same name in a report, so they cannot be told apart")
+
+
 def test_a_failure_and_its_teardown_error_are_one_test(tmp_path, capsys):
     """pytest writes a test that failed and then failed again in teardown as two cases with one name.
     That is not a test run twice; the report still fails, at the audit, for the failure."""
