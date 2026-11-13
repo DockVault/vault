@@ -171,3 +171,11 @@ the tests before it did.
 A test that needs another value sets it with `monkeypatch.setattr(settings, ...)` or a
 function-scoped fixture of its own. A value that a module- or session-scoped fixture sets on the
 settings is undone before each of its tests. `test_settings_isolation.py` holds all of this.
+
+## When the stack stops during a run
+
+After a live test has failed, the run asks `VAULT_BASE_URL/health` once. If the stack gives no usable
+answer, or says its database is not connected, the run ends there with exit status 2 and a message
+that names the address: the tests left would fail for the same reason. A failed unit test never asks,
+and neither does a run that found no stack when it started
+(`test_run_ends_when_the_stack_is_gone.py`).
