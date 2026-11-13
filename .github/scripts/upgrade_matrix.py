@@ -103,11 +103,11 @@ _VULN_KEYS = {"advisory", "title", "fixed_in"}
 # 0.32.x merges main's copy of this file into every version it knows, and prints a line for each of
 # the 15 newest releases that are not end-of-life, counting what each reference's own `title` and
 # `fixed_in` say: an id-only reference in that window would read as "no fix released yet". That
-# window reaches 0.27.0 today and only moves up as releases are added, so references on 0.27.0 and
+# window reaches 0.32.0 today and only moves up as releases are added, so references on 0.32.0 and
 # later keep both fields. Below it that tool still reads a short reference for a release asked for
 # by name, or for the release a container runs; tests/test_upgrade_matrix_older_readers.py states
 # what it then shows.
-ID_ONLY_REFERENCES_BELOW = "0.27.0"
+ID_ONLY_REFERENCES_BELOW = "0.32.0"
 # One record per vulnerability. title, description, impact and remediation carry the meaning and are
 # always stated. The ratings are required keys that may be null, so an unrated finding says so rather
 # than omitting the field: `cvss` is a CVSS v4.0 base vector and `severity` the band it scores to

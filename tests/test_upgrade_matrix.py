@@ -576,44 +576,44 @@ def test_a_release_cannot_be_affected_by_an_issue_fixed_in_it():
 # --- references that carry only the advisory id --------------------------------------------------
 
 def _across_the_id_only_boundary():
-    """0.26.0 -> 0.27.0 -> 0.28.0, one advisory affecting the first two and fixed in the third.
+    """0.31.0 -> 0.32.0 -> 0.33.0, one advisory affecting the first two and fixed in the third.
 
     The references are in full; each test shortens the one it is about.
     """
     data = _valid()
     data["versions"] = {
         ver: {"released": f"2026-01-0{day}", "notes": ver, "support": _support(secure=secure)}
-        for day, (ver, secure) in enumerate((("0.26.0", False), ("0.27.0", False),
-                                             ("0.28.0", True)), start=1)
+        for day, (ver, secure) in enumerate((("0.31.0", False), ("0.32.0", False),
+                                             ("0.33.0", True)), start=1)
     }
     data["edges"] = [{"from": a, "to": b, "kind": "direct", "reversible": True,
                       "requires_backup": False}
-                     for a, b in (("0.26.0", "0.27.0"), ("0.27.0", "0.28.0"))]
-    data["advisories"] = {"a-fixed-issue": _advisory(fixed_in="0.28.0")}
-    for ver in ("0.26.0", "0.27.0"):
-        data["versions"][ver]["vulnerabilities"] = [_ref(fixed_in="0.28.0")]
+                     for a, b in (("0.31.0", "0.32.0"), ("0.32.0", "0.33.0"))]
+    data["advisories"] = {"a-fixed-issue": _advisory(fixed_in="0.33.0")}
+    for ver in ("0.31.0", "0.32.0"):
+        data["versions"][ver]["vulnerabilities"] = [_ref(fixed_in="0.33.0")]
     return data
 
 
-def test_the_id_only_boundary_is_0_27_0():
+def test_the_id_only_boundary_is_0_32_0():
     # The host tools of 0.30.0 to 0.32.x print a line for each of the 15 newest releases that are not
-    # end-of-life, from each reference's own title and fixed_in; that list reaches 0.27.0 today. The
+    # end-of-life, from each reference's own title and fixed_in; that list reaches 0.32.0 today. The
     # frozen-reader tests in test_upgrade_matrix_older_readers.py check the list itself.
-    assert um.ID_ONLY_REFERENCES_BELOW == "0.27.0"
+    assert um.ID_ONLY_REFERENCES_BELOW == "0.32.0"
 
 
 def test_below_the_boundary_a_reference_may_carry_only_its_advisory_id():
     data = _across_the_id_only_boundary()
     um.validate_matrix(data, released_ceiling=None)
-    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
-    um.validate_matrix(data, released_ceiling="0.28.0")
+    data["versions"]["0.31.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    um.validate_matrix(data, released_ceiling="0.33.0")
 
 
 def test_from_the_boundary_on_a_reference_repeats_its_advisory_title_and_fix():
     data = _across_the_id_only_boundary()
-    data["versions"]["0.27.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
-    _reject(data, "versions[0.27.0].vulnerabilities[0] is missing required key(s): fixed_in, title; "
-                  "from 0.27.0 on a reference repeats its advisory's title and fixed_in for the host "
+    data["versions"]["0.32.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    _reject(data, "versions[0.32.0].vulnerabilities[0] is missing required key(s): fixed_in, title; "
+                  "from 0.32.0 on a reference repeats its advisory's title and fixed_in for the host "
                   "tools of 0.30.0 to 0.32.x")
 
 
@@ -621,12 +621,12 @@ def test_below_the_boundary_a_reference_is_whole_or_the_id_alone():
     # Half a reference is a mistake, not the short form: it is refused like any missing key, and the
     # note about the boundary is not given, since the boundary is not the reason.
     data = _across_the_id_only_boundary()
-    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue",
+    data["versions"]["0.31.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue",
                                                       "title": "A fixed issue"}]
     with pytest.raises(um.UpgradeMatrixError) as caught:
         um.validate_matrix(data, released_ceiling=None)
-    assert "versions[0.26.0].vulnerabilities[0] is missing required key(s): fixed_in" in str(caught.value)
-    assert "from 0.27.0 on" not in str(caught.value)
+    assert "versions[0.31.0].vulnerabilities[0] is missing required key(s): fixed_in" in str(caught.value)
+    assert "from 0.32.0 on" not in str(caught.value)
 
 
 @pytest.mark.parametrize("refs, expected", [
@@ -634,33 +634,33 @@ def test_below_the_boundary_a_reference_is_whole_or_the_id_alone():
     ([{"advisory": "Bad Slug"}], "malformed"),
     ([{"advisory": "a-fixed-issue"}, {"advisory": "a-fixed-issue"}],
      "lists advisory a-fixed-issue a second time"),
-    ([{"advisory": "a-fixed-issue"}, _ref(fixed_in="0.28.0")],
+    ([{"advisory": "a-fixed-issue"}, _ref(fixed_in="0.33.0")],
      "lists advisory a-fixed-issue a second time"),
 ])
 def test_an_id_only_reference_is_checked_like_a_whole_one(refs, expected):
     data = _across_the_id_only_boundary()
-    data["versions"]["0.26.0"]["vulnerabilities"] = refs
+    data["versions"]["0.31.0"]["vulnerabilities"] = refs
     _reject(data, expected)
 
 
 def test_an_id_only_reference_still_counts_toward_the_advisory_coverage():
-    # The advisory affects 0.26.0 and 0.27.0; with 0.26.0's short reference dropped the advisory
-    # starts at 0.27.0, which is still unbroken. With 0.27.0's dropped instead, the gap is found.
+    # The advisory affects 0.31.0 and 0.32.0; with 0.31.0's short reference dropped the advisory
+    # starts at 0.32.0, which is still unbroken. With 0.32.0's dropped instead, the gap is found.
     data = _across_the_id_only_boundary()
-    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
-    data["versions"]["0.27.0"]["vulnerabilities"] = []
-    data["versions"]["0.27.0"]["support"] = _support(secure=True)
-    data["versions"]["0.28.0"]["support"] = _support(secure=True)
-    _reject(data, "not listed on: 0.27.0")
+    data["versions"]["0.31.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    data["versions"]["0.32.0"]["vulnerabilities"] = []
+    data["versions"]["0.32.0"]["support"] = _support(secure=True)
+    data["versions"]["0.33.0"]["support"] = _support(secure=True)
+    _reject(data, "not listed on: 0.32.0")
 
 
 def test_an_id_only_reference_cannot_name_an_advisory_fixed_in_its_own_release():
     data = _across_the_id_only_boundary()
-    data["advisories"]["a-fixed-issue"]["fixed_in"] = "0.26.0"
-    data["versions"]["0.26.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
-    data["versions"]["0.27.0"]["vulnerabilities"] = []
-    data["versions"]["0.27.0"]["support"] = _support(secure=True)
-    _reject(data, "must be a version later than 0.26.0")
+    data["advisories"]["a-fixed-issue"]["fixed_in"] = "0.31.0"
+    data["versions"]["0.31.0"]["vulnerabilities"] = [{"advisory": "a-fixed-issue"}]
+    data["versions"]["0.32.0"]["vulnerabilities"] = []
+    data["versions"]["0.32.0"]["support"] = _support(secure=True)
+    _reject(data, "must be a version later than 0.31.0")
 
 
 # --- a fix released on several lines (fixed_in_lines) ---------------------------------------------
@@ -1345,12 +1345,17 @@ def test_the_committed_matrix_holds_its_vulnerability_invariants():
     data = um.load_matrix(MATRIX_PATH)
     versions, advisories = data["versions"], data["advisories"]
 
-    # (a) MEMBERSHIP: 0.28.0 and 0.29.0 each still list the 0.29.1-era titles, fixed_in 0.29.1.
+    # (a) MEMBERSHIP: 0.28.0 and 0.29.0 each still list the 0.29.1-era titles, fixed_in 0.29.1. A
+    # reference that carries only the advisory id says both through its advisory.
     for ver in ("0.28.0", "0.29.0"):
-        by_title = {v["title"]: v for v in (versions[ver].get("vulnerabilities") or [])}
+        fix_by_title = {}
+        for v in (versions[ver].get("vulnerabilities") or []):
+            advisory = advisories[v["advisory"]]
+            fix_by_title[v.get("title", advisory["title"])] = v.get(
+                "fixed_in", um._fix_for(ver, um._fixes(advisory)))
         for title in _VULNS_FIXED_IN_0_29_1:
-            assert title in by_title, f"{ver} no longer lists the 0.29.1-fixed defect {title!r}"
-            assert by_title[title]["fixed_in"] == "0.29.1", f"{ver}:{title!r} must be fixed_in 0.29.1"
+            assert title in fix_by_title, f"{ver} no longer lists the 0.29.1-fixed defect {title!r}"
+            assert fix_by_title[title] == "0.29.1", f"{ver}:{title!r} must be fixed_in 0.29.1"
 
     # (b) FIXED_IN STRICTLY LATER, over EVERY version: the release that fixes a defect never lists it.
     # A reference that carries only the advisory id (below the id-only boundary) takes the fix from
