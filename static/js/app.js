@@ -263,7 +263,7 @@ function reconcileNavGroupLabels() {
 // credential is restricted; the backend returns accessible_sections=null for
 // regular users / admins / legacy temp creds (they keep normal nav).
 async function loadSessionAccess() {
-    if (!authToken) return;
+    if (!authToken) { navDecided('uploadlinks'); return; }
     try {
         const r = await fetch(`${API_BASE}/auth/session`, {
             headers: { 'Authorization': `Bearer ${authToken}` }
@@ -277,6 +277,7 @@ async function loadSessionAccess() {
         console.warn('Failed to load session access:', e);
         hideAdminNavForTempSession();
         updateActionButtonPermissions();
+        navDecided('uploadlinks');   // not asked about: the item stays as it is
         return;
     }
     applyScopedNavLock();
@@ -289,8 +290,10 @@ async function loadSessionAccess() {
     refreshOpenVaultCapGating();
     // Reveal the "Upload links" nav when receivers are available to this account (a temp/scoped
     // session can't create receivers, so hide it for them). Best-effort; never blocks the session.
-    if (sessionAccess && sessionAccess.is_scoped_temp) { const nav = document.getElementById('nav-uploadlinks'); if (nav) nav.style.display = 'none'; }
-    else { refreshReceiverAvailability().catch(() => {}); }
+    if (sessionAccess && sessionAccess.is_scoped_temp) {
+        const nav = document.getElementById('nav-uploadlinks'); if (nav) nav.style.display = 'none';
+        navDecided('uploadlinks');
+    } else { refreshReceiverAvailability().catch(() => {}); }
 }
 
 // Recompute a scoped temp credential's caps for the CURRENTLY-OPEN vault and re-apply
@@ -956,6 +959,68 @@ function navItemHidden(item) {
     return !item || getComputedStyle(item).display === 'none';
 }
 
+// Some items are shown or hidden by an answer that comes after sign-in: Compliance, and Activity for an
+// account that is not an administrator, by the account's standing (static/js/compliance.js); Upload
+// links by the account's upload-link policy. From sign-in until that answer such an item is hidden but
+// still being decided, which is not refused: asked for meanwhile (a reload on that page, a notice's
+// link), its section opens empty and waits. The answer then loads the page, or, when the item stays
+// hidden, opens the dashboard; the page behind it is never loaded, so it asks the server nothing,
+// before the answer says it is this account's.
+const navDeciding = new Map();   // section -> { promise, resolve }, from sign-in until its item is decided
+let navWaiting = null;           // { section, target }: the section on screen, empty, waiting for its answer
+
+function navBeginDeciding(sections) {
+    sections.forEach((section) => {
+        let resolve;
+        const promise = new Promise((r) => { resolve = r; });
+        navDeciding.set(section, { promise, resolve });
+    });
+}
+
+// The item of `section` has been shown or hidden by its answer (or will never be shown in this session).
+function navDecided(section) {
+    const deciding = navDeciding.get(section);
+    if (!deciding) return;
+    navDeciding.delete(section);
+    deciding.resolve();
+}
+
+// A hidden item this account may not open: one that is not being decided any more.
+function navItemRefused(item) {
+    return navItemHidden(item) && !(item && navDeciding.has(item.getAttribute('data-section')));
+}
+
+// The section that was waiting for its answer is left: by the answer itself, by going elsewhere, by signing out.
+function navStopWaiting() {
+    if (!navWaiting) return;
+    const target = navWaiting.target;
+    navWaiting = null;
+    if (target) { target.style.visibility = ''; target.removeAttribute('aria-busy'); }
+}
+
+// Open `section` empty while its item is being decided, and settle it when the answer has come.
+function navOpenWhileDeciding(item, section) {
+    navStopWaiting();
+    cleanupPreviousView(section);
+    document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
+    document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
+    const target = document.getElementById(`${section}-section`);
+    if (target) {
+        // Nothing of the page is drawn or read out until it is known to be this account's.
+        target.style.visibility = 'hidden';
+        target.setAttribute('aria-busy', 'true');
+        target.classList.add('active');
+    }
+    const mine = navWaiting = { section, target };
+    navDeciding.get(section).promise.then(() => {
+        if (navWaiting !== mine) return;   // the person went elsewhere by the sidebar, or signed out
+        navStopWaiting();
+        if (target && !target.classList.contains('active')) return;   // or opened something else (a vault)
+        if (navItemHidden(item)) navigateToSection('dashboard');
+        else item.click();
+    });
+}
+
 // Update profile UI with user information
 function updateProfileUI(user) {
     // Get initials from username
@@ -985,6 +1050,9 @@ function updateProfileUI(user) {
     // have been an administrator: the items were shown for them, and nothing hid them again, so the
     // next person found Groups, Activity and Settings in their sidebar.
     setAdminNavVisible(user.role === 'admin');
+
+    // The items an answer still on its way decides (see navDeciding): hidden now, not refused yet.
+    navBeginDeciding(user.role === 'admin' ? ['compliance', 'uploadlinks'] : ['compliance', 'activity', 'uploadlinks']);
 
     // If this is a scoped temp credential whose owner is an admin, the block above
     // just revealed admin sidebar items — re-hide them in the SAME synchronous pass
@@ -2233,6 +2301,9 @@ function logout(how) {
     document.querySelector('.sidebar-item[data-section="dashboard"]')?.classList.add('active');
     // The administrators' items go too: the next person on this tab is shown their own at sign-in.
     setAdminNavVisible(false);
+    // Nothing waits for an answer of the person who has gone, and none of their items is being decided.
+    navStopWaiting();
+    navDeciding.clear();
     const vaultTitleEl = document.getElementById('vault-view-title');
     if (vaultTitleEl) vaultTitleEl.textContent = '';
     const vaultDescEl = document.getElementById('vault-view-description');
@@ -16217,9 +16288,11 @@ function getNavState() {
 }
 
 // Programmatically switch to a top-level section (mirror of the sidebar click). A section whose
-// sidebar item is hidden is not this account's: the dashboard opens instead.
+// sidebar item is hidden is not this account's: the dashboard opens instead. One whose item is still
+// being decided opens empty and waits for its answer (navOpenWhileDeciding).
 function navigateToSection(section) {
     let item = document.querySelector(`.sidebar-item[data-section="${section}"]`);
+    if (item && navItemHidden(item) && !navItemRefused(item)) { navOpenWhileDeciding(item, section); return; }
     if (navItemHidden(item)) item = document.querySelector('.sidebar-item[data-section="dashboard"]');
     if (item) item.click();
 }
@@ -16275,9 +16348,10 @@ async function restoreLastView() {
     }
     // A page this release no longer has (the Live Monitor, say) is not restored, and neither is a
     // page this account may not use (Settings saved by an administrator, restored for a user on the
-    // same browser): the dashboard is.
+    // same browser): the dashboard is. A page whose item is still being decided is asked for, and
+    // waits for its answer.
     if (nav.section && nav.section !== 'dashboard'
-            && !navItemHidden(document.querySelector(`.sidebar-item[data-section="${nav.section}"]`))) {
+            && !navItemRefused(document.querySelector(`.sidebar-item[data-section="${nav.section}"]`))) {
         navigateToSection(nav.section);
         return true;
     }
@@ -21574,6 +21648,7 @@ async function refreshReceiverAvailability() {
     state._receiversEnabled = !!state._receiverPolicy.enabled && tags.length > 0;
     const nav = document.getElementById('nav-uploadlinks');
     if (nav) nav.style.display = state._receiversEnabled ? '' : 'none';
+    navDecided('uploadlinks');
     return state._receiversEnabled;
 }
 
@@ -22811,8 +22886,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const section = item.getAttribute('data-section');
 
             // A hidden item is not a page this account has. A click that reaches it anyway (a restored
-            // view, a script) opens the dashboard instead of the page behind it.
-            if (section !== 'dashboard' && navItemHidden(item)) { navigateToSection('dashboard'); return; }
+            // view, a script) opens the dashboard instead of the page behind it, or, while the item is
+            // still being decided, waits for its answer.
+            if (section !== 'dashboard' && navItemHidden(item)) {
+                navigateToSection(navItemRefused(item) ? 'dashboard' : section);
+                return;
+            }
+            navStopWaiting();   // going somewhere: a section that was waiting for its answer is left
 
             // Remember the section so a refresh restores it (and leaving a vault
             // this way correctly drops us back to that section, not inside it).

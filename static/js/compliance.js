@@ -718,6 +718,9 @@
         if (activityNav && window.complianceAuditorLive) { activityNav.style.display = 'flex'; CP.shownActivity = true; }
         renderAuditorBadge();
         if (typeof reconcileNavGroupLabels === 'function') { try { reconcileNavGroupLabels(); } catch (_) { /* nav groups are cosmetic */ } }
+        // The two items this answer decides are decided: a page asked for meanwhile opens, or gives way to the
+        // dashboard (static/js/app.js, navDeciding).
+        if (typeof navDecided === 'function') { navDecided('compliance'); navDecided('activity'); }
         if (CP.admin) refreshCount();
         else setCount(0);
     }
