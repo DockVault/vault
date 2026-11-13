@@ -510,12 +510,18 @@ class ApiClient:
 # Live-deployment guard. Unit tests bypass this; every other test is
 # classified as integration during collection and must see a healthy stack.
 # ---------------------------------------------------------------------------
+def _stack_health():
+    """What the stack under test says of itself at its health address. Raises when it does not answer
+    within five seconds, or answers with an error."""
+    r = requests.get(f"{BASE_URL}/health", timeout=5)
+    r.raise_for_status()
+    return r.json()
+
+
 @pytest.fixture(scope="session")
 def _live_container_health():
     try:
-        r = requests.get(f"{BASE_URL}/health", timeout=5)
-        r.raise_for_status()
-        health = r.json()
+        health = _stack_health()
     except Exception as exc:  # noqa: BLE001
         pytest.skip(
             f"Vault container not reachable at {BASE_URL} ({exc}). "
@@ -541,14 +547,74 @@ def _sftp_service_health():
         )
 
 
+# Whether a live test of this run has been given a healthy stack (see "A run against a stack ends when
+# the stack is gone" below). Set where the health is handed to a test, so that a module that answers
+# for the stack with a health fixture of its own counts too.
+_stack_was_healthy = False
+
+
 @pytest.fixture(autouse=True)
 def _require_running_container(request):
+    global _stack_was_healthy
     if request.node.get_closest_marker("unit") is not None:
         return None
     health = request.getfixturevalue("_live_container_health")
+    _stack_was_healthy = True
     if request.node.get_closest_marker("sftp") is not None:
         request.getfixturevalue("_sftp_service_health")
     return health
+
+
+# ---------------------------------------------------------------------------
+# A run against a stack ends when the stack is gone.
+# ---------------------------------------------------------------------------
+# A run may go on past a failed test, so that one run shows every independent failure (--maxfail above
+# 1). When the stack itself has stopped, every test left fails for that one reason, each after its own
+# timeouts, and the run tells nothing more. So after a test that needs the stack has failed, and its
+# fixtures are torn down, the stack is asked for its health once, the way the run asked before its
+# first live test. A stack that gives no usable answer, or answers that its database is not connected,
+# ends the run there, with the address in the message and STACK_GONE_EXIT_STATUS as pytest's exit
+# status.
+#
+# Asked only where a stack was there to lose: never after a unit test, never in a run that selected
+# only unit tests, and never when no stack answered at the start (the live tests skip then, as before).
+STACK_GONE_EXIT_STATUS = 2      # pytest's own status for a run that was cut short
+
+_a_phase_failed = pytest.StashKey[bool]()
+
+
+def _why_the_stack_is_gone():
+    """Why the stack under test can no longer be tested, or None while it can."""
+    try:
+        health = _stack_health()
+    except Exception as exc:  # noqa: BLE001 — refused, timed out, an error status: nothing to test against
+        return f"gave no usable answer ({type(exc).__name__}: {str(exc)[:200]})"
+    if health.get("database") != "connected":
+        return f"answers that its database is not connected ({health})"
+    return None
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if report.failed:
+        item.stash[_a_phase_failed] = True
+    return report
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    result = yield
+    if (_stack_was_healthy and item.stash.get(_a_phase_failed, False)
+            and item.get_closest_marker("unit") is None):
+        gone = _why_the_stack_is_gone()
+        if gone is not None:
+            pytest.exit(
+                f"The stack under test is gone: {BASE_URL}/health {gone}, asked after {item.nodeid} "
+                f"failed. The run ends here: the tests left would fail for the same reason.",
+                returncode=STACK_GONE_EXIT_STATUS,
+            )
+    return result
 
 
 @pytest.fixture(autouse=True)
