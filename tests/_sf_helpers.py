@@ -61,6 +61,14 @@ def set_action_require_otp(admin, action, value):
 SESSION_LIMITS_ACTION = "admin.session_limits.write"
 
 
+def a_different_code_lifetime(client):
+    """(the mfa_email_code_ttl_minutes in force, another valid value). A save is a change of the second-factor
+    policy only when its value differs from the one in force, so a test that needs a change asks what is stored
+    first: a fixed value is a change on a fresh stack and none on the next run."""
+    stored = client.get("/settings").json().get("mfa_email_code_ttl_minutes") or 5
+    return stored, (7 if stored != 7 else 8)
+
+
 def put_settings_allowing_longer_sessions(client, password, body):
     """PUT /settings, confirming with the password only when the save lets a sign-in last longer (the server
     refuses it with step_up_required otherwise). For restoring settings a test changed."""

@@ -4,7 +4,7 @@ admin exercises it, so the shared admin (and everyone else) stays un-enrolled an
 safeguard against a lock-out: an admin who wants to tighten MFA enrolls first, so they always keep an OTP
 to loosen it again.
 """
-from _sf_helpers import enrolled_admin, step_up_receipt   # noqa: E402
+from _sf_helpers import a_different_code_lifetime, enrolled_admin, step_up_receipt   # noqa: E402
 
 
 def _receipt(client, codes):
@@ -30,15 +30,18 @@ def test_changing_the_matrix_requires_step_up(admin):
 
 def test_changing_the_mfa_policy_requires_step_up_validates_and_persists(admin):
     ta, c, _secret, codes = enrolled_admin(admin)
+    stored, other = a_different_code_lifetime(admin)
     try:
         # A non-MFA settings save is NOT gated (baseline: the gate is conditional on mfa_* keys).
         assert c.put("/settings", json={"note_max_chars": 5000}).status_code == 200
+        # The value in force sent back is no change of the policy: not gated either.
+        assert c.put("/settings", json={"mfa_email_code_ttl_minutes": stored}).status_code == 200
         # An mfa_* change without a receipt is refused.
-        assert c.put("/settings", json={"mfa_email_code_ttl_minutes": 10}).status_code == 403
+        assert c.put("/settings", json={"mfa_email_code_ttl_minutes": other}).status_code == 403
         # With a receipt it persists, and GET reflects it (benign key -- no global login effect).
-        assert c.put("/settings", json={"mfa_email_code_ttl_minutes": 10},
+        assert c.put("/settings", json={"mfa_email_code_ttl_minutes": other},
                      headers={"X-Second-Factor": _receipt(c, codes)}).status_code == 200
-        assert admin.get("/settings").json()["mfa_email_code_ttl_minutes"] == 10
+        assert admin.get("/settings").json()["mfa_email_code_ttl_minutes"] == other
         # A bad value is rejected 400 (a fresh receipt lets us reach validation).
         assert c.put("/settings", json={"mfa_email_code_ttl_minutes": 999},
                      headers={"X-Second-Factor": _receipt(c, codes)}).status_code == 400
@@ -46,4 +49,9 @@ def test_changing_the_mfa_policy_requires_step_up_validates_and_persists(admin):
         # Restore note_max_chars to its default so a low value can't leak into later tests (a long-note
         # test elsewhere in the full suite posts ~5800 chars). admin.settings.write defaults off -> no step-up.
         admin.put("/settings", json={"note_max_chars": 100000})
+        # The code lifetime goes back to what it was, so the next run changes it again (a change of the policy:
+        # saved by the administrator who has the second factor, with a receipt).
+        back = c.put("/settings", json={"mfa_email_code_ttl_minutes": stored},
+                     headers={"X-Second-Factor": _receipt(c, codes)})
         admin.delete_user(ta["id"])
+        assert back.status_code == 200, back.text

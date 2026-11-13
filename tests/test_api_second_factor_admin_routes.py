@@ -13,7 +13,8 @@ import os
 import struct
 import uuid
 
-from _sf_helpers import enroll_totp, enrolled_admin, step_up_receipt, set_action_require_otp   # noqa: E402
+from _sf_helpers import (a_different_code_lifetime, enroll_totp, enrolled_admin, step_up_receipt,   # noqa: E402
+                         set_action_require_otp)
 
 
 def _ssh_key():
@@ -120,6 +121,7 @@ def test_self_password_change_is_conditionally_gated(admin, temp_user, temp_user
 
 def test_settings_write_gated_but_mfa_keys_still_use_the_account_gate(admin):
     ta, c, _secret, codes = enrolled_admin(admin)
+    stored, other = a_different_code_lifetime(admin)
     try:
         set_action_require_otp(admin, "admin.settings.write", True)
         try:
@@ -131,14 +133,24 @@ def test_settings_write_gated_but_mfa_keys_still_use_the_account_gate(admin):
             assert r.status_code == 200, r.text
             # An mfa_* change routes to account.second_factor instead: an admin.settings.write receipt
             # must NOT satisfy it (receipts are action-bound), but an account.second_factor one does.
-            assert c.put("/settings", json={"mfa_email_code_ttl_minutes": 7},
+            assert c.put("/settings", json={"mfa_email_code_ttl_minutes": other},
                          headers={"X-Second-Factor": step_up_receipt(c, action="admin.settings.write",
                                                                      recovery_codes=codes)}).status_code == 403
-            assert c.put("/settings", json={"mfa_email_code_ttl_minutes": 7},
+            assert c.put("/settings", json={"mfa_email_code_ttl_minutes": other},
                          headers={"X-Second-Factor": step_up_receipt(c, action="account.second_factor",
+                                                                     recovery_codes=codes)}).status_code == 200
+            # The same value again is no change of the policy: the ordinary settings gate asks for its own.
+            assert c.put("/settings", json={"mfa_email_code_ttl_minutes": other}).status_code == 403
+            assert c.put("/settings", json={"mfa_email_code_ttl_minutes": other},
+                         headers={"X-Second-Factor": step_up_receipt(c, action="admin.settings.write",
                                                                      recovery_codes=codes)}).status_code == 200
         finally:
             set_action_require_otp(admin, "admin.settings.write", False)
+            # The code lifetime goes back to what it was, so the next run changes it again (a change of the
+            # policy: saved by the administrator who has the second factor, with a receipt).
+            assert c.put("/settings", json={"mfa_email_code_ttl_minutes": stored},
+                         headers={"X-Second-Factor": step_up_receipt(c, action="account.second_factor",
+                                                                     recovery_codes=codes)}).status_code == 200
             # Restore note_max_chars (now that admin.settings.write is off -> no step-up) so the lowered
             # value can't leak into a later full-suite test that posts a long note.
             admin.put("/settings", json={"note_max_chars": 100000})
