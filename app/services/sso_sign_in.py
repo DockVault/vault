@@ -773,12 +773,17 @@ def reauth_offered(row) -> bool:
             and isinstance(last_test, dict) and last_test.get("auth_time_present") is True)
 
 
-def renewal_refusal(db, user, provider_id) -> Optional[str]:
+def renewal_refusal(db, user, provider_id, *, methods=(), now: Optional[datetime] = None) -> Optional[str]:
     """Why a session that came through the provider ``provider_id`` (its token's ``idp``) is not renewed, as the
     sentence the sign-in screen shows, or None when it may be. A renewal keeps the provider's sign-in going, so it
     needs what that sign-in would need now: the identity still linked, the provider turned on, no refusal by the
     provider in force and its freshness window not run out (app/services/sso_freshness.py). A record that cannot be
-    read (no such provider, a database without the tables) is a refusal: nothing vouches for the session."""
+    read (no such provider, a database without the tables) is a refusal: nothing vouches for the session.
+
+    ``methods`` are the old token's proofs (its ``amr``). A sign-in through a provider is whole without the vault's
+    own second factor only while the provider's is trusted; when the account needs a second factor, the token shows
+    none of the vault's own and the provider's is not trusted now, signing in again would ask for the vault's, so
+    the renewal is refused as the renewal rules refuse a password alone."""
     import uuid
     from app.core.models import ExternalIdentity, SsoProvider
     from app.services import sign_in, sso_freshness
@@ -799,8 +804,13 @@ def renewal_refusal(db, user, provider_id) -> Optional[str]:
     if provider is None or getattr(provider, "state", None) != "enabled":
         return f"Signing in through {name} is turned off. Sign in again another way, or ask an administrator."
     found = sso_freshness.deadline_of(identity, provider)
-    if found is not None and (found.refused or found.due <= datetime.utcnow()):
+    now = now or datetime.utcnow()
+    if found is not None and (found.refused or found.due <= now):
         return f"Sign in through {name} again to stay signed in."
+    from app.api import api_server as api
+    own_factor = set(methods or ()) & sign_in.SECOND_KINDS
+    if not own_factor and not policy_of(provider)["sso_trust_idp_mfa"] and api._login_second_factor_in_effect(db, user):
+        return "Signing in now needs your second factor; sign in again."
     return None
 
 

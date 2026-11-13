@@ -296,6 +296,16 @@ async def sign_in_reasons():
     return {"reasons": dict(sso.REASON_TEXTS)}
 
 
+def _logged_error(error) -> str:
+    """What the callback's ``error`` parameter is logged as. Anyone can send it (the callback has no session), so
+    only a value shaped like an error code of the protocol (``access_denied``, ``login_required``) is written;
+    anything else is named, never copied, and no text a caller chose reaches a log line."""
+    import re
+    if error is None:
+        return "no code"
+    return error if isinstance(error, str) and re.fullmatch(r"[a-z_]{1,40}", error) else "unrecognised"
+
+
 @router.get("/auth/sso/{provider_id}/callback")
 async def sign_in_callback(
     provider_id: str,
@@ -331,7 +341,7 @@ async def sign_in_callback(
     if error is not None or not code:
         # Unsigned: anyone can send it. A reason, a row, and nothing else.
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": oc.PROVIDER_ERROR})
-        log.info("sso callback error for provider %s: %s", login.provider_id, (error or "no code")[:64])
+        log.info("sso callback error for provider %s: %s", login.provider_id, _logged_error(error))
         return _redirect("sso-error=" + oc.PROVIDER_ERROR)
     why = sso.usable_for(row, login.purpose)
     if why is not None:
@@ -494,9 +504,14 @@ def _a_session_is_live(db, session_ids) -> bool:
         return True
 
 
-# How many more times a back-channel logout asks which sessions the provider's token names, after ending the ones it
-# first found: each further look is made only while the one before found a session it had not seen.
-BACKCHANNEL_MORE_LOOKS = 3
+def _owners_of(db, session_ids) -> list:
+    """The accounts the given sessions belong to, in one order always (two logouts that name the same accounts take
+    their turns the same way round)."""
+    if not session_ids:
+        return []
+    from app.core.models import ActiveSession
+    rows = db.query(ActiveSession).filter(ActiveSession.id.in_(list(session_ids))).all()
+    return sorted({str(row.user_id) for row in rows})
 
 
 @router.post("/auth/sso/{provider_id}/backchannel-logout")
@@ -604,7 +619,13 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         return invalid
     session_ids = []
     try:
-        session_ids = [s.session_id for s in query.all()]
+        # Whose sessions the token names, then, under each of those accounts' turn at its sessions, which sessions.
+        # A renewal ("Stay signed in") moves the provider's session to its new session row under the same turn, so
+        # the read made under it sees a renewal wholly done or not begun: the live session is among those ended.
+        named = [s.session_id for s in query.all()]
+        for owner in _owners_of(db, named):
+            api._sessions_turn(db, owner)
+        session_ids = [s.session_id for s in query.all()] if named else []
         ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
                                      durable=True) if session_ids else 0
     except Exception as exc:  # noqa: BLE001 -- nothing was applied: the token is not spent, so the provider's retry works
@@ -624,24 +645,6 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         if session_ids and _a_session_is_live(db, session_ids):
             sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
         log.warning("sso back-channel logout commit failed: %s", type(exc).__name__)
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": "revocation_failed"})
-        return failed
-    # A renewal ("Stay signed in") makes its new session, with the provider's session copied to it, before it ends
-    # the old one. One that was under way while this ran may have committed a session the look above could not
-    # see, so the question is asked again, until a look finds nothing new.
-    try:
-        for _look in range(BACKCHANNEL_MORE_LOOKS):
-            more = [s.session_id for s in query.all() if s.session_id not in session_ids]
-            if not more:
-                break
-            ended += api._revoke_sessions(db, session_ids=more, actor_username="provider logout", durable=True)
-            db.commit()
-            session_ids = session_ids + more
-    except Exception as exc:  # noqa: BLE001 -- the sessions first seen are ended; the provider's retry ends the rest
-        db.rollback()
-        sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
-        log.warning("sso back-channel logout second look failed: %s", type(exc).__name__)
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": "revocation_failed"})
         return failed

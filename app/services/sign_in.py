@@ -1125,7 +1125,7 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
             raise HTTPException(status_code=403, detail=sso_only.provider_only_message(db, user))
         return
     from app.services import sso_sign_in
-    sentence = sso_sign_in.renewal_refusal(db, user, provider_id)
+    sentence = sso_sign_in.renewal_refusal(db, user, provider_id, methods=old.get("amr") or ())
     if sentence:
         raise HTTPException(status_code=403, detail=sentence)
 

@@ -4,8 +4,10 @@ The provider returns the person to the callback with the authorization code and 
 (``/auth/sso/<provider>/callback?code=...&state=...``), and some send a session state or their issuer beside
 them; a refused sign-in comes back with an error and its description. A code is spent once and a state names one
 login, but neither belongs in a log. An access line prints a query's parameter names and never a value
-(app/core/log_redaction.py), which this pins for the callback's own parameters, on every path a request's address
-takes into a line. No single sign-on route carries a secret in its path: its path parameters are row ids.
+(app/core/log_redaction.py), which this pins for the callback's own parameters: through the functions that reduce
+an address, through the filter the web server's access log runs every line through, and on a line read back. (What
+the callback itself logs of a refusal is pinned with the callback, in tests/test_sso_sign_in.py.) No single
+sign-on route carries a secret in its path: its path parameters are row ids.
 """
 import re
 import uuid
@@ -46,6 +48,36 @@ def test_the_callbacks_query_reaches_a_line_as_names_only(case):
     for secret in (CODE, STATE, SESSION_STATE, "idp.example"):
         assert secret not in read_back, read_back
     assert f"GET {CALLBACK}?{names} HTTP/1.1" in read_back
+
+
+@pytest.mark.parametrize("case", sorted(ANSWERS))
+def test_the_access_logs_own_filter_reduces_the_callbacks_line(case):
+    """The web server's access record carries the address as its third argument; the filter installed on that log
+    (app/api/api_server.py) rewrites it before the line is formatted."""
+    import logging
+    from app.core.log_redaction import AccessLogRedactFilter
+    query, names = ANSWERS[case]
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                               ("203.0.113.9:51234", "GET", CALLBACK + "?" + query, "1.1", 302), None)
+    assert AccessLogRedactFilter().filter(record) is True
+    line = record.getMessage()
+    assert line == f'203.0.113.9:51234 - "GET {CALLBACK}?{names} HTTP/1.1" 302'
+    for secret in (CODE, STATE, SESSION_STATE, "idp.example"):
+        assert secret not in line
+
+
+def test_the_filter_is_put_on_the_access_log_when_the_app_starts():
+    """The app's start-up installs it on the logger the web server's access lines go through."""
+    import inspect
+    import logging
+    from app.core.log_redaction import AccessLogRedactFilter
+    source = inspect.getsource(api)
+    calls = [line for line in source.splitlines() if line.strip() == "_install_access_log_redaction()"]
+    assert len(calls) == 1
+    api._install_access_log_redaction()
+    api._install_access_log_redaction()                    # once, however often it is asked
+    installed = [f for f in logging.getLogger("uvicorn.access").filters if isinstance(f, AccessLogRedactFilter)]
+    assert len(installed) == 1
 
 
 def _served(routes, prefix=""):

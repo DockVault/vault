@@ -1024,8 +1024,7 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
     # A verified token whose groups leave the person out ends their access.
     assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
     assert identity.refused_at is not None
-    # Twice: the look that ends the sessions, and a second one once the refusal is committed.
-    assert h.revoked == [{"user_id": alice.id, "actor_username": "system", "durable": True}] * 2
+    assert h.revoked == [{"user_id": alice.id, "actor_username": "system", "durable": True}]
     assert ("sso_access_ended_by_refusal", "success",
             {"provider_id": str(p.id), "identity_id": str(identity.id), "sessions": 2}) in h.audits
     assert ("sso_sign_in_refused", "failure",
@@ -1044,25 +1043,29 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
     assert F.lapsed(h.db, alice.id) is None
 
 
-def test_a_refusal_looks_for_the_accounts_sessions_again_once_it_is_committed(monkeypatch):
-    """A renewal ("Stay signed in") under way while the refusal ran may commit its new session after the refusal's
-    look. The refusal is committed first, so a renewal that has not made its session yet refuses itself, and then
-    the account's sessions are asked for once more; what that look ends is committed too."""
-    h, alice, root, p, identity, callback_with = _refusal_world(monkeypatch)
-    order = []
-    monkeypatch.setattr(h.S, "_revoke_sessions",
-                        lambda db, **kw: order.append(("revoke", identity.refused_at is not None)) or 1)
-    real_commit = h.db.commit
+def test_the_callbacks_error_is_logged_as_a_code_of_the_protocol_or_not_at_all(monkeypatch, caplog):
+    """Anyone can call the callback with an ``error`` of their choosing: it has no session, and the state comes
+    from the start route. Only a value shaped like an error code of the protocol is written to the log; any other
+    text is named, never copied, so a caller cannot write a line of their own into it."""
+    import logging
+    from app.api import sso_router
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
 
-    def commit():
-        order.append(("commit", identity.refused_at is not None))
-        return real_commit()
-    monkeypatch.setattr(h.db, "commit", commit)
-    assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
-    looks = [i for i, (what, _) in enumerate(order) if what == "revoke"]
-    assert len(looks) == 2
-    assert ("commit", True) in order[looks[0] + 1:looks[1]], order
-    assert ("commit", True) in order[looks[1] + 1:], order
+    def refused_with(error):
+        status, out = h.start(p)
+        state, _ = h.state_of(out["authorization_url"])
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="dockvault.sso"):
+            assert h.callback(p, state, code=None, error=error)[1] == "/#sso-error=provider_error"
+        return [r.getMessage() for r in caplog.records if "sso callback error" in r.getMessage()]
+
+    assert refused_with("access_denied") == [f"sso callback error for provider {p.id}: access_denied"]
+    for chosen in ("x%0d%0a2026-11-13 forged line", "Access_Denied", "a" * 41, "access denied", "<b>", "0"):
+        assert refused_with(chosen) == [f"sso callback error for provider {p.id}: unrecognised"], chosen
+    assert sso_router._logged_error(None) == "no code" and sso_router._logged_error("login_required") == "login_required"
+    assert sso_router._logged_error("a" * 40) == "a" * 40 and sso_router._logged_error(["access_denied"]) == "unrecognised"
+    assert sso_router._logged_error("access_denied\n") == "unrecognised"
 
 
 def test_a_refusal_ends_nothing_when_the_option_is_off_or_the_subject_is_nobodys(monkeypatch):

@@ -249,14 +249,6 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
         resource_id=str(user.id),
         details={"provider_id": str(row.id), "identity_id": str(identity.id), "sessions": ended}))
     db.commit()
-    # A renewal ("Stay signed in") under way while this ran may have committed its new session after the look above.
-    # The refusal is committed now, so a renewal that has not made its session yet refuses itself; one that had is
-    # found by this second look.
-    try:
-        if api._revoke_sessions(db, user_id=user.id, actor_username="system", durable=True):
-            db.commit()
-    except Exception:  # noqa: BLE001 -- the refusal and the sessions first seen stand
-        db.rollback()
     label = (getattr(row, "name", None) or "").strip() or (getattr(row, "label", None) or "the identity provider")
     try:
         admins = [str(a.id) for a in api._active_admins(db)]

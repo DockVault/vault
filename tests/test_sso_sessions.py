@@ -552,99 +552,66 @@ def test_a_logout_that_could_not_be_applied_does_not_spend_the_token(monkeypatch
     assert status == 200 and not [s for s in h.active_sessions() if s.is_active], body
 
 
-def _renewal_made_meanwhile(h, user, like):
-    """A session a renewal committed while a logout ran: a new session row with the provider's session copied."""
+def test_a_logout_reads_the_sessions_again_under_the_turn_of_the_accounts_it_names(monkeypatch):
+    """A renewal ("Stay signed in") moves the provider's session to a new session row under the account's turn at
+    its sessions. The logout finds whose sessions the token names, takes those accounts' turn, and reads the
+    sessions again under it: a renewal that committed while the logout waited for the turn is seen whole, and the
+    session it made is ended with the rest."""
     from app.core.models import ActiveSession, SsoSession
-    new = ActiveSession(session_token=uuid.uuid4().hex, user_id=user.id, ip_address="127.0.0.1")
-    h.db.add(new)
-    h.db.add(SsoSession(session_id=new.id, provider_id=like.provider_id, idp_sid=like.idp_sid, idp_sub=like.idp_sub,
-                        auth_time=like.auth_time, id_token_enc=None))
-    return new
-
-
-def test_a_logout_looks_again_for_a_session_a_renewal_made_while_it_ran(monkeypatch):
-    """A renewal ("Stay signed in") makes its new session, with the provider's session copied to it, before it ends
-    the old one. A logout whose first look came before that session was committed asks again after ending what it
-    found, and ends the new session too."""
-    alice, p = _user(), _provider()
-    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    alice, bob, p = _user(), _user("bob"), _provider()
+    h = Sessions(monkeypatch, [alice, bob], [p], identities=[_identity(alice, p), _identity(bob, p, subject="subject-bob")])
     _signed_in(h, p, sid="s-1")
-    old, kept = h.active_sessions()[0], h.sso_sessions()[0]
+    _signed_in(h, p, sid="s-bob", sub="subject-bob", email="bob@example.test")
+    old = [s for s in h.active_sessions() if s.user_id == alice.id][0]
+    kept = [r for r in h.sso_sessions() if r.session_id == old.id][0]
+    order, made = [], []
+
+    def turn(db, user_id):
+        order.append(("turn", str(user_id)))
+        if not made:
+            # The renewal the logout waited for: the old session ended, a new one in its place with the record.
+            new = ActiveSession(session_token=uuid.uuid4().hex, user_id=alice.id, ip_address="127.0.0.1")
+            h.db.add(new)
+            h.db.add(SsoSession(session_id=new.id, provider_id=kept.provider_id, idp_sid=kept.idp_sid,
+                                idp_sub=kept.idp_sub, auth_time=kept.auth_time, id_token_enc="enc:hint"))
+            old.is_active, old.revoked, kept.id_token_enc = False, True, None
+            made.append(new)
+    monkeypatch.setattr(h.S, "_sessions_turn", turn)
     through = h.S._revoke_sessions
-    late = []
 
     def revoke(db, **kw):
-        out = through(db, **kw)
-        if not late:
-            late.append(_renewal_made_meanwhile(h, alice, kept))
-        return out
+        order.append(("revoke", sorted(str(i) for i in kw["session_ids"])))
+        return through(db, **kw)
     monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
     status, body = h.logout(p, h.logout_token(sid="s-1", sub="subject-1"))
     assert (status, body) == (200, {})
-    assert late[0].is_active is False and late[0].revoked is True and old.is_active is False
-    assert [kw["session_ids"] for kw in h.revoked] == [[old.id], [late[0].id]]
-    assert any(a[0] == "sso_backchannel_logout" and a[1] == "success" and a[2]["sessions"] == 2 for a in h.audits), h.audits
+    # The turn of the account the token names (alice's, nobody else's), before anything is ended; then one
+    # revocation of what the second read found: the old session's record and the new one's.
+    assert order == [("turn", str(alice.id)), ("revoke", sorted([str(old.id), str(made[0].id)]))]
+    assert made[0].is_active is False and made[0].revoked is True
+    assert [s for s in h.active_sessions() if s.is_active and s.user_id == bob.id]
+    assert any(a[0] == "sso_backchannel_logout" and a[1] == "success" and a[2]["sessions"] == 1 for a in h.audits), h.audits
 
 
-def test_a_logout_stops_looking_after_a_few_looks_and_with_nothing_new_asks_once_more_only(monkeypatch):
+def test_a_logout_that_names_several_accounts_takes_their_turns_in_one_order(monkeypatch):
+    """By subject, a token can name sessions of one account only; by a session id shared across accounts it cannot
+    either. The order is fixed all the same, so two logouts never wait on each other's turn."""
     from app.api import sso_router
-    alice, p = _user(), _provider()
-    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    from app.core.models import ActiveSession
+    alice, bob, p = _user(), _user("bob"), _provider()
+    h = Sessions(monkeypatch, [alice, bob], [p], identities=[_identity(alice, p), _identity(bob, p, subject="subject-bob")])
     _signed_in(h, p, sid="s-1")
-    kept = h.sso_sessions()[0]
-    # Nothing new: the sessions are asked for once more and nothing more is ended.
-    asked = []
-    real_query = h.db.query
-
-    def query(*entities):
-        asked.append(entities)
-        return real_query(*entities)
-    monkeypatch.setattr(h.db, "query", query)
-    status, _ = h.logout(p, h.logout_token(sid="s-1", sub="subject-1"))
-    assert status == 200 and len(h.revoked) == 1
-    monkeypatch.setattr(h.db, "query", real_query)
-    # A session appearing at every look (it cannot happen: a renewal comes once a session): the looks are bounded.
-    _signed_in(h, p, sid="s-2")
-    kept = [r for r in h.sso_sessions() if r.idp_sid == "s-2"][0]
-    h.revoked.clear()
-    through = h.S._revoke_sessions
-
-    def revoke(db, **kw):
-        out = through(db, **kw)
-        _renewal_made_meanwhile(h, alice, kept)
-        return out
-    monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
-    status, _ = h.logout(p, h.logout_token(sid="s-2", sub="subject-1"))
-    assert status == 200 and len(h.revoked) == 1 + sso_router.BACKCHANNEL_MORE_LOOKS
-
-
-def test_a_second_look_that_fails_does_not_spend_the_token(monkeypatch):
-    """The sessions first found are ended; the look after them fails. The answer is 501 and the token's id is
-    forgotten, so the provider's retry ends the session the renewal made."""
-    alice, p = _user(), _provider()
-    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
-    _signed_in(h, p, sid="s-1")
-    old, kept = h.active_sessions()[0], h.sso_sessions()[0]
-    token = h.logout_token(sid="s-1", sub="subject-1")
-    through = h.S._revoke_sessions
-    calls, late = [], []
-
-    def revoke(db, **kw):
-        calls.append(kw)
-        if len(calls) == 2:
-            raise RuntimeError("the database went away")
-        out = through(db, **kw)
-        if not late:
-            late.append(_renewal_made_meanwhile(h, alice, kept))
-        return out
-    monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
-    status, body = h.logout(p, token)
-    assert (status, body) == (501, {"error": "logout_failed"})
-    assert old.is_active is False and late[0].is_active is True
-    assert any(a[0] == "sso_backchannel_logout" and a[1] == "failure" and a[2].get("reason") == "revocation_failed"
-               for a in h.audits), h.audits
-    status, body = h.logout(p, token)
-    assert status == 200 and late[0].is_active is False
+    _signed_in(h, p, sid="s-bob", sub="subject-bob", email="bob@example.test")
+    ids = [s.id for s in h.active_sessions()]
+    assert sso_router._owners_of(h.db, ids) == sorted([str(alice.id), str(bob.id)])
+    assert sso_router._owners_of(h.db, list(reversed(ids))) == sorted([str(alice.id), str(bob.id)])
+    assert sso_router._owners_of(h.db, []) == [] and sso_router._owners_of(h.db, [uuid.uuid4()]) == []
+    # A token that names nothing takes no turn and ends nothing.
+    turns = []
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: turns.append(user_id))
+    status, _ = h.logout(p, h.logout_token(sid="no-such-session", sub="subject-1"))
+    assert status == 200 and turns == [] and h.revoked == []
+    assert all(s.is_active for s in h.db.rows_of(ActiveSession))
 
 
 def test_a_commit_that_fails_spends_the_token_only_when_the_logout_took_effect(monkeypatch):
