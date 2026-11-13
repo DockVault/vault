@@ -9240,6 +9240,33 @@ def _send_force_closes(items) -> None:
 _after_commit_work.handler(_FORCE_CLOSE_WORK, _send_force_closes)
 
 
+# The advisory lock class of an account's turn at its sessions ("ST"); the turn at signing in has its own.
+_SESSIONS_TURN_CLASS = 0x5354
+
+
+def _sessions_turn(db, user_id) -> None:
+    """Take the account's turn at its sessions, in the caller's transaction, and keep it until that transaction
+    ends (commit or rollback).
+
+    What ends an account's sessions together (_revoke_sessions for an account: a password change or reset, a
+    sign-out everywhere, a change of the second factor) and a renewal ("Stay signed in", app/services/sign_in.py
+    renew), which puts a new session in the place of one, take it before they read the account's sessions. So a
+    revocation never reads them while a renewal is half done: it comes wholly before the renewal, which then
+    finds its session ended and makes nothing, or wholly after it, and ends the new session. Without the turn, a
+    renewal that fell between a revocation's read and its write left a live session the revocation never saw.
+
+    On PostgreSQL the turn is a transaction-scoped advisory lock keyed on the account, as the turn at signing in
+    is (app/core/sign_in_lockout.py take_turn), in a class of its own: two accounts whose ids hash alike share a
+    queue, which costs a wait and nothing else, and the wait is bounded by the connection's lock_timeout.
+    Elsewhere (the tests' SQLite, a stand-in store) one writer works at a time already and nothing is taken."""
+    get_bind = getattr(db, "get_bind", None)
+    if get_bind is None or get_bind().dialect.name != "postgresql":
+        return
+    from sqlalchemy import text
+    db.execute(text("SELECT pg_advisory_xact_lock(:cls, hashtext(:account))"),
+               {"cls": _SESSIONS_TURN_CLASS, "account": str(user_id)})
+
+
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
                      durable=True, except_session_token=None):
     """Deactivate the matching active sessions AND publish a force-close signal to
@@ -9262,9 +9289,15 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
     revoked, so it kept working until it expired. Those rows get no force-close signal: an SFTP
     connection re-reads its row on every operation and stops once the row is inactive, and a
     live-monitor socket re-checks the revoked flag on its own every few seconds, so the signal
-    would reach nothing that can still act."""
+    would reach nothing that can still act.
+
+    For an account, the account's turn at its sessions is taken first (_sessions_turn), so a renewal under way
+    is wholly before this or wholly after it."""
     from app.core.models import ActiveSession
     from app.core.database import redis_client
+
+    if user_id is not None:
+        _sessions_turn(db, user_id)
 
     # Release any chunked upload the credential had open. Those sessions are bound to the
     # principal that started them, so once the credential is gone nobody can finish them and
@@ -25723,8 +25756,9 @@ def _renewal_terms(db, user, old: dict, now: datetime = None):
     auth_time is the original sign-in (the old token's auth_time, else its iat), carried through every
     renewal. A sign-in is renewed only up to the renewal limit counted from auth_time, and only while the
     way the person signed in still satisfies the sign-in rules: an account that now needs a second factor
-    at sign-in is refused when its token shows none. The new token's life is the session timeout, cut at
-    the limit. Raises HTTPException(403) with the sentence to show when the renewal is refused; nothing
+    at sign-in is refused when its token shows none (in amr, or by mfa_at: two kinds of factor were present,
+    as when an identity provider's own second factor is trusted). The new token's life is the session
+    timeout, cut at the limit. Raises HTTPException(403) with the sentence to show when the renewal is refused; nothing
     has changed by then."""
     now = now or datetime.now(timezone.utc)
     try:
@@ -25735,7 +25769,8 @@ def _renewal_terms(db, user, old: dict, now: datetime = None):
     if now >= limit_end - timedelta(seconds=5):
         raise HTTPException(status_code=403, detail=(
             "You have been signed in for as long as this vault allows at a stretch; sign in again."))
-    if _login_second_factor_in_effect(db, user) and not _amr_has_second_factor(old.get("amr")):
+    shown = _amr_has_second_factor(old.get("amr")) or bool(old.get("mfa_at"))
+    if _login_second_factor_in_effect(db, user) and not shown:
         raise HTTPException(status_code=403, detail="Signing in now needs your second factor; sign in again.")
     timeout = timedelta(minutes=_setting_int(db, "session_timeout", settings.jwt_access_token_expire_minutes))
     return auth_time, min(now + timeout, limit_end)
@@ -25780,10 +25815,13 @@ async def extend_session(
     original sign-in, and a renewal is refused once the renewal limit counted from it is reached, or when
     the account now needs a second factor its token does not show (_renewal_terms). A temporary
     credential's session is not extended. The renewal itself is the sign-in pipeline's (sign_in.renew): a
-    refusal before anything changes, the new session made before the old one is ended, one winner."""
+    refusal before anything changes, then the new session and the end of the old one in one transaction,
+    under the account's turn at its sessions. It runs in a worker thread: it may wait for that turn."""
+    from starlette.concurrency import run_in_threadpool
     token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     payload = verify_access_token(token) or {}
-    renewed = sign_in.renew(db, current_user, payload, client_ip=get_client_ip(request))
+    client_ip = get_client_ip(request)
+    renewed = await run_in_threadpool(lambda: sign_in.renew(db, current_user, payload, client_ip=client_ip))
     return {"access_token": renewed.access_token, "token_type": "bearer",
             "expires_at": renewed.expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")}
 

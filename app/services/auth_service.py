@@ -1713,8 +1713,13 @@ class AuthService:
         ip_address: str,
         expires_at: Optional[datetime] = None,
         channel: Optional[str] = None,
+        commit: bool = True,
     ) -> str:
-        """Create a new active session, signed in on ``channel`` (WEB or SFTP)."""
+        """Create a new active session, signed in on ``channel`` (WEB or SFTP).
+
+        ``commit=False`` writes the row without committing it: the caller commits it with the rest of its
+        transaction (a renewal commits the new session and the end of the old one together). No cache entry is
+        made for a row that may never exist."""
         session_token = generate_session_token()
 
         # Store the token's SHA-256 hash at rest, not the token itself: a database read then yields
@@ -1732,6 +1737,9 @@ class AuthService:
         # The committed row is the session: every request reads it by the token's hash. Nothing keeps a
         # copy of it in Redis.
         self.db.add(session)
+        if not commit:
+            self.db.flush()
+            return session_token
         self.db.commit()
         self.db.refresh(session)
 

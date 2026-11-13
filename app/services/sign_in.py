@@ -20,7 +20,7 @@ who the person is, so the finishing moves here and every route calls it:
   method: the audit row, the live-monitor event, the sign-in alert, the owner's notice of a
   temporary credential's sign-in.
 * :func:`renew` keeps a finished sign-in going ("Stay signed in"): a new session and token in place of
-  the old, by the renewal rules, in an order that leaves no moment without one of the two.
+  the old, by the renewal rules, the two changed in one transaction under the account's turn at its sessions.
 
 The route decides how it answers (the shapes the web app knows are unchanged); this module decides
 what a sign-in is.
@@ -465,11 +465,6 @@ def _record(db, result: SignInResult, api) -> None:
         api._fire_action_email(db, "login_alert", email=user.email, username=user.username)
 
 
-# How long the session row a renewal makes lives until the renewal has won: time enough for the few statements between
-# making it and ending the old session, and short enough that a row left by a crash in between ends on its own.
-RENEWAL_HOLD = timedelta(minutes=2)
-
-
 @dataclass
 class Renewed:
     """A renewed sign-in: the new token, and when it runs out."""
@@ -487,16 +482,18 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
     person signed in. This function owns the order:
 
     1. A refusal comes before anything changes: the session is left as it was, to run out on its own.
-    2. The new session row is made first, with what the old one carried, and lives only minutes
-       (``RENEWAL_HOLD``) until the renewal has won. So whatever looks for the account's sessions meanwhile (a
-       sign-out everywhere, an identity provider's logout) finds it, at no moment is the old session ended with
-       the new one not yet there, and a row left by a crash at this point ends on its own. Its token exists only
-       inside this call.
-    3. The old session is ended by one conditional update, and only the call that ended it goes on. Of two
-       requests with the same token one wins; the other, like a renewal whose session was ended meanwhile, deletes
-       the row it made and is refused, so a replay carries a dead token and leaves nothing.
-    4. The winner's row gets its full life, the old token is refused for the rest of its own, the new token is
-       minted and the renewal is recorded (``session_extended``).
+    2. The renewal takes the account's turn at its sessions (``_sessions_turn``, which every revocation of an
+       account's sessions takes too) and reads the old session under it, locked. A session that has ended, or is
+       not this account's, is refused here with nothing made.
+    3. In that same transaction the new session row is made and the old one is ended, and both are committed
+       together. Nothing sees the old session ended with the new one not yet there, or the new one while the old
+       still stands. A revocation of the account's sessions (a password change, a sign-out everywhere) comes wholly
+       before the renewal, which then finds its session ended and makes nothing, or wholly after it, and ends the
+       new session. Of two requests with the same token, one takes the turn first and the other finds the session
+       ended: a replay carries a dead token and leaves nothing. A crash before the commit leaves nothing either.
+    4. The old token is refused for the rest of its own life, what the person proved in the old session is carried
+       to the new one, the new token is minted (it exists only in this answer) and the renewal is recorded
+       (``session_extended``).
     """
     import time
     from app.api import api_server as api
@@ -508,25 +505,28 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
         raise HTTPException(status_code=403, detail="This session cannot be extended; sign in again when it ends.")
     auth_time, expires_at = api._renewal_terms(db, user, old, now)
     ended_already = HTTPException(status_code=401, detail="This session has already ended.")
-    old_row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(old_session)).first()
-    if old_row is None or str(old_row.user_id) != str(user.id) or old_row.revoked:
-        raise ended_already
-    auth = AuthService(db)
-    new_session = auth._create_session(user, None, client_ip, expires_at=now + RENEWAL_HOLD, channel=auth.WEB)
+    user_id = user.id
     try:
-        api._carry_session_marks(db, old_row, new_session)
-        _row, ended = api._end_web_session(db, old_session, user_id=user.id)
+        api._sessions_turn(db, user_id)
+        old_row = (db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(old_session))
+                   .populate_existing().with_for_update().first())
+        if old_row is None or str(old_row.user_id) != str(user_id) or old_row.revoked:
+            raise ended_already
+        auth = AuthService(db)
+        new_session = auth._create_session(user, None, client_ip, expires_at=now + SESSION_ROW_LIFETIME,
+                                           channel=auth.WEB, commit=False)
+        # Ends the old session and commits: the new session and the old one's end become visible together.
+        _row, ended = api._end_web_session(db, old_session, user_id=user_id)
     except BaseException:
-        _drop_unwon_session(db, new_session)
+        db.rollback()
         raise
     if not ended:
-        _drop_unwon_session(db, new_session)
+        # Not reachable while the turn and the row are held. A session is never left without its token.
+        api._end_web_session(db, new_session, user_id=user_id)
         raise ended_already
-    db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(new_session)).update(
-        {ActiveSession.expires_at: now + SESSION_ROW_LIFETIME}, synchronize_session=False)
-    db.commit()
     ttl = int(old.get("exp", 0) - time.time())
     denylist_token(old_session, ttl if ttl > 0 else 1800)
+    api._carry_session_marks(db, old_row, new_session)
     access_token = api._renewed_token(user, old, new_session, auth_time, expires_at, now)
     try:
         api.AuditLogger(db).log_action(action="session_extended", status="success", user=user, ip_address=client_ip,
@@ -538,20 +538,6 @@ def renew(db, user, old: dict, *, client_ip: Optional[str], now: Optional[dateti
     except Exception:  # noqa: BLE001 -- the renewal stands without its row
         pass
     return Renewed(access_token=access_token, expires_at=expires_at)
-
-
-def _drop_unwon_session(db, session_token: str) -> None:
-    """A renewal that did not win leaves nothing: the row it made is deleted (its token never left the call that
-    made it) and its cache entry with it."""
-    from app.services import auth_service
-    try:
-        db.rollback()
-        delete_session_by_token(db, session_token)
-    except Exception:  # noqa: BLE001 -- the row ends on its own (RENEWAL_HOLD) when it cannot be deleted now
-        db.rollback()
-    auth_service._best_effort_cache(
-        "session.cache-delete.skipped",
-        lambda: auth_service.redis_client.delete(f"session:{hash_session_token(session_token)}"))
 
 
 def read_password_stage(payload: Optional[dict], db):
