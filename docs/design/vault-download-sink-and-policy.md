@@ -127,6 +127,17 @@ and tells the user a download did not start if the browser has not asked within 
 has given up, and in the other order holds back the file's body until the page has heard that the
 browser asked, so each order is tested instead of being left to timing.
 
+## A download is answered as plain bytes, whatever the file was stored as (0.33.7)
+
+The slot's address is one of the vault's own origin, and a stored MIME type is whatever its uploader
+claimed. Up to 0.33.6 the worker answered under the type the page passed it, so a file stored as a
+script or a page was a script or a page of this origin to anything that named the address while the
+slot was open. From 0.33.7 the worker answers every download as `application/octet-stream` (still an
+attachment, with sniffing off), and the page saves a file it read whole from an object address made
+under the same type. The browser saves the file under the name it is given, so the type is not needed.
+`tests/test_download_sink_worker_type.py` and `tests/test_download_object_urls.py` run the shipped
+code for both.
+
 ## Measured after building it: the memory case is not made
 
 The sink was built to remove a memory ceiling. Measured, it does not do that. It moves the cost
