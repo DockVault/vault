@@ -16,6 +16,9 @@ and carries on when it cannot reach them. At localhost, where nothing listens, L
 but Windows tries each of localhost's two addresses for two seconds before giving up: four seconds for
 each such try, and the offline lane makes dozens of them. Windows refuses 0.0.0.0 at once, as an
 address no connection can use; Linux takes it for this host, as it took localhost.
+
+tests/conftest.py calls this too, once, before it starts the application's runtime for the run: the
+settings every test starts from are the ones that start read from this environment.
 """
 import base64
 import os

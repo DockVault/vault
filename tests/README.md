@@ -157,3 +157,17 @@ tests\.venv\Scripts\python -m pytest -m docker
 | `VAULT_ADMIN_USER` / `VAULT_ADMIN_PASS` | read from `../.env` (`ADMIN_USERNAME` / `ADMIN_PASSWORD`) |
 
 If the container isn't reachable, integration tests **skip** cleanly while the offline unit lane still runs.
+
+## Application settings in unit tests
+
+A unit test runs the application's code in the test process, and the application keeps one settings
+object for the whole process. `conftest.py` starts the application's runtime once when a run starts,
+from the process environment and the minimal values in `_bare_api_env.py`, and never from the `.env`
+in the working directory: that file configures the stack under test, not the test process. Every test
+starts from those settings, and they are put back when it ends. So a test finds the same settings
+whether its module runs alone, in the offline lane, or in the whole suite beside a stack, and whatever
+the tests before it did.
+
+A test that needs another value sets it with `monkeypatch.setattr(settings, ...)` or a
+function-scoped fixture of its own. A value that a module- or session-scoped fixture sets on the
+settings is undone before each of its tests. `test_settings_isolation.py` holds all of this.
