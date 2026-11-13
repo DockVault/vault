@@ -99,6 +99,21 @@ def test_the_test_after_it_finds_the_object_the_run_started_with():
     assert _left_behind() == []
 
 
+# ---- a credential changed where it is kept ---------------------------------------------------------
+# Ahead of the pair that replaces the credentials with others: what is put back there is a copy, and
+# this pair is about the credentials the start itself filled.
+
+def test_a_test_changes_a_credential_in_the_place_the_start_filled():
+    credential_manager.credentials["ENCRYPTION_KEY"] = "another"
+    credential_manager.credentials["A_NAME_THE_START_DID_NOT_READ"] = "added"
+    assert set(_left_behind()) == {"credentials.ENCRYPTION_KEY", "credentials.A_NAME_THE_START_DID_NOT_READ"}
+
+
+def test_the_test_after_it_finds_the_credentials_the_start_read():
+    assert _left_behind() == []
+    assert "A_NAME_THE_START_DID_NOT_READ" not in credential_manager.credentials
+
+
 # ---- a setting removed, one added, the latch, the credentials --------------------------------------
 
 def test_a_test_removes_a_setting_adds_one_and_changes_the_latch_and_the_credentials():
@@ -259,6 +274,27 @@ A_MODULE_THAT_IMPORTS_THE_SERVER = """
 """
 
 
+IN_THE_DOTENV = ("MAX_STORAGE_GB", "RATE_LIMIT_LOGIN_ATTEMPTS", ONLY_IN_THE_DOTENV)
+
+
+def _a_run_of_its_own(directory, module, **environment):
+    """Run `module` in a pytest process of its own, started in `directory` with tests/conftest.py loaded
+    as it is, and with this process's environment plus `environment`, less the names the deployment's
+    .env sets. Returns the finished process and everything it said."""
+    (directory / "pytest.ini").write_text("[pytest]\nmarkers =\n    unit: runs without a stack\n", encoding="utf-8")
+    (directory / "test_in_a_run_of_its_own.py").write_text(textwrap.dedent(module), encoding="utf-8")
+    given = {name: value for name, value in os.environ.items()
+             if not name.startswith("PYTEST_") and name not in IN_THE_DOTENV}
+    given.update(environment, PYTHONPATH=os.pathsep.join([str(TESTS), str(TESTS.parent)]),
+                 PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    # Well under the deadline every test of the suite has, so that a run that hangs fails this test.
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "conftest", "-p", "no:cacheprovider", "-v",
+         "test_in_a_run_of_its_own.py"],
+        cwd=directory, env=given, capture_output=True, text=True, timeout=300)
+    return done, done.stdout + done.stderr
+
+
 def test_a_run_beside_a_deployment_does_not_work_under_the_deployments_dotenv(tmp_path):
     """The case as it happens: a run of its own, started in a directory that holds a deployment's .env,
     whose test module imports the server while it is collected. The run's settings are the defaults:
@@ -267,22 +303,47 @@ def test_a_run_beside_a_deployment_does_not_work_under_the_deployments_dotenv(tm
     same file, named, does carry the limits."""
     (tmp_path / ".env").write_text(
         f"MAX_STORAGE_GB=64\nRATE_LIMIT_LOGIN_ATTEMPTS=2000\n{ONLY_IN_THE_DOTENV}=1\n", encoding="utf-8")
-    (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers =\n    unit: runs without a stack\n", encoding="utf-8")
-    (tmp_path / "test_beside_a_deployment.py").write_text(
-        textwrap.dedent(A_MODULE_THAT_IMPORTS_THE_SERVER), encoding="utf-8")
-    in_the_dotenv = ("MAX_STORAGE_GB", "RATE_LIMIT_LOGIN_ATTEMPTS", ONLY_IN_THE_DOTENV)
-    environment = {name: value for name, value in os.environ.items()
-                   if not name.startswith("PYTEST_") and name not in in_the_dotenv}
-    environment.update(PYTHONPATH=os.pathsep.join([str(TESTS), str(TESTS.parent)]),
-                       PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
-    done = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "conftest", "-p", "no:cacheprovider", "-v",
-         "test_beside_a_deployment.py"],
-        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=600)
-    said = done.stdout + done.stderr
+    done, said = _a_run_of_its_own(tmp_path, A_MODULE_THAT_IMPORTS_THE_SERVER)
     assert "test_the_settings_are_not_the_deployments PASSED" in said, said[-3000:]
     assert "test_nor_what_a_module_set_while_it_was_imported PASSED" in said, said[-3000:]
     assert "test_the_same_file_given_by_name_would_have_set_them PASSED" in said, said[-3000:]
+    assert done.returncode == 0, said[-3000:]
+
+
+# ---- an environment the runtime refuses -------------------------------------------------------------
+
+A_GOOD_SIGNING_SECRET = "s" * 32
+
+IN_A_RUN_THAT_COULD_NOT_START_THE_RUNTIME = f"""
+    import pytest
+
+    from app.core import config
+
+    pytestmark = pytest.mark.unit
+
+
+    def test_the_runtime_is_not_started_and_a_test_can_start_it_for_itself(monkeypatch):
+        assert not config.runtime_is_initialized()
+        monkeypatch.setenv("JWT_SECRET_KEY", "{A_GOOD_SIGNING_SECRET}")
+        config.initialize_runtime(interactive=False)
+        assert config.runtime_is_initialized()
+        assert config.settings.jwt_secret_key == "{A_GOOD_SIGNING_SECRET}"
+
+
+    def test_the_test_after_it_starts_as_the_run_did():
+        assert not config.runtime_is_initialized()
+        assert config.settings.jwt_secret_key != "{A_GOOD_SIGNING_SECRET}"
+"""
+
+
+def test_a_run_whose_environment_the_runtime_refuses_still_runs_its_tests(tmp_path):
+    """The run's own start is given an environment the runtime refuses: a signing secret too short to
+    use. The run does not end there. Its tests start from the settings as they were, never started, a
+    test that needs the runtime starts it from an environment of its own, and the test after that one
+    finds it not started again."""
+    done, said = _a_run_of_its_own(tmp_path, IN_A_RUN_THAT_COULD_NOT_START_THE_RUNTIME, JWT_SECRET_KEY="short")
+    assert "test_the_runtime_is_not_started_and_a_test_can_start_it_for_itself PASSED" in said, said[-3000:]
+    assert "test_the_test_after_it_starts_as_the_run_did PASSED" in said, said[-3000:]
     assert done.returncode == 0, said[-3000:]
 
 
