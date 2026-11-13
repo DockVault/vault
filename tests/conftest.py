@@ -2,9 +2,11 @@
 Shared pytest fixtures for the DockVault vault-service integration suite.
 
 These tests run on the HOST and exercise the live container at
-http://localhost:8200 (bring it up with `docker compose up -d`). Nothing here
-imports the application code — everything goes
-over HTTP, so the suite tests the real, deployed surface.
+http://localhost:8200 (bring it up with `docker compose up -d`). The live tests
+go over HTTP, so the suite tests the real, deployed surface. The unit tests run
+the application's code in this process: this file starts its runtime once for
+the run and gives every test the same settings (see "Every test starts from the
+application settings the run started with" below).
 
 Config (all optional, sensible defaults):
   VAULT_BASE_URL   default http://localhost:8200
@@ -563,6 +565,109 @@ def _recording_levels_start_afresh():
 
 
 # ---------------------------------------------------------------------------
+# Every test starts from the application settings the run started with.
+# ---------------------------------------------------------------------------
+# The application keeps one settings object for the whole process (app.core.config.settings). The
+# runtime's start fills it, once, from the environment and, on a host, from the .env in the working
+# directory; importing the server module starts the runtime, and so does the first use of a key or of
+# a database session. Many unit test modules import the server module, so in a full run the start
+# happened while the tests were being collected, with whatever .env was in the working directory.
+# Beside a running stack that is the stack's .env: every unit test of the run then worked under that
+# deployment's limits, and a test that passes at the defaults failed there and nowhere else. A test
+# that started the runtime again from an environment of its own left its values to every test after
+# it in the same way.
+#
+# Three things keep the tests apart from a deployment, and from each other:
+#
+# - A start in the test process reads the process environment alone. The .env in the working directory
+#   configures the stack under test, never the test process. A start that is given a file by name still
+#   reads that file.
+# - The run starts the runtime itself, below, before any test module is imported, from the minimal
+#   environment the unit modules set (tests/_bare_api_env.py). The settings a test finds are then the
+#   same whether its module runs alone, in the offline lane, or in the whole suite beside a stack.
+# - Every test starts from the settings as that start left them, and they are put back when the test
+#   ends (_settings_as_the_run_started), whatever the test or the code it ran did: a value changed,
+#   an attribute added or removed, the object replaced by another, the runtime started again. The
+#   credentials the start read from the environment are kept the same way: the settings take the
+#   secrets the environment does not name from them.
+#
+# A test that needs another value sets it for itself, with monkeypatch or a fixture of its own, and the
+# value holds while the test runs. A value set by a module- or session-scoped fixture does not reach
+# the fixture's tests: each of them starts from the run's settings.
+class _SettingsAtStart:
+    """What the application's process-wide settings held when the run started, and how to put it back."""
+
+    def __init__(self, config, credentials):
+        self.config = config
+        self.settings = config.settings
+        self.values = dict(vars(config.settings))
+        self.fields_set = frozenset(config.settings.__pydantic_fields_set__)
+        self.initialized = config._runtime_initialized
+        self.credentials = credentials
+        self.unlocked = credentials.is_unlocked
+        self.held = dict(credentials.credentials)
+        self.cipher = credentials._fernet_cipher
+
+    def put_back(self):
+        config, settings, credentials = self.config, self.settings, self.credentials
+        if config.settings is not settings:
+            config.settings = settings
+        # In place and without emptying it first: a thread the application started may be reading.
+        live = vars(settings)
+        live.update(self.values)
+        if len(live) != len(self.values):
+            for name in [name for name in live if name not in self.values]:
+                del live[name]
+        if settings.__pydantic_fields_set__ != self.fields_set:
+            object.__setattr__(settings, "__pydantic_fields_set__", set(self.fields_set))
+        config._runtime_initialized = self.initialized
+        credentials.is_unlocked = self.unlocked
+        if credentials.credentials != self.held:
+            credentials.credentials = dict(self.held)
+        credentials._fernet_cipher = self.cipher
+
+
+def _start_the_run_with_its_own_settings():
+    try:
+        from app.core import config
+        from app.core.startup_security import credential_manager
+    except Exception:  # noqa: BLE001 — the application cannot be imported here: there are no settings to keep
+        return None
+    from _bare_api_env import set_bare_api_env
+
+    read_dotenv = config.load_runtime_environment
+
+    def read_only_a_named_dotenv(dotenv_path=None):
+        return None if dotenv_path is None else read_dotenv(dotenv_path)
+
+    config.load_runtime_environment = read_only_a_named_dotenv
+    set_bare_api_env()
+    try:
+        config.initialize_runtime(interactive=False)
+    except Exception:  # noqa: BLE001
+        # The environment the run was given cannot start the runtime (a value the settings refuse, say).
+        # The tests then start from the settings as they are, not started, and a module that imports the
+        # server reports the refusal itself, as it did before.
+        pass
+    return _SettingsAtStart(config, credential_manager)
+
+
+_SETTINGS_AT_START = _start_the_run_with_its_own_settings()
+
+
+@pytest.fixture(autouse=True)
+def _settings_as_the_run_started():
+    """Each test starts from the application settings the run started with, and they are put back when
+    it ends (see above). The fixture that gives a test `monkeypatch` asks for this one first, so that
+    what a test patched is undone before the settings are put back, not after."""
+    if _SETTINGS_AT_START is not None:
+        _SETTINGS_AT_START.put_back()
+    yield
+    if _SETTINGS_AT_START is not None:
+        _SETTINGS_AT_START.put_back()
+
+
+# ---------------------------------------------------------------------------
 # The host tool's unit tests see no running deployment.
 # ---------------------------------------------------------------------------
 # dockvault.py asks Docker about the deployment's containers by their fixed names (vault, vault-api,
@@ -588,7 +693,9 @@ def _nothing_runs(real, answer):
 
 
 @pytest.fixture(autouse=True)
-def _host_tool_unit_tests_see_no_running_deployment(request, monkeypatch):
+def _host_tool_unit_tests_see_no_running_deployment(_settings_as_the_run_started, request, monkeypatch):
+    # _settings_as_the_run_started is asked for first, and only for the order: this fixture is the one
+    # that brings `monkeypatch` into every test, and a fixture set up later is undone earlier.
     if request.node.get_closest_marker("unit") is None or request.node.get_closest_marker("docker") is not None:
         return
     import types
