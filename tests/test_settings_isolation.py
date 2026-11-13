@@ -13,6 +13,10 @@ of a pair needs no help from the first: each compares with what this module saw 
 before any test ran.
 """
 import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +25,8 @@ from app.core.config import Settings, settings
 from app.core.startup_security import credential_manager
 
 pytestmark = pytest.mark.unit
+
+TESTS = Path(__file__).resolve().parent
 
 
 def _seen():
@@ -217,6 +223,67 @@ def test_a_start_given_that_file_by_name_reads_it(dotenv):
     config.initialize_runtime(dotenv_path=dotenv, interactive=False)
     assert os.environ[ONLY_IN_THE_DOTENV] == "1"
     assert settings.max_storage_gb == 64
+
+
+# A unit module as many are: it imports the server module, which starts the runtime if nothing has, so
+# the start happens while pytest collects the module, before any test and any fixture.
+A_MODULE_THAT_IMPORTS_THE_SERVER = """
+    import os
+
+    import pytest
+
+    from app.api import api_server  # noqa: F401
+    from app.core import config
+    from app.core.config import settings
+
+    pytestmark = pytest.mark.unit
+
+    settings.rate_limit_vault_attempts = 77     # a change made while the module is imported
+
+
+    def test_the_settings_are_not_the_deployments():
+        assert config.runtime_is_initialized()
+        assert "A_NAME_ONLY_THE_DOTENV_HAS" not in os.environ
+        assert (settings.max_storage_gb, settings.rate_limit_login_attempts) == (-1, 5)
+
+
+    def test_nor_what_a_module_set_while_it_was_imported():
+        assert settings.rate_limit_vault_attempts == 5
+
+
+    def test_the_same_file_given_by_name_would_have_set_them():
+        config._runtime_initialized = False
+        config.initialize_runtime(dotenv_path=".env", interactive=False)
+        assert os.environ["A_NAME_ONLY_THE_DOTENV_HAS"] == "1"
+        assert (settings.max_storage_gb, settings.rate_limit_login_attempts) == (64, 2000)
+"""
+
+
+def test_a_run_beside_a_deployment_does_not_work_under_the_deployments_dotenv(tmp_path):
+    """The case as it happens: a run of its own, started in a directory that holds a deployment's .env,
+    whose test module imports the server while it is collected. The run's settings are the defaults:
+    they were taken when the run started, before any test module was imported, so neither the .env nor
+    a change the module makes at import is in them. The last test of the module is the control: the
+    same file, named, does carry the limits."""
+    (tmp_path / ".env").write_text(
+        f"MAX_STORAGE_GB=64\nRATE_LIMIT_LOGIN_ATTEMPTS=2000\n{ONLY_IN_THE_DOTENV}=1\n", encoding="utf-8")
+    (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers =\n    unit: runs without a stack\n", encoding="utf-8")
+    (tmp_path / "test_beside_a_deployment.py").write_text(
+        textwrap.dedent(A_MODULE_THAT_IMPORTS_THE_SERVER), encoding="utf-8")
+    in_the_dotenv = ("MAX_STORAGE_GB", "RATE_LIMIT_LOGIN_ATTEMPTS", ONLY_IN_THE_DOTENV)
+    environment = {name: value for name, value in os.environ.items()
+                   if not name.startswith("PYTEST_") and name not in in_the_dotenv}
+    environment.update(PYTHONPATH=os.pathsep.join([str(TESTS), str(TESTS.parent)]),
+                       PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "conftest", "-p", "no:cacheprovider", "-v",
+         "test_beside_a_deployment.py"],
+        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=600)
+    said = done.stdout + done.stderr
+    assert "test_the_settings_are_not_the_deployments PASSED" in said, said[-3000:]
+    assert "test_nor_what_a_module_set_while_it_was_imported PASSED" in said, said[-3000:]
+    assert "test_the_same_file_given_by_name_would_have_set_them PASSED" in said, said[-3000:]
+    assert done.returncode == 0, said[-3000:]
 
 
 # ---- what putting back by value relies on -----------------------------------------------------------
