@@ -334,13 +334,23 @@ def condition(cid: str) -> dict:
 
 def before_the_release(matrix: dict) -> dict:
     """A copy of ``matrix`` with only the releases below INTO: every release from INTO on, every edge to or from
-    one, and the lines from INTO's on taken out, and the newest line left the newest again (no end date). The same
-    matrix whether or not ``matrix`` already declares INTO."""
+    one, and the lines from INTO's on taken out, and the newest line left the newest again (no end date). An
+    advisory keeps only the fixes released below INTO, and one fixed only from INTO on goes with the releases that
+    named it. The same matrix whether or not ``matrix`` already declares INTO."""
     out = copy.deepcopy(matrix)
     floor = _version_key(INTO)
     out["versions"] = {v: entry for v, entry in out["versions"].items() if _version_key(v) < floor}
     out["edges"] = [edge for edge in out["edges"]
                     if _version_key(edge["from"]) < floor and _version_key(edge["to"]) < floor]
+    for slug, advisory in list(out.get("advisories", {}).items()):
+        if advisory.get("fixed_in") is not None and _version_key(advisory["fixed_in"]) >= floor:
+            del out["advisories"][slug]
+        elif "fixed_in_lines" in advisory:
+            kept = [fix for fix in advisory["fixed_in_lines"] if _version_key(fix) < floor]
+            if len(kept) > 1:
+                advisory["fixed_in_lines"] = kept
+            else:
+                del advisory["fixed_in_lines"]
     if "lines" in out:
         lines = {line: dict(entry) for line, entry in out["lines"].items() if _version_key(line + ".0") < floor}
         if lines:

@@ -273,16 +273,16 @@ def _edge_from(source, kind="direct", conditions=True):
 
 
 @pytest.mark.parametrize("change, found", [
-    (_drop("legal-holds-block-rollback"), "the edge 0.33.6 -> 0.34.0 lacks the condition legal-holds-block-rollback"),
-    (_drop("container-output-rotates"), "the edge 0.33.6 -> 0.34.0 lacks the condition container-output-rotates"),
+    (_drop("legal-holds-block-rollback"), "the edge {newest} -> 0.34.0 lacks the condition legal-holds-block-rollback"),
+    (_drop("container-output-rotates"), "the edge {newest} -> 0.34.0 lacks the condition container-output-rotates"),
     (_alter("recording-levels-changed", "blocks_rollback", None),
-     "the edge 0.33.6 -> 0.34.0 leaves blocks_rollback off recording-levels-changed, which blocks a rollback"),
+     "the edge {newest} -> 0.34.0 leaves blocks_rollback off recording-levels-changed, which blocks a rollback"),
     (_alter("panel-retention-not-read", "blocks_rollback", True),
-     "the edge 0.33.6 -> 0.34.0 marks panel-retention-not-read with blocks_rollback, which blocks none"),
+     "the edge {newest} -> 0.34.0 marks panel-retention-not-read with blocks_rollback, which blocks none"),
     (_alter("audit-retention-runs-on-a-timer", "detect", "SELECT 1"),
-     "the edge 0.33.6 -> 0.34.0 gives audit-retention-runs-on-a-timer another detect query than the one kept here"),
+     "the edge {newest} -> 0.34.0 gives audit-retention-runs-on-a-timer another detect query than the one kept here"),
     (_alter("older-images-refuse-newer-data", "summary", "Another text."),
-     "the edge 0.33.6 -> 0.34.0 gives older-images-refuse-newer-data another text than the one kept here"),
+     "the edge {newest} -> 0.34.0 gives older-images-refuse-newer-data another text than the one kept here"),
     (_edge_from("0.33.2"), "the edge 0.33.2 -> 0.34.0 skips 0.33.6: an edge into 0.34.0 leaves from 0.33.6 or later"),
     (_edge_from("0.33.5", conditions=False),
      "the edge 0.33.5 -> 0.34.0 lacks the condition audit-history-compressed-after-90-days"),
@@ -290,7 +290,8 @@ def _edge_from(source, kind="direct", conditions=True):
 def test_the_check_finds_an_edge_into_0_34_0_that_lacks_a_condition_or_skips_0_33_6(change, found):
     data = _with_the_release()
     change(data)
-    assert found in rc.edge_problems(data)
+    # The edge into the release leaves from the newest release below it: 0.33.6, or a later one of that line.
+    assert found.format(newest=rc.newest_below(data)) in rc.edge_problems(data)
 
 
 def test_the_matrix_check_takes_an_edge_that_skips_0_33_6_so_only_this_one_refuses_it():
