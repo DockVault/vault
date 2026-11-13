@@ -88,11 +88,12 @@ module absent rather than broken, and every other extension module of the standa
 (but `_tkinter`, which the base ships without the Tk library it needs).
 
 The reviewed OpenVEX template, `security/vex.openvex.json`, holds the findings the maintainers have
-reviewed as not affecting the image, each with its justification. It holds no statements now. The
-last four were bound to package versions the image no longer contains: three findings in Python's
+reviewed as not affecting the image, each with its justification. It holds one statement now, for
+`CVE-2026-119170` in Python 3.14.10 (its paragraph is below). Four earlier statements were removed
+once they were bound to package versions the image no longer contained: three findings in Python's
 standard library, bound to Python 3.14.7, whose release already carries their fixes, and one in
 Alpine's `zlib` 1.3.2-r0, which the build's `apk upgrade` replaces with the fixed 1.3.2-r1. They
-suppressed nothing, so they were removed. Before the local scan, the workflow renders the template
+suppressed nothing. Before the local scan, the workflow renders the template
 for the tested source revision, the versioned image reference, and the local image content ID.
 After push, it renders the release asset again for the exact registry manifest digest. Every
 statement must contain both the immutable OCI digest PURL and the versioned image reference, and
@@ -103,7 +104,7 @@ one statement. OpenVEX requires a document to hold at least one, so a release wi
 exception has no VEX to publish: the renderer writes no file and the release attaches none, and the
 release is refused before it is created if any file it does list is missing. The scans still apply
 the document they render for the image they scan; with no statement it suppresses nothing, and it is
-never published.
+never published. While the template holds the statement below, a release attaches its VEX.
 
 Each statement names the exact package versions it was reviewed for, so an image that has moved on
 (a newer base image, or a newer Alpine package from the build's `apk upgrade`) is no longer covered
@@ -115,6 +116,18 @@ finding and the version the image has instead. The statement then lives in three
 template, its entry in `tests/test_supply_chain_contract.py`, and its paragraph in this document. It is removed
 from all three, or, if the new version is still affected and the reasoning still holds, reviewed
 again and its version changed in all three.
+
+One exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
+`CVE-2026-119170`, a regression in Python 3.14.10 in how the `hashlib` module enforces the
+algorithms OpenSSL allows in FIPS mode. Only a Python whose OpenSSL runs in FIPS mode is affected,
+and only 3.14.10; Python 3.14.11 fixes it. When it was reviewed, in November 2026, the official
+`python:3.14.11-alpine` image was not published, so the base image could not move to it. OpenSSL in
+this image cannot run in FIPS mode: the image ships no FIPS provider (`/usr/lib/ossl-modules/`
+holds only `legacy.so`), its `/etc/ssl/openssl.cnf` enables none, neither the image nor the Compose
+files set `OPENSSL_CONF` or `OPENSSL_MODULES`, and nothing in the application enables FIPS mode, so
+`_hashlib.get_fips_mode()` returns 0 and the code with the flaw never runs. The statement binds the
+`pkg:generic/python@3.14.10` subcomponent: when the base image moves to a Python release without the
+flaw, the pin stops matching, the image scan says so, and the statement is removed.
 
 ### Base-package patching: a deliberate reproducibility exception
 

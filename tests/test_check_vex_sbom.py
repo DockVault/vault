@@ -65,7 +65,7 @@ def _statement(name: str, subcomponent: str) -> dict:
 
 def _vex() -> dict:
     """A template holding reviewed statements: three bound to one Python version, one to one zlib
-    package. The committed template holds none today (see the last tests), so the checker's own
+    package. The committed template holds one statement (see the last tests), so the checker's own
     behaviour is exercised against this one."""
     statements = [_statement(name, "pkg:generic/python@3.14.7") for name in _PYTHON_FINDINGS]
     statements.append(_statement(_ZLIB_FINDING, "pkg:apk/alpine/zlib@1.3.2-r0"))
@@ -209,19 +209,27 @@ def test_the_command_refuses_an_sbom_it_cannot_read(tmp_path, capsys, sbom_text)
     assert capsys.readouterr().out.startswith("::error::")
 
 
-def test_the_committed_template_pins_nothing_and_passes_against_a_real_image(tmp_path, capsys):
-    """The committed template holds no statement, so it pins no package version: the check passes
-    for any image whose SBOM lists packages, and still refuses an SBOM that lists none (above)."""
+def test_the_committed_template_pins_the_python_it_was_reviewed_for(tmp_path, capsys):
+    """The committed template holds one statement, bound to Python 3.14.10: the check passes for an
+    image with that Python, and fails once the base image has moved to another one, so the statement
+    is removed or reviewed again instead of being carried forward."""
     committed = json.loads(_TEMPLATE.read_text(encoding="utf-8"))
-    assert committed["statements"] == []
-    assert _CHECK.vex_pins(committed) == []
-    assert _CHECK.stale_pins(committed, _image_as_reviewed()) == []
+    assert [s["vulnerability"]["name"] for s in committed["statements"]] == ["CVE-2026-119170"]
+    assert {purl for _, purl, _ in _CHECK.vex_pins(committed)} == {"pkg:generic/python@3.14.10"}
 
     sbom = tmp_path / "sbom.json"
-    sbom.write_text(json.dumps(_spdx("pkg:generic/python@3.14.8",
+    sbom.write_text(json.dumps(_spdx("pkg:generic/python@3.14.10",
                                      f"pkg:apk/alpine/zlib@1.3.2-r1{_ALPINE}")), encoding="utf-8")
     assert _CHECK.main(["--vex", str(_TEMPLATE), "--sbom", str(sbom)]) == 0
-    assert "every package version the VEX names is in the image (0 checked)" in capsys.readouterr().out
+    assert "every package version the VEX names is in the image (1 checked)" in capsys.readouterr().out
+
+    moved = _spdx("pkg:generic/python@3.14.11", f"pkg:apk/alpine/zlib@1.3.2-r1{_ALPINE}")
+    assert _CHECK.stale_pins(committed, moved) == [
+        _CHECK.Stale("CVE-2026-119170", "pkg:generic/python@3.14.10", ("pkg:generic/python@3.14.11",))]
+    sbom.write_text(json.dumps(moved), encoding="utf-8")
+    assert _CHECK.main(["--vex", str(_TEMPLATE), "--sbom", str(sbom)]) == 1
+    assert capsys.readouterr().out.startswith(
+        "::error file=security/vex.openvex.json::CVE-2026-119170 is bound to pkg:generic/python@3.14.10")
 
 
 def test_the_image_scan_checks_the_vex_against_the_image_before_scanning():
