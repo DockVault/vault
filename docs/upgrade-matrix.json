@@ -7,6 +7,9 @@
   },
   "lines": {
     "0.33": {
+      "security_fixes_until": "2027-05-09"
+    },
+    "0.34": {
       "security_fixes_until": null
     }
   },
@@ -1677,6 +1680,94 @@
         }
       ]
     },
+    "0.18.0": {
+      "released": "2026-08-28",
+      "notes": "No schema change; same physical schema as 0.17.0. Follow-up hardening and fixes on the 0.17.0 at-rest sealing round. At rest: seals a Standard vault's ACTIVE resumable-upload filename and MIME (they were plaintext in chunked_upload_sessions for the life of the upload; the enc_name/enc_mime/name_bi columns already existed and are simply now used for Standard uploads too, decrypted transparently on read), and stops copying already-sealed item/vault names and note titles into the plaintext notification body (the recipient reaches the live item via the deep link). Host tool (dockvault.py): drops the spent ADMIN_PASSWORD from .env after the admin is bootstrapped (only when the DB bootstrap marker confirms an admin exists; fail-closed otherwise); no longer archives a never-used fresh .env when 'deploy a new set' is chosen on a fresh install, and warns in red when a real .env is archived; and lock/status now surface unsealed plaintext .env.* archives. SFTP: the effective per-file upload limit is min(MAX_FILE_SIZE_MB, the RAM staging tmpfs) -- the shipped .env.example defaults are reconciled to agree, the effective SFTP limit is surfaced in the admin settings, and an over-limit or staging-full upload returns a named error instead of a bare 'Failure'. A rollback to 0.17.0 is clean and needs no backup: no persistent schema or data changed, and only an upload in flight at the moment of a downgrade would be affected.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "note-link-token-stored-in-cleartext"
+        },
+        {
+          "advisory": "temp-credential-liveness-at-sign-in"
+        },
+        {
+          "advisory": "sftp-interrupted-upload-committed"
+        },
+        {
+          "advisory": "sftp-stalled-upload-holds-connection"
+        },
+        {
+          "advisory": "link-tokens-written-to-access-log"
+        },
+        {
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
+        },
+        {
+          "advisory": "client-address-forgeable-behind-proxy"
+        },
+        {
+          "advisory": "live-monitor-sent-names-to-every-admin"
+        },
+        {
+          "advisory": "file-expiry-not-enforced"
+        },
+        {
+          "advisory": "links-kept-working-after-owner-locked"
+        },
+        {
+          "advisory": "ending-sessions-missed-older-web-sessions"
+        },
+        {
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
+        },
+        {
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
+        },
+        {
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
+        },
+        {
+          "advisory": "administrator-invitation-outlived-its-maker"
+        },
+        {
+          "advisory": "unbounded-request-bodies-before-sign-in"
+        },
+        {
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
+        },
+        {
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
+        },
+        {
+          "advisory": "demoted-administrator-kept-the-live-feed"
+        },
+        {
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
+        },
+        {
+          "advisory": "client-address-forgeable-through-docker-gateway"
+        },
+        {
+          "advisory": "revoked-permission-came-back-after-a-restart"
+        },
+        {
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
+        },
+        {
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
+        },
+        {
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
+        }
+      ]
+    },
     "0.18.1": {
       "released": "2026-08-28",
       "notes": "No schema change; same physical schema as 0.17.0/0.18.0. Follow-up fixes from an external audit of 0.18.0, none a confidentiality break: two vault handlers (update-info, change-password) that answered an authorization failure with 500 now return 403; the ECC key-topology endpoint (/ecc/vaults/{id}/keys) returns 403 for a vault the caller cannot reach instead of leaking mode/dek_version to a non-member or 404-vs-403 confirming existence; the public note-link redeem endpoint adds the missing per-IP rate-limit bucket (token enumeration was unthrottled); chunked-upload completion returns a named 409 (not a 500) for a session it cannot read, and the 0.17.0->0.18.0 downgrade edge now documents that in-flight uploads do not survive a downgrade; the download Content-Disposition header strips forward slashes as well as backslashes; a NUL byte in an uploaded filename is rejected with 400 instead of surfacing as a 500; and the base-image apk-upgrade reproducibility exception is documented and contract-tested. A rollback to 0.18.0 is clean and needs no backup.",
@@ -1768,94 +1859,6 @@
     "0.18.2": {
       "released": "2026-08-28",
       "notes": "Additive schema fix, no data migration. Adds the foreign key for temporary_credentials.created_by_temp_credential_id (self-referential, ON DELETE SET NULL) that create_all already declares but the boot DDL omitted, so a fresh install and an upgraded one converge to the same physical schema. Deleting a temp credential that had minted others now nulls their created_by_temp_credential_id provenance pointer instead of leaving a dangling id (any pre-existing dangling ids are nulled first, so the constraint add cannot fail on an install that ran the earlier column-only DDL). A rollback to 0.18.1 is clean and needs no backup: the older image simply does not re-add the foreign key and the column is unchanged.",
-      "support": {
-        "eol": false,
-        "secure": false
-      },
-      "vulnerabilities": [
-        {
-          "advisory": "note-link-token-stored-in-cleartext"
-        },
-        {
-          "advisory": "temp-credential-liveness-at-sign-in"
-        },
-        {
-          "advisory": "sftp-interrupted-upload-committed"
-        },
-        {
-          "advisory": "sftp-stalled-upload-holds-connection"
-        },
-        {
-          "advisory": "link-tokens-written-to-access-log"
-        },
-        {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets"
-        },
-        {
-          "advisory": "client-address-forgeable-behind-proxy"
-        },
-        {
-          "advisory": "live-monitor-sent-names-to-every-admin"
-        },
-        {
-          "advisory": "file-expiry-not-enforced"
-        },
-        {
-          "advisory": "links-kept-working-after-owner-locked"
-        },
-        {
-          "advisory": "ending-sessions-missed-older-web-sessions"
-        },
-        {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder"
-        },
-        {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
-        },
-        {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account"
-        },
-        {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
-        },
-        {
-          "advisory": "administrator-invitation-outlived-its-maker"
-        },
-        {
-          "advisory": "unbounded-request-bodies-before-sign-in"
-        },
-        {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner"
-        },
-        {
-          "advisory": "temp-credential-heard-other-credentials-sign-in"
-        },
-        {
-          "advisory": "demoted-administrator-kept-the-live-feed"
-        },
-        {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
-        },
-        {
-          "advisory": "client-address-forgeable-through-docker-gateway"
-        },
-        {
-          "advisory": "revoked-permission-came-back-after-a-restart"
-        },
-        {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
-        },
-        {
-          "advisory": "sign-in-form-sent-credentials-in-the-url"
-        },
-        {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
-        }
-      ]
-    },
-    "0.18.0": {
-      "released": "2026-08-28",
-      "notes": "No schema change; same physical schema as 0.17.0. Follow-up hardening and fixes on the 0.17.0 at-rest sealing round. At rest: seals a Standard vault's ACTIVE resumable-upload filename and MIME (they were plaintext in chunked_upload_sessions for the life of the upload; the enc_name/enc_mime/name_bi columns already existed and are simply now used for Standard uploads too, decrypted transparently on read), and stops copying already-sealed item/vault names and note titles into the plaintext notification body (the recipient reaches the live item via the deep link). Host tool (dockvault.py): drops the spent ADMIN_PASSWORD from .env after the admin is bootstrapped (only when the DB bootstrap marker confirms an admin exists; fail-closed otherwise); no longer archives a never-used fresh .env when 'deploy a new set' is chosen on a fresh install, and warns in red when a real .env is archived; and lock/status now surface unsealed plaintext .env.* archives. SFTP: the effective per-file upload limit is min(MAX_FILE_SIZE_MB, the RAM staging tmpfs) -- the shipped .env.example defaults are reconciled to agree, the effective SFTP limit is surfaced in the admin settings, and an over-limit or staging-full upload returns a named error instead of a bare 'Failure'. A rollback to 0.17.0 is clean and needs no backup: no persistent schema or data changed, and only an upload in flight at the moment of a downgrade would be affected.",
       "support": {
         "eol": false,
         "secure": false
@@ -2921,139 +2924,85 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "note-link-token-stored-in-cleartext",
-          "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0"
+          "advisory": "note-link-token-stored-in-cleartext"
         },
         {
-          "advisory": "temp-credential-liveness-at-sign-in",
-          "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0"
+          "advisory": "temp-credential-liveness-at-sign-in"
         },
         {
-          "advisory": "sftp-interrupted-upload-committed",
-          "title": "An interrupted SFTP upload was committed as a complete file",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-interrupted-upload-committed"
         },
         {
-          "advisory": "sftp-stalled-upload-holds-connection",
-          "title": "A stalled SFTP upload held its connection indefinitely",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-stalled-upload-holds-connection"
         },
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -3066,154 +3015,94 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "temp-credential-device-management",
-          "title": "Temporary-credential sessions could manage devices",
-          "fixed_in": "0.29.1"
+          "advisory": "temp-credential-device-management"
         },
         {
-          "advisory": "sign-in-fails-without-session-cache",
-          "title": "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
-          "fixed_in": "0.29.1"
+          "advisory": "sign-in-fails-without-session-cache"
         },
         {
-          "advisory": "device-sync-shares-sign-in-throttle",
-          "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
-          "fixed_in": "0.30.0"
+          "advisory": "device-sync-shares-sign-in-throttle"
         },
         {
-          "advisory": "note-link-token-stored-in-cleartext",
-          "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0"
+          "advisory": "note-link-token-stored-in-cleartext"
         },
         {
-          "advisory": "temp-credential-liveness-at-sign-in",
-          "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0"
+          "advisory": "temp-credential-liveness-at-sign-in"
         },
         {
-          "advisory": "sftp-interrupted-upload-committed",
-          "title": "An interrupted SFTP upload was committed as a complete file",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-interrupted-upload-committed"
         },
         {
-          "advisory": "sftp-stalled-upload-holds-connection",
-          "title": "A stalled SFTP upload held its connection indefinitely",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-stalled-upload-holds-connection"
         },
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -3226,154 +3115,94 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "temp-credential-device-management",
-          "title": "Temporary-credential sessions could manage devices",
-          "fixed_in": "0.29.1"
+          "advisory": "temp-credential-device-management"
         },
         {
-          "advisory": "sign-in-fails-without-session-cache",
-          "title": "Sign-in and credential minting failed or consumed a credential when the session cache was unavailable",
-          "fixed_in": "0.29.1"
+          "advisory": "sign-in-fails-without-session-cache"
         },
         {
-          "advisory": "device-sync-shares-sign-in-throttle",
-          "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
-          "fixed_in": "0.30.0"
+          "advisory": "device-sync-shares-sign-in-throttle"
         },
         {
-          "advisory": "note-link-token-stored-in-cleartext",
-          "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0"
+          "advisory": "note-link-token-stored-in-cleartext"
         },
         {
-          "advisory": "temp-credential-liveness-at-sign-in",
-          "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0"
+          "advisory": "temp-credential-liveness-at-sign-in"
         },
         {
-          "advisory": "sftp-interrupted-upload-committed",
-          "title": "An interrupted SFTP upload was committed as a complete file",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-interrupted-upload-committed"
         },
         {
-          "advisory": "sftp-stalled-upload-holds-connection",
-          "title": "A stalled SFTP upload held its connection indefinitely",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-stalled-upload-holds-connection"
         },
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -3386,144 +3215,88 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "device-sync-shares-sign-in-throttle",
-          "title": "Device sync sign-in attempts shared the interactive sign-in throttle",
-          "fixed_in": "0.30.0"
+          "advisory": "device-sync-shares-sign-in-throttle"
         },
         {
-          "advisory": "note-link-token-stored-in-cleartext",
-          "title": "Note-link URL tokens were stored in cleartext",
-          "fixed_in": "0.30.0"
+          "advisory": "note-link-token-stored-in-cleartext"
         },
         {
-          "advisory": "temp-credential-liveness-at-sign-in",
-          "title": "A temporary credential in use was distinguishable at sign-in",
-          "fixed_in": "0.30.0"
+          "advisory": "temp-credential-liveness-at-sign-in"
         },
         {
-          "advisory": "sftp-interrupted-upload-committed",
-          "title": "An interrupted SFTP upload was committed as a complete file",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-interrupted-upload-committed"
         },
         {
-          "advisory": "sftp-stalled-upload-holds-connection",
-          "title": "A stalled SFTP upload held its connection indefinitely",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-stalled-upload-holds-connection"
         },
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -3536,129 +3309,79 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "sftp-interrupted-upload-committed",
-          "title": "An interrupted SFTP upload was committed as a complete file",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-interrupted-upload-committed"
         },
         {
-          "advisory": "sftp-stalled-upload-holds-connection",
-          "title": "A stalled SFTP upload held its connection indefinitely",
-          "fixed_in": "0.31.0"
+          "advisory": "sftp-stalled-upload-holds-connection"
         },
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -3671,119 +3394,73 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -3796,119 +3473,73 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         }
       ]
     },
@@ -4844,6 +4475,22 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.33.7": {
+      "released": "2026-11-13",
+      "notes": "Security release for the 0.33 line: it fixes one security issue in the web app, rated high. The advisory and its details are published with 0.34.1. Upgrade, then reload browser tabs that were open before the upgrade. The image is also rebuilt with the Alpine packages current at this release, and without SQLite. zlib moves from 1.3.2-r1 to 1.4-r0. Image scanners report CVE-2026-4738 (critical) against Alpine's zlib before 1.4-r0; the flaw is in the infback9 code of zlib's contrib folder, which is not part of the zlib library the image ships (its libz has no inflateBack9), so the vault is not affected. The base image installs Alpine's sqlite-libs 3.53.4-r0 only for Python's sqlite3 module, and scanners report four High findings in it with no fixed package (CVE-2026-119373, CVE-2026-119374, CVE-2026-119379, CVE-2026-119586). They need a crafted SQLite database file, and the vault keeps its data in PostgreSQL and opens no SQLite database, so it is not affected either. The image now leaves SQLite out, as 0.34.0 does: `import sqlite3` fails in it. Nothing changes in the stored data. Scanners also report CVE-2026-119170 (high) against the image's Python 3.14.10: a flaw in hashlib that needs OpenSSL in FIPS mode, which the image's OpenSSL cannot be in, and a base image with the fixed Python is not published yet. The release attaches a VEX document with that one reviewed exception.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
+    "0.34.0": {
+      "released": "2026-11-09",
+      "notes": "The first release of the 0.34 line. It publishes no advisory: 0.33.6 stays secure, and 0.33.x receives security fixes until 2027-05-09 (.github/SECURITY.md). Administrators decide what the audit log keeps and for how long, and can check that it was not changed; an auditor can open other people's vaults only in a case a second administrator approved, and their owners are told at once; and the remaining ways to obtain a zero-knowledge key through an account someone else took over are closed. Upgrade from 0.33.6 (an older release moves to 0.33.6 first), and take a backup first. Update the checkout before running python dockvault.py update (git pull, or git fetch --tags and git checkout v0.34.0): the checks it makes before the upgrade are in this release's tool, and the rotation of container output is in its compose files. Reload browser tabs opened before the upgrade, and with SFTP in its own container update it together with the web container. The upgrade conditions say what changes at the first start and what going back needs. Records: the pruner deletes on a timer, in the web container, never when a page is opened. The audit log is still kept for ever by default: a positive AUDIT_LOG_RETENTION_DAYS set before the upgrade first waits RETENTION_REDUCTION_DELAY_DAYS (7) as a change that deletes sooner, as every such change made in Settings, Activity and records does, with every administrator told and any of them able to cancel it. The audit log takes a minimum age, a maximum and a size cap; administration and security rows are kept at least AUDIT_PROTECTED_MIN_DAYS (365), and the size cap never deletes them. RETENTION_HOLD stops every deletion of logs. Each failed sign-in is kept in full in a security record for SECURITY_RECORD_DAYS (30), after which security alerts lose the name and the address that raised them. Ended invitations, and used or expired reset links and codes, are deleted 30 days after they end. Every closed hour of the audit log is sealed into a chain under a key the database never holds (AUDIT_CHAIN_KEY, else one derived from ENCRYPTION_KEY): python dockvault.py audit verify checks it and prints its head to keep elsewhere, and the Activity page and every export show the head. The chain shows a change made in the database without the server's key, not one made by the server's operator. From 14 days after the upgrade, audit days older than AUDIT_HOT_DAYS (90) are compressed into daily blocks, each checked against the chain before its rows are removed; the Activity page and its exports still read them, and python dockvault.py audit unarchive puts them back as rows. An administrator can erase a deleted account's username, or a name typed at a failed sign-in, from the audit log and the other records; the erase waits RETENTION_REDUCTION_DELAY_DAYS first. Recording levels set how much the audit log keeps of the names of vaults, files and folders, names typed at sign-in, email addresses, IP addresses and browser descriptions: in full, as a keyed fingerprint, shortened (addresses) or not at all, within the AUDIT_MAX_* limits of .env. The default records what earlier releases did, setup offers the presets full, standard and minimal, and the page /recording tells everyone what is recorded, for how long and who can see it. Compliance access: two administrators give a person the auditor right, for at most a year (COMPLIANCE_AUDITOR_GRANT_DAYS). An auditor opens other people's vaults only in a case a second, independent administrator approved, for at most COMPLIANCE_MAX_ACCESS_DAYS (30) days, extended to at most COMPLIANCE_MAX_TOTAL_DAYS (90), and every compliance step asks for the password and an authenticator or recovery code. Each owner of a vault a case covers is told when it is approved, in the app and by email when the server sends mail, and the page Access to my vaults lists every file opened. A case can export copies of files, fetched once (COMPLIANCE_EXPORT=disabled turns exports off), and place a legal hold, which a second administrator confirms within COMPLIANCE_HOLD_CONFIRM_DAYS (7) or it lapses: while it stands, the files and folders deleted from its vaults and the old names of renamed ones are kept, and they are purged COMPLIANCE_HOLD_PURGE_DELAY_DAYS (7) after its release. COMPLIANCE_ACCESS=disabled turns compliance access off; holds already placed stay. docs/guides/hardening.md says what it cannot prevent, and docs/guides/dpia-compliance-access.md is a template for the impact assessment. Accounts and keys: each account records whether its current password is its own or one someone else set; making such an account an administrator ends that password and its sessions and sends a reset link, and until it has a password of its own it cannot approve a held change to someone's sign-in details. SSH keys record who added them. For ZK_ENVELOPE_HOLD_DAYS (14) after an administrator or the server's operator changed an account's sign-in details, its zero-knowledge key is given to a browser only after a code sent by email; python dockvault.py accounts --action release-key-hold releases it. A new zero-knowledge passphrase must be at least 12 characters and not a common one. Members' browsers check the vault keys they hold, a person is told when an encryption key is set up for their account, and the share dialog shows the recipient's key fingerprint. Other changes: signing out of the web app ends the session on the server; a password reset ends the account's sessions in the transaction that writes the password; logs carry an error id where they carried an error's text, and no part of a session token. Uploads finish off the event loop, so other requests are answered meanwhile. Copies, moves to another vault and folder copies wait for a transfer slot as uploads do, one account's copies taking at most a quarter of the slots, and downloads and previews wait for theirs without holding a database connection. The storage volume keeps free space (MIN_FREE_SPACE_GB): an upload, an SFTP write or a copy that would leave less is refused with 507, and what legal holds keep counts toward the deployment's storage limit. Clients of one IPv6 /64 share one set of per-address limits, and the container's access log keeps the names of query parameters, not their values. The image no longer contains SQLite, which the vault never used. The host tool: a backup pauses the deployment for its whole run and records each archive's SHA-256, and a sealed backup an HMAC of its manifest; a restore checks every archive before it stops anything and keeps the current .env first, and a restore that stops part way keeps that set from starting; setup without a terminal writes a generated password to a mode-600 file and prints only its path, and takes the first administrator's password from a file or standard input; and the tool refuses to write a plain .env beside a sealed one. Personal data this release stores (docs/data-inventory.md lists every store): each failed sign-in with the name typed and the address (security_records, SECURITY_RECORD_DAYS); the chain's seals, and its head in a file on the keys volume; archived audit days, the same data as the rows they replace; erase requests, their name sealed; the values set in Settings, Activity and records and the changes waiting, with who set them; the compliance tables (auditor rights, cases, exports, revealed names, notices to owners, legal holds and what they keep), their free text sealed at rest; who set an account's password and who added an SSH key; and the key hold's codes and releases. Schema: new tables, nullable columns and triggers (among them those on files, folders and vaults that keep what a legal hold keeps), created at the first start; an index of audit_logs that another one duplicates is dropped in the background. Going back: 0.33.1 and later refuse to start, and python dockvault.py update refuses to go back unless --force-downgrade is given, while audit days are archived, a legal hold stands or what it kept waits for its purge, a recording level is below Full, or a compliance case is open or the records of compliance access are younger than COMPLIANCE_RECORD_MIN_DAYS (six years by default); the conditions say what to undo first. Set AUDIT_LOG_RETENTION_DAYS=0 before going back. 0.33.0 and earlier do not read these records.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -5281,6 +4928,183 @@
         {
           "id": "steps-after-intercepted-mail",
           "summary": "Upgrading stops the interception that the advisory mail-server-certificate-from-a-compromised-authority-accepted describes, but does not undo what it took. If the vault sent mail over a network someone else could be on, after upgrading: change the password the vault uses at its mail server; revoke the invitations still pending that were sent by mail before the upgrade, and send them again; on the Activity page, check the audit log for password resets, accepted invitations and email changes nobody recognises, now and again an hour later; lock each such account (locking ends its sessions), remove the SSH keys, second factor, devices, temporary credentials, shares and links its owner did not add, and give it back with a new password; delete an account made from an invitation its person never accepted; for an administrator's account, also check the accounts, roles, settings and sending profiles changed while it was taken. If the vault checked its database's certificate against the system trust store over such a network, change the database password too. From 0.33.6 the vault refuses a mail server whose certificate depends on emSign ECC Root CA - C3, emSign ECC Root CA - G3 or emSign Root CA - C1, and says that the mail server's certificate could not be verified."
+        }
+      ]
+    },
+    {
+      "from": "0.33.6",
+      "to": "0.33.7",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.6",
+      "to": "0.34.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true,
+      "conditions": [
+        {
+          "id": "audit-history-compressed-after-90-days",
+          "summary": "From 0.34.0 the audit log is still kept for ever by default, but each UTC day older than 90 days (AUDIT_HOT_DAYS, 31 to 3650, or Settings, Activity and records) is moved from audit_logs into compressed daily blocks (audit_archive_blocks), each checked against the log's integrity chain before its rows are removed; nothing is deleted. Archiving starts 14 days after 0.34.0 first starts (AUDIT_ARCHIVE_START_AFTER_DAYS, 0 to 90), and again 14 days after it starts once more following more than 12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or stopped, so going back to an earlier release within that time needs nothing. The Activity page and its exports read archived days; a tool that reads audit_logs directly sees only the newer days. python dockvault.py audit unarchive puts days back as rows once they fit. The check counts the rows archiving will move when it starts, with the default windows: those of the days before the day 76 days ago.",
+          "detect": "SELECT count(*) AS rows_to_archive, min(timestamp) AS oldest FROM audit_logs WHERE timestamp < date_trunc('day', (now() AT TIME ZONE 'utc') - interval '76 days') HAVING count(*) > 0"
+        },
+        {
+          "id": "audit-retention-runs-on-a-timer",
+          "summary": "Before 0.34.0 a positive AUDIT_LOG_RETENTION_DAYS deleted old audit rows only when an administrator opened the activity dashboard, so rows older than it can be in the database now. From 0.34.0 the pruner deletes them on a timer. On an install that already has a positive value nothing is deleted at the upgrade: the value first waits RETENTION_REDUCTION_DELAY_DAYS (7 by default) as a change that deletes sooner, every administrator is told, and any administrator can cancel it in Settings, Activity and records. Administration and security rows are kept at least 365 days whatever the value (AUDIT_PROTECTED_MIN_DAYS). python dockvault.py audit retention shows the values in force. The check shows the number of audit rows and the oldest.",
+          "detect": "SELECT count(*) AS audit_rows, min(timestamp) AS oldest FROM audit_logs HAVING count(*) > 0"
+        },
+        {
+          "id": "audit-protected-minimum-365-days",
+          "summary": "From 0.34.0 administration and security audit rows (what administrators did, and the security events) are kept at least AUDIT_PROTECTED_MIN_DAYS (365 by default) whatever the maximum days, and the size cap never deletes them; only .env lowers the minimum. A deployment whose AUDIT_LOG_RETENTION_DAYS is below 365 keeps these rows longer than before; one that must delete them sooner sets AUDIT_PROTECTED_MIN_DAYS before the upgrade. The server refuses to start when AUDIT_PROTECTED_MIN_DAYS or AUDIT_MIN_RETENTION_DAYS is longer than PLAN_LOG_MAX_DAYS, or AUDIT_LOG_RETENTION_DAYS is shorter than AUDIT_MIN_RETENTION_DAYS."
+        },
+        {
+          "id": "container-output-rotates",
+          "summary": "From 0.34.0 the shipped compose files rotate each container's output (docker logs): Docker's json-file driver keeps at most DOCKER_LOG_MAX_FILE files (5 by default) of DOCKER_LOG_MAX_SIZE (10m by default) per container. Only installs whose compose files come from 0.34.0 get it: set up from it, or updated after updating the checkout (git pull, or git fetch --tags and git checkout v0.34.0). An install that updates by pulling images keeps its old compose files, which never rotate: update the checkout, or add the logging block to each service by hand. A Docker host whose default log driver is journald or syslog refuses these options: remove the block there (README, Container logs)."
+        },
+        {
+          "id": "storage-volume-keeps-free-space",
+          "summary": "From 0.34.0 the storage volume keeps free space: an upload, an SFTP write or a copy that would leave less is refused (507). MIN_FREE_SPACE_GB sets it in GB; unset, it is the larger of 2 GB and 5% of the volume, never more than half of it nor more than 20 GB; 0 turns it off. A volume that already has less free refuses them all from the first start: free some space, grow the volume or lower MIN_FREE_SPACE_GB in .env first. python dockvault.py update checks the volume before the upgrade only when the tool itself is 0.34.0 or later (update the checkout first: git pull, or git fetch --tags and git checkout v0.34.0; an older tool does not check). To check by hand: docker exec vault df -h /app/storage (the container is vault-api in the split layout and the local trial) shows the volume's Size and Available, and Available must be more than the floor its Size gives."
+        },
+        {
+          "id": "alert-names-and-addresses-cleared-after-30-days",
+          "summary": "From 0.34.0 each failed sign-in is kept in full in the security record for SECURITY_RECORD_DAYS (30 by default, 7 to 365), and security alerts lose the name and the address that raised them after the same time, resolved or not; their messages no longer spell them out. The first pass after the upgrade clears every older alert. Resolved alerts are deleted after SECURITY_ALERT_RETENTION_DAYS (90 by default) on a timer, where earlier releases deleted them only when the alerts were read. The check counts the alerts whose name or address will be cleared.",
+          "detect": "SELECT count(*) AS alerts FROM security_alerts WHERE timestamp < (now() AT TIME ZONE 'utc') - interval '30 days' AND (username IS NOT NULL OR ip_address IS NOT NULL) HAVING count(*) > 0"
+        },
+        {
+          "id": "ended-invitations-and-codes-deleted-after-30-days",
+          "summary": "From 0.34.0 invitations are deleted 30 days after they are accepted, revoked or expire, and used or expired password reset links, one-time codes and email-change codes 30 days after they end; earlier releases kept them. The first pass after the upgrade deletes every older one, so the list of invitations shows only the ended ones of the last 30 days. The lineage an administrator's accepted invitation gave is kept apart, and the audit log keeps every event. Notifications stay until the person dismisses them unless NOTIFICATION_RETENTION_DAYS (or Settings, Activity and records) gives them a window. The check counts what the first pass deletes.",
+          "detect": "SELECT * FROM (SELECT (SELECT count(*) FROM account_invitations WHERE accepted_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR revoked_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS invitations, (SELECT count(*) FROM password_reset_tokens WHERE consumed_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS reset_links, (SELECT count(*) FROM otp_codes WHERE consumed_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS codes, (SELECT count(*) FROM email_change_codes WHERE consumed_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS email_codes) t WHERE invitations + reset_links + codes + email_codes > 0"
+        },
+        {
+          "id": "archived-audit-history-hidden",
+          "summary": "An earlier release cannot read the audit log's compressed daily blocks. While any block exists, 0.33.1 and later refuse to start on this database, and 0.33.0 and earlier start without seeing those days. Before going back, put the days back as rows with this release: python dockvault.py audit unarchive (it checks the database volume's free space first: restored days take 7 to 12 times their compressed size), then go back. Within 14 days of the first 0.34.0 start (AUDIT_ARCHIVE_START_AFTER_DAYS), or of a start of 0.34.0 after more than 12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or stopped, there is nothing to undo. The check finds the archived days.",
+          "detect": "SELECT count(DISTINCT day) AS days, sum(row_count) AS rows, min(day) AS first_day, max(day) AS last_day FROM audit_archive_blocks HAVING count(*) > 0",
+          "blocks_rollback": true
+        },
+        {
+          "id": "panel-retention-not-read",
+          "summary": "Going back to 0.33.x: the values administrators set in Settings, Activity and records are not read, and the changes waiting do not run. Retention falls back to AUDIT_LOG_RETENTION_DAYS, applied again only when the activity dashboard is opened, and resolved alerts are deleted only when they are read. Set AUDIT_LOG_RETENTION_DAYS=0 before going back: the older release would otherwise delete old audit rows the integrity chain has sealed, and back on 0.34.0 python dockvault.py audit verify reports them missing until python dockvault.py audit acknowledge-removed-before --before <time> --retention-days <days> seals over them. What the older release ignores stays for the next upgrade. The check lists the values set in the panel.",
+          "detect": "SELECT key, value FROM managed_settings WHERE value IS NOT NULL AND value::text <> 'null' ORDER BY key"
+        },
+        {
+          "id": "recording-levels-changed",
+          "summary": "From 0.34.0 the recording levels (Settings, Activity and records, or the AUDIT_MAX_* lines of .env) decide how much of names typed at sign-in, email addresses, IP addresses and browser descriptions the audit log records; by default it records them in full, as earlier releases do. While the newest levels record less than Full of any of them, an earlier release would record them all in full again, behind the notice that tells users otherwise: 0.33.1 and later refuse to start on this database, and python dockvault.py update refuses to go back unless --force-downgrade is given. Before going back, set those levels back to Full and remove any AUDIT_MAX_* line in .env that lowers one, then start 0.34.0 once so it removes the record that stops the earlier release. The check finds the newest levels while they record less than Full.",
+          "detect": "SELECT 1 FROM audit_privacy_policies WHERE version = (SELECT max(version) FROM audit_privacy_policies) AND (signin_names <> 'full' OR emails <> 'full' OR ip <> 'full' OR user_agent <> 'full')",
+          "blocks_rollback": true
+        },
+        {
+          "id": "legal-holds-block-rollback",
+          "summary": "While a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones) waits for its purge, going back to a release before 0.34.0 would destroy it: release the holds and let the purge run first.",
+          "detect": "SELECT 1 FROM legal_hold_vaults WHERE released_at IS NULL UNION ALL SELECT 1 FROM held_files UNION ALL SELECT 1 FROM held_folders UNION ALL SELECT 1 FROM held_name_history LIMIT 1",
+          "blocks_rollback": true
+        },
+        {
+          "id": "compliance-records-block-rollback",
+          "summary": "From 0.34.0, while a compliance case is open, a case's records must still be kept, or the record of a step of compliance access taken (an auditor right given or taken, a case's steps, a name revealed) is younger than COMPLIANCE_RECORD_MIN_DAYS (2190 by default, at least 365), an earlier release would not keep them: it knows no cases, and with a positive AUDIT_LOG_RETENTION_DAYS, which 0.34.0 leaves in .env as a waiting change, it deletes every older audit row the first time an administrator opens the dashboard's activity feed. So 0.33.1 and later refuse to start on this database, and python dockvault.py update refuses to go back unless --force-downgrade is given. A refused request, which any account can make, a vault owner's own steps on Access to my vaults, and a notice to a vault's owner (also of access someone else gave to their vault) do not count. Wait until no case is open and those records are older than COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the record that stops the earlier release. An earlier release started sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env sets no AUDIT_LOG_RETENTION_DAYS. The check finds that record.",
+          "detect": "SELECT key, requires_at_least, since FROM data_requirements WHERE key = 'compliance-records'",
+          "blocks_rollback": true
+        },
+        {
+          "id": "older-images-refuse-newer-data",
+          "summary": "From 0.34.0 the release records in the table data_requirements each state of the data that an earlier release cannot read or would destroy, for as long as it lasts: archived audit days, legal holds and what they kept, recording levels below Full, and open compliance cases and the records of compliance access while they must be kept. 0.33.1 and later refuse to start on a database that holds such a record, and print what to undo with 0.34.0 before going back; python dockvault.py update refuses to go back while one exists unless --force-downgrade is given. ALLOW_START_ON_NEWER_DATA=true in .env starts an earlier release anyway, on data it cannot fully read: it may show an incomplete audit log and delete what 0.34.0 keeps. 0.33.0 and earlier do not read the table. The check lists the records.",
+          "detect": "SELECT key, requires_at_least, reason, since FROM data_requirements ORDER BY key",
+          "blocks_rollback": true
+        },
+        {
+          "id": "promotion-resets-passwords-set-by-others",
+          "summary": "From 0.34.0 each account records whether its current password is its own or one someone else set: an administrator, a user who manages users, the server's operator, or a reset link another account made. At the upgrade this is read once from the audit log, and a password whose setting the log no longer holds counts as the person's own. When an account whose password someone else set is made an administrator, that password stops working, its sessions end, and the person sets a new one through a reset link sent to their own email address (when none can be sent, the administrator who promoted them gets a link to hand over); until then the account cannot approve a held change to someone's sign-in details. What an earlier release did after going back to it is not read on the return to 0.34.0: a password an administrator set while it ran counts as the person's own, and an account marked before keeps its mark though its person set a password of their own meanwhile."
+        },
+        {
+          "id": "zk-envelope-held-after-admin-reset",
+          "summary": "From 0.34.0, for ZK_ENVELOPE_HOLD_DAYS days (14 by default) after an administrator or the server's operator changed an account's sign-in details, the account's zero-knowledge encryption key is given to a browser only after it enters a code sent by email to the address the account had before the first of those changes. Changes made before the upgrade count: an account with an encryption key whose sign-in details were changed in the 14 days before the upgrade is held from the first start (opening the key answers 403 zk-envelope-hold), and an account changed then that has no key yet is held as soon as it sets one up, until the hold ends. Only an email change recorded before 0.34.0 kept the address it replaced, so for an account whose first such change was of another kind or an email change of an account that had no address, or on a deployment without mail, no code can be sent (409 zk-envelope-hold-no-mail): the server's operator releases it with python dockvault.py accounts --action release-key-hold, or the hold ends ZK_ENVELOPE_HOLD_DAYS days after the last change. The check below counts the accounts held at the first start and those only the server's operator can release; it cannot count an account that sets up a key later, so a check that finds none does not mean no account will be held. ZK_ENVELOPE_HOLD_DAYS=0 in .env before the upgrade turns the hold off. Going back to an earlier release lifts the hold.",
+          "detect": "SELECT count(*) AS held_accounts, count(*) FILTER (WHERE kind <> 'email' OR coalesce(btrim(previous_email), '') = '') AS released_only_by_the_host FROM (SELECT DISTINCT ON (c.target_user_id) c.target_user_id, c.kind, c.payload->>'previous_email' AS previous_email FROM credential_changes c JOIN user_keypairs k ON k.user_id = c.target_user_id WHERE c.status IN ('made', 'approved') AND c.applied_at > (now() AT TIME ZONE 'utc') - interval '14 days' ORDER BY c.target_user_id, c.applied_at) t HAVING count(*) > 0"
+        }
+      ]
+    },
+    {
+      "from": "0.33.7",
+      "to": "0.34.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": true,
+      "conditions": [
+        {
+          "id": "audit-history-compressed-after-90-days",
+          "summary": "From 0.34.0 the audit log is still kept for ever by default, but each UTC day older than 90 days (AUDIT_HOT_DAYS, 31 to 3650, or Settings, Activity and records) is moved from audit_logs into compressed daily blocks (audit_archive_blocks), each checked against the log's integrity chain before its rows are removed; nothing is deleted. Archiving starts 14 days after 0.34.0 first starts (AUDIT_ARCHIVE_START_AFTER_DAYS, 0 to 90), and again 14 days after it starts once more following more than 12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or stopped, so going back to an earlier release within that time needs nothing. The Activity page and its exports read archived days; a tool that reads audit_logs directly sees only the newer days. python dockvault.py audit unarchive puts days back as rows once they fit. The check counts the rows archiving will move when it starts, with the default windows: those of the days before the day 76 days ago.",
+          "detect": "SELECT count(*) AS rows_to_archive, min(timestamp) AS oldest FROM audit_logs WHERE timestamp < date_trunc('day', (now() AT TIME ZONE 'utc') - interval '76 days') HAVING count(*) > 0"
+        },
+        {
+          "id": "audit-retention-runs-on-a-timer",
+          "summary": "Before 0.34.0 a positive AUDIT_LOG_RETENTION_DAYS deleted old audit rows only when an administrator opened the activity dashboard, so rows older than it can be in the database now. From 0.34.0 the pruner deletes them on a timer. On an install that already has a positive value nothing is deleted at the upgrade: the value first waits RETENTION_REDUCTION_DELAY_DAYS (7 by default) as a change that deletes sooner, every administrator is told, and any administrator can cancel it in Settings, Activity and records. Administration and security rows are kept at least 365 days whatever the value (AUDIT_PROTECTED_MIN_DAYS). python dockvault.py audit retention shows the values in force. The check shows the number of audit rows and the oldest.",
+          "detect": "SELECT count(*) AS audit_rows, min(timestamp) AS oldest FROM audit_logs HAVING count(*) > 0"
+        },
+        {
+          "id": "audit-protected-minimum-365-days",
+          "summary": "From 0.34.0 administration and security audit rows (what administrators did, and the security events) are kept at least AUDIT_PROTECTED_MIN_DAYS (365 by default) whatever the maximum days, and the size cap never deletes them; only .env lowers the minimum. A deployment whose AUDIT_LOG_RETENTION_DAYS is below 365 keeps these rows longer than before; one that must delete them sooner sets AUDIT_PROTECTED_MIN_DAYS before the upgrade. The server refuses to start when AUDIT_PROTECTED_MIN_DAYS or AUDIT_MIN_RETENTION_DAYS is longer than PLAN_LOG_MAX_DAYS, or AUDIT_LOG_RETENTION_DAYS is shorter than AUDIT_MIN_RETENTION_DAYS."
+        },
+        {
+          "id": "container-output-rotates",
+          "summary": "From 0.34.0 the shipped compose files rotate each container's output (docker logs): Docker's json-file driver keeps at most DOCKER_LOG_MAX_FILE files (5 by default) of DOCKER_LOG_MAX_SIZE (10m by default) per container. Only installs whose compose files come from 0.34.0 get it: set up from it, or updated after updating the checkout (git pull, or git fetch --tags and git checkout v0.34.0). An install that updates by pulling images keeps its old compose files, which never rotate: update the checkout, or add the logging block to each service by hand. A Docker host whose default log driver is journald or syslog refuses these options: remove the block there (README, Container logs)."
+        },
+        {
+          "id": "storage-volume-keeps-free-space",
+          "summary": "From 0.34.0 the storage volume keeps free space: an upload, an SFTP write or a copy that would leave less is refused (507). MIN_FREE_SPACE_GB sets it in GB; unset, it is the larger of 2 GB and 5% of the volume, never more than half of it nor more than 20 GB; 0 turns it off. A volume that already has less free refuses them all from the first start: free some space, grow the volume or lower MIN_FREE_SPACE_GB in .env first. python dockvault.py update checks the volume before the upgrade only when the tool itself is 0.34.0 or later (update the checkout first: git pull, or git fetch --tags and git checkout v0.34.0; an older tool does not check). To check by hand: docker exec vault df -h /app/storage (the container is vault-api in the split layout and the local trial) shows the volume's Size and Available, and Available must be more than the floor its Size gives."
+        },
+        {
+          "id": "alert-names-and-addresses-cleared-after-30-days",
+          "summary": "From 0.34.0 each failed sign-in is kept in full in the security record for SECURITY_RECORD_DAYS (30 by default, 7 to 365), and security alerts lose the name and the address that raised them after the same time, resolved or not; their messages no longer spell them out. The first pass after the upgrade clears every older alert. Resolved alerts are deleted after SECURITY_ALERT_RETENTION_DAYS (90 by default) on a timer, where earlier releases deleted them only when the alerts were read. The check counts the alerts whose name or address will be cleared.",
+          "detect": "SELECT count(*) AS alerts FROM security_alerts WHERE timestamp < (now() AT TIME ZONE 'utc') - interval '30 days' AND (username IS NOT NULL OR ip_address IS NOT NULL) HAVING count(*) > 0"
+        },
+        {
+          "id": "ended-invitations-and-codes-deleted-after-30-days",
+          "summary": "From 0.34.0 invitations are deleted 30 days after they are accepted, revoked or expire, and used or expired password reset links, one-time codes and email-change codes 30 days after they end; earlier releases kept them. The first pass after the upgrade deletes every older one, so the list of invitations shows only the ended ones of the last 30 days. The lineage an administrator's accepted invitation gave is kept apart, and the audit log keeps every event. Notifications stay until the person dismisses them unless NOTIFICATION_RETENTION_DAYS (or Settings, Activity and records) gives them a window. The check counts what the first pass deletes.",
+          "detect": "SELECT * FROM (SELECT (SELECT count(*) FROM account_invitations WHERE accepted_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR revoked_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS invitations, (SELECT count(*) FROM password_reset_tokens WHERE consumed_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS reset_links, (SELECT count(*) FROM otp_codes WHERE consumed_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS codes, (SELECT count(*) FROM email_change_codes WHERE consumed_at < (now() AT TIME ZONE 'utc') - interval '30 days' OR expires_at < (now() AT TIME ZONE 'utc') - interval '30 days') AS email_codes) t WHERE invitations + reset_links + codes + email_codes > 0"
+        },
+        {
+          "id": "archived-audit-history-hidden",
+          "summary": "An earlier release cannot read the audit log's compressed daily blocks. While any block exists, 0.33.1 and later refuse to start on this database, and 0.33.0 and earlier start without seeing those days. Before going back, put the days back as rows with this release: python dockvault.py audit unarchive (it checks the database volume's free space first: restored days take 7 to 12 times their compressed size), then go back. Within 14 days of the first 0.34.0 start (AUDIT_ARCHIVE_START_AFTER_DAYS), or of a start of 0.34.0 after more than 12 hours on an earlier release that wrote to the audit log, or more than 3 days on one or stopped, there is nothing to undo. The check finds the archived days.",
+          "detect": "SELECT count(DISTINCT day) AS days, sum(row_count) AS rows, min(day) AS first_day, max(day) AS last_day FROM audit_archive_blocks HAVING count(*) > 0",
+          "blocks_rollback": true
+        },
+        {
+          "id": "panel-retention-not-read",
+          "summary": "Going back to 0.33.x: the values administrators set in Settings, Activity and records are not read, and the changes waiting do not run. Retention falls back to AUDIT_LOG_RETENTION_DAYS, applied again only when the activity dashboard is opened, and resolved alerts are deleted only when they are read. Set AUDIT_LOG_RETENTION_DAYS=0 before going back: the older release would otherwise delete old audit rows the integrity chain has sealed, and back on 0.34.0 python dockvault.py audit verify reports them missing until python dockvault.py audit acknowledge-removed-before --before <time> --retention-days <days> seals over them. What the older release ignores stays for the next upgrade. The check lists the values set in the panel.",
+          "detect": "SELECT key, value FROM managed_settings WHERE value IS NOT NULL AND value::text <> 'null' ORDER BY key"
+        },
+        {
+          "id": "recording-levels-changed",
+          "summary": "From 0.34.0 the recording levels (Settings, Activity and records, or the AUDIT_MAX_* lines of .env) decide how much of names typed at sign-in, email addresses, IP addresses and browser descriptions the audit log records; by default it records them in full, as earlier releases do. While the newest levels record less than Full of any of them, an earlier release would record them all in full again, behind the notice that tells users otherwise: 0.33.1 and later refuse to start on this database, and python dockvault.py update refuses to go back unless --force-downgrade is given. Before going back, set those levels back to Full and remove any AUDIT_MAX_* line in .env that lowers one, then start 0.34.0 once so it removes the record that stops the earlier release. The check finds the newest levels while they record less than Full.",
+          "detect": "SELECT 1 FROM audit_privacy_policies WHERE version = (SELECT max(version) FROM audit_privacy_policies) AND (signin_names <> 'full' OR emails <> 'full' OR ip <> 'full' OR user_agent <> 'full')",
+          "blocks_rollback": true
+        },
+        {
+          "id": "legal-holds-block-rollback",
+          "summary": "While a legal hold stands, or what a hold kept (files, folders, the old names of renamed ones) waits for its purge, going back to a release before 0.34.0 would destroy it: release the holds and let the purge run first.",
+          "detect": "SELECT 1 FROM legal_hold_vaults WHERE released_at IS NULL UNION ALL SELECT 1 FROM held_files UNION ALL SELECT 1 FROM held_folders UNION ALL SELECT 1 FROM held_name_history LIMIT 1",
+          "blocks_rollback": true
+        },
+        {
+          "id": "compliance-records-block-rollback",
+          "summary": "From 0.34.0, while a compliance case is open, a case's records must still be kept, or the record of a step of compliance access taken (an auditor right given or taken, a case's steps, a name revealed) is younger than COMPLIANCE_RECORD_MIN_DAYS (2190 by default, at least 365), an earlier release would not keep them: it knows no cases, and with a positive AUDIT_LOG_RETENTION_DAYS, which 0.34.0 leaves in .env as a waiting change, it deletes every older audit row the first time an administrator opens the dashboard's activity feed. So 0.33.1 and later refuse to start on this database, and python dockvault.py update refuses to go back unless --force-downgrade is given. A refused request, which any account can make, a vault owner's own steps on Access to my vaults, and a notice to a vault's owner (also of access someone else gave to their vault) do not count. Wait until no case is open and those records are older than COMPLIANCE_RECORD_MIN_DAYS, then start 0.34.0 once so it removes the record that stops the earlier release. An earlier release started sooner with ALLOW_START_ON_NEWER_DATA=true keeps the audit rows only while .env sets no AUDIT_LOG_RETENTION_DAYS. The check finds that record.",
+          "detect": "SELECT key, requires_at_least, since FROM data_requirements WHERE key = 'compliance-records'",
+          "blocks_rollback": true
+        },
+        {
+          "id": "older-images-refuse-newer-data",
+          "summary": "From 0.34.0 the release records in the table data_requirements each state of the data that an earlier release cannot read or would destroy, for as long as it lasts: archived audit days, legal holds and what they kept, recording levels below Full, and open compliance cases and the records of compliance access while they must be kept. 0.33.1 and later refuse to start on a database that holds such a record, and print what to undo with 0.34.0 before going back; python dockvault.py update refuses to go back while one exists unless --force-downgrade is given. ALLOW_START_ON_NEWER_DATA=true in .env starts an earlier release anyway, on data it cannot fully read: it may show an incomplete audit log and delete what 0.34.0 keeps. 0.33.0 and earlier do not read the table. The check lists the records.",
+          "detect": "SELECT key, requires_at_least, reason, since FROM data_requirements ORDER BY key",
+          "blocks_rollback": true
+        },
+        {
+          "id": "promotion-resets-passwords-set-by-others",
+          "summary": "From 0.34.0 each account records whether its current password is its own or one someone else set: an administrator, a user who manages users, the server's operator, or a reset link another account made. At the upgrade this is read once from the audit log, and a password whose setting the log no longer holds counts as the person's own. When an account whose password someone else set is made an administrator, that password stops working, its sessions end, and the person sets a new one through a reset link sent to their own email address (when none can be sent, the administrator who promoted them gets a link to hand over); until then the account cannot approve a held change to someone's sign-in details. What an earlier release did after going back to it is not read on the return to 0.34.0: a password an administrator set while it ran counts as the person's own, and an account marked before keeps its mark though its person set a password of their own meanwhile."
+        },
+        {
+          "id": "zk-envelope-held-after-admin-reset",
+          "summary": "From 0.34.0, for ZK_ENVELOPE_HOLD_DAYS days (14 by default) after an administrator or the server's operator changed an account's sign-in details, the account's zero-knowledge encryption key is given to a browser only after it enters a code sent by email to the address the account had before the first of those changes. Changes made before the upgrade count: an account with an encryption key whose sign-in details were changed in the 14 days before the upgrade is held from the first start (opening the key answers 403 zk-envelope-hold), and an account changed then that has no key yet is held as soon as it sets one up, until the hold ends. Only an email change recorded before 0.34.0 kept the address it replaced, so for an account whose first such change was of another kind or an email change of an account that had no address, or on a deployment without mail, no code can be sent (409 zk-envelope-hold-no-mail): the server's operator releases it with python dockvault.py accounts --action release-key-hold, or the hold ends ZK_ENVELOPE_HOLD_DAYS days after the last change. The check below counts the accounts held at the first start and those only the server's operator can release; it cannot count an account that sets up a key later, so a check that finds none does not mean no account will be held. ZK_ENVELOPE_HOLD_DAYS=0 in .env before the upgrade turns the hold off. Going back to an earlier release lifts the hold.",
+          "detect": "SELECT count(*) AS held_accounts, count(*) FILTER (WHERE kind <> 'email' OR coalesce(btrim(previous_email), '') = '') AS released_only_by_the_host FROM (SELECT DISTINCT ON (c.target_user_id) c.target_user_id, c.kind, c.payload->>'previous_email' AS previous_email FROM credential_changes c JOIN user_keypairs k ON k.user_id = c.target_user_id WHERE c.status IN ('made', 'approved') AND c.applied_at > (now() AT TIME ZONE 'utc') - interval '14 days' ORDER BY c.target_user_id, c.applied_at) t HAVING count(*) > 0"
         }
       ]
     }
