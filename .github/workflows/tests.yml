@@ -1042,12 +1042,19 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-          cache-dependency-path: tests/requirements-test.lock
+          cache-dependency-path: |
+            requirements.lock
+            tests/requirements-test.lock
 
-      # The test lock alone, as in the Fast lanes: this job collects tests and runs none.
+      # The packages preflight and the shards have: the test lock, then the production lock over
+      # it. This job runs no test, but the names it collects are compared with those lanes'
+      # reports and their number with preflight's count, and what is installed can change what a
+      # test file collects: a file that skips itself when a package is missing collects nothing
+      # without it.
       - name: Install locked test dependencies
         run: |
           python -m pip install -r tests/requirements-test.lock
+          python -m pip install --force-reinstall --require-hashes -r requirements.lock
           python -m pip check
 
       # The names every lane's report is compared with. The second collection is the offline lane's

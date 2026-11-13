@@ -331,8 +331,14 @@ def test_fast_host_pytest_job_installs_the_cross_platform_locked_environment():
             _job_text("scenarios", "suite-report"),
             "python -m pytest tests/test_transfer_admission_live.py",
         ),
+        # The report job runs no test, but it collects the names the lanes' reports are compared
+        # with, so it collects them with the packages those lanes have.
+        (
+            _job_text("suite-report", None),
+            "python -m pytest --collect-only -q",
+        ),
     ],
-    ids=["preflight", "integration", "scenarios"],
+    ids=["preflight", "integration", "scenarios", "suite-report"],
 )
 def test_linux_host_pytest_jobs_layer_the_hash_locked_production_environment(
     workflow: str, first_pytest_command: str

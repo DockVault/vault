@@ -250,6 +250,14 @@ def test_the_suite_report_reads_every_lane_and_cannot_be_skipped():
     assert checkout == {"ref": "${{ inputs.expected_sha || github.sha }}", "fetch-depth": 0,
                         "persist-credentials": False}
     assert _step(_REPORT, "Verify requested commit")["run"] == 'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"'
+    # The names are collected with the packages preflight and the shards have, and with nothing
+    # else: what is installed can change what a test file collects, and the names are compared
+    # with those lanes' reports.
+    assert _step(_REPORT, "Install locked test dependencies")["run"].splitlines() == [
+        "python -m pip install -r tests/requirements-test.lock",
+        "python -m pip install --force-reinstall --require-hashes -r requirements.lock",
+        "python -m pip check",
+    ]
 
     # Every lane's report, by the one prefix their artifacts share.
     fetch = _step(_REPORT, "Fetch every lane's report")
