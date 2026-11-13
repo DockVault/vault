@@ -14407,7 +14407,11 @@ async function _downloadFile(fileId, fileName) {
                 downloadProgress.done(dlId);
             }
         }
-        const url = window.URL.createObjectURL(blob);
+        // Saved from an address made under a type a browser only saves, never the type the file was
+        // stored with (whatever its uploader claimed): a browser that does not honour the link's
+        // download attribute opens the address instead, and under a page's type that would be a page
+        // of this origin. The link carries the file's own name, so its type is not needed to save it.
+        const url = window.URL.createObjectURL(new Blob([blob], { type: 'application/octet-stream' }));
         const a = document.createElement('a');
         a.href = url;
         a.download = fileName;
