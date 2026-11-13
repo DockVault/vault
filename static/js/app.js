@@ -14173,7 +14173,10 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
             }
         };
         worker.postMessage(
-            { type: 'dv-sink-open', id, filename, size, mime }, [channel.port2]);
+            // The worker answers every download as plain bytes whatever it is told. A browser can still run
+            // the worker of the release before for the first download after an upgrade, and that one answered
+            // under the type it was given: so the page gives it plain bytes too, never the file's stored type.
+            { type: 'dv-sink-open', id, filename, size, mime: 'application/octet-stream' }, [channel.port2]);
     });
     if (!url) return null;
 

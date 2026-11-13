@@ -119,3 +119,11 @@ def test_the_worker_takes_no_type_from_the_page():
     assert source.count("const SINK_CONTENT_TYPE = 'application/octet-stream';") == 1
     assert source.count("'Content-Type': SINK_CONTENT_TYPE,") == 1 and source.count("'Content-Type'") == 1
     assert "data.mime" not in source and "slot.mime" not in source
+
+
+def test_the_page_gives_the_worker_plain_bytes_as_the_type():
+    # A browser can run the worker of an earlier release for the first download after an upgrade, and that worker
+    # answered under the type the page gave it. So the page gives it no stored type either.
+    source = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    assert source.count("type: 'dv-sink-open'") == 1
+    assert source.count("{ type: 'dv-sink-open', id, filename, size, mime: 'application/octet-stream' }") == 1
