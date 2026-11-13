@@ -73,6 +73,12 @@ RUN = JAVASCRIPT + [
     # an XML type known only by its shape, with a parameter after it, and named anywhere else in the value
     "application/rss+xml; charset=utf-8", "application/atom+xml ;charset=utf-8", "X-Made-Up/XML ; q=1",
     'image/png; x="application/rss+xml"', 'image/png; x="a, x-made-up/xml "', 'video/mp4; note="image/x-thing+xml"',
+    # a type one browser lays out as XML though it has no XML shape
+    "text/rdf", "TEXT/RDF; charset=utf-8", 'video/mp4; x="text/rdf"',
+    # every stream of parts: each part is laid out under the type the part names
+    "multipart/mixed", "multipart/mixed; boundary=part", "Multipart/Byteranges; boundary=part", "multipart/related",
+    'multipart/related; type="application/x-thing"', "multipart/form-data; boundary=part",
+    'image/png; x="multipart/mixed"',
     # a listed type named anywhere in the value
     'image/png; x="text/html"', 'text/plain; note="application/javascript"', 'image/png; type="text/css"',
     'video/webm; codecs="vp8, text/javascript"', "application/octet-stream; kind=javascript",
@@ -128,13 +134,13 @@ def test_the_list_holds_every_javascript_type_of_the_standard_and_changes_only_o
     assert len(JAVASCRIPT) == len(set(JAVASCRIPT)) == 16
     assert S._BROWSER_RUN_TYPES == set(JAVASCRIPT) | {
         "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml", "application/xml-dtd",
-        "multipart/x-mixed-replace",
+        "text/rdf", "multipart/x-mixed-replace",
         "text/css", "text/xsl", "text/xslt", "application/xslt+xml", "text/vtt", "application/wasm",
         "application/webbundle",
         "text/vbscript", "text/vbs",
     }
     assert S._SCRIPT_LANGUAGE_NAMES == ("javascript", "ecmascript", "jscript", "livescript", "vbscript")
-    assert S._BROWSER_RUN_SHAPES == ("/xml", "+xml")
+    assert S._BROWSER_RUN_SHAPES == ("/xml", "+xml", "multipart/")
 
 
 @pytest.mark.parametrize("subtype", ["xml", "rss+xml", "x-thing+xml", "vnd.example.record+xml"])
@@ -324,6 +330,7 @@ RUN_AS_STORED = [
     ("clip.mp4", "video/x-thing+xml"), ("feed.xml", "application/rss+xml"), ("sheet.xsl", "text/xsl"),
     ("cues.vtt", "text/vtt"), ("picture.png", 'image/png; x="text/html"'),
     ("picture.png", 'image/png; x="application/rss+xml"'), ("feed.xml", "application/rss+xml ; charset=utf-8"),
+    ("notes.rdf", "text/rdf"), ("saved.mht", "multipart/related; boundary=part"),
 ]
 
 

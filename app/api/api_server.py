@@ -20106,8 +20106,9 @@ def _safe_media_type(value: Optional[str]) -> str:
 # the one list of them: a case's content route (app/api/compliance_router.py) reads it too.
 #
 #   Pages: HTML, a stream of parts each laid out as a page, and every XML type (a browser lays any of them out,
-#   and runs the script of an XHTML or SVG element inside). The XML types are also matched by their shape
-#   (_BROWSER_RUN_SHAPES).
+#   and runs the script of an XHTML or SVG element inside). The XML types and the streams of parts are also
+#   matched by their shape (_BROWSER_RUN_SHAPES); text/rdf has no XML shape, and Firefox lays it out as XML all
+#   the same.
 #   What a page applies when it names it: a style sheet, a transform for an XML page, a text track, a compiled
 #   module, a bundle of responses.
 #   Scripts: the JavaScript MIME types of the WHATWG MIME Sniffing standard. Once sniffing is off they are the only
@@ -20120,7 +20121,7 @@ def _safe_media_type(value: Optional[str]) -> str:
 # is off none of them is taken for a script or a style sheet.
 _BROWSER_RUN_TYPES = frozenset({
     "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml", "application/xml-dtd",
-    "multipart/x-mixed-replace",
+    "text/rdf", "multipart/x-mixed-replace",
     "text/css", "text/xsl", "text/xslt", "application/xslt+xml", "text/vtt", "application/wasm",
     "application/webbundle",
     "application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript",
@@ -20130,9 +20131,11 @@ _BROWSER_RUN_TYPES = frozenset({
     "text/vbscript", "text/vbs",
 })
 _SCRIPT_LANGUAGE_NAMES = ("javascript", "ecmascript", "jscript", "livescript", "vbscript")
-# An XML type is known by its shape rather than by a list: its subtype is xml, or ends in +xml. Either way the
-# type has one of these in it, so a value that has one anywhere is taken for an XML type.
-_BROWSER_RUN_SHAPES = ("/xml", "+xml")
+# Two kinds of type are known by their shape rather than by a list, and a value that has one of these anywhere is
+# taken for one. An XML type: its subtype is xml, or ends in +xml, so it has one of the first two in it. A
+# multipart type: a stream of parts, and a browser that takes such an answer apart lays each part out under the
+# type the part itself names, so the type of the whole says nothing of what is shown.
+_BROWSER_RUN_SHAPES = ("/xml", "+xml", "multipart/")
 _NOTHING_RUNS_POLICY = "default-src 'none'; sandbox"
 
 
@@ -20142,7 +20145,7 @@ def _browser_runs(media_type: Optional[str]) -> bool:
     A stored type is whatever its uploader wrote, so nothing is matched against the type alone. A listed type
     counts wherever it stands in the value, a parameter included, since not every reader takes the type from
     the same place; so does the name of a script language in a spelling the list does not have; and so does
-    the shape of an XML type.
+    the shape of an XML type or of a multipart one.
     """
     value = (media_type or "").lower()
     if any(listed in value for listed in _BROWSER_RUN_TYPES):
