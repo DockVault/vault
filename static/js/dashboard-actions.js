@@ -86,19 +86,25 @@
         setTimeout(tick, 100);
     }
 
-    // Whether upload links are on for this account. Asked of the server once when the page does not know yet
-    // (the quick actions and the attention lane draw at the same time and share the one question).
-    let receiversAsking = null;
-    async function receiversOn() {
+    // The upload-link policy as this page knows it, asked of the server when it does not know yet (one question
+    // for the sign-in, the quick actions and the attention lane together: refreshReceiverAvailability in app.js).
+    async function receiverPolicyKnown() {
         if (typeof state === 'undefined') return false;
         if (state._receiversEnabled === undefined && typeof refreshReceiverAvailability === 'function') {
-            if (!receiversAsking) {
-                receiversAsking = Promise.resolve().then(refreshReceiverAvailability).catch(() => false)
-                    .finally(() => { receiversAsking = null; });
-            }
-            await receiversAsking;
+            try { await refreshReceiverAvailability(); } catch (_) {}
         }
-        return !!state._receiversEnabled;
+        return true;
+    }
+
+    // Whether this person may make an upload link: the feature on, and a tag they may make one with.
+    async function receiversOn() {
+        return (await receiverPolicyKnown()) && !!state._receiversEnabled;
+    }
+
+    // Whether upload links are switched on at all. The links a person already has (their files waiting, their
+    // expiry) are theirs to see whatever the tags allow them to make now; a switched-off feature asks nothing.
+    async function receiversSwitchedOn() {
+        return (await receiverPolicyKnown()) && !!(state._receiverPolicy && state._receiverPolicy.enabled);
     }
 
     // ---- quick actions --------------------------------------------------------------------------------------
@@ -202,7 +208,7 @@
             // Upload links switched off: their page is not asked for, here as anywhere else.
             const [shares, publicLinks, noteLinks, receivers] = await Promise.all([
                 quiet('/shares'), quiet('/public-links'), quiet('/note-links'),
-                receiversOn().then(on => (on ? quiet('/receivers') : null))]);
+                receiversSwitchedOn().then(on => (on ? quiet('/receivers') : null))]);
             // Each expiry row opens the place its Extend button is: the "Shared by me" tab and the card, the
             // Notes "Shared" tab, the Drop vaults tab, or the vault's "My public links" dialog (openAppTarget in
             // app.js understands the same targets the reminder notices carry).
@@ -364,5 +370,21 @@
         await Promise.all([renderQuickActions(ctx || {}), renderAttention(ctx || {}), renderGetStarted()]);
     }
 
-    window.DashboardActions = { render, soon, inDays, listsNotice };
+    // What this module drew for the person signed in goes at a sign-out (logout in app.js), so the next person on
+    // the tab sees none of it before their own dashboard is drawn.
+    function reset() {
+        shown = new Set();
+        const actions = document.getElementById('dashboard-quick-actions');
+        if (actions) { actions.replaceChildren(); actions.hidden = true; }
+        const attention = document.getElementById('lane-attention');
+        if (attention) attention.replaceChildren();
+        const card = document.getElementById('dashboard-get-started');
+        if (card) {
+            card.hidden = true;
+            const list = card.querySelector('.get-started-list');
+            if (list) list.replaceChildren();
+        }
+    }
+
+    window.DashboardActions = { render, reset, soon, inDays, listsNotice };
 })();

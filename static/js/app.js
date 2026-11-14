@@ -2655,6 +2655,9 @@ function logout(how, reason) {
     state.allVaults = [];
     state.dashboardVaults = null;   // the lanes' vaults, with any decrypted zero-knowledge names
     state.dashboardShared = null;
+    // What the server said of upload links for this person (on, and with which tags): the next person asks again.
+    state._receiverPolicy = undefined;
+    state._receiversEnabled = undefined;
     state.selectedFileIds = new Set();
     try { clearMoveCopy(); } catch (_) {}          // move/copy clipboard + its floating bar
     try { uploadManager.reset(); } catch (_) {}    // upload tray items + DOM (no server cancels)
@@ -2664,10 +2667,15 @@ function logout(how, reason) {
     try { transferGate.reset(); } catch (_) {}
     ['vaults-list', 'vault-files-grid', 'vault-files-table-body', 'receivers-list',
      'dashboard-vaults-count', 'dashboard-storage', 'dashboard-temp-creds-count',
-     'dashboard-users-count'].forEach(id => {
+     'dashboard-users-count', 'lane-waiting', 'lane-favourites', 'lane-recent'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.replaceChildren();
     });
+    // The dashboard's quick actions, its Needs-attention lane and the Get started list: drawn from this person's
+    // permissions and policy, none of it may greet the next person.
+    if (window.DashboardActions && typeof DashboardActions.reset === 'function') {
+        try { DashboardActions.reset(); } catch (_) {}
+    }
     // Upload-link and public-link URLs are bearer credentials. The ones minted in this session are
     // held in memory for the drop-vault card's Copy button and sit in the result field of three
     // dialogs, and the server cannot produce them again — so the next person on this tab must not
@@ -22657,9 +22665,27 @@ function _mbShown(b) { return String(_mbFromBytes(b) || 0); }
 function _bytesFromMb(mb) { const n = parseInt(mb, 10); return Number.isFinite(n) && n > 0 ? n * _MB : null; }
 
 // Availability: feature on + at least one tag the user can create with. Toggles the nav item.
-async function refreshReceiverAvailability() {
-    try { state._receiverPolicy = await apiRequest('/receiver-policy', { silent: true }); }
-    catch (_) { state._receiverPolicy = { enabled: false, tags: [] }; }
+// One question at a time per session: callers that ask while it is on its way share its answer (the sign-in and
+// the dashboard drawn beside it both ask). An answer that comes back after the person signed out is dropped.
+let _receiverPolicyAsking = null;
+function refreshReceiverAvailability() {
+    const asker = authToken;
+    if (!_receiverPolicyAsking || _receiverPolicyAsking.asker !== asker) {
+        const asking = _askReceiverPolicy(asker).finally(() => {
+            if (_receiverPolicyAsking === asking) _receiverPolicyAsking = null;
+        });
+        asking.asker = asker;
+        _receiverPolicyAsking = asking;
+    }
+    return _receiverPolicyAsking;
+}
+
+async function _askReceiverPolicy(asker) {
+    let policy;
+    try { policy = await apiRequest('/receiver-policy', { silent: true }); }
+    catch (_) { policy = { enabled: false, tags: [] }; }
+    if (authToken !== asker) return false;
+    state._receiverPolicy = policy || { enabled: false, tags: [] };
     const tags = (state._receiverPolicy.tags || []);
     state._receiversEnabled = !!state._receiverPolicy.enabled && tags.length > 0;
     const nav = document.getElementById('nav-uploadlinks');
