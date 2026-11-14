@@ -20980,11 +20980,6 @@ def _is_media_token(text: str) -> bool:
     return bool(text) and all(c in _MEDIA_TOKEN_CHARS for c in text)
 
 
-# What a preview answer always carries: a document opened from it runs nothing and loads nothing, and the
-# browser never guesses another type than the one sent.
-_PREVIEW_HEADERS = {"Content-Security-Policy": "default-src 'none'; sandbox", "X-Content-Type-Options": "nosniff"}
-
-
 def _preview_media_type(value: Optional[str]) -> str:
     """The type a preview is served with: the stored type made safe (_safe_media_type), except that every type
     a browser would run, or apply to the page that names it (_browser_runs, the server's one list of them), is
@@ -21068,6 +21063,9 @@ _SCRIPT_LANGUAGE_NAMES = ("javascript", "ecmascript", "jscript", "livescript", "
 # type the part itself names, so the type of the whole says nothing of what is shown.
 _BROWSER_RUN_SHAPES = ("/xml", "+xml", "multipart/")
 _NOTHING_RUNS_POLICY = "default-src 'none'; sandbox"
+# What a preview answer always carries: a document opened from it runs nothing and loads nothing, and the
+# browser never guesses another type than the one sent.
+_PREVIEW_HEADERS = {"Content-Security-Policy": _NOTHING_RUNS_POLICY, "X-Content-Type-Options": "nosniff"}
 
 
 def _browser_runs(media_type: Optional[str]) -> bool:

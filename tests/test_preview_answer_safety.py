@@ -43,6 +43,11 @@ def test_other_types_are_previewed_as_stored_and_made_safe(stored, served):
 def test_the_preview_headers_sandbox_and_forbid_sniffing():
     assert api._PREVIEW_HEADERS == {"Content-Security-Policy": "default-src 'none'; sandbox",
                                     "X-Content-Type-Options": "nosniff"}
+    # The policy is the server's one policy under which nothing runs, named, not written out again.
+    [assign] = [n for n in ast.parse(SOURCE).body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "_PREVIEW_HEADERS" for t in n.targets)]
+    given = {k.value: ast.unparse(v) for k, v in zip(assign.value.keys, assign.value.values)}
+    assert given["Content-Security-Policy"] == "_NOTHING_RUNS_POLICY"
 
 
 def _serve_file():
