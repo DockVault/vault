@@ -34,18 +34,33 @@ def _warn(page: Page):
     expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=10000)
 
 
-def test_a_renewal_refused_for_the_account_signs_out_and_says_why(page: Page, admin, person):
+def test_a_renewal_refused_for_the_account_signs_out_with_the_servers_sentence(page: Page, person):
     _login(page, person)
+    page.wait_for_load_state("networkidle", timeout=15000)
     _warn(page)
-    # The account is made inactive while the warning is open: the renewal is refused for the account.
-    assert admin.patch(f"/users/{person['id']}", json={"is_active": False}).status_code in (200, 204)
-    with page.expect_response(lambda r: r.url.endswith("/auth/session/extend")) as answer:
-        page.click("#session-stay")
-    assert answer.value.status in (401, 403)
+    # The server refuses the renewal for the account, in its own words.
+    page.route("**/auth/session/extend", lambda route: route.fulfill(
+        status=403, content_type="application/json", body='{"detail": "User account is inactive"}'))
+    page.click("#session-stay")
     expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
     note = page.locator("#login-error")
-    expected = "User account is inactive" if answer.value.status == 403 else "Your session has ended"
-    expect(note).to_contain_text(expected, timeout=5000)
+    expect(note).to_contain_text("User account is inactive", timeout=5000)
+    assert note.get_attribute("role") == "alert"
+    expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
+    expect(page.locator("#toast-container")).not_to_contain_text("Could not extend")
+
+
+def test_an_account_made_inactive_while_the_warning_is_open_signs_the_tab_out_with_a_reason(page: Page, admin, person):
+    # The page learns of it at once, from whichever of its requests is refused first (an unread-count poll, within
+    # a tenth of a second here): the tab signs out, and the sign-in screen says why.
+    _login(page, person)
+    _warn(page)
+    assert admin.patch(f"/users/{person['id']}", json={"is_active": False}).status_code in (200, 204)
+    page.evaluate("() => { if (typeof refreshNotifUnread === 'function') refreshNotifUnread(); }")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    note = page.locator("#login-error")
+    expect(note).not_to_be_empty(timeout=5000)
+    assert note.inner_text().strip() in ("Your session has ended. Sign in again.", "User account is inactive")
     assert note.get_attribute("role") == "alert"
     expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
     expect(page.locator("#toast-container")).not_to_contain_text("Could not extend")
