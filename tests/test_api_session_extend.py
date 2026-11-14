@@ -7,6 +7,7 @@ session is not extended; the renewal limit setting is bounded; recorded.
 """
 import os
 import subprocess
+import time
 
 import pytest
 import requests
@@ -92,6 +93,8 @@ def test_a_renewal_carries_how_the_person_signed_in_and_when(admin):
         first = r.json()["access_token"]
         before = _claims(first)
         assert before["amr"] == ["pwd", "totp"] and before["mfa_at"]
+        # A renewal in a later second than the sign-in, so a renewal that took its own time could not pass.
+        time.sleep(1.1)
         renewed = _extend(first)
         assert renewed.status_code == 200, renewed.text
         after = _claims(renewed.json()["access_token"])
@@ -100,7 +103,7 @@ def test_a_renewal_carries_how_the_person_signed_in_and_when(admin):
         # took more than one step can say it began a second before the token was made), else its iat.
         signed_in = before.get("auth_time", before["iat"])
         assert signed_in <= before["iat"]
-        assert after["auth_time"] == signed_in and after["auth_time"] <= after["iat"]
+        assert after["auth_time"] == signed_in and after["iat"] > signed_in
         again = _claims(_extend(renewed.json()["access_token"]).json()["access_token"])
         assert again["auth_time"] == signed_in and again["amr"] == before["amr"]
         rows = _psql(f"SELECT details::text FROM audit_logs WHERE action='session_extended' AND username='{u['_username']}' "
