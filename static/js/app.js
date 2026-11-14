@@ -2785,11 +2785,17 @@ function logout(how, reason) {
 }
 
 // Load Dashboard Statistics
+// Whether the session a dashboard draw began for has ended (a sign-out, or another person signed in since): an answer
+// that comes back after it is the last person's, and none of it is written into the page.
+function _dashboardSessionGone(who) { return !who || authToken !== who; }
+
 async function loadDashboardStats() {
+    const who = authToken;
     try {
         // Load vaults count (silent: the dashboard polls endpoints a non-admin
         // can't reach — surface nothing, just leave those tiles blank).
         const vaults = await apiRequest('/vaults', { silent: true });
+        if (_dashboardSessionGone(who)) return;
         const vaultsCountEl = document.getElementById('dashboard-vaults-count');
         if (vaultsCountEl) {
             vaultsCountEl.textContent = vaults.length;
@@ -2809,6 +2815,7 @@ async function loadDashboardStats() {
         // Load temp credentials count
         try {
             const tempCreds = await apiRequest('/temp-creds/list', { silent: true });
+            if (_dashboardSessionGone(who)) return;
             const tempCredsCountEl = document.getElementById('dashboard-temp-creds-count');
             if (tempCredsCountEl) {
                 const activeCount = tempCreds.filter(c => c.is_active).length;
@@ -2823,6 +2830,7 @@ async function loadDashboardStats() {
         if (currentUser && currentUser.role === 'admin') {
             try {
                 const users = await apiRequest('/users', { silent: true });
+                if (_dashboardSessionGone(who)) return;
                 const usersCountEl = document.getElementById('dashboard-users-count');
                 if (usersCountEl) usersCountEl.textContent = users.length;   // every account, as the label says
             } catch (error) {
@@ -2835,6 +2843,7 @@ async function loadDashboardStats() {
         if (currentUser && currentUser.role === 'admin') {
             try {
                 await loadRecentEvents();
+                if (_dashboardSessionGone(who)) return;
             } catch (error) {
                 console.log('Events endpoint not available:', error);
             }
@@ -2861,16 +2870,19 @@ async function loadDashboardStats() {
         } catch (error) {
             console.log('Shared-with-me not available:', error);
         }
+        if (_dashboardSessionGone(who)) return;
         // Zero-knowledge vaults by their real names when the key is unlocked, else by their labels;
         // never a prompt from the dashboard. Kept so a later unlock or lock redraws the lanes.
         state.dashboardVaults = vaults;
         state.dashboardShared = sharedWithMe;
         try { await zkDecryptVaultNames(vaults); } catch (_) {}
+        if (_dashboardSessionGone(who)) return;
         renderDashboardLanes(vaults, sharedWithMe);
         // Quick actions, the attention lane and the administrators' checklist (static/js/dashboard-actions.js).
         if (window.DashboardActions) {
             try { await DashboardActions.render({ vaults, sharedWithMe }); }
             catch (error) { console.error('Failed to render dashboard actions:', error); }
+            if (_dashboardSessionGone(who)) return;
         }
 
         // Update system status (the gating also runs at profile-render time, before first paint;
@@ -2939,10 +2951,12 @@ function renderWaitingLane(sharedWithMe) {
 // The dashboard lanes drawn again from the vaults they were last drawn from: after an unlock the real
 // names of zero-knowledge vaults, after a lock their labels. Nothing is fetched, nothing is stored.
 async function redrawDashboardLanes() {
+    const who = authToken;
     const vaults = state.dashboardVaults;
     if (!Array.isArray(vaults)) return;
     if (zkKeyUnlocked()) { try { await zkDecryptVaultNames(vaults); } catch (_) {} }
     else zkRelockVaultNames(vaults);
+    if (_dashboardSessionGone(who)) return;
     renderDashboardLanes(vaults, state.dashboardShared || []);
 }
 
@@ -3034,8 +3048,10 @@ function dashboardEventIcon(event) {
 
 // Load recent events from audit log
 async function loadRecentEvents() {
+    const who = authToken;
     try {
         const events = await apiRequest('/audit/events?limit=10', { silent: true });
+        if (_dashboardSessionGone(who)) return;
         const eventsFeed = document.getElementById('events-feed');
         
         if (!eventsFeed) return;

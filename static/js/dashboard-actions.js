@@ -40,6 +40,11 @@
         try { return await apiRequest(path, { silent: true }); } catch (_) { return null; }
     }
 
+    // The session a draw begins for, and whether it has ended since (a sign-out, or another person signed in): an
+    // answer that comes back after that is the last person's, and none of it is drawn.
+    function session() { return typeof authToken !== 'undefined' ? authToken : null; }
+    function gone(who) { return !who || session() !== who; }
+
     function isAdmin() {
         const temporary = (typeof isScopedTemp !== 'undefined' && isScopedTemp)
             || !!(typeof sessionAccess !== 'undefined' && sessionAccess && sessionAccess.is_temp_session);
@@ -111,6 +116,7 @@
     async function renderQuickActions(ctx) {
         const host = document.getElementById('dashboard-quick-actions');
         if (!host) return;
+        const who = session();
         const vaults = ctx.vaults || [];
         const scoped = typeof isScopedTemp !== 'undefined' && isScopedTemp;
         const caps = (typeof sessionAccess !== 'undefined' && sessionAccess && sessionAccess.scope_caps) || [];
@@ -124,7 +130,9 @@
             actions.push({ id: 'qa-new-vault', icon: 'plus', label: 'New vault', run: () => goAndPress('vaults', 'create-vault-btn') });
         }
         if (!scoped) {
-            if (await receiversOn()) {
+            const on = await receiversOn();
+            if (gone(who)) return;
+            if (on) {
                 actions.push({ id: 'qa-upload-link', icon: 'upload', label: 'New upload link',
                                run: () => goAndPress('uploadlinks', 'receiver-new-btn') });
             }
@@ -136,6 +144,7 @@
         if (isAdmin() && may('USER_MANAGE') && typeof currentSettings !== 'undefined' && currentSettings.invite_enabled === undefined) {
             // The settings ride the admin-only GET /settings; the Users page loads them, the dashboard may come first.
             const settings = await quiet('/settings');
+            if (gone(who)) return;
             if (settings) currentSettings = settings;
         }
         if (isAdmin() && may('USER_MANAGE') && typeof currentSettings !== 'undefined' && currentSettings.invite_enabled === true) {
@@ -145,6 +154,7 @@
             actions.push({ id: 'qa-temp-cred', icon: 'key', label: 'New temporary credential',
                            run: () => goAndPress('temp-creds', 'generate-temp-creds-btn') });
         }
+        if (gone(who)) return;
         host.replaceChildren();
         host.hidden = actions.length === 0;
         actions.forEach((a) => {
@@ -202,6 +212,7 @@
     async function renderAttention(ctx) {
         const box = document.getElementById('lane-attention');
         if (!box) return;
+        const who = session();
         const rows = [];
         const scoped = typeof isScopedTemp !== 'undefined' && isScopedTemp;
         if (!scoped) {
@@ -209,6 +220,7 @@
             const [shares, publicLinks, noteLinks, receivers] = await Promise.all([
                 quiet('/shares'), quiet('/public-links'), quiet('/note-links'),
                 receiversSwitchedOn().then(on => (on ? quiet('/receivers') : null))]);
+            if (gone(who)) return;
             // Each expiry row opens the place its Extend button is: the "Shared by me" tab and the card, the
             // Notes "Shared" tab, the Drop vaults tab, or the vault's "My public links" dialog (openAppTarget in
             // app.js understands the same targets the reminder notices carry).
@@ -235,6 +247,7 @@
         if (isAdmin()) {
             const [invites, requests] = await Promise.all([
                 may('USER_VIEW') ? quiet('/invites') : null, may('USER_MANAGE') ? quiet('/admin/credential-requests') : null]);
+            if (gone(who)) return;
             const pending = list(invites, 'invites').filter(i => i.status === 'pending').length;
             if (pending) rows.unshift(row('users', `${pending} invitation${pending === 1 ? '' : 's'} pending`,
                                           'Not accepted yet', () => navigateToSection('users')));
@@ -303,7 +316,9 @@
         const card = document.getElementById('dashboard-get-started');
         if (!card) return;
         if (!isAdmin()) { card.hidden = true; return; }
+        const who = session();
         const view = await quiet('/admin/get-started');
+        if (gone(who)) return;
         if (!view || view.dismissed || view.done) { card.hidden = true; return; }
         drawGetStarted(card, view);
         card.hidden = false;
