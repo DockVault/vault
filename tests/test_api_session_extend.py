@@ -96,9 +96,13 @@ def test_a_renewal_carries_how_the_person_signed_in_and_when(admin):
         assert renewed.status_code == 200, renewed.text
         after = _claims(renewed.json()["access_token"])
         assert after["amr"] == before["amr"] and after["mfa_at"] == before["mfa_at"]
-        assert after["auth_time"] == before["iat"]          # the sign-in, not the renewal
+        # The sign-in, not the renewal: the first token's own auth_time when it carries one (a sign-in that
+        # took more than one step can say it began a second before the token was made), else its iat.
+        signed_in = before.get("auth_time", before["iat"])
+        assert signed_in <= before["iat"]
+        assert after["auth_time"] == signed_in and after["auth_time"] <= after["iat"]
         again = _claims(_extend(renewed.json()["access_token"]).json()["access_token"])
-        assert again["auth_time"] == before["iat"] and again["amr"] == before["amr"]
+        assert again["auth_time"] == signed_in and again["amr"] == before["amr"]
         rows = _psql(f"SELECT details::text FROM audit_logs WHERE action='session_extended' AND username='{u['_username']}' "
                      "ORDER BY timestamp DESC LIMIT 1")
         assert '"ended_session"' in rows and '"new_session"' in rows and '"signed_in_at"' in rows
