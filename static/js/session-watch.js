@@ -261,31 +261,58 @@
         }, 400);
     }
 
+    // Another tab of this browser renewed this sign-in first, so the token sent is spent: the renewed one, which
+    // that tab stored for the browser, is taken instead, as a tab told of the renewal takes it. Only a token of
+    // the same account that is still running; true when one was taken.
+    function takeRenewedToken(sent) {
+        if (authToken && authToken !== sent) { armFromToken(authToken); return true; }   // taken already
+        if (authToken !== sent) return false;                                          // signed out since
+        let stored = null;
+        try { stored = storage.getItem('authToken'); } catch (_) {}
+        const mine = claimsOf(sent), theirs = stored ? claimsOf(stored) : null;
+        if (!stored || stored === sent || !mine || !theirs || theirs.sub !== mine.sub) return false;
+        if (!theirs.exp || theirs.exp * 1000 <= Date.now()) return false;
+        return adopt(stored);
+    }
+
     async function stay() {
         if (busy || temporary) return;
         busy = true;
         const btn = el('session-stay');
         if (btn) btn.disabled = true;
+        const sent = authToken;
         try {
-            const res = await apiRequest('/auth/session/extend', { method: 'POST', silent: true });
-            if (!res || !res.access_token) throw new Error('no token');
-            const previous = authToken;
-            authToken = res.access_token;
+            // Asked directly rather than through apiRequest: a refusal here is this dialog's to explain. Through
+            // apiRequest a 401, or a 403 that names the account, signs the tab out before the answer is read,
+            // a 401 even when another tab of this browser has just renewed the sign-in.
+            const res = await fetch(`${API_BASE}/auth/session/extend`, {
+                method: 'POST', headers: { 'Authorization': `Bearer ${sent}` },
+            });
+            let body = null;
+            try { body = await res.json(); } catch (_) {}
+            if (res.status === 401 || res.status === 403) {
+                if (takeRenewedToken(sent)) return;
+                const detail = body && typeof body.detail === 'string' ? body.detail : '';
+                // 403: the server will not renew this sign-in (its limit, a second factor now required, the
+                // account locked or made inactive). 401: the session has ended already. Either way it is over,
+                // and the sign-in screen says why.
+                signOutWithNote(res.status === 403
+                    ? (detail || 'This session could not be renewed. Sign in again.')
+                    : 'Your session has ended. Sign in again.');
+                return;
+            }
+            if (!res.ok || !body || !body.access_token) throw new Error('no token');
+            if (authToken !== sent) return;   // signed out, or signed in again, while the answer was on its way
+            authToken = body.access_token;
             try { storage.setItem('authToken', authToken); } catch (_) {}
             armFromToken(authToken);   // hides the dialog and arms for the new expiry
             // The other tabs of this browser hold the old token, which is dead now: told, they take the new
             // one from the shared storage and carry on (static/js/app.js, the sign-out channel).
-            if (typeof _tellOtherTabsRenewed === 'function') _tellOtherTabsRenewed(previous);
+            if (typeof _tellOtherTabsRenewed === 'function') _tellOtherTabsRenewed(sent);
             if (typeof showSuccess === 'function') showSuccess('You stay signed in.');
         } catch (e) {
-            if (e && e.status === 403) {
-                // The server will not renew this sign-in (its limit, a second factor now required): it ends
-                // when the token does, and the person signs in again; said on the sign-in screen.
-                signOutWithNote(e.message || 'This session could not be renewed. Sign in again.');
-            } else {
-                if (typeof showError === 'function') showError('Could not extend the session right now. Try again, or sign in again when it ends.');
-                show();
-            }
+            if (typeof showError === 'function') showError('Could not extend the session right now. Try again, or sign in again when it ends.');
+            show();
         } finally {
             busy = false;
             if (btn) btn.disabled = false;
