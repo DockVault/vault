@@ -22690,7 +22690,8 @@ function _bytesFromMb(mb) { const n = parseInt(mb, 10); return Number.isFinite(n
 
 // Availability: feature on + at least one tag the user can create with. Toggles the nav item.
 // One question at a time per session: callers that ask while it is on its way share its answer (the sign-in and
-// the dashboard drawn beside it both ask). An answer that comes back after the person signed out is dropped.
+// the dashboard drawn beside it both ask). An answer that comes back for another token than the tab holds is
+// dropped (_askReceiverPolicy).
 let _receiverPolicyAsking = null;
 function refreshReceiverAvailability() {
     const asker = authToken;
@@ -22708,7 +22709,10 @@ async function _askReceiverPolicy(asker) {
     let policy;
     try { policy = await apiRequest('/receiver-policy', { silent: true }); }
     catch (_) { policy = { enabled: false, tags: [] }; }
-    if (authToken !== asker) return false;
+    // The tab holds another token since it asked (a renewal, a renewed token taken from another tab, a new sign-in):
+    // the answer is dropped and the question asked again for the session the tab holds now, so the upload-links
+    // item is still decided; signed out, nothing more is asked.
+    if (authToken !== asker) return authToken ? refreshReceiverAvailability() : false;
     state._receiverPolicy = policy || { enabled: false, tags: [] };
     const tags = (state._receiverPolicy.tags || []);
     state._receiversEnabled = !!state._receiverPolicy.enabled && tags.length > 0;

@@ -120,3 +120,44 @@ def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(pag
     finally:
         admin.delete_user(other["id"])
         admin.delete(f"/receiver-tags/{tag.json()['id']}")
+
+
+def test_a_renewal_while_the_policy_is_on_its_way_still_decides_the_upload_links_item(
+        page: Page, admin, person, links_setting):
+    links_setting(True)
+    tag = admin.post("/receiver-tags", json={
+        "name": "RenewTag-" + person["_username"][-8:], "min_token_len": 10, "max_file_bytes_cap": 100 * _MB,
+        "max_total_bytes_cap": 500 * _MB, "auto_enroll_new_users": True, "is_active": True})
+    assert tag.status_code in (200, 201), tag.text
+    policy = _requests(page, r"^/receiver-policy$")
+    held = []
+
+    def hold_first(route):
+        if held:
+            route.continue_()
+        else:
+            held.append((route, route.fetch()))
+
+    page.route("**/receiver-policy", hold_first)
+    try:
+        page.goto("/")
+        _sign_in(page, person)
+        for _ in range(150):
+            if held:
+                break
+            page.wait_for_timeout(100)
+        assert held, "the policy was not asked for"
+        # The sign-in is renewed while the policy's answer is on its way: the tab holds another token when it comes.
+        old = page.evaluate("() => authToken")
+        page.evaluate("() => SessionWatch.armAt(Date.now() + 61000)")
+        expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=10000)
+        page.click("#session-stay")
+        page.wait_for_function("(t) => authToken && authToken !== t", arg=old, timeout=10000)
+        route, response = held[0]
+        route.fulfill(response=response)
+        # Asked again for the session the tab holds now, and the item decided.
+        expect(page.locator("#nav-uploadlinks")).to_be_visible(timeout=10000)
+        assert len(policy) == 2, policy
+    finally:
+        page.unroute("**/receiver-policy")
+        admin.delete(f"/receiver-tags/{tag.json()['id']}")
