@@ -15,6 +15,8 @@
 // again. A refusal (the sign-in's renewal limit reached, a second factor now required, a temporary
 // credential) signs out with the server's sentence. A temporary credential's session is never renewed:
 // its warning is timed to whichever ends first, the token or the credential, and offers only "Sign out".
+// Another request of the session refused for it (a poll's answer may come before the warning's own check)
+// signs out the same way, once, and the sign-in screen says why (refusedSession, called by apiRequest).
 // All text is written with textContent.
 (function () {
     'use strict';
@@ -221,6 +223,12 @@
         if (remaining() <= 0) expire();
     }
 
+    // What the sign-in screen says when a session is over: it ran out (a temporary credential's, or one nobody
+    // chose to keep), or it ended otherwise.
+    const RAN_OUT = 'Your session ended because nobody chose to stay signed in. Sign in again.';
+    const TEMPORARY_RAN_OUT = 'Your temporary access ended. Ask for a new credential if you need more time.';
+    const ENDED = 'Your session has ended. Sign in again.';
+
     // The count reached zero on this device's clock: the server decides. Refused: signed out, with the
     // reason on the sign-in screen. Still accepted (this device's clock runs ahead of the server's): armed
     // again from the server's own reading of the time left, and the dialog waits for the real end.
@@ -229,12 +237,12 @@
         checking = true;
         if (ticker) clearInterval(ticker);
         ticker = null;
+        const token = authToken;
         try {
-            const res = await askTheServer(authToken);
+            const res = await askTheServer(token);
             if (res.status === 401) {
-                signOutWithNote(temporary
-                    ? 'Your temporary access ended. Ask for a new credential if you need more time.'
-                    : 'Your session ended because nobody chose to stay signed in. Sign in again.');
+                // Unless a refusal of another request of this session has signed the tab out first (refusedSession).
+                signOutWithNote(temporary ? TEMPORARY_RAN_OUT : RAN_OUT, token);
                 return;
             }
             const claims = claimsOf(authToken);
@@ -253,20 +261,16 @@
         }
     }
 
-    function signOutWithNote(sentence) {
+    // Sign out the session of `token` and say why on the sign-in screen. Once per session: when the tab no longer
+    // holds that token (signed out already, by this or by another refusal, or signed in again) nothing is done,
+    // so a second refusal of the same session neither signs out twice nor writes over the first reason.
+    function signOutWithNote(sentence, token) {
+        if (!token || authToken !== token) return false;
         disarm();
         forgetArrival();
-        if (typeof logout === 'function') logout();
-        // The sign-in screen says why, once the sign-out has drawn it.
-        setTimeout(() => {
-            const note = el('login-error');
-            if (note) {
-                note.className = 'alert alert-warning mt-md';
-                note.setAttribute('role', 'alert');
-                note.textContent = sentence;
-                note.style.display = 'block';
-            }
-        }, 400);
+        // The sign-in screen says why: this page's, and the page's that replaces it after the sign-out.
+        if (typeof logout === 'function') logout(undefined, sentence);
+        return true;
     }
 
     // Another tab of this browser renewed this sign-in first, so the token sent is spent: the renewed one, which
@@ -306,7 +310,7 @@
                 // and the sign-in screen says why.
                 signOutWithNote(res.status === 403
                     ? (detail || 'This session could not be renewed. Sign in again.')
-                    : 'Your session has ended. Sign in again.');
+                    : ENDED, sent);
                 return;
             }
             if (!res.ok || !body || !body.access_token) throw new Error('no token');
@@ -331,6 +335,29 @@
         disarm();
         forgetArrival();
         if (typeof logout === 'function') logout();
+    }
+
+    // Whether the session of `token` ends within `ms` (or has ended): by this device's count when it is armed for
+    // that token, which is measured on this device's clock from the token's arrival; else by the token's own exp.
+    function endsWithin(token, ms) {
+        if (deadline && authToken === token) return deadline - Date.now() <= ms;
+        const claims = claimsOf(token);
+        return !!(claims && claims.exp && claims.exp * 1000 - Date.now() <= ms);
+    }
+
+    // A request of this tab's own session was refused for the session (apiRequest: a 401, or a 403 that names
+    // the account), perhaps before this warning's own check at the end of the count: the session is over, and
+    // the sign-in screen says why. A 403 says the server's own sentence. A 401 says that the session ran out only
+    // when it was ending anyway (its end has passed, or is two seconds away: the count may end a second after
+    // the token does, since the server's clock is read in whole seconds); any other 401 (a session ended by an
+    // administrator, by a password change, revoked) says that it has ended, never that it ran out. Once per
+    // session (signOutWithNote). False when the tab no longer holds that token: nothing was done.
+    function refusedSession(token, status, detail) {
+        let sentence;
+        if (status === 403) sentence = (typeof detail === 'string' && detail) || ENDED;
+        else if (endsWithin(token, 2000)) sentence = temporary ? TEMPORARY_RAN_OUT : RAN_OUT;
+        else sentence = ENDED;
+        return signOutWithNote(sentence, token);
     }
 
     // The dialog closed by the person (Escape, the x, a click beside it) while the count still ran: they
@@ -375,5 +402,6 @@
     }
 
     window.SessionWatch = { armFromToken, armTemporary, armAt, disarm, show, remaining, adopt, forgetArrival,
-                            isTemporary: () => temporary, WARN_SECONDS };
+                            refusedSession, isTemporary: () => temporary, WARN_SECONDS,
+                            REASONS: { ran_out: RAN_OUT, temporary_ran_out: TEMPORARY_RAN_OUT } };
 })();

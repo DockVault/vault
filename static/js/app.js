@@ -762,6 +762,18 @@ function showLoading(element, message = 'Loading...') {
 // API & UTILITY FUNCTIONS
 // ============================================================================
 
+// A request of this tab's own session was refused for the session: sign the tab out once, with the reason on the
+// sign-in screen (SessionWatch.refusedSession: that it ran out, that it ended, or the server's sentence for an
+// account). Whichever refusal arrives first does it, a background poll's as much as the warning's own check, and
+// the rest find the tab signed out already. Without the warning's module, the plain sign-out with the same reasons.
+function _signOutRefused(token, status, detail) {
+    if (window.SessionWatch && typeof SessionWatch.refusedSession === 'function') {
+        SessionWatch.refusedSession(token, status, detail);
+        return;
+    }
+    logout(undefined, (status === 403 && typeof detail === 'string' && detail) ? detail : SIGNED_OUT_REASONS.ended);
+}
+
 // Every call made through apiRequest belongs to the session open on this page when it was made. Once that session has
 // ended here (logout counts it), its answer is dropped: the promise never settles, so nothing the call would do with
 // it (draw a list into a page that has gone, show an error) is done for the next person or on the sign-in screen.
@@ -836,7 +848,7 @@ async function _apiRequestNow(endpoint, options = {}) {
                 // Session expired - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
                     console.error('Session expired, logging out');
-                    logout(undefined, 'Your session has ended. Sign in again.');
+                    _signOutRefused(sentToken, 401, '');
                 }
                 throw new Error('Session expired. Please log in again.');
             }
@@ -871,7 +883,7 @@ async function _apiRequestNow(endpoint, options = {}) {
                 // Account issue - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
                     console.error('Account issue, logging out');
-                    logout(undefined, errorDetail);
+                    _signOutRefused(sentToken, 403, errorDetail);
                 }
                 throw new Error(errorDetail);
             } else {
@@ -2447,15 +2459,23 @@ const SIGNED_OUT_REASONS = {
     locked: 'User account is locked',
 };
 
+// The app's own sentences with their codes: these, and the stay-or-sign-out warning's (static/js/session-watch.js:
+// a session that ran out).
+function _knownReasons() {
+    const watch = window.SessionWatch && SessionWatch.REASONS;
+    return Object.assign({}, (watch && typeof watch === 'object') ? watch : {}, SIGNED_OUT_REASONS);
+}
+
 function _reasonCode(reason) {
-    for (const [code, said] of Object.entries(SIGNED_OUT_REASONS)) if (said === reason) return code;
+    for (const [code, said] of Object.entries(_knownReasons())) if (said === reason) return code;
     return '';
 }
 
 // The reason the tab's name carries, as the app's own sentence; null when it carries none.
 function _nameNoteReason() {
-    if (!_nameNote || !Object.prototype.hasOwnProperty.call(SIGNED_OUT_REASONS, _nameNote.code)) return null;
-    return SIGNED_OUT_REASONS[_nameNote.code];
+    const known = _knownReasons();
+    if (!_nameNote || !Object.prototype.hasOwnProperty.call(known, _nameNote.code)) return null;
+    return known[_nameNote.code];
 }
 let _endedReason = '';
 let _endedTold = false;
