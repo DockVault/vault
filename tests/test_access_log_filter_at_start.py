@@ -2,8 +2,9 @@
 
 A secret that rides a path (an upload link's token, an invitation's) or a query is written to uvicorn's access
 log on every request unless the access logger carries the redaction filter. The server puts it there as it starts,
-unconditionally and before it serves a request: the lifespan calls the installer before its yield. The installer
-puts one filter on the access log however often it runs, and a line logged there is then written masked.
+unconditionally and before it serves a request: the app's own lifespan calls the installer before its yield. The
+installer puts one filter on the access log and one on the error log (a WebSocket handshake is written there)
+however often it runs, and a line logged on the access log is then written masked.
 """
 import ast
 import logging
@@ -16,7 +17,7 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 from app.api import api_server as api  # noqa: E402
-from app.core.log_redaction import AccessLogRedactFilter  # noqa: E402
+from app.core.log_redaction import AccessLogRedactFilter, WebSocketLogRedactFilter  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -28,6 +29,16 @@ def _lifespan():
     found = [n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.AsyncFunctionDef) and n.name == "lifespan"]
     assert len(found) == 1
     return found[0]
+
+
+def test_the_lifespan_read_here_is_the_one_the_app_starts_with():
+    assert api.app.router.lifespan_context is api.lifespan
+    # The function the app was given is the one this file reads (asynccontextmanager keeps it as __wrapped__; a
+    # decorated function's code starts at its first decorator).
+    node = _lifespan()
+    started = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+    code = api.lifespan.__wrapped__.__code__
+    assert code.co_filename.replace("\\", "/").endswith("app/api/api_server.py") and code.co_firstlineno == started
 
 
 def test_the_start_installs_the_filter_before_serving_and_unconditionally():
@@ -46,7 +57,8 @@ def test_the_start_installs_the_filter_before_serving_and_unconditionally():
 
 def test_the_installer_puts_one_filter_on_the_access_log_and_a_line_there_is_masked():
     lg = logging.getLogger("uvicorn.access")
-    before, errors_before = list(lg.filters), list(logging.getLogger("uvicorn.error").filters)
+    errors = logging.getLogger("uvicorn.error")
+    before, errors_before = list(lg.filters), list(errors.filters)
     seen = []
 
     class _Capture(logging.Handler):
@@ -56,6 +68,7 @@ def test_the_installer_puts_one_filter_on_the_access_log_and_a_line_there_is_mas
     handler = _Capture()
     old_level, old_propagate = lg.level, lg.propagate
     lg.filters[:] = [f for f in lg.filters if not isinstance(f, AccessLogRedactFilter)]
+    errors.filters[:] = [f for f in errors.filters if not isinstance(f, WebSocketLogRedactFilter)]
     lg.addHandler(handler)
     lg.setLevel(logging.INFO)
     lg.propagate = False
@@ -63,6 +76,8 @@ def test_the_installer_puts_one_filter_on_the_access_log_and_a_line_there_is_mas
         api._install_access_log_redaction()
         api._install_access_log_redaction()
         assert sum(isinstance(f, AccessLogRedactFilter) for f in lg.filters) == 1
+        # The second filter, on the error log, where uvicorn writes a WebSocket handshake with its path and query.
+        assert sum(isinstance(f, WebSocketLogRedactFilter) for f in errors.filters) == 1
         lg.info('%s - "%s %s HTTP/%s" %s', "198.51.100.20:5123", "GET", f"/receivers/{TOKEN}/page", "1.1", 200)
         lg.info('%s - "%s %s HTTP/%s" %s', "198.51.100.20:5123", "GET", f"/?invite={TOKEN}", "1.1", 200)
         assert len(seen) == 2 and not any(TOKEN in line for line in seen), seen
@@ -72,4 +87,4 @@ def test_the_installer_puts_one_filter_on_the_access_log_and_a_line_there_is_mas
         lg.setLevel(old_level)
         lg.propagate = old_propagate
         lg.filters[:] = before
-        logging.getLogger("uvicorn.error").filters[:] = errors_before
+        errors.filters[:] = errors_before
