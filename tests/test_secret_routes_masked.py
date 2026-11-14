@@ -17,6 +17,7 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 from app.api import api_server as api  # noqa: E402
+from _route_walk import served_routes  # noqa: E402
 from app.core.log_redaction import redact_access_path, redact_log_path, redact_secret_urls_in_text  # noqa: E402
 from app.core.request_context import channel_for_path  # noqa: E402
 
@@ -32,19 +33,9 @@ NOT_SECRET = {
 }
 
 
-def _served_paths(routes, prefix=""):
-    """Every path the app serves, with the routes of each included router under the prefix it was included with.
-
-    A router added with include_router may sit in the app's list as one entry that holds the router's own
-    routes (original_router) and the prefix it was given (include_context.prefix), so a walk of the app's
-    list alone would never see them."""
-    for route in routes:
-        included = getattr(route, "original_router", None)
-        if included is not None:
-            context = getattr(route, "include_context", None)
-            yield from _served_paths(included.routes, prefix + (getattr(context, "prefix", "") or ""))
-        elif getattr(route, "path", None) is not None:
-            yield prefix + route.path
+def _served_paths(routes):
+    """Every path the app serves, the routes of included routers among them (tests/_route_walk.py)."""
+    return [path for path, _route in served_routes(routes)]
 
 
 def _holds_a_secret(name: str) -> bool:
