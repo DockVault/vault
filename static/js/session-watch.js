@@ -64,13 +64,21 @@
         try { storage.setItem(ARRIVAL_KEY, (guessed ? '~' : '') + Math.round(ms) + ':' + tailOf(token)); } catch (_) {}
     }
 
+    // Ask the server for the account, for the Date of its answer only. The answer's body is read to its end
+    // and dropped: a body nobody reads keeps its request open in the browser for as long as the page lives.
+    async function askTheServer(token) {
+        const res = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${token}` } });
+        try { res.text().catch(() => {}); } catch (_) {}
+        return res;
+    }
+
     // A token with no stored arrival: the time it has left as the server counts it, carried onto this
     // device's clock, as expire() does. Its arrival is stored from that, so a reload agrees. When the server
     // does not answer, the local arming stands.
     async function correctFromServer(token, claims) {
         const tail = tailOf(token);
         try {
-            const res = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${token}` } });
+            const res = await askTheServer(token);
             const serverNow = Date.parse(res.headers.get('Date') || '');
             if (!res.ok || !Number.isFinite(serverNow)) return;
             if (armedFor !== tail || authToken !== token) return;   // armed since from something else
@@ -222,7 +230,7 @@
         if (ticker) clearInterval(ticker);
         ticker = null;
         try {
-            const res = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${authToken}` } });
+            const res = await askTheServer(authToken);
             if (res.status === 401) {
                 signOutWithNote(temporary
                     ? 'Your temporary access ended. Ask for a new credential if you need more time.'
