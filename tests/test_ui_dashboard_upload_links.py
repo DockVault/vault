@@ -81,17 +81,27 @@ def test_switched_on_the_lane_asks_for_the_links_even_with_no_tag_to_make_one(pa
     expect(page.locator("#nav-uploadlinks")).to_be_hidden()
 
 
+# A Get started list with every step still to do, whatever this deployment has done: drawn for an administrator.
+_GET_STARTED = {"dismissed": False, "done": False, "items": {}}
+
+
 def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(page: Page, admin, person, links_setting):
     links_setting(True)
     tag = admin.post("/receiver-tags", json={
         "name": "DashTag-" + person["_username"][-8:], "min_token_len": 10, "max_file_bytes_cap": 100 * _MB,
         "max_total_bytes_cap": 500 * _MB, "auto_enroll_new_users": True, "is_active": True})
     assert tag.status_code in (200, 201), tag.text
+    # The first person is an administrator, so the Get started list is drawn for them.
+    first = admin.create_user(role="admin")
     other = admin.create_user(role="user")
+    page.route("**/admin/get-started", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(_GET_STARTED))
+        if route.request.method == "GET" else route.continue_())
     try:
         page.goto("/")
-        _sign_in(page, person)
+        _sign_in(page, first)
         expect(page.locator("#qa-upload-link")).to_be_visible(timeout=15000)
+        expect(page.locator("#dashboard-get-started .get-started-list > *").first).to_be_visible(timeout=15000)
         page.evaluate("() => logout()")
         # The signed-out tab keeps nothing of what the dashboard drew for this person.
         for lane in ("#lane-attention", "#lane-recent", "#lane-waiting", "#lane-favourites"):
@@ -118,6 +128,7 @@ def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(pag
         expect(page.locator("#qa-upload-link")).to_have_count(0)
         expect(page.locator("#nav-uploadlinks")).to_be_hidden()
     finally:
+        admin.delete_user(first["id"])
         admin.delete_user(other["id"])
         admin.delete(f"/receiver-tags/{tag.json()['id']}")
 
