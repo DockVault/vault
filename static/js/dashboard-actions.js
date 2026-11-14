@@ -86,6 +86,21 @@
         setTimeout(tick, 100);
     }
 
+    // Whether upload links are on for this account. Asked of the server once when the page does not know yet
+    // (the quick actions and the attention lane draw at the same time and share the one question).
+    let receiversAsking = null;
+    async function receiversOn() {
+        if (typeof state === 'undefined') return false;
+        if (state._receiversEnabled === undefined && typeof refreshReceiverAvailability === 'function') {
+            if (!receiversAsking) {
+                receiversAsking = Promise.resolve().then(refreshReceiverAvailability).catch(() => false)
+                    .finally(() => { receiversAsking = null; });
+            }
+            await receiversAsking;
+        }
+        return !!state._receiversEnabled;
+    }
+
     // ---- quick actions --------------------------------------------------------------------------------------
     async function renderQuickActions(ctx) {
         const host = document.getElementById('dashboard-quick-actions');
@@ -103,11 +118,7 @@
             actions.push({ id: 'qa-new-vault', icon: 'plus', label: 'New vault', run: () => goAndPress('vaults', 'create-vault-btn') });
         }
         if (!scoped) {
-            if (typeof state !== 'undefined' && state._receiversEnabled === undefined
-                && typeof refreshReceiverAvailability === 'function') {
-                try { await refreshReceiverAvailability(); } catch (_) {}
-            }
-            if (typeof state !== 'undefined' && state._receiversEnabled) {
+            if (await receiversOn()) {
                 actions.push({ id: 'qa-upload-link', icon: 'upload', label: 'New upload link',
                                run: () => goAndPress('uploadlinks', 'receiver-new-btn') });
             }
@@ -188,8 +199,10 @@
         const rows = [];
         const scoped = typeof isScopedTemp !== 'undefined' && isScopedTemp;
         if (!scoped) {
+            // Upload links switched off: their page is not asked for, here as anywhere else.
             const [shares, publicLinks, noteLinks, receivers] = await Promise.all([
-                quiet('/shares'), quiet('/public-links'), quiet('/note-links'), quiet('/receivers')]);
+                quiet('/shares'), quiet('/public-links'), quiet('/note-links'),
+                receiversOn().then(on => (on ? quiet('/receivers') : null))]);
             // Each expiry row opens the place its Extend button is: the "Shared by me" tab and the card, the
             // Notes "Shared" tab, the Drop vaults tab, or the vault's "My public links" dialog (openAppTarget in
             // app.js understands the same targets the reminder notices carry).
