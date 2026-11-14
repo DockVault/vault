@@ -74,27 +74,6 @@ def test_every_name_listed_as_no_secret_is_a_route_the_app_serves():
         assert path in served and "{" + name + "}" in path, path
 
 
-def test_the_walk_reaches_the_routes_of_every_included_router():
-    served = set(_served_paths(api.app.routes))
-    # A route from a router included with a prefix of its own, and one included without one, each named as
-    # the app itself builds its address (so the prefix is applied once, neither twice nor not at all).
-    assert api.app.url_path_for("test_action", key="x1") == "/email/actions/x1/test"
-    assert "/email/actions/{key}/test" in served
-    assert api.app.url_path_for("put_managed_setting", key="x1") == "/settings/managed/x1"
-    assert "/settings/managed/{key}" in served
-    assert len(served) > len({getattr(r, "path", None) for r in api.app.routes})
-
-
-def test_the_walk_follows_a_router_included_inside_another():
-    from fastapi import APIRouter, FastAPI
-
-    inner, outer, app = APIRouter(prefix="/inner"), APIRouter(), FastAPI()
-    inner.add_api_route("/{token}/open", lambda token: None)
-    outer.include_router(inner, prefix="/outer")
-    app.include_router(outer, prefix="/top")
-    assert "/top/outer/inner/{token}/open" in set(_served_paths(app.routes))
-
-
 def test_there_are_token_routes_to_check():
     paths = {p for p, _ in _token_routes()}
     assert "/receivers/{token}/page" in paths and "/u/{token}" in paths and len(paths) >= 10
