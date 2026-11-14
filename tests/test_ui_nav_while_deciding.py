@@ -281,6 +281,10 @@ def test_a_reload_on_upload_links_comes_back_to_it_and_to_the_dashboard_once_the
     expect(page.locator("#nav-uploadlinks")).to_be_visible(timeout=15000)
     page.click("#nav-uploadlinks")
     expect(_section(page, "uploadlinks")).to_have_class(ACTIVE)
+    # What the page loads before the reload is no request of the reloaded page: let it finish first (the
+    # dashboard drawn at sign-in asks for the upload links once it knows they are on, which can come after
+    # this page has opened, and the page before a reload lives until the new one's answer arrives).
+    page.wait_for_load_state("networkidle", timeout=15000)
     held = _Held(page, "**/receiver-policy")
     asked = _requests(page, r"^/receivers(/|$)")
     page.reload()
