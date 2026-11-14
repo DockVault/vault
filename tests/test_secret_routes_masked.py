@@ -26,7 +26,25 @@ TOKEN = "Sk7Qe2LmN9xVb4Rt"
 SECRET_WORDS = ("token", "code", "secret", "claim", "key")
 NOT_SECRET = {
     ("/second-factor/actions/{key}", "key"): "the catalog name of a step-up action, such as admin.settings.write",
+    ("/email/actions/{key}", "key"): "the catalog name of an email action, such as receiver_upload_received",
+    ("/email/actions/{key}/test", "key"): "the catalog name of an email action, such as receiver_upload_received",
+    ("/settings/managed/{key}", "key"): "the name of a setting in the settings registry",
 }
+
+
+def _served_paths(routes, prefix=""):
+    """Every path the app serves, with the routes of each included router under the prefix it was included with.
+
+    A router added with include_router may sit in the app's list as one entry that holds the router's own
+    routes (original_router) and the prefix it was given (include_context.prefix), so a walk of the app's
+    list alone would never see them."""
+    for route in routes:
+        included = getattr(route, "original_router", None)
+        if included is not None:
+            context = getattr(route, "include_context", None)
+            yield from _served_paths(included.routes, prefix + (getattr(context, "prefix", "") or ""))
+        elif getattr(route, "path", None) is not None:
+            yield prefix + route.path
 
 
 def _holds_a_secret(name: str) -> bool:
@@ -39,8 +57,7 @@ def _secret_params(path):
 
 def _token_routes():
     out = []
-    for route in api.app.routes:
-        path = getattr(route, "path", "")
+    for path in _served_paths(api.app.routes):
         names = _secret_params(path)
         if not names:
             continue
@@ -61,8 +78,30 @@ def test_which_names_are_taken_to_hold_a_secret(name, secret):
 
 
 def test_every_name_listed_as_no_secret_is_a_route_the_app_serves():
-    served = {getattr(r, "path", "") for r in api.app.routes}
-    assert all(path in served and "{" + name + "}" in path for path, name in NOT_SECRET)
+    served = set(_served_paths(api.app.routes))
+    for path, name in NOT_SECRET:
+        assert path in served and "{" + name + "}" in path, path
+
+
+def test_the_walk_reaches_the_routes_of_every_included_router():
+    served = set(_served_paths(api.app.routes))
+    # A route from a router included with a prefix of its own, and one included without one, each named as
+    # the app itself builds its address (so the prefix is applied once, neither twice nor not at all).
+    assert api.app.url_path_for("test_action", key="x1") == "/email/actions/x1/test"
+    assert "/email/actions/{key}/test" in served
+    assert api.app.url_path_for("put_managed_setting", key="x1") == "/settings/managed/x1"
+    assert "/settings/managed/{key}" in served
+    assert len(served) > len({getattr(r, "path", None) for r in api.app.routes})
+
+
+def test_the_walk_follows_a_router_included_inside_another():
+    from fastapi import APIRouter, FastAPI
+
+    inner, outer, app = APIRouter(prefix="/inner"), APIRouter(), FastAPI()
+    inner.add_api_route("/{token}/open", lambda token: None)
+    outer.include_router(inner, prefix="/outer")
+    app.include_router(outer, prefix="/top")
+    assert "/top/outer/inner/{token}/open" in set(_served_paths(app.routes))
 
 
 def test_there_are_token_routes_to_check():
