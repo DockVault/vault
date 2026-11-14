@@ -766,12 +766,15 @@ function showLoading(element, message = 'Loading...') {
 // sign-in screen (SessionWatch.refusedSession: that it ran out, that it ended, or the server's sentence for an
 // account). Whichever refusal arrives first does it, a background poll's as much as the warning's own check, and
 // the rest find the tab signed out already. Without the warning's module, the plain sign-out with the same reasons.
-function _signOutRefused(token, status, detail) {
+// Resolves true when the tab carries on instead, with the token of a renewal of the same sign-in (another tab's,
+// or this tab's own Stay signed in that was on its way).
+async function _signOutRefused(token, status, detail) {
     if (window.SessionWatch && typeof SessionWatch.refusedSession === 'function') {
-        SessionWatch.refusedSession(token, status, detail);
-        return;
+        await SessionWatch.refusedSession(token, status, detail);
+        return !!authToken && authToken !== token;
     }
     logout(undefined, (status === 403 && typeof detail === 'string' && detail) ? detail : SIGNED_OUT_REASONS.ended);
+    return false;
 }
 
 // Every call made through apiRequest belongs to the session open on this page when it was made. Once that session has
@@ -848,7 +851,12 @@ async function _apiRequestNow(endpoint, options = {}) {
                 // Session expired - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
                     console.error('Session expired, logging out');
-                    _signOutRefused(sentToken, 401, errorDetail);
+                    const renewed = await _signOutRefused(sentToken, 401, errorDetail);
+                    // The tab carries on with a renewed token of the same sign-in: this request is sent once more
+                    // with it, rather than failing while the person stays signed in. A refused retry signs out.
+                    if (renewed && !options._renewedRetry) {
+                        return _apiRequestNow(endpoint, { ...options, silent, _renewedRetry: true });
+                    }
                 }
                 throw new Error('Session expired. Please log in again.');
             }
