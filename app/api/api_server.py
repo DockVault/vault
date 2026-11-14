@@ -20952,20 +20952,15 @@ def _is_media_token(text: str) -> bool:
 # What a preview answer always carries: a document opened from it runs nothing and loads nothing, and the
 # browser never guesses another type than the one sent.
 _PREVIEW_HEADERS = {"Content-Security-Policy": "default-src 'none'; sandbox", "X-Content-Type-Options": "nosniff"}
-# Types a browser would run as a document of the vault's own origin when opened from the preview's address:
-# a preview serves them as text.
-_ACTIVE_ESSENCES = {"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
-                    "text/xsl", "application/xslt+xml", "application/xml-dtd", "text/vtt", "multipart/x-mixed-replace"}
 
 
 def _preview_media_type(value: Optional[str]) -> str:
-    """The type a preview is served with: the stored type made safe (_safe_media_type), except that HTML,
-    XHTML, SVG and every XML type are served as plain text, so their bytes are shown and never run."""
+    """The type a preview is served with: the stored type made safe (_safe_media_type), except that every type
+    a browser would run, or apply to the page that names it (_browser_runs, the server's one list of them), is
+    served as plain text, so its bytes are shown and never run. A compliance case shows its files by the same
+    rule (compliance_router._content_type)."""
     safe = _safe_media_type(value)
-    essence = safe.partition(";")[0].strip().lower()
-    if essence in _ACTIVE_ESSENCES or essence.endswith("+xml") or essence.endswith("/xml"):
-        return "text/plain; charset=utf-8"
-    return safe
+    return "text/plain; charset=utf-8" if _browser_runs(safe) else safe
 
 
 def _safe_media_type(value: Optional[str]) -> str:
@@ -23537,7 +23532,7 @@ async def preview_file(
     x_vault_password: Optional[str] = Header(None),
 ):
     """The file's bytes for the browser to show, not to save: served inline and never cached, under a
-    sandboxing Content-Security-Policy, HTML, XHTML, SVG and any XML type as plain text, recorded
+    sandboxing Content-Security-Policy, every type a browser would run as plain text, recorded
     as a preview (file_previewed, file_preview_completed, share_previewed), and for a share recipient
     counted apart from downloads against the same per-recipient cap.
 

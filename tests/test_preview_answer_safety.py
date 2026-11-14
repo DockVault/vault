@@ -25,6 +25,7 @@ SOURCE = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
     "text/html", "text/html; charset=utf-8", "TEXT/HTML", "application/xhtml+xml", "image/svg+xml",
     "image/svg+xml; charset=utf-8", "text/xml", "application/xml", "application/rss+xml", "application/atom+xml",
     "application/mathml+xml", "text/xsl", "application/xslt+xml", "multipart/x-mixed-replace",
+    "text/javascript", "application/javascript", "application/ecmascript", "text/ecmascript",
 ])
 def test_types_a_browser_would_run_are_previewed_as_plain_text(stored):
     assert api._preview_media_type(stored) == "text/plain; charset=utf-8"

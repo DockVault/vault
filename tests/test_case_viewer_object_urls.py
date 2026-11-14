@@ -45,6 +45,22 @@ def test_other_types_are_served_as_stored_once_made_safe(stored, served):
     assert cr._content_type(stored) == served
 
 
+def test_a_case_shows_its_files_by_the_vaults_preview_rule():
+    import ast
+    from app.api import api_server as api
+    for stored in ("text/html", "text/javascript", "image/x-thing+xml", "image/png", "text/plain", None, "a b",
+                   "text/css", "application/wasm", "multipart/mixed", "text/rdf", "text/plain; x=text/html"):
+        assert cr._content_type(stored) == api._preview_media_type(stored), stored
+    # Both answers ask the server's one list of the types a browser runs, and keep none of their own.
+    for path, name in ((ROOT / "app" / "api" / "compliance_router.py", "_content_type"),
+                       (ROOT / "app" / "api" / "api_server.py", "_preview_media_type")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        called = sorted(c.func.id for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name))
+        assert called == ["_browser_runs", "_safe_media_type"], name
+    assert not hasattr(api, "_ACTIVE_ESSENCES")
+
+
 def _lift(js: str, name: str) -> str:
     start = js.index("    function " + name + "(")
     return js[start:js.index("\n    }\n", start) + 7]

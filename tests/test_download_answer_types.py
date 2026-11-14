@@ -451,7 +451,9 @@ TYPED_ANSWERS = {
         "'text/csv; charset=utf-8' if format == 'csv' else 'application/x-ndjson'",   # the activity export
         "_BRAND_ASSET_MEDIA.get(ext, 'application/octet-stream')",        # a brand picture, typed by the server
         "media_type",                                                     # the public download: the rule
-        "_safe_media_type(mime_type)", "_safe_media_type(mime_type)",     # the signed-in download, whole and ranged
+        # the signed-in download and preview, whole and ranged: a preview by the list, a download as stored
+        "_preview_media_type(mime_type) if is_preview else _safe_media_type(mime_type)",
+        "_preview_media_type(mime_type) if is_preview else _safe_media_type(mime_type)",
     ]),
     "compliance_router.py": sorted(["media", "media", "'application/zip'"]),
     "email_studio_router.py": ["r.content_type"],                         # a picture typed by the server on upload
@@ -537,11 +539,16 @@ def test_the_stored_type_goes_out_as_it_is_only_to_a_signed_in_user():
         fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
         for c in _calls(fn) if _name(c.func) == "_safe_media_type")
     # (nested functions are walked with the function they are in, so a caller is named once per call it makes)
-    assert callers == ["_download_media_type", "download_file", "download_file"]
-    signed_in = _function(tree, "download_file")
-    defaults = dict(zip([a.arg for a in signed_in.args.args][-len(signed_in.args.defaults):],
-                        [ast.unparse(d) for d in signed_in.args.defaults]))
-    assert defaults["current_user"] == "Depends(get_current_user)"
+    # The preview's rule takes the stored type through the same list as the case route (_browser_runs).
+    assert callers == ["_download_media_type", "_preview_media_type", "_serve_file", "_serve_file"]
+    servers = sorted(fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     for c in _calls(fn) if _name(c.func) == "_serve_file")
+    assert servers == ["download_file", "preview_file"]
+    for route in servers:
+        signed_in = _function(tree, route)
+        defaults = dict(zip([a.arg for a in signed_in.args.args][-len(signed_in.args.defaults):],
+                            [ast.unparse(d) for d in signed_in.args.defaults]))
+        assert defaults["current_user"] == "Depends(get_current_user)", route
     # ... and that user comes from a bearer header, which a page's markup cannot send.
     current = _function(tree, "get_current_user")
     credentials = dict(zip([a.arg for a in current.args.args][-len(current.args.defaults):],
