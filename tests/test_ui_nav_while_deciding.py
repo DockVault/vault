@@ -297,7 +297,9 @@ def test_a_reload_on_upload_links_comes_back_to_it_and_to_the_dashboard_once_the
     _expect_not_waiting(page, "uploadlinks")
     _until(page, lambda: asked, "the page, once shown, did not load")
 
-    # Switched off: the same reload waits for the answer, then opens the dashboard.
+    # Switched off: the same reload waits for the answer, then opens the dashboard. What the page loads before
+    # it is no request of the reloaded page, as above: let it finish first.
+    page.wait_for_load_state("networkidle", timeout=15000)
     assert admin.put("/settings", json={"public_receivers_enabled": False}).status_code in (200, 204)
     del asked[:]
     page.reload()
