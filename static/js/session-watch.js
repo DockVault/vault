@@ -248,8 +248,9 @@
     const ENDED = 'Your session has ended. Sign in again.';
 
     // The server's sentences for a session it ended itself (signed out, ended by an administrator, by a password
-    // change, revoked; a temporary credential deactivated or released): such a 401 never reads as one that ran out.
-    const ENDED_ON_THE_SERVER = /terminated|deactivated|has ended/i;
+    // change, revoked; a temporary credential deactivated or released; the account deleted): such a 401 never
+    // reads as one that ran out.
+    const ENDED_ON_THE_SERVER = /terminated|deactivated|has ended|user not found/i;
 
     // Why a 401 of `token` ended its session: that it ran out only when its end has passed or is two seconds away
     // (the count may end a second after the token does, since the server's clock is read in whole seconds) and the

@@ -166,6 +166,7 @@ out({ held: authToken, ended: ended.map((s) => s.bearer === 'Bearer ' + renewed)
     ("Invalid authentication credentials", True, RAN_OUT),        # the token ran out at the end of its count
     ("", True, RAN_OUT),
     ("Session has been terminated. Please login again.", True, ENDED),   # ended on the server in its last seconds
+    ("User not found", True, ENDED),                             # the account deleted in its last seconds
     ("Invalid authentication credentials", False, ENDED),        # far from its end: it did not run out
 ])
 def test_a_401_says_it_ran_out_only_when_it_was_ending_and_not_ended_on_the_server(detail, ending, said):
