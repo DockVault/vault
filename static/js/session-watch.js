@@ -68,10 +68,28 @@
 
     // Ask the server for the account, for the Date of its answer only. The answer's body is read to its end
     // and dropped: a body nobody reads keeps its request open in the browser for as long as the page lives.
+    // An answer that has not come within CHECK_TIMEOUT_MS is given up (the caller asks again later), so a hung
+    // request never leaves the count standing at zero. Returns the answer and, for a refusal, its sentence.
+    const CHECK_TIMEOUT_MS = 15000;
     async function askTheServer(token) {
-        const res = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${token}` } });
-        try { res.text().catch(() => {}); } catch (_) {}
-        return res;
+        const stop = typeof AbortController === 'function' ? new AbortController() : null;
+        const timer = stop ? setTimeout(() => stop.abort(), CHECK_TIMEOUT_MS) : null;
+        try {
+            const res = await fetch(`${API_BASE}/users/me`, {
+                headers: { 'Authorization': `Bearer ${token}` }, ...(stop ? { signal: stop.signal } : {}),
+            });
+            let detail = '';
+            try {
+                const text = await res.text();
+                if (!res.ok) {
+                    const body = JSON.parse(text);
+                    if (body && typeof body.detail === 'string') detail = body.detail;
+                }
+            } catch (_) { /* no body, or not one with a sentence */ }
+            return { res, detail };
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
     }
 
     // A token with no stored arrival: the time it has left as the server counts it, carried onto this
@@ -80,7 +98,7 @@
     async function correctFromServer(token, claims) {
         const tail = tailOf(token);
         try {
-            const res = await askTheServer(token);
+            const { res } = await askTheServer(token);
             const serverNow = Date.parse(res.headers.get('Date') || '');
             if (!res.ok || !Number.isFinite(serverNow)) return;
             if (armedFor !== tail || authToken !== token) return;   // armed since from something else
@@ -229,6 +247,19 @@
     const TEMPORARY_RAN_OUT = 'Your temporary access ended. Ask for a new credential if you need more time.';
     const ENDED = 'Your session has ended. Sign in again.';
 
+    // The server's sentences for a session it ended itself (signed out, ended by an administrator, by a password
+    // change, revoked; a temporary credential deactivated or released): such a 401 never reads as one that ran out.
+    const ENDED_ON_THE_SERVER = /terminated|deactivated|has ended/i;
+
+    // Why a 401 of `token` ended its session: that it ran out only when its end has passed or is two seconds away
+    // (the count may end a second after the token does, since the server's clock is read in whole seconds) and the
+    // server did not say that it ended the session itself; else that it has ended.
+    function sentenceFor401(token, detail) {
+        if (typeof detail === 'string' && ENDED_ON_THE_SERVER.test(detail)) return ENDED;
+        if (!endsWithin(token, 2000)) return ENDED;
+        return temporary ? TEMPORARY_RAN_OUT : RAN_OUT;
+    }
+
     // The count reached zero on this device's clock: the server decides. Refused: signed out, with the
     // reason on the sign-in screen. Still accepted (this device's clock runs ahead of the server's): armed
     // again from the server's own reading of the time left, and the dialog waits for the real end.
@@ -239,10 +270,17 @@
         ticker = null;
         const token = authToken;
         try {
-            const res = await askTheServer(token);
+            const { res, detail } = await askTheServer(token);
             if (res.status === 401) {
-                // Unless a refusal of another request of this session has signed the tab out first (refusedSession).
-                signOutWithNote(temporary ? TEMPORARY_RAN_OUT : RAN_OUT, token);
+                // Another tab of this browser may have renewed the sign-in in its last second: its token is taken.
+                // Else signed out, unless a refusal of another request of this session has done it first.
+                if (!takeRenewedToken(token)) signOutWithNote(sentenceFor401(token, detail), token);
+                return;
+            }
+            if (res.status === 403 && detail) {
+                // Refused for the account (locked, made inactive): signed out with the server's sentence, rather
+                // than asked again every thirty seconds for ever.
+                refusedSession(token, 403, detail);
                 return;
             }
             const claims = claimsOf(authToken);
@@ -263,7 +301,8 @@
 
     // Sign out the session of `token` and say why on the sign-in screen. Once per session: when the tab no longer
     // holds that token (signed out already, by this or by another refusal, or signed in again) nothing is done,
-    // so a second refusal of the same session neither signs out twice nor writes over the first reason.
+    // so a second refusal of the same session neither signs out twice nor writes over the first reason. True when
+    // this call signed the tab out.
     function signOutWithNote(sentence, token) {
         if (!token || authToken !== token) return false;
         disarm();
@@ -273,18 +312,31 @@
         return true;
     }
 
-    // Another tab of this browser renewed this sign-in first, so the token sent is spent: the renewed one, which
-    // that tab stored for the browser, is taken instead, as a tab told of the renewal takes it. Only a token of
-    // the same account that is still running; true when one was taken.
+    // Another tab of this browser renewed this sign-in first, so the token sent is spent (the server answered it
+    // with a 401): the renewed one, which that tab stored for the browser, is taken instead, as a tab told of the
+    // renewal takes it. Only the same person's full sign-in, still running: not the token of another account
+    // signed in since in another tab, and never a temporary credential's (it carries its owner's id as sub).
+    // True when one was taken.
     function takeRenewedToken(sent) {
         if (authToken && authToken !== sent) { armFromToken(authToken); return true; }   // taken already
         if (authToken !== sent) return false;                                          // signed out since
         let stored = null;
         try { stored = storage.getItem('authToken'); } catch (_) {}
         const mine = claimsOf(sent), theirs = stored ? claimsOf(stored) : null;
-        if (!stored || stored === sent || !mine || !theirs || theirs.sub !== mine.sub) return false;
+        if (!stored || stored === sent || !mine || !theirs) return false;
+        if (theirs.sub !== mine.sub || theirs.username !== mine.username) return false;
+        if (theirs.is_temporary || mine.is_temporary) return false;
         if (!theirs.exp || theirs.exp * 1000 <= Date.now()) return false;
         return adopt(stored);
+    }
+
+    // A session renewed for a tab that has signed out, or signed in again, while the answer was on its way: it is
+    // nobody's now, and it is ended on the server rather than left open.
+    function endUnwantedSession(token) {
+        try {
+            fetch(`${API_BASE}/auth/sign-out`, { method: 'POST', headers: { 'Authorization': `Bearer ${token}` } })
+                .then((r) => r.text()).catch(() => {});
+        } catch (_) {}
     }
 
     async function stay() {
@@ -303,18 +355,19 @@
             let body = null;
             try { body = await res.json(); } catch (_) {}
             if (res.status === 401 || res.status === 403) {
-                if (takeRenewedToken(sent)) return;
+                // A 401: the token sent is spent, perhaps by another tab's renewal of this sign-in, whose token is
+                // then taken. A 403: the server refused this renewal (its limit, a second factor now required, the
+                // account locked or made inactive) and the token is not spent: nothing is taken. Otherwise the
+                // session is over, and the sign-in screen says why.
+                if (res.status === 401 && takeRenewedToken(sent)) return;
                 const detail = body && typeof body.detail === 'string' ? body.detail : '';
-                // 403: the server will not renew this sign-in (its limit, a second factor now required, the
-                // account locked or made inactive). 401: the session has ended already. Either way it is over,
-                // and the sign-in screen says why.
                 signOutWithNote(res.status === 403
                     ? (detail || 'This session could not be renewed. Sign in again.')
                     : ENDED, sent);
                 return;
             }
             if (!res.ok || !body || !body.access_token) throw new Error('no token');
-            if (authToken !== sent) return;   // signed out, or signed in again, while the answer was on its way
+            if (authToken !== sent) { endUnwantedSession(body.access_token); return; }
             authToken = body.access_token;
             try { storage.setItem('authToken', authToken); } catch (_) {}
             armFromToken(authToken);   // hides the dialog and arms for the new expiry
@@ -346,18 +399,15 @@
     }
 
     // A request of this tab's own session was refused for the session (apiRequest: a 401, or a 403 that names
-    // the account), perhaps before this warning's own check at the end of the count: the session is over, and
-    // the sign-in screen says why. A 403 says the server's own sentence. A 401 says that the session ran out only
-    // when it was ending anyway (its end has passed, or is two seconds away: the count may end a second after
-    // the token does, since the server's clock is read in whole seconds); any other 401 (a session ended by an
-    // administrator, by a password change, revoked) says that it has ended, never that it ran out. Once per
-    // session (signOutWithNote). False when the tab no longer holds that token: nothing was done.
+    // the account), perhaps before this warning's own check at the end of the count. A 403 signs out with the
+    // server's own sentence. A 401 first takes the token of another tab's renewal of this sign-in, when there is
+    // one (the session renewed in its last second); else it signs out, saying that the session ran out or that it
+    // has ended (sentenceFor401, by the answer's own sentence). Once per session (signOutWithNote). True when the
+    // tab took a renewed token or was signed out by this call.
     function refusedSession(token, status, detail) {
-        let sentence;
-        if (status === 403) sentence = (typeof detail === 'string' && detail) || ENDED;
-        else if (endsWithin(token, 2000)) sentence = temporary ? TEMPORARY_RAN_OUT : RAN_OUT;
-        else sentence = ENDED;
-        return signOutWithNote(sentence, token);
+        if (status === 403) return signOutWithNote((typeof detail === 'string' && detail) || ENDED, token);
+        if (takeRenewedToken(token)) return true;
+        return signOutWithNote(sentenceFor401(token, detail), token);
     }
 
     // The dialog closed by the person (Escape, the x, a click beside it) while the count still ran: they

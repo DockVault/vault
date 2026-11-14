@@ -8,6 +8,8 @@ session ran out when it was ending anyway, that it has ended for any other 401, 
 403 that names the account. Nothing more is sent with the spent token, and a later refusal of the same session
 changes nothing.
 """
+import base64
+import json
 import time
 
 import pytest
@@ -15,6 +17,7 @@ import requests
 from playwright.sync_api import Page, expect
 
 from conftest import BASE_URL
+from _sf_helpers import put_settings_allowing_longer_sessions
 
 pytestmark = pytest.mark.ui
 
@@ -77,29 +80,69 @@ def _signed_out_saying(page: Page, sentence: str):
     assert page.evaluate("() => authToken") is None
 
 
-def test_a_poll_refused_before_the_warnings_own_check_signs_out_saying_the_session_ran_out(page: Page, person):
-    token = _login(page, person)
-    sent = _Sent(page)
+def _hold_the_warnings_check(page: Page) -> list:
     held = []
     page.route("**/users/me", lambda route: held.append(route))
-    # The session is over on the server, and the count on this device reaches zero: the warning asks the
-    # server, and that check is held on its way.
-    _end_on_the_server(token)
-    page.evaluate("() => SessionWatch.armAt(Date.now() + 1000)")
-    deadline = time.time() + 10
+    return held
+
+
+def _until_held(page: Page, held: list, seconds: float):
+    deadline = time.time() + seconds
     while not held and time.time() < deadline:
         page.wait_for_timeout(100)
     assert len(held) == 1, "the warning did not ask the server at the end of its count"
-    # A poll's refusal arrives first.
+
+
+def test_a_poll_refused_at_the_real_end_before_the_warnings_check_says_the_session_ran_out(
+        page: Page, admin, admin_creds, person):
+    # A session that really runs out: two minutes.
+    before = admin.get("/settings").json().get("session_timeout") or 0
+    assert admin.put("/settings", json={"session_timeout": 2}).status_code in (200, 204)
+    try:
+        token = _login(page, person)
+    finally:
+        restored = put_settings_allowing_longer_sessions(admin, admin_creds["password"], {"session_timeout": before})
+        assert restored.status_code in (200, 204), restored.text
+    sent = _Sent(page)
+    part = token.split(".")[1]
+    exp = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))["exp"]
+    # The count on this device reaches zero (a second early at most): the warning asks the server, and that check
+    # is held on its way while the token runs out.
+    held = _hold_the_warnings_check(page)
+    _until_held(page, held, 150)
+    while time.time() < exp + 1:
+        page.wait_for_timeout(200)
+    # A poll's refusal of the token that ran out arrives first.
     _poll(page)
     _signed_out_saying(page, RAN_OUT)
-    # Then the warning's own check comes back refused too: it changes nothing.
+    # The person starts to sign in again; then the warning's own check comes back refused too: it changes
+    # nothing, neither the reason nor what the person typed.
+    page.fill("#username", "someone-else")
     held[0].continue_()
     page.unroute("**/users/me")
     page.wait_for_timeout(1500)
     expect(page.locator("#login-error")).to_contain_text(RAN_OUT)
+    assert page.input_value("#username") == "someone-else"
     assert len(sent.sign_outs()) == 1, sent.sign_outs()
     assert sent.with_token_after_sign_out(token) == [], sent.with_token_after_sign_out(token)
+
+
+def test_a_session_ended_on_the_server_at_the_end_of_its_count_says_it_ended(page: Page, person):
+    token = _login(page, person)
+    sent = _Sent(page)
+    held = _hold_the_warnings_check(page)
+    # Ended on the server, and the count on this device reaches zero: the warning's check is held on its way.
+    _end_on_the_server(token)
+    page.evaluate("() => SessionWatch.armAt(Date.now() + 1000)")
+    _until_held(page, held, 10)
+    # A poll's refusal arrives first, saying the session was ended: not that it ran out.
+    _poll(page)
+    _signed_out_saying(page, ENDED)
+    held[0].continue_()
+    page.unroute("**/users/me")
+    page.wait_for_timeout(1500)
+    expect(page.locator("#login-error")).to_contain_text(ENDED)
+    assert len(sent.sign_outs()) == 1, sent.sign_outs()
 
 
 def test_a_session_ended_elsewhere_signs_out_saying_it_ended_not_that_it_ran_out(page: Page, person):

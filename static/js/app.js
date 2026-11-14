@@ -848,7 +848,7 @@ async function _apiRequestNow(endpoint, options = {}) {
                 // Session expired - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
                     console.error('Session expired, logging out');
-                    _signOutRefused(sentToken, 401, '');
+                    _signOutRefused(sentToken, 401, errorDetail);
                 }
                 throw new Error('Session expired. Please log in again.');
             }
