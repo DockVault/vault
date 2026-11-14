@@ -418,7 +418,6 @@
     "tests/test_ui_replace_link_shows_it_once.py": 0.1,
     "tests/test_ui_retention.py": 42.4,
     "tests/test_ui_retention_hold_unread_live.py": 17.2,
-    "tests/test_ui_row_actions_exclusive.py": 3.3,
     "tests/test_ui_second_factor.py": 28.1,
     "tests/test_ui_settings_auth_limits.py": 8.2,
     "tests/test_ui_settings_levels.py": 63.0,
