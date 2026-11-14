@@ -172,7 +172,7 @@ out({ held: authToken, ended: ended.map((s) => s.bearer === 'Bearer ' + renewed)
 def test_a_401_says_it_ran_out_only_when_it_was_ending_and_not_ended_on_the_server(detail, ending, said):
     out = _node(f"""
 SessionWatch.armAt(Date.now() + ({'1000' if ending else '3600000'}));
-const done = SessionWatch.refusedSession(mine, 401, {json.dumps(detail)});
+const done = await SessionWatch.refusedSession(mine, 401, {json.dumps(detail)});
 out({{ done, logouts, note: note() }});
 """)
     assert out == {"done": True, "logouts": 1, "note": said}
@@ -182,7 +182,7 @@ def test_a_401_of_a_request_takes_the_same_persons_renewed_sign_in():
     out = _node("""
 store.set('authToken', renewed);
 SessionWatch.armAt(Date.now() + 1000);
-const done = SessionWatch.refusedSession(mine, 401, 'Session has been terminated. Please login again.');
+const done = await SessionWatch.refusedSession(mine, 401, 'Session has been terminated. Please login again.');
 out({ done, taken: authToken === renewed, logouts });
 """)
     assert out == {"done": True, "taken": True, "logouts": 0}
@@ -190,8 +190,8 @@ out({ done, taken: authToken === renewed, logouts });
 
 def test_the_session_is_signed_out_once_and_the_first_reason_stays():
     out = _node("""
-const first = SessionWatch.refusedSession(mine, 403, 'User account is locked');
-const second = SessionWatch.refusedSession(mine, 401, 'Invalid authentication credentials');
+const first = await SessionWatch.refusedSession(mine, 403, 'User account is locked');
+const second = await SessionWatch.refusedSession(mine, 401, 'Invalid authentication credentials');
 out({ first, second, logouts, note: note() });
 """)
     assert out == {"first": True, "second": False, "logouts": 1, "note": "User account is locked"}
@@ -229,3 +229,27 @@ out({ timers: before, held: authToken === mine, logouts, left: SessionWatch.rema
 """)
     assert out["timers"] >= 1 and out["held"] is True and out["logouts"] == 0
     assert 25 <= out["left"] <= 30, out
+
+
+def test_a_refusal_while_this_tabs_renewal_is_on_its_way_waits_for_it():
+    out = _node("""
+let release;
+route = (url) => url.endsWith('/auth/session/extend')
+    ? new Promise((r) => { release = () => r(answer(200, { access_token: renewed })); })
+    : Promise.resolve(answer(200, {}));
+SessionWatch.armAt(Date.now() + 30000);
+SessionWatch.show();
+const pressed = listeners['session-stay:click']();
+// The renewal has ended the old session on the server: a poll sent meanwhile is refused.
+let decided = null;
+const refused = SessionWatch.refusedSession(mine, 401, 'Session has been terminated. Please login again.')
+    .then((v) => { decided = v; });
+await settle();
+const before = { decided, logouts };
+release();
+await pressed; await refused; await settle();
+const ended = sent.filter((s) => s.url.endsWith('/auth/sign-out')).length;
+out({ before, decided, held: authToken === renewed, logouts, ended });
+""")
+    assert out == {"before": {"decided": None, "logouts": 0}, "decided": True, "held": True, "logouts": 0,
+                   "ended": 0}

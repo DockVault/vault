@@ -340,12 +340,18 @@
         } catch (_) {}
     }
 
+    // A renewal on its way: the token it was asked for, and what settles once its answer has been dealt with
+    // (refusedSession waits for it).
+    let renewing = null;
+
     async function stay() {
         if (busy || temporary) return;
         busy = true;
         const btn = el('session-stay');
         if (btn) btn.disabled = true;
         const sent = authToken;
+        let settled;
+        renewing = { token: sent, done: new Promise((resolve) => { settled = resolve; }) };
         try {
             // Asked directly rather than through apiRequest: a refusal here is this dialog's to explain. Through
             // apiRequest a 401, or a 403 that names the account, signs the tab out before the answer is read,
@@ -382,6 +388,8 @@
         } finally {
             busy = false;
             if (btn) btn.disabled = false;
+            renewing = null;
+            settled();
         }
     }
 
@@ -403,10 +411,16 @@
     // the account), perhaps before this warning's own check at the end of the count. A 403 signs out with the
     // server's own sentence. A 401 first takes the token of another tab's renewal of this sign-in, when there is
     // one (the session renewed in its last second); else it signs out, saying that the session ran out or that it
-    // has ended (sentenceFor401, by the answer's own sentence). Once per session (signOutWithNote). True when the
-    // tab took a renewed token or was signed out by this call.
-    function refusedSession(token, status, detail) {
+    // has ended (sentenceFor401, by the answer's own sentence). Once per session (signOutWithNote). A renewal of
+    // this token on its way (Stay pressed in this tab) ends the old session at once, so a request sent meanwhile is
+    // refused: the refusal waits for the renewal's answer and is weighed again with what the tab holds then. Resolves
+    // true when the tab carries on with a renewed token or was signed out by this call.
+    async function refusedSession(token, status, detail) {
         if (status === 403) return signOutWithNote((typeof detail === 'string' && detail) || ENDED, token);
+        if (renewing && renewing.token === token) {
+            await renewing.done;
+            if (authToken && authToken !== token) return true;
+        }
         if (takeRenewedToken(token)) return true;
         return signOutWithNote(sentenceFor401(token, detail), token);
     }
