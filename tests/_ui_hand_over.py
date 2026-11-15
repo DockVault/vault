@@ -90,6 +90,56 @@ def sign_out(page: Page):
         page.evaluate("() => logout()")
 
 
+# The two ways a sign-out stands when something of the session that ended comes after it: its call answered, so
+# the page has been replaced; or its call still on its way (a slow or unreachable server), so the page signed out
+# and emptied stays until it is answered.
+ANSWERED = "sign-out answered"
+ON_ITS_WAY = "sign-out on its way"
+SIGN_OUT_STANDS = [ANSWERED, ON_ITS_WAY]
+
+
+class HeldSignOut:
+    """The page's sign-out (POST /auth/sign-out) held on its way until ``release``: the page stays signed out and is
+    not replaced meanwhile."""
+
+    def __init__(self, page: Page):
+        self.page, self.routes = page, []
+        page.route("**/auth/sign-out", lambda route: self.routes.append(route))
+
+    def wait(self):
+        for _ in range(300):
+            if self.routes:
+                return
+            self.page.wait_for_timeout(50)
+        raise AssertionError("the sign-out was not sent")
+
+    def release(self):
+        """Let the sign-out go on to the server (each call held, then the route taken away)."""
+        for route in self.routes:
+            route.continue_()
+        self.routes = []
+        self.page.unroute("**/auth/sign-out")
+
+
+def sign_out_as(page: Page, how, action=None):
+    """Sign out (``action``, logout() by default) with the sign-out ``how`` (ANSWERED or ON_ITS_WAY). ANSWERED: back
+    once the page has been replaced; returns None. ON_ITS_WAY: back once the call is held, the page signed out and
+    still the one that showed the app; returns the HeldSignOut, whose ``release`` lets the call go (the page is
+    replaced then, unless someone signed in on it meanwhile, whose sign-in replaces it at once)."""
+    action = action or (lambda: page.evaluate("() => logout()"))
+    if how == ANSWERED:
+        with replaced(page):
+            action()
+        return None
+    held = HeldSignOut(page)
+    mark_old(page)
+    action()
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    held.wait()
+    assert still_old(page), "the page was replaced before its sign-out was answered"
+    return held
+
+
 def new_folder_through_the_page(page: Page, client, vault_id, name):
     """Open the vault from the vault list and make a folder with New folder, as a person does; returns once the
     page's request for it is answered. The folder is read back from the server with ``client``."""

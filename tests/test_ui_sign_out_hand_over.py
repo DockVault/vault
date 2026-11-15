@@ -269,8 +269,8 @@ def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out_while_the_sig
     # The other refusal of ana's session, and ana's sign-out answered at last: ben stays signed in, on that page.
     mark_old(page)
     held.refuse_next()
-    page.unroute("**/auth/sign-out")
     sign_outs.pop().continue_()
+    page.unroute("**/auth/sign-out")
     for _ in range(200):
         if session_row(sent_for) == "f|t":
             break
