@@ -16,6 +16,7 @@ import time
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import SIGN_OUT_STANDS, sign_out_as
 from conftest import unique
 
 
@@ -39,7 +40,10 @@ def _login(page: Page, username: str, password: str):
 
 
 @pytest.mark.ui
-def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_creds):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_creds, how):
+    """Signed out with the Sign out button. Browser online: the page is replaced by a new one, which holds no link.
+    Browser offline: the page signed out stays until it is back online, and holds none either."""
     # Restored to what it WAS, not to off: a fresh deployment has upload links on, and a test that
     # switched them off on its way out would make every later test skip for a reason it created.
     before = admin.get("/settings").json().get("public_receivers_enabled")
@@ -72,9 +76,11 @@ def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_c
         page.evaluate("""() => { state._lastPflUrl = 'https://example.invalid/p/file';
                                  state._lastPublicLinkUrl = 'https://example.invalid/n/note'; }""")
 
-        page.click("#profile-btn")
-        page.click("#dropdown-logout-btn")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+        def button():
+            page.click("#profile-btn")
+            page.click("#dropdown-logout-btn")
+
+        signing_out = sign_out_as(page, how, button)
 
         after = page.evaluate(
             """() => ({ field: document.getElementById('rc-link-value').value,
@@ -87,6 +93,8 @@ def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_c
         assert after == {"field": "", "pfl": "", "note": "", "session": 0, "last": "",
                          "lastPfl": "", "lastPublic": ""}, (
             f"a link URL survived logout on this tab: {after}")
+        if signing_out:
+            signing_out()                         # back online: the page is replaced
     finally:
         admin.put("/settings", json={"public_receivers_enabled": bool(before)})
         admin.delete(f"/receiver-tags/{tag['id']}")
