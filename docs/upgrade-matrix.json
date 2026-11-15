@@ -389,6 +389,22 @@
         "0.34.1"
       ],
       "published": "2026-11-13"
+    },
+    "page-kept-data-after-session-end": {
+      "title": "The page kept a person's data after their session ended",
+      "description": "When a session ended (signing out, expiry, an administrator ending it, the server refusing it, or another tab signing out), the web app showed its sign-in screen but kept the page the person had used. What it had shown stayed in it, hidden, where the browser's developer tools show it to whoever uses the tab next: the lists of vaults, users, shares, notes, invitations and activity, and the person's profile, as far as the release has them and the person had opened them. From 0.14.0 the dashboard's lists of recent, waiting and favourite vaults also showed, for about 50 to 270 milliseconds, to the next person who signed in on that tab: vault names, and who shared a vault with the person; from 0.34.1 also the names of zero-knowledge vaults the person had unlocked. 0.33.8 and 0.34.3 remove the signed-in page when a session ends and load the page anew; the sign-in screen then says why the session ended.",
+      "impact": "Someone using the same browser tab after another person's session ended there, without a reload, can see names of vaults that person used or was given, and with the developer tools read the rest of what the page had shown them: for an administrator, the users list with its email addresses. Nothing is read from the server and nothing can be changed.",
+      "remediation": "Upgrade to 0.34.3, or to 0.33.8 on the 0.33 line, and reload browser tabs that were open before the upgrade.",
+      "mitigation": "Until you upgrade: on a computer someone else also uses, close the vault's tab when you are done, or reload it after signing out.",
+      "severity": "low",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.8",
+      "fixed_in_lines": [
+        "0.33.8",
+        "0.34.3"
+      ],
+      "published": "2026-11-16"
     }
   },
   "versions": {
@@ -465,6 +481,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -541,6 +560,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -617,6 +639,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -693,6 +718,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -769,6 +797,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -845,6 +876,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -921,6 +955,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -997,6 +1034,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1073,6 +1113,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1149,6 +1192,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1225,6 +1271,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1304,6 +1353,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1383,6 +1435,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1471,6 +1526,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1562,6 +1620,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1653,6 +1714,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1744,6 +1808,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1835,6 +1902,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -1926,6 +1996,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2017,6 +2090,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2108,6 +2184,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2199,6 +2278,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2290,6 +2372,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2381,6 +2466,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2472,6 +2560,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2563,6 +2654,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2654,6 +2748,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2745,6 +2842,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2836,6 +2936,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -2927,6 +3030,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3021,6 +3127,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3115,6 +3224,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3218,6 +3330,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3321,6 +3436,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3418,6 +3536,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3506,6 +3627,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3588,6 +3712,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3670,6 +3797,9 @@
         },
         {
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3682,124 +3812,79 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         },
         {
-          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
-          "title": "A file opened from its preview could run as a page with the vault's origin",
-          "fixed_in": "0.33.7"
+          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3812,124 +3897,79 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         },
         {
-          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
-          "title": "A file opened from its preview could run as a page with the vault's origin",
-          "fixed_in": "0.33.7"
+          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -3942,124 +3982,79 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "link-tokens-written-to-access-log",
-          "title": "Public link tokens were written to the access log",
-          "fixed_in": "0.32.3"
+          "advisory": "link-tokens-written-to-access-log"
         },
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         },
         {
-          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
-          "title": "A file opened from its preview could run as a page with the vault's origin",
-          "fixed_in": "0.33.7"
+          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -4185,6 +4180,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4310,6 +4310,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4420,6 +4425,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4505,6 +4515,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4550,6 +4565,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4580,6 +4600,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4600,6 +4625,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4620,6 +4650,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4640,6 +4675,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4660,6 +4700,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
@@ -4675,12 +4720,32 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.33.7"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
         }
       ]
     },
     "0.33.7": {
       "released": "2026-11-13",
       "notes": "Security release for the 0.33 line: it fixes one security issue in the web app, rated high. The advisory and its details are in this matrix. Upgrade, then reload browser tabs that were open before the upgrade. The image is also rebuilt with the Alpine packages current at this release, and without SQLite. zlib moves from 1.3.2-r1 to 1.4-r0. Image scanners report CVE-2026-4738 (critical) against Alpine's zlib before 1.4-r0; the flaw is in the infback9 code of zlib's contrib folder, which is not part of the zlib library the image ships (its libz has no inflateBack9), so the vault is not affected. The base image installs Alpine's sqlite-libs 3.53.4-r0 only for Python's sqlite3 module, and scanners report four High findings in it with no fixed package (CVE-2026-119373, CVE-2026-119374, CVE-2026-119379, CVE-2026-119586). They need a crafted SQLite database file, and the vault keeps its data in PostgreSQL and opens no SQLite database, so it is not affected either. The image now leaves SQLite out, as 0.34.0 does: `import sqlite3` fails in it. Nothing changes in the stored data. Scanners also report CVE-2026-119170 (high) against the image's Python 3.14.10: a flaw in hashlib that needs OpenSSL in FIPS mode, which the image's OpenSSL cannot be in, and a base image with the fixed Python is not published yet. The release attaches a VEX document with that one reviewed exception.",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.33.8"
+        }
+      ]
+    },
+    "0.33.8": {
+      "released": "2026-11-16",
+      "notes": "Security release for the 0.33 line: it fixes one security issue in the web app, rated low; the advisory is published with 0.34.3. When a session ends, the page now drops everything it showed and loads anew, and the sign-in screen says why the session ended. Upgrade, then reload browser tabs that were open before the upgrade. dnspython moves to 2.9.2 (CVE-2026-128089 in 2.9.1 reads DNS zone files, which the vault never does). The release attaches a VEX document for the scanners' CVE-2026-119170 in Python 3.14.10. No stored data changes, so going back to 0.33.7 needs no restore.",
       "support": {
         "eol": false,
         "secure": true
@@ -4698,6 +4763,11 @@
           "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
           "title": "A file opened from its preview could run as a page with the vault's origin",
           "fixed_in": "0.34.1"
+        },
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.34.3"
         }
       ]
     },
@@ -4706,12 +4776,34 @@
       "notes": "Not published. This release was tagged on 2026-11-13, but its build stopped at the dependency check, which that evening began to report CVE-2026-128089 in dnspython 2.9.1 (a flaw in reading DNS zone files, which the vault never does). No image and no GitHub release exist for it. 0.34.2 is this release with dnspython 2.9.2: use 0.34.2.",
       "support": {
         "eol": true,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.34.3"
+        }
+      ]
     },
     "0.34.2": {
       "released": "2026-11-14",
       "notes": "Security release, one advisory (stored-file-opened-from-a-preview-runs-as-a-page, high): this is the release that fixes it on the 0.34 line. 0.34.1 held the same changes and was tagged the day before, but it was not published: its build stopped at the dependency check, which had begun to report CVE-2026-128089 in dnspython 2.9.1 (a flaw in reading DNS zone files, which the vault never does). 0.34.2 differs from it only by dnspython 2.9.2. Upgrade, then reload browser tabs that were open before the upgrade; with SFTP in its own container, update it together with the web container. A file stored as a web page under a picture's or a video's name, or an SVG picture that carries script, could run with the vault's origin when another member opened its preview in a tab of its own. Previews, the compliance case viewer and the files the web app saves now reach the browser under a type it only shows or saves, and a public file link's download that a browser would run is answered as plain bytes. The advisory says what to check if someone may have opened such a file. The 0.33 line has the fix in 0.33.7. Also in this release: the administrators' items in the sidebar show only to an administrator, the web app no longer asks the administrators' routes from other people's pages (so the audit record holds fewer refused administrator actions), and an item that waits for an answer after sign-in opens instead of sending you to the dashboard; Settings saves only after the settings loaded; an unlocked zero-knowledge vault shows its name in its header and on the dashboard; a vault's Permissions tab lists an owner's or manager's own departments; creating a vault asks for the type first and keeps what was typed; the administrators' forms judge a password by the deployment's policy, as the server does; dialogs open at the top, and Escape or a click outside closes only the top one; selecting files no longer moves the rows; a preview is recorded as a preview (file_previewed, then file_preview_completed), not as a download, so a search or export of downloads no longer counts previews; and the help texts say what view-only shares, log components, allow-lists and alert delivery do today (a deployment made before this release keeps the old description of its Confidential (Read) share tag: edit it if you kept that tag). python dockvault.py update counts a line's support period by the day in UTC, as the app does. Image scanners report CVE-2026-119170 (high) against the image's Python 3.14.10; it needs OpenSSL in FIPS mode, which the image's OpenSSL cannot be in, and the release attaches a VEX document that says so. No stored data changes its shape, so going back to 0.34.0 needs no restore; 0.34.0 lists the preview rows as \"Other (legacy)\", and going back brings the security issue back. Upgrade from 0.34.0, or from 0.33.7 under the conditions of the step from 0.33.x into the 0.34 line (take a backup first).",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "page-kept-data-after-session-end",
+          "title": "The page kept a person's data after their session ended",
+          "fixed_in": "0.34.3"
+        }
+      ]
+    },
+    "0.34.3": {
+      "released": "2026-11-16",
+      "notes": "Security release, one advisory (page-kept-data-after-session-end, low); the 0.33 line has the fix in 0.33.8. When a session ends, the page now drops everything it showed and loads anew, and the sign-in screen says why the session ended. Upgrade, then reload browser tabs that were open before the upgrade. The release attaches a VEX document for the scanners' CVE-2026-119170 in Python 3.14.10. No stored data changes, so going back to 0.34.2 needs no restore. Upgrade from 0.34.2 or 0.34.0, or from 0.33.8 under the conditions of the step from 0.33.x into the 0.34 line (take a backup first).",
       "support": {
         "eol": false,
         "secure": true
@@ -5250,7 +5342,14 @@
     },
     {
       "from": "0.33.7",
-      "to": "0.34.2",
+      "to": "0.33.8",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.8",
+      "to": "0.34.3",
       "kind": "direct",
       "reversible": true,
       "requires_backup": true,
@@ -5350,6 +5449,13 @@
     {
       "from": "0.34.0",
       "to": "0.34.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.2",
+      "to": "0.34.3",
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
