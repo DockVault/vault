@@ -42,8 +42,9 @@ def _block(head: str) -> str:
 
 SHIPPED = "".join(_line(f"const {name} =") for name in (
     "SIGN_OUT_WAIT_MS", "SIGN_OUT_RETRY_FIRST_MS", "SIGN_OUT_RETRY_MOST_MS", "_preferenceSaves", "_signOutsOwed",
+    "_signOutsOver",
 )) + "".join(_fn(name) for name in (
-    "_endServerSession", "_sendSignOut", "_signOutAgain", "_retryAfterMs", "_tokenClaims",
+    "_endServerSession", "_sendSignOut", "_signOutAgain", "_retryAfterMs", "_tokenClaims", "_signOutOver",
 )) + _block("window.addEventListener('online',")
 
 HARNESS = """
@@ -183,3 +184,26 @@ await online();
 console.log(JSON.stringify(report()));
 """)
     assert out["sent"] == [0]
+
+
+def test_the_sign_out_is_over_only_once_the_server_has_answered_it_for_good():
+    """The page is replaced when the sign-out is over (static/js/app.js logout): not while it is still owed."""
+    out = _run(TOKEN + """
+answers = [{ status: 503, retryAfter: '20' }, { status: 200 }];
+let overAt = null;
+_endServerSession(token).then(() => { overAt = now - START; });
+await settle();
+const first = overAt;
+await advance(600000);
+const retried = overAt;
+// A call that is never answered keeps the sign-out owed: never over.
+answers = ['pending'];
+let neverAt = null;
+const other = tokenFor({ sub: 'v', session_token: 't', exp: Math.floor((now + 3600000) / 1000) });
+_endServerSession(other).then(() => { neverAt = now - START; });
+await advance(600000);
+console.log(JSON.stringify({ first, retried, never: neverAt, sent: report().sent }));
+""")
+    assert out["first"] is None
+    assert out["retried"] == 20000
+    assert out["never"] is None
