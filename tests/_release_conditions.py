@@ -13,7 +13,9 @@ The tests build the matrix the release commit makes (with_the_release) from the 
 (before_the_release), so they give the same answers before that commit and after it, when docs/upgrade-matrix.json
 declares 0.34.0 itself.
 """
+import calendar
 import copy
+import datetime
 
 # The edges every condition below goes on: each edge into INTO. None of them leaves from a release below
 # SOURCE_FLOOR, the only release of the line before that no advisory affects: such an edge would let an upgrade skip
@@ -366,6 +368,13 @@ def newest_below(matrix: dict) -> str:
     return max(before_the_release(matrix)["versions"], key=_version_key)
 
 
+def _six_months_after(day: str) -> str:
+    """The day six months after ``day``, or the last day of that month: the shortest support the line before keeps."""
+    d = datetime.date.fromisoformat(day)
+    year, month = (d.year + 1, d.month - 6) if d.month > 6 else (d.year, d.month + 6)
+    return d.replace(year=year, month=month, day=min(d.day, calendar.monthrange(year, month)[1])).isoformat()
+
+
 def with_the_release(matrix: dict) -> dict:
     """``matrix`` as the release commit makes it from this file: the releases below INTO, then INTO declared (its
     entry made from the newest release below it), its line listed, and one edge into it, from that release (SOURCE_FLOOR
@@ -374,11 +383,15 @@ def with_the_release(matrix: dict) -> dict:
     newest = newest_below(matrix)
     assert _version_key(newest) >= _version_key(SOURCE_FLOOR), "the newest release below 0.34.0 is older than 0.33.6"
     entry = copy.deepcopy(data["versions"][newest])
-    entry.update(released="2026-11-15", notes="The release.")
+    # Released no earlier than any release below it: a fix the line before shipped after 2026-11-15 then still
+    # comes before its line began, as the matrix check requires of a fix on one line only.
+    released = max(["2026-11-15"] + [e["released"] for e in data["versions"].values()])
+    entry.update(released=released, notes="The release.")
     entry["support"] = {"eol": False, "secure": True}
     entry.pop("vulnerabilities", None)
     data["versions"][INTO] = entry
-    data["lines"] = {"0.33": {"security_fixes_until": "2027-05-15"}, "0.34": {"security_fixes_until": None}}
+    data["lines"] = {"0.33": {"security_fixes_until": _six_months_after(released)},
+                     "0.34": {"security_fixes_until": None}}
     data["edges"].append({"from": newest, "to": INTO, "kind": "direct", "reversible": True,
                           "requires_backup": True, "conditions": [condition(cid) for cid in CONDITIONS]})
     return data
