@@ -8,6 +8,7 @@ import re
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import replaced
 from conftest import unique
 
 
@@ -33,10 +34,11 @@ def sign_in(page: Page, user):
 
 
 def sign_out(page: Page):
-    """Through the profile menu, as a person does."""
-    page.click("#profile-btn")
-    page.click("#dropdown-logout-btn")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    """Through the profile menu, as a person does; back once the page has been replaced by the sign-in screen of a
+    new one (static/js/app.js replaces the page after every end of a session)."""
+    with replaced(page):
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
 
 
 def open_activity(page: Page):

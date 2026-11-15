@@ -12,6 +12,8 @@ import uuid
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import replaced
+
 pytestmark = pytest.mark.ui
 
 
@@ -448,10 +450,13 @@ def test_vault_file_list_live_updates(logged_in: Page, admin):
 
 
 def test_logout_returns_to_login(logged_in: Page):
+    """The Sign out button signs out, and the page is replaced by a new one on the sign-in screen that says
+    nothing (a sign-out by hand gives no reason)."""
     page = logged_in
-    page.click("#profile-btn")
-    page.click("#dropdown-logout-btn")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    with replaced(page):
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
+    expect(page.locator("#login-error")).to_be_hidden()
 
 
 # --- June-16 appearance work: background palettes + centered empty states ----
@@ -1617,19 +1622,19 @@ def test_zero_knowledge_upload_store_cleared_on_logout(logged_in: Page):
     """logout() must wipe the ZK upload store so an interrupted upload's ciphertext can't
     sit at rest on a shared machine after the user leaves (parity with the key scrub)."""
     page = logged_in
-    gone = page.evaluate(
+    had = page.evaluate(
         """async () => {
             await zkUploadStore.put({ sessionId: 'logout-sid', vaultId: 'v', blob: new Blob(['z']),
                 totalChunks: 1, chunkSize: 64, createdAt: Date.now() });
-            const before = await zkUploadStore.get('logout-sid');
-            logout();                              // fires zkUploadStore.clear() (fail-soft)
-            await new Promise(r => setTimeout(r, 400));
-            const after = await zkUploadStore.get('logout-sid');
-            return { had: before != null, after };
+            return (await zkUploadStore.get('logout-sid')) != null;
         }"""
     )
-    assert gone["had"], "precondition: record was stored"
-    assert gone["after"] is None, "logout did not clear the ZK upload store"
+    assert had, "precondition: record was stored"
+    # logout() fires zkUploadStore.clear() (fail-soft); the store is read from the page that replaces this one.
+    with replaced(page):
+        page.evaluate("() => logout()")
+    after = page.evaluate("() => zkUploadStore.get('logout-sid')")
+    assert after is None, "logout did not clear the ZK upload store"
 
 
 def test_zk_upload_store_surfaces_quota_exceeded(logged_in: Page):

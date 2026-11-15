@@ -7,6 +7,7 @@ the browser so it cannot apply to the next person who signs in here."""
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import sign_out
 from conftest import ApiClient, unique
 
 pytestmark = pytest.mark.ui
@@ -38,8 +39,7 @@ def _open_notes(page: Page):
 
 
 def _sign_out(page: Page):
-    page.evaluate("logout()")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    sign_out(page)                                # back once the page has been replaced
 
 
 def _account_choice(page: Page, person, want):

@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import replaced
 from conftest import unique
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -128,9 +129,8 @@ def _the_app_answers_clicks(page: Page, viewport: str):
     page.locator("#profile-btn").click()
     expect(page.locator(".profile-menu")).to_have_class(re.compile(r"\bactive\b"), timeout=5000)
     expect(page.locator("#profile-dropdown")).to_be_visible()
-    page.locator("#dropdown-logout-btn").click()
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
-    expect(page.locator("#dashboard-screen")).to_be_hidden()
+    with replaced(page):                          # back once a new page, signed out, has replaced this one
+        page.locator("#dropdown-logout-btn").click()
 
 
 @pytest.mark.ui
