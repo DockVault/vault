@@ -19,7 +19,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _sign_out_helpers import expired_copy, session_row, shipped_auth_limit
-from _ui_hand_over import sign_in_on_the_tab
+from _ui_hand_over import mark_old, sign_in_on_the_tab, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -64,8 +64,9 @@ def _auth_requests(page: Page):
 
 
 def _all_signed_out(tabs):
+    """Every tab, marked by ``mark_old`` before the sign-out, has been replaced by a new page, signed out."""
     for t in tabs:
-        expect(t.locator("#login-screen")).to_be_visible(timeout=15000)
+        wait_replaced(t)
     assert [t.evaluate("() => authToken") for t in tabs] == [None] * TABS
 
 
@@ -93,6 +94,8 @@ def test_the_sign_out_button_with_many_tabs_open_leaves_the_sign_in_that_follows
     tabs, token = _tabs_of_one_session(page, ana)
     with shipped_auth_limit(admin) as limit:
         seen = _auth_requests(page)
+        for t in tabs:
+            mark_old(t)
         page.click("#profile-btn")
         page.click("#dropdown-logout-btn")
         _all_signed_out(tabs)
@@ -115,6 +118,7 @@ def test_a_session_that_runs_out_in_many_tabs_leaves_the_sign_in_that_follows_it
         seen = _auth_requests(page)
         for t in tabs:                            # the session's token runs out in every tab
             t.evaluate("(x) => { authToken = x; }", expired)
+            mark_old(t)
         # The first tab's next request is refused: it signs out, and tells the others.
         page.evaluate("() => { apiRequest('/users/me').catch(() => {}); }")
         _all_signed_out(tabs)
