@@ -7,6 +7,7 @@ _replacePageAfterSignOut) once the sign-out is over: the sign-in screen the next
 page's, which holds nothing of the old one (its variables, its listeners, what a test put on its window). A test
 that reads the page after a sign-out reads it after the replacement (``replaced`` / ``wait_replaced``), and what
 must survive it is put in with ``page.add_init_script`` or kept in the tab's sessionStorage."""
+import re
 from contextlib import contextmanager
 
 from playwright.sync_api import Page, expect
@@ -22,11 +23,45 @@ def mark_old(page: Page):
     page.evaluate(MARK_OLD)
 
 
+def wait_new_page(page: Page, timeout=15000):
+    """Wait until a page marked by ``mark_old`` has been replaced by a new one that has loaded (on whichever screen
+    its start chose: the sign-in screen, or the app when the browser holds a session stored since)."""
+    page.wait_for_function(NEW_AND_LOADED, timeout=timeout)
+
+
 def wait_replaced(page: Page, timeout=15000):
     """Wait until a page marked by ``mark_old`` has been replaced by a new one, loaded, on the sign-in screen."""
-    page.wait_for_function(NEW_AND_LOADED, timeout=timeout)
+    wait_new_page(page, timeout)
     expect(page.locator("#login-screen")).to_be_visible(timeout=timeout)
     expect(page.locator("#dashboard-screen")).to_be_hidden()
+
+
+def still_old(page: Page) -> bool:
+    """Whether the page marked by ``mark_old`` is still the one in the tab (it was not replaced)."""
+    return page.evaluate("() => window.__oldPage === true")
+
+
+def expect_reason(page: Page, reason):
+    """The sign-in screen of the new page says why the session ended (``reason``), or says nothing (``None``); either
+    way the reason kept for it in the tab's sessionStorage is gone, so it is shown once."""
+    note = page.locator("#login-error")
+    if reason:
+        expect(note).to_be_visible()
+        expect(note).to_have_text(reason)
+        expect(note).to_have_class(re.compile(r"\balert-warning\b"))
+        expect(note).to_have_attribute("role", "alert")
+    else:
+        expect(note).to_be_hidden()
+    assert page.evaluate("() => sessionStorage.getItem('dv_signed_out_reason')") is None
+
+
+def expect_reason_once(page: Page, reason):
+    """``expect_reason``, and a reload of the page then shows it no more."""
+    expect_reason(page, reason)
+    page.reload()
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    page.wait_for_function("() => document.readyState === 'complete' && typeof logout === 'function'")
+    expect(page.locator("#login-error")).to_be_hidden()
 
 
 @contextmanager
