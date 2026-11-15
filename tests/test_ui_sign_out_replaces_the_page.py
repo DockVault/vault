@@ -14,6 +14,7 @@ load did not bring opens nothing for the next person, while a copied link still 
 """
 import json
 import time
+from urllib.parse import urlsplit
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -1147,3 +1148,347 @@ def test_a_search_brought_back_by_history_within_the_signed_out_page_is_dropped_
         assert _seen(page, [ghost]) == set(), "the search was opened for the next person"
     finally:
         admin.delete_user(boss["id"])
+
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The page's own history entries, a copied link across a reload, the back-and-forward cache, and a session's late
+# answers.
+
+def _where_the_search_is(page: Page, term: str) -> list:
+    """Where a person would see the search for ``term``: the address, the Activity filters' chips, any field."""
+    return page.evaluate("""(t) => {
+        const out = [];
+        if (location.href.includes(t)) out.push('address');
+        const chips = document.getElementById('act-chips');
+        if (chips && (chips.textContent || '').includes(t)) out.push('chips');
+        for (const el of document.querySelectorAll('input, textarea, select'))
+            if ((el.value || '').includes(t)) out.push('field ' + (el.id || el.name || el.tagName));
+        return out;
+    }""", term)
+
+
+def _open_activity(page: Page):
+    toggle = page.locator("#mobile-nav-toggle")
+    if toggle.is_visible():
+        toggle.click()
+    page.click('.sidebar-item[data-section="activity"]')
+    expect(page.locator("#act-pager")).to_be_visible(timeout=15000)
+    page.wait_for_timeout(1500)
+
+
+def _hold_get(page: Page, pattern: str) -> list:
+    """Hold every GET to ``pattern`` (anything else goes through); the held routes are returned."""
+    held = []
+
+    def hold(route):
+        if route.request.method == "GET":
+            held.append(route)
+        else:
+            route.continue_()
+    page.route(pattern, hold)
+    return held
+
+
+def _wait_held(page: Page, held: list, what: str):
+    for _ in range(150):
+        if held:
+            return
+        page.wait_for_timeout(100)
+    raise AssertionError(f"{what} was not asked for")
+
+
+def test_back_and_forward_after_the_next_administrator_signed_in_bring_back_no_earlier_search(
+        page: Page, admin, anon):
+    """On a phone, an administrator searched the Activity page for a person, opened an event and signed out. The
+    next administrator signs in on the new page and then presses Back and Forward: at every step the address holds
+    none of the earlier search, the Activity page shows none of it, and neither does a reload."""
+    boss = admin.create_user(role="admin")
+    other = admin.create_user(role="admin")
+    ghost = unique("nextghost")
+    anon.post("/auth/login", json={"username": ghost, "password": "not-it-1"})
+    try:
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto("/")
+        _sign_in(page, boss)
+        _activity_with_a_search(page, ghost)
+        page.locator("#activity-cards .act-card").first.click()
+        expect(page.locator("#activity-event-modal")).to_be_visible(timeout=10000)
+        assert ghost in page.url, "the control: her search is not in the address"
+        page.evaluate("() => { window.__oldPage = true; }")
+        page.evaluate("() => logout()")
+        assert _ended(page, 20), "the page was not replaced"
+        _sign_in(page, other)
+        page.wait_for_timeout(1500)
+        # Chromium steps within the new page here, to the entries the page that ended the session left.
+        for step in (page.go_back, page.go_forward, page.go_back):
+            step()
+            page.wait_for_timeout(2000)
+            expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+            assert page.evaluate("() => location.hash") == "", page.url
+            assert ghost not in page.url, page.url
+        _open_activity(page)
+        assert _where_the_search_is(page, ghost) == [], "the earlier search is on the Activity page"
+        page.reload()
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        page.wait_for_timeout(2500)
+        assert _where_the_search_is(page, ghost) == [], "a reload opened the earlier search"
+    finally:
+        admin.delete_user(boss["id"])
+        admin.delete_user(other["id"])
+
+
+def test_a_search_on_an_entry_this_page_did_not_write_leaves_the_address_while_signed_in(page: Page, admin, anon):
+    """Signed in, Back and Forward reach an entry with an Activity search that this page never wrote (one an earlier
+    page left): the search leaves the address at once, and opening the Activity page shows none of it. The page's
+    own entries keep theirs: a search of her own, and the event she opened and closed with Back."""
+    boss = admin.create_user(role="admin")
+    ghost = unique("entryghost")
+    mine = unique("ownsearch")
+    anon.post("/auth/login", json={"username": mine, "password": "not-it-1"})
+    try:
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto("/")
+        _sign_in(page, boss)
+        page.evaluate("""(term) => new Promise((done) => {
+            history.pushState(null, '', '/#activity?range=24h&user=' + term);
+            history.back();
+            setTimeout(() => { history.forward(); setTimeout(done, 600); }, 600);
+        })""", ghost)
+        assert page.evaluate("() => location.hash") == "", "the search stayed in the address"
+        _open_activity(page)
+        assert _where_the_search_is(page, ghost) == [], "the search was opened"
+        # The page's own entries: her search, and an event's view pushed over it, closed by Back.
+        _activity_with_a_search(page, mine)
+        page.locator("#activity-cards .act-card").first.click()
+        expect(page.locator("#activity-event-modal")).to_be_visible(timeout=10000)
+        assert page.evaluate("() => !!(history.state && history.state.activityDetail)"), "no entry for the event"
+        page.evaluate("() => new Promise((done) => { history.back(); setTimeout(done, 800); })")
+        expect(page.locator("#activity-event-modal")).to_be_hidden(timeout=5000)
+        assert mine in page.evaluate("() => location.hash"), page.url
+        page.evaluate("() => new Promise((done) => { history.forward(); setTimeout(done, 800); })")
+        assert mine in page.evaluate("() => location.hash"), page.url
+        page.evaluate("() => new Promise((done) => { history.back(); setTimeout(done, 800); })")
+        assert mine in page.evaluate("() => location.hash"), page.url
+        expect(page.locator("#act-chips")).to_contain_text(mine)
+    finally:
+        admin.delete_user(boss["id"])
+
+
+def test_a_copied_link_opens_after_a_sign_in_that_reloads_for_the_accounts_saved_look(page: Page, admin, anon):
+    """The administrator's account keeps another look (the Classic skin) than this browser shows: the sign-in loads
+    the page again to apply it, and the copied link to an Activity search opened before signing in still opens."""
+    boss = admin.create_user(role="admin")
+    client = ApiClient(BASE_URL)
+    client.login(boss["_username"], boss["_password"])
+    client.put("/users/me/preferences", json={"ui": "v1"}).raise_for_status()
+    someone = unique("skinlink")
+    anon.post("/auth/login", json={"username": someone, "password": "not-it-1"})
+    try:
+        loads = []
+        page.on("load", lambda _p: loads.append(time.time()))
+        page.goto(f"/#activity?range=24h&user={someone}")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        assert page.evaluate("() => localStorage.getItem('ui')") != "v1", "the control: the browser has the skin"
+        page.fill("#username", boss["_username"])
+        page.fill("#password", boss["_password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#activity-section")).to_be_visible(timeout=20000)
+        expect(page.locator("#act-chips")).to_contain_text(someone, timeout=15000)
+        assert page.evaluate("() => localStorage.getItem('ui')") == "v1"
+        assert len(loads) >= 2, "the control: the sign-in did not load the page again"
+    finally:
+        admin.delete_user(boss["id"])
+
+
+@pytest.mark.parametrize("kind", ["reset", "invitation"])
+def test_a_reset_or_invitation_page_brought_back_from_the_cache_is_loaded_again_without_its_form(
+        page: Page, admin, kind):
+    """A password-reset or invitation page shown again from the browser's back-and-forward cache, with no session:
+    it is loaded again as the sign-in screen, and neither the form nor its link's token is in the page."""
+    before = admin.get("/settings").json()
+    keys = ("invite_enabled", "email_requirement", "signup_email_domain_mode")
+    user = None
+    try:
+        if kind == "reset":
+            user = admin.create_user(role="user", email=None)
+            r = admin.post(f"/users/{user['id']}/reset-link")
+            assert r.status_code == 200, r.text
+            token = r.json()["reset_link"].split("?reset=", 1)[1]
+            page.goto(f"/?reset={token}")
+            screen, body = "#reset-screen", "#reset-card-body"
+        else:
+            admin.put("/settings", json={"invite_enabled": True, "email_requirement": "optional",
+                                         "signup_email_domain_mode": "off"})
+            r = admin.post("/invites", json={"username": unique("cacheinv").replace("_", ""), "role": "user"})
+            assert r.status_code == 200, r.text
+            token = r.json()["token"]
+            page.goto(f"/?invite={token}")
+            screen, body = "#invite-screen", "#invite-card-body"
+        expect(page.locator(screen)).to_be_visible(timeout=10000)
+        expect(page.locator(f"{body} input[type=password]")).to_be_visible(timeout=10000)
+        page.evaluate("() => { window.__oldPage = true; }")
+        page.evaluate("""() => { setTimeout(() => window.dispatchEvent(
+            new PageTransitionEvent('pageshow', { persisted: true })), 0); }""")
+        page.wait_for_function("() => !window.__oldPage && document.readyState === 'complete'", timeout=15000)
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        expect(page.locator(screen)).to_be_hidden()
+        expect(page.locator(f"{body} input[type=password]")).to_have_count(0)
+        assert token not in page.url, page.url
+        assert _seen(page, [token]) == set(), "the link's token is in the page"
+    finally:
+        if user:
+            admin.delete_user(user["id"])
+        if kind == "invitation":
+            admin.put("/settings", json={k: before.get(k) for k in keys if k in before})
+
+
+def test_a_session_stored_without_its_account_opens_the_app(page: Page, ana):
+    """The browser holds a session's token but not the account stored beside it (as a two-factor sign-in on an ended
+    page can leave it): the page asks for the account itself and opens the app."""
+    client = ApiClient(BASE_URL)
+    client.login(ana["_username"], ana["_password"])
+    page.goto("/")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    page.evaluate("(t) => { localStorage.setItem('authToken', t); localStorage.removeItem('currentUser'); }",
+                  client.token)
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => currentUser && currentUser.username") == ana["_username"]
+    stored = page.evaluate("() => JSON.parse(localStorage.getItem('currentUser') || 'null')")
+    assert stored and stored.get("username") == ana["_username"], stored
+
+
+def test_a_two_factor_sign_in_on_a_page_that_ended_a_session_stores_the_account_before_the_page_goes(
+        page: Page, admin):
+    """On a page that ended a session, the two-factor sign-in stores the account beside its token before it hands
+    over to a new page: kept on the old page (the new page's load is answered with nothing), the browser holds both."""
+    ana = admin.create_user(role="user")
+    client = admin.clone_anonymous()
+    client.login(ana["_username"], ana["_password"])
+    secret, _codes = enroll_totp(ana, client)
+    try:
+        _end_a_session_before_the_app_is_shown(page, ana)
+        assert page.evaluate("() => localStorage.getItem('currentUser')") is None
+        page.evaluate("() => { window.__oldPage = true; }")
+        asked = []
+
+        def no_new_page(route):
+            if route.request.resource_type == "document":
+                asked.append(route.request.url)
+                route.fulfill(status=204)
+            else:
+                route.continue_()
+
+        def the_page(url):
+            return urlsplit(url).path == "/" and not urlsplit(url).query
+        page.route(the_page, no_new_page)
+        page.fill("#username", ana["_username"])
+        page.fill("#password", ana["_password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#sf-code-input")).to_be_visible(timeout=10000)
+        page.fill("#sf-code-input", totp(secret, 1))
+        page.click("#login-second-factor button")
+        for _ in range(150):
+            if asked:
+                break
+            page.wait_for_timeout(100)
+        assert asked, "the sign-in did not hand over to a new page"
+        page.wait_for_timeout(500)
+        assert page.evaluate("() => window.__oldPage === true"), "the old page went: nothing to read"
+        assert page.evaluate("() => !!localStorage.getItem('authToken')")
+        stored = page.evaluate("() => JSON.parse(localStorage.getItem('currentUser') || 'null')")
+        assert stored and stored.get("username") == ana["_username"], stored
+        page.unroute(the_page)
+    finally:
+        admin.delete_user(ana["id"])
+
+
+def test_permissions_answered_after_the_session_ended_on_a_starting_page_are_not_kept(page: Page, ana):
+    """A page opening her stored session waits for her permissions when the session ends: the answer, let through
+    after that, is not kept in the browser."""
+    page.goto("/")
+    _sign_in(page, ana)
+    assert page.evaluate("() => localStorage.getItem('userPermissions')") is not None, \
+        "the control: her permissions are not kept after a sign-in"
+    held = _hold(page, "**/permissions/users/**")
+    page.reload()
+    _wait_held(page, held, "her permissions")
+    held_out = _hold(page, "**/auth/sign-out")             # her session stays valid on the server meanwhile
+    page.evaluate("() => { window.__oldPage = true; }")
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => localStorage.getItem('userPermissions')") is None
+    answered = []
+    page.on("response", lambda r: answered.append(r.status) if "/permissions/users/" in r.url else None)
+    page.unroute("**/permissions/users/**")
+    _release(held)
+    page.wait_for_timeout(2500)
+    assert answered == [200], f"the control: the permissions were answered {answered}"
+    assert page.evaluate("() => window.__oldPage === true"), "the page went: the answer reached nothing to test"
+    kept = page.evaluate("() => localStorage.getItem('userPermissions') || sessionStorage.getItem('userPermissions')")
+    assert kept is None, f"her permissions were kept: {kept}"
+    expect(page.locator("#dashboard-screen")).to_be_hidden()
+    page.unroute("**/auth/sign-out")
+    _release(held_out)
+
+
+LOOK = """() => [localStorage.getItem('theme'), localStorage.getItem('accent'),
+                 document.documentElement.getAttribute('data-theme'),
+                 document.documentElement.getAttribute('data-accent')]"""
+
+
+def test_preferences_answered_after_the_session_ended_on_a_starting_page_are_not_applied(page: Page, ana):
+    """A page opening her stored session waits for her saved look when the session ends: the answer, let through
+    after that, is neither kept nor applied."""
+    page.goto("/")
+    _sign_in(page, ana)
+    before = page.evaluate(LOOK)
+    assert "dark" not in before and "rose" not in before, f"the control: the browser has her look already {before}"
+    client = ApiClient(BASE_URL)
+    client.login(ana["_username"], ana["_password"])
+    client.put("/users/me/preferences", json={"theme": "dark", "accent": "rose"}).raise_for_status()
+    held = _hold_get(page, "**/users/me/preferences")
+    page.reload()
+    _wait_held(page, held, "her saved look")
+    held_out = _hold(page, "**/auth/sign-out")             # her session stays valid on the server meanwhile
+    page.evaluate("() => { window.__oldPage = true; }")
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    after_sign_out = page.evaluate(LOOK)
+    answered = []
+    page.on("response", lambda r: answered.append(r.status)
+            if r.url.endswith("/users/me/preferences") and r.request.method == "GET" else None)
+    page.unroute("**/users/me/preferences")
+    _release(held)
+    page.wait_for_timeout(2500)
+    assert answered == [200], f"the control: her look was answered {answered}"
+    assert page.evaluate("() => window.__oldPage === true"), "the page went: the answer reached nothing to test"
+    assert page.evaluate("() => state.userPreferences") is None, "her saved look was kept"
+    assert page.evaluate(LOOK) == after_sign_out, "her saved look was applied"
+    page.unroute("**/auth/sign-out")
+    _release(held_out)
+
+
+def test_a_copied_link_opens_after_a_two_factor_sign_in(page: Page, admin, anon):
+    """A link to an Activity search opened signed out, by an administrator who signs in with a password and a code
+    from an authenticator app: the Activity page opens on that search."""
+    ta, _client, secret, _codes = enrolled_admin(admin)
+    someone = unique("twofactorlink")
+    anon.post("/auth/login", json={"username": someone, "password": "not-it-1"})
+    try:
+        page.goto(f"/#activity?range=24h&user={someone}")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.wait_for_timeout(500)
+        assert page.evaluate("() => location.hash") == "", page.url
+        page.fill("#username", ta["_username"])
+        page.fill("#password", ta["_password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#sf-code-input")).to_be_visible(timeout=10000)
+        page.fill("#sf-code-input", totp(secret, 1))
+        page.click("#login-second-factor button")
+        expect(page.locator("#activity-section")).to_be_visible(timeout=15000)
+        expect(page.locator("#act-chips")).to_contain_text(someone, timeout=15000)
+        assert page.evaluate("() => location.hash").startswith("#activity")
+    finally:
+        admin.delete_user(ta["id"])
