@@ -1,30 +1,43 @@
 """What a sign-out hands to the next person on the tab, in a real browser (static/js/app.js logout).
 
 A shared tab is handed over at a sign-out: the next person who signs in on it must find nothing of the person
-who left that still acts, and nothing that takes what they type.
+who left that still acts, and nothing that takes what they type. Once the sign-out is over, the page that showed
+the app is replaced by a new one (app.js _replacePageAfterSignOut), and the next person types into that one;
+until then, the page signed out and emptied stays, and a sign-in on it replaces it there and then.
 
 - A question left open in the shared confirm dialog (showPrompt, showConfirm) is answered as cancelled at the
-  sign-out. Closing the dialog alone left its handlers on the dialog's buttons and field, so the next person's
-  first answer there went to the question of the person who left as well, and their own question got nothing.
+  sign-out, and the next person's own question in that dialog, on the new page, gets their answer alone.
   A question opened while another is still open answers that one as cancelled the same way.
-- An answer that comes after the sign-out to a request of the session that ended, refused because that session
-  is over, signs nobody out: neither the form the next person is filling in is emptied, nor are they signed out
-  once they are in. Only a refusal of the session the tab holds now ends it.
+- An answer that comes after the sign-out to a request of the session that ended signs nobody out. With the
+  sign-out answered, the request belonged to the page that was replaced: its answer reaches nothing, and the next
+  person's form and sign-in are untouched. With the sign-out not answered yet, the page stays while the next person
+  types: a refusal of the session that ended, or one of a request sent with no session at all, empties nothing of
+  the form; their sign-in then replaces the page, and a refusal arriving after that signs them out no more. Only
+  a refusal of the session the tab holds now ends it.
 - After a two-factor sign-in the sign-out leaves the form to sign in with: the second step hid it, and nothing but
   the screen's own "Back to sign in" showed it again.
 
 tests/test_ui_compliance_sign_out.py holds the same hand-over for a vault's password asked on Access to my
-vaults. Waits are on state, never on time (the timing rules of the browser tests).
+vaults. Waits are on state, never on time (the timing rules of the browser tests), but for the moments in which
+something must not happen.
 """
 import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import signed_in
 from _sf_helpers import enroll_totp
-from _ui_hand_over import new_folder_through_the_page, sign_in_on_the_tab, sign_out
+from _sign_out_helpers import session_row
+from _ui_hand_over import (expect_reason, mark_old, new_folder_through_the_page, replaced, sign_in_on_the_tab,
+                           sign_out, still_old, wait_new_page)
 from conftest import unique
 
 pytestmark = pytest.mark.ui
+
+SESSION_ENDED = "Your session has ended. Sign in again."
+
+
+def _is_sign_out(request):
+    return request.method == "POST" and request.url.endswith("/auth/sign-out")
 
 
 @pytest.fixture
@@ -40,13 +53,20 @@ def two(admin):
     admin.delete_user(ben["id"])
 
 
-# The question ana leaves open, and what a cancel answers it with.
+# The question ana leaves open, and what a cancel answers it with. Each answer is noted in the tab's sessionStorage
+# too, which outlives the page the sign-out replaces.
+_NOTE = ("(v) => { window.__asked.push(v);"
+         " sessionStorage.setItem('probe_asked', JSON.stringify(window.__asked)); }")
 _ASK = {
     "prompt": ("() => { window.__asked = []; showPrompt('A question of the person who leaves.', 'Asked before',"
-               " { password: true }).then((v) => window.__asked.push(v)); }", None),
+               " { password: true }).then(" + _NOTE + "); }", None),
     "confirm": ("() => { window.__asked = []; showConfirm('A question of the person who leaves.', 'Asked before')"
-                ".then((v) => window.__asked.push(v)); }", False),
+                ".then(" + _NOTE + "); }", False),
 }
+
+
+def _asked(page: Page):
+    return page.evaluate("() => JSON.parse(sessionStorage.getItem('probe_asked') || 'null')")
 
 
 @pytest.mark.parametrize("kind", ["prompt", "confirm"])
@@ -65,9 +85,9 @@ def test_a_question_left_open_at_a_sign_out_is_cancelled_and_takes_nothing_of_th
     if kind == "prompt":
         prompt.locator("#confirm-modal-input").fill("typed by the person who leaves")
     sign_out(page)
-    # Answered as cancelled at the sign-out, the dialog closed and its field empty.
-    page.wait_for_function("() => window.__asked.length === 1", timeout=5000)
-    assert page.evaluate("() => window.__asked") == [cancelled]
+    # Answered as cancelled at the sign-out (noted before the page was replaced); the new page has the dialog
+    # closed and its field empty.
+    assert _asked(page) == [cancelled]
     expect(page.locator("#confirm-modal.active")).to_have_count(0)
     assert page.evaluate("() => document.getElementById('confirm-modal-input').value") == ""
 
@@ -77,7 +97,7 @@ def test_a_question_left_open_at_a_sign_out_is_cancelled_and_takes_nothing_of_th
     new_folder_through_the_page(page, ben_c, vault, name)
     # ana's question took nothing of his: it was answered once, at the sign-out, and only his own request carried
     # the name he typed.
-    assert page.evaluate("() => window.__asked") == [cancelled]
+    assert _asked(page) == [cancelled]
     carrying = [(m, u) for m, u, body in sent if name in body]
     assert len(carrying) == 1 and carrying[0][0] == "POST" and carrying[0][1].endswith(f"/vaults/{vault}/folders"), \
         carrying
@@ -133,8 +153,42 @@ def _settled(page: Page, i):
     return page.evaluate("(i) => window.__probes[i]", i)
 
 
-def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out(page: Page, two):
+def _round_trip(page: Page):
+    """A request of the page's own, sent and answered, then a few turns of its event loop: whatever the page does
+    with an answer that came before is done."""
+    page.evaluate("() => fetch('/health').then((r) => r.text())")
+    page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
+
+
+def _types(page: Page, account):
+    page.fill("#username", account["_username"])
+    page.fill("#password", account["_password"])
+
+
+def _form_kept(page: Page, account):
+    assert page.input_value("#username") == account["_username"]
+    assert page.input_value("#password") == account["_password"]
+    expect(page.locator("#login-error")).to_be_hidden()
+
+
+def _a_refusal_of_the_session_held_now_ends_it(page: Page):
+    """The control: a refusal of the session the tab holds now still ends it, and replaces the page."""
+    page.unroute("**/hand-over-probe")
+    page.route("**/hand-over-probe", lambda route: route.fulfill(
+        status=401, content_type="application/json", body='{"detail": "Could not validate credentials"}'))
+    with replaced(page):
+        page.evaluate(_ASK_SERVER, 2)
+    assert page.evaluate("() => authToken") is None
+    expect_reason(page, SESSION_ENDED)
+
+
+def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out_once_the_page_is_replaced(page: Page, two):
+    """The sign-out is answered, so the page is replaced: the requests of the session that ended belonged to the
+    page that is gone, and their refusals, let go while the next person types and after they are in, reach
+    nothing."""
     ana, ben, _ben_c, _vault = two
+    sign_outs = []
+    page.context.on("request", lambda r: _is_sign_out(r) and sign_outs.append(r))
     held = _Held(page, "**/hand-over-probe")
     sign_in_on_the_tab(page, ana)
     sent_for = page.evaluate("() => authToken")
@@ -143,35 +197,90 @@ def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out(page: Page, t
     held.wait(2)
     assert all(r.request.headers.get("authorization") == f"Bearer {sent_for}" for r in held.routes)
     sign_out(page)
+    assert page.evaluate("() => window.__probes === undefined"), "the new page holds a request of the old one"
 
-    # ben fills in the form. A refusal of ana's session arrives, and so does one of a request sent with no
-    # session at all (the server's own answer): the form keeps what he typed.
-    page.fill("#username", ben["_username"])
-    page.fill("#password", ben["_password"])
+    # ben fills in the form, and a refusal of ana's session is let go: it reaches nothing of his form.
+    _types(page, ben)
+    held.refuse_next()
+    _round_trip(page)
+    _form_kept(page, ben)
+    assert page.evaluate("() => window.__probes === undefined")
+    mark_old(page)
+    page.click("#login-form button[type=submit]")
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert still_old(page), "the new page was replaced again at the sign-in"
+    signed_in_as = page.evaluate("() => authToken")
+    assert signed_in_as and signed_in_as != sent_for
+
+    # ben is signed in when the other refusal of ana's session is let go: he stays signed in, on the same page.
+    held.refuse_next()
+    _round_trip(page)
+    expect(page.locator("#dashboard-screen")).to_be_visible()
+    assert still_old(page)
+    assert page.evaluate("() => authToken") == signed_in_as
+    assert len(sign_outs) == 1, f"{len(sign_outs)} sign-outs sent"
+    _a_refusal_of_the_session_held_now_ends_it(page)
+
+
+def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out_while_the_sign_out_is_on_its_way(
+        page: Page, two):
+    """The sign-out is not answered yet, so the page signed out stays while the next person types: a refusal of
+    the session that ended, and one of a request sent with no session at all, leave their form as it is. Their
+    sign-in replaces the page there and then, and the new page opens their session; the other refusal of the
+    session that ended, let go after that, reaches nothing."""
+    ana, ben, _ben_c, _vault = two
+    sign_outs = []
+    page.route("**/auth/sign-out", lambda route: sign_outs.append(route))
+    held = _Held(page, "**/hand-over-probe")
+    sign_in_on_the_tab(page, ana)
+    sent_for = page.evaluate("() => authToken")
+    page.evaluate(_ASK_SERVER, 0)
+    page.evaluate(_ASK_SERVER, 1)
+    held.wait(2)
+    assert all(r.request.headers.get("authorization") == f"Bearer {sent_for}" for r in held.routes)
+    mark_old(page)
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    for _ in range(200):
+        if sign_outs:
+            break
+        page.wait_for_timeout(50)
+    assert len(sign_outs) == 1 and sign_outs[0].request.headers.get("authorization") == f"Bearer {sent_for}"
+    assert still_old(page), "the page was replaced before its sign-out was answered"
+
+    # ben fills in the form on the page that stays. A refusal of ana's session arrives, and so does one of a
+    # request sent with no session at all (the server's own answer): the form keeps what he typed.
+    _types(page, ben)
     held.refuse_next()
     assert _settled(page, 0) == "Session expired. Please log in again."
     unrouted = page.evaluate("() => apiRequest('/vaults').then(() => 'answered', (e) => e.message)")
     assert unrouted != "answered", unrouted
-    assert page.input_value("#username") == ben["_username"]
-    assert page.input_value("#password") == ben["_password"]
-    expect(page.locator("#toast-container .toast", has_text="Session expired")).to_have_count(0)
+    _form_kept(page, ben)
+    assert still_old(page)
+
+    # His sign-in replaces the page there and then: the new page opens his session, holding nothing of the old one.
     page.click("#login-form button[type=submit]")
+    wait_new_page(page)
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    signed_in_as = page.evaluate("() => authToken")
+    assert signed_in_as and signed_in_as != sent_for
+    assert page.evaluate("() => window.__probes === undefined"), "the new page holds a request of the old one"
 
-    # ben is signed in when the other refusal of ana's session arrives: he stays signed in.
+    # The other refusal of ana's session, and ana's sign-out answered at last: ben stays signed in, on that page.
+    mark_old(page)
     held.refuse_next()
-    assert _settled(page, 1) == "Session expired. Please log in again."
+    page.unroute("**/auth/sign-out")
+    sign_outs.pop().continue_()
+    for _ in range(200):
+        if session_row(sent_for) == "f|t":
+            break
+        page.wait_for_timeout(50)
+    assert session_row(sent_for) == "f|t", "ana's session was not ended once her sign-out went through"
+    _round_trip(page)
     expect(page.locator("#dashboard-screen")).to_be_visible()
-    assert page.evaluate("(old) => !!authToken && authToken !== old", sent_for)
-
-    # A refusal of the session the tab holds now still ends it.
-    page.unroute("**/hand-over-probe")
-    page.route("**/hand-over-probe", lambda route: route.fulfill(
-        status=401, content_type="application/json", body='{"detail": "Could not validate credentials"}'))
-    page.evaluate(_ASK_SERVER, 2)
-    assert _settled(page, 2) == "Session expired. Please log in again."
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
-    assert page.evaluate("() => authToken") is None
+    assert still_old(page), "the page was replaced after the next person's sign-in"
+    assert page.evaluate("() => authToken") == signed_in_as
+    _a_refusal_of_the_session_held_now_ends_it(page)
 
 
 def test_after_a_two_factor_sign_in_the_sign_out_leaves_a_form_to_sign_in_with(page: Page, admin):
