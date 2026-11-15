@@ -772,8 +772,7 @@ async function apiRequest(endpoint, options = {}) {
             } else {
                 // Session expired - log out user
                 console.error('Session expired, logging out');
-                if (!silent) showError('Session expired. Please log in again.');
-                logout();
+                logout(undefined, 'Your session has ended. Sign in again.');
                 throw new Error('Session expired. Please log in again.');
             }
         }
@@ -806,8 +805,7 @@ async function apiRequest(endpoint, options = {}) {
             if (errorDetail.includes('inactive') || errorDetail.includes('terminated') || errorDetail.includes('locked')) {
                 // Account issue - log out user
                 console.error('Account issue, logging out');
-                if (!silent) showError(errorDetail);
-                logout();
+                logout(undefined, errorDetail);
                 throw new Error(errorDetail);
             } else {
                 // Permission denied - show specific message but don't log out
@@ -904,6 +902,7 @@ function showPermissionDenied(message) {
 
 // Show/Hide Screens
 function showScreen(screenId) {
+    if (screenId === 'dashboard-screen') _appShown = true;
     document.querySelectorAll('.screen').forEach(screen => {
         screen.classList.remove('active');
     });
@@ -1880,8 +1879,55 @@ function _buildStepUpBody(action, methods) {
     if (!codeInput && pwInput) pwInput.focus();
 }
 
-// Logout
-function logout() {
+// After every end of a session the page is replaced, not scrubbed: a fresh page holds nothing of the person who
+// signed out (no list, no cached answer, no unlocked key), whatever the sections hold now or will hold later. The
+// sign-out below still empties what it can at once, so nothing of the person stays on screen while the page is
+// being replaced. The reason for the sign-in screen rides along in this tab's sessionStorage under a one-shot key
+// (SIGNED_OUT_REASON_KEY), which the new page shows once and deletes (_showSignedOutReason). Only a page that has
+// shown the app since it loaded replaces itself: one that boots without a session, or whose stored token is refused
+// before anything was drawn, shows the sign-in screen as it is, so a replacement can never loop. Offline, the
+// replacement waits until the browser is back online: replaced then, the page would be the browser's own error page.
+const SIGNED_OUT_REASON_KEY = 'dv_signed_out_reason';
+let _appShown = false;
+let _replacing = false;
+
+function _replacePageAfterSignOut(reason) {
+    if (_replacing) return;
+    _replacing = true;
+    try {
+        if (reason) sessionStorage.setItem(SIGNED_OUT_REASON_KEY, String(reason));
+        else sessionStorage.removeItem(SIGNED_OUT_REASON_KEY);
+    } catch (_) {}
+    const replace = () => {
+        if (authToken) { _replacing = false; return; }      // signed in again meanwhile: nothing to replace
+        location.replace(location.pathname);
+    };
+    if (navigator.onLine === false) window.addEventListener('online', replace, { once: true });
+    else replace();
+}
+
+// The reason the last session of this tab ended, on the sign-in screen of the page that replaced it: once, and only
+// when the page boots signed out. The key is deleted whatever the page then shows.
+function _showSignedOutReason(signedIn) {
+    let reason = null;
+    try {
+        reason = sessionStorage.getItem(SIGNED_OUT_REASON_KEY);
+        sessionStorage.removeItem(SIGNED_OUT_REASON_KEY);
+    } catch (_) {}
+    if (!reason || signedIn) return;
+    const note = document.getElementById('login-error');
+    if (!note) return;
+    note.className = 'alert alert-warning mt-md';
+    note.setAttribute('role', 'alert');
+    note.textContent = reason;
+    note.style.display = 'block';
+}
+
+// Logout. The sign-out buttons pass their click event, which is ignored; `reason`, when given, is shown on the
+// sign-in screen of the page that replaces this one.
+function logout(_event, reason) {
+    const replaceAfter = _appShown;
+    _appShown = false;
     // The Activity page first, while the session still holds its token: a page size or range chosen in
     // the last second, which the page saves to the account a second after the last change, is saved now.
     // It also forgets everything it held, so none of it carries over to the next person on this tab.
@@ -2005,6 +2051,7 @@ function logout() {
     // hand-off this function's own storage scrub exists to prevent.
     closeModal();
     showScreen('login-screen');
+    if (replaceAfter) _replacePageAfterSignOut(typeof reason === 'string' ? reason : '');
 }
 
 // Load Dashboard Statistics
@@ -21559,6 +21606,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Check for existing session BEFORE showing any screen.
     const hasSession = authToken && currentUser;
+    _showSignedOutReason(!!hasSession);
 
     if (hasSession) {
         // The pre-paint splash (auth-boot.js) is up. VERIFY the cached token with the
