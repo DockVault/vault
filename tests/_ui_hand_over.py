@@ -46,6 +46,12 @@ def still_old(page: Page) -> bool:
     return page.evaluate("() => window.__oldPage === true")
 
 
+def in_the_background(page: Page):
+    """Every page loaded in this tab from now on is a tab behind another, without the focus. The browser the tests
+    drive tells every page it has the focus, as no browser in use does for more than one tab at a time."""
+    page.add_init_script("document.hasFocus = () => false;")
+
+
 def expect_reason(page: Page, reason):
     """The sign-in screen of the new page says why the session ended (``reason``), or says nothing (``None``); either
     way the reason kept for it in the tab's sessionStorage is gone, so it is shown once."""

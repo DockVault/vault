@@ -6,9 +6,9 @@ A sign-out in one tab tells every other tab holding the same session, and they s
 signs in again, from the same address, a moment later; the sign-in is in the auth requests' class, counted by
 address, ten a minute as shipped. So the told tabs send nothing of their own: no second sign-out (the first tab's
 ended the session) and no request for the sign-in screen's policy (sent without a token, so counted by address),
-which they ask for when they are next shown instead. Held for the sign-out button and for a session that has run
-out, with eleven tabs: one sign-out is sent, the session is ended, at most one request for the policy, and the
-sign-in right after is let in.
+which they ask for when they are next shown instead (but the one in front and focused, which asks at once). Held
+for the sign-out button and for a session that has run out, with eleven tabs: one sign-out is sent, the session is
+ended, at most two requests for the policy, and the sign-in right after is let in.
 
 The tabs' own timers (the notifications' unread count, once a minute) are stopped while this runs: a tab whose own
 request meets the ended session signs out by itself, as it should, and that is not what is counted here.
@@ -19,7 +19,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _sign_out_helpers import expired_copy, session_row, shipped_auth_limit
-from _ui_hand_over import mark_old, sign_in_on_the_tab, wait_replaced
+from _ui_hand_over import in_the_background, mark_old, sign_in_on_the_tab, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -46,6 +46,10 @@ def _tabs_of_one_session(page: Page, account):
     assert [t.evaluate("() => authToken") for t in tabs] == [token] * TABS
     for t in tabs:
         t.evaluate("() => { clearInterval(notifPollTimer); }")
+    # As in a browser in use, the other tabs are behind the first, without the focus; but the last, the one in front
+    # of a second window that has the focus.
+    for t in tabs[1:-1]:
+        in_the_background(t)
     return tabs, token
 
 

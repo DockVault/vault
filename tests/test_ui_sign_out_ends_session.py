@@ -46,8 +46,8 @@ from playwright.sync_api import Page, expect
 from _account_change_helpers import signed_in
 from _sf_helpers import enroll_totp
 from _sign_out_helpers import expired_copy, session_row
-from _ui_hand_over import (expect_reason, expect_reason_once, mark_old, replaced, sign_in_on_the_tab, sign_out,
-                           still_old, wait_replaced)
+from _ui_hand_over import (expect_reason, expect_reason_once, in_the_background, mark_old, replaced,
+                           sign_in_on_the_tab, sign_out, still_old, wait_replaced)
 from conftest import BASE_URL
 
 pytestmark = pytest.mark.ui
@@ -376,13 +376,15 @@ def test_the_tab_that_signs_out_asks_for_the_sign_in_policy_at_once(page: Page, 
 
 
 def test_a_tab_told_of_a_sign_out_asks_for_the_sign_in_policy_when_it_is_next_shown_once(page: Page, ana):
-    """Told of a sign-out, a tab does not ask for the sign-in screen's policy at once (every tab of the session is
-    told at the same moment, and those requests count against the address the person signs in from again); it asks
-    when it is next shown or focused, once, so the screen it shows then is labelled by the policy of that moment."""
+    """Told of a sign-out, a tab behind another does not ask for the sign-in screen's policy at once (every tab of
+    the session is told at the same moment, and those requests count against the address the person signs in from
+    again); it asks when it is next shown or focused, once, so the screen it shows then is labelled by the policy of
+    that moment. (The tab in front and focused asks at once: test_ui_sign_out_replaces_the_page.py.)"""
     sign_in_on_the_tab(page, ana)
     same = page.context.new_page()
     same.goto("/")
     expect(same.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    in_the_background(same)
     asked = []
     same.on("request", lambda r: _is_policy(r) and asked.append(r))
     mark_old(same)
