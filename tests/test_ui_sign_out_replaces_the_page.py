@@ -813,3 +813,27 @@ def test_a_late_account_answer_after_the_session_ended_stores_nothing(page: Page
     assert page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')") is None
     assert new_page["held"] == [], "the answer opened the app"
     expect(page.locator("#dashboard-screen")).to_have_count(0)
+
+
+def test_a_search_brought_back_by_history_within_the_signed_out_page_is_dropped_and_never_opened(page: Page, admin):
+    """Back or Forward within the signed-out page itself (what Chromium can do after the page that ended a session was
+    replaced, to an entry that page left): the search leaves the address at once, and the administrator who signs in
+    next gets no Activity search opened."""
+    boss = admin.create_user(role="admin")
+    ghost = unique("historyghost")
+    try:
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.evaluate("""(term) => new Promise((done) => {
+            history.pushState(null, '', '/#activity?range=24h&user=' + term);
+            history.back();
+            setTimeout(() => { history.forward(); setTimeout(done, 600); }, 600);
+        })""", ghost)
+        assert page.evaluate("() => location.hash") == "", "the search stayed in the address"
+        _sign_in(page, boss)
+        page.wait_for_timeout(1500)
+        assert ghost not in page.evaluate("() => location.href")
+        expect(page.locator("#activity-section")).to_be_hidden()
+        assert _seen(page, [ghost]) == set(), "the search was opened for the next person"
+    finally:
+        admin.delete_user(boss["id"])
