@@ -1411,6 +1411,23 @@ function _resetDone() {
 // A hash the page was loaded with on the sign-in screen, kept out of the address until the sign-in opens it.
 let _hashForSignIn = '';
 
+// The address a sign-in opens: the hash this page was loaded with (a copied link), or none. A hash the address holds
+// by then came from elsewhere (Back or Forward to an entry an earlier page left) and is never opened.
+function _openOnlyTheHashThePageCameWith() {
+    const hash = _hashForSignIn;
+    _hashForSignIn = '';
+    try { history.replaceState(null, '', location.pathname + location.search + hash); } catch (_) {}
+}
+
+// A hash brought back by Back or Forward while no session is open (in Chromium that can be a step within this very
+// page, to an entry an earlier page left, perhaps of an earlier person's session): it leaves the address at once.
+function _dropHashWhileSignedOut() {
+    if (authToken || !location.hash) return;
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+}
+window.addEventListener('popstate', _dropHashWhileSignedOut);
+window.addEventListener('hashchange', _dropHashWhileSignedOut);
+
 // Login
 document.getElementById('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1512,10 +1529,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
         // A copied link to an Activity search, opened before signing in, opens it now. Only a link this page was
         // loaded with (_hashForSignIn).
-        if (_hashForSignIn) {
-            try { history.replaceState(null, '', location.pathname + location.search + _hashForSignIn); } catch (_) {}
-            _hashForSignIn = '';
-        }
+        _openOnlyTheHashThePageCameWith();
         openActivityFromHash();
 
         // Prompt a keyless user who's been invited to a ZK vault to set up a key.
@@ -1604,6 +1618,7 @@ async function finishSecondFactorLogin(accessToken) {
     }
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
+    _openOnlyTheHashThePageCameWith();
     // enterAuthedSession fetches /users/me, applies prefs, loads permissions, and reveals the
     // dashboard — the same boot a refreshed session runs.
     await enterAuthedSession();
