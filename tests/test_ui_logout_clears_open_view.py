@@ -29,9 +29,12 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from _ui_hand_over import ONLINE, SIGN_OUT_STANDS, sign_out_as
+from _ui_hand_over import SIGN_OUT_STANDS, sign_out_as
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The vault header of a page that never opened a vault (static/index.html).
+PLACEHOLDER = "Vault Name"
 
 
 # --------------------------------------------------------------------------- helpers
@@ -83,10 +86,10 @@ def _view(page: Page) -> dict:
 def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
     page: Page, admin_creds, admin, temp_vault, how
 ):
-    """The page is replaced by a new one after the sign-out, which never held the vault; with the browser offline
-    the replacement waits until it is back online, and the page signed out that stays meanwhile must already show
-    nothing of it. Either way the next sign-in on the tab lands on the dashboard, with no trace of the vault's
-    name."""
+    """The page is replaced by a new one after the sign-out, which never held the vault (with the browser offline,
+    by the browser's error page first, and by a new page once it is back). The header is the new page's own
+    placeholder, and the next sign-in on the tab lands on the dashboard with that placeholder, no trace of the
+    vault's name."""
     vault_id = temp_vault["id"]
     admin.post(
         f"/vaults/{vault_id}/files",
@@ -107,27 +110,21 @@ def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
 
     # The idle path: the session ends and the app signs the user out. This is what apiRequest's own
     # 401 branch calls when the token has expired while the tab sat idle.
-    signing_out = sign_out_as(page, how)
+    sign_out_as(page, how)
 
     after_logout = _view(page)
     assert after_logout["section"] == "dashboard-section", (
         f"logout left the previous view active: {after_logout}")
-    assert temp_vault["name"] not in (after_logout["title"] or ""), (
-        f"logout left the previous vault's name in the header: {after_logout['title']!r}")
-    if how != ONLINE:
-        # The page that stays: its header emptied by logout itself.
-        assert not (after_logout["title"] or ""), (
-            f"logout left the previous vault's name in the header: {after_logout['title']!r}")
+    assert after_logout["title"] == PLACEHOLDER, (
+        f"the header is not the new page's own: {after_logout['title']!r}")
 
-    if signing_out:
-        signing_out()                             # back online: the page is replaced
 
     # And signing back in lands on the dashboard, not on a hollowed-out vault.
     _login(page, admin_creds["username"], admin_creds["password"])
     after_login = _view(page)
     assert after_login["section"] == "dashboard-section", (
         f"signing back in returned to the stale vault view: {after_login}")
-    assert temp_vault["name"] not in (after_login["title"] or ""), (
+    assert after_login["title"] == PLACEHOLDER, (
         f"the previous vault's name survived a full sign-out and sign-in: {after_login['title']!r}")
 
 

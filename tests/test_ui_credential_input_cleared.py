@@ -155,15 +155,14 @@ def test_logging_out_does_not_leave_an_open_prompt_holding_a_passphrase(logged_i
     passphrase typed. The screen swap only touches `.screen` elements, so the dialog was never
     dismissed and its cleanup never ran — the login screen appeared with the passphrase still in
     the page, ready for whoever uses the tab next. The page is then replaced by a new one; with the browser
-    offline it stays signed out until the browser is back online, and must hold nothing either.
+    offline it goes at once all the same (to the browser's error page), and the page loaded once it is back online
+    holds nothing either.
     """
     page = logged_in
     _open_password_prompt(page)
-    signing_out = sign_out_as(page, how)
+    sign_out_as(page, how)
     assert _value(page) == "", "the passphrase survived logout into the login screen"
     assert page.locator("#confirm-modal.active").count() == 0, "the dialog is still open"
-    if signing_out:
-        signing_out()                             # back online: the page is replaced
 
 
 def test_the_account_password_is_not_kept_after_signing_in(logged_in: Page):

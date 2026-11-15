@@ -2,10 +2,11 @@
 that showed the app. Imported by the test modules that need them; holds no tests.
 
 After every end of a session that had shown the app, the page replaces itself (static/js/app.js:
-_replacePageAfterSignOut): at once, or, with the browser offline, once it is back online. The sign-in screen the
-next person types into is a new page's, which holds nothing of the old one (its variables, its listeners, what a
-test put on its window). A test that reads the page after a sign-out reads it after the replacement (``replaced``
-/ ``wait_replaced``), or reads the page that stays while the browser is offline (``sign_out_as`` with OFFLINE)."""
+_replacePageAfterSignOut), at once, online or not. The sign-in screen the next person types into is a new page's,
+which holds nothing of the old one (its variables, its listeners, what a test put on its window). A test that reads
+the page after a sign-out reads it after the replacement (``replaced`` / ``wait_replaced``). With the browser
+offline the replacement is the browser's own error page, and the page loaded once it is back online is a new one
+on the sign-in screen (``sign_out_as`` with OFFLINE)."""
 from contextlib import contextmanager
 
 from playwright.sync_api import Page, expect
@@ -48,17 +49,30 @@ def sign_out(page: Page):
         page.evaluate("() => logout()")
 
 
-# The two ways a sign-out stands: the browser online, so the page is replaced at once; or offline, so the page
-# signed out and emptied stays until the browser is back online.
+# The two ways a sign-out stands: the browser online, so the page is replaced by a new one on the sign-in screen; or
+# offline, so it is replaced all the same, by the browser's own error page, and a new page loads once it is back.
 ONLINE = "browser online"
 OFFLINE = "browser offline"
 SIGN_OUT_STANDS = [ONLINE, OFFLINE]
 
 
+def _left_old_page(page: Page, seconds=15) -> bool:
+    """Whether the page marked by ``mark_old`` has gone (replaced, even by an error page) within ``seconds``."""
+    for _ in range(int(seconds * 10)):
+        try:
+            if not page.evaluate("() => window.__oldPage === true"):
+                return True
+        except Exception:
+            pass                                  # between two documents
+        page.wait_for_timeout(100)
+    return False
+
+
 def sign_out_as(page: Page, how, action=None):
-    """Sign out (``action``, logout() by default) with the browser ``how`` (ONLINE or OFFLINE). ONLINE: back once
-    the page has been replaced; returns None. OFFLINE: back with the page signed out and still the one that showed
-    the app; returns a function that brings the browser back online and waits for the page to be replaced."""
+    """Sign out (``action``, logout() by default) with the browser ``how`` (ONLINE or OFFLINE), and come back once a
+    new page is on the sign-in screen. OFFLINE: the page signed out goes at once all the same, to the browser's
+    error page, which holds nothing of the app; back online, the page loaded is a new one. Returns None (kept for
+    the callers, which call what it returns when there is something)."""
     action = action or (lambda: page.evaluate("() => logout()"))
     if how == ONLINE:
         with replaced(page):
@@ -67,12 +81,11 @@ def sign_out_as(page: Page, how, action=None):
     page.context.set_offline(True)
     mark_old(page)
     action()
-    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
-    page.wait_for_timeout(500)                    # a moment in which a replacement would begin
-    assert still_old(page), "the page was replaced with the browser offline"
-
-    def back_online():
+    try:
+        assert _left_old_page(page), "the page signed out was kept with the browser offline"
+        assert page.locator("#dashboard-screen").count() == 0, "the page in the tab still holds the app"
+    finally:
         page.context.set_offline(False)
-        wait_replaced(page)
-
-    return back_online
+    page.goto("/")
+    wait_replaced(page)
+    return None
