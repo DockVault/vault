@@ -164,7 +164,7 @@ def test_the_form_and_a_preview_on_its_way_are_gone_for_the_next_person_on_the_t
         _preview(page, name)
         expect(page.locator("#erase-preview")).to_contain_text(near)
         expect(page.locator("#erase-ask")).to_be_enabled()
-        signing_out = sign_out_as(page, how)
+        signing_out = sign_out_as(page, how, markers=[name, near])
 
         def gone():
             assert page.input_value("#erase-name") == ""
@@ -172,13 +172,15 @@ def test_the_form_and_a_preview_on_its_way_are_gone_for_the_next_person_on_the_t
             assert near not in (page.locator("#erase-card").text_content() or "")
             expect(page.locator("#erase-ask")).to_be_disabled()
 
-        # Out of the page at once, though it is hidden behind the sign-in screen (the page that stays while the
-        # sign-out is on its way), and out of the page that replaces it.
-        gone()
+        # Out of the page at once: the page that stays while the sign-out is on its way holds the sign-in screen
+        # alone, the card gone with the rest of the signed-in page (and neither name anywhere in it, above); and out
+        # of the page that replaces it, whose card is empty.
         if signing_out:
+            expect(page.locator("#erase-card")).to_have_count(0)
+            expect(page.locator("#erase-name")).to_have_count(0)
             signing_out.release()
             wait_replaced(page)
-            gone()
+        gone()
         # ben signs in on the tab and opens the card: nothing of ada's.
         sign_in_on_the_tab(page, ben)
         _open(page)

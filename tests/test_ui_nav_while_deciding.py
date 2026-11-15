@@ -19,7 +19,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
-from _ui_hand_over import SIGN_OUT_STANDS, sign_out, sign_out_as
+from _ui_hand_over import SIGN_OUT_STANDS, added, expect_waiting, sign_out, sign_out_as, watch_added
 from conftest import unique
 
 pytestmark = pytest.mark.ui
@@ -196,8 +196,9 @@ def test_a_user_who_asks_for_compliance_or_activity_meanwhile_lands_on_the_dashb
 @pytest.mark.parametrize("how", SIGN_OUT_STANDS)
 def test_going_elsewhere_or_signing_out_ends_the_wait(page: Page, admin, admin_creds, how):
     """Signed out while waiting, with the sign-out answered (the page is replaced by a new one, which waits for
-    nothing) or still on its way (the page signed out stays, and waits for nothing either): the answer of the person
-    who has gone, let go then, opens nothing for the next one."""
+    nothing) or still on its way (the page signed out stays, holding the sign-in screen alone, and waits for nothing
+    either): the answer of the person who has gone, let go then, changes nothing on it and opens nothing for the next
+    one."""
     u = admin.create_user(role="user")
     try:
         page.goto("/")
@@ -222,12 +223,31 @@ def test_going_elsewhere_or_signing_out_ends_the_wait(page: Page, admin, admin_c
         page.evaluate("() => navigateToSection('compliance')")
         held.wait()
         _expect_waiting(page, "compliance")
+        errors = []
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
         signing_out = sign_out_as(page, how)
-        _expect_not_waiting(page, "compliance")
+        if signing_out:
+            # The page that waits for its sign-out holds the sign-in screen alone: the sections and the sidebar have
+            # gone with the rest of the signed-in page, and it waits for nothing.
+            assert page.evaluate("() => navWaiting") is None
+            expect(_section(page, "compliance")).to_have_count(0)
+            expect(_item(page, "compliance")).to_have_count(0)
+            watch_added(page)
+        else:
+            _expect_not_waiting(page, "compliance")
         assert page.evaluate("() => navDeciding.size") == 0
         held.release()
         page.evaluate("() => fetch('/health').then((r) => r.text())")    # the page has had the answer
-        _expect_not_waiting(page, "compliance")
+        if signing_out:
+            # The answer of the person who has gone changes nothing on it: nothing is added, nothing waits, no error.
+            page.wait_for_timeout(500)
+            assert added(page) == [], f"the answer added to the page that waits for its sign-out: {added(page)}"
+            assert page.evaluate("() => navWaiting") is None
+            assert page.evaluate("() => navDeciding.size") == 0
+            expect_waiting(page)
+            assert errors == [], errors
+        else:
+            _expect_not_waiting(page, "compliance")
         _login(page, u["_username"], u["_password"])
         if signing_out:
             signing_out.release()

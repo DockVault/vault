@@ -26,7 +26,7 @@ from playwright.sync_api import Browser, Page, expect
 from _account_change_helpers import psql
 from _auditor_helpers import compliance_receipt, forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, outbox, owner_with_vault
-from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, replaced, sign_out_as, wait_replaced
+from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, added, replaced, sign_out_as, wait_replaced, watch_added
 from conftest import BASE_URL
 
 pytestmark = pytest.mark.ui
@@ -318,8 +318,8 @@ def test_an_export_whose_answer_has_not_come_at_a_sign_out_is_cancelled(browser:
 @pytest.mark.parametrize("how", SIGN_OUT_STANDS)
 def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(browser: Browser, world, codes, how):
     """Sign-out answered: the read belonged to the page that was replaced, and nothing of it is left to finish.
-    Sign-out on its way: the page signed out stays, and the read let go there hands nothing over; nor does it once
-    the sign-out goes through and the page is replaced."""
+    Sign-out on its way: the page signed out stays, holding the sign-in screen alone, and the read let go there hands
+    nothing over and adds nothing to it; nor does it once the sign-out goes through and the page is replaced."""
     page = _page(browser, "block")
     try:
         _login(page, world)
@@ -333,11 +333,15 @@ def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(browser
         if how == ANSWERED:
             assert page.evaluate("() => typeof window.__letRead") == "undefined"
         else:
+            # The page that stays has no toast container left (it holds the sign-in screen alone): what the read adds
+            # to it, a message among it, is watched from its body.
+            watch_added(page)
             page.evaluate("() => window.__letRead()")
         page.wait_for_timeout(1500)                     # the moment in which the file would be handed over
         assert downloads == [], "the archive landed in the downloads after the sign-out"
-        expect(page.locator("#toast-container .toast-error")).to_have_count(0)
+        expect(page.locator(".toast-error")).to_have_count(0)
         if signing_out:
+            assert added(page) == [], f"the read added to the page that waits for its sign-out: {added(page)}"
             signing_out.release()
             wait_replaced(page)
             page.wait_for_timeout(1000)

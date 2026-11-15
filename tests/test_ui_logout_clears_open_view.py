@@ -84,8 +84,9 @@ def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
     page: Page, admin_creds, admin, temp_vault, how
 ):
     """Once the sign-out is answered the page is replaced by a new one, which never held the vault; until then
-    (the sign-out on its way) the page signed out stays, and must already show nothing of it. Either way the next
-    sign-in on the tab lands on the dashboard, with no trace of the vault's name."""
+    (the sign-out on its way) the page signed out stays, holding the sign-in screen alone, with nothing of the
+    vault anywhere in it. Either way the next sign-in on the tab lands on the dashboard, with no trace of the vault's
+    name."""
     vault_id = temp_vault["id"]
     admin.post(
         f"/vaults/{vault_id}/files",
@@ -106,17 +107,20 @@ def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
 
     # The idle path: the session ends and the app signs the user out. This is what apiRequest's own
     # 401 branch calls when the token has expired while the tab sat idle.
-    signing_out = sign_out_as(page, how)
+    signing_out = sign_out_as(page, how, markers=[temp_vault["name"], "hello.txt"])
 
-    after_logout = _view(page)
-    assert after_logout["section"] == "dashboard-section", (
-        f"logout left the previous view active: {after_logout}")
-    assert temp_vault["name"] not in (after_logout["title"] or ""), (
-        f"logout left the previous vault's name in the header: {after_logout['title']!r}")
-    if how != ANSWERED:
-        # The page that stays: its header emptied by logout itself.
-        assert not (after_logout["title"] or ""), (
+    if how == ANSWERED:
+        after_logout = _view(page)
+        assert after_logout["section"] == "dashboard-section", (
+            f"logout left the previous view active: {after_logout}")
+        assert temp_vault["name"] not in (after_logout["title"] or ""), (
             f"logout left the previous vault's name in the header: {after_logout['title']!r}")
+    else:
+        # The page that stays holds the sign-in screen alone: no section, no file list, no header is left in it, and
+        # neither the vault's name nor its file's is anywhere in the document (above).
+        assert _view(page) == {"section": None, "rows": -1, "title": None}, (
+            f"logout left the previous view in the page: {_view(page)}")
+        expect(page.locator(".content-section")).to_have_count(0)
 
     # And signing back in lands on the dashboard, not on a hollowed-out vault (on the page that stays, the sign-in
     # replaces it by a new one).

@@ -44,8 +44,8 @@ def _login(page: Page, username: str, password: str):
 
 def _sign_out_in_app(page: Page, how=ANSWERED):
     """The app's own sign-out through the Sign out button, not a reload. Sign-out answered: back once the page has
-    been replaced. Sign-out on its way: back with the page signed out still in place, its sidebar as the sign-out
-    left it; returns the held call."""
+    been replaced. Sign-out on its way: back with the page signed out still in place, holding the sign-in screen
+    alone (no sidebar left); returns the held call."""
 
     def button():
         page.click("#profile-btn")
@@ -77,8 +77,8 @@ def _expect_admin_items_hidden(page: Page):
 def test_a_user_after_an_administrator_on_the_same_tab_gets_no_administrator_items(page: Page, admin, admin_creds,
                                                                                    how):
     """Both ways: hidden for the user who follows an administrator, back for the administrator who follows. The
-    administrator's sign-out answered (the page is replaced), or on its way (the page signed out stays until the
-    user signs in on it, which replaces it)."""
+    administrator's sign-out answered (the page is replaced), or on its way (the page signed out stays, holding the
+    sign-in screen alone, until the user signs in on it, which replaces it)."""
     u = admin.create_user(role="user")
     try:
         page.goto("/")
@@ -87,7 +87,13 @@ def test_a_user_after_an_administrator_on_the_same_tab_gets_no_administrator_ite
             expect(_item(page, section)).to_be_visible()
 
         signing_out = _sign_out_in_app(page, how)
-        _expect_admin_items_hidden(page)  # already at sign-out, before anyone signs in
+        # Already at sign-out, before anyone signs in: on the new page the items are there and hidden; on the page
+        # that waits for its sign-out there is no sidebar at all, so none of them is anywhere in it.
+        if signing_out:
+            for section in ADMIN_ITEMS + ("dashboard",):
+                expect(_item(page, section)).to_have_count(0)
+        else:
+            _expect_admin_items_hidden(page)
 
         asked = _admin_requests(page)
         _login(page, u["_username"], u["_password"])

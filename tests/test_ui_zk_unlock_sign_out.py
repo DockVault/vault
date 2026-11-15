@@ -14,8 +14,10 @@ download and upload start.
 
 Each (but the transfers, see there) is held both ways a sign-out stands. Sign-out answered: the page is replaced by
 a new one, and the work held in the page that is gone can never end there (nothing of it is left in the new page).
-Sign-out on its way: the page signed out stays until the call is over, and the work held in it is let go there,
-before the next person signs in (whose sign-in would replace that page at once).
+Sign-out on its way: the page signed out stays until the call is over, holding the sign-in screen alone (the
+signed-in page, its dialogs among it, has gone from the document), and the work held in it is let go there, before
+the next person signs in (whose sign-in would replace that page at once): it adds nothing to that page and says
+nothing.
 
 Waits are on state, never on time, but for the moments after which something must not happen.
 """
@@ -24,7 +26,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, sign_in_on_the_tab, sign_out_as, wait_replaced
+from _ui_hand_over import (ANSWERED, SIGN_OUT_STANDS, added, expect_waiting, sign_in_on_the_tab, sign_out_as,
+                           wait_replaced, watch_added)
 from conftest import BASE_URL
 from test_ui_e2e import _create_zk_vault_via_ui, _login, _u
 from test_ui_zk_key_proof import PASSPHRASE, _keyed, zk  # noqa: F401 (zk is a fixture)
@@ -124,12 +127,16 @@ HOLD_WRAP = """() => {
     }
 }"""
 
-# Every message the page shows from now on.
+# Every message the page shows from now on: a toast added anywhere under <body> (the body, which a sign-out keeps,
+# is watched: the page that waits for its sign-out has no toast container left to watch).
 WATCH_MESSAGES = """() => {
     window.__shown = [];
+    const seen = (n) => window.__shown.push(n.className + ': ' + n.textContent);
     new MutationObserver((records) => records.forEach((r) => r.addedNodes.forEach((n) => {
-        if (n.classList && n.classList.contains('toast')) window.__shown.push(n.className + ': ' + n.textContent);
-    }))).observe(document.getElementById('toast-container'), { childList: true });
+        if (n.nodeType !== 1) return;
+        if (n.classList.contains('toast')) seen(n);
+        n.querySelectorAll('.toast').forEach(seen);
+    }))).observe(document.body, { childList: true, subtree: true });
 }"""
 
 
@@ -170,23 +177,32 @@ def test_a_passphrase_change_that_ends_after_a_sign_out_leaves_the_next_person_t
         page.wait_for_function("() => typeof window.__letWrap === 'function'", timeout=30000)
         expect(page.locator("#encryption-key-change-passphrase-btn")).to_be_disabled()   # while it runs
 
-        signing_out = sign_out_as(page, how)
+        markers = [ada["_username"], PASSPHRASE, NEW_PASSPHRASE]
+        signing_out = sign_out_as(page, how, markers=markers)
         if how == ANSWERED:
             assert page.evaluate("() => typeof window.__letWrap") == "undefined", \
                 "the new page holds the change of the old one"
         else:
-            # The change ends on the page that stays signed out: it stores nothing, says nothing, keeps no key, and
-            # leaves the button on.
+            # The change ends on the page that stays signed out, which holds the sign-in screen alone (the encryption
+            # key dialog has gone with the rest of the signed-in page): it stores nothing, says nothing, adds nothing
+            # to the page, and keeps no key.
+            expect(page.locator("#encryption-key-modal")).to_have_count(0)
+            expect(page.locator("#encryption-key-change-passphrase-btn")).to_have_count(0)
             page.evaluate(WATCH_MESSAGES)
+            watch_added(page)
             page.evaluate("() => window.__letWrap()")
             page.wait_for_function("() => window.__wrapped === true", timeout=30000)
             page.wait_for_timeout(1500)                       # the moment in which it would be stored or said
             assert page.evaluate("() => window.__shown") == [], "the first person's change said something"
+            assert added(page) == [], f"the first person's change added to the page: {added(page)}"
             assert page.evaluate("() => zkState.privateKey === null"), "the first person's key was kept"
-            assert page.evaluate("() => document.getElementById('encryption-key-change-passphrase-btn').disabled") \
-                is False
+            expect_waiting(page, markers)
+            assert errors == []
             signing_out.release()
             wait_replaced(page)
+            # The new page's button is on, before anyone signs in.
+            assert page.evaluate("() => document.getElementById('encryption-key-change-passphrase-btn').disabled") \
+                is False
         sign_in_on_the_tab(page, ben)
         page.evaluate(WATCH_MESSAGES)
         _open_key_dialog(page)
@@ -224,23 +240,33 @@ def test_a_recovery_key_export_that_ends_after_a_sign_out_downloads_nothing(brow
         _answer(page, PASSPHRASE, RECOVERY_PASSPHRASE, RECOVERY_PASSPHRASE)
         page.wait_for_function("() => typeof window.__letWrap === 'function'", timeout=30000)
 
-        signing_out = sign_out_as(page, how)
+        markers = [ada["_username"], PASSPHRASE, RECOVERY_PASSPHRASE]
+        signing_out = sign_out_as(page, how, markers=markers)
         page.evaluate(WATCH_MESSAGES)
         if how == ANSWERED:
             assert page.evaluate("() => typeof window.__letWrap") == "undefined", \
                 "the new page holds the export of the old one"
         else:
+            # The page that stays holds the sign-in screen alone: the encryption key dialog has gone from it.
+            expect(page.locator("#encryption-key-modal")).to_have_count(0)
+            expect(page.locator("#encryption-key-export-recovery-btn")).to_have_count(0)
+            watch_added(page)
             page.evaluate("() => window.__letWrap()")
             page.wait_for_function("() => window.__wrapped === true", timeout=30000)
         page.wait_for_timeout(1500)                           # the moment in which the kit would be handed over
         assert downloads == [], "a recovery kit landed in the downloads after the sign-out"
         assert page.evaluate("() => window.__shown") == []
-        assert page.evaluate("() => document.getElementById('encryption-key-export-recovery-btn').disabled") is False
         if signing_out:
+            # Nothing of the export came to the page that waits: no element added, nothing of the person in it.
+            assert added(page) == [], f"the export added to the page: {added(page)}"
+            expect_waiting(page, markers)
+            assert errors == []
             signing_out.release()
             wait_replaced(page)
             page.wait_for_timeout(1000)
             assert downloads == [], "a recovery kit landed in the downloads once the page was replaced"
+        # The export button of the page the tab now shows is on.
+        assert page.evaluate("() => document.getElementById('encryption-key-export-recovery-btn').disabled") is False
         assert errors == []
     finally:
         page.context.close()

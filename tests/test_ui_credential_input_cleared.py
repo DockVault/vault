@@ -22,7 +22,7 @@ import json
 import pytest
 from playwright.sync_api import Page, expect
 
-from _ui_hand_over import SIGN_OUT_STANDS, sign_out_as
+from _ui_hand_over import SIGN_OUT_STANDS, sign_out_as, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -155,15 +155,19 @@ def test_logging_out_does_not_leave_an_open_prompt_holding_a_passphrase(logged_i
     passphrase typed. The screen swap only touches `.screen` elements, so the dialog was never
     dismissed and its cleanup never ran — the login screen appeared with the passphrase still in
     the page, ready for whoever uses the tab next. Once the sign-out is answered the page is replaced by a new
-    one; until then (the sign-out on its way) the page signed out stays, and must hold nothing either.
+    one, whose field is empty; until then (the sign-out on its way) the page signed out stays, holding the sign-in
+    screen alone: the dialog and its field have gone from it, and the passphrase is nowhere in the document.
     """
     page = logged_in
     _open_password_prompt(page)
-    signing_out = sign_out_as(page, how)
+    signing_out = sign_out_as(page, how, markers=[SECRET])
+    if signing_out:
+        expect(page.locator("#confirm-modal")).to_have_count(0)
+        expect(page.locator(INPUT)).to_have_count(0)
+        signing_out.release()
+        wait_replaced(page)
     assert _value(page) == "", "the passphrase survived logout into the login screen"
     assert page.locator("#confirm-modal.active").count() == 0, "the dialog is still open"
-    if signing_out:
-        signing_out.release()
 
 
 def test_the_account_password_is_not_kept_after_signing_in(logged_in: Page):

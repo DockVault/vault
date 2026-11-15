@@ -16,7 +16,7 @@ import time
 import pytest
 from playwright.sync_api import Page, expect
 
-from _ui_hand_over import SIGN_OUT_STANDS, sign_out_as
+from _ui_hand_over import SIGN_OUT_STANDS, holds, sign_out_as, wait_replaced
 from conftest import unique
 
 
@@ -43,7 +43,8 @@ def _login(page: Page, username: str, password: str):
 @pytest.mark.parametrize("how", SIGN_OUT_STANDS)
 def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_creds, how):
     """Signed out with the Sign out button. Sign-out answered: the page is replaced by a new one, which holds no
-    link. Sign-out on its way: the page signed out stays until the call is over, and holds none either."""
+    link. Sign-out on its way: the page signed out stays until the call is over, holding the sign-in screen alone,
+    with no link anywhere in it or in what its script remembers; then it is replaced, and the new page holds none."""
     # Restored to what it WAS, not to off: a fresh deployment has upload links on, and a test that
     # switched them off on its way out would make every later test skip for a reason it created.
     before = admin.get("/settings").json().get("public_receivers_enabled")
@@ -80,21 +81,32 @@ def test_signing_out_leaves_no_upload_link_url_behind(page: Page, admin, admin_c
             page.click("#profile-btn")
             page.click("#dropdown-logout-btn")
 
-        signing_out = sign_out_as(page, how, button)
-
+        # What the person had: the link on screen and in memory, and the two other remembered URLs.
+        links = [held["field"], held["last"], "https://example.invalid/p/file", "https://example.invalid/n/note"]
+        signing_out = sign_out_as(page, how, button, markers=links)
+        if signing_out:
+            # The page that waits for its sign-out holds the sign-in screen alone: the three dialogs and their result
+            # fields have gone with the rest of the signed-in page (and no link is anywhere in it, above).
+            for field in ("rc-link-value", "pfl-link-value", "note-public-link-value"):
+                expect(page.locator(f"#{field}")).to_have_count(0)
+        # What the page's script still holds (on the page that waits, the Copy handlers' memory), or the new page's
+        # fields and memory.
         after = page.evaluate(
-            """() => ({ field: document.getElementById('rc-link-value').value,
-                        pfl: (document.getElementById('pfl-link-value') || {}).value || '',
-                        note: (document.getElementById('note-public-link-value') || {}).value || '',
-                        session: Object.keys(rcSessionUrls).length,
+            """() => ({ session: Object.keys(rcSessionUrls).length,
                         last: state._lastRcUrl || '',
                         lastPfl: state._lastPflUrl || '',
                         lastPublic: state._lastPublicLinkUrl || '' })""")
-        assert after == {"field": "", "pfl": "", "note": "", "session": 0, "last": "",
-                         "lastPfl": "", "lastPublic": ""}, (
+        assert after == {"session": 0, "last": "", "lastPfl": "", "lastPublic": ""}, (
             f"a link URL survived logout on this tab: {after}")
         if signing_out:
             signing_out.release()
+            wait_replaced(page)
+        fields = page.evaluate(
+            """() => ({ field: document.getElementById('rc-link-value').value,
+                        pfl: document.getElementById('pfl-link-value').value,
+                        note: document.getElementById('note-public-link-value').value })""")
+        assert fields == {"field": "", "pfl": "", "note": ""}, f"a link URL is in the new page: {fields}"
+        assert holds(page, links) == [], "a link URL is in the new page"
     finally:
         admin.put("/settings", json={"public_receivers_enabled": bool(before)})
         admin.delete(f"/receiver-tags/{tag['id']}")

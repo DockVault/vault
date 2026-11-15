@@ -21,7 +21,8 @@ from playwright.sync_api import Page, expect
 from _account_change_helpers import signed_in
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault
-from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, new_folder_through_the_page, replaced, sign_out_as, wait_replaced
+from _ui_hand_over import (ANSWERED, SIGN_OUT_STANDS, added, expect_waiting, new_folder_through_the_page, replaced,
+                           sign_out_as, wait_replaced, watch_added)
 from conftest import unique
 
 pytestmark = pytest.mark.ui
@@ -139,13 +140,15 @@ def _release_and_wait_for_the_read(page: Page, held: "_Held", part: str):
     page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
 
 
-def _answer_after_the_sign_out(page: Page, held: "_Held", part: str, how, check):
+def _answer_after_the_sign_out(page: Page, held: "_Held", part: str, how, check, markers=()):
     """Sign out with the sign-out ``how``, then let the held answers go, and ``check`` what the page shows.
 
     Sign-out answered: the page has been replaced, and the request belonged to the page that is gone: its answer
-    is read by nothing in the new page. Sign-out on its way: the page signed out stays, reads the answer, and draws
-    it for nobody; then the sign-out goes through, and the page that replaces it shows nothing either."""
-    signing_out = sign_out_as(page, how)
+    is read by nothing in the new page. Sign-out on its way: the page signed out stays, holding the sign-in screen
+    alone (none of ``markers`` in it), reads the answer, and draws it for nobody (nothing is added to it, and it
+    still holds none of ``markers``); then the sign-out goes through, and the page that replaces it shows nothing
+    either."""
+    signing_out = sign_out_as(page, how, markers=markers)
     if how == ANSWERED:
         page.evaluate(_WATCH_READS, part)
         held.release()
@@ -154,8 +157,10 @@ def _answer_after_the_sign_out(page: Page, held: "_Held", part: str, how, check)
         assert page.evaluate("(p) => window.__read[p]", part) is False, "the new page read an answer of the old one"
         check()
         return
+    watch_added(page)
     _release_and_wait_for_the_read(page, held, part)
-    check()
+    assert added(page) == [], f"the answer added to the page that waits for its sign-out: {added(page)}"
+    expect_waiting(page, markers)
     signing_out.release()
     wait_replaced(page)
     check()
@@ -237,7 +242,7 @@ def test_an_answer_that_comes_after_the_sign_out_is_drawn_for_nobody(page: Page,
         assert page.locator("#cmp-root .cmp-ws, #cmp-root .cmp-file-row").count() == 0
         assert world["listed"] not in page.locator("#cmp-root").inner_text()
 
-    _answer_after_the_sign_out(page, held, "/tree", how, nothing_drawn)
+    _answer_after_the_sign_out(page, held, "/tree", how, nothing_drawn, [world["listed"]])
     assert errors == []
 
 
@@ -266,7 +271,7 @@ def test_the_owners_page_and_receipts_are_gone_for_the_next_person_on_the_tab(pa
         expect(page.locator("#my-access-modal.active")).to_have_count(0)
         expect(page.locator("#vault-review-banner")).to_have_count(0)
 
-    _answer_after_the_sign_out(page, held, "/me/compliance-access", how, nothing_drawn)
+    _answer_after_the_sign_out(page, held, "/me/compliance-access", how, nothing_drawn, [world["opened"]])
     before = len(sent)
 
     # mia signs in on the same tab and opens her own page; her answers are held on their way.
