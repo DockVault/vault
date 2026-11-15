@@ -108,7 +108,9 @@ def test_the_sign_out_button_with_many_tabs_open_leaves_the_sign_in_that_follows
         expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
         assert len(sign_outs) == 1, f"{len(sign_outs)} sign-outs sent for one session"
         assert sign_outs[0].headers.get("authorization") == f"Bearer {token}"
-        assert len(policies) <= 1, f"the sign-in screen's policy was asked for {len(policies)} times"
+        # The tab that signed out asks at once, and so does a told tab replaced while it is the one in front (at most
+        # one tab can be): two at most, whatever the number of tabs.
+        assert len(policies) <= 2, f"the sign-in screen's policy was asked for {len(policies)} times"
 
 
 def test_a_session_that_runs_out_in_many_tabs_leaves_the_sign_in_that_follows_its_budget(page: Page, admin, ana):
@@ -131,4 +133,6 @@ def test_a_session_that_runs_out_in_many_tabs_leaves_the_sign_in_that_follows_it
         expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
         assert len(sign_outs) == 1, f"{len(sign_outs)} sign-outs sent for one session"
         assert sign_outs[0].headers.get("authorization") == f"Bearer {expired}"
-        assert len(policies) <= 1, f"the sign-in screen's policy was asked for {len(policies)} times"
+        # The tab that signed out asks at once, and so does a told tab replaced while it is the one in front (at most
+        # one tab can be): two at most, whatever the number of tabs.
+        assert len(policies) <= 2, f"the sign-in screen's policy was asked for {len(policies)} times"
