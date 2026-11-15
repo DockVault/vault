@@ -75,8 +75,10 @@ def _is_contract_text(path: Path) -> bool:
 
 
 def _attributes(paths: list[Path], *names: str) -> dict[Path, dict[str, str]]:
+    # The paths go in on standard input: as arguments, the tracked files outgrow the command line Windows allows.
     result = subprocess.run(
-        ["git", "check-attr", "-z", *names, "--", *(path.as_posix() for path in paths)],
+        ["git", "check-attr", "-z", "--stdin", *names],
+        input=b"".join(path.as_posix().encode("utf-8") + b"\0" for path in paths),
         cwd=ROOT,
         check=True,
         capture_output=True,
