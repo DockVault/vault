@@ -7,7 +7,8 @@ erase is listed by its placeholder, never by the name, with a Cancel any adminis
 is previewed as refused, and asking stays off. The name is never kept in the browser. The card fits a phone. No
 console error. A sign-out takes the name typed, its preview (with the near-miss names the records hold) and the Ask
 button it turned on out of the page, so the next person on the tab finds none of them, and a preview on its way at
-the sign-out is drawn for nobody.
+the sign-out is drawn for nobody. Held both ways a sign-out stands: answered (the page is replaced by a new one) and
+still on its way (the page signed out stays, emptied at once, until the call is over or someone signs in on it).
 """
 import re
 import uuid
@@ -16,7 +17,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import psql
-from _ui_hand_over import sign_in_on_the_tab
+from _ui_hand_over import SIGN_OUT_STANDS, sign_in_on_the_tab, sign_out_as, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -138,12 +139,15 @@ def test_the_erase_card_fits_a_phone(page: Page, admin_creds):
     assert page.evaluate("() => document.documentElement.scrollWidth <= window.innerWidth + 1")
 
 
-def _signed_out(page: Page):
-    page.evaluate("() => logout()")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+def _round_trip(page: Page):
+    """A request of the page's own, sent and answered, then a few turns of its event loop: whatever the page does
+    with an answer that came before is done."""
+    page.evaluate("() => fetch('/health').then((r) => r.text())")
+    page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
 
 
-def test_the_form_and_a_preview_on_its_way_are_gone_for_the_next_person_on_the_tab(page: Page, admin):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_the_form_and_a_preview_on_its_way_are_gone_for_the_next_person_on_the_tab(page: Page, admin, how):
     # Errors of the page's code (a request of the person who signed out may still meet the ended session, which
     # the console reports as a failed load: that is not one).
     errors = []
@@ -160,12 +164,21 @@ def test_the_form_and_a_preview_on_its_way_are_gone_for_the_next_person_on_the_t
         _preview(page, name)
         expect(page.locator("#erase-preview")).to_contain_text(near)
         expect(page.locator("#erase-ask")).to_be_enabled()
-        _signed_out(page)
-        # Out of the page at once, though it is hidden behind the sign-in screen.
-        assert page.input_value("#erase-name") == ""
-        assert page.locator("#erase-preview").evaluate("(n) => n.childNodes.length") == 0
-        assert near not in (page.locator("#erase-card").text_content() or "")
-        expect(page.locator("#erase-ask")).to_be_disabled()
+        signing_out = sign_out_as(page, how)
+
+        def gone():
+            assert page.input_value("#erase-name") == ""
+            assert page.locator("#erase-preview").evaluate("(n) => n.childNodes.length") == 0
+            assert near not in (page.locator("#erase-card").text_content() or "")
+            expect(page.locator("#erase-ask")).to_be_disabled()
+
+        # Out of the page at once, though it is hidden behind the sign-in screen (the page that stays while the
+        # sign-out is on its way), and out of the page that replaces it.
+        gone()
+        if signing_out:
+            signing_out.release()
+            wait_replaced(page)
+            gone()
         # ben signs in on the tab and opens the card: nothing of ada's.
         sign_in_on_the_tab(page, ben)
         _open(page)
@@ -191,16 +204,18 @@ def test_the_form_and_a_preview_on_its_way_are_gone_for_the_next_person_on_the_t
                 break
             page.wait_for_timeout(50)
         assert len(held) == 1, "the preview was not asked for"
-        _signed_out(page)
+        signing_out = sign_out_as(page, how)
+        # ada signs in again on the tab: on the page that replaced ben's (sign-out answered), or on the one that
+        # stays, which her sign-in replaces there and then (sign-out on its way). Either way the preview was asked
+        # by a page that is gone, and its answer, let go now, reaches nothing.
         sign_in_on_the_tab(page, ada)
+        if signing_out:
+            signing_out.release()
         _open(page)
         route, answer = held[0]
-        with page.expect_event("requestfinished", lambda r: r.url.endswith("/settings/erase-requests/preview"),
-                               timeout=15000):
-            route.fulfill(response=answer)
+        route.fulfill(response=answer)
         page.unroute("**/settings/erase-requests/preview")
-        page.evaluate("() => fetch('/health').then((r) => r.text())")
-        page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
+        _round_trip(page)
         expect(page.locator("#erase-preview")).to_be_empty()
         # The name ben previewed, typed by ada: no preview of hers, so asking stays off.
         page.fill("#erase-name", name)
