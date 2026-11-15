@@ -29,6 +29,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, sign_out_as
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -77,9 +79,13 @@ def _view(page: Page) -> dict:
 # --------------------------------------------------------------------------- ui lane
 
 @pytest.mark.ui
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
 def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
-    page: Page, admin_creds, admin, temp_vault
+    page: Page, admin_creds, admin, temp_vault, how
 ):
+    """Once the sign-out is answered the page is replaced by a new one, which never held the vault; until then
+    (the sign-out on its way) the page signed out stays, and must already show nothing of it. Either way the next
+    sign-in on the tab lands on the dashboard, with no trace of the vault's name."""
     vault_id = temp_vault["id"]
     admin.post(
         f"/vaults/{vault_id}/files",
@@ -100,21 +106,27 @@ def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
 
     # The idle path: the session ends and the app signs the user out. This is what apiRequest's own
     # 401 branch calls when the token has expired while the tab sat idle.
-    page.evaluate("() => logout()")
-    expect(page.locator("#login-screen")).to_be_visible()
+    signing_out = sign_out_as(page, how)
 
     after_logout = _view(page)
     assert after_logout["section"] == "dashboard-section", (
         f"logout left the previous view active: {after_logout}")
-    assert not (after_logout["title"] or ""), (
+    assert temp_vault["name"] not in (after_logout["title"] or ""), (
         f"logout left the previous vault's name in the header: {after_logout['title']!r}")
+    if how != ANSWERED:
+        # The page that stays: its header emptied by logout itself.
+        assert not (after_logout["title"] or ""), (
+            f"logout left the previous vault's name in the header: {after_logout['title']!r}")
 
-    # And signing back in lands on the dashboard, not on a hollowed-out vault.
+    # And signing back in lands on the dashboard, not on a hollowed-out vault (on the page that stays, the sign-in
+    # replaces it by a new one).
     _login(page, admin_creds["username"], admin_creds["password"])
+    if signing_out:
+        signing_out.release()
     after_login = _view(page)
     assert after_login["section"] == "dashboard-section", (
         f"signing back in returned to the stale vault view: {after_login}")
-    assert not (after_login["title"] or ""), (
+    assert temp_vault["name"] not in (after_login["title"] or ""), (
         f"the previous vault's name survived a full sign-out and sign-in: {after_login['title']!r}")
 
 
