@@ -14,6 +14,12 @@ another page's text in it is never shown and never drops a session. A search add
 (Back after a sign-out) is never opened. A copied link to a search, opened signed out,
 leaves the address on the sign-in screen and still opens after the sign-in. A late answer about the account after the
 session ended stores nothing.
+
+A search an earlier page left in the tab's history is never brought back, even after the next person signed in, while
+the page's own entries keep theirs. A copied link survives a sign-in that reloads the page for the account's saved skin,
+and a sign-in with a code. A reset or invitation page brought back from the browser's cache is loaded again without its
+form. A token stored without its account opens the app; a sign-in with a code on an ended page stores the account
+before the page goes. Late answers about permissions and saved choices while the page starts store and apply nothing.
 """
 import json
 import time
@@ -837,3 +843,325 @@ def test_a_search_brought_back_by_history_within_the_signed_out_page_is_dropped_
         assert _seen(page, [ghost]) == set(), "the search was opened for the next person"
     finally:
         admin.delete_user(boss["id"])
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# History entries of an earlier page, a copied link through a reload for the saved skin, a page brought back from the
+# browser's cache, a two-factor sign-in, and late answers while the page starts.
+
+def _search_left_of(page: Page, term: str) -> list:
+    """Where an Activity search for ``term`` is held: the address, the filter chips, any field of the page (the event
+    list itself may name ``term``: an administrator may see that event)."""
+    return page.evaluate("""(t) => {
+        const at = [];
+        const href = location.href;
+        if (href.includes(t) || decodeURIComponent(href).includes(t)) at.push('address');
+        const chips = document.getElementById('act-chips');
+        if (chips && (chips.textContent || '').includes(t)) at.push('chips');
+        for (const el of document.querySelectorAll('input, textarea'))
+            if ((el.value || '').includes(t)) at.push('field:' + (el.id || el.name || el.type));
+        return at;
+    }""", term)
+
+
+def _open_activity(page: Page):
+    toggle = page.locator("#mobile-nav-toggle")
+    if toggle.is_visible():
+        toggle.click()
+    page.click('.sidebar-item[data-section="activity"]')
+    expect(page.locator("#act-pager")).to_be_visible(timeout=15000)
+    page.wait_for_timeout(1000)
+
+
+def _search_for_a_person_and_open_an_event(page: Page, term: str):
+    """On a phone: the Activity page searched for ``term``, and an event of the search opened (its own history
+    entry)."""
+    _open_activity(page)
+    page.click("#act-filter-btn")
+    page.fill("#act-fp-user", term)
+    page.locator("#act-fp-user").press("Enter")
+    page.click("#act-fp-done")
+    page.locator("#activity-cards .act-card").first.click()
+    expect(page.locator("#activity-event-modal")).to_be_visible(timeout=10000)
+    assert page.evaluate("() => history.state && history.state.activityDetail") is True, "no history entry"
+
+
+def test_back_and_forward_after_the_next_administrator_signed_in_bring_back_no_earlier_search(
+        page: Page, admin, anon):
+    """The real flow: a search and an open event, a sign-out, the next administrator signs in on the new page, then
+    Back and Forward."""
+    boss, other = admin.create_user(role="admin"), admin.create_user(role="admin")
+    ghost = unique("nextghost")
+    anon.post("/auth/login", json={"username": ghost, "password": "not-it-1"})
+    try:
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto("/")
+        _sign_in(page, boss)
+        _search_for_a_person_and_open_an_event(page, ghost)
+        assert ghost in page.evaluate("() => decodeURIComponent(location.hash)"), "the control: no search in the address"
+        page.evaluate("() => { window.__oldPage = true; }")
+        page.evaluate("() => logout()")
+        assert _ended(page, 20), "the page was not replaced"
+        _sign_in(page, other)
+        page.wait_for_timeout(1500)
+        page.go_back()
+        page.wait_for_timeout(2500)
+        assert page.evaluate("() => location.hash") == "", "Back brought a search into the address"
+        assert _search_left_of(page, ghost) == [], "Back brought the earlier search back"
+        page.go_forward()
+        page.wait_for_timeout(2500)
+        assert page.evaluate("() => location.hash") == "", "Forward brought a search into the address"
+        assert _search_left_of(page, ghost) == [], "Forward brought the earlier search back"
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        # A reload opens no search of the earlier person.
+        page.reload()
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        page.wait_for_timeout(2000)
+        assert _search_left_of(page, ghost) == [], "a reload opened the earlier search"
+        # Nor does opening Activity.
+        _open_activity(page)
+        assert _search_left_of(page, ghost) == [], "Activity opened with the earlier search"
+        assert page.evaluate("() => currentUser && currentUser.username") == other["_username"]
+    finally:
+        admin.delete_user(boss["id"])
+        admin.delete_user(other["id"])
+
+
+def test_a_search_left_in_history_by_an_earlier_page_leaves_the_address_while_someone_is_signed_in(
+        page: Page, admin):
+    """An entry without this page's mark, as an earlier page leaves one, reached by Back and Forward while an
+    administrator is signed in: the search leaves the address, and Activity opens without it."""
+    boss = admin.create_user(role="admin")
+    ghost = unique("leftghost")
+    try:
+        page.goto("/")
+        _sign_in(page, boss)
+        page.evaluate("""(term) => new Promise((done) => {
+            history.pushState(null, '', '/#activity?range=24h&user=' + term);
+            history.back();
+            setTimeout(() => { history.forward(); setTimeout(done, 800); }, 800);
+        })""", ghost)
+        assert page.evaluate("() => location.hash") == "", "the search stayed in the address"
+        _open_activity(page)
+        assert _search_left_of(page, ghost) == [], "Activity opened with the search an earlier page left"
+    finally:
+        admin.delete_user(boss["id"])
+
+
+def test_back_and_forward_between_the_pages_own_entries_keep_the_search(page: Page, admin, anon):
+    """The control: this page's own entries (the search, an event opened on a phone) keep their search through a step
+    back and forward."""
+    boss = admin.create_user(role="admin")
+    mine = unique("ownsearch")
+    anon.post("/auth/login", json={"username": mine, "password": "not-it-1"})
+    try:
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto("/")
+        _sign_in(page, boss)
+        _search_for_a_person_and_open_an_event(page, mine)
+        page.evaluate("() => new Promise((done) => { history.back(); setTimeout(done, 1200); })")
+        expect(page.locator("#activity-event-modal")).to_be_hidden(timeout=10000)
+        assert f"user={mine}" in page.evaluate("() => location.hash"), "Back dropped the page's own search"
+        expect(page.locator("#act-chips")).to_contain_text(mine)
+        page.evaluate("() => new Promise((done) => { history.forward(); setTimeout(done, 1200); })")
+        assert f"user={mine}" in page.evaluate("() => location.hash"), "Forward dropped the page's own search"
+        expect(page.locator("#act-chips")).to_contain_text(mine)
+    finally:
+        admin.delete_user(boss["id"])
+
+
+def test_a_copied_link_opens_after_a_sign_in_that_reloads_the_page_for_the_saved_skin(page: Page, admin):
+    boss = admin.create_user(role="admin")
+    client = ApiClient(BASE_URL)
+    client.login(boss["_username"], boss["_password"])
+    someone = unique("skinlink")
+    try:
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.goto(f"/#activity?range=24h&user={someone}")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        here = page.evaluate("() => localStorage.getItem('ui') === 'v1' ? 'v1' : 'v2'")
+        saved = "v2" if here == "v1" else "v1"
+        client.put("/users/me/preferences", json={"ui": saved}).raise_for_status()
+        loads = []
+        page.on("load", lambda _p: loads.append(time.time()))
+        _sign_in(page, boss)
+        expect(page.locator("#activity-section")).to_be_visible(timeout=15000)
+        expect(page.locator("#act-chips")).to_contain_text(someone, timeout=15000)
+        assert f"user={someone}" in page.evaluate("() => location.hash")
+        # The control: the sign-in did reload the page for the account's skin.
+        assert loads, "the page was not reloaded for the saved skin"
+        assert page.evaluate("() => localStorage.getItem('ui')") == saved
+    finally:
+        admin.delete_user(boss["id"])
+
+
+@pytest.fixture
+def invites_on(admin):
+    keys = ("invite_enabled", "email_requirement", "signup_email_domain_mode")
+    before = admin.get("/settings").json()
+    admin.put("/settings", json={"invite_enabled": True, "email_requirement": "optional",
+                                 "signup_email_domain_mode": "off"})
+    yield
+    admin.put("/settings", json={k: before.get(k) for k in keys})
+
+
+@pytest.mark.parametrize("which", ["reset", "invite"])
+def test_a_link_page_brought_back_from_the_browsers_cache_is_loaded_again_without_its_form(
+        page: Page, admin, invites_on, which):
+    """A page of a password-reset or invitation link, brought back from the back-and-forward cache: it is loaded again
+    as the sign-in page, its form and its live token gone."""
+    who = admin.create_user(role="user") if which == "reset" else None
+    invitee = unique("cachedinvite")
+    try:
+        if which == "reset":
+            link = admin.post(f"/users/{who['id']}/reset-link").json()["reset_link"]
+            token = link.split("?reset=", 1)[1]
+        else:
+            r = admin.post("/invites", json={"username": invitee, "role": "user"})
+            assert r.status_code == 200, r.text
+            token = r.json()["token"]
+        page.goto(f"/?{which}={token}")
+        expect(page.locator(f"#{which}-screen")).to_be_visible(timeout=10000)
+        expect(page.locator(f"#{which}-card-body input[type=password]").first).to_be_visible(timeout=10000)
+        page.evaluate("() => { window.__oldPage = true; }")
+        page.evaluate("() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))")
+        page.wait_for_function("() => !window.__oldPage", timeout=10000)
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        expect(page.locator(f"#{which}-screen")).to_be_hidden()
+        expect(page.locator(f"#{which}-card-body input[type=password]")).to_have_count(0)
+        assert token not in page.url
+        assert _seen(page, [token]) == set(), "the token is in the page"
+    finally:
+        if who:
+            admin.delete_user(who["id"])
+        for u in admin.get("/users").json():
+            if u.get("username") == invitee:
+                admin.delete_user(u["id"])
+
+
+def test_a_stored_session_without_its_account_opens_the_app(page: Page, ana):
+    """A token stored alone (as a two-factor sign-in on an ended page may leave it): the page verifies it and opens the
+    app, signed in as its account."""
+    client = ApiClient(BASE_URL)
+    client.login(ana["_username"], ana["_password"])
+    page.goto("/")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    page.evaluate("(t) => { localStorage.clear(); sessionStorage.clear(); localStorage.setItem('authToken', t); }",
+                  client.token)
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => currentUser && currentUser.username") == ana["_username"]
+    stored = page.evaluate("() => localStorage.getItem('currentUser')")
+    assert stored and json.loads(stored)["username"] == ana["_username"], stored
+
+
+def test_a_sign_in_with_a_code_on_an_ended_page_stores_its_account_before_the_page_goes(page: Page, admin):
+    """The new page is kept from coming, so the page that signed in can be read: the account is stored beside the
+    token."""
+    ana = admin.create_user(role="user")
+    client = admin.clone_anonymous()
+    client.login(ana["_username"], ana["_password"])
+    secret, _codes = enroll_totp(ana, client)
+    try:
+        _end_a_session_before_the_app_is_shown(page, ana)
+        assert page.evaluate("() => localStorage.getItem('currentUser')") is None, "the control: an account stored"
+        _password_step(page, ana)
+        expect(page.locator("#sf-code-input")).to_be_visible(timeout=10000)
+        new_page = _hold_the_new_page(page)
+        page.fill("#sf-code-input", totp(secret, 1))
+        page.get_by_role("button", name="Verify").click()
+        _wait_until(page, lambda: new_page["held"], 15, "the page did not ask for its replacement")
+        assert page.evaluate("() => window.__oldPage === true"), "the page went: nothing to read"
+        assert page.evaluate("() => !!localStorage.getItem('authToken')"), "no token stored"
+        stored = page.evaluate("() => localStorage.getItem('currentUser')")
+        assert stored and json.loads(stored)["username"] == ana["_username"], stored
+        _let_the_new_page_come(page, new_page)
+        _signed_in_as(page, ana)
+    finally:
+        admin.delete_user(ana["id"])
+
+
+def test_a_copied_link_opens_after_a_sign_in_with_a_code(page: Page, admin):
+    boss, _client, secret, _codes = enrolled_admin(admin)
+    someone = unique("codelink")
+    try:
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.goto(f"/#activity?range=24h&user={someone}")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        assert page.evaluate("() => location.hash") == "", "the link stays in the address on the sign-in screen"
+        _password_step(page, boss)
+        expect(page.locator("#sf-code-input")).to_be_visible(timeout=10000)
+        page.fill("#sf-code-input", totp(secret, 1))
+        page.get_by_role("button", name="Verify").click()
+        expect(page.locator("#activity-section")).to_be_visible(timeout=15000)
+        expect(page.locator("#act-chips")).to_contain_text(someone, timeout=15000)
+        assert f"user={someone}" in page.evaluate("() => location.hash")
+    finally:
+        admin.delete_user(boss["id"])
+
+
+def _a_late_answer_while_the_page_starts(page: Page, path: str) -> list:
+    """The page starts with a stored session; the answer to ``path`` (a prefix when it ends with a slash) is held, the
+    session ends on that page, and the answer then comes. Returns the keys the page wrote to the browser's storage
+    after the sign-out."""
+    def is_it(url: str) -> bool:
+        p = urlparse(url).path
+        return p == path or (path.endswith("/") and p.startswith(path))
+
+    held = []
+    page.route(is_it, lambda route: held.append(route))
+    page.reload()
+    _wait_until(page, lambda: held, 15, f"the page did not ask for {path}")
+    new_page = _hold_the_new_page(page)
+    page.evaluate("""() => {
+        window.__written = [];
+        const set = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (k, v) { window.__written.push(k); return set.call(this, k, v); };
+        window.__oldPage = true;
+        logout();
+    }""")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    answered = []
+    page.on("response", lambda r: answered.append(r.status) if is_it(r.url) else None)
+    page.unroute(is_it)
+    _release(held)
+    _wait_until(page, lambda: answered, 10, "the held answer never reached the page")
+    assert answered == [200], answered
+    page.wait_for_timeout(1500)
+    assert page.evaluate("() => window.__oldPage === true"), "the page went: nothing to read"
+    assert new_page["held"] == [], "the answer opened the app"
+    expect(page.locator("#dashboard-screen")).to_have_count(0)
+    return page.evaluate("() => window.__written")
+
+
+def test_a_late_answer_about_permissions_after_the_session_ended_stores_nothing(page: Page, ana):
+    page.goto("/")
+    _sign_in(page, ana)
+    written = _a_late_answer_while_the_page_starts(page, "/permissions/users/")
+    assert "userPermissions" not in written, f"the answer was stored: {written}"
+    assert page.evaluate(
+        "() => localStorage.getItem('userPermissions') || sessionStorage.getItem('userPermissions')") is None
+
+
+def test_a_late_answer_with_the_saved_choices_after_the_session_ended_applies_nothing(page: Page, ana):
+    """The account's saved choices (its look, its vault order, never remembering a vault password) come after the
+    session ended: none of them is applied, and the page asks the server for nothing more with them."""
+    page.goto("/")
+    _sign_in(page, ana)
+    here = page.evaluate("() => localStorage.getItem('theme') || document.documentElement.getAttribute('data-theme')")
+    other = "light" if here == "dark" else "dark"
+    before = page.evaluate("() => [state.vaultSort, state.neverRememberVaultPassword]")
+    assert before == ["name", False], "the control: the account's choices are already applied"
+    client = ApiClient(BASE_URL)
+    client.login(ana["_username"], ana["_password"])
+    client.put("/users/me/preferences", json={"theme": other, "vault_sort": "viewed",
+                                             "never_remember_vault_password": "on"}).raise_for_status()
+    written = _a_late_answer_while_the_page_starts(page, "/users/me/preferences")
+    assert page.evaluate("() => state.userPreferences") is None, "the answer was kept"
+    sort, never = page.evaluate("() => [state.vaultSort, state.neverRememberVaultPassword]")
+    assert sort != "viewed" and never is False, f"the answer was applied: {sort}, {never}"
+    assert written == [], f"the answer was applied: {written}"
+    assert page.evaluate("() => localStorage.getItem('theme')") != other
+    assert page.evaluate("() => document.documentElement.getAttribute('data-theme')") != other
+    # One end of the session, the sign-out's: the answer did not go on to ask with no session (and be refused).
+    assert page.evaluate("() => _sessionsEnded") == 1
