@@ -24,8 +24,15 @@ import pytest
 # Reads the container's own cgroup in a loop. Both layouts are handled: v2 exposes
 # `memory.current`, v1 `memory/memory.usage_in_bytes`, and a probe that assumes one silently
 # reports zero on the other — which is its own way of making a test pass for no reason.
+#
+# The loop says its own process id first, so the sampler can stop it inside the container: stopping the
+# `docker exec` that started it does not (on Docker Desktop the loop went on for hours after its test, and
+# several of them took two processors from every later test on that stack). It also stops by itself after
+# _MAX_READINGS readings, whatever happens to the test that started it.
+_MAX_READINGS = 200000
 _SAMPLE_LOOP = (
-    'while true; do '
+    'echo "pid:$$"; n=0; '
+    f'while [ $n -lt {_MAX_READINGS} ]; do n=$((n+1)); '
     'if [ -r /sys/fs/cgroup/memory.current ]; then '
     'cur=$(cat /sys/fs/cgroup/memory.current); '
     'fil=$(awk \'/^inactive_file /{a=$2} /^active_file /{b=$2} END{print a+b}\' '
@@ -51,6 +58,7 @@ class CgroupSampler:
     def __init__(self, container=None):
         self.container = container or os.environ.get("VAULT_API_CONTAINER", "vault-api")
         self._proc = None
+        self._pid = None        # the loop's process id inside the container
         self._thread = None
         self._stop = False
         self.samples = []
@@ -75,13 +83,22 @@ class CgroupSampler:
             if self._stop:
                 break
             line = line.strip()
-            if line.isdigit():
+            if line.startswith("pid:") and line[4:].isdigit():
+                self._pid = line[4:]
+            elif line.isdigit():
                 self.samples.append(int(line))
 
     def __exit__(self, *exc):
         self._stop = True
-        if self._proc is not None:
-            self._proc.kill()
+        try:
+            if self._pid is not None:
+                subprocess.run(["docker", "exec", self.container, "kill", self._pid],
+                               capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            if self._proc is not None:
+                self._proc.kill()
         time.sleep(0.2)
         return False
 
