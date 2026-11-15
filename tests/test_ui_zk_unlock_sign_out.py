@@ -12,6 +12,11 @@ downloads of a zero-knowledge vault, waiting at the passphrase prompt when they 
 page gives transfers (static/js/transfer_gate.js). The sign-out frees those places, so the next person's own
 download and upload start.
 
+Each (but the transfers, see there) is held both ways a sign-out stands. Sign-out answered: the page is replaced by
+a new one, and the work held in the page that is gone can never end there (nothing of it is left in the new page).
+Sign-out on its way: the page signed out stays until the call is over, and the work held in it is let go there,
+before the next person signs in (whose sign-in would replace that page at once).
+
 Waits are on state, never on time, but for the moments after which something must not happen.
 """
 from pathlib import Path
@@ -19,7 +24,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from _ui_hand_over import sign_in_on_the_tab
+from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, sign_in_on_the_tab, sign_out_as, wait_replaced
 from conftest import BASE_URL
 from test_ui_e2e import _create_zk_vault_via_ui, _login, _u
 from test_ui_zk_key_proof import PASSPHRASE, _keyed, zk  # noqa: F401 (zk is a fixture)
@@ -53,7 +58,8 @@ def _set_up_key(page: Page):
     expect(page.locator("#encryption-key-modal")).to_be_hidden(timeout=5000)
 
 
-def test_an_unlock_that_ends_after_a_sign_out_keeps_no_key_for_the_next_person(browser, zk):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_an_unlock_that_ends_after_a_sign_out_keeps_no_key_for_the_next_person(browser, zk, how):
     ada, _ada_c = zk()
     ben, _ben_c = zk()
     page = browser.new_context(base_url=BASE_URL).new_page()
@@ -72,20 +78,27 @@ def test_an_unlock_that_ends_after_a_sign_out_keeps_no_key_for_the_next_person(b
         page.click("#confirm-modal-confirm-btn")
         page.wait_for_function("() => typeof window.__letDerive === 'function'", timeout=10000)
 
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        signing_out = sign_out_as(page, how)
+        if how == ANSWERED:
+            assert page.evaluate("() => [typeof window.__letDerive, typeof window.__first]") == \
+                ["undefined", "undefined"], "the new page holds the unlock of the old one"
+        else:
+            # The derivation ends on the page that stays signed out: its key is not kept, and it says nothing.
+            page.evaluate("() => window.__letDerive()")
+            page.wait_for_function("() => window.__derived === true", timeout=30000)
+            page.wait_for_timeout(1500)                       # the moment in which the key would be kept
+            assert page.evaluate("() => zkState.privateKey === null"), "the first person's key was kept"
+            assert page.evaluate("() => window.__first") == "running", "the first person's unlock said something"
+            signing_out.release()
+            wait_replaced(page)
         sign_in_on_the_tab(page, ben)
         # ben's first unlock is his own: he has no key, and it says so at once.
         page.evaluate("() => { window.__bens = 'running'; zkEnsureUnlocked().then("
                       "() => { window.__bens = 'unlocked'; }, (e) => { window.__bens = 'failed: ' + e.message; }); }")
         page.wait_for_function("() => window.__bens !== 'running'", timeout=10000)
         assert page.evaluate("() => window.__bens") == "failed: No encryption key is set up for your account."
-
-        page.evaluate("() => window.__letDerive()")
-        page.wait_for_function("() => window.__derived === true", timeout=30000)
-        page.wait_for_timeout(1500)                           # the moment in which the key would be kept
+        page.wait_for_timeout(1500)                           # the moment in which a key would come
         assert page.evaluate("() => zkState.privateKey === null"), "the first person's key was kept for the next"
-        assert page.evaluate("() => window.__first") == "running", "the first person's unlock said something"
         # ben's next step still has no key: it asks the server again, and is told he has none.
         page.evaluate("() => { window.__bens = 'running'; zkEnsureUnlocked().then("
                       "() => { window.__bens = 'unlocked'; }, (e) => { window.__bens = 'failed: ' + e.message; }); }")
@@ -134,7 +147,8 @@ def _answer(page: Page, *answers):
         page.click("#confirm-modal-confirm-btn")
 
 
-def test_a_passphrase_change_that_ends_after_a_sign_out_leaves_the_next_person_their_dialog(browser, zk):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_a_passphrase_change_that_ends_after_a_sign_out_leaves_the_next_person_their_dialog(browser, zk, how):
     """The first person changes their passphrase and signs out while the key is wrapped under the new one; the next
     person (who has a key of their own) opens the encryption key dialog: its Change passphrase and Export recovery
     key buttons are theirs to use, not turned off by the first person's change. The change then ends without a
@@ -156,18 +170,30 @@ def test_a_passphrase_change_that_ends_after_a_sign_out_leaves_the_next_person_t
         page.wait_for_function("() => typeof window.__letWrap === 'function'", timeout=30000)
         expect(page.locator("#encryption-key-change-passphrase-btn")).to_be_disabled()   # while it runs
 
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        signing_out = sign_out_as(page, how)
+        if how == ANSWERED:
+            assert page.evaluate("() => typeof window.__letWrap") == "undefined", \
+                "the new page holds the change of the old one"
+        else:
+            # The change ends on the page that stays signed out: it stores nothing, says nothing, keeps no key, and
+            # leaves the button on.
+            page.evaluate(WATCH_MESSAGES)
+            page.evaluate("() => window.__letWrap()")
+            page.wait_for_function("() => window.__wrapped === true", timeout=30000)
+            page.wait_for_timeout(1500)                       # the moment in which it would be stored or said
+            assert page.evaluate("() => window.__shown") == [], "the first person's change said something"
+            assert page.evaluate("() => zkState.privateKey === null"), "the first person's key was kept"
+            assert page.evaluate("() => document.getElementById('encryption-key-change-passphrase-btn').disabled") \
+                is False
+            signing_out.release()
+            wait_replaced(page)
         sign_in_on_the_tab(page, ben)
         page.evaluate(WATCH_MESSAGES)
         _open_key_dialog(page)
         expect(page.locator("#encryption-key-change-passphrase-btn")).to_be_visible()
         expect(page.locator("#encryption-key-change-passphrase-btn")).to_be_enabled()
         expect(page.locator("#encryption-key-export-recovery-btn")).to_be_enabled()
-
-        page.evaluate("() => window.__letWrap()")
-        page.wait_for_function("() => window.__wrapped === true", timeout=30000)
-        page.wait_for_timeout(1500)                           # the moment in which it would be stored or said
+        page.wait_for_timeout(1500)                           # the moment in which the change would come back
         assert page.evaluate("() => window.__shown") == [], "the first person's change spoke to the next person"
         assert page.evaluate("() => zkState.privateKey === null"), "the first person's key was kept for the next"
         expect(page.locator("#encryption-key-change-passphrase-btn")).to_be_enabled()
@@ -177,7 +203,8 @@ def test_a_passphrase_change_that_ends_after_a_sign_out_leaves_the_next_person_t
         page.context.close()
 
 
-def test_a_recovery_key_export_that_ends_after_a_sign_out_downloads_nothing(browser, zk):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_a_recovery_key_export_that_ends_after_a_sign_out_downloads_nothing(browser, zk, how):
     """The first person exports a recovery key and signs out while it is wrapped under the recovery passphrase: no
     kit lands in the browser's downloads after they have gone, nothing is said to the next person, and the export
     button is not left turned off."""
@@ -197,15 +224,23 @@ def test_a_recovery_key_export_that_ends_after_a_sign_out_downloads_nothing(brow
         _answer(page, PASSPHRASE, RECOVERY_PASSPHRASE, RECOVERY_PASSPHRASE)
         page.wait_for_function("() => typeof window.__letWrap === 'function'", timeout=30000)
 
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        signing_out = sign_out_as(page, how)
         page.evaluate(WATCH_MESSAGES)
-        page.evaluate("() => window.__letWrap()")
-        page.wait_for_function("() => window.__wrapped === true", timeout=30000)
+        if how == ANSWERED:
+            assert page.evaluate("() => typeof window.__letWrap") == "undefined", \
+                "the new page holds the export of the old one"
+        else:
+            page.evaluate("() => window.__letWrap()")
+            page.wait_for_function("() => window.__wrapped === true", timeout=30000)
         page.wait_for_timeout(1500)                           # the moment in which the kit would be handed over
         assert downloads == [], "a recovery kit landed in the downloads after the sign-out"
         assert page.evaluate("() => window.__shown") == []
         assert page.evaluate("() => document.getElementById('encryption-key-export-recovery-btn').disabled") is False
+        if signing_out:
+            signing_out.release()
+            wait_replaced(page)
+            page.wait_for_timeout(1000)
+            assert downloads == [], "a recovery kit landed in the downloads once the page was replaced"
         assert errors == []
     finally:
         page.context.close()
@@ -274,9 +309,11 @@ def test_transfers_waiting_for_the_key_at_a_sign_out_leave_the_next_person_room(
         assert sorted(landed) == [f"first-{n}.txt" for n in range(5)], landed
         assert page.evaluate(GATE) == [5, 1]
 
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        # Answered only: this page's sign-out goes through its download service worker, where no route can hold it.
+        sign_out_as(page, ANSWERED)
         assert page.evaluate(GATE) == [0, 0], "the sign-out left the places of the transfers waiting for the key taken"
+        assert page.evaluate("() => typeof window.__firsts") == "undefined", \
+            "the new page holds the downloads of the old one"
         before = len(landed)
 
         own_vault = ben_c.create_vault(name=_u("own"))["id"]
@@ -299,7 +336,8 @@ def test_transfers_waiting_for_the_key_at_a_sign_out_leave_the_next_person_room(
 
         page.wait_for_timeout(1500)                           # the moment in which a first person's download would end
         assert landed[before:] == ["theirs.txt"], landed
-        assert page.evaluate("() => window.__firsts") == [], "a download of the first person ended for the next"
+        assert page.evaluate("() => typeof window.__firsts") == "undefined", \
+            "a download of the first person ended for the next"
         assert errors == []
     finally:
         page.context.close()

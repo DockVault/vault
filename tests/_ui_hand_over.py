@@ -100,7 +100,7 @@ SIGN_OUT_STANDS = [ANSWERED, ON_ITS_WAY]
 
 class HeldSignOut:
     """The page's sign-out (POST /auth/sign-out) held on its way until ``release``: the page stays signed out and is
-    not replaced meanwhile."""
+    not replaced meanwhile. A route sees the call only when no service worker of the page passes it on."""
 
     def __init__(self, page: Page):
         self.page, self.routes = page, []
