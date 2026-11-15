@@ -13,7 +13,8 @@ until then, the page signed out and emptied stays, and a sign-in on it replaces 
   person's form and sign-in are untouched. With the sign-out not answered yet, the page stays while the next person
   types: a refusal of the session that ended, or one of a request sent with no session at all, empties nothing of
   the form; their sign-in then replaces the page, and a refusal arriving after that signs them out no more. Only
-  a refusal of the session the tab holds now ends it.
+  a refusal of the session the tab holds now ends it. A sign-out the page still owes then (refused for now, to be
+  sent again later) is sent before their sign-in replaces the page, so the session that ended does not stay live.
 - After a two-factor sign-in the sign-out leaves the form to sign in with: the second step hid it, and nothing but
   the screen's own "Back to sign in" showed it again.
 
@@ -281,6 +282,50 @@ def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out_while_the_sig
     assert still_old(page), "the page was replaced after the next person's sign-in"
     assert page.evaluate("() => authToken") == signed_in_as
     _a_refusal_of_the_session_held_now_ends_it(page)
+
+
+def test_a_sign_out_still_owed_when_the_next_person_signs_in_is_sent_before_the_page_is_replaced(page: Page, two):
+    """ana's sign-out is answered 503 with a Retry-After longer than the test waits, so the page that stays owes it
+    and would send it again only when that wait is over. ben signs in on that page first: his sign-in replaces it,
+    and before that the page sends ana's sign-out again (two in all, both with her token), so her session is ended
+    on the server rather than left live with the page that owed it."""
+    ana, ben, _ben_c, _vault = two
+    sent = []
+
+    def refuse_first(route):
+        sent.append(route.request.headers.get("authorization"))
+        if len(sent) == 1:
+            route.fulfill(status=503, content_type="application/json", headers={"Retry-After": "120"},
+                          body='{"detail": "Service Unavailable"}')
+        else:
+            route.continue_()
+
+    page.route("**/auth/sign-out", refuse_first)
+    sign_in_on_the_tab(page, ana)
+    token = page.evaluate("() => authToken")
+    mark_old(page)
+    page.evaluate("() => logout()")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    for _ in range(200):
+        if sent:
+            break
+        page.wait_for_timeout(50)
+    assert sent == [f"Bearer {token}"], sent
+    page.wait_for_timeout(500)                    # the 503's answer has been had: the page owes the sign-out
+    assert still_old(page), "the page was replaced though its sign-out was refused for now"
+    assert session_row(token) == "t|f"
+
+    _types(page, ben)
+    page.click("#login-form button[type=submit]")
+    wait_new_page(page)
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("(old) => !!authToken && authToken !== old", token)
+    for _ in range(200):
+        if session_row(token) == "f|t":
+            break
+        page.wait_for_timeout(50)
+    assert sent == [f"Bearer {token}"] * 2, f"{len(sent)} sign-outs sent for ana's session"
+    assert session_row(token) == "f|t", "ana's session was left live when ben's sign-in replaced the page"
 
 
 def test_after_a_two_factor_sign_in_the_sign_out_leaves_a_form_to_sign_in_with(page: Page, admin):
