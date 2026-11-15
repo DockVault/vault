@@ -10,7 +10,8 @@ A request still on its way when the session ended cannot write into the new page
 
 A sign-in with a second factor on a page that ended a session opens the app, signed in as that account. A download
 under way when the session ends is stopped and saves nothing. The tab's name carries only the app's own reason code:
-another page's text in it is never shown and never drops a session. A copied link to a search, opened signed out,
+another page's text in it is never shown and never drops a session. A search address the next person did not bring
+(Back after a sign-out) is never opened. A copied link to a search, opened signed out,
 leaves the address on the sign-in screen and still opens after the sign-in. A late answer about the account after the
 session ended stores nothing.
 """
@@ -703,6 +704,58 @@ def test_signed_out_the_tab_name_shows_only_the_apps_own_sentence(page: Page):
     page.reload()
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
     expect(page.locator("#login-error")).to_be_hidden()
+
+
+def _activity_search_of(page: Page, term: str) -> list:
+    """Where an Activity search for ``term`` is in the page: the address, the page itself, its filter chips and
+    fields."""
+    return page.evaluate("""(t) => {
+        const at = [];
+        if (location.hash.includes(t) || decodeURIComponent(location.hash).includes(t)) at.push('address');
+        const section = document.getElementById('activity-section');
+        if (section && section.classList.contains('active')) at.push('activity page');
+        const chips = document.getElementById('act-chips');
+        if (chips && (chips.textContent || '').includes(t)) at.push('chips');
+        for (const el of document.querySelectorAll('#activity-section input'))
+            if ((el.value || '').includes(t)) at.push('field:' + (el.id || el.name));
+        return at;
+    }""", term)
+
+
+def test_back_after_a_sign_out_opens_no_search_of_the_person_for_the_next(page: Page, admin, anon):
+    boss, other = admin.create_user(role="admin"), admin.create_user(role="admin")
+    ghost = unique("ghostsearch")
+    anon.post("/auth/login", json={"username": ghost, "password": "not-it-1"})
+    try:
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto("/")
+        _sign_in(page, boss)
+        toggle = page.locator("#mobile-nav-toggle")
+        if toggle.is_visible():
+            toggle.click()
+        page.click('.sidebar-item[data-section="activity"]')
+        expect(page.locator("#act-pager")).to_be_visible(timeout=15000)
+        page.click("#act-filter-btn")
+        page.fill("#act-fp-user", ghost)
+        page.locator("#act-fp-user").press("Enter")
+        page.click("#act-fp-done")
+        page.locator("#activity-cards .act-card").first.click()
+        expect(page.locator("#activity-event-modal")).to_be_visible(timeout=10000)
+        assert page.evaluate("() => history.state && history.state.activityDetail") is True, "no history entry"
+        assert ghost in page.evaluate("() => decodeURIComponent(location.hash)"), "the control: no search in the address"
+        page.evaluate("() => { window.__oldPage = true; }")
+        page.evaluate("() => logout()")
+        assert _ended(page, 20), "the page was not replaced"
+        page.go_back()
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.wait_for_timeout(1000)
+        assert page.evaluate("() => location.hash") == "", "Back brought the person's search into the address"
+        _sign_in(page, other)
+        page.wait_for_timeout(3000)
+        assert _activity_search_of(page, ghost) == [], "the next administrator was shown the person's search"
+    finally:
+        admin.delete_user(boss["id"])
+        admin.delete_user(other["id"])
 
 
 def test_a_copied_link_to_a_search_opens_after_the_sign_in(page: Page, admin):
