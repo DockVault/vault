@@ -66,6 +66,9 @@ const zkFileKeyVersion = () => 1;
 const zkMaybeDecryptResponse = async () => ({ plaintext: true });
 const isCodedCryptoError = () => false, safeMessageForCode = () => '';
 const downloadProgress = { start: () => 1, update() {}, done() {} };
+// A page that has not ended a session, and the downloads it is keeping track of (logout aborts them).
+let _pageEnded = false;
+const _downloadsOfThisSession = new Set();
 const readResponseWithProgress = async () => ({ bytes: true });
 const window = { URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} } };
 const document = { createElement: () => ({ click() { saved++; } }), body: { appendChild() {}, removeChild() {} } };
