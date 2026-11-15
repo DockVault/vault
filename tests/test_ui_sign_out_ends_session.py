@@ -4,9 +4,10 @@ logout, _endServerSession).
 Every sign-out goes through logout(), which signs the page out at once and asks the server to end the session it
 held (POST /auth/sign-out, which answers without Clear-Site-Data). Once that call is over, a page that showed the
 app is replaced by a new one (app.js _replacePageAfterSignOut), whose sign-in screen says once why the session
-ended (nothing for the Sign out button), and which opens the session stored for the browser if another tab signed
-in since; until then the page stays, signed out. Held here, path by path, each time by reading the token back
-from the server afterwards:
+ended (nothing for the Sign out button), even when another tab has signed in since and its session is stored for the
+browser (that session is left in storage, for that tab, and the next load opens it); until then the page stays,
+holding the sign-in screen alone. Held here, path by path, each time by reading the token back from the server
+afterwards:
 
 - the sign-out button, through the profile menu: the call carries the tab's token, and the token is refused from
   then on, while the look stored in this browser stays (the answer itself, without Clear-Site-Data, is held by
@@ -17,10 +18,10 @@ from the server afterwards:
 - a sign-out after a two-factor sign-in;
 - a sign-out in another tab: a tab holding the same token signs out at once (told by the other tab, not by a
   refusal), sends nothing of its own, asks for the sign-in screen's policy only when it is next shown (once), and
-  leaves a session stored since by another tab (and the uploads saved since), while a tab of another account stays
-  signed in; the tab the person signs out in asks for that policy at once; a tab never told, whose request with
-  the ended token is refused (without Clear-Site-Data), signs out and leaves the session stored since, its uploads
-  and the look kept for the browser;
+  leaves a session stored since by another tab (and the uploads saved since) without opening it, while a tab of
+  another account stays signed in; the tab the person signs out in asks for that policy at once; a tab never told,
+  whose request with the ended token is refused (without Clear-Site-Data), signs out and leaves the session stored
+  since, its uploads and the look kept for the browser, and the tab signed in to it signed in;
 - the sign-in check of a tab being loaded: a refusal of the session (a 401, an account's 403) ends the session and
   signs out the other tabs; a check that could not be answered (a server error, a proxy's 502 or 503 while the
   vault restarts, a proxy's own 403 page, a rate limit, no answer at all) signs out that tab alone, as it always
@@ -46,7 +47,7 @@ from _account_change_helpers import signed_in
 from _sf_helpers import enroll_totp
 from _sign_out_helpers import expired_copy, session_row
 from _ui_hand_over import (expect_reason, expect_reason_once, mark_old, replaced, sign_in_on_the_tab, sign_out,
-                           still_old, wait_new_page, wait_replaced)
+                           still_old, wait_replaced)
 from conftest import BASE_URL
 
 pytestmark = pytest.mark.ui
@@ -190,14 +191,18 @@ def test_a_sign_out_in_another_tab_signs_out_the_tabs_of_that_session_only(page:
         assert ended.value.headers.get("authorization") == f"Bearer {token}"
         _ended(token)
         # The tab holding the same token signs out at once, told so by the first tab rather than by a refusal of
-        # its next request. Both of ana's tabs are replaced, and their new pages open the session stored for this
-        # browser, which is ben's (he signed in last), as a load of either tab would: ana's is held by neither.
-        for tab in (page, same):
-            wait_new_page(tab)
-            expect(tab.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-            assert tab.evaluate("() => authToken") == ben_token
-            assert tab.evaluate("() => [sessionStorage.getItem('dv_signed_out_reason'), "
-                                "sessionStorage.getItem('dv_signed_out_told')]") == [None, None]
+        # its next request. Both of ana's tabs are replaced, and their new pages show the sign-in screen once (the
+        # told one saying why), though the session stored for this browser is ben's (he signed in last): a tab whose
+        # own session ended does not open another one. ben's session stays in storage, where his tab left it.
+        for tab, reason in ((page, None), (same, TOLD)):
+            wait_replaced(tab)
+            assert tab.evaluate("() => authToken") is None
+            expect_reason(tab, reason)
+            assert tab.evaluate("() => sessionStorage.getItem('dv_signed_out_told')") is None
+            tab.wait_for_timeout(1000)                   # the moment in which a stored session would be opened
+            expect(tab.locator("#dashboard-screen")).to_be_hidden()
+            assert tab.evaluate("() => authToken") is None
+            assert tab.evaluate("() => localStorage.getItem('authToken')") == ben_token
         # The told tab sent no sign-out of its own: the first tab's ended the session.
         same.wait_for_timeout(1000)
         assert len(sent) == 1, f"{len(sent)} sign-outs sent for one session"
@@ -206,6 +211,10 @@ def test_a_sign_out_in_another_tab_signs_out_the_tabs_of_that_session_only(page:
         assert still_old(other), "the tab of another account was replaced"
         assert other.evaluate("() => authToken") == ben_token
         assert _refused(ben_token) == 200 and _refused(token) == 401
+        # Shown once: a load of either of ana's tabs now finds the session stored for the browser, ben's.
+        page.reload()
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        assert page.evaluate("() => authToken") == ben_token
     finally:
         admin.delete_user(ben["id"])
 
@@ -218,8 +227,9 @@ def test_a_tab_told_late_leaves_the_session_stored_since_by_another_tab(page: Pa
     signed in again in another tab since: the session then stored for this browser is that new one. The told tab
     signs out (it held the ended session) and leaves the stored one where it is, so the other tab's next load still
     finds it, and the zero-knowledge uploads saved in this browser (which every tab shares), now that session's, so
-    they can be resumed. The page that replaces the told tab opens that stored session, as a load of the tab would.
-    A full sign-out of the session stored still empties that store (the control)."""
+    they can be resumed. The page that replaces the told tab shows the sign-in screen once, saying why, and does not
+    open that stored session; the tab's next load does. A full sign-out of the session stored still empties that
+    store (the control)."""
     sign_in_on_the_tab(page, ana)
     token = page.evaluate("() => authToken")
     sent = []
@@ -238,15 +248,22 @@ def test_a_tab_told_late_leaves_the_session_stored_since_by_another_tab(page: Pa
     mark_old(page)
     page.evaluate("(tail) => new BroadcastChannel('dockvault-sign-out').postMessage({ type: 'signed-out', token: tail })",
                   token[-24:])
-    # Replaced: the new page opens the session stored since, which the told tab left where it was.
-    wait_new_page(page)
-    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-    assert page.evaluate("() => authToken") == newer
+    # Replaced: the new page shows the sign-in screen once, saying why, and leaves the session stored since where the
+    # told tab left it, without opening it.
+    wait_replaced(page)
+    assert page.evaluate("() => authToken") is None
+    expect_reason(page, TOLD)
+    page.wait_for_timeout(1000)                          # the moment in which the stored session would be opened
+    expect(page.locator("#dashboard-screen")).to_be_hidden()
+    assert page.evaluate("() => authToken") is None
     assert page.evaluate("() => localStorage.getItem('authToken')") == newer
-    assert page.evaluate("() => sessionStorage.getItem('dv_signed_out_reason')") is None
-    page.wait_for_timeout(1000)
     assert sent == [], "a tab told of the sign-out sent one of its own"
     assert _refused(newer) == 200 and session_row(newer) == "t|f", "the session stored since was ended"
+    assert page.evaluate(SAVED_SINCE) is True, "the uploads saved by the session stored since were wiped"
+    # The tab's next load finds the session stored since, as the other tab's would.
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => authToken") == newer
     assert page.evaluate(SAVED_SINCE) is True, "the uploads saved by the session stored since were wiped"
     # The control: a full sign-out of the session stored (here this tab holds it) empties the store, as it always did.
     with replaced(page):
@@ -260,7 +277,8 @@ def test_a_tab_never_told_leaves_the_session_signed_in_since_its_uploads_and_the
     with the ended token once the person has signed in again in the first tab. The server refuses it without
     Clear-Site-Data (which a browser applies to the whole origin, in every tab), and the tab signs out without
     touching what is stored for the browser: the session signed in since, the uploads it saved, the look. The page
-    that replaces it opens the session signed in since."""
+    that replaces it shows the sign-in screen once, saying why, and does not open the session signed in since, which
+    stays signed in in the first tab."""
     sign_in_on_the_tab(page, ana)
     token = page.evaluate("() => authToken")
     late = page.context.new_page()
@@ -284,22 +302,32 @@ def test_a_tab_never_told_leaves_the_session_signed_in_since_its_uploads_and_the
     saved = page.evaluate("() => zkUploadStore.put({ sessionId: 'saved-since', vaultId: 'v', createdAt: Date.now(), "
                           "schema: zkUploadStore.schemaVersion(), blob: zkUploadStore.neutralBlob(new Blob(['x'])) })")
     assert saved == {"ok": True}, saved
+    mark_old(page)
 
     with late.expect_response(lambda r: r.request.method == "GET" and r.url.endswith("/users/me"),
                               timeout=15000) as answered:
         late.evaluate("() => { apiRequest('/users/me').catch(() => {}); }")
     assert answered.value.status == 401
     assert "clear-site-data" not in answered.value.all_headers(), answered.value.all_headers()
-    # The tab signs out of the ended session and is replaced by a page that opens the session stored since, as a
-    # load of the tab would: the refusal took nothing of what is stored for the browser.
-    wait_new_page(late)
-    expect(late.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-    assert late.evaluate("() => authToken") == newer
-    assert late.evaluate("() => sessionStorage.getItem('dv_signed_out_reason')") is None
+    # The tab signs out of the ended session and is replaced by a page that shows the sign-in screen once, saying
+    # why, without opening the session stored since: the refusal took nothing of what is stored for the browser.
+    wait_replaced(late)
+    assert late.evaluate("() => authToken") is None
+    expect_reason(late, SESSION_ENDED)
+    late.wait_for_timeout(1000)                          # the moment in which the stored session would be opened
+    expect(late.locator("#dashboard-screen")).to_be_hidden()
+    assert late.evaluate("() => authToken") is None
     assert page.evaluate("() => [localStorage.getItem('authToken'), localStorage.getItem('theme'), "
                          "localStorage.getItem('accent')]") == [newer, "dark", "teal"]
     assert page.evaluate(SAVED_SINCE) is True, "the uploads saved by the session signed in since were wiped"
-    # The first tab's next load finds its session.
+    # The first tab stays signed in to the session signed in since, on the same page (not replaced).
+    expect(page.locator("#dashboard-screen")).to_be_visible()
+    assert still_old(page), "the tab signed in since was replaced"
+    assert page.evaluate("() => authToken") == newer and _refused(newer) == 200
+    # Shown once: the next load of the tab never told finds the session signed in since, and so does the first tab's.
+    late.reload()
+    expect(late.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert late.evaluate("() => authToken") == newer
     page.reload()
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
     assert page.evaluate("() => authToken") == newer and _refused(newer) == 200
