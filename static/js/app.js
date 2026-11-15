@@ -1572,10 +1572,30 @@ function dvHistoryState(state) {
 }
 window.dvHistoryState = dvHistoryState;
 
+// How the last same-document navigation came about, where the browser says (the Navigation API): 'traverse' for Back
+// and Forward, 'push' for a link followed or pasted into the address bar.
+let _lastNavigation = '';
+try {
+    if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+        window.navigation.addEventListener('navigate', (event) => { _lastNavigation = event.navigationType || ''; });
+    }
+} catch (_) { /* no Navigation API: every step to an unmarked entry is treated as one through history */ }
+
 function _dropAHashThisPageDidNotWrite() {
+    const how = _lastNavigation;
+    _lastNavigation = '';
     if (!location.hash) return;
     const st = history.state;
     if (st && typeof st === 'object' && st.dvDoc === _DOC_MARK) return;
+    // A link the person followed or pasted into this tab (not a step through history) is theirs: kept and marked as
+    // this page's own; on the sign-in screen it is kept for the sign-in, out of the address meanwhile.
+    if (how === 'push' || how === 'replace') {
+        if (authToken) {
+            try { history.replaceState(dvHistoryState(st), '', location.href); } catch (_) {}
+            return;
+        }
+        _hashForSignIn = location.hash;
+    }
     try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
 }
 window.addEventListener('popstate', _dropAHashThisPageDidNotWrite);
