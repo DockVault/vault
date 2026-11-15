@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, sign_out_as
+
 pytestmark = pytest.mark.ui
 
 ADMIN_ITEMS = ("groups", "activity", "settings")
@@ -40,11 +42,16 @@ def _login(page: Page, username: str, password: str):
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
 
 
-def _sign_out_in_app(page: Page):
-    """The app's own sign-out, not a reload: the page and its sidebar stay as they were."""
-    page.click("#profile-btn")
-    page.click("#dropdown-logout-btn")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+def _sign_out_in_app(page: Page, how=ANSWERED):
+    """The app's own sign-out through the Sign out button, not a reload. Sign-out answered: back once the page has
+    been replaced. Sign-out on its way: back with the page signed out still in place, its sidebar as the sign-out
+    left it; returns the held call."""
+
+    def button():
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
+
+    return sign_out_as(page, how, button)
 
 
 def _admin_requests(page: Page) -> list:
@@ -66,8 +73,12 @@ def _expect_admin_items_hidden(page: Page):
         expect(_item(page, section)).to_be_hidden()
 
 
-def test_a_user_after_an_administrator_on_the_same_tab_gets_no_administrator_items(page: Page, admin, admin_creds):
-    """Both ways: hidden for the user who follows an administrator, back for the administrator who follows."""
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_a_user_after_an_administrator_on_the_same_tab_gets_no_administrator_items(page: Page, admin, admin_creds,
+                                                                                   how):
+    """Both ways: hidden for the user who follows an administrator, back for the administrator who follows. The
+    administrator's sign-out answered (the page is replaced), or on its way (the page signed out stays until the
+    user signs in on it, which replaces it)."""
     u = admin.create_user(role="user")
     try:
         page.goto("/")
@@ -75,11 +86,13 @@ def test_a_user_after_an_administrator_on_the_same_tab_gets_no_administrator_ite
         for section in ADMIN_ITEMS:
             expect(_item(page, section)).to_be_visible()
 
-        _sign_out_in_app(page)
+        signing_out = _sign_out_in_app(page, how)
         _expect_admin_items_hidden(page)  # already at sign-out, before anyone signs in
 
         asked = _admin_requests(page)
         _login(page, u["_username"], u["_password"])
+        if signing_out:
+            signing_out.release()
         _expect_admin_items_hidden(page)
         # Moving about as the user asks nothing of the administrator routes either.
         page.click('.sidebar-item[data-section="vaults"]')

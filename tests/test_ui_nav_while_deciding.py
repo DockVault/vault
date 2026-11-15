@@ -19,6 +19,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
+from _ui_hand_over import SIGN_OUT_STANDS, sign_out, sign_out_as
 from conftest import unique
 
 pytestmark = pytest.mark.ui
@@ -192,7 +193,11 @@ def test_a_user_who_asks_for_compliance_or_activity_meanwhile_lands_on_the_dashb
         admin.delete_user(u["id"])
 
 
-def test_going_elsewhere_or_signing_out_ends_the_wait(page: Page, admin, admin_creds):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_going_elsewhere_or_signing_out_ends_the_wait(page: Page, admin, admin_creds, how):
+    """Signed out while waiting, with the sign-out answered (the page is replaced by a new one, which waits for
+    nothing) or still on its way (the page signed out stays, and waits for nothing either): the answer of the person
+    who has gone, let go then, opens nothing for the next one."""
     u = admin.create_user(role="user")
     try:
         page.goto("/")
@@ -211,19 +216,21 @@ def test_going_elsewhere_or_signing_out_ends_the_wait(page: Page, admin, admin_c
         expect(_section(page, "compliance")).not_to_have_class(ACTIVE)
 
         # Signed out while waiting: the answer of the person who has gone opens nothing for the next one.
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        sign_out(page)
         held = _Held(page, "**/compliance/me")
         _login(page, admin_creds["username"], admin_creds["password"])
         page.evaluate("() => navigateToSection('compliance')")
         held.wait()
         _expect_waiting(page, "compliance")
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        signing_out = sign_out_as(page, how)
         _expect_not_waiting(page, "compliance")
         assert page.evaluate("() => navDeciding.size") == 0
         held.release()
+        page.evaluate("() => fetch('/health').then((r) => r.text())")    # the page has had the answer
+        _expect_not_waiting(page, "compliance")
         _login(page, u["_username"], u["_password"])
+        if signing_out:
+            signing_out.release()
         page.wait_for_function("() => !navDeciding.has('compliance')", timeout=15000)
         _expect_the_dashboard(page)
         expect(_section(page, "compliance")).not_to_have_class(ACTIVE)
