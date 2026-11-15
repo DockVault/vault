@@ -469,7 +469,9 @@
     function writeHash() {
         if (!S.active || S.blocked) return;
         const qs = hashParams(S.detailOpen).toString();
-        try { history.replaceState(history.state, '', location.pathname + location.search + '#activity' + (qs ? '?' + qs : '')); }
+        // Marked as this page's own entry (app.js dvHistoryState): a step back to it keeps the search.
+        const own = typeof window.dvHistoryState === 'function' ? window.dvHistoryState(history.state) : history.state;
+        try { history.replaceState(own, '', location.pathname + location.search + '#activity' + (qs ? '?' + qs : '')); }
         catch (_) { /* a sandboxed frame */ }
     }
 
@@ -1870,7 +1872,9 @@
         if (m.classList.contains('active')) return;
         openModal('activity-event-modal');
         m.dataset.actOpen = '1';
-        try { history.pushState({ activityDetail: true }, '', location.href); phonePushed = true; } catch (_) { phonePushed = false; }
+        const own = typeof window.dvHistoryState === 'function'
+            ? window.dvHistoryState({ activityDetail: true }) : { activityDetail: true };
+        try { history.pushState(own, '', location.href); phonePushed = true; } catch (_) { phonePushed = false; }
         setTimeout(() => { const b = m.querySelector('.act-sheet-back'); if (b) b.focus(); }, 0);
     }
 

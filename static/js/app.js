@@ -1416,17 +1416,32 @@ let _hashForSignIn = '';
 function _openOnlyTheHashThePageCameWith() {
     const hash = _hashForSignIn;
     _hashForSignIn = '';
-    try { history.replaceState(null, '', location.pathname + location.search + hash); } catch (_) {}
+    try { history.replaceState(dvHistoryState(null), '', location.pathname + location.search + hash); } catch (_) {}
 }
 
-// A hash brought back by Back or Forward while no session is open (in Chromium that can be a step within this very
-// page, to an entry an earlier page left, perhaps of an earlier person's session): it leaves the address at once.
-function _dropHashWhileSignedOut() {
-    if (authToken || !location.hash) return;
+// The history entries this page writes with a hash carry its own mark (dvHistoryState: the Activity search, its
+// event's view on a phone, a copied link opened at the sign-in). Back or Forward can be a step within this very page
+// to an entry an earlier page left (Chromium keeps the page that replaced a signed-out one in that page's history),
+// perhaps of an earlier person's session: a hash reached so, without this page's mark, leaves the address at once
+// and is never opened, whoever is signed in.
+const _DOC_MARK = (() => {
+    try { if (window.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID(); } catch (_) {}
+    return String(Date.now()) + '-' + String(Math.random()).slice(2);
+})();
+
+function dvHistoryState(state) {
+    return Object.assign({}, state && typeof state === 'object' ? state : {}, { dvDoc: _DOC_MARK });
+}
+window.dvHistoryState = dvHistoryState;
+
+function _dropAHashThisPageDidNotWrite() {
+    if (!location.hash) return;
+    const st = history.state;
+    if (st && typeof st === 'object' && st.dvDoc === _DOC_MARK) return;
     try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
 }
-window.addEventListener('popstate', _dropHashWhileSignedOut);
-window.addEventListener('hashchange', _dropHashWhileSignedOut);
+window.addEventListener('popstate', _dropAHashThisPageDidNotWrite);
+window.addEventListener('hashchange', _dropAHashThisPageDidNotWrite);
 
 // Login
 document.getElementById('login-form').addEventListener('submit', async (e) => {
@@ -1503,6 +1518,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // Apply this account's server-saved UI preferences (theme/accent/skin) so a
         // login on a fresh browser picks up the look they set elsewhere. May reload
         // once if the saved skin differs; if so, stop — the reload restarts the flow.
+        // The address the sign-in opens, set before anything can reload the page (the account's saved skin below):
+        // a copied link this page was loaded with is opened by the page that loads then.
+        _openOnlyTheHashThePageCameWith();
         let reloadingPrefs = false;
         try { reloadingPrefs = await applyServerPreferences(); } catch (_) {}
         if (reloadingPrefs) return;
@@ -1529,7 +1547,6 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
         // A copied link to an Activity search, opened before signing in, opens it now. Only a link this page was
         // loaded with (_hashForSignIn).
-        _openOnlyTheHashThePageCameWith();
         openActivityFromHash();
 
         // Prompt a keyless user who's been invited to a ZK vault to set up a key.
@@ -1610,7 +1627,8 @@ async function finishSecondFactorLogin(accessToken) {
     // account stored beside it, as the password sign-in stores it (the new page also verifies a token stored alone).
     if (_pageEnded) {
         try {
-            const resp = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+            const resp = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${accessToken}` },
+                signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(10000) : undefined });
             if (resp.ok) storage.setItem('currentUser', JSON.stringify(await resp.json()));
         } catch (_) { /* the new page verifies the token itself */ }
         _replaceAfterSignIn();
@@ -1621,8 +1639,7 @@ async function finishSecondFactorLogin(accessToken) {
     _openOnlyTheHashThePageCameWith();
     // enterAuthedSession fetches /users/me, applies prefs, loads permissions, and reveals the
     // dashboard — the same boot a refreshed session runs.
-    await enterAuthedSession();
-    try { connectAppSocket(); } catch (_) {}
+    await enterAuthedSession();      // which opens the app-wide socket
 }
 
 function renderVerifyCard(box, opts) {
@@ -2025,9 +2042,8 @@ function _replaceAfterSignIn() {
 
 // A page brought back from the browser's back-and-forward cache after a session ended on it (or with no session at
 // all) is not shown as it was left: it is loaded again.
-let _inviteOrResetPage = false;
 window.addEventListener('pageshow', (event) => {
-    if (event && event.persisted && (_pageEnded || (!authToken && !_inviteOrResetPage))) location.replace(location.pathname);
+    if (event && event.persisted && (_pageEnded || !authToken)) location.replace(location.pathname);
 });
 
 // The reason on the sign-in screen, as text.
@@ -13389,6 +13405,8 @@ async function dvOpenDownloadSink({ filename, size, mime }) {
             { type: 'dv-sink-open', id, filename, size, mime: 'application/octet-stream' }, [channel.port2]);
     });
     if (!url) return null;
+    // The session ended while the sink was being opened: no download is started in the browser for it.
+    if (_pageEnded) return null;
 
     // A hidden same-origin iframe, NOT an anchor, and this is not a style choice. An anchor
     // navigates the document; if the stream then errors, the browser follows that navigation to
@@ -13490,7 +13508,7 @@ async function dvTryStandardStreamedDownload(response, fileName, size, mime, abo
     }
 }
 
-async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileName) {
+async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileName, abortCtl) {
     const lib = eccLib();
     const declared = Number(response.headers.get('Content-Length'));
     if (!response.body || typeof lib.decryptStreamV2 !== 'function'
@@ -13562,7 +13580,7 @@ async function zkTryStreamedDownload(response, vault, keyVersion, fileId, fileNa
                 next = await fetch(
                     `${API_BASE}/vaults/${vault.id}/files/${fileId}/download`,
                     { headers: { ...zkDownloadHeaders(), 'Range': `bytes=${resume.offset}-`,
-                                 'If-Range': etag } });
+                                 'If-Range': etag }, signal: abortCtl ? abortCtl.signal : undefined });
             } catch (_) {
                 sink.abort('reconnect-failed');
                 return 'failed';
@@ -14545,13 +14563,13 @@ async function _downloadFile(fileId, fileName) {
                 return;
             }
             response = await fetch(
-                `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers });
+                `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`, { headers, signal: _dlAbort.signal });
             if (!response.ok) throw new Error('Download failed');
         }
 
         if (isZkVault(state.currentVault) && state.downloadSink === 'streaming') {
             const streamed = await zkTryStreamedDownload(
-                response, state.currentVault, zkFileKeyVersion(fileId), fileId, fileName);
+                response, state.currentVault, zkFileKeyVersion(fileId), fileId, fileName, _dlAbort);
             if (streamed === true) {
                 showSuccess(`Downloading "${fileName}"`);
                 return;
@@ -14573,7 +14591,7 @@ async function _downloadFile(fileId, fileName) {
             }
             response = await fetch(
                 `${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/download`,
-                { headers });
+                { headers, signal: _dlAbort.signal });
             if (!response.ok) throw new Error('Download failed');
         }
 
@@ -21766,7 +21784,6 @@ document.addEventListener('DOMContentLoaded', () => {
         // sit in browser/proxy history. Done before initInviteFlow fetches anything.
         try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
-        _inviteOrResetPage = true;
         initInviteFlow(inviteToken);
         return;
     }
@@ -21777,7 +21794,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (resetToken) {
         try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
-        _inviteOrResetPage = true;
         initResetFlow(resetToken);
         return;
     }
