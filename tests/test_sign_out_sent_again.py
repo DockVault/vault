@@ -42,7 +42,7 @@ def _block(head: str) -> str:
 
 SHIPPED = "".join(_line(f"const {name} =") for name in (
     "SIGN_OUT_WAIT_MS", "SIGN_OUT_RETRY_FIRST_MS", "SIGN_OUT_RETRY_MOST_MS", "_preferenceSaves", "_signOutsOwed",
-    "_signOutsOver",
+    "_signOutsOver", "SIGN_OUT_REPLACE_CAP_MS",
 )) + "".join(_fn(name) for name in (
     "_endServerSession", "_sendSignOut", "_signOutAgain", "_retryAfterMs", "_tokenClaims", "_signOutOver",
 )) + _block("window.addEventListener('online',")
@@ -114,8 +114,9 @@ const after = report();
 await advance(600000);
 console.log(JSON.stringify({ first, after, end: report(), auth: sent.map((s) => s.auth), kept: sent.every((s) => s.keepalive) }));
 """)
-    assert out["first"] == {"sent": [0], "owed": 1, "timers": 1}
-    assert out["after"] == {"sent": [0, 4000], "owed": 0, "timers": 0}
+    # The timers: the retry, and the latest the page waits for the sign-out before it is replaced (the cap).
+    assert out["first"] == {"sent": [0], "owed": 1, "timers": 2}
+    assert out["after"] == {"sent": [0, 4000], "owed": 0, "timers": 1}
     assert out["end"]["sent"] == [0, 4000]
     assert out["kept"] is True and set(out["auth"]) == {out["auth"][0]} and out["auth"][0].startswith("Bearer ")
 
@@ -186,24 +187,60 @@ console.log(JSON.stringify(report()));
     assert out["sent"] == [0]
 
 
-def test_the_sign_out_is_over_only_once_the_server_has_answered_it_for_good():
-    """The page is replaced when the sign-out is over (static/js/app.js logout): not while it is still owed."""
+def test_the_sign_out_is_over_once_the_server_has_answered_it_for_good_or_at_the_cap():
+    """The page is replaced when the sign-out is over (static/js/app.js logout): not while it is still owed, but at the
+    latest SIGN_OUT_REPLACE_CAP_MS (15 s) after it was sent; the call is still sent again after that while the page
+    lives."""
     out = _run(TOKEN + """
-answers = [{ status: 503, retryAfter: '20' }, { status: 200 }];
+answers = [{ status: 503, retryAfter: '5' }, { status: 200 }];
 let overAt = null;
 _endServerSession(token).then(() => { overAt = now - START; });
 await settle();
 const first = overAt;
 await advance(600000);
 const retried = overAt;
-// A call that is never answered keeps the sign-out owed: never over.
+// Answered after the cap: over at the cap, and sent again all the same.
+let lateAt = null;
+const START2 = now;
+answers = [{ status: 503, retryAfter: '20' }, { status: 200 }];
+const late = tokenFor({ sub: 'w', session_token: 'u', exp: Math.floor((now + 3600000) / 1000) });
+_endServerSession(late).then(() => { lateAt = now - START2; });
+await advance(600000);
+const lateSent = report().sent.length;
+// A call that is never answered: over at the cap too.
 answers = ['pending'];
 let neverAt = null;
+const START3 = now;
 const other = tokenFor({ sub: 'v', session_token: 't', exp: Math.floor((now + 3600000) / 1000) });
-_endServerSession(other).then(() => { neverAt = now - START; });
+_endServerSession(other).then(() => { neverAt = now - START3; });
 await advance(600000);
-console.log(JSON.stringify({ first, retried, never: neverAt, sent: report().sent }));
+console.log(JSON.stringify({ first, retried, late: lateAt, lateSent, never: neverAt }));
 """)
     assert out["first"] is None
-    assert out["retried"] == 20000
-    assert out["never"] is None
+    assert out["retried"] == 5000
+    assert out["late"] == 15000
+    assert out["lateSent"] == 4          # 2 for the first token, 2 for the late one: the retry outlives the cap
+    assert out["never"] == 15000
+
+
+def test_a_sign_out_waiting_for_a_preference_save_is_owed_before_it_is_sent():
+    """A sign-out put off for a preference save still on its way is owed at once, so a page that goes early (a sign-in
+    on it, app.js _replaceAfterSignIn) sends it too; once sent, it is sent once."""
+    out = _run(TOKEN + """
+answers = [{ status: 200 }];
+let release;
+_preferenceSaves.add(new Promise((resolve) => { release = resolve; }));
+_endServerSession(token);
+await settle();
+const parked = report();
+// What a page that goes early does with what it owes.
+_signOutsOwed.forEach((owed, t) => { if (!owed.sending) _sendSignOut(t); });
+await settle();
+const flushed = report();
+release();
+await advance(600000);
+console.log(JSON.stringify({ parked, flushed, end: report() }));
+""")
+    assert out["parked"]["sent"] == [] and out["parked"]["owed"] == 1
+    assert out["flushed"]["sent"] == [0] and out["flushed"]["owed"] == 0
+    assert out["end"]["sent"] == [0]

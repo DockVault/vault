@@ -738,8 +738,22 @@ function showLoading(element, message = 'Loading...') {
 // API & UTILITY FUNCTIONS
 // ============================================================================
 
+// Every call made through apiRequest belongs to the session open on this page when it was made. Once that session has
+// ended here (logout counts it), its answer is dropped: the promise never settles, so nothing the call would do with
+// it (draw a list into a page that has gone, show an error) is done for the next person or on the sign-in screen.
+// A call made after the end (the sign-in screen's own) is answered as usual.
+let _sessionsEnded = 0;
+
+function apiRequest(endpoint, options = {}) {
+    const asked = _sessionsEnded;
+    const dropped = () => new Promise(() => {});
+    return _apiRequestNow(endpoint, options).then(
+        (value) => (asked === _sessionsEnded ? value : dropped()),
+        (err) => (asked === _sessionsEnded ? Promise.reject(err) : dropped()));
+}
+
 // Utility: API Request with auth and enhanced error handling
-async function apiRequest(endpoint, options = {}) {
+async function _apiRequestNow(endpoint, options = {}) {
     const headers = {
         'Content-Type': 'application/json',
         ...options.headers
@@ -931,17 +945,15 @@ function showPermissionDenied(message) {
 
 // Show/Hide Screens
 function showScreen(screenId) {
+    // A page that has ended a session holds the sign-in screen alone (_removeSignedInPage) and never shows anything
+    // else again: whatever would be shown (a session just stored by a sign-in on this page) is shown by a new page.
+    if (_pageEnded && screenId !== 'login-screen') {
+        _replaceAfterSignIn();
+        return;
+    }
     if (screenId === 'dashboard-screen') {
-        // Signed in again on a page still waiting to be replaced after a sign-out (its sign-out not answered yet): it
-        // is replaced now, and the new page opens the session just stored, holding nothing of the page before. The
-        // sign-outs it still owes are sent first, at once and keepalive (the sign-in just reached the server), since
-        // their retries end with the page.
-        if (_replacing) {
-            _signOutsOwed.forEach((owed, token) => { if (!owed.sending) _sendSignOut(token); });
-            location.replace(location.pathname);
-            return;
-        }
         _appShown = true;
+        _signingIn = false;
     }
     document.querySelectorAll('.screen').forEach(screen => {
         screen.classList.remove('active');
@@ -1112,11 +1124,17 @@ async function applyLoginPolicyLabel() {
 // shown or focused, as the told tab itself would have: many tabs told at once must not spend the request budget the
 // sign-in that follows needs. Any other page asks at once.
 function _toldTabReplaced() {
+    let told = false;
     try {
-        const told = sessionStorage.getItem('dv_signed_out_told') === '1';
+        told = sessionStorage.getItem('dv_signed_out_told') === '1';
         sessionStorage.removeItem('dv_signed_out_told');
-        return told;
-    } catch (_) { return false; }
+    } catch (_) {}
+    // The same note in the tab's name (SIGNED_OUT_NAME, read again and emptied by _takeSignedOutNote).
+    try {
+        const name = String(window.name || '');
+        if (name.startsWith('dv-signed-out:')) told = told || JSON.parse(name.slice(14)).t === true;
+    } catch (_) {}
+    return told;
 }
 if (_toldTabReplaced()) queueMicrotask(() => { try { _refreshLoginPolicyWhenShown(); } catch (_) {} });
 else applyLoginPolicyLabel();
@@ -1523,6 +1541,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     errorDiv.style.display = 'none';
     errorDiv.className = 'alert alert-error mt-md';
 
+    // From here until the app is shown or the sign-in fails (its second step included), the page is not replaced
+    // under the person signing in (_replacePageAfterSignOut).
+    _signingIn = true;
     try {
         const response = await fetch(`${API_BASE}/auth/login`, {
             method: 'POST',
@@ -1573,7 +1594,10 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
         // Store user data
         storage.setItem('currentUser', JSON.stringify(currentUser));
-        
+
+        // On a page that has ended a session the app is not there to show: a new page opens the session just stored.
+        if (_pageEnded) { _replaceAfterSignIn(); return; }
+
         console.log('Login successful:', currentUser);
 
         // Load user permissions
@@ -1617,6 +1641,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         console.error('Login error:', error);
         errorDiv.textContent = error.message;
         errorDiv.style.display = 'block';
+        _signInEnded(error.message);
     }
 });
 
@@ -1659,6 +1684,8 @@ function _sfError(node, msg) {
 
 // policyWhenShown: ask for the screen's policy when the tab is next shown, not now (a tab told of a sign-out).
 function _sfRestoreLoginForm(policyWhenShown) {
+    // A second step given up (Back to sign in, a cancel, a pre-sign-in token that ran out) ends that sign-in.
+    _signInEnded();
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
     const form = document.getElementById('login-form');
@@ -1711,6 +1738,8 @@ async function finishSecondFactorLogin(accessToken) {
     isScopedTemp = false;
     sessionAccess = null;
     try { storage.setItem('authToken', accessToken); storage.setItem('isScopedTemp', ''); } catch (_) {}
+    // On a page that has ended a session, a new page opens the session just stored (see the sign-in above).
+    if (_pageEnded) { _replaceAfterSignIn(); return; }
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
     // enterAuthedSession fetches /users/me, applies prefs, loads permissions, and reveals the
@@ -2073,8 +2102,11 @@ const SIGN_OUT_RETRY_MOST_MS = 300000;
 const _preferenceSaves = new Set();
 const _signOutsOwed = new Map();     // token -> { timer, wait, sending }
 
-// Resolves when the sign-out of `token` is over: answered for good, or given up once the token has run out. Until then
-// the page is kept (signed out and emptied) so that the call is sent again as above; the page is replaced after.
+// Resolves when the sign-out of `token` is over: answered for good, given up once the token has run out, or at the
+// latest SIGN_OUT_REPLACE_CAP_MS after it was first sent. Until then the page is kept (holding the sign-in screen
+// alone) so that the call is sent again as above; the page is replaced after. A call still unanswered at the cap ends
+// with the page: that session ends when its token expires, as when a tab is closed.
+const SIGN_OUT_REPLACE_CAP_MS = 15000;
 const _signOutsOver = new Map();     // token -> resolve
 
 function _signOutOver(token) {
@@ -2085,13 +2117,18 @@ function _signOutOver(token) {
 
 function _endServerSession(token) {
     if (!token) return Promise.resolve();
-    const over = new Promise((resolve) => { _signOutsOver.set(token, resolve); });
+    let resolveOver;
+    const over = new Promise((resolve) => { resolveOver = resolve; _signOutsOver.set(token, resolve); });
     _tellOtherTabsSignedOut(token);
+    // Owed from now on, not only once sent: a call still waiting for a preference save is then sent too when the
+    // page goes early (a sign-in on this page, _replaceAfterSignIn).
+    _signOutsOwed.set(token, { timer: null, wait: 0, sending: false });
     let sent = false;
     const send = () => {
         if (sent) return;
         sent = true;
-        _sendSignOut(token);
+        setTimeout(() => resolveOver(), SIGN_OUT_REPLACE_CAP_MS);
+        if (_signOutsOwed.has(token)) _sendSignOut(token);   // not when already sent and answered meanwhile
     };
     const saving = Array.from(_preferenceSaves);
     if (!saving.length) { send(); return over; }
@@ -2214,63 +2251,170 @@ function _sessionOf(token) {
     return String(token);
 }
 
-// After every end of a session the page is replaced, not scrubbed: a fresh page holds nothing of the person who
-// signed out (no list, no cached answer, no unlocked key), whatever the sections hold now or will hold later. The
-// sign-out below still empties what it can at once, so nothing of the person stays on screen while the page is
-// being replaced. The reason for the sign-in screen rides along in this tab's sessionStorage under a one-shot key
-// (SIGNED_OUT_REASON_KEY), which the new page shows once and deletes (_showSignedOutReason). Only a page that has
-// shown the app since it loaded replaces itself: one that boots without a session, or whose stored token is refused
-// before anything was drawn, shows the sign-in screen as it is, so a replacement can never loop. The page is replaced
-// once the session's sign-out is over (_endServerSession: answered for good, which takes a moment, or given up when
-// the token runs out after the server could not take it); until then it stays signed out and emptied, sending the
-// call again as before. Offline, the replacement waits until the browser is back online: replaced then, the page
-// would be the browser's own error page.
+// After every end of a session the signed-in page is removed from the document at once, and the page is then replaced:
+// a fresh page holds nothing of the person who signed out (no list, no cached answer, no unlocked key), whatever the
+// sections hold now or will hold later.
+//
+// - At the end of a session, everything under <body> but the sign-in screen goes (_removeSignedInPage): the
+//   dashboard screen with every section and dialog in it, and what is added beside it (a reset link's overlay, the
+//   download and upload trays, menus, dialogs). However long the page then waits for its replacement, it holds
+//   nothing of the person, painted or hidden, and nothing depends on a list of what to empty being complete. Such a
+//   page never shows anything but the sign-in screen again (_pageEnded, showScreen): a sign-in on it stores the new
+//   session and a new page opens it (_replaceAfterSignIn).
+// - The tab's own session has ended: its new page shows the sign-in screen once, whatever this browser's storage
+//   holds (a session another tab signed in to meanwhile is that tab's and is left alone). The key that says so
+//   (SIGNED_OUT_REASON_KEY, one-shot, this tab's sessionStorage) also holds the reason to show there, if any.
+// - The page is replaced once the session's sign-out is over (_endServerSession: answered for good, given up when the
+//   token runs out, or at the latest SIGN_OUT_REPLACE_CAP_MS after it was sent); until then it is sent again as
+//   before. Not in the middle of a sign-in on this page (_signingIn, the second step included): the replacement then
+//   waits until the sign-in ends, and a sign-in that succeeds replaces the page itself.
+// - Before replacing, the page asks whether the server answers (/health); while it does not (offline, a proxy's 502),
+//   the page asks again every few seconds and is replaced once it does: replaced before, it would be the browser's
+//   or the proxy's error page.
+// - Only a page that has shown the app since it loaded replaces itself after a sign-out: one that boots without a
+//   session, or whose stored token is refused before anything was drawn, keeps its sign-in screen (with the reason),
+//   so a replacement can never loop.
 const SIGNED_OUT_REASON_KEY = 'dv_signed_out_reason';
 // Set for a page replacing a tab that was told of a sign-out in another tab (see _toldTabReplaced).
 const SIGNED_OUT_TOLD_KEY = 'dv_signed_out_told';
-let _appShown = false;
-let _replacing = false;
+const REPLACE_RETRY_MS = 3000;
+const REPLACE_HEALTH_TIMEOUT_MS = 2500;
+let _appShown = false;      // the app has been shown since the page loaded
+let _pageEnded = false;     // a session has ended on this page: it holds the sign-in screen alone
+let _replacing = false;     // the page is to be replaced (never undone)
+let _signingIn = false;     // a sign-in on this page is under way
+let _replaceWhenSignInEnds = false;
+
+// Everything under <body> but the sign-in screen (and the scripts and the icon sprite, which hold nothing of anyone).
+function _removeSignedInPage() {
+    if (!document.body) return;
+    Array.from(document.body.children).forEach((node) => {
+        if (node.id === 'login-screen' || node.tagName === 'SCRIPT'
+            || (node.classList && node.classList.contains('svg-sprite'))) return;
+        node.remove();
+    });
+}
+
+// Whether the server answers: asked before the page is replaced, so the new page is the app and not an error page.
+async function _serverAnswers() {
+    try {
+        const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), REPLACE_HEALTH_TIMEOUT_MS) : null;
+        const resp = await fetch(`${API_BASE}/health`, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+        if (timer) clearTimeout(timer);
+        return resp.ok;
+    } catch (_) {
+        return false;
+    }
+}
+
+// The note the new page reads, written now and again just before the page goes. It rides in the tab's window.name as
+// well (SIGNED_OUT_NAME): a refusal of the session carries Clear-Site-Data, which can empty the tab's storage after
+// that, even for an answer that arrives while the page is going; the tab's name is not storage. The new page reads
+// either and empties both at once (_takeSignedOutNote).
+const SIGNED_OUT_NAME = 'dv-signed-out:';
+let _endedReason = '';
+let _endedTold = false;
+
+function _writeSignedOutKeys() {
+    try {
+        sessionStorage.setItem(SIGNED_OUT_REASON_KEY, _endedReason);
+        if (_endedTold) sessionStorage.setItem(SIGNED_OUT_TOLD_KEY, '1');
+        else sessionStorage.removeItem(SIGNED_OUT_TOLD_KEY);
+    } catch (_) {}
+    try { window.name = SIGNED_OUT_NAME + JSON.stringify({ r: _endedReason, t: _endedTold }); } catch (_) {}
+}
 
 function _replacePageAfterSignOut(signOutOver, reason, told) {
     if (_replacing) return;
     _replacing = true;
-    try {
-        if (reason) sessionStorage.setItem(SIGNED_OUT_REASON_KEY, String(reason));
-        else sessionStorage.removeItem(SIGNED_OUT_REASON_KEY);
-        if (told) sessionStorage.setItem(SIGNED_OUT_TOLD_KEY, '1');
-        else sessionStorage.removeItem(SIGNED_OUT_TOLD_KEY);
-    } catch (_) {}
-    const replace = () => {
-        if (authToken) { _replacing = false; return; }      // signed in again meanwhile: nothing to replace
-        location.replace(location.pathname);
+    _endedReason = reason ? String(reason) : '';
+    _endedTold = !!told;
+    _writeSignedOutKeys();
+    let asking = false;
+    const attempt = async () => {
+        if (asking) return;
+        if (_signingIn) { _replaceWhenSignInEnds = true; return; }
+        asking = true;
+        const answers = await _serverAnswers();
+        asking = false;
+        if (_signingIn) { _replaceWhenSignInEnds = true; return; }
+        if (answers) { _writeSignedOutKeys(); location.replace(location.pathname); return; }
+        setTimeout(attempt, REPLACE_RETRY_MS);
     };
-    Promise.resolve(signOutOver).then(() => {
-        if (navigator.onLine === false) window.addEventListener('online', replace, { once: true });
-        else replace();
-    });
+    _replaceAttempt = attempt;
+    Promise.resolve(signOutOver).then(attempt);
+}
+let _replaceAttempt = null;
+window.addEventListener('online', () => { if (_replaceAttempt) _replaceAttempt(); });
+
+// A sign-in on this page has ended without showing the app (it failed, or its second step was given up): a
+// replacement put off meanwhile happens now, with what the sign-in screen said as the new page's reason.
+function _signInEnded(message) {
+    if (!_signingIn) return;
+    _signingIn = false;
+    if (!_replaceWhenSignInEnds || !_replaceAttempt) return;
+    _replaceWhenSignInEnds = false;
+    if (message) _endedReason = String(message);
+    _replaceAttempt();
 }
 
-// The reason the last session of this tab ended, on the sign-in screen of the page that replaced it: once, and only
-// when the page boots signed out. The key is deleted whatever the page then shows.
-function _showSignedOutReason(signedIn) {
-    let reason = null;
+// A sign-in on a page that has ended a session has stored the new session: a new page opens it. The sign-outs this
+// page still owes are sent first, at once and keepalive (the sign-in just reached the server), since their retries
+// end with the page; one still waiting for a preference save among them.
+function _replaceAfterSignIn() {
+    _replacing = true;
+    _signOutsOwed.forEach((owed, token) => { if (!owed.sending) _sendSignOut(token); });
     try {
-        reason = sessionStorage.getItem(SIGNED_OUT_REASON_KEY);
         sessionStorage.removeItem(SIGNED_OUT_REASON_KEY);
+        sessionStorage.removeItem(SIGNED_OUT_TOLD_KEY);
     } catch (_) {}
-    if (!reason || signedIn) return;
+    try { window.name = ''; } catch (_) {}
+    location.replace(location.pathname);
+}
+
+// A page brought back from the browser's back-and-forward cache after a session ended on it (or with no session at
+// all) is not shown as it was left: it is loaded again.
+window.addEventListener('pageshow', (event) => {
+    if (event && event.persisted && (_pageEnded || !authToken)) location.replace(location.pathname);
+});
+
+// The reason on the sign-in screen, as text.
+function _showReasonNote(reason) {
     const note = document.getElementById('login-error');
-    if (!note) return;
+    if (!note || !reason) return;
     note.className = 'alert alert-warning mt-md';
     note.setAttribute('role', 'alert');
-    note.textContent = reason;
+    note.textContent = String(reason);
     note.style.display = 'block';
+}
+
+// Whether the last session of this tab ended on the page this one replaces, with its reason ('' for none); null when
+// it did not. One-shot: the key is deleted whatever the page then shows (the invitation and reset pages too).
+function _takeSignedOutNote() {
+    let note = null;
+    try {
+        note = sessionStorage.getItem(SIGNED_OUT_REASON_KEY);
+        sessionStorage.removeItem(SIGNED_OUT_REASON_KEY);
+    } catch (_) {}
+    try {
+        const name = String(window.name || '');
+        if (name.startsWith(SIGNED_OUT_NAME)) {
+            if (note === null) {
+                const said = JSON.parse(name.slice(SIGNED_OUT_NAME.length));
+                note = said && typeof said.r === 'string' ? said.r : '';
+            }
+            window.name = '';
+        }
+    } catch (_) { try { window.name = ''; } catch (__) {} }
+    return note;
 }
 
 // Sign the page out. `how` is SIGN_OUT_THIS_TAB or SIGN_OUT_TOLD (see above); anything else, the click event the
 // sign-out buttons pass among them, is a full sign-out. `reason`, when given, is shown on the sign-in screen of the
 // page that replaces this one.
 function logout(how, reason) {
+    _sessionsEnded += 1;      // answers to calls made until now are dropped (apiRequest)
     const replaceAfter = _appShown;
     _appShown = false;
     let signOutOver = Promise.resolve();
@@ -2445,9 +2589,15 @@ function logout(how, reason) {
     settleConfirmModal();
     closeModal();
     showScreen('login-screen');
-    if (replaceAfter) {
-        _replacePageAfterSignOut(signOutOver, typeof reason === 'string' ? reason : '', mode === SIGN_OUT_TOLD);
-    }
+    // Then the signed-in page goes from the document, all of it (see _replacePageAfterSignOut). The page's own parts
+    // learn of the sign-out from the dashboard screen being put away (compliance.js stops an export on its way,
+    // notice-banner.js hides its banners, activity.js stops its timers): their watchers run first, on the page as it
+    // was, and the page goes in the microtask after them. Nothing is painted in between.
+    _pageEnded = true;
+    queueMicrotask(_removeSignedInPage);
+    const said = typeof reason === 'string' ? reason : '';
+    if (replaceAfter) _replacePageAfterSignOut(signOutOver, said, mode === SIGN_OUT_TOLD);
+    else _showReasonNote(said);
 }
 
 // Load Dashboard Statistics
@@ -22794,6 +22944,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // session TTL (+1h slack) so abandoned uploads can't accumulate in IndexedDB.
     try { zkUploadStore.pruneOlderThan(25 * 60 * 60 * 1000); } catch (_) {}
 
+    // Whether this tab's session ended on the page this one replaces (_replacePageAfterSignOut), and why: taken
+    // first, so the invitation and reset pages below delete it too.
+    const signedOutNote = _takeSignedOutNote();
+
     // An /?invite=... link is the invitation-acceptance flow: an anonymous visitor sets a password
     // and claims a pre-created account. It takes precedence over any cached session and never enters
     // the app — run it and stop here so the login/session bootstrap below is skipped.
@@ -22822,9 +22976,18 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
     }
 
+    // This tab's own session has just ended: the sign-in screen, once, whatever this browser's storage holds. A
+    // session another tab stored meanwhile is that tab's; it is left in storage, and this page does not open it.
+    if (signedOutNote !== null) {
+        authToken = null;
+        currentUser = null;
+        userPermissions = [];
+        isScopedTemp = false;
+        _showReasonNote(signedOutNote);
+    }
+
     // Check for existing session BEFORE showing any screen.
     const hasSession = authToken && currentUser;
-    _showSignedOutReason(!!hasSession);
 
     if (hasSession) {
         // The pre-paint splash (auth-boot.js) is up. VERIFY the cached token with the

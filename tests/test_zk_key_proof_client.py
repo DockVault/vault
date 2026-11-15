@@ -99,7 +99,7 @@ def test_the_string_proved_is_the_string_sent():
 
 
 def test_an_older_server_is_told_apart_by_a_404_without_a_reason():
-    api = _function("apiRequest")
+    api = _function("_apiRequestNow")       # apiRequest's own work (apiRequest drops answers of an ended session)
     branch = api[api.index("if (response.status === 404) {"):]
     branch = branch[:branch.index("\n        }\n")]
     assert "err.status = 404;" in branch and "err.reason =" in branch
