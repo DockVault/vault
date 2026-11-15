@@ -177,6 +177,7 @@ function hasAnyPermission(...groupNames) {
 
 // Load user permissions from API
 async function loadUserPermissions() {
+    const asked = _sessionsEnded;
     if (!currentUser || !currentUser.id) {
         console.warn('No user ID, skipping permission load');
         userPermissions = [];
@@ -198,6 +199,7 @@ async function loadUserPermissions() {
         }
         
         const data = await response.json();
+        if (asked !== _sessionsEnded) return;      // the session ended meanwhile: nothing of it is stored
         userPermissions = data.granted_groups || [];
         storage.setItem('userPermissions', JSON.stringify(userPermissions));
         console.log('✅ Loaded user permissions:', userPermissions);
@@ -1406,6 +1408,9 @@ function _resetDone() {
     setTimeout(_reloadToSignIn, 2500);
 }
 
+// A hash the page was loaded with on the sign-in screen, kept out of the address until the sign-in opens it.
+let _hashForSignIn = '';
+
 // Login
 document.getElementById('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1505,7 +1510,12 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
         // Load dashboard stats
         loadDashboardStats();
 
-        // A copied link to an Activity search, opened before signing in, opens it now.
+        // A copied link to an Activity search, opened before signing in, opens it now. Only a link this page was
+        // loaded with (_hashForSignIn).
+        if (_hashForSignIn) {
+            try { history.replaceState(null, '', location.pathname + location.search + _hashForSignIn); } catch (_) {}
+            _hashForSignIn = '';
+        }
         openActivityFromHash();
 
         // Prompt a keyless user who's been invited to a ZK vault to set up a key.
@@ -1582,8 +1592,16 @@ async function finishSecondFactorLogin(accessToken) {
     isScopedTemp = false;
     sessionAccess = null;
     try { storage.setItem('authToken', accessToken); storage.setItem('isScopedTemp', ''); } catch (_) {}
-    // On a page that has ended a session, a new page opens the session just stored (see the sign-in above).
-    if (_pageEnded) { _replaceAfterSignIn(); return; }
+    // On a page that has ended a session, a new page opens the session just stored (see the sign-in above), with its
+    // account stored beside it, as the password sign-in stores it (the new page also verifies a token stored alone).
+    if (_pageEnded) {
+        try {
+            const resp = await fetch(`${API_BASE}/users/me`, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+            if (resp.ok) storage.setItem('currentUser', JSON.stringify(await resp.json()));
+        } catch (_) { /* the new page verifies the token itself */ }
+        _replaceAfterSignIn();
+        return;
+    }
     const box = _sfBox();
     if (box) { box.replaceChildren(); box.style.display = 'none'; }
     // enterAuthedSession fetches /users/me, applies prefs, loads permissions, and reveals the
@@ -1918,15 +1936,38 @@ function _buildStepUpBody(action, methods) {
 //   error page, which holds nothing; the reload after it shows the sign-in screen and the reason.
 // - The tab's own session has ended: its new page shows the sign-in screen once, whatever this browser's storage
 //   holds. The key that says so (SIGNED_OUT_REASON_KEY, one-shot, this tab's sessionStorage) also holds the reason
-//   to show there, if any. The same note rides in the tab's window.name as well (SIGNED_OUT_NAME), set just before
-//   the page goes: a refusal of the session carries Clear-Site-Data, which can empty the tab's storage after that,
-//   even for an answer that arrives while the page is going. The new page reads either and empties both at once.
+//   to show there, if any. Its reason code rides in the tab's window.name as well (SIGNED_OUT_NAME), set just
+//   before the page goes: a refusal of the session carries Clear-Site-Data, which can empty the tab's storage after
+//   that, even for an answer that arrives while the page is going. Any page can name a tab, so only a code from
+//   SIGNED_OUT_REASONS goes there, never text, and a note found only in the name never drops or hides a session.
 // - Only a page that has shown the app since it loaded replaces itself after a sign-out: one that boots without a
 //   session, or whose stored token is refused before anything was drawn, keeps its sign-in screen (with the reason),
 //   so a replacement can never loop.
 const SIGNED_OUT_REASON_KEY = 'dv_signed_out_reason';
 const SIGNED_OUT_NAME = 'dv-signed-out:';
+const SIGNED_OUT_REASONS = {
+    ended: 'Your session has ended. Sign in again.',
+    inactive: 'User account is inactive',
+    locked: 'User account is locked',
+};
 const SIGNED_OUT_CLEAR_WAIT_MS = 2000;
+
+function _reasonCode(reason) {
+    for (const [code, said] of Object.entries(SIGNED_OUT_REASONS)) if (said === reason) return code;
+    return '';
+}
+
+// The note in the tab's name, read once as the page loads and the name emptied at once: the app's own sentence for
+// its code, or null.
+let _nameNoteText = null;
+try {
+    const name = String(window.name || '');
+    if (name.startsWith(SIGNED_OUT_NAME)) {
+        window.name = '';
+        const code = name.slice(SIGNED_OUT_NAME.length);
+        if (Object.prototype.hasOwnProperty.call(SIGNED_OUT_REASONS, code)) _nameNoteText = SIGNED_OUT_REASONS[code];
+    }
+} catch (_) { /* not the app's own note */ }
 let _appShown = false;      // the app has been shown since the page loaded
 let _pageEnded = false;     // a session has ended on this page: it holds the sign-in screen alone
 let _replacing = false;     // the page is to be replaced (never undone)
@@ -1954,7 +1995,7 @@ function _replacePageAfterSignOut(reason, cleared) {
         try {
             // Signed in on this page meanwhile: the new page opens that session, not the sign-in screen.
             if (authToken) { sessionStorage.removeItem(SIGNED_OUT_REASON_KEY); window.name = ''; }
-            else { sessionStorage.setItem(SIGNED_OUT_REASON_KEY, said); window.name = SIGNED_OUT_NAME + said; }
+            else { sessionStorage.setItem(SIGNED_OUT_REASON_KEY, said); window.name = SIGNED_OUT_NAME + _reasonCode(said); }
         } catch (_) {}
         location.replace(location.pathname);
     });
@@ -1969,8 +2010,9 @@ function _replaceAfterSignIn() {
 
 // A page brought back from the browser's back-and-forward cache after a session ended on it (or with no session at
 // all) is not shown as it was left: it is loaded again.
+let _inviteOrResetPage = false;
 window.addEventListener('pageshow', (event) => {
-    if (event && event.persisted && (_pageEnded || !authToken)) location.replace(location.pathname);
+    if (event && event.persisted && (_pageEnded || (!authToken && !_inviteOrResetPage))) location.replace(location.pathname);
 });
 
 // The reason on the sign-in screen, as text.
@@ -1991,13 +2033,6 @@ function _takeSignedOutNote() {
         note = sessionStorage.getItem(SIGNED_OUT_REASON_KEY);
         sessionStorage.removeItem(SIGNED_OUT_REASON_KEY);
     } catch (_) {}
-    try {
-        const name = String(window.name || '');
-        if (name.startsWith(SIGNED_OUT_NAME)) {
-            if (note === null) note = name.slice(SIGNED_OUT_NAME.length);
-            window.name = '';
-        }
-    } catch (_) {}
     return note;
 }
 
@@ -2005,6 +2040,8 @@ function _takeSignedOutNote() {
 // sign-in screen of the page that replaces this one.
 function logout(_event, reason) {
     _sessionsEnded += 1;      // answers to calls made until now are dropped (apiRequest)
+    _downloadsOfThisSession.forEach((ctl) => { try { ctl.abort(); } catch (_) {} });
+    _downloadsOfThisSession.clear();
     const replaceAfter = _appShown;
     _appShown = false;
     // The Activity page first, while the session still holds its token: a page size or range chosen in
@@ -2139,7 +2176,7 @@ function logout(_event, reason) {
     queueMicrotask(_removeSignedInPage);
     const said = typeof reason === 'string' ? reason : '';
     if (replaceAfter) _replacePageAfterSignOut(said, cleared);
-    else _showReasonNote(said);
+    _showReasonNote(said);
 }
 
 // Load Dashboard Statistics
@@ -14309,6 +14346,8 @@ const downloadProgress = {
     rows: new Map(),   // id -> { row, fill, sub }
     _tray() {
         let t = document.getElementById('download-tray');
+        // A page that has ended a session draws no tray: a row for a download still settling is drawn nowhere.
+        if (!t && _pageEnded) return document.createElement('div');
         if (!t) { t = document.createElement('div'); t.id = 'download-tray'; document.body.appendChild(t); }
         return t;
     },
@@ -14378,12 +14417,19 @@ async function downloadFile(fileId, fileName) {
     return transferGate.run(() => _downloadFile(fileId, fileName));
 }
 
+// The downloads under way in this session: logout aborts them all.
+const _downloadsOfThisSession = new Set();
+
 async function _downloadFile(fileId, fileName) {
     // A cancel handle for the download. Aborting it stops the in-flight fetch/read; the Standard
     // path below wires it to the progress tray's Cancel button. (This does not change the transfer
     // -- it just lets the user stop one.) Declared before the try so the catch can tell a
     // user-initiated cancel from a genuine failure.
     const _dlAbort = new AbortController();
+    // The end of the session stops it too (logout), the request, the read and the download it writes into, so a file
+    // of the person who signed out never lands in the browser's downloads after they have gone.
+    if (_pageEnded) return;
+    _downloadsOfThisSession.add(_dlAbort);
     _sinkUnavailableReason = null;   // a fresh download; only this run's sink attempt may set it
     const _finfo = (state.currentFiles || []).find(i => i.id === fileId) || {};
     const _fsize = Number(_finfo.size) || 0;
@@ -14545,6 +14591,7 @@ async function _downloadFile(fileId, fileName) {
                 downloadProgress.done(dlId);
             }
         }
+        if (_pageEnded) return;            // the session ended while it was read: nothing is saved
         // Saved from an address made under a type a browser only saves, never the type the file was
         // stored with (whatever its uploader claimed): a browser that does not honour the link's
         // download attribute opens the address instead, and under a page's type that would be a page
@@ -14567,6 +14614,8 @@ async function _downloadFile(fileId, fileName) {
         }
         console.error('Download failed:', error);
         showError('Failed to download file');
+    } finally {
+        _downloadsOfThisSession.delete(_dlAbort);
     }
 }
 
@@ -21491,15 +21540,20 @@ function cleanupPreviousView(newSection) {
 // while the pre-paint boot splash (auth-boot.js) is showing, so an EXPIRED token
 // bounces straight to login without ever flashing the app shell.
 async function enterAuthedSession() {
+    // A session ended while this waited (a refusal): its answers write nothing back.
+    const asked = _sessionsEnded;
     try {
         const resp = await fetch(`${API_BASE}/users/me`, {
             headers: { 'Authorization': `Bearer ${authToken}` }
         });
+        if (asked !== _sessionsEnded) return;
         if (!resp.ok) { logout(); return; }   // 401/403/etc -> login, no dashboard flash
         const user = await resp.json();
+        if (asked !== _sessionsEnded) return;
         currentUser = user;
         try { storage.setItem('currentUser', JSON.stringify(user)); } catch (_) {}
     } catch (e) {
+        if (asked !== _sessionsEnded) return;
         // Couldn't reach the server to verify — fail safe to login rather than a
         // half-loaded app on a dead/expired session.
         console.error('Session verification failed:', e);
@@ -21519,9 +21573,12 @@ async function enterAuthedSession() {
     // dashboard in the SAME synchronous tick so the default-active login screen never
     // paints in the gap (removing data-auth before an await would flash it).
     await loadUserPermissions();
+    if (asked !== _sessionsEnded) return;
     updateProfileUI(currentUser);
     document.documentElement.removeAttribute('data-auth');
     showScreen('dashboard-screen');
+    // The app-wide socket, as a sign-in opens it.
+    try { ensureAppSocket(); } catch (_) {}
 
     // Restore the section/vault/folder the user was on before a refresh.
     let restored = false;
@@ -21547,6 +21604,7 @@ async function enterAuthedSession() {
 // DOM/screens) so no screen flashes before the page navigates away.
 async function applyServerPreferences() {
     if (!authToken) return false;
+    const asked = _sessionsEnded;
     let prefs = null;
     try {
         const resp = await fetch(`${API_BASE}/users/me/preferences`, {
@@ -21555,6 +21613,7 @@ async function applyServerPreferences() {
         if (!resp.ok) return false;
         prefs = await resp.json();
     } catch (_) { return false; }
+    if (asked !== _sessionsEnded) return false;     // the session ended meanwhile
     if (!prefs || typeof prefs !== 'object') return false;
 
     // Vault-list ordering. Applied before any early-return below so the list is ordered the
@@ -21677,6 +21736,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // first, so the invitation and reset pages below delete it too.
     const signedOutNote = _takeSignedOutNote();
 
+    // A hash this load did not bring of its own: the page reached by Back or Forward (an entry of an earlier page,
+    // perhaps of an earlier person's session), or the page that replaces a signed-out one. It is never opened.
+    let navType = '';
+    try { const nav = performance.getEntriesByType('navigation')[0]; navType = nav ? nav.type : ''; } catch (_) {}
+    if (location.hash && (navType === 'back_forward' || signedOutNote !== null)) {
+        try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+    }
+
     const inviteToken = new URLSearchParams(location.search).get('invite');
     if (inviteToken) {
         // Strip ?invite=<token> from the URL immediately (keep the token only in JS memory), so the
@@ -21684,6 +21751,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // sit in browser/proxy history. Done before initInviteFlow fetches anything.
         try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
+        _inviteOrResetPage = true;
         initInviteFlow(inviteToken);
         return;
     }
@@ -21694,6 +21762,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (resetToken) {
         try { history.replaceState(null, '', location.pathname); } catch (_) {}
         document.documentElement.removeAttribute('data-auth');
+        _inviteOrResetPage = true;
         initResetFlow(resetToken);
         return;
     }
@@ -21707,8 +21776,16 @@ document.addEventListener('DOMContentLoaded', () => {
         _showReasonNote(signedOutNote);
     }
 
-    // Check for existing session BEFORE showing any screen.
-    const hasSession = authToken && currentUser;
+    // Check for existing session BEFORE showing any screen. A token stored without its account is verified the same
+    // way (enterAuthedSession fetches and stores the account).
+    const hasSession = !!authToken;
+    if (!hasSession && signedOutNote === null) _showReasonNote(_nameNoteText);
+    // The sign-in screen: a hash brought by this load (a copied link to an Activity search) leaves the address at
+    // once and is kept in memory only, to be opened after the sign-in (_hashForSignIn).
+    if (!hasSession && location.hash) {
+        _hashForSignIn = location.hash;
+        try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+    }
 
     if (hasSession) {
         // The pre-paint splash (auth-boot.js) is up. VERIFY the cached token with the
