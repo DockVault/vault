@@ -26,6 +26,7 @@ from playwright.sync_api import Browser, Page, expect
 from _account_change_helpers import psql
 from _auditor_helpers import compliance_receipt, forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, outbox, owner_with_vault
+from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, replaced, sign_out_as, wait_replaced
 from conftest import BASE_URL
 
 pytestmark = pytest.mark.ui
@@ -241,16 +242,23 @@ def test_listed_files_too_large_to_read_whole_are_refused_before_the_export_is_p
         page.context.close()
 
 
-# Marks, in the page, each export's request (an address under /exports/) that is cancelled.
+# Notes, in the tab's sessionStorage (which outlives the page a sign-out replaces), each export's request (an
+# address under /exports/) that is cancelled.
 WATCH_CANCELS = """() => {
-    window.__cancelled = [];
+    sessionStorage.setItem('probe_cancelled', '[]');
     const fetchOf = window.fetch;
     window.fetch = function (url, init) {
         const sent = fetchOf.apply(this, arguments);
-        sent.catch((e) => { if (e && e.name === 'AbortError' && String(url).includes('/exports/')) window.__cancelled.push(String(url)); });
+        sent.catch((e) => {
+            if (!(e && e.name === 'AbortError' && String(url).includes('/exports/'))) return;
+            const cancelled = JSON.parse(sessionStorage.getItem('probe_cancelled') || '[]');
+            cancelled.push(String(url));
+            sessionStorage.setItem('probe_cancelled', JSON.stringify(cancelled));
+        });
         return sent;
     };
 }"""
+CANCELLED = "() => JSON.parse(sessionStorage.getItem('probe_cancelled') || '[]').length"
 
 # Holds the page's read of an export's answer (an address under /exports/) until window.__letRead() is called.
 HOLD_READ = """() => {
@@ -289,9 +297,10 @@ def test_an_export_whose_answer_has_not_come_at_a_sign_out_is_cancelled(browser:
                 break
             page.wait_for_timeout(50)
         assert len(held) == 1, "the export was not asked for"
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
-        page.wait_for_function("() => window.__cancelled.length === 1", timeout=10000)
+        with replaced(page):
+            page.evaluate("() => logout()")
+        # Cancelled at the sign-out, by the page that was replaced after.
+        assert page.evaluate(CANCELLED) == 1
         page.wait_for_timeout(1000)
         assert downloads == []
         expect(page.locator("#toast-container .toast-error")).to_have_count(0)
@@ -306,7 +315,11 @@ def test_an_export_whose_answer_has_not_come_at_a_sign_out_is_cancelled(browser:
         page.context.close()
 
 
-def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(browser: Browser, world, codes):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(browser: Browser, world, codes, how):
+    """Sign-out answered: the read belonged to the page that was replaced, and nothing of it is left to finish.
+    Sign-out on its way: the page signed out stays, and the read let go there hands nothing over; nor does it once
+    the sign-out goes through and the page is replaced."""
     page = _page(browser, "block")
     try:
         _login(page, world)
@@ -316,12 +329,19 @@ def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(browser
         page.evaluate(HOLD_READ)
         _export_with_the_step_up(page, world)
         page.wait_for_function("() => typeof window.__letRead === 'function'", timeout=30000)
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
-        page.evaluate("() => window.__letRead()")
+        signing_out = sign_out_as(page, how)
+        if how == ANSWERED:
+            assert page.evaluate("() => typeof window.__letRead") == "undefined"
+        else:
+            page.evaluate("() => window.__letRead()")
         page.wait_for_timeout(1500)                     # the moment in which the file would be handed over
         assert downloads == [], "the archive landed in the downloads after the sign-out"
         expect(page.locator("#toast-container .toast-error")).to_have_count(0)
+        if signing_out:
+            signing_out.release()
+            wait_replaced(page)
+            page.wait_for_timeout(1000)
+            assert downloads == [], "the archive landed in the downloads once the page was replaced"
         assert ERRORS[id(page)] == []
     finally:
         page.context.close()

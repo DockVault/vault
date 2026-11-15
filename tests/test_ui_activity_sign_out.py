@@ -1,11 +1,11 @@
 """What the Activity page draws after a sign-out, in a real browser (static/js/activity.js: get, resetActivity).
 
 The answers to the reads made for the person who signed out are drawn for nobody: not the list, the summary or the
-Now panel of the next person who signs in on the same tab. Here the first person's three reads are made, answered
-by the server for them, and held on their way; they sign out, the next person signs in on the tab and opens the
-page (its reads are answered and drawn), and the held answers then arrive. Their rows, top people and counts are
-marked, so that one drawn would show. The page's own counters of those reads start again at each sign-out, so the
-next person's first reads carry the same numbers as the first person's.
+Now panel of the next person who signs in on the same tab. Here the first person's three reads are made, answered by
+the server for them, and held on their way; they sign out (the page is replaced once the sign-out is answered), the
+next person signs in on the tab and opens the page (its reads are answered and drawn), and the held answers then
+arrive. Their rows, top people and counts are marked, so that one drawn would show. The page's own counters of those
+reads start again at each sign-out, so the next person's first reads carry the same numbers as the first person's.
 
 What the first person unlocked stays with them too: the vaults whose names they unlocked with the vault password
 (a receipt each, kept for 15 minutes) are forgotten at their sign-out, so none of the next person's reads carries
@@ -26,6 +26,7 @@ from playwright.sync_api import Page, expect
 from _account_change_helpers import psql
 from _activity_ui import login, open_activity, rows, sign_in, sign_out, summary, total_of
 from _recording_levels import levels_restored, store, wait_for  # noqa: F401 -- a fixture
+from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, expect_reason, replaced, sign_out_as, wait_replaced
 from conftest import ApiClient, unique
 
 pytestmark = pytest.mark.ui
@@ -88,16 +89,12 @@ def test_answers_for_the_person_who_signed_out_are_drawn_for_nobody(page: Page, 
     holding["on"] = False
     sign_in(page, ben)
     open_activity(page)
-    finished = []
-    page.on("requestfinished", lambda r: "/activity/" in r.url and finished.append(r.url))
+    # The held reads belonged to the page the sign-out replaced: their answers, let go now, reach nothing of the
+    # new page.
     for route, answer in held:
         route.fulfill(response=answer, json=_marked(route.request.url, answer.json(), marker))
-    for _ in range(300):
-        if sum(1 for u in finished if any(u == r.request.url for r, _a in held)) >= len(held):
-            break
-        page.wait_for_timeout(50)
-    # The page has had the answers; a request of its own, sent and answered after them, then a few turns of its
-    # event loop, so that whatever it does with them is done.
+    # A request of the page's own, sent and answered after them, then a few turns of its event loop, so that
+    # whatever it would do with them is done.
     page.evaluate("() => fetch('/health').then((r) => r.text())")
     page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
     page.wait_for_timeout(500)
@@ -148,11 +145,14 @@ def test_a_step_on_its_way_at_a_sign_out_leaves_the_next_person_free_to_step(pag
             held.append((route, route.fetch()))
 
     page.route(lambda url: "/activity/events?" in url, hold)
-    older.click()
     if how.startswith("refused"):
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        # The refusal signs the page out, and the page is replaced by one that says the session has ended.
+        with replaced(page):
+            older.click()
+        expect_reason(page, "Your session has ended. Sign in again.")
         holding["on"] = False
     else:
+        older.click()
         for _ in range(200):
             if held:
                 break
@@ -211,8 +211,8 @@ def test_the_vault_unlocks_of_the_person_who_signed_out_are_forgotten(page: Page
     expect(detail).to_contain_text(name, timeout=15000)
     assert any(receipts), "the receipt was not sent while its holder was signed in"
 
-    page.evaluate("() => logout()")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    with replaced(page):
+        page.evaluate("() => logout()")
     receipts.clear()
     sign_in(page, ben)
     open_activity(page)
@@ -220,16 +220,23 @@ def test_the_vault_unlocks_of_the_person_who_signed_out_are_forgotten(page: Page
     assert not any(receipts), "the next person's reads carry the receipt of the person who signed out"
 
 
-# Marks, in the page, each export of the events (POST /activity/export) that is cancelled.
+# Notes, in the tab's sessionStorage (which outlives the page a sign-out replaces), each export of the events
+# (POST /activity/export) that is cancelled.
 WATCH_CANCELS = """() => {
-    window.__cancelled = [];
+    sessionStorage.setItem('probe_cancelled', '[]');
     const fetchOf = window.fetch;
     window.fetch = function (url, init) {
         const sent = fetchOf.apply(this, arguments);
-        sent.catch((e) => { if (e && e.name === 'AbortError' && String(url).includes('/activity/export')) window.__cancelled.push(String(url)); });
+        sent.catch((e) => {
+            if (!(e && e.name === 'AbortError' && String(url).includes('/activity/export'))) return;
+            const cancelled = JSON.parse(sessionStorage.getItem('probe_cancelled') || '[]');
+            cancelled.push(String(url));
+            sessionStorage.setItem('probe_cancelled', JSON.stringify(cancelled));
+        });
         return sent;
     };
 }"""
+CANCELLED = "() => JSON.parse(sessionStorage.getItem('probe_cancelled') || '[]').length"
 
 # Holds the page's read of an export's answer until window.__letRead() is called.
 HOLD_READ = """() => {
@@ -264,9 +271,10 @@ def test_an_export_whose_answer_has_not_come_at_a_sign_out_is_cancelled(page: Pa
                 break
             page.wait_for_timeout(50)
         assert len(held) == 1, "the export was not asked for"
-        page.evaluate("() => logout()")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
-        page.wait_for_function("() => window.__cancelled.length === 1", timeout=10000)
+        with replaced(page):
+            page.evaluate("() => logout()")
+        # Cancelled at the sign-out, by the page that was replaced after.
+        assert page.evaluate(CANCELLED) == 1
         page.wait_for_timeout(1000)
         assert downloads == []
         expect(page.locator("#toast-container .toast-error")).to_have_count(0)
@@ -278,7 +286,11 @@ def test_an_export_whose_answer_has_not_come_at_a_sign_out_is_cancelled(page: Pa
                 pass
 
 
-def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(page: Page, two_admins):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(page: Page, two_admins, how):
+    """Sign-out answered: the read belonged to the page that was replaced, and nothing of it is left to finish.
+    Sign-out on its way: the page signed out stays, and the read let go there hands nothing over; nor does it once
+    the sign-out goes through and the page is replaced."""
     ada, _ben = two_admins
     downloads = []
     page.on("download", lambda d: downloads.append(d))
@@ -287,9 +299,16 @@ def test_an_export_being_read_at_a_sign_out_never_lands_in_the_downloads(page: P
     page.evaluate(HOLD_READ)
     _export(page)
     page.wait_for_function("() => typeof window.__letRead === 'function'", timeout=30000)
-    page.evaluate("() => logout()")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
-    page.evaluate("() => window.__letRead()")
+    signing_out = sign_out_as(page, how)
+    if how == ANSWERED:
+        assert page.evaluate("() => typeof window.__letRead") == "undefined"
+    else:
+        page.evaluate("() => window.__letRead()")
     page.wait_for_timeout(1500)                     # the moment in which the file would be handed over
     assert downloads == [], "the export landed in the downloads after the sign-out"
     expect(page.locator("#toast-container .toast-error")).to_have_count(0)
+    if signing_out:
+        signing_out.release()
+        wait_replaced(page)
+        page.wait_for_timeout(1000)
+        assert downloads == [], "the export landed in the downloads once the page was replaced"
