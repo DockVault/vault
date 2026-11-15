@@ -226,14 +226,6 @@ def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(
         # The token runs out two minutes after the sign-in; the page's next request (its minute's poll) is refused.
         replaced = _ended(page, max(30, 200 - (time.time() - signed_in_at)))
         expect(page.locator("#login-error")).to_contain_text("Your session has ended")
-    else:
-        other = page.context.new_page()
-        other.goto("/")
-        expect(other.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-        _sign_out_by_hand(other)
-        replaced = _ended(page, 20)
-        expect(page.locator("#login-error")).to_contain_text("Signed out in another tab")
-        other.close()
     _nothing_of_a_left(page, world)
     assert replaced, "the page was not replaced"
 

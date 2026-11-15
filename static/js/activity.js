@@ -2543,6 +2543,8 @@
         if (plotObserver) plotObserver.disconnect();
         plotWidth = plot.clientWidth;
         plotObserver = new ResizeObserver(() => {
+            // The plot taken out of the page (the signed-in page removed at a sign-out): nothing to fit any more.
+            if (!plot.isConnected) { if (plotObserver) plotObserver.disconnect(); return; }
             fitTimeKeys($('act-p-time'));
             const w = plot.clientWidth;
             if (w && Math.abs(w - plotWidth) > 1 && S.band && !S.bandError) {
