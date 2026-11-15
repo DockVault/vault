@@ -60,6 +60,9 @@ const zkFileKeyVersion = () => 1;
 const zkMaybeDecryptResponse = async () => new Blob([new Uint8Array(CONTENT)], { type: answerType });
 const isCodedCryptoError = () => false, safeMessageForCode = () => '';
 const downloadProgress = { start: () => 1, update() {}, done() {} };
+// A page that has not ended a session, and the downloads it is keeping track of (logout aborts them).
+let _pageEnded = false;
+const _downloadsOfThisSession = new Set();
 const made = [], events = [];
 const window = { URL: {
     createObjectURL: (blob) => { made.push(blob); events.push('made'); return 'blob:https://vault/' + made.length; },
