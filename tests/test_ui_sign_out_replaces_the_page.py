@@ -1492,3 +1492,22 @@ def test_a_copied_link_opens_after_a_two_factor_sign_in(page: Page, admin, anon)
         assert page.evaluate("() => location.hash").startswith("#activity")
     finally:
         admin.delete_user(ta["id"])
+
+
+def test_a_copied_link_pasted_into_the_sign_in_screen_opens_after_the_sign_in(page: Page, admin):
+    """A link to an Activity search pasted into the address bar of a tab already on the sign-in screen (a link
+    followed, not a step through history): it leaves the address meanwhile and opens once an administrator signs
+    in."""
+    boss = admin.create_user(role="admin")
+    term = unique("pastedlink")
+    try:
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.goto(f"/#activity?range=24h&user={term}")
+        page.wait_for_timeout(500)
+        assert page.evaluate("() => location.hash") == "", "the link stayed in the address on the sign-in screen"
+        _sign_in(page, boss)
+        expect(page.locator("#activity-section")).to_be_visible(timeout=15000)
+        expect(page.locator("#act-chips")).to_contain_text(term, timeout=15000)
+    finally:
+        admin.delete_user(boss["id"])
