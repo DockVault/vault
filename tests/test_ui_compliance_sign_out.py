@@ -5,10 +5,12 @@ After a sign-out nothing of the Compliance pages stays for the next person on th
 (with the names of the files it lists) and an owner's Access to my vaults (with a name shown once the vault's
 password was given) are taken out of the page at sign-out: the next person who signs in on the same tab and opens
 either page sees none of it while their own page loads. An answer the server sends after the sign-out to a request
-made before it is drawn for nobody. The owner's vault receipts are forgotten too: no request after the sign-out
-carries them, and the name is hidden again until the password is given again. A vault's password asked on Access
-to my vaults and left open at the sign-out is answered as cancelled then: what the next person types in that
-dialog goes to their own question only. test_ui_owner_unlock.py holds the owner's unlock itself.
+made before it is drawn for nobody: with the sign-out answered, the page has been replaced and the answer reaches
+nothing; with the sign-out still on its way, the page signed out stays, and draws it for nobody. The owner's vault
+receipts are forgotten too: no request after the sign-out carries them, and the name is hidden again until the
+password is given again. A vault's password asked on Access to my vaults and left open at the sign-out is answered
+as cancelled then: what the next person types in that dialog goes to their own question only.
+test_ui_owner_unlock.py holds the owner's unlock itself.
 
 Waits are on state, never on time (the timing rules of the browser tests); a request is held by routing it and let
 go by continuing it.
@@ -19,7 +21,7 @@ from playwright.sync_api import Page, expect
 from _account_change_helpers import signed_in
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault
-from _ui_hand_over import new_folder_through_the_page
+from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, new_folder_through_the_page, replaced, sign_out_as, wait_replaced
 from conftest import unique
 
 pytestmark = pytest.mark.ui
@@ -82,8 +84,9 @@ def _sign_in(page: Page, account, codes=None):
 
 
 def _sign_out(page: Page):
-    page.evaluate("() => logout()")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    """Sign out, and come back once the page has been replaced by a new one on the sign-in screen."""
+    with replaced(page):
+        page.evaluate("() => logout()")
 
 
 class _Held:
@@ -134,6 +137,28 @@ def _release_and_wait_for_the_read(page: Page, held: "_Held", part: str):
     held.release()
     page.wait_for_function("(p) => window.__read && window.__read[p] === true", arg=part, timeout=15000)
     page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
+
+
+def _answer_after_the_sign_out(page: Page, held: "_Held", part: str, how, check):
+    """Sign out with the sign-out ``how``, then let the held answers go, and ``check`` what the page shows.
+
+    Sign-out answered: the page has been replaced, and the request belonged to the page that is gone: its answer
+    is read by nothing in the new page. Sign-out on its way: the page signed out stays, reads the answer, and draws
+    it for nobody; then the sign-out goes through, and the page that replaces it shows nothing either."""
+    signing_out = sign_out_as(page, how)
+    if how == ANSWERED:
+        page.evaluate(_WATCH_READS, part)
+        held.release()
+        page.evaluate("() => fetch('/health').then((r) => r.text())")
+        page.evaluate("() => new Promise((done) => setTimeout(() => setTimeout(done, 0), 0))")
+        assert page.evaluate("(p) => window.__read[p]", part) is False, "the new page read an answer of the old one"
+        check()
+        return
+    _release_and_wait_for_the_read(page, held, part)
+    check()
+    signing_out.release()
+    wait_replaced(page)
+    check()
 
 
 def _unlock_on_my_access(page: Page, world):
@@ -197,7 +222,8 @@ def test_the_next_person_on_the_tab_sees_nothing_of_an_auditors_case(page: Page,
     assert errors == []
 
 
-def test_an_answer_that_comes_after_the_sign_out_is_drawn_for_nobody(page: Page, world):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_an_answer_that_comes_after_the_sign_out_is_drawn_for_nobody(page: Page, world, how):
     errors = []
     page.on("pageerror", lambda exc: errors.append(str(exc)))
     _sign_in(page, world["uma"], world["codes"])
@@ -206,14 +232,17 @@ def test_an_answer_that_comes_after_the_sign_out_is_drawn_for_nobody(page: Page,
     held = _Held(page, "**/compliance/cases/*/tree*")
     page.evaluate("(id) => { window.openCaseWorkspace(id); }", world["case"]["id"])
     held.wait()
-    _sign_out(page)
-    _release_and_wait_for_the_read(page, held, "/tree")
-    assert page.locator("#cmp-root .cmp-ws, #cmp-root .cmp-file-row").count() == 0
-    assert world["listed"] not in page.locator("#cmp-root").inner_text()
+
+    def nothing_drawn():
+        assert page.locator("#cmp-root .cmp-ws, #cmp-root .cmp-file-row").count() == 0
+        assert world["listed"] not in page.locator("#cmp-root").inner_text()
+
+    _answer_after_the_sign_out(page, held, "/tree", how, nothing_drawn)
     assert errors == []
 
 
-def test_the_owners_page_and_receipts_are_gone_for_the_next_person_on_the_tab(page: Page, world):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_the_owners_page_and_receipts_are_gone_for_the_next_person_on_the_tab(page: Page, world, how):
     errors = []
     page.on("pageerror", lambda exc: errors.append(str(exc)))
     sent = []
@@ -229,11 +258,15 @@ def test_the_owners_page_and_receipts_are_gone_for_the_next_person_on_the_tab(pa
     held = _Held(page, "**/me/compliance-access")
     page.evaluate("() => { window.openMyAccess(); }")
     held.wait()
-    _sign_out(page)
-    _release_and_wait_for_the_read(page, held, "/me/compliance-access")
-    expect(page.locator("#my-access-body")).to_be_empty()
-    expect(page.locator("#my-access-modal.active")).to_have_count(0)
-    expect(page.locator("#vault-review-banner")).to_have_count(0)
+
+    def nothing_drawn():
+        # Empty, or not built at all (the page that replaces the signed-out one builds it when it is opened).
+        assert page.evaluate("() => { const b = document.getElementById('my-access-body');"
+                             " return !b || b.childNodes.length === 0; }")
+        expect(page.locator("#my-access-modal.active")).to_have_count(0)
+        expect(page.locator("#vault-review-banner")).to_have_count(0)
+
+    _answer_after_the_sign_out(page, held, "/me/compliance-access", how, nothing_drawn)
     before = len(sent)
 
     # mia signs in on the same tab and opens her own page; her answers are held on their way.
