@@ -8,11 +8,13 @@ document, nothing of theirs is in the browser's storage, and the next person sig
 any of it painted. The reason the session ended is on the sign-in screen once, and a sign-out by hand gives none.
 A request still on its way when the session ended cannot write into the new page.
 """
+import json
 import time
 
 import pytest
 from playwright.sync_api import Page, expect
 
+from _account_change_helpers import psql
 from conftest import ApiClient, BASE_URL, unique
 
 pytestmark = pytest.mark.ui
@@ -157,11 +159,20 @@ def world(admin):
         admin.delete_user(u["id"])
 
 
-def _go_everywhere(page: Page, m: dict):
-    """Through every section, as the administrator, and back to the dashboard with the zero-knowledge key unlocked."""
+def _seen(page: Page, markers) -> set:
+    """The markers the page holds now (text, attributes, form values)."""
+    return {f.split(":", 1)[1] for f in page.evaluate(FIND, list(markers))["found"]}
+
+
+def _go_everywhere(page: Page, m: dict) -> set:
+    """Through every section, as the administrator, and back to the dashboard with the zero-knowledge key unlocked.
+    Returns the markers the page held on the way (the control: the checks after the sign-out look for what was
+    really there)."""
+    seen = set()
     _zero_knowledge_vault(page, m["zk_name"], m["zk_desc"], m["zk_label"])
     for section in ("vaults", "shared", "notes", "users", "temp-creds", "groups", "activity", "settings"):
         _go(page, section)
+        seen |= _seen(page, m.values())
         if section == "vaults":
             card = page.locator(".vault-card", has_text=m["vault"]).locator(".vault-open")
             if card.count():
@@ -173,6 +184,7 @@ def _go_everywhere(page: Page, m: dict):
                 row.locator("button", has_text=m["note"]).first.click()
                 page.wait_for_timeout(800)
                 # The note opened in a dialog, its text drawn there; closed again, so the next section can be opened.
+                seen |= _seen(page, m.values())
                 page.evaluate("() => { if (typeof closeModal === 'function') closeModal(); }")
                 page.wait_for_timeout(300)
     _go(page, "dashboard")
@@ -186,6 +198,7 @@ def _go_everywhere(page: Page, m: dict):
         except AssertionError:
             pass
     page.wait_for_timeout(2500)
+    return seen | _seen(page, m.values())
 
 
 def _nothing_of_a_left(page: Page, world: dict):
@@ -202,7 +215,7 @@ def _nothing_of_a_left(page: Page, world: dict):
     assert page.evaluate("() => Array.from(new Set(window.__painted))") == []
 
 
-@pytest.mark.parametrize("how", ["button", "ended_by_an_administrator", "run_out", "another_tab"])
+@pytest.mark.parametrize("how", ["button", "ended_by_an_administrator", "deactivated", "made_inactive", "run_out", "another_tab"])
 def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(page: Page, world, how):
     admin, a = world["admin"], world["a"]
     if how == "run_out":
@@ -212,7 +225,10 @@ def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(
     if how == "run_out":
         admin.put("/settings", json={"session_timeout": 240})
     signed_in_at = time.time()
-    _go_everywhere(page, world["m"])
+    seen = _go_everywhere(page, world["m"])
+    # The control: every marker was in the page on the way, and the page still holds them when the session ends.
+    assert set(world["m"].values()) - seen == set(), f"never in the page: {set(world['m'].values()) - seen}"
+    assert {world["m"]["vault"], world["m"]["zk_name"]} <= _seen(page, world["m"].values())
     page.evaluate("() => { window.__oldPage = true; }")
     if how == "button":
         _sign_out_by_hand(page)
@@ -222,6 +238,21 @@ def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(
         page.evaluate("() => { if (typeof refreshNotifUnread === 'function') refreshNotifUnread(); }")
         replaced = _ended(page, 20)
         expect(page.locator("#login-error")).to_contain_text("Your session has ended")
+    elif how == "deactivated":
+        # An administrator's deactivation ends the account's sessions; the refusals that follow carry Clear-Site-Data,
+        # which empties this tab's storage after the reason was put there: the reason still reaches the new page.
+        assert admin.patch(f"/users/{a['id']}", json={"is_active": False}).status_code == 200
+        page.evaluate("() => { if (typeof refreshNotifUnread === 'function') refreshNotifUnread(); }")
+        replaced = _ended(page, 20)
+        expect(page.locator("#login-error")).to_have_text("Your session has ended. Sign in again.")
+    elif how == "made_inactive":
+        # A refusal that names the account (403): its own sentence is the reason. Made inactive in the database, so
+        # the session itself stays valid (an administrator's deactivation also ends the account's sessions, and the
+        # page is then told its session has ended, as above).
+        psql(f"UPDATE users SET is_active = false WHERE id = '{a['id']}'")
+        page.evaluate("() => { if (typeof refreshNotifUnread === 'function') refreshNotifUnread(); }")
+        replaced = _ended(page, 20)
+        expect(page.locator("#login-error")).to_have_text("User account is inactive")
     elif how == "run_out":
         # The token runs out two minutes after the sign-in; the page's next request (its minute's poll) is refused.
         replaced = _ended(page, max(30, 200 - (time.time() - signed_in_at)))
@@ -321,3 +352,288 @@ def test_an_unlocked_zero_knowledge_key_is_locked_for_the_next_sign_in(page: Pag
     finally:
         admin.delete_user(ana["id"])
         admin.put("/settings", json={"zero_knowledge_enabled": before})
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The page waiting for its replacement, the sign-out request, and what the new page shows.
+
+# Every painted frame on every document of the page from now on (the old one and those that replace it), reported to
+# the test through window.__painted_seen (an exposed binding, which outlives the documents).
+WATCH_ALL = r"""(() => {
+  const markers = %s;
+  const t0 = performance.now();
+  const frame = () => {
+    if (!document.body) { requestAnimationFrame(frame); return; }
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      const t = n.nodeValue || '';
+      for (const m of markers) if (t.includes(m)) {
+        const el = n.parentElement, r = el.getBoundingClientRect();
+        if (el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) && r.width > 0 && r.height > 0)
+          window.__painted_seen(m);
+      }
+    }
+    if (performance.now() - t0 < 30000) requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+})();"""
+
+
+def _watch_every_document(page: Page, markers) -> list:
+    painted = []
+    page.expose_binding("__painted_seen", lambda source, m: painted.append(m))
+    script = WATCH_ALL % json.dumps(list(markers))
+    page.add_init_script(script)
+    page.evaluate(script)
+    return painted
+
+
+def _sign_out_posts(page: Page) -> list:
+    sent = []
+    page.on("request", lambda r: sent.append(r.url) if r.method == "POST" and "/auth/sign-out" in r.url else None)
+    return sent
+
+
+@pytest.fixture
+def ana(admin):
+    """A person with a vault and a note of hers, and the markers to look for."""
+    u = admin.create_user(role="user")
+    client = ApiClient(BASE_URL)
+    client.login(u["_username"], u["_password"])
+    m = {"user": u["_username"], "vault": unique("AnaWaits"), "note": unique("AnaWaitNote")}
+    client.create_vault(name=m["vault"])
+    client.post("/notes", json={"title": m["note"], "body": unique("body")}).raise_for_status()
+    u["m"] = m
+    yield u
+    admin.delete_user(u["id"])
+
+
+def _hold(page: Page, pattern: str) -> list:
+    """Hold every request to ``pattern``; the held routes are returned, to be released by the test."""
+    held = []
+    page.route(pattern, lambda route: held.append(route))
+    return held
+
+
+def _release(held: list):
+    for route in held:
+        try:
+            route.continue_()
+        except Exception:
+            pass                                   # its page has gone
+
+
+def test_while_the_page_waits_for_its_sign_out_it_holds_nothing_and_goes_at_the_latest_after_15_seconds(
+        page: Page, ana):
+    page.goto("/")
+    _sign_in(page, ana)
+    _go(page, "notes")
+    _go(page, "dashboard")
+    assert {ana["m"]["vault"], ana["m"]["note"]} <= _seen(page, ana["m"].values()), "the control: not in the page"
+    sent = _sign_out_posts(page)
+    held = _hold(page, "**/auth/sign-out")         # never answered
+    page.evaluate("() => { window.__oldPage = true; }")
+    started = time.time()
+    _sign_out_by_hand(page)
+    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    for _ in range(3):
+        page.wait_for_timeout(1000)
+        assert page.evaluate("() => window.__oldPage === true"), "the page went before its sign-out was over"
+        assert _seen(page, ana["m"].values()) == set(), "the page waiting for its replacement holds the person"
+        expect(page.locator("#dashboard-screen")).to_have_count(0)
+    page.wait_for_function("() => !window.__oldPage", timeout=30000)
+    took = time.time() - started
+    assert 13 <= took <= 25, f"replaced {took:.1f} s after the sign-out, not at the cap"
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    page.unroute("**/auth/sign-out")
+    _release(held)
+    assert len(sent) == 1, f"sign-out requests: {sent}"
+
+
+def test_one_sign_out_request_and_a_reason_shown_as_text(page: Page, ana):
+    page.goto("/")
+    sent = _sign_out_posts(page)
+    _sign_in(page, ana)
+    page.evaluate("() => { window.__oldPage = true; }")
+    _sign_out_by_hand(page)
+    assert _ended(page, 20), "the page was not replaced"
+    page.wait_for_timeout(1500)
+    assert len(sent) == 1, f"sign-out requests: {sent}"
+    # A reason is shown as text, never as markup.
+    page.evaluate("() => sessionStorage.setItem('dv_signed_out_reason', '<b>bold</b> <img src=x onerror=alert(1)>')")
+    page.reload()
+    note = page.locator("#login-error")
+    expect(note).to_have_text("<b>bold</b> <img src=x onerror=alert(1)>")
+    assert note.locator("b, img").count() == 0
+
+
+def test_a_sign_out_answered_during_the_next_sign_in_does_not_bring_the_old_page_back(page: Page, admin, ana):
+    bob = admin.create_user(role="user")
+    try:
+        page.goto("/")
+        _sign_in(page, ana)
+        _go(page, "notes")
+        _go(page, "dashboard")
+        assert ana["m"]["vault"] in _seen(page, ana["m"].values()), "the control: her vault is not on the dashboard"
+        held_out = _hold(page, "**/auth/sign-out")
+        page.evaluate("() => { window.__oldPage = true; }")
+        _sign_out_by_hand(page)
+        expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+        # From the sign-out on: every frame of this page and of the pages that replace it.
+        painted = _watch_every_document(page, list(ana["m"].values()))
+        # The next person signs in on the page still waiting; the sign-out is answered while that sign-in loads.
+        held_prefs = _hold(page, "**/users/me/preferences")
+        page.fill("#username", bob["_username"])
+        page.fill("#password", bob["_password"])
+        page.click("#login-form button[type=submit]")
+        page.wait_for_function("() => !window.__oldPage || (typeof authToken !== 'undefined' && !!authToken)",
+                               timeout=15000)
+        page.unroute("**/auth/sign-out")
+        _release(held_out)
+        page.wait_for_timeout(1000)
+        page.unroute("**/users/me/preferences")
+        _release(held_prefs)
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        assert page.evaluate("() => !window.__oldPage"), "the app was shown on the page that ended the session"
+        expect(page.locator("body")).to_contain_text(bob["_username"])
+        page.wait_for_timeout(2000)
+        assert sorted(set(painted)) == [], f"painted of the person before: {sorted(set(painted))}"
+    finally:
+        admin.delete_user(bob["id"])
+
+
+def test_a_tab_whose_own_session_ended_shows_the_sign_in_screen_whatever_another_tab_stored(
+        page: Page, admin, ana):
+    bob = admin.create_user(role="user")
+    try:
+        page.goto("/")
+        _sign_in(page, ana)
+        held = _hold(page, "**/auth/sign-out")
+        page.evaluate("() => { window.__oldPage = true; }")
+        _sign_out_by_hand(page)
+        expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+        # Meanwhile another tab of the browser signs in to another account.
+        other = page.context.new_page()
+        other.goto("/")
+        _sign_in(other, bob)
+        page.unroute("**/auth/sign-out")
+        _release(held)
+        page.wait_for_function("() => !window.__oldPage", timeout=30000)
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.wait_for_timeout(2000)
+        expect(page.locator("#dashboard-screen")).to_be_hidden()
+        expect(page.locator("#login-error")).to_be_hidden()
+        # The other tab's session is untouched.
+        expect(other.locator("#dashboard-screen")).to_be_visible()
+        other.reload()
+        expect(other.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        other.close()
+    finally:
+        admin.delete_user(bob["id"])
+
+
+def test_a_tab_told_of_a_sign_out_waits_for_the_server_before_it_is_replaced(page: Page, ana):
+    page.goto("/")
+    _sign_in(page, ana)
+    other = page.context.new_page()
+    other.goto("/")
+    expect(other.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    # This tab finds the server not answering (a proxy's 502) when it is told.
+    page.route("**/health", lambda route: route.fulfill(status=502, body="Bad Gateway"))
+    page.evaluate("() => { window.__oldPage = true; }")
+    _sign_out_by_hand(other)
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    page.wait_for_timeout(7000)
+    assert page.evaluate("() => window.__oldPage === true"), "replaced while the server did not answer"
+    assert _seen(page, ana["m"].values()) == set()
+    expect(page.locator("#dashboard-screen")).to_have_count(0)
+    page.unroute("**/health")
+    page.wait_for_function("() => !window.__oldPage", timeout=15000)
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    expect(page.locator("#login-error")).to_contain_text("Signed out in another tab")
+    other.close()
+
+
+def test_a_session_refused_before_the_app_is_shown_says_why_and_the_page_stays(page: Page, ana):
+    page.goto("/")
+    _sign_in(page, ana)
+    # The next load's session is refused while it starts, before the app is shown.
+    page.route("**/temp-passcode-policy", lambda route: route.fulfill(
+        status=401, content_type="application/json", body='{"detail": "Not authenticated"}'))
+    loads = []
+    page.on("load", lambda _p: loads.append(time.time()))
+    page.reload()
+    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    expect(page.locator("#login-error")).to_have_text("Your session has ended. Sign in again.")
+    page.wait_for_timeout(4000)
+    assert len(loads) == 1, f"the page loaded {len(loads)} times"
+    page.unroute("**/temp-passcode-policy")
+    expect(page.locator("#dashboard-screen")).to_have_count(0)
+
+
+def test_back_after_a_sign_out_shows_nothing_of_the_person(page: Page, admin, anon):
+    boss = admin.create_user(role="admin")
+    ghost = unique("ghostback")
+    anon.post("/auth/login", json={"username": ghost, "password": "not-it-1"})
+    try:
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto("/")
+        _sign_in(page, boss)
+        toggle = page.locator("#mobile-nav-toggle")
+        if toggle.is_visible():
+            toggle.click()
+        page.click('.sidebar-item[data-section="activity"]')
+        expect(page.locator("#act-pager")).to_be_visible(timeout=15000)
+        page.click("#act-filter-btn")
+        page.fill("#act-fp-user", ghost)
+        page.locator("#act-fp-user").press("Enter")
+        page.click("#act-fp-done")
+        page.locator("#activity-cards .act-card").first.click()
+        expect(page.locator("#activity-event-modal")).to_be_visible(timeout=10000)
+        assert page.evaluate("() => history.state && history.state.activityDetail") is True, "no history entry"
+        assert ghost in _seen(page, [ghost]), "the control: the event is not in the page"
+        page.evaluate("() => { window.__oldPage = true; }")
+        page.evaluate("() => logout()")
+        assert _ended(page, 20), "the page was not replaced"
+        page.go_back()
+        page.wait_for_timeout(3000)
+        assert _seen(page, [ghost, boss["_username"]]) == set(), "Back showed the person"
+        expect(page.locator("#dashboard-screen")).to_be_hidden()
+    finally:
+        admin.delete_user(boss["id"])
+
+
+def test_an_answer_that_comes_after_the_sign_out_does_nothing_on_the_page(page: Page, admin):
+    """A call on its way when the session ends (the storage figures of Settings): its answer, let through while the
+    page waits for its replacement, draws nothing and throws nothing."""
+    boss = admin.create_user(role="admin")
+    try:
+        errors = []
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+        page.goto("/")
+        _sign_in(page, boss)
+        held = _hold(page, "**/storage/stats")
+        _go(page, "settings")
+        for _ in range(100):
+            if held:
+                break
+            page.wait_for_timeout(100)
+        assert held, "Settings did not ask for the storage figures"
+        held_out = _hold(page, "**/auth/sign-out")         # the page waits for its sign-out meanwhile
+        page.evaluate("() => { window.__oldPage = true; }")
+        _sign_out_by_hand(page)
+        expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+        page.evaluate("""() => { window.__added = 0;
+            new MutationObserver((rs) => { for (const r of rs) window.__added += r.addedNodes.length; })
+              .observe(document.body, { childList: true, subtree: true, characterData: true }); }""")
+        page.unroute("**/storage/stats")
+        _release(held)
+        page.wait_for_timeout(1500)
+        assert page.evaluate("() => window.__oldPage === true"), "the page went: the answer reached nothing to test"
+        assert page.evaluate("() => window.__added") == 0, "the answer drew into the page"
+        assert errors == [], errors
+        page.unroute("**/auth/sign-out")
+        _release(held_out)
+    finally:
+        admin.delete_user(boss["id"])

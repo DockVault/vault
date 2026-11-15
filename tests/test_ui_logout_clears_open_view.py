@@ -33,6 +33,9 @@ from _ui_hand_over import ANSWERED, SIGN_OUT_STANDS, sign_out_as
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# The vault header of a page that never opened a vault (static/index.html).
+PLACEHOLDER = "Vault Name"
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -113,8 +116,8 @@ def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
         after_logout = _view(page)
         assert after_logout["section"] == "dashboard-section", (
             f"logout left the previous view active: {after_logout}")
-        assert temp_vault["name"] not in (after_logout["title"] or ""), (
-            f"logout left the previous vault's name in the header: {after_logout['title']!r}")
+        assert after_logout["title"] == PLACEHOLDER, (
+            f"the header is not the new page's own: {after_logout['title']!r}")
     else:
         # The page that stays holds the sign-in screen alone: no section, no file list, no header is left in it, and
         # neither the vault's name nor its file's is anywhere in the document (above).
@@ -130,7 +133,7 @@ def test_signing_out_of_an_open_vault_does_not_leave_it_on_screen(
     after_login = _view(page)
     assert after_login["section"] == "dashboard-section", (
         f"signing back in returned to the stale vault view: {after_login}")
-    assert temp_vault["name"] not in (after_login["title"] or ""), (
+    assert after_login["title"] == PLACEHOLDER, (
         f"the previous vault's name survived a full sign-out and sign-in: {after_login['title']!r}")
 
 

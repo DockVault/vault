@@ -249,11 +249,13 @@ def test_a_late_refusal_of_the_session_that_ended_signs_nobody_out_while_the_sig
     assert len(sign_outs) == 1 and sign_outs[0].request.headers.get("authorization") == f"Bearer {sent_for}"
     assert still_old(page), "the page was replaced before its sign-out was answered"
 
-    # ben fills in the form on the page that stays. A refusal of ana's session arrives, and so does one of a
-    # request sent with no session at all (the server's own answer): the form keeps what he typed.
+    # ben fills in the form on the page that stays. A refusal of ana's session arrives (to a call made before her
+    # session ended: it never settles on this page, app.js apiRequest), and so does one of a request sent with no
+    # session at all (the server's own answer): the form keeps what he typed.
     _types(page, ben)
     held.refuse_next()
-    assert _settled(page, 0) == "Session expired. Please log in again."
+    _round_trip(page)
+    assert page.evaluate("() => window.__probes[0]") == "pending", "the answer of the ended session settled"
     unrouted = page.evaluate("() => apiRequest('/vaults').then(() => 'answered', (e) => e.message)")
     assert unrouted != "answered", unrouted
     _form_kept(page, ben)
