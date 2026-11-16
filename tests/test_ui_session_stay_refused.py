@@ -60,7 +60,6 @@ def test_a_renewal_refused_for_the_account_signs_out_with_the_servers_sentence(p
     # The page is replaced, and the new one's sign-in screen says why.
     wait_replaced(page)
     expect_reason(page, "User account is inactive")
-    expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
     assert not [t for t in toasts if "Could not extend" in t], toasts
 
 
@@ -79,7 +78,6 @@ def test_an_account_made_inactive_while_the_warning_is_open_signs_the_tab_out_wi
     said = note.inner_text().strip()
     assert said in ("Your session has ended. Sign in again.", "User account is inactive"), said
     expect_reason(page, said)
-    expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
     assert not [t for t in toasts if "Could not extend" in t], toasts
 
 

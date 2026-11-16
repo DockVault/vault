@@ -1,14 +1,15 @@
 """A sign-out leaves nothing of the person in the dashboard's lists (static/js/app.js logout).
 
 The lists Most recent, Favourites and What's waiting name the person's vaults (an unlocked zero-knowledge vault by
-its real name) and what was shared with them. A sign-out empties them, so the sign-in screen hides none of it in the
-page, and the next person signed in on the same tab never sees any of it painted before their own lists are drawn.
+its real name) and what was shared with them. A sign-out takes them out of the page, so the sign-in screen hides none
+of it, neither while the page waits for its sign-out nor in the page put in its place, and the next person signed in
+on the same tab never sees any of it painted before their own lists are drawn.
 """
 import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import ApiClient, BASE_URL, unique
-from _ui_hand_over import replaced
+from _ui_hand_over import ON_ITS_WAY, SIGN_OUT_STANDS, sign_out_as, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -43,7 +44,8 @@ def _sign_in(page: Page, user):
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
 
 
-def test_a_sign_out_empties_the_dashboards_lists_and_the_next_person_never_sees_them(page: Page, admin):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_a_sign_out_empties_the_dashboards_lists_and_the_next_person_never_sees_them(page: Page, admin, how):
     sharing_before = admin.get("/settings").json().get("sharing_enabled", False)
     admin.put("/settings", json={"sharing_enabled": True}).raise_for_status()
     ana, ben = admin.create_user(role="user"), admin.create_user(role="user")
@@ -68,10 +70,14 @@ def test_a_sign_out_empties_the_dashboards_lists_and_the_next_person_never_sees_
         for lane, name in (("#lane-favourites", "favourite"), ("#lane-recent", "recent"), ("#lane-waiting", "pushed")):
             expect(page.locator(lane)).to_contain_text(names[name], timeout=15000)
 
-        # The app's own sign-out, and the page put in place of the one that showed the app.
-        with replaced(page):
-            page.click("#profile-btn")
-            page.click("#dropdown-logout-btn")
+        # The app's own sign-out. Its call answered, the page is replaced; on its way, the page waits holding the
+        # sign-in screen alone, and none of her names is anywhere in it (sign_out_as: expect_waiting), until the
+        # call is answered and the page replaced.
+        signing_out = sign_out_as(page, how, lambda: (page.click("#profile-btn"), page.click("#dropdown-logout-btn")),
+                                  markers=list(names.values()))
+        if how == ON_ITS_WAY:
+            signing_out.release()
+            wait_replaced(page)
         for lane in LISTS:
             expect(page.locator(f"{lane} > *")).to_have_count(0)
         held = page.evaluate("(names) => names.filter((n) => document.body.textContent.includes(n))",

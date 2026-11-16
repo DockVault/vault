@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, expect
 
-from _ui_hand_over import sign_out
+from _ui_hand_over import ON_ITS_WAY, SIGN_OUT_STANDS, sign_out_as
 
 pytestmark = pytest.mark.ui
 
@@ -87,7 +87,9 @@ def test_switched_on_the_lane_asks_for_the_links_even_with_no_tag_to_make_one(pa
 _GET_STARTED = {"dismissed": False, "done": False, "items": {}}
 
 
-def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(page: Page, admin, person, links_setting):
+@pytest.mark.parametrize("how", SIGN_OUT_STANDS)
+def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(page: Page, admin, person, links_setting,
+                                                                            how):
     links_setting(True)
     tag = admin.post("/receiver-tags", json={
         "name": "DashTag-" + person["_username"][-8:], "min_token_len": 10, "max_file_bytes_cap": 100 * _MB,
@@ -104,7 +106,12 @@ def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(pag
         _sign_in(page, first)
         expect(page.locator("#qa-upload-link")).to_be_visible(timeout=15000)
         expect(page.locator("#dashboard-get-started .get-started-list > *").first).to_be_visible(timeout=15000)
-        sign_out(page)
+        # Its call answered, the page is replaced. On its way, the page waits holding the sign-in screen alone
+        # (sign_out_as: expect_waiting), and what the server said of upload links for this person is gone from its
+        # state: the next person signs in on this page.
+        signing_out = sign_out_as(page, how)
+        if how == ON_ITS_WAY:
+            assert page.evaluate("() => state._receiverPolicy === undefined && state._receiversEnabled === undefined")
         # The signed-out tab keeps nothing of what the dashboard drew for this person.
         for lane in ("#lane-attention", "#lane-recent", "#lane-waiting", "#lane-favourites"):
             expect(page.locator(f"{lane} > *")).to_have_count(0)
@@ -129,6 +136,8 @@ def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(pag
         _lane_drawn(page)
         expect(page.locator("#qa-upload-link")).to_have_count(0)
         expect(page.locator("#nav-uploadlinks")).to_be_hidden()
+        if signing_out:
+            signing_out.release()
     finally:
         admin.delete_user(first["id"])
         admin.delete_user(other["id"])

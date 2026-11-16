@@ -16,6 +16,7 @@ from playwright.sync_api import Page, expect
 
 from conftest import BASE_URL
 from _sf_helpers import put_settings_allowing_longer_sessions
+from _ui_hand_over import mark_old, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -106,11 +107,12 @@ def test_doing_nothing_signs_out_and_the_sign_in_screen_says_why(page: Page, adm
         assert restored.status_code in (200, 204), restored.text
     # Two minutes at most: the count read from the server's clock errs early, never late.
     assert page.evaluate("() => SessionWatch.remaining()") <= 120
+    mark_old(page)
     expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=75000)
-    expect(page.locator("#login-screen")).to_be_visible(timeout=90000)
+    # The session ends, and the page put in place of this one says why.
+    wait_replaced(page, 90000)
     expect(page.locator("#login-error")).to_contain_text("Your session ended because nobody chose to stay")
     assert page.get_attribute("#login-error", "role") == "alert"
-    expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
 
 
 def test_another_tab_of_the_same_browser_carries_on_after_a_renewal(page: Page, person):

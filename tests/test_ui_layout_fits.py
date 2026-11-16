@@ -13,6 +13,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import ApiClient, BASE_URL, unique
+from _ui_hand_over import replaced
 
 pytestmark = pytest.mark.ui
 
@@ -48,9 +49,10 @@ def _section(page: Page, name: str):
 
 
 def _sign_out(page: Page):
-    page.click("#profile-btn")
-    page.click("#dropdown-logout-btn")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+    # Back once the page has been replaced: a navigation started meanwhile would be cut short by the replacement.
+    with replaced(page):
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
 
 
 def _row_order(page: Page, selector: str, ids):

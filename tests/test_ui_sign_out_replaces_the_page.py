@@ -124,7 +124,7 @@ def _zero_knowledge_vault(page: Page, name: str, desc: str, label: str):
 
 
 @pytest.fixture
-def world(admin):
+def world(admin, admin_creds):
     """An administrator with something of theirs in every section, a second person, and the markers to look for."""
     before = admin.get("/settings").json()
     admin.put("/settings", json={"sharing_enabled": True, "invite_enabled": True, "zero_knowledge_enabled": True})
@@ -158,9 +158,13 @@ def world(admin):
     ca.post(f"/users/{c['id']}/reset-link")
     held = ca.post(f"/users/{c['id']}/reset-link")
     yield {"a": a, "b": b, "c": c, "m": m, "admin": admin, "held_change": held.status_code}
-    admin.put("/settings", json={k: before.get(k) for k in ("sharing_enabled", "invite_enabled",
-                                                            "zero_knowledge_enabled", "session_timeout")
-                                 if k in before})
+    # Put back as it was, a session timeout a test left shorter too: lengthening it asks for the administrator's
+    # password, which the helper gives when the server asks.
+    restored = put_settings_allowing_longer_sessions(
+        admin, admin_creds["password"],
+        {k: before.get(k) for k in ("sharing_enabled", "invite_enabled", "zero_knowledge_enabled", "session_timeout")
+         if k in before})
+    assert restored.status_code in (200, 204), restored.text
     for u in (a, b, c):
         admin.delete_user(u["id"])
 
@@ -227,8 +231,8 @@ def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(
     if how == "run_out":
         before = admin.get("/settings").json().get("session_timeout") or 0
         assert admin.put("/settings", json={"session_timeout": 2}).status_code in (200, 204)
-    page.goto("/")
     try:
+        page.goto("/")
         _sign_in(page, a)
     finally:
         if how == "run_out":
@@ -265,7 +269,8 @@ def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(
         replaced = _ended(page, 20)
         expect(page.locator("#login-error")).to_have_text("User account is inactive")
     elif how == "run_out":
-        # The token runs out two minutes after the sign-in; the page's next request (its minute's poll) is refused.
+        # The token runs out two minutes after the sign-in. The warning's own check at the end of its count is
+        # usually the request refused first (else the page's minute poll): either way the session ran out.
         # The warning was shown before the end and nobody chose to stay: the reason says so (session-watch.js).
         replaced = _ended(page, max(30, 200 - (time.time() - signed_in_at)))
         expect(page.locator("#login-error")).to_have_text(

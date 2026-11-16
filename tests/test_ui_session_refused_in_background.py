@@ -18,7 +18,7 @@ from playwright.sync_api import Page, expect
 
 from conftest import BASE_URL
 from _sf_helpers import put_settings_allowing_longer_sessions
-from _ui_hand_over import mark_old, wait_replaced
+from _ui_hand_over import HeldSignOut, mark_old, still_old, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -70,19 +70,33 @@ def _end_on_the_server(token: str):
                         timeout=15).status_code == 401
 
 
-def _poll(page: Page):
-    """The unread-count poll, as its timer sends it (silent: it shows no error of its own). Not waited for: a refusal
-    signs the tab out, and the page is replaced while the poll is still on its way."""
-    assert page.evaluate("() => window.__oldPage === true"), "the page was signed out before the test's poll"
+def _poll(page: Page, token: str):
+    """The unread-count poll, as its timer sends it (silent: it shows no error of its own), sent by the page that
+    shows the app while it still holds `token`. Not waited for: a refusal signs the tab out on its way."""
+    assert page.evaluate("(t) => window.__oldPage === true && !_pageEnded && authToken === t", token), \
+        "the page was signed out, or holds another token, before the test's poll"
     page.evaluate("() => { refreshNotifUnread(); }")
 
 
-def _signed_out_saying(page: Page, sentence: str):
+def _signed_out_saying(page: Page, signing_out: HeldSignOut, sentence: str):
+    """The page that sent the refused request, its sign-out held on its way: signed out, its token gone, the sign-in
+    screen saying why."""
+    signing_out.wait()
+    assert still_old(page), "the page was replaced before its sign-out was answered"
+    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    note = page.locator("#login-error")
+    expect(note).to_contain_text(sentence, timeout=5000)
+    assert note.get_attribute("role") == "alert"
+    assert page.evaluate("() => _pageEnded === true && authToken === null")
+
+
+def _replaced_saying(page: Page, signing_out: HeldSignOut, sentence: str):
+    """The sign-out let through: the page put in place of the one that showed the app says the same."""
+    signing_out.release()
     wait_replaced(page)
     note = page.locator("#login-error")
     expect(note).to_contain_text(sentence, timeout=5000)
     assert note.get_attribute("role") == "alert"
-    assert page.evaluate("() => authToken") is None
 
 
 def _hold_the_warnings_check(page: Page) -> list:
@@ -119,19 +133,24 @@ def test_a_poll_refused_at_the_real_end_before_the_warnings_check_says_the_sessi
     _until_held(page, held, 150)
     while time.time() < exp + 1:
         page.wait_for_timeout(200)
-    # A poll's refusal of the token that ran out arrives first.
-    _poll(page)
-    _signed_out_saying(page, RAN_OUT)
-    # The person starts to sign in again; then the warning's own check comes back refused too: it changes
-    # nothing, neither the reason nor what the person typed.
+    # A poll's refusal of the token that ran out arrives first. The page's sign-out is held, so that the page
+    # stays while the warning's own check comes back.
+    signing_out = HeldSignOut(page)
+    _poll(page, token)
+    _signed_out_saying(page, signing_out, RAN_OUT)
+    # The person starts to sign in again; then the warning's own check comes back refused too: on the same page,
+    # it changes nothing, neither the reason nor what the person typed.
     page.fill("#username", "someone-else")
     held[0].continue_()
     page.unroute("**/users/me")
     page.wait_for_timeout(1500)
+    assert still_old(page), "the page went: the check's refusal reached nothing to test"
     expect(page.locator("#login-error")).to_contain_text(RAN_OUT)
     assert page.input_value("#username") == "someone-else"
+    assert page.evaluate("() => authToken") is None
     assert len(sent.sign_outs()) == 1, sent.sign_outs()
     assert sent.with_token_after_sign_out(token) == [], sent.with_token_after_sign_out(token)
+    _replaced_saying(page, signing_out, RAN_OUT)
 
 
 def test_a_session_ended_on_the_server_at_the_end_of_its_count_says_it_ended(page: Page, person):
@@ -142,14 +161,18 @@ def test_a_session_ended_on_the_server_at_the_end_of_its_count_says_it_ended(pag
     _end_on_the_server(token)
     page.evaluate("() => SessionWatch.armAt(Date.now() + 1000)")
     _until_held(page, held, 10)
-    # A poll's refusal arrives first, saying the session was ended: not that it ran out.
-    _poll(page)
-    _signed_out_saying(page, ENDED)
+    # A poll's refusal arrives first, saying the session was ended: not that it ran out. The warning's check then
+    # comes back refused on the same page, its sign-out held: the reason stays.
+    signing_out = HeldSignOut(page)
+    _poll(page, token)
+    _signed_out_saying(page, signing_out, ENDED)
     held[0].continue_()
     page.unroute("**/users/me")
     page.wait_for_timeout(1500)
+    assert still_old(page), "the page went: the check's refusal reached nothing to test"
     expect(page.locator("#login-error")).to_contain_text(ENDED)
     assert len(sent.sign_outs()) == 1, sent.sign_outs()
+    _replaced_saying(page, signing_out, ENDED)
 
 
 def test_a_session_ended_elsewhere_signs_out_saying_it_ended_not_that_it_ran_out(page: Page, person):
@@ -158,21 +181,25 @@ def test_a_session_ended_elsewhere_signs_out_saying_it_ended_not_that_it_ran_out
     assert page.evaluate("() => SessionWatch.remaining()") > 600
     # Ended by the server long before its end (as an administrator, a password change or a revocation ends one).
     _end_on_the_server(token)
-    _poll(page)
-    _signed_out_saying(page, ENDED)
+    signing_out = HeldSignOut(page)
+    _poll(page, token)
+    _signed_out_saying(page, signing_out, ENDED)
     note = page.locator("#login-error").inner_text()
     assert "nobody chose" not in note and "expired" not in note.lower(), note
     page.wait_for_timeout(1500)
     assert len(sent.sign_outs()) == 1, sent.sign_outs()
     assert sent.with_token_after_sign_out(token) == [], sent.with_token_after_sign_out(token)
+    _replaced_saying(page, signing_out, ENDED)
 
 
 def test_a_refusal_for_the_account_signs_out_with_the_servers_sentence(page: Page, person):
-    _login(page, person)
+    token = _login(page, person)
     sent = _Sent(page)
     page.route("**/notifications/unread-count", lambda route: route.fulfill(
         status=403, content_type="application/json", body='{"detail": "User account is locked"}'))
-    _poll(page)
-    _signed_out_saying(page, "User account is locked")
+    signing_out = HeldSignOut(page)
+    _poll(page, token)
+    _signed_out_saying(page, signing_out, "User account is locked")
     page.wait_for_timeout(1000)
     assert len(sent.sign_outs()) == 1, sent.sign_outs()
+    _replaced_saying(page, signing_out, "User account is locked")

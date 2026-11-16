@@ -12,6 +12,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import ApiClient, BASE_URL, unique
+from _ui_hand_over import replaced
 
 pytestmark = pytest.mark.ui
 
@@ -104,10 +105,10 @@ def test_the_density_switch_is_kept_for_the_account(page: Page, admin):
         page.reload()
         expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
         page.wait_for_function("() => document.documentElement.getAttribute('data-density') === 'compact'", timeout=10000)
-        # And the next person on this tab starts comfortable.
-        page.click("#profile-btn")
-        page.click("#dropdown-logout-btn")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        # And the next person on this tab starts comfortable: the page put in place after the sign-out.
+        with replaced(page):
+            page.click("#profile-btn")
+            page.click("#dropdown-logout-btn")
         assert page.evaluate("() => document.documentElement.getAttribute('data-density')") is None
     finally:
         admin.delete_user(u["id"])
