@@ -902,6 +902,13 @@ def test_a_name_another_page_gave_the_tab_neither_shows_its_text_nor_drops_the_s
     page.reload()
     expect(page.locator("#login-error")).to_have_text("Your session has ended. Sign in again.", timeout=15000)
     assert page.evaluate("() => window.name") == ""
+    # A reason of the session warning's (static/js/session-watch.js), the one an expired token's refusal carries
+    # past the storage the browser empties (Clear-Site-Data): its code alone gives the app's own sentence.
+    page.evaluate("(n) => { window.name = n; }", "dv-signed-out:" + json.dumps({"c": "ran_out", "t": True}))
+    page.reload()
+    expect(page.locator("#login-error")).to_have_text(
+        "Your session ended because nobody chose to stay signed in. Sign in again.", timeout=15000)
+    assert page.evaluate("() => window.name") == ""
     page.reload()
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
     page.wait_for_timeout(500)

@@ -8439,7 +8439,7 @@ async def second_factor_login_verify(
     access_token = create_access_token(
         data={"sub": str(user.id), "username": user.username, "session_token": session_token,
               "is_temporary": False, "amr": ["pwd", (body.method or "").lower()],
-              "mfa_at": int(datetime.now(timezone.utc).timestamp())},
+              "mfa_at": int(datetime.now(timezone.utc).timestamp()), "sign_in_id": _new_sign_in_id()},
         expires_delta=_expires)
     recovery_used = (body.method or "").lower() == "recovery"
     try:
@@ -8633,7 +8633,8 @@ async def login(
                 "sub": str(user.id),
                 "username": user.username,
                 "session_token": session_token if session_token else None,
-                "is_temporary": is_temporary
+                "is_temporary": is_temporary,
+                "sign_in_id": _new_sign_in_id(),
             },
             expires_delta=_expires,
         )
@@ -11105,7 +11106,8 @@ async def acknowledge_recovery_codes(
         access_token = create_access_token(
             data={"sub": str(current_user.id), "username": current_user.username,
                   "session_token": session_token, "is_temporary": False,
-                  "amr": ["pwd", "totp"], "mfa_at": int(datetime.now(timezone.utc).timestamp())},
+                  "amr": ["pwd", "totp"], "mfa_at": int(datetime.now(timezone.utc).timestamp()),
+                  "sign_in_id": _new_sign_in_id()},
             expires_delta=_expires)
         try:
             AuditLogger(db).log_login_success(current_user, client_ip, is_temporary=False)
@@ -25581,10 +25583,18 @@ def _session_renewal_limit(db) -> timedelta:
 
 
 # The identity claims a renewal carries unchanged from the token it replaces: how the person signed in
-# (amr), when the second factor was proved (mfa_at), when the sign-in happened (auth_time) and, for a
-# sign-in through an outside identity provider, which one (idp). The sign-in path owns what each means;
-# a renewal only keeps them.
-RENEWAL_CLAIMS = ("amr", "mfa_at", "auth_time", "idp")
+# (amr), when the second factor was proved (mfa_at), when the sign-in happened (auth_time), which sign-in
+# it is (sign_in_id) and, for a sign-in through an outside identity provider, which one (idp). The sign-in
+# path owns what each means; a renewal only keeps them.
+RENEWAL_CLAIMS = ("amr", "mfa_at", "auth_time", "sign_in_id", "idp")
+
+
+def _new_sign_in_id() -> str:
+    """A random id for one sign-in, minted when the person signs in and kept by every renewal of it
+    (RENEWAL_CLAIMS). A page tells by it a renewal of its own sign-in from a new sign-in of the same person:
+    a time cannot, since two sign-ins may share one (the same second, or an identity provider's session)."""
+    import secrets as _secrets
+    return _secrets.token_urlsafe(16)
 
 
 def _amr_has_second_factor(amr) -> bool:

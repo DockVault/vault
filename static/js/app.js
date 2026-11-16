@@ -851,10 +851,13 @@ async function _apiRequestNow(endpoint, options = {}) {
                 // Session expired - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
                     console.error('Session expired, logging out');
+                    const endedBefore = _sessionsEnded;
                     const renewed = await _signOutRefused(sentToken, 401, errorDetail);
                     // The tab carries on with a renewed token of the same sign-in: this request is sent once more
                     // with it, rather than failing while the person stays signed in. A refused retry signs out.
-                    if (renewed && !options._renewedRetry) {
+                    // Never when a session ended on the page meanwhile: the token held now may be a sign-in made
+                    // since, and the request is not that person's.
+                    if (renewed && endedBefore === _sessionsEnded && !options._renewedRetry) {
                         return _apiRequestNow(endpoint, { ...options, silent, _renewedRetry: true });
                     }
                 }
@@ -2338,11 +2341,16 @@ function _tellOtherTabsSignedOut(token) {
     try { if (_signOutChannel) _signOutChannel.postMessage({ type: 'signed-out', token: _tokenTail(token) }); } catch (_) {}
 }
 
-// A tab that stayed signed in (static/js/session-watch.js) tells the others which token it replaced; each tab
-// holding that token takes the new one from the storage they share. The message carries no token: only the tail
-// of the one that died.
-function _tellOtherTabsRenewed(previousToken) {
-    try { if (_signOutChannel) _signOutChannel.postMessage({ type: 'renewed', token: _tokenTail(previousToken) }); } catch (_) {}
+// A tab that stayed signed in (static/js/session-watch.js) tells the others which token it replaced and which
+// token replaced it; each tab holding the old one takes the new one from the storage they share, when the token
+// stored there is that one and renews its own sign-in (SessionWatch.takeToldRenewal). The message carries no
+// token: only the tails of the two.
+function _tellOtherTabsRenewed(previousToken, newToken) {
+    try {
+        if (_signOutChannel) {
+            _signOutChannel.postMessage({ type: 'renewed', token: _tokenTail(previousToken), next: _tokenTail(newToken) });
+        }
+    } catch (_) {}
 }
 
 if (_signOutChannel) {
@@ -2350,8 +2358,11 @@ if (_signOutChannel) {
         const told = event && event.data;
         if (!told || !authToken || told.token !== _tokenTail(authToken)) return;
         if (told.type === 'renewed') {
-            const renewed = storage.getItem('authToken');
-            if (renewed && renewed !== authToken && window.SessionWatch) SessionWatch.adopt(renewed);
+            const stored = storage.getItem('authToken');
+            if (stored && typeof told.next === 'string' && told.next && _tokenTail(stored) === told.next
+                && window.SessionWatch && typeof SessionWatch.takeToldRenewal === 'function') {
+                SessionWatch.takeToldRenewal(stored);
+            }
             return;
         }
         if (told.type !== 'signed-out') return;

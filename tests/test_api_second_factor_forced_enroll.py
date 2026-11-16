@@ -53,6 +53,10 @@ def test_forced_enrollment_bootstraps_a_session(admin):
             assert ar.status_code == 200, ar.text
             tok = ar.json().get("access_token")
             assert tok, ar.text
+            # A sign-in of its own: its token carries a sign-in id, as every sign-in's does.
+            import base64, json
+            part = tok.split(".")[1]
+            assert json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("sign_in_id")
 
             # The minted session works and reports the enrollment.
             me = fresh.session.get(f"{BASE_URL}/users/me/second-factor",

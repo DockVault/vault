@@ -151,15 +151,21 @@ def test_an_account_that_now_needs_a_second_factor_is_refused_unless_its_token_s
 def test_the_renewed_token_carries_the_identity_claims_and_the_sign_in_time(db):
     user = _user(db)
     now = datetime.now(timezone.utc)
-    old = _old(2 * HOUR, now, amr=["pwd", "totp"], mfa_at=1700000000, idp="corp", nonce="dropped")
+    old = _old(2 * HOUR, now, amr=["pwd", "totp"], mfa_at=1700000000, idp="corp", sign_in_id="si-1", nonce="dropped")
     auth_time, expires_at = api._renewal_terms(db, user, old, now)
     token = api._renewed_token(user, old, "new-session-token", auth_time, expires_at, now)
     claims = jwt.decode(token, options={"verify_signature": False})
     assert claims["amr"] == ["pwd", "totp"] and claims["mfa_at"] == 1700000000 and claims["idp"] == "corp"
+    assert claims["sign_in_id"] == "si-1"
     assert claims["auth_time"] == old["iat"] and claims["session_token"] == "new-session-token"
     assert claims["sub"] == str(user.id) and claims["is_temporary"] is False and "nonce" not in claims
     assert abs(claims["exp"] - int(expires_at.timestamp())) <= 1
-    assert api.RENEWAL_CLAIMS == ("amr", "mfa_at", "auth_time", "idp")
+    assert api.RENEWAL_CLAIMS == ("amr", "mfa_at", "auth_time", "sign_in_id", "idp")
+
+
+def test_every_sign_in_gets_its_own_sign_in_id():
+    ids = {api._new_sign_in_id() for _ in range(200)}
+    assert len(ids) == 200 and all(isinstance(i, str) and len(i) >= 20 for i in ids)
 
 
 def test_the_session_probe_is_the_route_that_answers_auth_session():

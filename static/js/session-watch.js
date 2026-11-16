@@ -313,28 +313,47 @@
         return true;
     }
 
-    // Another tab of this browser renewed this sign-in first, so the token sent is spent (the server answered it
-    // with a 401): the renewed one, which that tab stored for the browser, is taken instead, as a tab told of the
-    // renewal takes it. Only the same person's full sign-in, still running: not the token of another account
-    // signed in since in another tab, and never a temporary credential's (it carries its owner's id as sub).
-    // True when one was taken.
     // When the sign-in a token belongs to happened: its auth_time once renewed, its iat before that; 0 when unknown.
     const signedInAt = (claims) => Number(claims.auth_time || claims.iat) || 0;
 
-    function takeRenewedToken(sent) {
-        if (authToken && authToken !== sent) { armFromToken(authToken); return true; }   // taken already
-        if (authToken !== sent) return false;                                          // signed out since
-        let stored = null;
-        try { stored = storage.getItem('authToken'); } catch (_) {}
-        const mine = claimsOf(sent), theirs = stored ? claimsOf(stored) : null;
-        if (!stored || stored === sent || !mine || !theirs) return false;
+    // Whether the token `theirs` renews the sign-in of `mine` (both as claims), so that a tab holding `mine` may
+    // take it: the same person's full sign-in, not the token of another account signed in since in another tab,
+    // never a temporary credential's (it carries its owner's id as sub), still running, and the same sign-in,
+    // not a new sign-in of the same person since: a tab signed out and never told signs out rather than open a
+    // session it was not part of. The same sign-in is told by the id the server gives every sign-in and keeps
+    // through its renewals (sign_in_id); a token from before that id, by the time of the sign-in.
+    function renewsSignIn(mine, theirs) {
+        if (!mine || !theirs) return false;
         if (theirs.sub !== mine.sub || theirs.username !== mine.username) return false;
         if (theirs.is_temporary || mine.is_temporary) return false;
         if (!theirs.exp || theirs.exp * 1000 <= Date.now()) return false;
-        // A renewal of this tab's own sign-in, which carries the time of that sign-in on (auth_time): not a new
-        // sign-in of the same person since, in another tab. This tab may have been signed out and never told, and
-        // it signs out rather than open a session it was not part of.
-        if (!signedInAt(mine) || signedInAt(theirs) !== signedInAt(mine)) return false;
+        if (mine.sign_in_id || theirs.sign_in_id) return !!mine.sign_in_id && theirs.sign_in_id === mine.sign_in_id;
+        return !!signedInAt(mine) && signedInAt(theirs) === signedInAt(mine);
+    }
+
+    // Another tab of this browser renewed this sign-in first, so the token sent is spent (the server answered it
+    // with a 401): the renewed one, which that tab stored for the browser, is taken instead, when it renews this
+    // tab's sign-in (renewsSignIn). True when the tab now holds such a token.
+    function takeRenewedToken(sent) {
+        if (authToken && authToken !== sent) {                                          // taken already
+            if (!renewsSignIn(claimsOf(sent), claimsOf(authToken))) return false;
+            armFromToken(authToken);
+            return true;
+        }
+        if (authToken !== sent) return false;                                          // signed out since
+        let stored = null;
+        try { stored = storage.getItem('authToken'); } catch (_) {}
+        if (!stored || stored === sent || !renewsSignIn(claimsOf(sent), claimsOf(stored))) return false;
+        return adopt(stored);
+    }
+
+    // Another tab told this one that it renewed the session this tab holds, and stored `stored`, the token its
+    // message names (static/js/app.js, the sign-out channel). Taken only when it renews this tab's sign-in
+    // (renewsSignIn): a tab the browser froze gets its messages when it wakes, by which time the token stored may
+    // be the next sign-in's. Otherwise nothing is taken, and the tab's next request, refused, signs it out.
+    function takeToldRenewal(stored) {
+        if (!authToken || !stored || stored === authToken) return false;
+        if (!renewsSignIn(claimsOf(authToken), claimsOf(stored))) return false;
         return adopt(stored);
     }
 
@@ -358,7 +377,8 @@
         if (btn) btn.disabled = true;
         const sent = authToken;
         let settled;
-        renewing = { token: sent, done: new Promise((resolve) => { settled = resolve; }) };
+        // `renewed`: the token this renewal produced, once taken (refusedSession carries on only with it).
+        renewing = { token: sent, renewed: null, done: new Promise((resolve) => { settled = resolve; }) };
         try {
             // Asked directly rather than through apiRequest: a refusal here is this dialog's to explain. Through
             // apiRequest a 401, or a 403 that names the account, signs the tab out before the answer is read,
@@ -383,11 +403,12 @@
             if (!res.ok || !body || !body.access_token) throw new Error('no token');
             if (authToken !== sent) { endUnwantedSession(body.access_token); return; }
             authToken = body.access_token;
+            if (renewing) renewing.renewed = authToken;
             try { storage.setItem('authToken', authToken); } catch (_) {}
             armFromToken(authToken);   // hides the dialog and arms for the new expiry
-            // The other tabs of this browser hold the old token, which is dead now: told, they take the new
-            // one from the shared storage and carry on (static/js/app.js, the sign-out channel).
-            if (typeof _tellOtherTabsRenewed === 'function') _tellOtherTabsRenewed(sent);
+            // The other tabs of this browser hold the old token, which is dead now: told which token replaced it,
+            // they take that one from the shared storage and carry on (static/js/app.js, the sign-out channel).
+            if (typeof _tellOtherTabsRenewed === 'function') _tellOtherTabsRenewed(sent, authToken);
             if (typeof showSuccess === 'function') showSuccess('You stay signed in.');
         } catch (e) {
             if (typeof showError === 'function') showError('Could not extend the session right now. Try again, or sign in again when it ends.');
@@ -421,12 +442,14 @@
     // has ended (sentenceFor401, by the answer's own sentence). Once per session (signOutWithNote). A renewal of
     // this token on its way (Stay pressed in this tab) ends the old session at once, so a request sent meanwhile is
     // refused: the refusal waits for the renewal's answer and is weighed again with what the tab holds then. Resolves
-    // true when the tab carries on with a renewed token or was signed out by this call.
+    // true when the tab carries on with a renewed token or was signed out by this call; after a renewal of its own,
+    // only when the tab holds the token that renewal produced (not that of a sign-in made on the page since).
     async function refusedSession(token, status, detail) {
         if (status === 403) return signOutWithNote((typeof detail === 'string' && detail) || ENDED, token);
         if (renewing && renewing.token === token) {
-            await renewing.done;
-            if (authToken && authToken !== token) return true;
+            const own = renewing;
+            await own.done;
+            if (own.renewed && authToken === own.renewed) return true;
         }
         if (takeRenewedToken(token)) return true;
         return signOutWithNote(sentenceFor401(token, detail), token);
@@ -474,6 +497,6 @@
     }
 
     window.SessionWatch = { armFromToken, armTemporary, armAt, disarm, show, remaining, adopt, forgetArrival,
-                            refusedSession, isTemporary: () => temporary, WARN_SECONDS,
+                            refusedSession, takeToldRenewal, isTemporary: () => temporary, WARN_SECONDS,
                             REASONS: { ran_out: RAN_OUT, temporary_ran_out: TEMPORARY_RAN_OUT } };
 })();

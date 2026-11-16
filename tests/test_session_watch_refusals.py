@@ -2,7 +2,8 @@
 
 "Stay signed in" refused with a 401 takes the token of another tab's renewal of the same person's full sign-in,
 and nothing else: not another account's token signed in since in another tab, not the same person's new sign-in
-since (a tab signed out and never told signs out), not a temporary credential's (it carries its owner's id as sub). Refused with a 403, nothing is taken: the server's sentence is said. A renewal
+since (a tab signed out and never told signs out; the same sign-in is told by the id every sign-in carries, else
+by its time), not a temporary credential's (it carries its owner's id as sub). Refused with a 403, nothing is taken: the server's sentence is said. A renewal
 that comes back after the tab signed out is ended on the server. A refusal of any request of the session signs
 the tab out once: a second refusal neither signs out again nor writes over the first reason. A 401 says that the
 session ran out only when it was ending anyway and the server did not say it ended the session itself. The
@@ -138,6 +139,47 @@ await stay();
 out({{ held: authToken, logouts, note: note() }})
 """)
     assert out == {"held": None, "logouts": 1, "note": ENDED}
+
+
+# This tab's own token is already a renewal (its sign-in at NOW - 600, made at NOW - 60). Another tab renews the
+# same sign-in again: taken. A token whose sign-in time is this token's own making time is another sign-in: not.
+@pytest.mark.parametrize("theirs,taken", [
+    ("{ ...person, iat: NOW, exp: NOW + 3600, auth_time: NOW - 600 }", True),
+    ("{ ...person, iat: NOW, exp: NOW + 3600, auth_time: NOW - 60 }", False),
+])
+def test_a_tab_whose_token_is_a_renewal_takes_the_next_renewal_of_the_same_sign_in(theirs, taken):
+    out = _node(f"""
+const again = token({{ ...person, iat: NOW - 60, exp: NOW + 3000, auth_time: NOW - 600 }}, 'again');
+const theirs = token({theirs}, 'theirs');
+authToken = again;
+store.set('authToken', theirs);
+route = () => Promise.resolve(answer(401, {{ detail: 'Session has been terminated. Please login again.' }}));
+await stay();
+out({{ taken: authToken === theirs, logouts }});
+""")
+    assert out == {"taken": taken, "logouts": 0 if taken else 1}
+
+
+# Sign-ins carry an id of their own, which every renewal keeps: the same sign-in is told by it, and only by it when
+# either token carries one (two sign-ins may share a time: an identity provider's session, or the same second).
+@pytest.mark.parametrize("mine_id,theirs_id,theirs_auth,taken", [
+    ("'s-1'", "'s-1'", "NOW - 600", True),        # a renewal of this sign-in
+    ("'s-1'", "'s-2'", "NOW - 600", False),       # another sign-in at the same time
+    ("'s-1'", "undefined", "NOW - 600", False),   # a token without the id, at the same time
+    ("undefined", "'s-2'", "NOW - 600", False),   # this tab's token from before the id; theirs a new sign-in
+    ("undefined", "undefined", "NOW - 600", True),    # neither carries one: told by the time of the sign-in
+])
+def test_the_same_sign_in_is_told_by_its_id(mine_id, theirs_id, theirs_auth, taken):
+    out = _node(f"""
+const own = token({{ ...person, sign_in_id: {mine_id} }}, 'own');
+const theirs = token({{ ...person, iat: NOW, exp: NOW + 3600, auth_time: {theirs_auth}, sign_in_id: {theirs_id} }}, 'theirs');
+authToken = own;
+store.set('authToken', theirs);
+route = () => Promise.resolve(answer(401, {{ detail: 'Session has been terminated. Please login again.' }}));
+await stay();
+out({{ taken: authToken === theirs, logouts }});
+""")
+    assert out == {"taken": taken, "logouts": 0 if taken else 1}
 
 
 def test_a_403_takes_nothing_and_says_the_servers_sentence():

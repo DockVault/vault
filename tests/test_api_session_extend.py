@@ -57,6 +57,22 @@ def test_extend_gives_a_new_token_and_kills_the_old_one(admin):
         admin.delete_user(u["id"])
 
 
+def test_each_sign_in_has_its_own_id_and_its_renewals_keep_it(admin):
+    # Two sign-ins of one person, in the same second as far as their times go: told apart by their ids alone.
+    u = admin.create_user(role="user")
+    try:
+        one, two = ApiClient(), ApiClient()
+        one.login(u["_username"], u["_password"])
+        two.login(u["_username"], u["_password"])
+        a, b = _claims(one.token), _claims(two.token)
+        assert a.get("sign_in_id") and b.get("sign_in_id") and a["sign_in_id"] != b["sign_in_id"]
+        renewed = _extend(one.token)
+        assert renewed.status_code == 200, renewed.text
+        assert _claims(renewed.json()["access_token"])["sign_in_id"] == a["sign_in_id"]
+    finally:
+        admin.delete_user(u["id"])
+
+
 def test_a_temporary_credentials_session_is_not_extended(admin):
     v = admin.create_vault(name="extend-temp")
     try:
@@ -92,13 +108,14 @@ def test_a_renewal_carries_how_the_person_signed_in_and_when(admin):
         assert r.status_code == 200, r.text
         first = r.json()["access_token"]
         before = _claims(first)
-        assert before["amr"] == ["pwd", "totp"] and before["mfa_at"]
+        assert before["amr"] == ["pwd", "totp"] and before["mfa_at"] and before["sign_in_id"]
         # A renewal in a later second than the sign-in, so a renewal that took its own time could not pass.
         time.sleep(1.1)
         renewed = _extend(first)
         assert renewed.status_code == 200, renewed.text
         after = _claims(renewed.json()["access_token"])
         assert after["amr"] == before["amr"] and after["mfa_at"] == before["mfa_at"]
+        assert after["sign_in_id"] == before["sign_in_id"]
         # The sign-in, not the renewal: the first token's own auth_time when it carries one (a sign-in that
         # took more than one step can say it began a second before the token was made), else its iat.
         signed_in = before.get("auth_time", before["iat"])
@@ -106,6 +123,7 @@ def test_a_renewal_carries_how_the_person_signed_in_and_when(admin):
         assert after["auth_time"] == signed_in and after["iat"] > signed_in
         again = _claims(_extend(renewed.json()["access_token"]).json()["access_token"])
         assert again["auth_time"] == signed_in and again["amr"] == before["amr"]
+        assert again["sign_in_id"] == before["sign_in_id"]
         rows = _psql(f"SELECT details::text FROM audit_logs WHERE action='session_extended' AND username='{u['_username']}' "
                      "ORDER BY timestamp DESC LIMIT 1")
         assert '"ended_session"' in rows and '"new_session"' in rows and '"signed_in_at"' in rows
