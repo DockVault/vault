@@ -1,8 +1,8 @@
 """How the session warning ends a session, offline (static/js/session-watch.js run in Node with small stand-ins).
 
 "Stay signed in" refused with a 401 takes the token of another tab's renewal of the same person's full sign-in,
-and nothing else: not another account's token signed in since in another tab, not a temporary credential's (it
-carries its owner's id as sub). Refused with a 403, nothing is taken: the server's sentence is said. A renewal
+and nothing else: not another account's token signed in since in another tab, not the same person's new sign-in
+since (a tab signed out and never told signs out), not a temporary credential's (it carries its owner's id as sub). Refused with a 403, nothing is taken: the server's sentence is said. A renewal
 that comes back after the tab signed out is ended on the server. A refusal of any request of the session signs
 the tab out once: a second refusal neither signs out again nor writes over the first reason. A 401 says that the
 session ran out only when it was ending anyway and the server did not say it ended the session itself. The
@@ -49,8 +49,8 @@ const elementFor = (id) => els[id] || (els[id] = {
 globalThis.document = { getElementById: elementFor, addEventListener: () => {}, hidden: false };
 const aborts = [];
 const intervals = [];
-// The note is written 400 ms after a sign-out: at once here. A check's give-up timer is kept to be fired by hand.
-globalThis.setTimeout = (fn, ms) => { if (ms === 400) fn(); else if (ms === 15000) aborts.push(fn); return 0; };
+// A check's give-up timer is kept to be fired by hand.
+globalThis.setTimeout = (fn, ms) => { if (ms === 15000) aborts.push(fn); return 0; };
 globalThis.clearTimeout = () => {};
 globalThis.setInterval = (fn) => { intervals.push(fn); return 1; };
 globalThis.clearInterval = () => {};
@@ -58,7 +58,12 @@ globalThis.API_BASE = '';
 globalThis.authToken = mine;
 store.set('authToken', mine);
 let logouts = 0;
-globalThis.logout = () => { logouts += 1; authToken = null; };
+// The page's sign-out shows the reason it is given on the sign-in screen (and hands it to the page that replaces it).
+globalThis.logout = (how, reason) => {
+    logouts += 1;
+    authToken = null;
+    if (reason) elementFor('login-error').textContent = reason;
+};
 const toasts = [];
 globalThis.showError = (m) => toasts.push(['error', m]);
 globalThis.showSuccess = (m) => toasts.push(['success', m]);
@@ -123,6 +128,7 @@ out({ taken: authToken === renewed, logouts, note: note() });
     "{ ...person, username: 'ben' }",                                 # another name under the same id
     "{ ...person, sub: '8', username: 'ben' }",                       # another account signed in since
     "{ ...person, exp: NOW - 5 }",                                    # one that has run out
+    "{ ...person, iat: NOW }",                                        # a new sign-in of the same person since
 ])
 def test_a_401_takes_no_other_token_and_signs_out_saying_the_session_ended(theirs):
     out = _node(f"""

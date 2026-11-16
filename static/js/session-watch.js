@@ -318,6 +318,9 @@
     // renewal takes it. Only the same person's full sign-in, still running: not the token of another account
     // signed in since in another tab, and never a temporary credential's (it carries its owner's id as sub).
     // True when one was taken.
+    // When the sign-in a token belongs to happened: its auth_time once renewed, its iat before that; 0 when unknown.
+    const signedInAt = (claims) => Number(claims.auth_time || claims.iat) || 0;
+
     function takeRenewedToken(sent) {
         if (authToken && authToken !== sent) { armFromToken(authToken); return true; }   // taken already
         if (authToken !== sent) return false;                                          // signed out since
@@ -328,6 +331,10 @@
         if (theirs.sub !== mine.sub || theirs.username !== mine.username) return false;
         if (theirs.is_temporary || mine.is_temporary) return false;
         if (!theirs.exp || theirs.exp * 1000 <= Date.now()) return false;
+        // A renewal of this tab's own sign-in, which carries the time of that sign-in on (auth_time): not a new
+        // sign-in of the same person since, in another tab. This tab may have been signed out and never told, and
+        // it signs out rather than open a session it was not part of.
+        if (!signedInAt(mine) || signedInAt(theirs) !== signedInAt(mine)) return false;
         return adopt(stored);
     }
 
