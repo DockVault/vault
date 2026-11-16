@@ -225,7 +225,11 @@ def test_the_share_dialog_says_what_view_only_gives_under_the_chosen_tag(page: P
         page.fill("#password", admin_creds["password"])
         page.click("#login-form button[type=submit]")
         expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-        page.evaluate("([id, name]) => openCreateShareModal('vault', id, name)", [vault["id"], vault["name"]])
+        # The vault opened, its whole-vault share dialog from the toolbar.
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.locator(f'.vault-card[data-vault-id="{vault["id"]}"] .open-vault-btn').click()
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+        page.click("#share-vault-btn")
         select = page.locator("#share-tag-select")
         expect(select.locator(f'option[value="{tags[False]["id"]}"]')).to_have_count(1, timeout=10000)
         label = page.locator("#share-view-only-text")
