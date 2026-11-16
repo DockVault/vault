@@ -1302,6 +1302,11 @@ class ShareCreate(BaseModel):
     max_recipients: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
     max_downloads: Optional[int] = Field(None, ge=1, le=_INT4_MAX)
     view_only: Optional[bool] = None
+    # What the maker was shown a view-only share would give: True when the dialog said its recipients can view
+    # files in the browser, False when it said names and sizes only. The tag may have changed since the dialog
+    # read it; a share is made viewable only when the tag allows it AND the maker was not told otherwise. A
+    # caller that leaves it out gets the tag's switch as it is.
+    view_only_preview_shown: Optional[bool] = None
     with_link: bool = True
 
 
@@ -12494,6 +12499,19 @@ _SHARE_TAG_NOT_NULLABLE = frozenset({
 })
 
 
+def _via_share(user, vault_id) -> dict:
+    """What a share-only caller's claims on a vault allow, for the web app (VaultResponse.via_share), read from the
+    scopes get_vault stamped (allow_share=True). view_only: no claim allows a download (the downloadable scope is a
+    dict with nothing in it; None is a whole-vault claim that allows downloads). preview: some claim lets the caller
+    view files in the browser (the previewable scope is not empty: view-only shares whose makers were told the
+    files cannot be opened add nothing to it)."""
+    def _empty(attr):
+        scopes = getattr(user, attr, None) or {}
+        scope = scopes.get(str(vault_id)) if str(vault_id) in scopes else None
+        return isinstance(scope, dict) and not scope.get("files") and not scope.get("folders")
+    return {"view_only": _empty("_share_download_scope"), "preview": not _empty("_share_preview_scope")}
+
+
 def _share_tag_dict(t: ShareTag) -> dict:
     """Full admin view of a share tag (includes the create-allowlist so the Tags manager can edit it).
     Id lists are stringified; this is the admin-only shape (GET /share-policy exposes far less)."""
@@ -17052,7 +17070,8 @@ async def create_share(
         link_token_hash=link_token_hash, claim_audience=payload.claim_audience,
         audience_user_ids=aud_users, audience_department_ids=aud_depts,
         expires_at=expires_at, max_recipients=limits["max_recipients"], max_downloads=limits["max_downloads"],
-        view_only=limits["view_only"], view_only_preview=bool(tag.view_only_preview),
+        view_only=limits["view_only"],
+        view_only_preview=bool(tag.view_only_preview) and payload.view_only_preview_shown is not False,
         tag_policy_snapshot=snapshot, status="active",
     )
     db.add(share)
@@ -18861,17 +18880,7 @@ async def get_vault(
             share_perms = permission_service.get_vault_permissions(current_user, vault.id, allow_share=True)
             if share_perms is not None:
                 base_perms = share_perms
-                # What the claims allow: get_vault (allow_share=True) stamped the caller's downloadable scope
-                # for this vault; a dict with nothing in it means every claim here is view-only. None means a
-                # whole-vault claim that allows downloads.
-                _dl_scopes = getattr(current_user, "_share_download_scope", None) or {}
-                _dl = _dl_scopes.get(str(vault.id)) if str(vault.id) in _dl_scopes else None
-                # And the previewable scope: empty when no claim here lets the caller view files in the
-                # browser (view-only shares whose makers were told the files cannot be opened).
-                _pv_scopes = getattr(current_user, "_share_preview_scope", None) or {}
-                _pv = _pv_scopes.get(str(vault.id)) if str(vault.id) in _pv_scopes else None
-                via_share = {"view_only": isinstance(_dl, dict) and not _dl.get("files") and not _dl.get("folders"),
-                             "preview": not (isinstance(_pv, dict) and not _pv.get("files") and not _pv.get("folders"))}
+                via_share = _via_share(current_user, vault.id)
                 try:
                     AuditLogger(db).log_action(
                         action="share_opened", status="success", user=current_user,
@@ -23583,8 +23592,10 @@ async def preview_file(
     Every gate of the download route applies (the endpoint permission, the file.download capability of a
     temporary credential, the vault password, a file's password, the file scope, the transfer slot), with
     one difference: a view-only share claim, which grants visibility and not download, may read through
-    here. A preview discloses the content as a download does and cannot stop copying; what the share's
-    maker is told says so. A zero-knowledge vault's file is ciphertext either way."""
+    here when its share lets view-only recipients view files (the tag's switch, copied into the share when it
+    was made; off for every share made before the switch existed, refused with a sentence saying so). A
+    preview discloses the content as a download does and cannot stop copying; what the share's maker is told
+    says so. A zero-knowledge vault's file is ciphertext either way."""
     return await _serve_file(vault_id, file_id, request, file_password, current_user, db, x_vault_password,
                              as_preview=True, view_only_ok=True)
 

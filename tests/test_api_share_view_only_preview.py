@@ -32,11 +32,17 @@ def _upload(client, vault_id, name, content):
     return next(f["id"] for f in client.get(f"/vaults/{vault_id}/files").json()["items"] if f["name"] == name)
 
 
+# The tags a test makes, deactivated when it ends (a tag is never deleted: shares keep their record of it).
+_MADE = []
+
+
 @pytest.fixture
 def sharing(admin):
     before = admin.get("/settings").json().get("sharing_enabled")
     admin.put("/settings", json={"sharing_enabled": True})
     yield
+    while _MADE:
+        admin.delete(f"/share-tags/{_MADE.pop()}")
     admin.put("/settings", json={"sharing_enabled": before})
 
 
@@ -46,6 +52,7 @@ def _tag(admin, **over):
     body.update(over)
     r = admin.post("/share-tags", json=body)
     assert r.status_code == 200, r.text
+    _MADE.append(r.json()["id"])
     return r.json()
 
 
@@ -170,6 +177,24 @@ def test_a_share_that_allows_downloads_previews_whatever_the_switch_says(admin, 
         _claimed(temp_user_client, share)
         assert _preview(temp_user_client, vault, fid).status_code == 200
         assert temp_user_client.get(f"/vaults/{vault['id']}/files/{fid}/download").status_code == 200
+    finally:
+        admin.delete_vault(vault["id"])
+
+
+def test_a_share_is_viewable_only_when_its_maker_was_not_told_otherwise(admin, sharing):
+    # The share dialog says what view-only gives from the tags it read when it opened, and sends that with the
+    # share. The tag may have been switched on since: what the maker was shown wins.
+    vault = admin.create_vault(name=unique("vpshown"))
+    try:
+        tag = _tag(admin, view_only_preview=True)
+        assert _share(admin, vault, tag, view_only_preview_shown=False)["view_only_preview"] is False
+        assert _share(admin, vault, tag, view_only_preview_shown=True)["view_only_preview"] is True
+        # A caller that says nothing gets the tag's switch as it is.
+        assert _share(admin, vault, tag)["view_only_preview"] is True
+        off = _tag(admin, view_only_preview=False)
+        assert _share(admin, vault, off)["view_only_preview"] is False
+        # Being told the files can be viewed does not open a share the tag does not allow.
+        assert _share(admin, vault, off, view_only_preview_shown=True)["view_only_preview"] is False
     finally:
         admin.delete_vault(vault["id"])
 

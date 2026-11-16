@@ -67,3 +67,15 @@ def test_view_only_says_what_the_chosen_tag_gives():
     html = _read("static/index.html")
     assert "View only (recipients see names and sizes; they cannot open or download)" in js
     assert "View-only recipients may view files in the browser (they still cannot download)" in html
+
+
+def test_every_place_a_view_only_share_is_named_says_what_it_gives():
+    """The maker's card and the administrator's tag list say whether view-only recipients view files; the share
+    dialog says what names-only recipients do see; a names-only recipient's file list offers no preview."""
+    js = _read("static/js/app.js")
+    assert "sh.view_only_preview\n        ? 'View only (preview in the browser, no download)' : 'View only (names and sizes only)'" in js
+    assert "'view-only: viewable' : 'view-only: names and sizes'" in js
+    assert "Recipients see the shared files' names, sizes, types and dates; they cannot open or download them." in js
+    assert "and nothing more." not in js.split("function _shareViewOnlyLabel", 1)[1].split("\n}\n", 1)[0]
+    assert js.count('title="${_fileOpenTitle()}"') == 2 and 'title="Click to preview"' not in js
+    assert "viaShareNoPreview() ? `About file ${item.name}` : `Preview file ${item.name}`" in js

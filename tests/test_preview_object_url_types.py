@@ -297,3 +297,27 @@ def test_without_the_download_a_document_is_shown_as_its_text_and_read_from_the_
     assert out["picture"]["minted"] == ["image/png"] and out["picture"]["button"] == "none"
     for r in out.values():
         assert r["urls"] and all(u.endswith("/preview") for u in r["urls"]), r["urls"]
+
+
+def test_a_names_only_claim_asks_for_nothing_and_a_refusal_shows_the_servers_own_sentence():
+    """A vault reached through claims that do not let the person view files (via_share.preview false): opening a
+    file asks the server for nothing and says why. Where the page could not tell and the server refuses, the
+    server's own sentence is shown, as text."""
+    out = _walk(
+        "const o = {};\n"
+        "state.currentVault.via_share = { view_only: true, preview: false };\n"
+        "o.names = await run('a.png', 'image/png', 1, false, Buffer.from('x'), false);\n"
+        "o.namesText = bodyEl.children.map((c) => c.textContent);\n"
+        "o.download = downloadEl.style.display;\n"
+        "state.currentVault.via_share = { view_only: true, preview: true };\n"
+        "global.fetch = async (u) => { fetched.push(u); return { ok: false, status: 403,\n"
+        "  json: async () => ({ detail: 'the server said no' }) }; };\n"
+        "fetched.length = 0; failures.length = 0;\n"
+        "await openFilePreview('f', 'a.png', 'image/png');\n"
+        "o.refused = { fetched: fetched.length, text: bodyEl.children.map((c) => c.textContent) };\n"
+        "process.stdout.write(JSON.stringify(o));")
+    assert out["names"]["fetched"] == 0, out
+    assert out["namesText"] == [("This share shows names and sizes only; ask the person who shared it to share it "
+                                 "again if you need to view the files.")], out
+    assert out["download"] == "none", out
+    assert out["refused"]["fetched"] == 1 and out["refused"]["text"] == ["the server said no"], out

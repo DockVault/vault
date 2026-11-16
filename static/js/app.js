@@ -357,8 +357,9 @@ function tempVaultCaps(vaultId) {
 // True if the current open vault's scope permits `cap` (or the session is not a
 // scoped temp credential, in which case the vault-role gating alone applies).
 function vaultCapAllowed(cap) {
-    // A view-only share recipient (GET /vaults/{id} says via_share.view_only) may preview, never download,
-    // so nothing download-shaped (Download, Copy, Copy SHA-256, Render) is offered: the server refuses each.
+    // A view-only share recipient (GET /vaults/{id} says via_share.view_only) never downloads, and previews only
+    // when the share allows it (via_share.preview), so nothing download-shaped (Download, Copy, Copy SHA-256,
+    // Render) is offered: the server refuses each.
     if (cap === 'file.download' && viaShareViewOnly()) return false;
     const caps = state.tempVaultCaps;   // set by openVault(); null when not scope-limited
     return !caps || caps.has(cap);
@@ -375,6 +376,12 @@ function viaShareViewOnly(vault) {
 function viaShareNoPreview(vault) {
     const v = vault || state.currentVault;
     return !!(v && v.via_share && v.via_share.preview === false);
+}
+
+// What opening a file in the list does, said on its name: a preview, or (for a recipient who may not view files)
+// why there is none.
+function _fileOpenTitle() {
+    return viaShareNoPreview() ? 'Names and sizes only: this share does not let you view the file' : 'Click to preview';
 }
 
 // The server's sentence for a preview it refuses to such a recipient (app/services/vault_service.py).
@@ -3884,7 +3891,8 @@ function _sharedByMeCard(sh) {
     meta.appendChild(_el('span', null, (sh.claim_count || 0) + (sh.max_recipients != null ? '/' + sh.max_recipients : '') + ' recipients'));
     if (sh.created_at) { const on = _el('span', 'shared-on'); on.appendChild(document.createTextNode('Shared ')); on.appendChild(People.time(sh.created_at)); meta.appendChild(on); }
     if (sh.expires_at) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(sh.expires_at)); meta.appendChild(ex); }
-    if (sh.view_only) meta.appendChild(_el('span', 'shared-view-only', 'View only'));
+    if (sh.view_only) meta.appendChild(_el('span', 'shared-view-only', sh.view_only_preview
+        ? 'View only (preview in the browser, no download)' : 'View only (names and sizes only)'));
     if (sh.max_downloads != null) meta.appendChild(_el('span', null, sh.max_downloads + ' downloads/recipient'));
     main.appendChild(meta);
     body.appendChild(main);
@@ -4100,7 +4108,7 @@ function _shareViewOnlyLabel(t) {
         : 'View only (recipients see names and sizes; they cannot open or download)';
     if (help) help.textContent = views
         ? 'A preview shows the content on their screen, so it cannot stop copying or a screenshot; it does stop saving the file and spends their preview allowance, counted apart from downloads.'
-        : 'Recipients see what is shared, by name and size, and nothing more.';
+        : "Recipients see the shared files' names, sizes, types and dates; they cannot open or download them.";
 }
 
 function onShareAudienceChange() {
@@ -4290,6 +4298,11 @@ async function submitCreateShare() {
     // view_only is only honored server-side when the tag allows customization (else the tag default
     // is forced); only send it then, matching the UI's read-only state for non-custom tags.
     if (t.allow_view_only && t.allow_custom) payload.view_only = document.getElementById('share-view-only').checked;
+    // What the dialog said a view-only share gives (from the tags it read when it opened): the server opens the
+    // share for viewing only when the tag still allows it and this was not "names and sizes".
+    if (t.force_view_only || (t.allow_view_only && document.getElementById('share-view-only').checked)) {
+        payload.view_only_preview_shown = !!t.view_only_preview;
+    }
     if (t.allow_custom) {
         // Block submit on an over-cap / malformed limit so the user gets an immediate red flag
         // instead of a server 400 after the round-trip (mirrors ShareCreate + resolve_share_limits).
@@ -10156,6 +10169,7 @@ function renderShareTagsList() {
         }
         if (tag.force_view_only) parts.push('view-only forced');
         else if (tag.default_view_only) parts.push('view-only default');
+        if (tag.allow_view_only) parts.push(tag.view_only_preview ? 'view-only: viewable' : 'view-only: names and sizes');
         if (tag.auto_enroll_new_users) parts.push('everyone (except blocked)');
         summary.textContent = parts.join(' · ');
         left.appendChild(summary);
@@ -12350,7 +12364,7 @@ function renderFilesTable(items, canWrite, tbody, needle) {
         const selected = state.selectedFileIds.has(item.id);
         const nameAttrs = isFolder
             ? `data-folder-id="${item.id}" data-folder-name="${escapeHtml(item.name)}" style="cursor:pointer;"`
-            : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" style="cursor:pointer;" title="Click to preview"`;
+            : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" style="cursor:pointer;" title="${_fileOpenTitle()}"`;
         const check = !allowBulkSelect() ? ''
             : `<input type="checkbox" class="files-check file-check" data-id="${item.id}" ${selected ? 'checked' : ''} aria-label="Select ${escapeHtml(item.name)}">`;
         return `
@@ -12393,12 +12407,13 @@ function renderFilesGrid(items, canWrite, grid, needle) {
         const lockIcon = item.has_password ? ` ${iconSvg('lock', 'icon-sm')}` : '';
         const nameAttrs = isFolder
             ? `data-folder-id="${item.id}" data-folder-name="${escapeHtml(item.name)}"`
-            : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" title="Click to preview"`;
+            : `data-file-id="${item.id}" data-file-name="${escapeHtml(item.name)}" data-mime="${escapeHtml(item.mime_type || '')}" title="${_fileOpenTitle()}"`;
         const check = !allowBulkSelect() ? ''
             : `<input type="checkbox" class="files-check file-check" data-id="${item.id}" ${selected ? 'checked' : ''} aria-label="Select ${escapeHtml(item.name)}">`;
         const primary = fileActionButtons(item, canWrite, { grid: true, slot: 'primary' });
         const secondary = fileActionButtons(item, canWrite, { grid: true, slot: 'secondary' });
-        const openLabel = escapeHtml(isFolder ? `Open folder ${item.name}` : `Preview file ${item.name}`);
+        const openLabel = escapeHtml(isFolder ? `Open folder ${item.name}`
+            : (viaShareNoPreview() ? `About file ${item.name}` : `Preview file ${item.name}`));
         // The name (the primary open action) comes first in DOM so it is the first tab stop and the
         // destructive Delete is last. The action row is an IN-FLOW row below the icon/name/meta
         // (checkbox left, Rename/Delete/Share/Download right) so the controls never paint over the icon.

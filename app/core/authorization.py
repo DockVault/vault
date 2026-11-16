@@ -326,8 +326,9 @@ class PermissionService:
           * a Standard, non-password vault (zero-knowledge + password-protected are
             refused; the vault could have gained a password after the claim);
           * an 'active', not-past-expiry share (INCLUDING view-only — a view-only share
-            grants read so the recipient can open/list/preview; the download path denies
-            file.download separately via the downloadable scope);
+            grants read so the recipient can open and list, and preview when its share lets view-only
+            recipients view files; the download path denies file.download separately via the
+            downloadable scope, and the preview path checks the previewable scope);
           * a caller holding a non-revoked ShareClaim on that share whose claim-audience the caller
             STILL matches — re-checked LIVE, so removing a recipient from the targeted department
             revokes their access on the next request, not just an explicit revoke/kick/expiry.
@@ -408,17 +409,19 @@ class PermissionService:
         share to its subtree. share-ONLY: an owner / member / group-member who ALSO holds a claim keeps
         full (unscoped) access — never downgraded.
 
-        Stamps TWO scopes, each the UNION of the caller's active, non-revoked claims on this vault:
+        Stamps THREE scopes, each the UNION of the caller's active, non-revoked claims on this vault:
           * ``_share_vault_scope[vault_id]``  — the VISIBLE scope (ALL claims, incl. view-only): what
             the recipient may open/list. This is the SAME claim set _share_vault_permission grants
             read for.
           * ``_share_download_scope[vault_id]`` — the DOWNLOADABLE scope (NON-view-only claims only):
             what the recipient may download. A view-only share contributes to the visible scope but
             NOT the downloadable one, so it is see-but-not-download.
+          * ``_share_preview_scope[vault_id]`` — the PREVIEWABLE scope: non-view-only claims, and view-only
+            claims whose share lets view-only recipients view files (``view_only_preview``).
         For each scope: any qualifying whole-vault claim ⇒ None (no id restriction); otherwise
         ``{"files": [...], "folders": [...]}`` (empty ⇒ deny-all, fail-closed). If the claim set is
         unresolvable NOW — sharing just disabled, or the claim revoked/expired between the read-grant
-        query and this one (a read-committed race) — BOTH scopes fail closed to deny-all rather than
+        query and this one (a read-committed race) — EVERY scope fails closed to deny-all rather than
         leaving the caller unstamped, which scope_ids would read as whole-vault (fail-open). No-op for
         a non-recipient (leaves the stamps untouched)."""
         if vault.owner_id == user.id:

@@ -44,6 +44,7 @@ def view_only_share(admin):
     finally:
         admin.delete_vault(vault["id"])
         admin.delete_user(recipient["id"])
+        admin.delete(f"/share-tags/{tag['id']}")
         admin.put("/settings", json={"sharing_enabled": before})
 
 
@@ -157,6 +158,7 @@ def names_only_share(admin):
     finally:
         admin.delete_vault(vault["id"])
         admin.delete_user(recipient["id"])
+        admin.delete(f"/share-tags/{tag['id']}")
         admin.put("/settings", json={"sharing_enabled": before})
 
 
@@ -242,5 +244,47 @@ def test_the_share_dialog_says_what_view_only_gives_under_the_chosen_tag(page: P
     finally:
         for t in tags.values():
             admin.delete(f"/share-tags/{t['id']}")
+        admin.delete_vault(vault["id"])
+        admin.put("/settings", json={"sharing_enabled": before})
+
+
+def test_a_share_made_after_the_tag_changed_keeps_what_its_maker_was_shown(page: Page, admin, admin_creds):
+    """The share dialog read the tag with the switch off and said "names and sizes"; an administrator turns the
+    switch on before the maker presses Create. The share is made as its maker was told: not viewable."""
+    before = admin.get("/settings").json().get("sharing_enabled")
+    admin.put("/settings", json={"sharing_enabled": True})
+    vault = admin.create_vault(name=unique("race"))
+    me = admin.get("/users/me").json()["id"]
+    r = admin.post("/share-tags", json={"name": unique("racetag"), "allowed_user_ids": [me],
+                                        "allowed_audiences": ["anyone_internal"], "allow_view_only": True,
+                                        "default_view_only": True, "view_only_preview": False})
+    assert r.status_code == 200, r.text
+    tag = r.json()
+    try:
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.fill("#username", admin_creds["username"])
+        page.fill("#password", admin_creds["password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.locator(f'.vault-card[data-vault-id="{vault["id"]}"] .open-vault-btn').click()
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+        page.click("#share-vault-btn")
+        select = page.locator("#share-tag-select")
+        expect(select.locator(f'option[value="{tag["id"]}"]')).to_have_count(1, timeout=10000)
+        select.select_option(tag["id"])
+        page.select_option("#share-audience-select", "anyone_internal")
+        expect(page.locator("#share-view-only")).to_be_checked()
+        expect(page.locator("#share-view-only-text")).to_contain_text("names and sizes")
+        assert admin.patch(f"/share-tags/{tag['id']}", json={"view_only_preview": True}).status_code == 200
+        with page.expect_response(lambda r: r.url.rstrip("/").endswith("/shares") and r.request.method == "POST") as resp:
+            page.click("#share-create-submit")
+        assert resp.value.ok, resp.value.status
+        assert resp.value.request.post_data_json["view_only_preview_shown"] is False
+        made = resp.value.json()
+        assert made["view_only"] is True and made["view_only_preview"] is False, made
+    finally:
+        admin.delete(f"/share-tags/{tag['id']}")
         admin.delete_vault(vault["id"])
         admin.put("/settings", json={"sharing_enabled": before})
