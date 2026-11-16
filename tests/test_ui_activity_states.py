@@ -43,30 +43,47 @@ def test_a_range_in_the_past_is_not_live(page: Page, activity_admin):
 
 
 def test_a_failed_read_says_so_keeps_the_rows_and_can_be_tried_again(page: Page, activity_admin):
+    # Only the two buttons read again here. The page also reads again by itself, and that read can take a button
+    # away before it is clicked: panel counts whose total differs from the list's are read again when the server
+    # counts afresh (for 7 days, about 15 seconds after the panels were read), a live event reads the panels again
+    # 10 seconds after the last one, and the panels' answer reads the list again when the list was last read from
+    # another start (the range changed and the list's read failed). So the panels' counts fail from the start (no
+    # total to compare), and the page is paused (no live event or poll reads the list or the panels).
     login(page, activity_admin)
-    open_activity(page)
-    failing = {"on": True}
+    failing = {"list": False, "panels": True}
 
     def events(route):
-        if failing["on"] and "ids=" not in route.request.url:
+        if failing["list"] and "ids=" not in route.request.url:
             return route.fulfill(status=500, json={"detail": "The database is busy."})
         return route.continue_()
 
     def summary(route):
-        if failing["on"]:
+        if failing["panels"]:
             return route.fulfill(status=500, json={"detail": "The database is busy."})
         return route.continue_()
 
     page.route(re.compile(r"/activity/events\?"), events)
     page.route(re.compile(r"/activity/summary\?"), summary)
+    page.click('.sidebar-item[data-section="activity"]')
+    expect(page.locator("#act-pager")).to_be_visible(timeout=15000)   # the list has been read
+    for panel in ("time", "cat", "signin", "active"):
+        expect(page.locator(f"#act-p-{panel} .act-plot-note")).to_have_text("Couldn't load.", timeout=15000)
+    pause = page.locator("#act-pause")
+    pause.click()
+    expect(pause).to_have_attribute("aria-pressed", "true")
     shown = rows(page).count()
-    page.click("#act-range [data-range='30d']")
+    assert shown, "the list shows rows to keep"
+    failing["list"] = True
+    # The new range's panel read is refused before the failures end: let through later, it would succeed, and its
+    # answer would read the list again before Try again is clicked.
+    with page.expect_response(lambda r: "/activity/summary?" in r.url and "range=30d" in r.url and r.status == 500):
+        page.click("#act-range [data-range='30d']")
     alert = page.locator("#act-list-alert")
     expect(alert).to_contain_text("Events could not be loaded: The database is busy.", timeout=10000)
     expect(rows(page)).to_have_count(shown)                          # the rows on screen stay
     for panel in ("time", "cat", "signin", "active"):
         expect(page.locator(f"#act-p-{panel} .act-plot-note")).to_have_text("Couldn't load.")
-    failing["on"] = False
+    failing["list"] = failing["panels"] = False
     alert.get_by_role("button", name="Try again").click()
     expect(alert).to_be_hidden(timeout=10000)
     page.locator("#act-p-cat .act-retry").click()
