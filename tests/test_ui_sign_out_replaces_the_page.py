@@ -20,7 +20,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import psql
-from _sf_helpers import enroll_totp, enrolled_admin, step_up_receipt, totp
+from _sf_helpers import enroll_totp, enrolled_admin, put_settings_allowing_longer_sessions, step_up_receipt, totp
 from conftest import ApiClient, BASE_URL, unique
 
 pytestmark = pytest.mark.ui
@@ -222,14 +222,19 @@ def _nothing_of_a_left(page: Page, world: dict):
 
 
 @pytest.mark.parametrize("how", ["button", "ended_by_an_administrator", "deactivated", "made_inactive", "run_out", "another_tab"])
-def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(page: Page, world, how):
+def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(page: Page, world, how, admin_creds):
     admin, a = world["admin"], world["a"]
     if how == "run_out":
-        admin.put("/settings", json={"session_timeout": 2})
+        before = admin.get("/settings").json().get("session_timeout") or 0
+        assert admin.put("/settings", json={"session_timeout": 2}).status_code in (200, 204)
     page.goto("/")
-    _sign_in(page, a)
-    if how == "run_out":
-        admin.put("/settings", json={"session_timeout": 240})
+    try:
+        _sign_in(page, a)
+    finally:
+        if how == "run_out":
+            # A longer timeout is put back with the administrator's password (the server asks for it).
+            restored = put_settings_allowing_longer_sessions(admin, admin_creds["password"], {"session_timeout": before})
+            assert restored.status_code in (200, 204), restored.text
     signed_in_at = time.time()
     seen = _go_everywhere(page, world["m"])
     # The control: every marker was in the page on the way, and the page still holds them when the session ends.

@@ -73,6 +73,7 @@ def _end_on_the_server(token: str):
 def _poll(page: Page):
     """The unread-count poll, as its timer sends it (silent: it shows no error of its own). Not waited for: a refusal
     signs the tab out, and the page is replaced while the poll is still on its way."""
+    assert page.evaluate("() => window.__oldPage === true"), "the page was signed out before the test's poll"
     page.evaluate("() => { refreshNotifUnread(); }")
 
 
@@ -108,6 +109,8 @@ def test_a_poll_refused_at_the_real_end_before_the_warnings_check_says_the_sessi
         restored = put_settings_allowing_longer_sessions(admin, admin_creds["password"], {"session_timeout": before})
         assert restored.status_code in (200, 204), restored.text
     sent = _Sent(page)
+    # The page's own minute poll is stopped, so that the test's poll is the request refused first.
+    page.evaluate("() => clearInterval(notifPollTimer)")
     part = token.split(".")[1]
     exp = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))["exp"]
     # The count on this device reaches zero (a second early at most): the warning asks the server, and that check
