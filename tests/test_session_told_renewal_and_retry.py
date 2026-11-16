@@ -106,6 +106,33 @@ def test_a_tab_told_of_a_renewal_it_can_take_takes_it_and_stays():
     assert out == {"held": "renewed", "said": []}
 
 
+def test_a_sign_out_naming_a_token_the_tab_has_moved_past_changes_nothing():
+    # The tab takes another tab's renewal (mine -> renewed), then renews the session itself (renewed -> third). A
+    # tab that slept through both signs out with the token in between: the session this tab holds is still open.
+    out = _node(TOLD + f"""
+vm.runInThisContext({json.dumps(CHANNEL)}, {{ filename: 'app-channel.js' }});
+const third = token({{ ...person, iat: NOW, exp: NOW + 3700, auth_time: NOW - 600 }}, 'third');
+const said = [];
+const signOut = logout;
+globalThis.logout = (how, reason) => {{ said.push([how === undefined ? null : how, reason]); signOut(how, reason); }};
+store.set('authToken', renewed);
+listener({{ data: {{ type: 'renewed', token: _tokenTail(mine), next: _tokenTail(renewed) }} }});
+const took = authToken === renewed;
+route = (url) => Promise.resolve(url.endsWith('/auth/session/extend')
+    ? answer(200, {{ access_token: third }}) : answer(200, {{}}));
+await stay();
+const renewedItself = authToken === third;
+listener({{ data: {{ type: 'signed-out', token: _tokenTail(renewed) }} }});
+listener({{ data: {{ type: 'signed-out', token: _tokenTail(mine) }} }});
+const kept = authToken === third && said.length === 0;
+// The control: a sign-out of the token it holds signs it out.
+listener({{ data: {{ type: 'signed-out', token: _tokenTail(third) }} }});
+out({{ took, renewedItself, kept, said }});
+""")
+    assert out == {"took": True, "renewedItself": True, "kept": True,
+                   "said": [["told", "Signed out in another tab."]]}
+
+
 def test_a_sign_out_or_renewal_of_another_session_changes_nothing():
     out = _wake("store.delete('authToken');",
                 "[{ type: 'signed-out', token: tail(quinn) },"
@@ -270,6 +297,38 @@ def test_a_request_refused_after_a_renewal_told_first_is_not_sent_again_with_ano
     out = _told_first(between)
     assert out["sent"] == ["--mine"], out
     assert out["settled"] == "rejected" and out["logouts"] == 0, out
+
+
+def test_a_request_is_sent_again_once_only_after_renewals_told_first():
+    # The request goes again with the renewal told first; while that send is on its way a second renewal is told
+    # and taken, and the send is refused too: it is not sent a third time.
+    out = _node(TOLD + r"""
+globalThis.SIGNED_OUT_REASONS = { ended: 'Your session has ended. Sign in again.' };
+vm.runInThisContext(CHANNEL_SRC, { filename: 'app-channel.js' });
+const third = token({ ...person, iat: NOW, exp: NOW + 3700, auth_time: NOW - 600 }, 'third');
+const json = (status, body) => ({ ...answer(status, body),
+    headers: { get: (h) => (h.toLowerCase() === 'content-type' ? 'application/json' : null) } });
+const refuse = () => json(401, { detail: 'Session has been terminated. Please login again.' });
+const answers = [];
+route = (url) => (url.endsWith('/invitations/i1')
+    ? new Promise((r) => { answers.push(r); }) : Promise.resolve(answer(200, {})));
+console.error = () => {};
+let settled = 'pending';
+_apiRequestNow('/invitations/i1', { method: 'DELETE' }).then(() => { settled = 'resolved'; }, () => { settled = 'rejected'; });
+await settle();
+store.set('authToken', renewed);
+listener({ data: { type: 'renewed', token: _tokenTail(mine), next: _tokenTail(renewed) } });
+answers[0](refuse());
+await settle();
+store.set('authToken', third);
+listener({ data: { type: 'renewed', token: _tokenTail(renewed), next: _tokenTail(third) } });
+const tookThird = authToken === third;
+answers[1](refuse());
+await settle();
+out({ tookThird, sent: sent.filter((s) => s.url.endsWith('/invitations/i1')).map((s) => s.bearer.slice(-6)),
+      settled, logouts });
+""".replace("CHANNEL_SRC", json.dumps(CHANNEL)), REQUESTS)
+    assert out == {"tookThird": True, "sent": ["--mine", "enewed"], "settled": "rejected", "logouts": 0}
 
 
 def test_a_refusal_carries_on_only_when_the_page_may_send_the_request_again():

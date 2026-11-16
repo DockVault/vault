@@ -2373,10 +2373,14 @@ function _tellOtherTabsRenewed(previousToken, newToken) {
 // The tails of the tokens other tabs renewed this page's session into, whether this page took them or not: a tab the
 // browser froze may be told of a renewal it cannot take (the token stored is already the next sign-in's, or none),
 // and then that the renewed session was signed out. That sign-out names the renewed token, not the one this page
-// holds, and is this page's session all the same. Emptied when the page's session ends (logout).
+// holds, and is this page's session all the same. The tails belong to the token the page holds: once it holds
+// another (a renewal it took, or its own), the tokens before it are behind it and a sign-out naming one of them
+// ends nothing it holds. Emptied too when the page's session ends (logout).
 const _renewedAway = new Set();
+let _renewedAwayFor = null;
 
 function _toldOfThisSession(tail) {
+    if (_renewedAwayFor !== authToken) { _renewedAway.clear(); _renewedAwayFor = authToken; }
     return typeof tail === 'string' && !!tail && (tail === _tokenTail(authToken) || _renewedAway.has(tail));
 }
 
@@ -2627,7 +2631,9 @@ function _takeSignedOutNote() {
 // page that replaces this one.
 function logout(how, reason) {
     _sessionsEnded += 1;      // answers to calls made until now are dropped (apiRequest)
-    _renewedAway.clear();     // a page not replaced keeps no tail of this session for the next one
+    // The next person's sign-in on this page holds its token here until the page goes (the wait for /users/me after
+    // a second factor, the moment before the replacement unloads it): no tail of this session may sign it out.
+    _renewedAway.clear();
     _downloadsOfThisSession.forEach((ctl) => { try { ctl.abort(); } catch (_) {} });
     _downloadsOfThisSession.clear();
     const replaceAfter = _appShown;

@@ -114,12 +114,14 @@ def _until_held(page: Page, held: list, seconds: float):
 
 def _check_comes_back_refused(page: Page, held: list):
     """The warning's held check let through, and its refusal received in full by the page (a short wait after it,
-    for the page to deal with it)."""
+    for the page to deal with it). The page signed out once already: the refusal signs nothing out again."""
+    ended = page.evaluate("() => _sessionsEnded")
     with page.expect_response(lambda r: r.url.endswith("/users/me") and r.status == 401) as answered:
         held[0].continue_()
     answered.value.finished()
     page.unroute("**/users/me")
     page.wait_for_timeout(200)
+    assert page.evaluate("() => _sessionsEnded") == ended, "the check's refusal signed the page out again"
 
 
 def test_a_poll_refused_at_the_real_end_before_the_warnings_check_says_the_session_ran_out(
