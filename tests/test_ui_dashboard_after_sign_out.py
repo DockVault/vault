@@ -3,12 +3,14 @@ static/js/dashboard-actions.js).
 
 The dashboard asks the server for several things and draws each answer as it comes. An answer that comes back
 after the person signed out, or after the next person signed in and their own dashboard was drawn, is the last
-person's: it is not written into the page.
+person's: it is not written into the page. The page is replaced once the sign-out is over (static/js/app.js
+_replacePageAfterSignOut), and the next person signs in on the page put in its place.
 """
 import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import ApiClient, BASE_URL, unique
+from _ui_hand_over import replaced
 
 pytestmark = pytest.mark.ui
 
@@ -48,9 +50,9 @@ def _sign_in(page: Page, user):
 
 
 def _sign_out(page: Page):
-    page.click("#profile-btn")
-    page.click("#dropdown-logout-btn")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    with replaced(page):
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
 
 
 @pytest.fixture

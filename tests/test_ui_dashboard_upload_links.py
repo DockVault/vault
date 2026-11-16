@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import sign_out
+
 pytestmark = pytest.mark.ui
 
 _MB = 1024 * 1024
@@ -102,7 +104,7 @@ def test_the_next_person_on_the_tab_does_not_start_from_the_last_ones_answer(pag
         _sign_in(page, first)
         expect(page.locator("#qa-upload-link")).to_be_visible(timeout=15000)
         expect(page.locator("#dashboard-get-started .get-started-list > *").first).to_be_visible(timeout=15000)
-        page.evaluate("() => logout()")
+        sign_out(page)
         # The signed-out tab keeps nothing of what the dashboard drew for this person.
         for lane in ("#lane-attention", "#lane-recent", "#lane-waiting", "#lane-favourites"):
             expect(page.locator(f"{lane} > *")).to_have_count(0)

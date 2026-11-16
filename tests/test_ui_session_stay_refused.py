@@ -9,6 +9,7 @@ import requests
 from playwright.sync_api import Page, expect
 
 from conftest import BASE_URL
+from _ui_hand_over import expect_reason, mark_old, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -34,6 +35,18 @@ def _warn(page: Page):
     expect(page.locator("#session-expiry-modal.active")).to_be_visible(timeout=10000)
 
 
+def _watch_toasts(page: Page) -> list:
+    """Every toast the page that shows the app puts up from now on, kept outside the page: the sign-out replaces it."""
+    seen = []
+    page.expose_function("__toastSeen", lambda text: seen.append(text))
+    page.evaluate("""() => {
+        const box = document.getElementById('toast-container');
+        new MutationObserver(() => { if (box.textContent) window.__toastSeen(box.textContent); })
+            .observe(box, { childList: true, subtree: true, characterData: true });
+    }""")
+    return seen
+
+
 def test_a_renewal_refused_for_the_account_signs_out_with_the_servers_sentence(page: Page, person):
     _login(page, person)
     page.wait_for_load_state("networkidle", timeout=15000)
@@ -41,13 +54,14 @@ def test_a_renewal_refused_for_the_account_signs_out_with_the_servers_sentence(p
     # The server refuses the renewal for the account, in its own words.
     page.route("**/auth/session/extend", lambda route: route.fulfill(
         status=403, content_type="application/json", body='{"detail": "User account is inactive"}'))
+    toasts = _watch_toasts(page)
+    mark_old(page)
     page.click("#session-stay")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
-    note = page.locator("#login-error")
-    expect(note).to_contain_text("User account is inactive", timeout=5000)
-    assert note.get_attribute("role") == "alert"
+    # The page is replaced, and the new one's sign-in screen says why.
+    wait_replaced(page)
+    expect_reason(page, "User account is inactive")
     expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
-    expect(page.locator("#toast-container")).not_to_contain_text("Could not extend")
+    assert not [t for t in toasts if "Could not extend" in t], toasts
 
 
 def test_an_account_made_inactive_while_the_warning_is_open_signs_the_tab_out_with_a_reason(page: Page, admin, person):
@@ -55,15 +69,18 @@ def test_an_account_made_inactive_while_the_warning_is_open_signs_the_tab_out_wi
     # a tenth of a second here): the tab signs out, and the sign-in screen says why.
     _login(page, person)
     _warn(page)
+    toasts = _watch_toasts(page)
+    mark_old(page)
     assert admin.patch(f"/users/{person['id']}", json={"is_active": False}).status_code in (200, 204)
     page.evaluate("() => { if (typeof refreshNotifUnread === 'function') refreshNotifUnread(); }")
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    wait_replaced(page, 10000)
     note = page.locator("#login-error")
     expect(note).not_to_be_empty(timeout=5000)
-    assert note.inner_text().strip() in ("Your session has ended. Sign in again.", "User account is inactive")
-    assert note.get_attribute("role") == "alert"
+    said = note.inner_text().strip()
+    assert said in ("Your session has ended. Sign in again.", "User account is inactive"), said
+    expect_reason(page, said)
     expect(page.locator("#session-expiry-modal.active")).to_be_hidden()
-    expect(page.locator("#toast-container")).not_to_contain_text("Could not extend")
+    assert not [t for t in toasts if "Could not extend" in t], toasts
 
 
 def test_a_renewal_beaten_by_another_tab_takes_its_token(page: Page, person):

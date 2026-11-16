@@ -8,6 +8,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import ApiClient, BASE_URL, unique
+from _ui_hand_over import replaced
 
 pytestmark = pytest.mark.ui
 
@@ -67,10 +68,10 @@ def test_a_sign_out_empties_the_dashboards_lists_and_the_next_person_never_sees_
         for lane, name in (("#lane-favourites", "favourite"), ("#lane-recent", "recent"), ("#lane-waiting", "pushed")):
             expect(page.locator(lane)).to_contain_text(names[name], timeout=15000)
 
-        # The app's own sign-out.
-        page.click("#profile-btn")
-        page.click("#dropdown-logout-btn")
-        expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+        # The app's own sign-out, and the page put in place of the one that showed the app.
+        with replaced(page):
+            page.click("#profile-btn")
+            page.click("#dropdown-logout-btn")
         for lane in LISTS:
             expect(page.locator(f"{lane} > *")).to_have_count(0)
         held = page.evaluate("(names) => names.filter((n) => document.body.textContent.includes(n))",

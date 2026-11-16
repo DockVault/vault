@@ -261,8 +261,10 @@ def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(
         expect(page.locator("#login-error")).to_have_text("User account is inactive")
     elif how == "run_out":
         # The token runs out two minutes after the sign-in; the page's next request (its minute's poll) is refused.
+        # The warning was shown before the end and nobody chose to stay: the reason says so (session-watch.js).
         replaced = _ended(page, max(30, 200 - (time.time() - signed_in_at)))
-        expect(page.locator("#login-error")).to_contain_text("Your session has ended")
+        expect(page.locator("#login-error")).to_have_text(
+            "Your session ended because nobody chose to stay signed in. Sign in again.")
     else:
         other = page.context.new_page()
         other.goto("/")

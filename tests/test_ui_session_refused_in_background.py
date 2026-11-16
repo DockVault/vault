@@ -18,6 +18,7 @@ from playwright.sync_api import Page, expect
 
 from conftest import BASE_URL
 from _sf_helpers import put_settings_allowing_longer_sessions
+from _ui_hand_over import mark_old, wait_replaced
 
 pytestmark = pytest.mark.ui
 
@@ -57,6 +58,8 @@ def _login(page: Page, user) -> str:
     page.click("#login-form button[type=submit]")
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
     page.wait_for_load_state("networkidle", timeout=15000)
+    # The page that shows the app: after the sign-out a new page is put in its place, which says why.
+    mark_old(page)
     return page.evaluate("() => authToken")
 
 
@@ -68,12 +71,13 @@ def _end_on_the_server(token: str):
 
 
 def _poll(page: Page):
-    """The unread-count poll, as its timer sends it (silent: it shows no error of its own)."""
-    page.evaluate("() => refreshNotifUnread()")
+    """The unread-count poll, as its timer sends it (silent: it shows no error of its own). Not waited for: a refusal
+    signs the tab out, and the page is replaced while the poll is still on its way."""
+    page.evaluate("() => { refreshNotifUnread(); }")
 
 
 def _signed_out_saying(page: Page, sentence: str):
-    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    wait_replaced(page)
     note = page.locator("#login-error")
     expect(note).to_contain_text(sentence, timeout=5000)
     assert note.get_attribute("role") == "alert"
