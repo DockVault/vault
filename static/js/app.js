@@ -370,6 +370,28 @@ function viaShareViewOnly(vault) {
     return !!(v && v.via_share && v.via_share.view_only);
 }
 
+// True when no claim the open vault was reached through lets its recipient view files in the browser: view-only
+// shares made under a tag that does not allow it (every share made before that choice existed).
+function viaShareNoPreview(vault) {
+    const v = vault || state.currentVault;
+    return !!(v && v.via_share && v.via_share.preview === false);
+}
+
+// The server's sentence for a preview it refuses to such a recipient (app/services/vault_service.py).
+const PREVIEW_NOT_SHARED = 'This share shows names and sizes only; ask the person who shared it to share it again '
+    + 'if you need to view the files.';
+
+// A preview the server refused: its own sentence when it gave one (shown as text), else the status.
+async function _previewRefusal(resp) {
+    let said = '';
+    if (resp.status === 403) {
+        try { const body = await resp.json(); said = body && typeof body.detail === 'string' ? body.detail : ''; } catch (_) {}
+    }
+    const err = new Error('Could not load file (status ' + resp.status + ')');
+    if (said) err.userMessage = said;
+    return err;
+}
+
 // The two BULK file actions (select checkboxes + the bulk bar) must be cap-gated
 // the same way the per-row buttons are, or a scoped cred sees a bulk button that 403s.
 function bulkDownloadAllowed() { return vaultCapAllowed('file.download'); }
@@ -3740,7 +3762,9 @@ function _sharedCard(it) {
     }
     if (it.expires_at && active) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(it.expires_at)); meta.appendChild(ex); }
     if (it.view_only) {
-        const s = _el('span', 'shared-view-only'); s.appendChild(_svgIcon('eye', 'icon-sm')); s.appendChild(document.createTextNode(' View only (preview in the browser, no download)'));
+        const s = _el('span', 'shared-view-only'); s.appendChild(_svgIcon('eye', 'icon-sm'));
+        s.appendChild(document.createTextNode(it.view_only_preview ? ' View only (preview in the browser, no download)'
+            : ' View only (names and sizes only)'));
         meta.appendChild(s);
     }
     if (it.max_downloads != null) {
@@ -4046,6 +4070,7 @@ function onShareTagChange() {
     audSel.replaceChildren(...auds.map(a => { const o = _el('option', null, _SHARE_AUD_LABEL[a] || a); o.value = a; return o; }));
     const voGroup = document.getElementById('share-viewonly-group');
     const voInput = document.getElementById('share-view-only');
+    _shareViewOnlyLabel(t);
     if (t.force_view_only) {
         // The tag MANDATES view-only: show it, force it on, and lock it (the server enforces this too).
         voGroup.style.display = '';
@@ -4062,6 +4087,20 @@ function onShareTagChange() {
     if (t.allow_custom) _shareRefreshLimitHints(); else _shareLimitSpec = null;
     _shareCreate.userIds = []; _shareCreate.deptIds = [];
     onShareAudienceChange();
+}
+
+// What view-only gives a recipient under the chosen tag: viewing in the browser without download, or names and
+// sizes alone (a tag that does not let view-only recipients view files).
+function _shareViewOnlyLabel(t) {
+    const text = document.getElementById('share-view-only-text');
+    const help = document.getElementById('share-view-only-help');
+    const views = !!(t && t.view_only_preview);
+    if (text) text.textContent = views
+        ? 'View only (recipients can view files in the browser but not download them)'
+        : 'View only (recipients see names and sizes; they cannot open or download)';
+    if (help) help.textContent = views
+        ? 'A preview shows the content on their screen, so it cannot stop copying or a screenshot; it does stop saving the file and spends their preview allowance, counted apart from downloads.'
+        : 'Recipients see what is shared, by name and size, and nothing more.';
 }
 
 function onShareAudienceChange() {
@@ -10336,6 +10375,8 @@ function openShareTagEditor(tag) {
     _stEl('share-tag-allow-view-only').checked = tag ? !!t.allow_view_only : true;
     _stEl('share-tag-default-view-only').checked = !!t.default_view_only;
     _stEl('share-tag-force-view-only').checked = !!t.force_view_only;
+    // On for a new tag; an existing tag shows what it holds.
+    _stEl('share-tag-view-only-preview').checked = tag ? !!t.view_only_preview : true;
     _stEl('share-tag-allow-custom').checked = tag ? !!t.allow_custom : true;
     _stEl('share-tag-auto-enroll').checked = !!t.auto_enroll_new_users;
     shareTagEditorDeptIds = (t.allowed_department_ids || []).map(String);
@@ -10403,6 +10444,7 @@ async function saveShareTag() {
         allow_view_only: _stChecked('share-tag-allow-view-only'),
         default_view_only: _stChecked('share-tag-default-view-only'),
         force_view_only: _stChecked('share-tag-force-view-only'),
+        view_only_preview: _stChecked('share-tag-view-only-preview'),
         allow_custom: _stChecked('share-tag-allow-custom'),
         auto_enroll_new_users: _stChecked('share-tag-auto-enroll'),
         allowed_department_ids: shareTagEditorDeptIds.slice(),
@@ -12488,7 +12530,7 @@ function openContextMenu(item, x, y, opener) {
         if (canWrite && vaultCapAllowed('folder.delete')) add('Delete', 'trash', 'delete-folder', true);
     } else {
         const canDownload = vaultCapAllowed('file.download');
-        add('Preview', 'eye', 'preview');
+        if (!viaShareNoPreview()) add('Preview', 'eye', 'preview');
         if (canWrite && vaultCapAllowed('file.rename')) add('Rename', 'edit', 'rename-file');
         if (_mayStage(item, 'copy')) add(clipHas ? 'Add to copy list' : 'Copy', 'copy', 'copy-file');
         if (canWrite && vaultCapAllowed('file.delete')) add(clipHas ? 'Add to move list' : 'Move', 'move', 'move-file');
@@ -16706,7 +16748,7 @@ async function _renderTextWindow(bodyEl, fileId, fileName, fsize, headers) {
     // The preview route: served inline and never cached, recorded as a preview, and open to a view-only
     // share's recipient; otherwise every gate is a download's.
     const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/preview`, { headers: h });
-    if (!resp.ok && resp.status !== 206) throw new Error('Could not load file (status ' + resp.status + ')');
+    if (!resp.ok && resp.status !== 206) throw await _previewRefusal(resp);
     let got = 0;
     const chunks = [];
     const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
@@ -16830,6 +16872,13 @@ async function openFilePreview(fileId, fileName, mime) {
         dlBtn.onclick = () => downloadFile(fileId, fileName);
     }
     modal.classList.add('active');
+    if (viaShareNoPreview()) {
+        const note = document.createElement('div');
+        note.className = 'alert alert-info';
+        note.textContent = PREVIEW_NOT_SHARED;
+        bodyEl.replaceChildren(note);
+        return;
+    }
 
     try {
         const headers = { 'Authorization': `Bearer ${authToken}` };
@@ -16865,7 +16914,7 @@ async function openFilePreview(fileId, fileName, mime) {
         // The preview route: served inline and never cached, recorded as a preview, and open to a view-only
         // share's recipient; otherwise every gate is a download's.
         const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/preview`, { headers });
-        if (!resp.ok) throw new Error('Could not load file (status ' + resp.status + ')');
+        if (!resp.ok) throw await _previewRefusal(resp);
         // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering, reading from
         // the body rather than a materialised copy. Preview needs the whole plaintext in the end
         // -- it becomes an object URL for an image or a video element -- but it does not need the

@@ -58,7 +58,7 @@ def test_the_recipient_previews_in_the_browser_and_cannot_download(page: Page, v
     expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
     # The vault says the claim is view-only, and the recipient is offered only what works: no Download on the
     # row, no Share or Public links on the toolbar, no row checkboxes (no bulk action is possible).
-    assert page.evaluate("() => state.currentVault.via_share") == {"view_only": True}
+    assert page.evaluate("() => state.currentVault.via_share") == {"view_only": True, "preview": True}
     row = page.locator(f'#vault-files-table-body tr:has(.file-name[data-file-id="{fid}"])')
     expect(row).to_be_visible(timeout=15000)
     assert row.locator(".file-actions button[data-action]").evaluate_all(
@@ -127,3 +127,112 @@ def test_the_share_dialog_says_what_view_only_means(page: Page, admin_creds):
     label = page.locator('label:has(#share-view-only)')
     expect(label).to_have_text("View only (recipients can view files in the browser but not download them)")
     expect(page.locator("#share-viewonly-group .form-help")).to_contain_text("cannot stop copying")
+
+
+NAMES_AND_SIZES = "This share shows names and sizes only"
+
+
+@pytest.fixture
+def names_only_share(admin):
+    """A view-only share made under a tag that does not let view-only recipients view files, as every share made
+    before that choice existed reads after the upgrade."""
+    before = admin.get("/settings").json().get("sharing_enabled")
+    admin.put("/settings", json={"sharing_enabled": True})
+    recipient = admin.create_user(role="user")
+    vault = admin.create_vault(name=unique("names"))
+    r = admin.post(f"/vaults/{vault['id']}/files", files=[("files", ("brief.txt", b"look, do not take\n", "text/plain"))])
+    assert r.status_code == 200, r.text
+    fid = next(f["id"] for f in admin.get(f"/vaults/{vault['id']}/files").json()["items"] if f["name"] == "brief.txt")
+    tag = admin.post("/share-tags", json={"name": unique("notag"), "auto_enroll_new_users": True,
+                                          "allowed_audiences": ["anyone_internal"], "max_recipients_cap": 10,
+                                          "allow_view_only": True, "view_only_preview": False}).json()
+    share = admin.post("/shares", json={"vault_id": vault["id"], "tag_id": tag["id"], "target_type": "vault",
+                                        "claim_audience": "anyone_internal", "view_only": True})
+    assert share.status_code == 200, share.text
+    client = ApiClient(BASE_URL)
+    client.login(recipient["_username"], recipient["_password"])
+    assert client.post("/shares/claim", json={"token": share.json()["link_token"]}).status_code == 200
+    try:
+        yield recipient, vault, fid
+    finally:
+        admin.delete_vault(vault["id"])
+        admin.delete_user(recipient["id"])
+        admin.put("/settings", json={"sharing_enabled": before})
+
+
+def test_the_recipient_of_a_names_only_share_is_told_why_and_no_preview_opens(page: Page, names_only_share):
+    recipient, vault, fid = names_only_share
+    previews = []
+    page.on("request", lambda r: previews.append(r.url) if "/preview" in r.url else None)
+    _login(page, recipient)
+    page.click('.sidebar-item[data-section="shared"]')
+    card = page.locator('[data-share-id]', has_text=vault["name"]).first
+    expect(card).to_be_visible(timeout=15000)
+    expect(card).to_contain_text("View only (names and sizes only)")
+    page.evaluate("id => openSharedItem(id)", vault["id"])
+    expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+    assert page.evaluate("() => state.currentVault.via_share") == {"view_only": True, "preview": False}
+    row = page.locator(f'#vault-files-table-body tr:has(.file-name[data-file-id="{fid}"])')
+    expect(row).to_be_visible(timeout=15000)
+    # The row's menu offers no preview.
+    row.locator(".action-more").click()
+    menu = page.locator("#file-context-menu")
+    expect(menu).to_be_visible()
+    expect(menu.get_by_role("menuitem").first).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="Preview", exact=True)).to_have_count(0)
+    page.keyboard.press("Escape")
+    # Opening the file says why, and asks the server for nothing it would refuse.
+    page.click(f'.file-name[data-file-id="{fid}"]')
+    expect(page.locator("#file-preview-modal")).to_be_visible(timeout=10000)
+    expect(page.locator("#file-preview-body")).to_contain_text(NAMES_AND_SIZES)
+    expect(page.locator("#file-preview-download")).to_be_hidden()
+    page.wait_for_timeout(500)
+    assert previews == [], previews
+
+
+def test_a_refused_preview_shows_the_servers_sentence(page: Page, names_only_share):
+    # A page that could not tell (the vault's answer is set here to say it could preview) is refused by the
+    # server, and shows the server's own sentence rather than a status code.
+    recipient, vault, fid = names_only_share
+    _login(page, recipient)
+    page.click('.sidebar-item[data-section="shared"]')
+    page.evaluate("id => openSharedItem(id)", vault["id"])
+    expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+    expect(page.locator(f'.file-name[data-file-id="{fid}"]')).to_be_visible(timeout=15000)
+    page.evaluate("() => { state.currentVault.via_share.preview = true; }")
+    with page.expect_response(lambda r: "/preview" in r.url and r.status == 403):
+        page.click(f'.file-name[data-file-id="{fid}"]')
+    expect(page.locator("#file-preview-body .alert")).to_contain_text(NAMES_AND_SIZES)
+
+
+def test_the_share_dialog_says_what_view_only_gives_under_the_chosen_tag(page: Page, admin, admin_creds):
+    before = admin.get("/settings").json().get("sharing_enabled")
+    admin.put("/settings", json={"sharing_enabled": True})
+    vault = admin.create_vault(name=unique("label"))
+    tags = {}
+    for views in (True, False):
+        tags[views] = admin.post("/share-tags", json={
+            "name": unique("lbl"), "auto_enroll_new_users": True, "allowed_audiences": ["anyone_internal"],
+            "allow_view_only": True, "view_only_preview": views}).json()
+    try:
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.fill("#username", admin_creds["username"])
+        page.fill("#password", admin_creds["password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        page.evaluate("([id, name]) => openCreateShareModal('vault', id, name)", [vault["id"], vault["name"]])
+        select = page.locator("#share-tag-select")
+        expect(select.locator(f'option[value="{tags[False]["id"]}"]')).to_have_count(1, timeout=10000)
+        label = page.locator("#share-view-only-text")
+        select.select_option(tags[False]["id"])
+        expect(label).to_have_text("View only (recipients see names and sizes; they cannot open or download)")
+        expect(page.locator("#share-view-only-help")).not_to_contain_text("preview")
+        select.select_option(tags[True]["id"])
+        expect(label).to_have_text("View only (recipients can view files in the browser but not download them)")
+        expect(page.locator("#share-view-only-help")).to_contain_text("cannot stop copying")
+    finally:
+        for t in tags.values():
+            admin.delete(f"/share-tags/{t['id']}")
+        admin.delete_vault(vault["id"])
+        admin.put("/settings", json={"sharing_enabled": before})

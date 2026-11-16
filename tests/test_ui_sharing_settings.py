@@ -242,3 +242,40 @@ def test_user_allowlist_and_blocklist_pickers(page: Page, admin, fresh_admin):
     finally:
         admin.delete_user(u_allow["id"])
         admin.delete_user(u_block["id"])
+
+
+def test_the_tag_editor_carries_whether_view_only_recipients_view_files(page: Page, admin, fresh_admin):
+    """On for a new tag; the box saves what it shows, and an existing tag shows what it holds."""
+    _login(page, fresh_admin["_username"], fresh_admin["_password"])
+    _open_sharing_settings(page)
+    name = unique("vpedit")
+    tid = None
+    try:
+        page.click("#share-tag-add-btn")
+        expect(page.locator("#share-tag-editor")).to_be_visible()
+        box = page.locator("#share-tag-view-only-preview")
+        expect(box).to_be_checked()
+        page.fill("#share-tag-name", name)
+        page.locator("#share-tag-aud-users").check()
+        box.uncheck()
+        with page.expect_response(
+            lambda r: r.url.rstrip("/").endswith("/share-tags") and r.request.method == "POST"
+        ) as resp:
+            page.click("#share-tag-save-btn")
+        assert resp.value.ok, f"POST /share-tags failed: {resp.value.status}"
+        tag = next(t for t in admin.get("/share-tags").json() if t["name"] == name)
+        tid = tag["id"]
+        assert tag["view_only_preview"] is False
+        page.locator(f'.share-tag-row[data-tag-id="{tid}"]').get_by_role("button", name="Edit").click()
+        expect(page.locator("#share-tag-editor")).to_be_visible()
+        expect(box).not_to_be_checked()
+        box.check()
+        with page.expect_response(
+            lambda r: f"/share-tags/{tid}" in r.url and r.request.method == "PATCH"
+        ) as resp:
+            page.click("#share-tag-save-btn")
+        assert resp.value.ok, f"PATCH /share-tags failed: {resp.value.status}"
+        assert next(t for t in admin.get("/share-tags").json() if t["id"] == tid)["view_only_preview"] is True
+    finally:
+        if tid:
+            admin.delete(f"/share-tags/{tid}")

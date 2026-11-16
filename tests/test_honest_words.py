@@ -58,3 +58,12 @@ def test_the_security_monitor_promises_no_delivery_it_lacks():
     assert "Email notifications" not in doc and "Webhook notifications" not in doc
     assert "no email or webhook delivery" in doc
     assert "TODO: Send email" not in src and "TODO: Send webhook" not in src
+
+
+def test_view_only_says_what_the_chosen_tag_gives():
+    """A view-only share shows its recipient names and sizes alone unless its tag lets view-only recipients view
+    files; the share dialog says which, and the tag editor carries the switch."""
+    js = _read("static/js/app.js")
+    html = _read("static/index.html")
+    assert "View only (recipients see names and sizes; they cannot open or download)" in js
+    assert "View-only recipients may view files in the browser (they still cannot download)" in html

@@ -7,7 +7,7 @@ from datetime import datetime
 import uuid
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, or_, select, update
 
 from app.core.models import (
     User, RoleEnum, PermissionEnum, user_permissions,
@@ -428,11 +428,12 @@ class PermissionService:
             return
         visible = {"files": [], "folders": []}
         downloadable = {"files": [], "folders": []}
+        previewable = {"files": [], "folders": []}
         if self._sharing_enabled():
             now = datetime.utcnow()
             rows = (
                 self.db.query(Share.target_type, Share.target_folder_id,
-                              Share.target_file_id, Share.view_only,
+                              Share.target_file_id, Share.view_only, Share.view_only_preview,
                               Share.claim_audience, Share.audience_user_ids,
                               Share.audience_department_ids)
                 .join(ShareClaim, ShareClaim.share_id == Share.id)
@@ -447,33 +448,45 @@ class PermissionService:
             )
             if rows:
                 gids = self._current_group_ids(user)
-                v_whole = d_whole = False
+                v_whole = d_whole = p_whole = False
                 v_files, v_folders = set(), set()
                 d_files, d_folders = set(), set()
-                for (target_type, folder_id, file_id, view_only,
+                p_files, p_folders = set(), set()
+                for (target_type, folder_id, file_id, view_only, view_only_preview,
                      _aud, _au, _ad) in rows:
                     # Drop a claim whose audience the caller no longer matches (e.g. removed from the
                     # targeted department) so its item leaves the caller's live scope.
                     if not self._audience_ok(_aud, _au, _ad, user.id, gids):
                         continue
                     # Every active claim contributes to the VISIBLE scope; only a non-view-only claim
-                    # also contributes to the DOWNLOADABLE scope.
+                    # also contributes to the DOWNLOADABLE scope. The PREVIEWABLE scope takes a non-view-only
+                    # claim, and a view-only claim only when its share lets view-only recipients view files
+                    # (view_only_preview, off for every share made before the switch existed).
+                    previews = (not view_only) or bool(view_only_preview)
                     if target_type == 'vault':
                         v_whole = True
                         if not view_only:
                             d_whole = True
+                        if previews:
+                            p_whole = True
                     elif target_type == 'folder' and folder_id is not None:
                         v_folders.add(str(folder_id))
                         if not view_only:
                             d_folders.add(str(folder_id))
+                        if previews:
+                            p_folders.add(str(folder_id))
                     elif target_type == 'file' and file_id is not None:
                         v_files.add(str(file_id))
                         if not view_only:
                             d_files.add(str(file_id))
+                        if previews:
+                            p_files.add(str(file_id))
                 visible = None if v_whole else {"files": sorted(v_files), "folders": sorted(v_folders)}
                 downloadable = None if d_whole else {"files": sorted(d_files), "folders": sorted(d_folders)}
+                previewable = None if p_whole else {"files": sorted(p_files), "folders": sorted(p_folders)}
         self._stamp_scope(user, "_share_vault_scope", vault.id, visible)
         self._stamp_scope(user, "_share_download_scope", vault.id, downloadable)
+        self._stamp_scope(user, "_share_preview_scope", vault.id, previewable)
 
     @staticmethod
     def _stamp_scope(user: User, attr: str, vault_id, scope) -> None:
@@ -489,8 +502,8 @@ class PermissionService:
 
     def burn_share_preview(self, user: User, vault: Vault, file, ancestor_folder_ids):
         """Consume one preview. A preview is counted apart from downloads, against the same
-        per-recipient ``max_downloads`` cap, and a view-only claim counts here (a view-only recipient may
-        preview, never download); see :meth:`burn_share_access`."""
+        per-recipient ``max_downloads`` cap. A view-only claim counts here only when its share lets
+        view-only recipients view files (``view_only_preview``); see :meth:`burn_share_access`."""
         return self.burn_share_access(user, vault, file, ancestor_folder_ids, kind='preview')
 
     def burn_share_access(self, user: User, vault: Vault, file, ancestor_folder_ids, kind='download'):
@@ -522,8 +535,9 @@ class PermissionService:
         anc = {str(a) for a in (ancestor_folder_ids or [])}
         fid = str(file.id)
         # ``kind`` says which counter: a download consumes download_count and only a non-view-only claim
-        # covers it; a preview consumes preview_count and every claim covers it (a view-only share grants
-        # exactly that). Each is a separate budget against the same cap.
+        # covers it; a preview consumes preview_count and is covered by a non-view-only claim, or by a
+        # view-only claim whose share lets view-only recipients view files. Each is a separate budget
+        # against the same cap.
         counter = ShareClaim.preview_count if kind == 'preview' else ShareClaim.download_count
         filters = [
             ShareClaim.user_id == user.id,
@@ -534,6 +548,8 @@ class PermissionService:
         ]
         if kind != 'preview':
             filters.append(Share.view_only.is_(False))
+        else:
+            filters.append(or_(Share.view_only.is_(False), Share.view_only_preview.is_(True)))
         rows = (
             self.db.query(ShareClaim.id, Share.max_downloads, Share.target_type,
                           Share.target_folder_id, Share.target_file_id,

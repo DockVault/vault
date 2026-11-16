@@ -68,7 +68,7 @@ from app.config.branding import branding
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, SessionLimitExceededError, RateLimitExceededError as AuthRateLimitExceededError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, StorageLimitExceeded, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, DestinationGoneError, _name_match_filter, is_refundable_serve_failure
-from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, folder_ancestry, filter_listing_for_scope
+from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, require_preview_scope, folder_ancestry, filter_listing_for_scope
 from app.core.id_scope import id_in_scope
 from sqlalchemy.exc import IntegrityError
 from app.services.audit_logger import AuditLogger
@@ -1218,6 +1218,9 @@ class ShareTagCreate(BaseModel):
     allow_view_only: bool = True
     default_view_only: bool = False
     force_view_only: bool = False
+    # A new tag lets view-only recipients view files in the browser unless the request says otherwise
+    # (the column's default, off, is for the tags made before the switch existed).
+    view_only_preview: bool = True
     allow_custom: bool = True
     allowed_audiences: List[str] = Field(default_factory=lambda: list(sharing_policy.AUDIENCES))
     allowed_department_ids: List[uuid.UUID] = Field(default_factory=list)
@@ -1259,6 +1262,7 @@ class ShareTagUpdate(BaseModel):
     allow_view_only: Optional[bool] = None
     default_view_only: Optional[bool] = None
     force_view_only: Optional[bool] = None
+    view_only_preview: Optional[bool] = None
     allow_custom: Optional[bool] = None
     allowed_audiences: Optional[List[str]] = None
     allowed_department_ids: Optional[List[uuid.UUID]] = None
@@ -1477,8 +1481,9 @@ class VaultResponse(BaseModel):
     # no case number, purpose, auditor or person concerned (app/core/owner_access.py, member_review).
     compliance_review: Optional[dict] = None
     # Present only when the caller reached the vault through a share claim (no owner, member or group
-    # access of their own): {"view_only": bool}. view_only is True when none of their claims on this vault
-    # allows a download, so the web app offers them the preview and nothing that would be refused.
+    # access of their own): {"view_only": bool, "preview": bool}. view_only is True when none of their claims
+    # on this vault allows a download; preview is False when none lets them view files in the browser either.
+    # The web app offers only what would not be refused.
     via_share: Optional[dict] = None
 
     class Config:
@@ -12484,8 +12489,8 @@ async def delete_group(
 # empty-audiences tag. The caps (max_recipients_cap/max_downloads_cap) are nullable -> null clears them.
 _SHARE_TAG_NOT_NULLABLE = frozenset({
     "name", "is_active", "max_lifetime_minutes", "default_lifetime_minutes",
-    "allow_view_only", "default_view_only", "force_view_only", "allow_custom", "auto_enroll_new_users",
-    "allowed_audiences",
+    "allow_view_only", "default_view_only", "force_view_only", "view_only_preview", "allow_custom",
+    "auto_enroll_new_users", "allowed_audiences",
 })
 
 
@@ -12507,6 +12512,7 @@ def _share_tag_dict(t: ShareTag) -> dict:
         "allow_view_only": t.allow_view_only,
         "default_view_only": t.default_view_only,
         "force_view_only": t.force_view_only,
+        "view_only_preview": bool(t.view_only_preview),
         "allow_custom": t.allow_custom,
         "allowed_audiences": list(t.allowed_audiences or []),
         "allowed_department_ids": [str(x) for x in (t.allowed_department_ids or [])],
@@ -16795,6 +16801,7 @@ async def get_share_policy(
             "allow_view_only": t.allow_view_only,
             "default_view_only": t.default_view_only,
             "force_view_only": t.force_view_only,
+            "view_only_preview": bool(t.view_only_preview),
             "allow_custom": t.allow_custom,
             **eff,
         })
@@ -16903,7 +16910,7 @@ def _share_dict(db: Session, share: Share, claim_counts: dict = None, tags: dict
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         "max_recipients": share.max_recipients,
         "max_downloads": share.max_downloads,
-        "view_only": share.view_only,
+        "view_only": share.view_only, "view_only_preview": bool(share.view_only_preview),
         "status": _share_effective_status(share),
         "claim_count": claim_count,
         "created_at": share.created_at.isoformat() if share.created_at else None,
@@ -17038,14 +17045,15 @@ async def create_share(
     snapshot = dict(sharing_policy.tag_effective_limits(tag_limits))
     snapshot.update({"allow_view_only": tag.allow_view_only, "default_view_only": tag.default_view_only,
                      "force_view_only": tag.force_view_only, "allow_custom": tag.allow_custom,
-                     "tag_name": tag.name})
+                     "view_only_preview": bool(tag.view_only_preview), "tag_name": tag.name})
     share = Share(
         creator_id=current_user.id, vault_id=vault.id, tag_id=tag.id,
         target_type=tt, target_folder_id=tf_folder, target_file_id=tf_file,
         link_token_hash=link_token_hash, claim_audience=payload.claim_audience,
         audience_user_ids=aud_users, audience_department_ids=aud_depts,
         expires_at=expires_at, max_recipients=limits["max_recipients"], max_downloads=limits["max_downloads"],
-        view_only=limits["view_only"], tag_policy_snapshot=snapshot, status="active",
+        view_only=limits["view_only"], view_only_preview=bool(tag.view_only_preview),
+        tag_policy_snapshot=snapshot, status="active",
     )
     db.add(share)
     db.commit()
@@ -17228,7 +17236,7 @@ def _share_claim_dict(claim: ShareClaim, share: Share) -> dict:
         "target_type": share.target_type,
         "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
         "target_file_id": str(share.target_file_id) if share.target_file_id else None,
-        "view_only": share.view_only,
+        "view_only": share.view_only, "view_only_preview": bool(share.view_only_preview),
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
     }
@@ -17406,7 +17414,7 @@ def _shared_with_me_dict(db: Session, claim: ShareClaim, share: Share,
         "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
         "target_file_id": str(share.target_file_id) if share.target_file_id else None,
         "target_name": target_name,
-        "view_only": share.view_only,
+        "view_only": share.view_only, "view_only_preview": bool(share.view_only_preview),
         "status": st,
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         "max_downloads": share.max_downloads,
@@ -17458,7 +17466,7 @@ def _shared_available_dict(db: Session, share: Share) -> Optional[dict]:
         "target_folder_id": str(share.target_folder_id) if share.target_folder_id else None,
         "target_file_id": str(share.target_file_id) if share.target_file_id else None,
         "target_name": target_name,
-        "view_only": share.view_only,
+        "view_only": share.view_only, "view_only_preview": bool(share.view_only_preview),
         "status": "available",   # pushed to you; claim to access
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         "max_downloads": share.max_downloads,
@@ -18858,7 +18866,12 @@ async def get_vault(
                 # whole-vault claim that allows downloads.
                 _dl_scopes = getattr(current_user, "_share_download_scope", None) or {}
                 _dl = _dl_scopes.get(str(vault.id)) if str(vault.id) in _dl_scopes else None
-                via_share = {"view_only": isinstance(_dl, dict) and not _dl.get("files") and not _dl.get("folders")}
+                # And the previewable scope: empty when no claim here lets the caller view files in the
+                # browser (view-only shares whose makers were told the files cannot be opened).
+                _pv_scopes = getattr(current_user, "_share_preview_scope", None) or {}
+                _pv = _pv_scopes.get(str(vault.id)) if str(vault.id) in _pv_scopes else None
+                via_share = {"view_only": isinstance(_dl, dict) and not _dl.get("files") and not _dl.get("folders"),
+                             "preview": not (isinstance(_pv, dict) and not _pv.get("files") and not _pv.get("folders"))}
                 try:
                     AuditLogger(db).log_action(
                         action="share_opened", status="success", user=current_user,
@@ -23611,9 +23624,12 @@ async def _serve_file(vault_id, file_id, request, file_password, current_user, d
             allow_share=True,
         )
         require_file_scope(db, current_user, vault_id, file_id)
-        # A view-only share claim covers a preview and not a download: only a download asks for the
-        # downloadable scope (here at the door, and again after the wait for a slot).
-        if not view_only_ok:
+        # A view-only share claim covers a preview, when its share lets view-only recipients view files, and
+        # never a download: a preview asks for the previewable scope, a download for the downloadable one
+        # (here at the door, and again after the wait for a slot).
+        if view_only_ok:
+            require_preview_scope(db, current_user, vault_id, file_id)
+        else:
             require_download_scope(db, current_user, vault_id, file_id)
 
         # The file must belong to the vault used for the access/password gate. Resolved before the
@@ -23642,9 +23658,11 @@ async def _serve_file(vault_id, file_id, request, file_password, current_user, d
         current_user, vault = _admitted_again(db, token, vault_id, password_hash_before, "FILE_DOWNLOAD",
                                               "file.download", allow_share=True)
         require_file_scope(db, current_user, vault_id, file_id)
-        # A view-only share claim covers a preview and not a download: only the download route asks
-        # for the downloadable scope.
-        if not view_only_ok:
+        # A view-only share claim covers a preview (when its share lets view-only recipients view files) and
+        # not a download.
+        if view_only_ok:
+            require_preview_scope(db, current_user, vault_id, file_id)
+        else:
             require_download_scope(db, current_user, vault_id, file_id)
         file_record = _the_file()
         start_operation(operation_id)
@@ -26516,7 +26534,7 @@ _DEFAULT_SHARE_TAGS = [
         "name": "Normal", "color": "sky",
         "description": "Everyday sharing with the standard limits.",
         "allowed_audiences": ["anyone_internal", "users", "departments"],
-        "allow_view_only": True, "default_view_only": False, "force_view_only": False,
+        "allow_view_only": True, "default_view_only": False, "force_view_only": False, "view_only_preview": True,
         "allow_custom": True, "auto_enroll_new_users": True,
         "max_lifetime_minutes": 90 * 24 * 60, "default_lifetime_minutes": 30 * 24 * 60,
     },
@@ -26524,7 +26542,7 @@ _DEFAULT_SHARE_TAGS = [
         "name": "Internal", "color": "indigo",
         "description": "For anyone inside the organisation who holds the link.",
         "allowed_audiences": ["anyone_internal", "users", "departments"],
-        "allow_view_only": True, "default_view_only": False, "force_view_only": False,
+        "allow_view_only": True, "default_view_only": False, "force_view_only": False, "view_only_preview": True,
         "allow_custom": True, "auto_enroll_new_users": True,
         "max_lifetime_minutes": 90 * 24 * 60, "default_lifetime_minutes": 30 * 24 * 60,
     },
@@ -26532,14 +26550,14 @@ _DEFAULT_SHARE_TAGS = [
         "name": "Confidential", "color": "amber",
         "description": "Sensitive — share only with named people or departments.",
         "allowed_audiences": ["users", "departments"],
-        "allow_view_only": True, "default_view_only": False, "force_view_only": False,
+        "allow_view_only": True, "default_view_only": False, "force_view_only": False, "view_only_preview": True,
         "allow_custom": True, "auto_enroll_new_users": True,
     },
     {
         "name": "Confidential (Read)", "color": "rose",
         "description": "Sensitive, view-only — recipients can view the files in the browser but not download them.",
         "allowed_audiences": ["users", "departments"],
-        "allow_view_only": True, "default_view_only": True, "force_view_only": True,
+        "allow_view_only": True, "default_view_only": True, "force_view_only": True, "view_only_preview": True,
         "allow_custom": True, "auto_enroll_new_users": True,
     },
 ]
@@ -27388,6 +27406,12 @@ END $$;""",
             "ALTER TABLE credential_changes ADD COLUMN IF NOT EXISTS envelope_released_at TIMESTAMP",
             # Previews of shared files, counted apart from downloads (the model declares NOT NULL DEFAULT 0).
             "ALTER TABLE share_claims ADD COLUMN IF NOT EXISTS preview_count INTEGER NOT NULL DEFAULT 0",
+            # Whether a view-only recipient may view a share's files in the browser: a switch on each tag,
+            # copied into each share when it is made. Every tag and share that exists before this release
+            # reads FALSE: their makers were told a view-only recipient cannot open the files, and an upgrade
+            # does not widen what a share grants. An older release ignores both columns.
+            "ALTER TABLE share_tags ADD COLUMN IF NOT EXISTS view_only_preview BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE shares ADD COLUMN IF NOT EXISTS view_only_preview BOOLEAN NOT NULL DEFAULT FALSE",
             # An owner's message on a public page, and the re-copy of an upload link's token (as the other
             # links have). Nullable, no default; an older release ignores them.
             "ALTER TABLE receivers ADD COLUMN IF NOT EXISTS message TEXT",
