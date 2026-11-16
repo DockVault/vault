@@ -162,15 +162,18 @@ def test_a_session_ended_on_the_server_at_the_end_of_its_count_says_it_ended(pag
     page.evaluate("() => SessionWatch.armAt(Date.now() + 1000)")
     _until_held(page, held, 10)
     # A poll's refusal arrives first, saying the session was ended: not that it ran out. The warning's check then
-    # comes back refused on the same page, its sign-out held: the reason stays.
+    # comes back refused on the same page, its sign-out held: it signs nothing out again, so the reason stays and
+    # what the person started to type is kept.
     signing_out = HeldSignOut(page)
     _poll(page, token)
     _signed_out_saying(page, signing_out, ENDED)
+    page.fill("#username", "someone-else")
     held[0].continue_()
     page.unroute("**/users/me")
     page.wait_for_timeout(1500)
     assert still_old(page), "the page went: the check's refusal reached nothing to test"
     expect(page.locator("#login-error")).to_contain_text(ENDED)
+    assert page.input_value("#username") == "someone-else"
     assert len(sent.sign_outs()) == 1, sent.sign_outs()
     _replaced_saying(page, signing_out, ENDED)
 
