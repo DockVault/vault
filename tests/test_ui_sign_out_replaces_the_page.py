@@ -159,11 +159,12 @@ def world(admin, admin_creds):
     held = ca.post(f"/users/{c['id']}/reset-link")
     yield {"a": a, "b": b, "c": c, "m": m, "admin": admin, "held_change": held.status_code}
     # Put back as it was, a session timeout a test left shorter too: lengthening it asks for the administrator's
-    # password, which the helper gives when the server asks.
+    # password, which the helper gives when the server asks. The timeout is always sent: one never saved goes
+    # back to the deployment's default (None).
     restored = put_settings_allowing_longer_sessions(
         admin, admin_creds["password"],
-        {k: before.get(k) for k in ("sharing_enabled", "invite_enabled", "zero_knowledge_enabled", "session_timeout")
-         if k in before})
+        {**{k: before.get(k) for k in ("sharing_enabled", "invite_enabled", "zero_knowledge_enabled") if k in before},
+         "session_timeout": before.get("session_timeout")})
     assert restored.status_code in (200, 204), restored.text
     for u in (a, b, c):
         admin.delete_user(u["id"])
@@ -240,7 +241,17 @@ def test_after_the_session_ends_the_page_is_new_and_holds_nothing_of_the_person(
             restored = put_settings_allowing_longer_sessions(admin, admin_creds["password"], {"session_timeout": before})
             assert restored.status_code in (200, 204), restored.text
     signed_in_at = time.time()
+    if how == "run_out":
+        # The warning opens a minute after this sign-in: during the walk-through it would cover what is clicked, and
+        # a dialog closed there counts as "stay". It is held off until the walk-through is over (nothing arms it
+        # again meanwhile), then armed from the token, which keeps its own end.
+        page.evaluate("""() => { window.__armWarning = SessionWatch.armFromToken; SessionWatch.disarm();
+                                 SessionWatch.armFromToken = () => false; }""")
     seen = _go_everywhere(page, world["m"])
+    if how == "run_out":
+        assert page.evaluate("""() => { SessionWatch.armFromToken = window.__armWarning;
+                                        return SessionWatch.armFromToken(authToken) && !!authToken; }"""), \
+            "the session ran out during the walk-through"
     # The control: every marker was in the page on the way, and the page still holds them when the session ends.
     assert set(world["m"].values()) - seen == set(), f"never in the page: {set(world['m'].values()) - seen}"
     assert {world["m"]["vault"], world["m"]["zk_name"]} <= _seen(page, world["m"].values())

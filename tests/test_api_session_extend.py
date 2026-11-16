@@ -58,7 +58,7 @@ def test_extend_gives_a_new_token_and_kills_the_old_one(admin):
 
 
 def test_each_sign_in_has_its_own_id_and_its_renewals_keep_it(admin):
-    # Two sign-ins of one person, in the same second as far as their times go: told apart by their ids alone.
+    # Two sign-ins of one person: each has its own id, and a renewal keeps the id of the sign-in it renews.
     u = admin.create_user(role="user")
     try:
         one, two = ApiClient(), ApiClient()

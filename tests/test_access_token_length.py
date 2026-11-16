@@ -87,11 +87,13 @@ def _request(token: str) -> Request:
 def test_the_longest_token_this_server_can_sign_is_well_under_the_limit(monkeypatch):
     # A username may be up to 255 characters, and JSON writes each character outside the Basic
     # Multilingual Plane as a 12-byte surrogate pair; HS512 gives the longest signature. Every claim
-    # a session token can carry is present.
+    # a session token can carry is present, those its renewals keep among them (an identity provider's
+    # name given room to spare).
     monkeypatch.setattr(settings, "jwt_algorithm", "HS512")
     monkeypatch.setattr(settings, "jwt_secret_key", "k" * 64)
     claims = {"sub": "0" * 36, "username": "\U0001F600" * 255, "session_token": "s" * 43,
-              "is_temporary": False, "amr": ["pwd", "recovery"], "mfa_at": 2_000_000_000}
+              "is_temporary": False, "amr": ["pwd", "recovery"], "mfa_at": 2_000_000_000,
+              "auth_time": 2_000_000_000, "sign_in_id": "i" * 22, "idp": "p" * 64}
     token = create_access_token(claims)
     assert len(token) * 3 // 2 < MAX_ACCESS_TOKEN_LENGTH, len(token)
     assert verify_access_token(token)["username"] == claims["username"]

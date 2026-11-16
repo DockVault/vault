@@ -112,6 +112,16 @@ def _until_held(page: Page, held: list, seconds: float):
     assert len(held) == 1, "the warning did not ask the server at the end of its count"
 
 
+def _check_comes_back_refused(page: Page, held: list):
+    """The warning's held check let through, and its refusal received in full by the page (a short wait after it,
+    for the page to deal with it)."""
+    with page.expect_response(lambda r: r.url.endswith("/users/me") and r.status == 401) as answered:
+        held[0].continue_()
+    answered.value.finished()
+    page.unroute("**/users/me")
+    page.wait_for_timeout(200)
+
+
 def test_a_poll_refused_at_the_real_end_before_the_warnings_check_says_the_session_ran_out(
         page: Page, admin, admin_creds, person):
     # A session that really runs out: two minutes.
@@ -141,9 +151,7 @@ def test_a_poll_refused_at_the_real_end_before_the_warnings_check_says_the_sessi
     # The person starts to sign in again; then the warning's own check comes back refused too: on the same page,
     # it changes nothing, neither the reason nor what the person typed.
     page.fill("#username", "someone-else")
-    held[0].continue_()
-    page.unroute("**/users/me")
-    page.wait_for_timeout(1500)
+    _check_comes_back_refused(page, held)
     assert still_old(page), "the page went: the check's refusal reached nothing to test"
     expect(page.locator("#login-error")).to_contain_text(RAN_OUT)
     assert page.input_value("#username") == "someone-else"
@@ -168,9 +176,7 @@ def test_a_session_ended_on_the_server_at_the_end_of_its_count_says_it_ended(pag
     _poll(page, token)
     _signed_out_saying(page, signing_out, ENDED)
     page.fill("#username", "someone-else")
-    held[0].continue_()
-    page.unroute("**/users/me")
-    page.wait_for_timeout(1500)
+    _check_comes_back_refused(page, held)
     assert still_old(page), "the page went: the check's refusal reached nothing to test"
     expect(page.locator("#login-error")).to_contain_text(ENDED)
     assert page.input_value("#username") == "someone-else"
