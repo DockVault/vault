@@ -52,12 +52,88 @@ def _node(body: str, *chunks: str, without_watch: bool = False) -> dict:
 # The tab the browser froze holds `mine`; it is told late that `mine` was renewed, and finds `stored` stored.
 TOLD = r"""
 let listener = null;
+const posted = [];
 globalThis.BroadcastChannel = function () {
     this.addEventListener = (t, fn) => { listener = fn; };
-    this.postMessage = () => {};
+    this.postMessage = (m) => posted.push(m);
 };
 globalThis.SIGN_OUT_TOLD = 'told';
 """
+
+# A frozen tab holding `mine` wakes to what another tab told while it slept: `messages`, with `stored` stored for the
+# browser by then. What the tab holds, and the sign-outs it did.
+WAKE = TOLD + r"""
+vm.runInThisContext(CHANNEL_SRC, { filename: 'app-channel.js' });
+const quinn = token({ sub: '9', username: 'quinn', is_temporary: false, iat: NOW, exp: NOW + 3600 }, 'quinn');
+const third = token({ ...person, iat: NOW, exp: NOW + 3700, auth_time: NOW - 600 }, 'third');
+const said = [];
+const signOut = logout;
+globalThis.logout = (how, reason) => { said.push([how === undefined ? null : how, reason]); signOut(how, reason); };
+const tail = (t) => _tokenTail(t);
+STORED
+for (const data of MESSAGES) listener({ data });
+out({ held: authToken === mine ? 'mine' : authToken === renewed ? 'renewed' : authToken === null ? null
+                                                                                  : String(authToken), said });
+"""
+
+
+def _wake(stored: str, messages: str) -> dict:
+    return _node(WAKE.replace("STORED", stored).replace("MESSAGES", messages)
+                 .replace("CHANNEL_SRC", json.dumps(CHANNEL)))
+
+
+@pytest.mark.parametrize("stored", [
+    "store.delete('authToken');",                # signed out, nobody signed in since
+    "store.set('authToken', quinn);",            # signed out, and the next person signed in
+])
+def test_a_tab_told_its_session_was_renewed_and_then_signed_out_signs_out(stored):
+    out = _wake(stored, "[{ type: 'renewed', token: tail(mine), next: tail(renewed) },"
+                        " { type: 'signed-out', token: tail(renewed) }]")
+    assert out == {"held": None, "said": [["told", "Signed out in another tab."]]}
+
+
+def test_a_tab_told_of_renewals_one_after_another_signs_out_when_the_last_is_signed_out():
+    out = _wake("store.delete('authToken');",
+                "[{ type: 'renewed', token: tail(mine), next: tail(renewed) },"
+                " { type: 'renewed', token: tail(renewed), next: tail(third) },"
+                " { type: 'signed-out', token: tail(third) }]")
+    assert out == {"held": None, "said": [["told", "Signed out in another tab."]]}
+
+
+def test_a_tab_told_of_a_renewal_it_can_take_takes_it_and_stays():
+    # The control: the renewal is stored, taken, and nothing signs out.
+    out = _wake("store.set('authToken', renewed);", "[{ type: 'renewed', token: tail(mine), next: tail(renewed) }]")
+    assert out == {"held": "renewed", "said": []}
+
+
+def test_a_sign_out_or_renewal_of_another_session_changes_nothing():
+    out = _wake("store.delete('authToken');",
+                "[{ type: 'signed-out', token: tail(quinn) },"
+                " { type: 'renewed', token: tail(quinn), next: tail(third) },"
+                " { type: 'signed-out', token: tail(third) },"
+                " { type: 'renewed', token: tail(mine) },"
+                " { type: 'signed-out', token: '' }]")
+    assert out == {"held": "mine", "said": []}
+
+
+def test_a_renewal_tells_the_other_tabs_which_token_replaced_which():
+    # The sending side: Stay signed in, renewed, tells the other tabs; a tab holding the old token, told so, takes
+    # the new one from the storage they share.
+    out = _node(TOLD + f"""
+vm.runInThisContext({json.dumps(CHANNEL)}, {{ filename: 'app-channel.js' }});
+route = (url) => Promise.resolve(url.endsWith('/auth/session/extend')
+    ? answer(200, {{ access_token: renewed }}) : answer(200, {{}}));
+await stay();
+const here = authToken === renewed;
+// The other tab, which still holds the old token.
+authToken = mine;
+posted.forEach((data) => listener({{ data }}));
+out({{ here, posted, expected: {{ type: 'renewed', token: _tokenTail(mine), next: _tokenTail(renewed) }},
+       there: authToken === renewed }});
+""")
+    assert out["here"] is True
+    assert out["posted"] == [out["expected"]], out
+    assert out["there"] is True
 
 
 @pytest.mark.parametrize("stored", [
@@ -142,6 +218,82 @@ def test_a_refused_request_is_sent_again_with_the_renewal_of_this_tab():
     assert out == {"sent": ["--mine", "enewed"], "settled": "resolved"}
 
 
+# A request on its way when another tab's renewal is told first and taken; then `between` happens, and the request's
+# answer comes back: a 401, the token it carried being spent by that renewal.
+TOLD_FIRST = TOLD + r"""
+globalThis.SIGNED_OUT_REASONS = { ended: 'Your session has ended. Sign in again.' };
+vm.runInThisContext(CHANNEL_SRC, { filename: 'app-channel.js' });
+const quinn = token({ sub: '9', username: 'quinn', iat: NOW, exp: NOW + 3600 }, 'quinn');
+const json = (status, body) => ({ ...answer(status, body),
+    headers: { get: (h) => (h.toLowerCase() === 'content-type' ? 'application/json' : null) } });
+let answerFirst;
+let revokes = 0;
+route = (url) => {
+    if (url.endsWith('/invitations/i1')) {
+        revokes += 1;
+        if (revokes === 1) return new Promise((r) => { answerFirst = r; });
+        return Promise.resolve(json(200, { ok: true }));
+    }
+    return Promise.resolve(answer(200, {}));
+};
+console.error = () => {};
+let settled = 'pending';
+let error = null;
+_apiRequestNow('/invitations/i1', { method: 'DELETE' })
+    .then(() => { settled = 'resolved'; }, (e) => { settled = 'rejected'; error = e.message; });
+await settle();
+store.set('authToken', renewed);
+listener({ data: { type: 'renewed', token: _tokenTail(mine), next: _tokenTail(renewed) } });
+const took = authToken === renewed;
+BETWEEN
+answerFirst(json(401, { detail: 'Session has been terminated. Please login again.' }));
+await settle();
+out({ took, sent: sent.filter((s) => s.url.endsWith('/invitations/i1')).map((s) => s.bearer.slice(-6)), settled, error,
+      logouts });
+"""
+
+
+def _told_first(between: str) -> dict:
+    return _node(TOLD_FIRST.replace("BETWEEN", between).replace("CHANNEL_SRC", json.dumps(CHANNEL)), REQUESTS)
+
+
+def test_a_request_refused_after_a_renewal_told_first_is_sent_again_with_it():
+    out = _told_first("")
+    assert out == {"took": True, "sent": ["--mine", "enewed"], "settled": "resolved", "error": None, "logouts": 0}
+
+
+@pytest.mark.parametrize("between", [
+    "_sessionsEnded += 1; authToken = renewed;",      # a session ended on the page since the request was sent
+    "authToken = quinn;",                              # another person's sign-in held since
+])
+def test_a_request_refused_after_a_renewal_told_first_is_not_sent_again_with_another_session(between):
+    out = _told_first(between)
+    assert out["sent"] == ["--mine"], out
+    assert out["settled"] == "rejected" and out["logouts"] == 0, out
+
+
+def test_a_refusal_carries_on_only_when_the_page_may_send_the_request_again():
+    # _signOutRefused's own answer, which apiRequest acts on: the warning's answer that the tab carries on, and the
+    # token held now renewing the refused token's sign-in, with no session ended on the page since it was sent.
+    out = _node(r"""
+const quinn = token({ sub: '9', username: 'quinn', iat: NOW, exp: NOW + 3600 }, 'quinn');
+const results = {};
+SessionWatch.refusedSession = async () => true;
+authToken = quinn;
+results.another_sign_in_held = await _signOutRefused(mine, 401, 'x', _sessionsEnded);
+authToken = renewed;
+results.a_session_ended_since = await _signOutRefused(mine, 401, 'x', _sessionsEnded - 1);
+SessionWatch.refusedSession = async () => false;
+results.the_warning_did_not_carry_on = await _signOutRefused(mine, 401, 'x', _sessionsEnded);
+// The control: the warning carries on, with a renewal of the same sign-in, nothing ended.
+SessionWatch.refusedSession = async () => true;
+results.carries_on = await _signOutRefused(mine, 401, 'x', _sessionsEnded);
+out(results);
+""", REQUESTS)
+    assert out == {"another_sign_in_held": False, "a_session_ended_since": False,
+                   "the_warning_did_not_carry_on": False, "carries_on": True}
+
+
 def test_the_reasons_travel_as_codes_that_name_only_the_apps_own_sentences():
     out = _node(r"""
 globalThis._nameNote = null;
@@ -174,8 +326,8 @@ out({ watch: Object.keys(watch).sort(), back, strange,
 
 
 def test_without_the_warnings_module_a_refusal_signs_out_with_the_same_sentences():
+    # The page's own sentences (its SIGNED_OUT_REASONS), not stand-ins: the sentence is what is pinned.
     out = _node(r"""
-globalThis.SIGNED_OUT_REASONS = { ended: 'Your session has ended. Sign in again.' };
 const said = [];
 globalThis.logout = (how, reason) => { said.push([how === undefined ? null : how, reason]); authToken = null; };
 const a = await _signOutRefused(mine, 401, 'Session has been terminated. Please login again.');
@@ -184,7 +336,7 @@ const b = await _signOutRefused(mine, 403, 'User account is locked');
 authToken = mine;
 const c = await _signOutRefused(mine, 403, '');
 out({ said, carriedOn: [a, b, c] });
-""", REQUESTS, without_watch=True)
+""", REASONS, REQUESTS, without_watch=True)
     assert out == {"said": [[None, "Your session has ended. Sign in again."], [None, "User account is locked"],
                             [None, "Your session has ended. Sign in again."]],
                    "carriedOn": [False, False, False]}

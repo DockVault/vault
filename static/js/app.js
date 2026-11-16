@@ -767,14 +767,24 @@ function showLoading(element, message = 'Loading...') {
 // account). Whichever refusal arrives first does it, a background poll's as much as the warning's own check, and
 // the rest find the tab signed out already. Without the warning's module, the plain sign-out with the same reasons.
 // Resolves true when the tab carries on instead, with the token of a renewal of the same sign-in (another tab's,
-// or this tab's own Stay signed in that was on its way).
-async function _signOutRefused(token, status, detail) {
+// or this tab's own Stay signed in that was on its way), and the refused request, sent while `sentEnded` sessions had
+// ended on the page, may be sent again with it (_mayResendWith).
+async function _signOutRefused(token, status, detail, sentEnded) {
     if (window.SessionWatch && typeof SessionWatch.refusedSession === 'function') {
-        await SessionWatch.refusedSession(token, status, detail);
-        return !!authToken && authToken !== token;
+        const carriedOn = await SessionWatch.refusedSession(token, status, detail);
+        return !!carriedOn && _mayResendWith(token, sentEnded);
     }
     logout(undefined, (status === 403 && typeof detail === 'string' && detail) ? detail : SIGNED_OUT_REASONS.ended);
     return false;
+}
+
+// Whether a request sent with `sentToken`, while `sentEnded` sessions had ended on the page, and refused for it, is sent
+// once more with the token the tab holds now: only when no session has ended on the page since it was sent, and that
+// token renews the sign-in of `sentToken` (SessionWatch.renews). A token of a sign-in made since, of another person
+// or the same, is never sent a request of the session before it.
+function _mayResendWith(sentToken, sentEnded) {
+    return sentEnded === _sessionsEnded && !!sentToken && !!authToken && authToken !== sentToken
+        && !!window.SessionWatch && typeof SessionWatch.renews === 'function' && SessionWatch.renews(sentToken, authToken);
 }
 
 // Every call made through apiRequest belongs to the session open on this page when it was made. Once that session has
@@ -806,6 +816,9 @@ async function _apiRequestNow(endpoint, options = {}) {
     if (sentToken) {
         headers['Authorization'] = `Bearer ${sentToken}`;
     }
+    // How many sessions had ended on the page when it was sent: a refused request is never sent again with a token
+    // held after one more has ended (_mayResendWith).
+    const sentEnded = _sessionsEnded;
 
     // Silent mode suppresses error logging (for optional endpoints)
     const silent = options.silent || false;
@@ -851,15 +864,19 @@ async function _apiRequestNow(endpoint, options = {}) {
                 // Session expired - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
                     console.error('Session expired, logging out');
-                    const endedBefore = _sessionsEnded;
-                    const renewed = await _signOutRefused(sentToken, 401, errorDetail);
+                    const renewed = await _signOutRefused(sentToken, 401, errorDetail, sentEnded);
                     // The tab carries on with a renewed token of the same sign-in: this request is sent once more
                     // with it, rather than failing while the person stays signed in. A refused retry signs out.
                     // Never when a session ended on the page meanwhile: the token held now may be a sign-in made
                     // since, and the request is not that person's.
-                    if (renewed && endedBefore === _sessionsEnded && !options._renewedRetry) {
+                    if (renewed && sentEnded === _sessionsEnded && !options._renewedRetry) {
                         return _apiRequestNow(endpoint, { ...options, silent, _renewedRetry: true });
                     }
+                } else if (sentToken && !options._renewedRetry && _mayResendWith(sentToken, sentEnded)) {
+                    // Another tab's renewal of this sign-in was taken while the request was on its way (the sign-out
+                    // channel told this tab first): the token sent is spent, and the request goes once more with
+                    // the renewed one rather than failing while the person stays signed in.
+                    return _apiRequestNow(endpoint, { ...options, silent, _renewedRetry: true });
                 }
                 throw new Error('Session expired. Please log in again.');
             }
@@ -2353,13 +2370,27 @@ function _tellOtherTabsRenewed(previousToken, newToken) {
     } catch (_) {}
 }
 
+// The tails of the tokens other tabs renewed this page's session into, whether this page took them or not: a tab the
+// browser froze may be told of a renewal it cannot take (the token stored is already the next sign-in's, or none),
+// and then that the renewed session was signed out. That sign-out names the renewed token, not the one this page
+// holds, and is this page's session all the same. Emptied when the page's session ends (logout).
+const _renewedAway = new Set();
+
+function _toldOfThisSession(tail) {
+    return typeof tail === 'string' && !!tail && (tail === _tokenTail(authToken) || _renewedAway.has(tail));
+}
+
 if (_signOutChannel) {
     _signOutChannel.addEventListener('message', (event) => {
         const told = event && event.data;
-        if (!told || !authToken || told.token !== _tokenTail(authToken)) return;
+        if (!told || !authToken || !_toldOfThisSession(told.token)) return;
         if (told.type === 'renewed') {
+            if (typeof told.next !== 'string' || !told.next) return;
+            _renewedAway.add(told.next);
+            // Taken only when the token stored is the one the message names and renews this page's sign-in. A
+            // renewal told but not taken signs nothing out: the storage may lag, and the next refusal decides.
             const stored = storage.getItem('authToken');
-            if (stored && typeof told.next === 'string' && told.next && _tokenTail(stored) === told.next
+            if (stored && _tokenTail(stored) === told.next
                 && window.SessionWatch && typeof SessionWatch.takeToldRenewal === 'function') {
                 SessionWatch.takeToldRenewal(stored);
             }
@@ -2596,6 +2627,7 @@ function _takeSignedOutNote() {
 // page that replaces this one.
 function logout(how, reason) {
     _sessionsEnded += 1;      // answers to calls made until now are dropped (apiRequest)
+    _renewedAway.clear();     // a page not replaced keeps no tail of this session for the next one
     _downloadsOfThisSession.forEach((ctl) => { try { ctl.abort(); } catch (_) {} });
     _downloadsOfThisSession.clear();
     const replaceAfter = _appShown;

@@ -498,5 +498,7 @@
 
     window.SessionWatch = { armFromToken, armTemporary, armAt, disarm, show, remaining, adopt, forgetArrival,
                             refusedSession, takeToldRenewal, isTemporary: () => temporary, WARN_SECONDS,
+                            // Whether the token `held` renews the sign-in of the token `sent` (renewsSignIn).
+                            renews: (sent, held) => renewsSignIn(claimsOf(sent), claimsOf(held)),
                             REASONS: { ran_out: RAN_OUT, temporary_ran_out: TEMPORARY_RAN_OUT } };
 })();
