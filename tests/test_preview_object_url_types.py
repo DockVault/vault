@@ -115,6 +115,10 @@ LIFTED = "\n".join([
     _block("const LARGE_MEDIA_EXTS = new Set([", "]);"),
     _block("const WINDOWABLE_TEXT_EXTS = new Set([", "]);"),
     _block("const RENDERABLE_PREVIEW_EXTS = new Set([", "]);"),
+    # Whether the open vault's claims let it preview at all, and how a refused preview is told.
+    _block("function viaShareNoPreview(vault) {", "\n}\n"),
+    _block("const PREVIEW_NOT_SHARED =", ";\n"),
+    _block("async function _previewRefusal(resp) {", "\n}\n"),
     PREVIEW,
     CLOSE,
 ])
