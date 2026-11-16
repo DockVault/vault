@@ -209,11 +209,15 @@ def test_the_share_dialog_says_what_view_only_gives_under_the_chosen_tag(page: P
     before = admin.get("/settings").json().get("sharing_enabled")
     admin.put("/settings", json={"sharing_enabled": True})
     vault = admin.create_vault(name=unique("label"))
+    # The administrator may share under both tags (auto-enrolment covers accounts made after a tag).
+    me = admin.get("/users/me").json()["id"]
     tags = {}
     for views in (True, False):
-        tags[views] = admin.post("/share-tags", json={
-            "name": unique("lbl"), "auto_enroll_new_users": True, "allowed_audiences": ["anyone_internal"],
-            "allow_view_only": True, "view_only_preview": views}).json()
+        r = admin.post("/share-tags", json={
+            "name": unique("lbl"), "allowed_user_ids": [me], "allowed_audiences": ["anyone_internal"],
+            "allow_view_only": True, "view_only_preview": views})
+        assert r.status_code == 200, r.text
+        tags[views] = r.json()
     try:
         page.goto("/")
         expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
