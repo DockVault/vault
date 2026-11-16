@@ -10,7 +10,6 @@ the tags seeded on a fresh install. tests/test_api_share_view_only_preview.py ru
 """
 import uuid
 from datetime import datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +18,8 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 from app.core import models as m  # noqa: E402
-from app.core.authorization import PermissionService  # noqa: E402
+from app.core.authorization import PermissionDeniedError, PermissionService  # noqa: E402
+from app.services.vault_service import PREVIEW_NOT_SHARED, require_preview_scope  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -43,8 +43,10 @@ def _people(db):
     v = m.Vault(id=uuid.uuid4(), name="v", owner_id=owner.id, type="standard", file_count=0, total_size_bytes=0)
     db.add(v)
     db.commit()
-    # The count of a preview reads only the file's id (and its folders, none here: the vault's root).
-    f = SimpleNamespace(id=uuid.uuid4())
+    # A file at the vault's root (no folders above it).
+    f = m.File(id=uuid.uuid4(), vault_id=v.id, folder_id=None, size_bytes=5, storage_path="x")
+    db.add(f)
+    db.commit()
     return owner, reader, v, f
 
 
@@ -70,13 +72,19 @@ def _shared(db, owner, reader, v, *, view_only, tag_preview, share_preview=None,
 
 
 def _what_it_may_do(db, reader, v, f):
+    """What the preview route asks (the previewable scope, with the sentence it refuses with) and what the count
+    of a preview and of a download allow."""
     ps = PermissionService(db)
     ps.stamp_share_scope(reader, v)
-    preview_scope = reader._share_preview_scope[str(v.id)]
+    try:
+        require_preview_scope(db, reader, v.id, f.id)
+        previewable = True
+    except PermissionDeniedError as e:
+        assert str(e) == PREVIEW_NOT_SHARED
+        previewable = False
     previewed, _ = ps.burn_share_preview(reader, v, f, [])
     downloaded, _ = ps.burn_share_download(reader, v, f, [])
-    return {"previewable": preview_scope is None or bool(preview_scope.get("files") or preview_scope.get("folders")),
-            "previewed": previewed, "downloaded": downloaded}
+    return {"previewable": previewable, "previewed": previewed, "downloaded": downloaded}
 
 
 @pytest.mark.parametrize("view_only, tag_preview, share_preview, expected", [
