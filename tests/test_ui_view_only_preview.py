@@ -391,3 +391,61 @@ def test_a_share_refused_because_the_tag_changed_shows_the_tags_rules_again(page
         admin.delete(f"/share-tags/{tag['id']}")
         admin.delete_vault(vault["id"])
         admin.put("/settings", json={"sharing_enabled": before})
+
+
+def test_a_share_refused_because_the_tag_changed_keeps_the_people_picked(page: Page, admin, admin_creds):
+    """The maker shares with a named person under a tag whose audiences start with "anyone internal", and ticks
+    view-only; an administrator stops the tag allowing view-only before the maker presses Create share. After the
+    refusal the dialog still shares with that person, and pressing Create share again makes the share for them."""
+    before = admin.get("/settings").json().get("sharing_enabled")
+    admin.put("/settings", json={"sharing_enabled": True})
+    vault = admin.create_vault(name=unique("vopeople"))
+    me = admin.get("/users/me").json()["id"]
+    person = admin.create_user(role="user")
+    r = admin.post("/share-tags", json={"name": unique("vopeopletag"), "allowed_user_ids": [me],
+                                         "allowed_audiences": ["anyone_internal", "users"], "allow_custom": True,
+                                         "allow_view_only": True, "default_view_only": False,
+                                         "view_only_preview": True})
+    assert r.status_code == 200, r.text
+    tag = r.json()
+    try:
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.fill("#username", admin_creds["username"])
+        page.fill("#password", admin_creds["password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.locator(f'.vault-card[data-vault-id="{vault["id"]}"] .open-vault-btn').click()
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+        page.click("#share-vault-btn")
+        select = page.locator("#share-tag-select")
+        expect(select.locator(f'option[value="{tag["id"]}"]')).to_have_count(1, timeout=10000)
+        select.select_option(tag["id"])
+        page.select_option("#share-audience-select", "users")
+        page.fill("#share-user-search", person["_username"])
+        page.locator("#share-user-results .pick-row", has_text=person["_username"]).click()
+        expect(page.locator("#share-user-chips")).to_contain_text(person["_username"])
+        page.check("#share-view-only")
+        assert admin.patch(f"/share-tags/{tag['id']}", json={"allow_view_only": False}).status_code == 200
+        with page.expect_response(lambda r: r.url.rstrip("/").endswith("/shares") and r.request.method == "POST") as resp:
+            page.click("#share-create-submit")
+        assert resp.value.status == 409, resp.value.status
+        expect(page.locator("#share-create-error")).to_have_text(
+            "This tag changed while the dialog was open. Check the share's settings and press Create share again.")
+        expect(page.locator("#share-audience-select")).to_have_value("users")
+        expect(page.locator("#share-user-chips")).to_contain_text(person["_username"])
+        expect(page.locator("#share-viewonly-group")).to_be_hidden()
+        with page.expect_response(lambda r: r.url.rstrip("/").endswith("/shares") and r.request.method == "POST") as resp:
+            page.click("#share-create-submit")
+        assert resp.value.ok, resp.value.status
+        sent = resp.value.request.post_data_json
+        assert sent["claim_audience"] == "users" and sent["audience_user_ids"] == [person["id"]], sent
+        assert sent["view_only_shown"] is False, sent
+        made = resp.value.json()
+        assert made["claim_audience"] == "users" and made["view_only"] is False, made
+    finally:
+        admin.delete(f"/share-tags/{tag['id']}")
+        admin.delete_vault(vault["id"])
+        admin.delete_user(person["id"])
+        admin.put("/settings", json={"sharing_enabled": before})

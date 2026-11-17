@@ -4280,19 +4280,36 @@ function setupShareCreateModalOnce() {
 }
 
 // The server refuses a share (409) when the tag changed while the dialog was open and no longer allows what the
-// dialog showed. The dialog then reads the tags again, keeps the one picked so that it shows that tag's rules now,
-// and says so.
+// dialog showed. The dialog then reads the tags again and keeps what the maker picked (the tag, who to share with,
+// the people or departments) wherever the tag still offers it, so that it shows that tag's rules now, and says so.
 const SHARE_TAG_CHANGED = "This tag changed while the dialog was open. Check the share's settings and press Create share again.";
+const SHARE_TAG_GONE = 'That tag is no longer available. Pick a tag and press Create share again.';
+const SHARE_AUDIENCE_GONE = 'This tag no longer allows sharing with the people you picked. Pick who to share with and press Create share again.';
 
+// Returns what the reload found: 'kept' (the tag and who to share with kept, the recipients put back), 'audience'
+// (the tag kept, who to share with no longer offered), 'tag' (the tag no longer offered: the first one is picked),
+// 'none' (sharing off or no tag for this person: populateShareTags has said so) or 'unread' (the tags could not be
+// read: the dialog keeps everything as it was).
 async function _shareReloadPolicyKeepingTag(tagId) {
+    const audSel = document.getElementById('share-audience-select');
+    const audience = audSel.value;
+    const userIds = _shareCreate.userIds.slice();
+    const deptIds = _shareCreate.deptIds.slice();
     try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
-    catch (_) { return; }   // keep the tags already read; the sentence still asks to check them
+    catch (_) { return 'unread'; }
     populateShareTags();
+    const policy = _shareCreate.policy;
+    if (!policy || !policy.sharing_enabled || !(policy.tags || []).length) return 'none';
     const tagSel = document.getElementById('share-tag-select');
-    if (tagSel && Array.from(tagSel.options).some(o => o.value === tagId)) {
-        tagSel.value = tagId;
-        onShareTagChange();
-    }
+    if (!Array.from(tagSel.options).some(o => o.value === tagId)) return 'tag';
+    tagSel.value = tagId;
+    onShareTagChange();                     // the tag's rules now; it empties the recipients
+    if (!Array.from(audSel.options).some(o => o.value === audience)) return 'audience';
+    audSel.value = audience;
+    _shareCreate.userIds = userIds;
+    _shareCreate.deptIds = deptIds;
+    onShareAudienceChange();                // draws the people's chips or the department picker again
+    return 'kept';
 }
 
 async function submitCreateShare() {
@@ -4346,9 +4363,12 @@ async function submitCreateShare() {
         showToast('Share created', 'success');
     } catch (e) {
         if (e && e.status === 409) {
-            await _shareReloadPolicyKeepingTag(t.id);
-            _shareSetError(SHARE_TAG_CHANGED);
-            submitBtn.disabled = false;
+            const found = await _shareReloadPolicyKeepingTag(t.id);
+            if (found !== 'none') {
+                _shareSetError(found === 'tag' ? SHARE_TAG_GONE
+                    : found === 'audience' ? SHARE_AUDIENCE_GONE : SHARE_TAG_CHANGED);
+                submitBtn.disabled = false;
+            }
             return;
         }
         const msg = (e && e.message) || '';
