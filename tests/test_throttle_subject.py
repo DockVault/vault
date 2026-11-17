@@ -471,6 +471,7 @@ def _routes():
          ["publiclink_redeem", "publiclink_redeem_ip"]),
         (A.download_public_link, {"token": "t" * 40, "file_id": "f", "x_download_grant": "g"},
          ["publiclink_download_ip"]),
+        (A.receiver_upload_page_info, {"token": "t" * 40}, ["receiver_page"]),
         (A.open_receiver_upload_session,
          {"token": "t" * 40, "payload": A.ReceiverUploadOpen(filename="a", total_size=1, total_chunks=1)},
          ["receiver_open", "receiver_open_ip"]),
@@ -511,7 +512,9 @@ def test_every_public_route_budget_answers_503_while_the_limiter_cannot_count(mo
         raise RL.RateLimiterUnavailable("down")
 
     monkeypatch.setattr(RL.rate_limiter, "check_rate_limit", _cannot_count)
-    for fn, kwargs, _prefixes in _routes():
+    routes = _routes()
+    assert len(routes) == 13, "every public route with a fail-closed budget (grep fail_open=False in app/)"
+    for fn, kwargs, _prefixes in routes:
         with pytest.raises(HTTPException) as refused:
             run_coroutine(fn(request=_request(PLAIN), db=None, **kwargs))
         assert refused.value.status_code == 503, (fn.__name__, refused.value.status_code, refused.value.detail)
