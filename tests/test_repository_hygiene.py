@@ -223,7 +223,7 @@ def test_the_security_policy_states_the_lines_the_tags_and_the_backport_rule():
     assert "0.33.x and later lines only" not in policy
     assert "until six\nmonths after the next minor release ships" in policy
     assert ("Low\n  findings are fixed in the next regular release, and in the supported previous "
-            "line in the same\n  release window.") in policy
+            "lines in the same\n  release window.") in policy
     assert "`ghcr.io/dockvault/vault:vX.Y.Z`, which never changes" in policy
     assert "tagged `:vX.Y` (for example `:v0.33`)" in policy
     assert "so a patch release of an older line never moves them" in policy
