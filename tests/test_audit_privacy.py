@@ -376,7 +376,9 @@ def test_the_scan_reads_keys_a_conditional_spreads_in_or_nests(tmp_path):
         def route(db, c):
             AuditLogger(db).log_action(action="x", status="success", details={
                 "plain_made_up": 1, **({"when_made_up": 2} if c else {"otherwise_made_up": 3}),
-                "outer_made_up": ({"inner_when_made_up": 4} if c else {"inner_otherwise_made_up": 5})})
+                "outer_made_up": ({"inner_when_made_up": 4} if c else {"inner_otherwise_made_up": 5}),
+                "deep_made_up": ({"a_made_up": 1} if c else ({"b_made_up": 2} if d else {})),
+                **({"spread_a_made_up": 1} if c else ({"spread_b_made_up": 2} if d else {}))})
             details = {"first_made_up": 1}
             details.update(**({"update_when_made_up": 6} if c else {}))
             AuditLogger(db).log_action(action="y", status="success", details=details)
@@ -384,7 +386,8 @@ def test_the_scan_reads_keys_a_conditional_spreads_in_or_nests(tmp_path):
     found = detail_paths({tmp_path / "fake.py": ast.parse(source)}, root=tmp_path)
     assert set(found) == {"plain_made_up", "when_made_up", "otherwise_made_up", "outer_made_up",
                           "outer_made_up.inner_when_made_up", "outer_made_up.inner_otherwise_made_up",
-                          "first_made_up", "update_when_made_up"}
+                          "deep_made_up", "deep_made_up.a_made_up", "deep_made_up.b_made_up",
+                          "spread_a_made_up", "spread_b_made_up", "first_made_up", "update_when_made_up"}
     # The application's own: a share made records whether a view-only share is viewable, spread in on a condition.
     paths = detail_paths(_trees())
     assert any(where.startswith("app/api/api_server.py:") for where in paths["view_only_preview"]), paths.get(

@@ -43,7 +43,6 @@ global.window = { location: { protocol: 'http:', host: 'vault.test' }, dispatchE
 let authToken = 'token';
 let currentUser = null;
 const isScopedTemp = false;
-function handleSocketFrameStub() {}
 """
 
 SCENARIOS = r"""
@@ -53,13 +52,12 @@ function closeCurrent(event) {          // the server closes the current socket
     ws.readyState = FakeSocket.CLOSED;
     if (event === undefined) ws.onclose(); else ws.onclose(event);
 }
-function fire() {                        // the one pending timer runs
+const out = { pending_when_fired: [] };
+function fire() {                        // the pending timer runs; how many were pending is checked in Python
     const due = timers.filter(t => t.live);
-    if (due.length !== 1) throw new Error('expected one pending timer, found ' + due.length);
-    due[0].live = false;
-    due[0].fn();
+    out.pending_when_fired.push(due.length);
+    if (due.length) { due[0].live = false; due[0].fn(); }
 }
-const out = {};
 
 connectAppSocket();
 closeCurrent({ code: 4429 });
@@ -117,6 +115,8 @@ def test_a_refused_socket_waits_a_minute_and_any_other_close_five_seconds():
     # Refused: exactly one timer, a minute away, and navigation opens nothing meanwhile.
     assert out["refused_timers"] == [60000], out
     assert out["ensure_during_wait"] == 0, out
+    # When the minute is up, the one timer pending is that minute's.
+    assert out["pending_when_fired"] == [1], out
     # When the minute is up, one socket is made.
     assert out["after_the_minute"] == 1, out
     # Any other close (or a close with no event) tries again after five seconds.
