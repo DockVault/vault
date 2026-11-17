@@ -17093,7 +17093,9 @@ async def create_share(
             action="share_created", status="success", user=current_user, ip_address=get_client_ip(request),
             details={"share_id": str(share.id), "vault_id": str(vault.id), "target_type": tt,
                      "tag_id": str(tag.id), "claim_audience": payload.claim_audience, "view_only": limits["view_only"],
-                     "view_only_preview": bool(share.view_only_preview)})
+                     # Whether a view-only share's recipients may view its files; a downloadable share's
+                     # recipients may view and download them, whatever its column says, so it is not recorded.
+                     **({"view_only_preview": bool(share.view_only_preview)} if limits["view_only"] else {})})
     except Exception:
         pass  # never fail the create on an audit-write error
     out = _share_dict(db, share)

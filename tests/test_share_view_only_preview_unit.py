@@ -343,7 +343,7 @@ def test_a_share_its_maker_was_shown_as_view_only_is_never_made_downloadable():
     assert ShareCreate(**base).view_only_shown is None
 
 
-def test_the_record_of_a_share_made_says_whether_it_is_viewable():
+def test_the_record_of_a_view_only_share_made_says_whether_it_is_viewable():
     import ast
     from pathlib import Path
     from app.core.audit_privacy import IDENTIFIER, kind_of
@@ -351,6 +351,7 @@ def test_the_record_of_a_share_made_says_whether_it_is_viewable():
     fn = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_share")
     body = ast.unparse(fn)
     record = body[body.index("action='share_created'"):]
-    assert "'view_only_preview': bool(share.view_only_preview)" in record.split("})", 1)[0]
+    assert ("**({'view_only_preview': bool(share.view_only_preview)} if limits['view_only'] else {})"
+            in record.split("\n", 1)[0])   # the call to log_action, which ast.unparse keeps on one line
     # And the audit log keeps it (a detail key it does not know is dropped).
     assert kind_of("view_only_preview") == IDENTIFIER

@@ -230,5 +230,10 @@ def test_a_share_its_maker_was_shown_as_view_only_stays_view_only(admin, sharing
         made = _share(admin, vault, _tag(admin, view_only_preview=False))
         assert _psql("SELECT details->>'view_only_preview' FROM audit_logs WHERE action='share_created' "
                      f"AND details->>'share_id'='{made['_id']}'") == "false"
+        # A downloadable share's record does not say: its recipients may view and download its files.
+        loose = _share(admin, vault, _tag(admin, view_only_preview=False), view_only=False)
+        assert loose["view_only"] is False
+        assert _psql("SELECT (details::jsonb ? 'view_only_preview')::text || ':' || (details->>'view_only') FROM audit_logs "
+                     f"WHERE action='share_created' AND details->>'share_id'='{loose['_id']}'") == "false:false"
     finally:
         admin.delete_vault(vault["id"])
