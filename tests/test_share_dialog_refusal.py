@@ -64,7 +64,12 @@ function _renderGroupPickerInto(hostId, get) { deptPickerDrawn = get().slice(); 
 function openModal() {}
 const toasts = [];            // each toast shown: [sentence, kind]
 function showToast(m, k) { toasts.push([m, k]); }
-async function loadSftpPolicyGroups() {}
+let groupsGate = null;        // a promise the next department-list read waits on
+let groupsAsked = null;       // resolved when the department list is asked for
+async function loadSftpPolicyGroups() {
+    if (groupsAsked) { const a = groupsAsked; groupsAsked = null; a(); }
+    if (groupsGate) { const g = groupsGate; groupsGate = null; await g; }
+}
 const state = { currentVault: { id: 'v1', name: 'V', type: 'standard' } };
 const navigator = { clipboard: { writeText: async () => {} } };
 let policyAnswer = null;      // what GET /share-policy answers next (an Error to fail)
@@ -241,7 +246,8 @@ function people() {
             target: _shareCreate.targetType, link: els['share-link-value'].textContent,
             fieldsShown: els['share-create-fields'].style.display !== 'none',
             resultShown: els['share-create-result'].style.display !== 'none',
-            submitShown: els['share-create-submit'].style.display !== 'none' });
+            submitShown: els['share-create-submit'].style.display !== 'none',
+            tagSelectDisabled: els['share-tag-select'].disabled });
     }
     // An open whose tags come back after a newer open's.
     policyAnswer = { sharing_enabled: true, tags: [tag('Old')] };
@@ -284,6 +290,62 @@ function people() {
     releaseReload();
     await pendingRefusal;
     out.refusal_superseded = { before: beforeRefusal, after: shown() };
+    // The next three are each checked while the newer dialog's own tags are still being read, and after they land.
+    // gated(): a promise to release the next /share-policy read, and one resolved when it is asked for.
+    function gated() {
+        let release; policyGate = new Promise(r => { release = r; });
+        const asked = new Promise(r => { policyAsked = r; });
+        return { release, asked };
+    }
+    // A share refused for another reason (400) after the dialog was opened again.
+    await open([tag('Normal')]);
+    pick('Normal', 'anyone_internal');
+    shareAnswers = [{ status: 400, detail: 'max_downloads exceeds the cap' }];
+    let releaseBad; shareGate = new Promise(r => { releaseBad = r; });
+    const askedBad = new Promise(r => { shareAsked = r; });
+    const pendingBad = submitCreateShare();
+    await askedBad;
+    policyAnswer = { sharing_enabled: true, tags: [tag('Newer')] };
+    const newer1 = gated();
+    const newerOpen1 = openCreateShareModal('file', 'file-two', 'two.txt');
+    await newer1.asked;
+    const pending1 = shown();
+    releaseBad(); await pendingBad;
+    const afterBad = shown();
+    newer1.release(); await newerOpen1;
+    out.refused_superseded = { pending: pending1, after: afterBad, landed: shown() };
+    // A refusal whose second read of the tags fails, after the dialog was opened again.
+    await open([first, tag('Normal')]);
+    people();
+    shareAnswers = [{ status: 409 }];
+    const reread = gated();
+    const pendingReread = submitCreateShare();
+    await reread.asked;
+    const newer2 = gated();
+    const newerOpen2 = openCreateShareModal('file', 'file-three', 'three.txt');
+    await newer2.asked;
+    const pending2 = shown();
+    policyAnswer = new Error('down');
+    reread.release(); await pendingReread;
+    const afterReread = shown();
+    policyAnswer = { sharing_enabled: true, tags: [tag('Newest')] };
+    newer2.release(); await newerOpen2;
+    out.failed_reread_superseded = { pending: pending2, after: afterReread, landed: shown() };
+    // An open that has its tags and waits on the department list when the dialog is opened again.
+    policyAnswer = { sharing_enabled: true, tags: [tag('Old')] };
+    let releaseGroups; groupsGate = new Promise(r => { releaseGroups = r; });
+    const askedGroups = new Promise(r => { groupsAsked = r; });
+    const waiting = openCreateShareModal('file', 'file-four', 'four.txt');
+    await askedGroups;
+    policyAnswer = { sharing_enabled: true, tags: [tag('New')] };
+    const newer3 = gated();
+    const newerOpen3 = openCreateShareModal('folder', 'folder-four', 'reports');
+    await newer3.asked;
+    const pending3 = shown();
+    releaseGroups(); await waiting;
+    const afterGroups = shown();
+    newer3.release(); await newerOpen3;
+    out.groups_superseded = { pending: pending3, after: afterGroups, landed: shown() };
     process.stdout.write(JSON.stringify(out));
 })().catch(e => { console.error(e); process.exit(1); });
 """
@@ -402,3 +464,29 @@ def test_a_refusal_read_again_while_the_dialog_was_opened_again_does_not_reach_t
     before, after = seen["before"], seen["after"]
     assert before["tags"] == ["Fresh"] and before["error"] == "" and before["submitDisabled"] is False, before
     assert after == before, seen
+
+
+def _pending_then_landed(seen, tags):
+    """The newer dialog untouched by the earlier one: the same while its own tags are read and after the earlier
+    answer came, still loading with Create off and nothing said; then showing its own tags, with Create on."""
+    pending, after, landed = seen["pending"], seen["after"], seen["landed"]
+    assert after == pending, seen
+    assert pending["tags"] == ["Loading…"] and pending["tagSelectDisabled"] is True, pending
+    assert pending["submitDisabled"] is True and pending["error"] == "", pending
+    assert landed["tags"] == tags and landed["policyTags"] == tags, landed
+    assert landed["error"] == "" and landed["submitDisabled"] is False and not landed["resultShown"], landed
+
+
+def test_a_refusal_for_another_reason_does_not_reach_a_dialog_opened_again(out):
+    _pending_then_landed(out["refused_superseded"], ["Newer"])
+
+
+def test_a_refusal_whose_second_read_fails_does_not_reach_a_dialog_opened_again(out):
+    _pending_then_landed(out["failed_reread_superseded"], ["Newest"])
+
+
+def test_an_open_waiting_on_the_department_list_does_not_reach_a_dialog_opened_again(out):
+    seen = out["groups_superseded"]
+    _pending_then_landed(seen, ["New"])
+    for name in ("pending", "after", "landed"):
+        assert "Old" not in seen[name]["tags"] and "Old" not in seen[name]["policyTags"], (name, seen[name])
