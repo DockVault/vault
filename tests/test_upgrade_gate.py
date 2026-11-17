@@ -1496,6 +1496,19 @@ def test_a_release_this_checkout_marks_end_of_life_is_never_named_the_newest_of_
     out = capsys.readouterr().out
     assert "newest on line  : v0.33.2 (fixes 1 known vulnerability in 0.33.1)" in out, out
     assert "    v0.33.2   <- newest of your line" in out, out
+    # The filter reads this checkout's matrix, as the list and the refusal do, not the copy merged with main's: a
+    # release only main's copy marks end-of-life is still named, listed and a place to move to.
+    bundled = _with_032_end_of_life()
+    for v in ("0.32.3", "0.32.6"):
+        bundled["versions"][v]["support"]["eol"] = False
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.32.3", bundled=bundled,
+                             main=_with_032_end_of_life(), tags=tags)
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "newest on line  : v0.32.6" in out, out
+    assert "    v0.32.6   <- newest of your line" in out, out
+    _update(tool, tag="v0.32.6", dry_run=True)
+    assert "is end-of-life and cannot be upgraded" not in capsys.readouterr().out
 
 
 def _row(out, tag):
