@@ -119,6 +119,11 @@ LIFTED = "\n".join([
     _block("function viaShareNoPreview(vault) {", "\n}\n"),
     _block("const PREVIEW_NOT_SHARED =", ";\n"),
     _block("async function _previewRefusal(resp) {", "\n}\n"),
+    # What a preview can show of a type, and what it says of a file it shows nothing of.
+    _block("function viaShareViewOnly(vault) {", "\n}\n"),
+    _block("function _previewSaveHint(withDownload) {", "\n}\n"),
+    _block("function _previewKinds(type, ext) {", "\n}\n"),
+    _block("function _renderNoInlinePreview(bodyEl) {", "\n}\n"),
     PREVIEW,
     CLOSE,
 ])
@@ -155,6 +160,7 @@ function _renderPdfNotInline() { branch = 'pdf-not-inline'; }
 async function _renderTextWindow() { branch = 'text-window'; }
 function _buildRenderablePreview() { branch = 'renderable'; return new El('div'); }
 const buildZoomControls = () => ({ el: new El('div') }), setupImageZoom = () => {}, iconSvg = () => '';
+const _svgIcon = () => new El('svg');
 const isCodedCryptoError = () => false, safeMessageForCode = () => '', downloadFile = () => {};
 const failures = [];
 console.error = (...a) => failures.push(a.map(String).join(' '));
@@ -321,3 +327,79 @@ def test_a_names_only_claim_asks_for_nothing_and_a_refusal_shows_the_servers_own
                                  "again if you need to view the files.")], out
     assert out["download"] == "none", out
     assert out["refused"]["fetched"] == 1 and out["refused"]["text"] == ["the server said no"], out
+
+
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+NO_DOWNLOADS = "This share does not include downloads; ask the person who shared it for a copy."
+
+
+def test_with_no_download_button_a_type_shown_nothing_of_is_not_fetched():
+    """A view-only share's recipient opening a file the preview shows nothing of: said so without fetching it, so
+    no preview is spent, and in words that do not point at a Download button they do not have."""
+    out = _walk(
+        "const b = Buffer.from('PK'), o = {};\n"
+        "const texts = (el) => [el.textContent, ...(el.children || []).flatMap(texts)].filter(Boolean);\n"
+        f"const DOCX = {json.dumps(DOCX)};\n"
+        "state.currentVault.via_share = { view_only: true, preview: true };\n"
+        "o.refused = await run('report.docx', DOCX, 4, false, b, false); o.refused.text = texts(bodyEl);\n"
+        "o.refusedZk = await run('report.docx', DOCX, 4, true, b, false);\n"
+        "o.refusedUntyped = await run('report.docx', '', 4, false, b, false); o.refusedUntyped.text = texts(bodyEl);\n"
+        "o.refusedImage = await run('a.png', 'image/png', 1, false, Buffer.from('x'), false);\n"
+        "state.currentVault.via_share = null;\n"
+        "o.scoped = await run('report.docx', DOCX, 4, false, b, false); o.scoped.text = texts(bodyEl);\n"
+        "o.allowed = await run('report.docx', DOCX, 4, false, b, true); o.allowed.text = texts(bodyEl);\n"
+        "process.stdout.write(JSON.stringify(o));")
+    # Nothing fetched, nothing spent, and a true sentence.
+    for key in ("refused", "refusedZk", "scoped"):
+        assert out[key]["fetched"] == 0 and not out[key]["failures"], out[key]
+    assert out["refused"]["text"] == ["No inline preview for this file type.", NO_DOWNLOADS], out["refused"]
+    assert out["scoped"]["text"] == ["No inline preview for this file type.", "This sign-in cannot download files."]
+    # With no stored type the server's answer decides, so it is fetched; the page then says the same.
+    assert out["refusedUntyped"]["fetched"] == 1, out["refusedUntyped"]
+    assert out["refusedUntyped"]["text"] == ["No inline preview for this file type.", NO_DOWNLOADS]
+    # A type the preview shows is fetched as before.
+    assert out["refusedImage"]["fetched"] == 1 and out["refusedImage"]["minted"] == ["image/png"]
+    # With the Download button nothing changes: fetched (and recorded) as before, pointing at Download.
+    assert out["allowed"]["fetched"] == 1
+    assert out["allowed"]["text"] == ["No inline preview for this file type.", "Use Download to save it."]
+
+
+def test_the_too_large_and_pdf_notes_point_at_download_only_when_there_is_one():
+    page = r"""
+class El { constructor(t) { this.tagName = t; this.children = []; this.textContent = ''; this.className = ''; }
+  append(...c) { this.children.push(...c); } replaceChildren(...c) { this.children = c; } }
+global.document = { createElement: (t) => new El(t) };
+const _svgIcon = () => new El('svg');
+const formatBytes = (n) => n + ' B';
+let canDownload = true;
+const vaultCapAllowed = (cap) => cap !== 'file.download' || canDownload;
+const state = { currentVault: {} };
+"""
+    lifted = "\n".join([
+        _block("function viaShareViewOnly(vault) {", "\n}\n"),
+        _block("function _previewSaveHint(withDownload) {", "\n}\n"),
+        _block("function _renderNoInlinePreview(bodyEl) {", "\n}\n"),
+        _block("function _renderPreviewTooLarge(bodyEl, fsize) {", "\n}\n"),
+        _block("function _renderPdfNotInline(bodyEl) {", "\n}\n"),
+    ])
+    script = r"""
+const texts = (el) => [el.textContent, ...(el.children || []).flatMap(texts)].filter(Boolean);
+const out = {};
+for (const [who, download, via] of [['downloader', true, null], ['recipient', false, { view_only: true }],
+                                      ['scoped', false, null]]) {
+    canDownload = download; state.currentVault.via_share = via;
+    const row = {};
+    for (const [name, draw] of [['large', (b) => _renderPreviewTooLarge(b, 5)], ['pdf', _renderPdfNotInline],
+                                ['none', _renderNoInlinePreview]]) {
+        const body = new El('div'); draw(body); row[name] = texts(body).slice(-1)[0];
+    }
+    out[who] = row;
+}
+process.stdout.write(JSON.stringify(out));
+"""
+    out = _node(page + lifted + script)
+    assert out["downloader"] == {"large": "Use Download to save it, then open it locally.",
+                                 "pdf": "Use Download to open it in your PDF app.",
+                                 "none": "Use Download to save it."}, out
+    assert out["recipient"] == {k: NO_DOWNLOADS for k in ("large", "pdf", "none")}, out
+    assert out["scoped"] == {k: "This sign-in cannot download files." for k in ("large", "pdf", "none")}, out

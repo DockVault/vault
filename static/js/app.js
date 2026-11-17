@@ -16779,6 +16779,41 @@ const WINDOWABLE_TEXT_EXTS = new Set([
     'kt', 'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'sql', 'diff', 'patch', 'srt', 'vtt',
 ]);
 
+// Where a preview would point at Download and there is no Download button (a view-only share's recipient, or a
+// sign-in without the download right), it says what is true instead.
+function _previewSaveHint(withDownload) {
+    if (vaultCapAllowed('file.download')) return withDownload;
+    return viaShareViewOnly()
+        ? 'This share does not include downloads; ask the person who shared it for a copy.'
+        : 'This sign-in cannot download files.';
+}
+
+// What a preview can show of a file, from its type and name. The preview decides by these after the fetch, and,
+// for a person with no Download button, before it when the file's type is stored (see openFilePreview).
+function _previewKinds(type, ext) {
+    return {
+        isImg: type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext),
+        isPdf: type.includes('pdf') || ext === 'pdf',
+        isVideo: type.startsWith('video/') || ['mp4', 'webm', 'mov'].includes(ext),
+        isAudio: type.startsWith('audio/') || ['mp3', 'wav', 'flac'].includes(ext),
+        isText: type.startsWith('text/') || ['txt', 'md', 'json', 'csv', 'log', 'xml', 'yml', 'yaml', 'js', 'css', 'html', 'py', 'sh', 'ini'].includes(ext),
+    };
+}
+
+// A file of a type the preview shows nothing of.
+function _renderNoInlinePreview(bodyEl) {
+    const wrap = document.createElement('div');
+    wrap.className = 'preview-none text-center text-secondary p-xl';
+    const p1 = document.createElement('p');
+    p1.className = 'mt-sm';
+    p1.textContent = 'No inline preview for this file type.';
+    const p2 = document.createElement('p');
+    p2.className = 'text-sm';
+    p2.textContent = _previewSaveHint('Use Download to save it.');
+    wrap.append(_svgIcon('file', 'icon-lg'), p1, p2);
+    bodyEl.replaceChildren(wrap);
+}
+
 // Bounded "too large to preview inline" placeholder (no body is fetched at all).
 function _renderPreviewTooLarge(bodyEl, fsize) {
     const wrap = document.createElement('div');
@@ -16787,7 +16822,7 @@ function _renderPreviewTooLarge(bodyEl, fsize) {
     p1.textContent = `This file is ${formatBytes ? formatBytes(fsize) : fsize + ' bytes'} — too large to preview inline.`;
     const p2 = document.createElement('p');
     p2.className = 'text-sm';
-    p2.textContent = 'Use Download to save it, then open it locally.';
+    p2.textContent = _previewSaveHint('Use Download to save it, then open it locally.');
     wrap.append(p1, p2);
     bodyEl.replaceChildren(wrap);
 }
@@ -16801,7 +16836,7 @@ function _renderPdfNotInline(bodyEl) {
     p1.textContent = "This browser can't show PDFs inside the page.";
     const p2 = document.createElement('p');
     p2.className = 'text-sm';
-    p2.textContent = 'Use Download to open it in your PDF app.';
+    p2.textContent = _previewSaveHint('Use Download to open it in your PDF app.');
     wrap.append(p1, p2);
     bodyEl.replaceChildren(wrap);
 }
@@ -16974,6 +17009,16 @@ async function openFilePreview(fileId, fileName, mime) {
             _renderPdfNotInline(bodyEl);
             return;
         }
+        // Nothing of this type would be shown, and there is no Download button: say so without fetching it, so no
+        // preview is spent on it. Decided by the rules the page applies after the fetch, from the stored type (which
+        // the page goes by then too); with no stored type, the type the server answers with decides, after the fetch.
+        if (_mt0 && !vaultCapAllowed('file.download')) {
+            const k = _previewKinds(_mt0, _ext0);
+            if (!(k.isText || k.isImg || k.isPdf || k.isVideo || k.isAudio)) {
+                _renderNoInlinePreview(bodyEl);
+                return;
+            }
+        }
         const _isTextish = _mt0.startsWith('text/') || WINDOWABLE_TEXT_EXTS.has(_ext0);
         if (_isTextish && _fsize > TEXT_PREVIEW_WINDOW_BYTES && !isZkVault(state.currentVault)) {
             await _renderTextWindow(bodyEl, fileId, fileName, _fsize, headers);
@@ -16998,11 +17043,7 @@ async function openFilePreview(fileId, fileName, mime) {
         if (_previewUrl) { URL.revokeObjectURL(_previewUrl); _previewUrl = null; }
         const type = (mime || blob.type || '').toLowerCase();
         const ext = (fileName.split('.').pop() || '').toLowerCase();
-        const isImg = type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext);
-        const isPdf = type.includes('pdf') || ext === 'pdf';
-        const isVideo = type.startsWith('video/') || ['mp4', 'webm', 'mov'].includes(ext);
-        const isAudio = type.startsWith('audio/') || ['mp3', 'wav', 'flac'].includes(ext);
-        const isText = type.startsWith('text/') || ['txt', 'md', 'json', 'csv', 'log', 'xml', 'yml', 'yaml', 'js', 'css', 'html', 'py', 'sh', 'ini'].includes(ext);
+        const { isImg, isPdf, isVideo, isAudio, isText } = _previewKinds(type, ext);
         // The stored MIME is whatever the uploader's browser sent, and a blob: address opened as a
         // page of its own runs with this origin and none of the page's CSP. So no branch below
         // ever mints an object URL under the stored type: each re-mints under a type that cannot
@@ -17072,10 +17113,7 @@ async function openFilePreview(fileId, fileName, mime) {
             else { el.controls = true; el.style.width = '100%'; }
             bodyEl.replaceChildren(el);
         } else {
-            const wrap = document.createElement('div');
-            wrap.className = 'preview-none text-center text-secondary p-xl';
-            wrap.innerHTML = `${iconSvg('file', 'icon-lg')}<p class="mt-sm">No inline preview for this file type.</p><p class="text-sm">Use Download to save it.</p>`;
-            bodyEl.replaceChildren(wrap);
+            _renderNoInlinePreview(bodyEl);
         }
     } catch (e) {
         // Built as DOM rather than assigned as markup, and the text is chosen from the contract's
