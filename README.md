@@ -573,7 +573,7 @@ start the deployment and run `update` again, so that it can ask. A setup re-run 
 older version either (pulling the release of an older checkout's `VERSION`, or building it): it stops,
 before anything changes, and names the `update --tag` command to use instead.
 
-### Support lifecycle and the minimum supported version
+### Support lifecycle and end-of-life
 
 Each version in the matrix also declares a support lifecycle: whether it is **end-of-life**, whether
 it is **secure** (free of known unpatched vulnerabilities), and — for an end-of-life version kept on
@@ -584,16 +584,17 @@ called supported only while its line still receives security fixes, as `.github/
 support; one on a line that does not says so.
 
 End-of-life is not the end of security support. It marks the releases an install can no longer move
-to or from in place (see the minimum supported version below). Which release lines still receive
-security fixes, and until when, is stated in [`.github/SECURITY.md`](.github/SECURITY.md): each line
-from 0.33 on is supported until six months after the next minor release ships. The matrix states the
-same in its top-level `lines` map: each line from 0.33 on with the day its security fixes end
-(`security_fixes_until`), null for the newest line, whose end is not known until the next minor
-release ships. The validator checks each date against that promise, and requires a mitigation on an
-advisory that leaves the newest release of a line affected while the line is supported. A release
-outside that period is not marked end-of-life, so a move within its line, or back to it, still works; it is
-marked not secure as soon as an advisory affects it. How a fix reaches an older line that is still
-supported is described in [`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
+to in place; an install on one can still upgrade to a supported release (see below). Which release
+lines still receive security fixes, and until when, is stated in
+[`.github/SECURITY.md`](.github/SECURITY.md): each line from 0.33 on is supported until six months
+after the next minor release ships. The matrix states the same in its top-level `lines` map: each
+line from 0.33 on with the day its security fixes end (`security_fixes_until`), null for the newest
+line, whose end is not known until the next minor release ships. The validator checks each date
+against that promise, and requires a mitigation on an advisory that leaves the newest release of a
+line affected while the line is supported. A release of a line from 0.33 on whose period has ended
+is not marked end-of-life by that alone, so a move within its line, or back to it, still works; it
+is marked not secure as soon as an advisory affects it. How a fix reaches an older line that is
+still supported is described in [`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
 
 When a version is not secure, the matrix says why. Each vulnerability is recorded once, in the
 top-level `advisories`: a title and description, its **impact** (what it let someone do), its
@@ -606,9 +607,9 @@ that apply to it, and each entry names the fix for that version's own line. **A 
 affected by even one advisory, of any severity, is not secure.** Each entry in that list repeats its
 advisory's title and `fixed_in`, which is all that `dockvault.py` and the in-app check read before
 0.33.0; from 0.33.0 they also accept an entry that carries only the advisory's id and take the rest
-from `advisories`. Below 0.27.0 an entry may carry only the id, which keeps the file small. From
-0.27.0 on the validator requires the repeated fields, because the `dockvault.py` of 0.30.0 to 0.32.x
-lists the newest releases from them.
+from `advisories`. Below 0.32.6 an entry may carry only the id, which keeps the file small. From
+0.32.6 on the validator requires the repeated fields, because the `dockvault.py` of 0.30.0 to 0.32.x
+lists the newest releases from them; that boundary moves up as releases are added.
 
 The validator recomputes every vector's score and refuses a severity that does not match it, requires
 an advisory to be listed on every release from the first it affects up to its fix, and refuses a
@@ -629,12 +630,14 @@ The file has three readers: `dockvault.py`, the running app's update check, and 
 at vault.dockvault.io, which fetches the copy on `main` and refuses a `schema_version` it does not
 know. A change to `schema_version` has to reach that site before it reaches `main`.
 
-**0.17.0 is the minimum supported version.** It seals vault names, descriptions and file checksums at
-rest in columns an older image cannot read, so there is no in-place upgrade into it from 0.16.1 and no
-in-place downgrade off it — an older image fails closed rather than serving something wrong. Reach
-0.17.0 by deploying it as a fresh set and restoring your data from a backup, not by upgrading over the
-existing volumes; `dockvault.py update` refuses the in-place move and says so. Every release below
-0.17.0 is end-of-life.
+**Releases before 0.33.0 are end-of-life from 0.35.0.** From a 0.35.0 checkout `dockvault.py update`
+no longer offers them; an install on one upgrades in place to a supported release. Below 0.17.0 there is no in-place
+route: 0.17.0 seals vault names, descriptions and file checksums at rest in columns an older image
+cannot read, so there is no in-place upgrade into it from 0.16.1 and no in-place downgrade off it — an
+older image fails closed rather than serving something wrong. An install older than 0.17.0 reaches
+0.17.0 by deploying it as a fresh set and restoring its data from a backup, not by upgrading over the
+existing volumes (`dockvault.py update` refuses the in-place move and says so), and upgrades from
+there.
 
 ## Data volumes
 
