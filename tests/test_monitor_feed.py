@@ -360,40 +360,17 @@ def test_the_socket_closes_at_its_tokens_end():
     assert end < send_events.index("checked_at >= 5")
 
 
-class _Rows:
-    """A database session that answers the re-check's two queries: the session row, then the account."""
-
-    def __init__(self, session_row, account):
-        self._answers = [session_row, account]
-
-    def query(self, *a, **k):
-        return self
-
-    def filter(self, *a, **k):
-        return self
-
-    def first(self):
-        return self._answers.pop(0)
-
-    def close(self):
-        pass
-
-
-@pytest.mark.parametrize("revoked, is_active, temporary, ends", [
-    (True, False, False, True),    # revoked and inactive
-    (False, True, False, False),   # a session in force
-    (True, True, False, True),     # revoked
-    (False, False, False, False),  # a regular session's row inactive, not revoked: superseded or idle, still valid
-    (False, False, True, True),    # a temporary credential invalidated
-])
-def test_the_re_check_ends_a_session_as_requests_are_ended(monkeypatch, revoked, is_active, temporary, ends):
+@pytest.mark.parametrize("temporary", [False, True])
+def test_the_re_check_keeps_the_socket_when_the_database_cannot_be_asked(monkeypatch, temporary):
+    # Which sessions the re-check ends is held to get_current_user's refusals, case by case, on real tables, in
+    # tests/test_live_session.py. A database it cannot ask keeps the socket open, so a blip does not drop every
+    # live socket at once; the next check asks again.
     import uuid
-    from types import SimpleNamespace
     from app.api import api_server
     from app.core import database
-    from app.services import auth_service
-    account = SimpleNamespace(is_active=True)
-    monkeypatch.setattr(auth_service, "is_token_denylisted", lambda token: False)
-    monkeypatch.setattr(auth_service, "admin_locked", lambda user: False)
-    monkeypatch.setattr(database, "SessionLocal", lambda: _Rows((revoked, is_active), account))
-    assert api_server._ws_session_invalid("tok", str(uuid.uuid4()), temporary) is ends
+
+    def _cannot_ask():
+        raise RuntimeError("the database cannot be reached")
+
+    monkeypatch.setattr(database, "SessionLocal", _cannot_ask)
+    assert api_server._ws_session_invalid("tok", str(uuid.uuid4()), temporary) is False

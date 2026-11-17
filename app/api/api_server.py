@@ -10067,42 +10067,27 @@ async def storage_stats(
 # ==============================================================================
 
 def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) -> bool:
-    """Re-check, on a LIVE /ws/monitor socket, whether the session has since been revoked, so the
-    socket can be closed promptly (the handshake only validates at CONNECT). Covers logout, admin
-    terminate-sessions, account lock/deactivate, and temp-credential invalidation -- all of which
-    either denylist the token or flip the session/account state. Returns True when the socket should
-    be torn down. Fails OPEN (returns False) on a transient error so a DB blip can't drop every live
-    socket at once; the next cycle re-checks."""
+    """Re-check, on a LIVE /ws/monitor socket, whether the session still stands, so the socket can be
+    closed promptly (the handshake only validates at CONNECT). Returns True when the socket should be torn
+    down: for exactly the sessions get_current_user refuses (app/core/live_session.py makes its checks), so
+    a logout, an ended or revoked session, a locked or deactivated account, and a temporary credential that
+    was switched off, finished, went idle past its grace or ran out (its validity window or its hard expiry)
+    each close it. A regular session's row can be inactive while the session is valid (superseded by
+    another sign-in, or idle): as for every other request, only `revoked` ends it, and the token's own end
+    (the handler's exp check) ends the socket. Fails OPEN (returns False) on a transient error so a DB blip
+    can't drop every live socket at once; the next cycle re-checks."""
     try:
         from app.core.database import SessionLocal
-        from app.services.auth_service import is_token_denylisted, admin_locked
-        from app.core.models import ActiveSession as _AS, User as _U
-        if is_token_denylisted(session_token):
-            return True
+        from app.core.live_session import session_is_live
         db = SessionLocal()
         try:
-            row = db.query(_AS.revoked, _AS.is_active).filter(
-                _AS.session_token == hash_session_token(session_token)).first()
-            if row is None:
-                return True  # session row gone -> treat as terminated
-            revoked, is_active = row
-            if revoked:
-                return True
-            # A temporary credential's session that is no longer active (_revoke_sessions) ends it as a revoked one
-            # does. A regular session's row can be inactive while the session is valid (superseded by another
-            # sign-in, or idle): as for every other request, only `revoked` ends it.
-            if is_temporary and not is_active:
-                return True
-            u = db.query(_U).filter(_U.id == uuid.UUID(user_id)).first()
-            # Only an administrator's lock ends a live session; an automatic one never does.
-            if not u or not u.is_active or admin_locked(u):
-                return True
+            return not session_is_live(db, {"sub": user_id, "session_token": session_token,
+                                            "is_temporary": bool(is_temporary)})
         finally:
             db.close()
     except Exception as e:
         print(f"[WS] periodic session re-check error (ignored): {e}")
         return False
-    return False
 
 
 def _ws_sees_activity(user_id: str, is_temporary: bool) -> bool:
@@ -10327,8 +10312,9 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         # Subscribe to the Redis channels. Every call on the subscription goes through the feed, one at a time,
         # and its own client (app/core/monitor_feed.py). A temporary credential's socket receives no frame of
         # either channel (socket_frames.frame_for), so it subscribes to nothing and holds no connection. It answers
-        # keep-alives and closes when its session is revoked or no longer active, its account is locked, or its
-        # token ends.
+        # keep-alives and closes when its session ends as get_current_user would end it (revoked or no longer
+        # active, idle past its grace, its credential switched off, finished or run out, its account locked), or
+        # when its token ends.
         if not is_temporary:
             feed = MonitorFeed(monitor_redis_client(), _socket_frames.CHANNELS)
             await asyncio.get_event_loop().run_in_executor(None, feed.subscribe)

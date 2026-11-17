@@ -240,6 +240,32 @@ def test_the_check_agrees_with_get_current_user(db, name):
     assert _web_door_admits(db, claims) is expected, f"the case no longer says what get_current_user does: {name}"
 
 
+class _Borrowed:
+    """The test's database session, lent to code that closes the sessions it opens."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_the_live_sockets_check_every_five_seconds_ends_what_get_current_user_refuses(db, monkeypatch, name):
+    """An open live socket asks every five seconds whether its session still stands (_ws_session_invalid), and closes
+    when it does not: for every session get_current_user refuses, and for none it admits. A temporary credential's
+    session that ran out (its validity window or its hard expiry), finished, went idle past its grace, or whose
+    credential was switched off or deleted, ended its requests but not its open socket."""
+    from app.core import database
+    claims, expected = CASES[name](db)
+    monkeypatch.setattr(database, "SessionLocal", lambda: _Borrowed(db))
+    ended = S._ws_session_invalid(claims["session_token"], claims["sub"], claims["is_temporary"])
+    assert ended is (not expected), name
+
+
 def test_every_case_takes_its_times_when_it_runs(db, monkeypatch):
     """A lane can reach these cases more than an hour after this module is imported, on a slow or busy runner.
     A time read once, at import, then put a signed-in temporary credential's last activity past its idle grace,
