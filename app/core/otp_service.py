@@ -147,14 +147,24 @@ def _redis_put(redis, purpose, user_id, *, code_hash, destination, expires_at, i
         return False
 
 
+# Every field _redis_put writes. A reply without all of them is not a stored code.
+_CODE_FIELDS = frozenset({"code_hash", "destination", "attempts", "max_attempts", "expires_at", "issued_at"})
+
+
 def _redis_load(redis, purpose, user_id):
     """Return the parsed Redis candidate dict (with int issued_at/expires_at/max_attempts) or None.
-    None means the key is absent OR Redis is unreachable — verify uses issued_at to pick the winner."""
+    None means the key is absent OR Redis is unreachable — verify uses issued_at to pick the winner.
+
+    A reply that is not a map with every field of a stored code (another command's reply, read through a
+    connection whose replies are out of step) is unreadable too, and is left alone: read as a code, its missing
+    expiry would call the real code expired and delete it."""
     try:
         data = redis_guard.timed_redis("otp._redis_load", lambda: redis.hgetall(redis_key(purpose, user_id)))
     except Exception:
         return None
     if not data:
+        return None
+    if not isinstance(data, dict) or not _CODE_FIELDS.issubset(data):
         return None
     try:
         return {

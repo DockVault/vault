@@ -184,6 +184,40 @@ def test_expired_redis_code_does_not_verify():
     assert o.verify(db, purpose="email_change", user_id="u5", code=code, pepper=PEP, redis=r).reason == "expired"
 
 
+class _MixedUpRedis(FakeRedis):
+    """A Redis whose next HGETALL answers with another command's reply, as a connection whose replies are out of
+    step would: a map without a code's fields (what HELLO answers), or something that is no map at all."""
+
+    def __init__(self, replies):
+        super().__init__()
+        self.replies = list(replies)
+
+    def hgetall(self, k):
+        if self.replies:
+            self._guard()
+            return self.replies.pop(0)
+        return super().hgetall(k)
+
+
+@pytest.mark.parametrize("reply", [
+    {"server": "redis", "version": "7.4.1", "proto": "3", "id": "12", "mode": "standalone", "role": "master"},
+    {"code_hash": "0" * 64},      # some of a code's fields, not all of them
+    "OK",
+    1,                            # an integer reply (EXISTS, DEL)
+    ["subscribe", "monitor", 1],
+])
+def test_a_reply_that_is_not_a_codes_map_is_refused_and_the_code_kept(reply):
+    """A map without every field a stored code has is not read as a code: read as one, its expiry was 0, so the
+    real code was called expired and deleted. It is refused as unreadable, the code stays, and the next read
+    verifies it."""
+    r, db = _MixedUpRedis([reply]), FakeDB()
+    code = o.issue(db, purpose="email_change", user_id="u6", destination="d", ttl_minutes=5, pepper=PEP, redis=r)
+    first = o.verify(db, purpose="email_change", user_id="u6", code=code, pepper=PEP, redis=r)
+    assert not first.ok and first.reason == "not_found", first.reason
+    assert o.redis_key("email_change", "u6") in r.h, "the stored code was deleted"
+    assert o.verify(db, purpose="email_change", user_id="u6", code=code, pepper=PEP, redis=r).ok
+
+
 # ---- DB fallback path (Redis down at issue) ------------------------------------------------------
 def test_issue_falls_back_to_db_when_redis_is_down():
     down, db = FakeRedis(down=True), FakeDB()
