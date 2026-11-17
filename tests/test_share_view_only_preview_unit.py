@@ -314,3 +314,34 @@ def test_a_share_copies_its_tags_switch_unless_its_maker_was_told_otherwise():
             "claim_audience": "anyone_internal"}
     assert ShareCreate(**base).view_only_preview_shown is None
     assert ShareCreate(**base, view_only_preview_shown=False).view_only_preview_shown is False
+
+
+def test_a_share_its_maker_was_shown_as_view_only_is_never_made_downloadable():
+    import ast
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_share")
+    body = ast.unparse(fn)
+    narrowed = "if payload.view_only_shown is True:\n        limits['view_only'] = True"
+    assert narrowed in body
+    # After the tag's limits are resolved, and before the share is made from them.
+    assert body.index("sharing_policy.resolve_share_limits(") < body.index(narrowed) < body.index("share = Share(")
+    # Only ever narrowed: nothing sets view_only to False from what the maker was shown.
+    assert "view_only_shown is False" not in body and "limits['view_only'] = False" not in body
+    from app.api.api_server import ShareCreate
+    base = {"vault_id": str(uuid.uuid4()), "tag_id": str(uuid.uuid4()), "target_type": "vault",
+            "claim_audience": "anyone_internal"}
+    assert ShareCreate(**base).view_only_shown is None
+
+
+def test_the_record_of_a_share_made_says_whether_it_is_viewable():
+    import ast
+    from pathlib import Path
+    from app.core.audit_privacy import IDENTIFIER, kind_of
+    src = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_share")
+    body = ast.unparse(fn)
+    record = body[body.index("action='share_created'"):]
+    assert "'view_only_preview': bool(share.view_only_preview)" in record.split("})", 1)[0]
+    # And the audit log keeps it (a detail key it does not know is dropped).
+    assert kind_of("view_only_preview") == IDENTIFIER

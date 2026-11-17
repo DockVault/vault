@@ -79,3 +79,14 @@ def test_every_place_a_view_only_share_is_named_says_what_it_gives():
     assert "and nothing more." not in js.split("function _shareViewOnlyLabel", 1)[1].split("\n}\n", 1)[0]
     assert js.count('title="${_fileOpenTitle()}"') == 2 and 'title="Click to preview"' not in js
     assert "viaShareNoPreview() ? `About file ${item.name}` : `Preview file ${item.name}`" in js
+
+
+def test_no_comment_says_every_view_only_recipient_previews():
+    """The preview is open to a view-only recipient only when the share lets view-only recipients view files."""
+    js = _read("static/js/app.js")
+    assert "may preview and nothing more" not in js
+    assert "open to a view-only\n    // share's recipient; otherwise" not in js
+    assert "open to a view-only\n        // share's recipient; otherwise" not in js
+    assert "share's recipient when the share lets view-only recipients view files" in js
+    for rel in ("app/core/models.py", "app/api/api_server.py"):
+        assert "off when its maker was told names and sizes" in _read(rel), rel

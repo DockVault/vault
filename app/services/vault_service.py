@@ -520,8 +520,9 @@ def require_download_scope(db, user, vault_id, file_id) -> None:
         raise PermissionDeniedError("This share is view-only; downloading is not permitted.")
 
 
-# Said to the recipient of a view-only share that does not let its recipients view files: every share made
-# before that choice existed, whose maker was told a view-only recipient cannot open the files.
+# Said to the recipient of a view-only share that does not let its recipients view files: one made under a tag
+# that does not allow it, one whose maker was told names and sizes, and every share made before that choice
+# existed (its maker was told a view-only recipient cannot open the files).
 PREVIEW_NOT_SHARED = ("This share shows names and sizes only; ask the person who shared it to share it again "
                       "if you need to view the files.")
 

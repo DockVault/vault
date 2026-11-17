@@ -203,3 +203,21 @@ def test_the_upgrade_gave_both_columns_a_default_off():
     out = _psql("SELECT table_name || ':' || column_default || ':' || is_nullable FROM information_schema.columns "
                 "WHERE column_name='view_only_preview' AND table_name IN ('shares', 'share_tags') ORDER BY 1")
     assert out.splitlines() == ["share_tags:false:NO", "shares:false:NO"], out
+
+
+def test_a_share_its_maker_was_shown_as_view_only_stays_view_only(admin, sharing):
+    # The dialog read a tag that forced view-only; an administrator stopped forcing it before the share was made.
+    # What the maker was shown wins, and it only ever narrows.
+    vault = admin.create_vault(name=unique("voshown"))
+    try:
+        free = _tag(admin, allow_custom=False, default_view_only=False, force_view_only=False)
+        assert _share(admin, vault, free, view_only=None, view_only_shown=True)["view_only"] is True
+        assert _share(admin, vault, free, view_only=None)["view_only"] is False
+        forced = _tag(admin, force_view_only=True)
+        assert _share(admin, vault, forced, view_only=None, view_only_shown=False)["view_only"] is True
+        # The record of the share made says whether it is viewable.
+        made = _share(admin, vault, _tag(admin, view_only_preview=False))
+        assert _psql("SELECT details->>'view_only_preview' FROM audit_logs WHERE action='share_created' "
+                     f"AND details->>'share_id'='{made['_id']}'") == "false"
+    finally:
+        admin.delete_vault(vault["id"])

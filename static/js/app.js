@@ -372,14 +372,16 @@ function viaShareViewOnly(vault) {
 }
 
 // True when no claim the open vault was reached through lets its recipient view files in the browser: view-only
-// shares made under a tag that does not allow it (every share made before that choice existed).
+// shares made under a tag that does not allow it, or whose maker was told names and sizes, and every share made
+// before that choice existed.
 function viaShareNoPreview(vault) {
     const v = vault || state.currentVault;
     return !!(v && v.via_share && v.via_share.preview === false);
 }
 
 // What opening a file in the list does, said on its name: a preview, or (for a recipient who may not view files)
-// why there is none.
+// why there is none. Decided for the whole vault (via_share.preview): a recipient who may view some files and not
+// others is offered the preview on each, and the server refuses the others with its own sentence.
 function _fileOpenTitle() {
     return viaShareNoPreview() ? 'Names and sizes only: this share does not let you view the file' : 'Click to preview';
 }
@@ -4298,11 +4300,12 @@ async function submitCreateShare() {
     // view_only is only honored server-side when the tag allows customization (else the tag default
     // is forced); only send it then, matching the UI's read-only state for non-custom tags.
     if (t.allow_view_only && t.allow_custom) payload.view_only = document.getElementById('share-view-only').checked;
-    // What the dialog said a view-only share gives (from the tags it read when it opened): the server opens the
-    // share for viewing only when the tag still allows it and this was not "names and sizes".
-    if (t.force_view_only || (t.allow_view_only && document.getElementById('share-view-only').checked)) {
-        payload.view_only_preview_shown = !!t.view_only_preview;
-    }
+    // What the dialog showed (from the tags it read when it opened): whether the share is view-only, and what a
+    // view-only share gives. A share shown as view-only is never made downloadable, and one shown as names and
+    // sizes is never made viewable, whatever the tag says by the time the server makes it.
+    const shownViewOnly = !!(t.force_view_only || (t.allow_view_only && document.getElementById('share-view-only').checked));
+    payload.view_only_shown = shownViewOnly;
+    if (shownViewOnly) payload.view_only_preview_shown = !!t.view_only_preview;
     if (t.allow_custom) {
         // Block submit on an over-cap / malformed limit so the user gets an immediate red flag
         // instead of a server 400 after the round-trip (mirrors ShareCreate + resolve_share_limits).
@@ -16761,7 +16764,7 @@ async function _renderTextWindow(bodyEl, fileId, fileName, fsize, headers) {
     const win = TEXT_WINDOW_FETCH_BYTES;
     const h = { ...headers, 'Range': `bytes=0-${win - 1}` };
     // The preview route: served inline and never cached, recorded as a preview, and open to a view-only
-    // share's recipient; otherwise every gate is a download's.
+    // share's recipient when the share lets view-only recipients view files; otherwise every gate is a download's.
     const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/preview`, { headers: h });
     if (!resp.ok && resp.status !== 206) throw await _previewRefusal(resp);
     let got = 0;
@@ -16882,7 +16885,8 @@ async function openFilePreview(fileId, fileName, mime) {
     const dlBtn = document.getElementById('file-preview-download');
     if (dlBtn) {
         // Offered only when a download would be allowed (a view-only share recipient, or a scoped credential
-        // without the download capability, may preview and nothing more).
+        // without the download capability, never downloads; a view-only recipient previews only when the share
+        // lets view-only recipients view files).
         dlBtn.style.display = vaultCapAllowed('file.download') ? '' : 'none';
         dlBtn.onclick = () => downloadFile(fileId, fileName);
     }
@@ -16927,7 +16931,8 @@ async function openFilePreview(fileId, fileName, mime) {
         }
 
         // The preview route: served inline and never cached, recorded as a preview, and open to a view-only
-        // share's recipient; otherwise every gate is a download's.
+        // share's recipient when the share lets view-only recipients view files; otherwise every gate is a
+        // download's.
         const resp = await fetch(`${API_BASE}/vaults/${state.currentVault.id}/files/${fileId}/preview`, { headers });
         if (!resp.ok) throw await _previewRefusal(resp);
         // Zero-knowledge vault: decrypt the ciphertext in-browser before rendering, reading from

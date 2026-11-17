@@ -606,8 +606,8 @@ class ShareTag(Base):
     # the other limits (lifetime/recipients/downloads). Distinct from default_view_only (a mere default).
     force_view_only = Column(Boolean, nullable=False, default=False)
     # Whether a view-only recipient of a share made under this tag may view its files in the browser (never
-    # download them). Copied into each share when it is made, like the limits: switching it later changes no
-    # existing share. A tag made through the API or the editor has it on unless the request says otherwise;
+    # download them). Copied into each share when it is made, like the limits, unless its maker was told names and
+    # sizes: switching it later changes no existing share. A tag made through the API or the editor has it on unless the request says otherwise;
     # the column's own default (off) is for the tags that existed before it, made under "cannot open".
     view_only_preview = Column(Boolean, nullable=False, default=False, server_default='false')
     allow_custom = Column(Boolean, nullable=False, default=True)  # may a creator override defaults within caps?
@@ -661,7 +661,7 @@ class Share(Base):
     max_recipients = Column(Integer, nullable=True)  # NULL = unlimited (within the tag cap at create)
     max_downloads = Column(Integer, nullable=True)   # NULL = unlimited (within the tag cap at create)
     view_only = Column(Boolean, nullable=False, default=False)  # capability: view-only vs read+download
-    # Whether a view-only claim may view the files in the browser: the tag's switch when the share was made.
+    # Whether a view-only claim may view the files in the browser: the tag's switch when the share was made, off when its maker was told names and sizes.
     # Off for every share made before the switch existed (their makers were told "cannot open").
     view_only_preview = Column(Boolean, nullable=False, default=False, server_default='false')
     tag_policy_snapshot = Column(JSON, nullable=True)  # the tag's limit fields at creation (provenance)

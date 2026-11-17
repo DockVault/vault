@@ -1307,6 +1307,10 @@ class ShareCreate(BaseModel):
     # read it; a share is made viewable only when the tag allows it AND the maker was not told otherwise. A
     # caller that leaves it out gets the tag's switch as it is.
     view_only_preview_shown: Optional[bool] = None
+    # Whether the dialog showed the share as view-only. The tag may have changed since the dialog read it; a share
+    # its maker was shown as view-only is never made downloadable. Never widens: a share the tag makes view-only
+    # stays so whatever this says.
+    view_only_shown: Optional[bool] = None
     with_link: bool = True
 
 
@@ -17047,6 +17051,9 @@ async def create_share(
     })
     if err:
         raise HTTPException(status_code=400, detail=err)
+    # A share its maker was shown as view-only is view-only, whatever the tag says now.
+    if payload.view_only_shown is True:
+        limits["view_only"] = True
     try:
         expires_at = datetime.utcnow() + timedelta(minutes=limits["lifetime_minutes"])
     except OverflowError:  # an absurd admin-set tag ceiling; the creator can't reach this
@@ -17081,7 +17088,8 @@ async def create_share(
         AuditLogger(db).log_action(
             action="share_created", status="success", user=current_user, ip_address=get_client_ip(request),
             details={"share_id": str(share.id), "vault_id": str(vault.id), "target_type": tt,
-                     "tag_id": str(tag.id), "claim_audience": payload.claim_audience, "view_only": limits["view_only"]})
+                     "tag_id": str(tag.id), "claim_audience": payload.claim_audience, "view_only": limits["view_only"],
+                     "view_only_preview": bool(share.view_only_preview)})
     except Exception:
         pass  # never fail the create on an audit-write error
     out = _share_dict(db, share)
@@ -23592,8 +23600,8 @@ async def preview_file(
     Every gate of the download route applies (the endpoint permission, the file.download capability of a
     temporary credential, the vault password, a file's password, the file scope, the transfer slot), with
     one difference: a view-only share claim, which grants visibility and not download, may read through
-    here when its share lets view-only recipients view files (the tag's switch, copied into the share when it
-    was made; off for every share made before the switch existed, refused with a sentence saying so). A
+    here when its share lets view-only recipients view files (the tag's switch when the share was made, off when its maker was told names and sizes; off for every
+    share made before the switch existed; refused with a sentence saying so). A
     preview discloses the content as a download does and cannot stop copying; what the share's maker is told
     says so. A zero-knowledge vault's file is ciphertext either way."""
     return await _serve_file(vault_id, file_id, request, file_password, current_user, db, x_vault_password,
