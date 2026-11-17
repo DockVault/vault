@@ -160,7 +160,7 @@ _IDENTIFIER_KEYS = (
     "previous_expiry", "new_expiry", "by_admin",
     # what happened, and how
     "action", "kind", "type", "mode", "method", "via", "reason", "reasons", "revoked_because",
-    "withdrawn_because", "outcome", "status", "surface", "level", "posture", "message", "step_up",
+    "withdrawn_because", "refused_because", "outcome", "status", "surface", "level", "posture", "message", "step_up",
     "approver_refusals", "secret_kind", "capability", "claim_audience", "endpoint_group", "required_group",
     "granted_groups", "revoked_groups", "permission", "target_type", "view_only", "view_only_preview", "format",
     "fields",

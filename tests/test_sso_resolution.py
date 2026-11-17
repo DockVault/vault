@@ -366,7 +366,7 @@ def test_a_privileged_account_is_never_linked_by_its_verified_email(monkeypatch,
     assert location == "/#sso-error=restricted", location
     assert h.identities() == [] and h.codes() == [] and h.notices == []
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "restricted"
-               and a[2].get("detail") == f"privileged_account:{kind}" for a in h.audits), h.audits
+               and a[2].get("refused_because") == f"privileged_account:{kind}" for a in h.audits), h.audits
     # An ended grant is no standing: the account links.
     if arrange != "role":
         h.db.rows_of(AuditorGrant)[0].status = "ended"
@@ -496,6 +496,13 @@ def test_creation_at_the_first_sign_in_needs_a_restricted_provider_and_an_admitt
     from app.core.models import User
     assert h.db.rows_of(User) == [root] and h.identities() == [] and h.codes() == []
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == reason for a in h.audits), h.audits
+    # The closer cause rides beside the reason under a name the recording levels know: a key they do not know is
+    # not recorded, so it is never a bare "detail".
+    refused = next(a[2] for a in h.audits if a[0] == "sso_sign_in_refused")
+    assert refused.get("refused_because") == (None if arrange == "unrestricted" else arrange), refused
+    assert "detail" not in refused
+    from app.core import audit_privacy
+    assert audit_privacy.kind_of("refused_because") == audit_privacy.IDENTIFIER
 
 
 def test_a_test_sign_in_says_what_account_it_would_make(monkeypatch):

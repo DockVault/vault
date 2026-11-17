@@ -392,7 +392,8 @@ async def sign_in_callback(
         except sso.Refusal as exc:
             db.rollback()          # nothing of a refused resolution may ride on the audit row's commit
             _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure",
-                   details={**details, "reason": exc.code, **({"detail": exc.detail} if exc.detail else {})})
+                   details={**details, "reason": exc.code,
+                            **({"refused_because": exc.detail} if exc.detail else {})})
             if invitation_id:
                 api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip,
                                           reason=exc.detail or exc.code)
