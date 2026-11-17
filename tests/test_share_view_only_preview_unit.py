@@ -355,3 +355,71 @@ def test_the_record_of_a_view_only_share_made_says_whether_it_is_viewable():
             in record.split("\n", 1)[0])   # the call to log_action, which ast.unparse keeps on one line
     # And the audit log keeps it (a detail key it does not know is dropped).
     assert kind_of("view_only_preview") == IDENTIFIER
+
+
+def _js_block(app, head, end="\n}\n"):
+    start = app.index(head)
+    return app[start:app.index(end, start) + len(end)]
+
+
+def test_a_share_refused_because_the_tag_changed_reads_the_tags_again_and_keeps_the_one_picked():
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    app = (root / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    # The create's refusal branch: a 409 reads the tags again, says why, and leaves the button usable.
+    submit = _js_block(app, "async function submitCreateShare() {")
+    branch = submit.split("if (e && e.status === 409) {", 1)[1].split("}", 1)[0]
+    assert "await _shareReloadPolicyKeepingTag(t.id);" in branch
+    assert "_shareSetError(SHARE_TAG_CHANGED);" in branch and "submitBtn.disabled = false;" in branch
+    assert branch.strip().endswith("return;")
+    # The reload itself, run as shipped with the page's calls recorded.
+    helper = (_js_block(app, "const SHARE_TAG_CHANGED =", ";\n")
+              + _js_block(app, "async function _shareReloadPolicyKeepingTag(tagId) {"))
+    harness = r"""
+const calls = [];
+const _shareCreate = { policy: { tags: [{ id: 'old' }] } };
+const options = [];
+const tagSel = { value: '', options };
+const document = { getElementById: (id) => id === 'share-tag-select' ? tagSel : null };
+let answer = { sharing_enabled: true, tags: [{ id: 'first' }, { id: 'picked' }] };
+async function apiRequest(path, opts) { calls.push('api ' + path); if (answer instanceof Error) throw answer; return answer; }
+function populateShareTags() {
+    calls.push('populate');
+    options.length = 0;
+    for (const t of _shareCreate.policy.tags) options.push({ value: t.id });
+    tagSel.value = options.length ? options[0].value : '';
+}
+function onShareTagChange() { calls.push('change ' + tagSel.value); }
+""" + helper + r"""
+(async () => {
+    const out = {};
+    await _shareReloadPolicyKeepingTag('picked');
+    out.kept = { calls: calls.splice(0), value: tagSel.value };
+    answer = { sharing_enabled: true, tags: [{ id: 'first' }] };
+    await _shareReloadPolicyKeepingTag('picked');
+    out.gone = { calls: calls.splice(0), value: tagSel.value };
+    answer = new Error('down');
+    const before = _shareCreate.policy;
+    await _shareReloadPolicyKeepingTag('first');
+    out.failed = { calls: calls.splice(0), same: _shareCreate.policy === before };
+    out.sentence = SHARE_TAG_CHANGED;
+    process.stdout.write(JSON.stringify(out));
+})();
+"""
+    node = shutil.which("node")
+    assert node, "Node is required: the page's own code must not be skipped"
+    done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8",
+                          timeout=120, cwd=str(root))
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = json.loads(done.stdout)
+    # The tags are read again and the tag picked stays picked, showing its rules now.
+    assert out["kept"] == {"calls": ["api /share-policy", "populate", "change picked"], "value": "picked"}, out
+    # A tag no longer offered leaves the first one picked, as the dialog does when it opens.
+    assert out["gone"] == {"calls": ["api /share-policy", "populate"], "value": "first"}, out
+    # If the tags cannot be read, the dialog keeps those it has.
+    assert out["failed"] == {"calls": ["api /share-policy"], "same": True}, out
+    assert out["sentence"] == ("This tag changed while the dialog was open. "
+                               "Check the share's settings and press Create share again.")

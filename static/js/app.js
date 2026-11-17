@@ -4279,6 +4279,22 @@ function setupShareCreateModalOnce() {
     });
 }
 
+// The server refuses a share (409) when the tag changed while the dialog was open and no longer allows what the
+// dialog showed. The dialog then reads the tags again, keeps the one picked so that it shows that tag's rules now,
+// and says so.
+const SHARE_TAG_CHANGED = "This tag changed while the dialog was open. Check the share's settings and press Create share again.";
+
+async function _shareReloadPolicyKeepingTag(tagId) {
+    try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
+    catch (_) { return; }   // keep the tags already read; the sentence still asks to check them
+    populateShareTags();
+    const tagSel = document.getElementById('share-tag-select');
+    if (tagSel && Array.from(tagSel.options).some(o => o.value === tagId)) {
+        tagSel.value = tagId;
+        onShareTagChange();
+    }
+}
+
 async function submitCreateShare() {
     const t = currentShareTag();
     if (!t) { _shareSetError('Pick a classification tag.'); return; }
@@ -4329,6 +4345,12 @@ async function submitCreateShare() {
         submitBtn.style.display = 'none';
         showToast('Share created', 'success');
     } catch (e) {
+        if (e && e.status === 409) {
+            await _shareReloadPolicyKeepingTag(t.id);
+            _shareSetError(SHARE_TAG_CHANGED);
+            submitBtn.disabled = false;
+            return;
+        }
         const msg = (e && e.message) || '';
         // create_share fails closed for a vault the user only reached via a claim (not owner /
         // member / group) — surface a clearer reason than the raw "You do not have access…".

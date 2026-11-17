@@ -339,3 +339,55 @@ def test_a_share_made_after_the_tag_stopped_requiring_view_only_stays_view_only(
         admin.delete(f"/share-tags/{tag['id']}")
         admin.delete_vault(vault["id"])
         admin.put("/settings", json={"sharing_enabled": before})
+
+
+def test_a_share_refused_because_the_tag_changed_shows_the_tags_rules_again(page: Page, admin, admin_creds):
+    """The dialog read a tag that forced view-only; an administrator stops the tag allowing view-only at all before
+    the maker presses Create share. The server refuses what the dialog showed; the dialog reads the tags again,
+    keeps the tag, says so, and no longer shows the share as view-only; pressing Create share again makes it."""
+    before = admin.get("/settings").json().get("sharing_enabled")
+    admin.put("/settings", json={"sharing_enabled": True})
+    vault = admin.create_vault(name=unique("vochanged"))
+    me = admin.get("/users/me").json()["id"]
+    r = admin.post("/share-tags", json={"name": unique("vochangedtag"), "allowed_user_ids": [me],
+                                         "allowed_audiences": ["anyone_internal"], "allow_view_only": True,
+                                         "default_view_only": True, "force_view_only": True,
+                                         "view_only_preview": True})
+    assert r.status_code == 200, r.text
+    tag = r.json()
+    try:
+        page.goto("/")
+        expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
+        page.fill("#username", admin_creds["username"])
+        page.fill("#password", admin_creds["password"])
+        page.click("#login-form button[type=submit]")
+        expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+        page.click('.sidebar-item[data-section="vaults"]')
+        page.locator(f'.vault-card[data-vault-id="{vault["id"]}"] .open-vault-btn').click()
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+        page.click("#share-vault-btn")
+        select = page.locator("#share-tag-select")
+        expect(select.locator(f'option[value="{tag["id"]}"]')).to_have_count(1, timeout=10000)
+        select.select_option(tag["id"])
+        page.select_option("#share-audience-select", "anyone_internal")
+        expect(page.locator("#share-view-only")).to_be_checked()
+        assert admin.patch(f"/share-tags/{tag['id']}", json={"force_view_only": False, "default_view_only": False,
+                                                             "allow_view_only": False}).status_code == 200
+        with page.expect_response(lambda r: r.url.rstrip("/").endswith("/shares") and r.request.method == "POST") as resp:
+            page.click("#share-create-submit")
+        assert resp.value.status == 409, resp.value.status
+        expect(page.locator("#share-create-error")).to_have_text(
+            "This tag changed while the dialog was open. Check the share's settings and press Create share again.")
+        expect(page.locator("#share-tag-select")).to_have_value(tag["id"])
+        expect(page.locator("#share-view-only")).not_to_be_checked()
+        expect(page.locator("#share-viewonly-group")).to_be_hidden()
+        with page.expect_response(lambda r: r.url.rstrip("/").endswith("/shares") and r.request.method == "POST") as resp:
+            page.click("#share-create-submit")
+        assert resp.value.ok, resp.value.status
+        assert resp.value.request.post_data_json["view_only_shown"] is False
+        assert resp.value.json()["view_only"] is False
+        expect(page.locator("#share-create-result")).to_be_visible()
+    finally:
+        admin.delete(f"/share-tags/{tag['id']}")
+        admin.delete_vault(vault["id"])
+        admin.put("/settings", json={"sharing_enabled": before})
