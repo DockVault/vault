@@ -35,6 +35,22 @@ _session_factory = None
 _redis_client = None
 
 
+def _cache_settings() -> dict:
+    """How the server's Redis clients connect (redis_client, monitor_redis_client)."""
+    return dict(
+        host=settings.redis_host,
+        port=settings.redis_port,
+        db=settings.redis_db,
+        password=settings.redis_password if settings.redis_password else None,
+        decode_responses=True,
+        socket_connect_timeout=settings.redis_connect_timeout,
+        socket_timeout=settings.redis_socket_timeout,
+        socket_keepalive=True,
+        health_check_interval=30,
+        retry=Retry(NoBackoff(), 0),
+    )
+
+
 def initialize_consumers() -> None:
     """Construct process-local SQLAlchemy and Redis clients exactly once.
 
@@ -71,18 +87,7 @@ def initialize_consumers() -> None:
                 autoflush=False,
                 bind=engine,
             )
-            cache = redis.Redis(
-                host=settings.redis_host,
-                port=settings.redis_port,
-                db=settings.redis_db,
-                password=settings.redis_password if settings.redis_password else None,
-                decode_responses=True,
-                socket_connect_timeout=settings.redis_connect_timeout,
-                socket_timeout=settings.redis_socket_timeout,
-                socket_keepalive=True,
-                health_check_interval=30,
-                retry=Retry(NoBackoff(), 0),
-            )
+            cache = redis.Redis(**_cache_settings())
         except Exception:
             try:
                 engine.dispose()
@@ -126,6 +131,22 @@ class _RedisClientProxy:
 
 
 redis_client = _RedisClientProxy()
+
+_monitor_redis_client = None
+
+
+def monitor_redis_client():
+    """A client of its own for the live sockets' subscriptions (app/core/monitor_feed.py): the same settings as
+    redis_client, and a connection pool of its own, so a subscription's connection is never one the rest of the
+    server is handed for its commands."""
+    global _monitor_redis_client
+    if _monitor_redis_client is None:
+        _require_redis_client()
+        with _consumer_lock:
+            if _monitor_redis_client is None:
+                # A client of its own makes a connection pool of its own.
+                _monitor_redis_client = redis.Redis(**_cache_settings())
+    return _monitor_redis_client
 
 
 def SessionLocal():
