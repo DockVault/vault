@@ -27,7 +27,7 @@ import uuid
 import paramiko
 import pytest
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import ApiClient, BASE_URL, unique, wait_out_breaker_cooldown
 from _account_change_helpers import (SFTP_CONTAINER, arm_lock, host_address, lock_rows, psql,
                                      reset_sign_in_throttle, sign_in_from_inside, signed_in)
 from _device_boundary_helpers import grant, mint_sync_cred, register_device
@@ -500,3 +500,68 @@ print(json.dumps(out))
     assert got["busy"] is True and 0.9 <= got["waited"] < 3 and got["retry_after"] == 5, got
     assert got["timeout_on_the_next"] == "5s", got
     assert got["after_the_first_ended"] < 0.5, got
+
+
+class _CachePaused:
+    """The stack's Redis paused for the block, then unpaused, waiting until the server sees it again."""
+
+    def __enter__(self):
+        import subprocess
+        self.container = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
+        paused = subprocess.run(["docker", "pause", self.container], capture_output=True, text=True, timeout=30)
+        assert paused.returncode == 0, paused.stderr
+        return self
+
+    def __exit__(self, *exc):
+        import subprocess
+        import requests
+        subprocess.run(["docker", "unpause", self.container], capture_output=True, text=True, timeout=30)
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            try:
+                if requests.get(f"{BASE_URL}/health", timeout=5).json().get("redis") == "connected":
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1)
+        # The next test in the invocation starts on a closed breaker, not on one the pause left open.
+        wait_out_breaker_cooldown()
+        return False
+
+
+def _phantom_rows():
+    """{key: state} of sign_in_phantoms."""
+    rows = {}
+    for line in psql("SELECT key, state FROM sign_in_phantoms").splitlines():
+        key, _, state = line.rpartition("|")      # the key holds a "|" too; the JSON state holds none
+        rows[key] = json.loads(state)
+    return rows
+
+
+def test_while_the_cache_is_down_a_name_that_is_no_account_is_paused_like_an_account(admin, temp_user, small_limits):
+    """On PostgreSQL, with the cache paused: THRESHOLD wrong passwords for an account and for a name that is no
+    account are each checked, and the next try is refused with the same pause from this address. The name's counts
+    are kept in sign_in_phantoms meanwhile, by its keyed stand-in. The sign-in throttle shares the limit, so its own
+    database rows are deleted before each phase, for the lock to answer rather than it."""
+    nobody = unique("no-such-account")
+    before = set(_phantom_rows())
+    answers = {}
+    with _CachePaused():
+        for name in (temp_user["_username"], nobody):
+            psql("DELETE FROM rate_limit_records")
+            codes = [_web(name, WRONG).status_code for _ in range(THRESHOLD)]
+            psql("DELETE FROM rate_limit_records")
+            refused = _web(name, WRONG)
+            detail = refused.json().get("detail", "") if refused.status_code != 500 else refused.text
+            answers[name] = (codes, refused.status_code, detail.split(".")[0],
+                             int(refused.headers.get("Retry-After", "0")) > 0)
+        new = {k: v for k, v in _phantom_rows().items() if k not in before}
+    real, unknown = answers[temp_user["_username"]], answers[nobody]
+    assert real == unknown, answers
+    assert real[:2] == ([401] * THRESHOLD, 403) and real[3], real
+    assert "from your network address" in real[2], real
+    # The name's two counts, by its keyed stand-in: its address's, locked at THRESHOLD, and the one from everywhere.
+    assert len(new) == 2 and not any(nobody in key for key in new), new
+    assert sorted(s.get("n") for s in new.values()) == [THRESHOLD, THRESHOLD], new
+    assert [bool(s.get("locked")) for s in new.values()].count(True) == 1, new
+    psql("DELETE FROM rate_limit_records")

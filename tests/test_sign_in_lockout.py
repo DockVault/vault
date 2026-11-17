@@ -1280,3 +1280,53 @@ def test_a_burst_on_a_name_that_is_no_account_waits_its_turn_like_one_on_an_acco
     assert real == nobody == ["address"] * 3 + ["wrong"] * THRESHOLD, (real, nobody)
     assert checked.running["most"] == 1, "two checks ran at once"
     assert L._CacheStore.WAIT_SECONDS == L.TURN_WAIT_SECONDS, "waited for as long as an account's turn"
+
+
+class _PostgresLike:
+    """Just enough of a PostgreSQL session for a name's attempt taken in the database: it records the advisory
+    locks asked for, and holds no rows."""
+
+    def __init__(self):
+        self.locks = []
+
+    def get_bind(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+    def execute(self, statement, params=None):
+        from types import SimpleNamespace
+        if "pg_advisory_xact_lock" in str(statement):
+            self.locks.append(dict(params))
+        return SimpleNamespace(scalar=lambda: "0", first=lambda: None)
+
+    def query(self, *a, **k):
+        return self
+
+    def filter(self, *a, **k):
+        return self
+
+    def first(self):
+        return None
+
+    def rollback(self):
+        pass
+
+
+def test_on_postgresql_a_names_turn_is_one_lock_per_name_whatever_the_address(monkeypatch, limits):
+    # SQLite's turn is the whole database's write lock, so the tests above cannot tell a lock per name from one per
+    # attempt. On PostgreSQL the turn is an advisory lock: attempts on one name, from any address, must queue on the
+    # same key, as an account's do on its id; another name has its own; and the name is never the key as typed.
+    monkeypatch.setattr(L, "_phantom_store", lambda: _CacheDown())
+
+    def lock_for(name, address):
+        db = _PostgresLike()
+        assert L.phantom_attempt(name, address, lambda: None, db=db) is None
+        assert len(db.locks) == 1, db.locks
+        return db.locks[0]
+
+    a, b = lock_for("nobody-here", ATTACKER), lock_for("nobody-here", HOME)
+    other = lock_for("someone-else", ATTACKER)
+    assert a == b == lock_for("nobody-here", ATTACKER), (a, b)
+    assert a["cls"] == L._PHANTOM_TURN_LOCK_CLASS != L._TURN_LOCK_CLASS
+    assert other["cls"] == a["cls"] and other["key"] != a["key"]
+    assert "nobody-here" not in a["key"] and ATTACKER not in a["key"], a
