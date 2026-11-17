@@ -748,15 +748,24 @@ jobs:
           cp VERSION "$RUNNER_TEMP/VERSION.checkout"
           printf '99.0.0\n' > VERSION
 
-          python3 dockvault.py reset --non-interactive --confirm
-          rm -f .env
-          python3 dockvault.py setup --non-interactive --image-source release --no-start \
-            --server-name localhost \
-            --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
-            --admin-password "$ADMIN_PASS" \
-            --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" \
-            | tee /tmp/setup-unpublished.log
-          python3 .github/scripts/mask_env_secrets.py .env
+          # Retried, like Scenario I. Setup reads GitHub's releases list without a token, and an
+          # answer it cannot read (the anonymous rate limit, shared with every job on the runner
+          # fleet, or a degraded API) leaves it nothing to compare with, so it goes on and pins the
+          # version it was given. Only an attempt that read the list can say 99.0.0 is not published.
+          for attempt in $(seq 1 5); do
+            python3 dockvault.py reset --non-interactive --confirm
+            rm -f .env
+            python3 dockvault.py setup --non-interactive --image-source release --no-start \
+              --server-name localhost \
+              --admin-username "$ADMIN_USER" --admin-email admin@dockvault-matrix.com \
+              --admin-password "$ADMIN_PASS" \
+              --cert-mode selfsigned --web-port "$WEB_PORT" --sftp-port "$SFTP_PORT" \
+              | tee /tmp/setup-unpublished.log
+            python3 .github/scripts/mask_env_secrets.py .env
+            grep -qi "not published" /tmp/setup-unpublished.log && break
+            echo "setup did not say 99.0.0 is unpublished: it could not read the releases list (attempt ${attempt} of 5)"
+            sleep 10
+          done
           cp "$RUNNER_TEMP/VERSION.checkout" VERSION
 
           grep -qi "not published" /tmp/setup-unpublished.log \

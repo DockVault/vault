@@ -171,3 +171,25 @@ def test_the_published_release_scenario_installs_the_highest_release_not_above_t
     assert "next((" not in step, "the first entry of the list is not the newest release"
     # The pick reads the checkout's own VERSION, so it has to happen before VERSION is pinned.
     assert step.index("pick_published_release.py") < step.index('> VERSION')
+
+
+def test_the_unpublished_version_scenario_runs_setup_again_until_it_read_the_releases_list():
+    """Setup reads GitHub's releases list without a token and takes an answer it cannot read as nothing to compare
+    with, so it pins the version it was given: one rate-limited call failed this scenario. Like Scenario I, it tries
+    again, up to five times, until setup says the version is not published, and only then judges what setup did."""
+    step = _step("Scenario I2 — an unpublished version falls back to a source build", "Deployment logs")
+    start = step.index("for attempt in $(seq 1 5); do")
+    end = step.index("\n          done\n", start)
+    loop = step[start:end]
+    assert step.index("printf '99.0.0\\n' > VERSION") < start
+    for line in ("python3 dockvault.py reset --non-interactive --confirm", "rm -f .env",
+                 "python3 dockvault.py setup --non-interactive --image-source release --no-start",
+                 "| tee /tmp/setup-unpublished.log", "python3 .github/scripts/mask_env_secrets.py .env"):
+        assert step.count(line) == 1 and line in loop, line
+    assert 'grep -qi "not published" /tmp/setup-unpublished.log && break' in loop
+    assert loop.index("tee /tmp/setup-unpublished.log") < loop.index("&& break") < loop.index("sleep 10")
+    after = step[end:]
+    # The checkout's own VERSION comes back once, after the loop, before anything is judged.
+    assert step.count('cp "$RUNNER_TEMP/VERSION.checkout" VERSION') == 1
+    assert after.index('cp "$RUNNER_TEMP/VERSION.checkout" VERSION') < after.index("::error::setup did not report")
+    assert "::error::setup pinned an image that was never published" in after
