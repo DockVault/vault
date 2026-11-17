@@ -302,3 +302,108 @@ def test_ws_handshake_rejects_a_token_whose_session_row_is_gone(base_url, admin)
             ws.close()
     finally:
         admin.delete_user(user["id"])
+
+
+@pytest.mark.websocket
+def test_an_account_holds_at_most_ten_live_sockets_and_a_closed_one_frees_its_place(base_url, admin):
+    """The server serves one account at most ten live sockets at once (app/core/monitor_feed.py): the eleventh is
+    told why and closed, another account is not affected, and a socket that closes frees its place. The sockets
+    held are read now and then, so that the server's keep-alive pings are answered."""
+    import time as _t
+    from conftest import ApiClient
+
+    person = admin.create_user(role="user")
+    client = ApiClient()
+    client.login(person["_username"], person["_password"])
+    held = []
+
+    def _open(token):
+        ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+        ws.send(json.dumps({"type": "auth", "token": token}))
+        return ws, json.loads(ws.recv())
+
+    def _read_all():
+        for ws in held:
+            ws.settimeout(0.05)
+            try:
+                ws.recv()
+            except Exception:
+                pass
+
+    try:
+        for _ in range(10):
+            ws, first = _open(client.token)
+            held.append(ws)
+            assert first["type"] == "connected", first
+        extra, first = _open(client.token)
+        assert first == {"type": "error",
+                         "message": "Too many live connections for this account; close another tab."}, first
+        extra.close()
+        # Another account is served as before.
+        other, first = _open(admin.token)
+        assert first["type"] == "connected", first
+        other.close()
+        _read_all()
+        # One of the ten closes: its place is free again (the server gives it back when it sees the close).
+        held.pop().close()
+        deadline = _t.time() + 10
+        while True:
+            ws, first = _open(client.token)
+            if first["type"] == "connected":
+                held.append(ws)
+                break
+            ws.close()
+            assert _t.time() < deadline, "a closed socket's place was not given back"
+            _read_all()
+            _t.sleep(0.5)
+    finally:
+        for ws in held:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        admin.delete_user(person["id"])
+
+
+@pytest.mark.websocket
+def test_a_temporary_credentials_sockets_never_take_the_places_of_its_account(base_url, admin):
+    """A temporary credential's live sockets are counted on their own: the account it belongs to keeps its ten
+    places however many the credential opens, and the credential has ten of its own. The sockets held are read
+    now and then, so that the server's keep-alive pings are answered."""
+    from conftest import unique, ApiClient
+
+    tc = admin.post("/auth/temp-credentials", json={"note": unique("ws-cap")}).json()
+    temporary = ApiClient()
+    temporary.login(tc["temp_username"], tc["credential"])
+    held = []
+
+    def _open(token):
+        ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+        ws.send(json.dumps({"type": "auth", "token": token}))
+        return ws, json.loads(ws.recv())
+
+    def _read_all():
+        for ws in held:
+            ws.settimeout(0.05)
+            try:
+                ws.recv()
+            except Exception:
+                pass
+
+    refused = {"type": "error", "message": "Too many live connections for this account; close another tab."}
+    try:
+        for token in [temporary.token] * 10 + [admin.token] * 10:
+            ws, first = _open(token)
+            held.append(ws)
+            assert first["type"] == "connected", first
+        _read_all()
+        for token in (temporary.token, admin.token):
+            ws, first = _open(token)
+            ws.close()
+            assert first == refused, first
+    finally:
+        for ws in held:
+            try:
+                ws.close()
+            except Exception:
+                pass
