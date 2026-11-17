@@ -137,5 +137,6 @@ def test_the_socket_sends_every_published_message_through_the_rules():
 
 
 def test_the_socket_listens_to_both_channels():
-    assert "pubsub.subscribe, *_socket_frames.CHANNELS" in _endpoint_source()
+    # Subscribed through the socket's feed (app/core/monitor_feed.py), on a client of its own.
+    assert "MonitorFeed(monitor_redis_client(), _socket_frames.CHANNELS)" in _endpoint_source()
     assert set(sf.CHANNELS) == {"activity_events", "audit_signal"}

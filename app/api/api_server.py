@@ -9802,8 +9802,9 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
     Client must send: {"type": "auth", "token": "JWT_TOKEN_HERE"}
     """
     import asyncio
-    from app.core.database import redis_client
-    
+    from app.core.database import monitor_redis_client
+    from app.core.monitor_feed import MonitorFeed
+
     # Accept the WebSocket connection
     await websocket.accept()
     
@@ -9962,11 +9963,10 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             sees_activity=await asyncio.get_event_loop().run_in_executor(
                 None, _ws_sees_activity, user_id, is_temporary))
 
-        # Subscribe to Redis pub/sub channels
-        pubsub = redis_client.pubsub()
-        await asyncio.get_event_loop().run_in_executor(
-            None, pubsub.subscribe, *_socket_frames.CHANNELS
-        )
+        # Subscribe to the Redis channels. Every call on the subscription goes through the feed, one at a time,
+        # and its own client (app/core/monitor_feed.py).
+        feed = MonitorFeed(monitor_redis_client(), _socket_frames.CHANNELS)
+        await asyncio.get_event_loop().run_in_executor(None, feed.subscribe)
         
         # Create tasks for sending and receiving
         async def send_events():
@@ -9992,9 +9992,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                                 None, _ws_sees_activity, user_id, is_temporary):
                             viewer = viewer._replace(sees_activity=False)
                     # Get message from Redis (non-blocking with timeout)
-                    message = await asyncio.get_event_loop().run_in_executor(
-                        None, pubsub.get_message, True, 0.1
-                    )
+                    message = await asyncio.get_event_loop().run_in_executor(None, feed.poll, 0.1)
 
                     if message and message['type'] == 'message':
                         # The frame this connection may receive for the message, if any.
@@ -10056,16 +10054,12 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         except:
             pass
     finally:
-        # Cleanup
+        # Cleanup. The task that polled may be cancelled with a poll still running in its thread; the feed's
+        # close waits for that poll, and no later one touches the subscription.
         try:
-            if 'pubsub' in locals():
-                await asyncio.get_event_loop().run_in_executor(
-                    None, pubsub.unsubscribe
-                )
-                await asyncio.get_event_loop().run_in_executor(
-                    None, pubsub.close
-                )
-        except:
+            if 'feed' in locals():
+                await asyncio.get_event_loop().run_in_executor(None, feed.close)
+        except Exception:
             pass
         
         try:
