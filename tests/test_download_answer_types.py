@@ -485,7 +485,9 @@ def test_no_answer_is_typed_outside_that_list_or_through_a_header_of_its_own():
     """The list above reads the API's modules for answers that are given a type. Outside them one answer is, a
     JSON one. And no answer anywhere has a Content-Type written into its headers, where it would take the place
     of the type the answer was given and stand outside the list: the header is named in two places only, the
-    middleware reading the type of an answer, and the fixed JSON refusal of a request body that is too large."""
+    middleware reading the type of an answer, and the fixed JSON refusal of a request body that is too large.
+    A third names it on a request the vault sends, not on an answer it gives: the form the single sign-on client
+    posts to an identity provider's token endpoint."""
     typed, named = {}, {}
     for path in sorted((ROOT / "app").rglob("*.py")):
         where = path.relative_to(ROOT / "app").as_posix()
@@ -498,6 +500,7 @@ def test_no_answer_is_typed_outside_that_list_or_through_a_header_of_its_own():
     assert named == {
         "api/api_server.py": ["response.headers.get('content-type', '')"],
         "core/body_limit.py": ["(b'content-type', b'application/json')"],
+        "services/oidc_client.py": ["{'Content-Type': 'application/x-www-form-urlencoded'}"],
     }
 
 
