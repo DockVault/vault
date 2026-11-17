@@ -165,11 +165,55 @@ def test_the_unused_session_lookup_stays_gone():
     assert "def verify_session(" not in src
 
 
-def test_terminate_uses_the_stored_hash_directly_no_double_hash():
-    src = _read("app/services/auth_service.py")
-    assert 'redis_key = f"session:{session.session_token}"' in src, (
-        "the Redis key is derived from the stored hash directly; re-hashing it would miss the key")
-    assert "hash_session_token(session.session_token)" not in src, "must not double-hash a stored row"
+class _RedisRecorder:
+    """A Redis client that records every command it is asked to run."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        def _command(*args, **kwargs):
+            self.calls.append((name, args))
+            return None
+        return _command
+
+
+class _SessionRows:
+    """Just enough of a database session for AuthService._create_session and _terminate_session."""
+
+    def __init__(self):
+        self.added = []
+
+    def add(self, row):
+        self.added.append(row)
+
+    def commit(self):
+        pass
+
+    def refresh(self, row):
+        pass
+
+
+def test_starting_and_ending_a_session_touch_no_redis_key(monkeypatch):
+    """A session is its database row, which every request reads by the token's hash (get_current_user). Nothing has
+    read a session from Redis since the second lookup went, so starting a session writes no session:<hash> key and
+    ending one deletes none."""
+    import uuid
+    from types import SimpleNamespace
+    from app.core.session_hash_utils import hash_session_token
+    from app.services import auth_service as A
+
+    redis = _RedisRecorder()
+    monkeypatch.setattr(A, "redis_client", redis)
+    monkeypatch.setattr(A, "_cache_guard_is_open", lambda now: False)   # the cache answers: a write would be made
+    db = _SessionRows()
+    service = A.AuthService(db)
+    token = service._create_session(SimpleNamespace(id=uuid.uuid4()), None, "198.51.100.7", channel=service.WEB)
+    row = db.added[0]
+    assert row.session_token == hash_session_token(token) != token
+    service._terminate_session(row)
+    assert row.is_active is False
+    assert redis.calls == [], redis.calls
 
 
 def test_the_rehash_runs_at_boot():

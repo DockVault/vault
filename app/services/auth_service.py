@@ -356,10 +356,10 @@ def _device_mint_refusal(reason: str, http_status: int = status.HTTP_403_FORBIDD
 
 
 def _best_effort_cache(code: str, op) -> None:
-    """Run a best-effort session-cache write/delete behind the read-through cache guard, so during a
+    """Run a best-effort cache write behind the read-through cache guard, so during a
     Redis outage the auth path pays ONE socket stall per cooldown instead of one per raw call.
 
-    The session cache is a convenience over the committed database rows, which are the source of
+    The cache is a convenience over the committed database rows, which are the source of
     truth, so the op is best-effort either way. What the guard adds: while it is open (the rate
     limiter's breaker is open — opened by the limiter's own read, which on the login path runs first —
     or this guard's private memory is inside its cooldown) the socket is skipped entirely, so a login
@@ -1749,37 +1749,17 @@ class AuthService:
             channel=channel,
         )
         
+        # The committed row is the session: every request reads it by the token's hash. Nothing keeps a
+        # copy of it in Redis.
         self.db.add(session)
         self.db.commit()
         self.db.refresh(session)
-        
-        # Cache in Redis with hashed token (security: prevents token exposure). Best-effort: the
-        # ActiveSession row is already committed and is what every request re-validates against, so a
-        # cache outage must not 500 the auth step of every door — nor, on the temp-credential path,
-        # leave a credential already claimed as used with no session returned.
-        token_hash = hash_session_token(session_token)
-        redis_key = f"session:{token_hash}"
-        redis_value = json.dumps({
-            'session_id': str(session.id),
-            'user_id': str(user.id)
-        })
-        # 30-minute session cache, best-effort behind the breaker.
-        _best_effort_cache(
-            'session.cache-write.skipped',
-            lambda: redis_client.setex(redis_key, 1800, redis_value))
-        
+
         return session_token
-    
+
     def _terminate_session(self, session: ActiveSession):
         """Terminate a session."""
         session.is_active = False
-
-        # The Redis key is session:<hash>, and session.session_token IS that hash at rest -- use it
-        # directly. Re-hashing it here would compute session:<hash-of-hash> and never delete the
-        # real key, stranding the cached session until its own TTL.
-        redis_key = f"session:{session.session_token}"
-        _best_effort_cache('session.cache-delete.skipped', lambda: redis_client.delete(redis_key))
-
         self.db.commit()
     
     def _terminate_existing_sessions(self, user_id: uuid.UUID):

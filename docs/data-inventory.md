@@ -259,7 +259,7 @@ In memory only with the shipped compose files. Every key below expires on its ow
 
 | Key | Holds | Lifetime |
 |---|---|---|
-| `session:*`, `denylist:session:*` | A session token's hash with its session and account id; ended sessions. | 30 minutes; a token's remaining life. |
+| `denylist:session:*` | Ended sessions: a session token's hash. **Gone in 0.35.1:** `session:*`, a copy of a session's id and its account's id that nothing read (the session's database row is what every request reads). | A token's remaining life. |
 | `temp_cred:<name>` | A temporary credential's ids and times. | The credential's lifetime. |
 | `otp:<purpose>:<account>` | A pending code's hash and the new email address it was sent to. | The code's lifetime. |
 | `rate_limit:login_user:<name key>\|<address>`, `rate_limit:login_ip:<address>` | Failed sign-ins per name and address, and per address. **Changed in 0.34.0:** the address is its throttle subject (an IPv6 address as its /64, an IPv4 address written as IPv6 as the IPv4 one), as in every per-address count. **Changed in 0.33.0:** the name is a keyed stand-in, 128 bits of an HMAC of it under the deployment's secret (`LOG_TOKEN_PEPPER`, else one derived from `JWT_SECRET_KEY`), which cannot be reversed or confirmed without that secret; it was the name as typed. | The login window (`RATE_LIMIT_LOGIN_WINDOW_SECONDS`, 5 minutes by default). |
@@ -637,3 +637,7 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
   24 hours by default). A save that lets a sign-in last longer (a longer session timeout or renewal limit) asks
   for the administrator's password, and their second factor when they have one, as a fixed step-up
   (`admin.session_limits.write`); the step-up and the save are recorded in the audit log as any other.
+
+## What 0.35.1 adds
+
+- The cache no longer holds `session:*`, a copy of each session's ids that nothing read.
