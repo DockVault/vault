@@ -115,6 +115,9 @@ STORES = (
           lambda: "Minutes: until the sign-in finishes or expires, then with the sessions.", table="pending_logins"),
     Store("sign_in_lockouts", "The address of failed sign-ins counted towards a lock.",
           lambda: "Until the lock ends: a day at most.", table="sign_in_lockouts"),
+    Store("sign_in_phantoms", "While the cache is down, the address of failed sign-ins for a name that is no "
+          "account, counted as an account's are (the name only as a keyed stand-in).",
+          lambda: "A day at most (30 days for a lock with no end).", table="sign_in_phantoms"),
     Store("rate_limit_records", "The address or account counted by the request limits when the cache is down.",
           lambda: "An hour.", table="rate_limit_records"),
     Store("receiver_upload_sessions", "The address of someone uploading through an upload link.",

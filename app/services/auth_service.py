@@ -562,12 +562,15 @@ class AuthService:
             # under a hold on the name in the cache (an account's turn), refused at the same point an
             # account's automatic lock would refuse it, and counted after its stand-in check. So being
             # refused, when, and how long a burst of attempts takes, never tell whether an account
-            # exists. The stand-in check equalizes each attempt's timing with the real path.
+            # exists. The stand-in check equalizes each attempt's timing with the real path. While the
+            # cache cannot be reached the attempt is taken in this transaction instead, which is
+            # committed here as an account's failure is, ending its turn.
             try:
                 phantom = sign_in_lockout.phantom_attempt(
-                    username, ip_address, lambda: verify_password(password, _DUMMY_PASSWORD_HASH))
+                    username, ip_address, lambda: verify_password(password, _DUMMY_PASSWORD_HASH), db=self.db)
             except sign_in_lockout.Busy as busy:
                 raise RateLimitExceededError(str(busy), retry_after=busy.retry_after)
+            self.db.commit()
             if phantom is not None:
                 raise AccountLockedError(_LOCK_REASONS[phantom.scope], locked_until=phantom.locked_until,
                                          scope=phantom.scope)

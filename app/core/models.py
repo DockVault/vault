@@ -3299,6 +3299,26 @@ class SignInLockout(Base):
     )
 
 
+class SignInPhantom(Base):
+    """Failed sign-ins counted for a name that is no account while the cache cannot be reached (see
+    app/core/sign_in_lockout.py): the same small value the cache keeps for it, under the same key, kept as
+    long. ``key`` names the source address (an IPv6 address as its /64) or '*', and the name as its keyed
+    stand-in, never as typed (app/core/name_keys.py).
+
+    A NEW table, so create_all builds it on an existing deployment, and a release that does not know it
+    ignores it (names that are no account are then counted only in the cache, as before)."""
+    __tablename__ = 'sign_in_phantoms'
+
+    key = Column(String(128), primary_key=True)
+    state = Column(Text, nullable=False)
+    # When the value is no longer read, and the periodic cleanup deletes it (naive UTC).
+    expires_at = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        Index('idx_sign_in_phantom_expires_at', 'expires_at'),
+    )
+
+
 class DataRequirement(Base):
     """A mark a release leaves on the data when it stores something an older release cannot read.
 

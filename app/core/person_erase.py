@@ -659,6 +659,8 @@ COVERAGE: Dict[str, str] = {
     "active_sessions": DELETED, "pending_logins": DELETED, "devices": DELETED, "device_grants": DELETED,
     "second_factor_enrollments": DELETED, "second_factor_recovery_codes": DELETED, "otp_codes": DELETED,
     "password_reset_tokens": DELETED, "email_change_codes": DELETED, "sign_in_lockouts": DELETED,
+    "sign_in_phantoms": "a name typed at sign-in only as a keyed stand-in, with an address; each row is gone within a "
+                        "day (a lock with no end: 30 days), as from the cache",
     "user_groups": DELETED, "user_permissions": DELETED, "user_endpoint_permissions": DELETED,
     "temp_credential_vault_access": DELETED, "vault_favorites": DELETED, "vault_views": DELETED,
     "vault_members": DELETED, "vault_group_access": "access of groups; no person's name",

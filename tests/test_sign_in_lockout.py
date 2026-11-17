@@ -5,7 +5,8 @@ new sign-ins to the account from THAT address are refused for the lockout durati
 the backstop multiple, counted over about the last 24 hours, they are refused from EVERY address. A refusal happens
 before the password is checked, so guessing stops. A lock never ends a session: only an
 administrator's lock (users.is_locked with no end) does. Locks end by themselves and are audited
-with their scope. Names that are no account are refused the same way, from the cache.
+with their scope. Names that are no account are refused the same way, from the cache, and from the
+database while the cache cannot be reached.
 
 These run app/core/sign_in_lockout.py and AuthService.authenticate_user against the real users,
 sign_in_lockouts and audit_logs tables in a throwaway SQLite database. test_smart_lockout_live.py
@@ -25,7 +26,7 @@ from _bare_api_env import set_bare_api_env
 set_bare_api_env()
 
 from app.core import sign_in_lockout as L  # noqa: E402
-from app.core.models import AuditLog, RoleEnum, SignInLockout, User  # noqa: E402
+from app.core.models import AuditLog, RoleEnum, SignInLockout, SignInPhantom, User  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.services import auth_service as A  # noqa: E402
 
@@ -54,7 +55,7 @@ def Session():
         # Attempts on one account take turns (sign_in_lockout.take_turn), here the database's write lock:
         # a long enough wait for it that a burst of slow checks queues rather than gives up.
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'lockout.db'}", connect_args={"timeout": 120})
-        for model in (User, AuditLog, SignInLockout):
+        for model in (User, AuditLog, SignInLockout, SignInPhantom):
             model.__table__.create(engine)
         yield sessionmaker(bind=engine, autocommit=False, autoflush=False)
         engine.dispose()
@@ -525,13 +526,31 @@ class _FakeStore:
         self.values[key] = (dict(value), self.clock.t + timedelta(seconds=ttl_seconds))
 
 
-@pytest.fixture
-def clocked(Session, limits, monkeypatch):
-    """A clock the lockout reads, the cache the mimicry uses, and one attempt at a time by a name from
-    an address: what the caller sees ("wrong", or the refusal's scope and minutes left)."""
+class _CacheDown:
+    """The cache while it cannot be reached, as the real one answers then: no value can be read, a write is
+    lost, and no hold can be taken."""
+
+    def get(self, key):
+        return L._UNAVAILABLE
+
+    def set(self, *a, **k):
+        pass
+
+    def hold(self, key):
+        return None
+
+    def release(self, key, token):
+        pass
+
+
+@pytest.fixture(params=["cache", "cache down"])
+def clocked(request, Session, limits, monkeypatch):
+    """A clock the lockout reads, the cache the mimicry uses (or, for "cache down", a cache that cannot be
+    reached, so names that are no account are counted in the database), and one attempt at a time by a
+    name from an address: what the caller sees ("wrong", or the refusal's scope and minutes left)."""
     clock = _Clock()
     monkeypatch.setattr(L, "utcnow", lambda: clock.t)
-    store = _FakeStore(clock)
+    store = _FakeStore(clock) if request.param == "cache" else _CacheDown()
     monkeypatch.setattr(L, "_phantom_store", lambda: store)
     _add_user(Session, username="real-person")
 
@@ -879,6 +898,72 @@ def test_a_name_that_is_no_account_meets_the_same_budget_in_a_burst(Session, lim
     backstop_checks = THRESHOLD * MULTIPLE * 0.4
     assert real_took >= backstop_checks and nobody_took >= backstop_checks, (real_took, nobody_took)
     assert checked.running["most"] == 1, "neither ran two checks at once"
+
+
+def test_with_the_cache_down_a_name_that_is_no_account_meets_the_same_budget_in_a_burst(Session, limits,
+                                                                                        monkeypatch):
+    # An account's counts are in the database and go on while the cache is down; a name's are taken there
+    # too, under its turn in the database, so a burst on each is refused at the same count, one check at a time.
+    monkeypatch.setattr(L, "_phantom_store", lambda: _CacheDown())
+    _add_user(Session, username="real-person")
+    checked = _slow_checks(monkeypatch, seconds=0.2)
+    real = _burst(Session, "real-person", BURST)
+    nobody = _burst(Session, "nobody-here", BURST)
+    assert real == nobody, (real, nobody)
+    assert nobody.count("wrong") == THRESHOLD * MULTIPLE
+    assert checked.running["most"] == 1, "two checks ran at once"
+
+
+def _phantom_rows(Session):
+    s = Session()
+    try:
+        return {r.key: r.expires_at for r in s.query(SignInPhantom).all()}
+    finally:
+        s.close()
+
+
+class _ReachableStore(_FakeStore):
+    """The fake cache, reachable: it gives a hold on a name, as the real one does."""
+
+    def hold(self, key):
+        return "token"
+
+    def release(self, key, token):
+        pass
+
+
+@pytest.mark.parametrize("cache", ["reachable", "down"])
+def test_a_names_count_is_kept_in_the_database_only_while_the_cache_is_down_and_pruned_when_unread(
+        Session, limits, monkeypatch, cache):
+    clock = _Clock()
+    monkeypatch.setattr(L, "utcnow", lambda: clock.t)
+    store = _ReachableStore(clock) if cache == "reachable" else _CacheDown()
+    monkeypatch.setattr(L, "_phantom_store", lambda: store)
+    s = Session()
+    svc = A.AuthService(s)
+    svc._check_rate_limit = lambda *a, **k: None
+    with pytest.raises(A.InvalidCredentialsError):
+        svc.authenticate_user("nobody-here", "a-guess", ATTACKER)
+    s.close()
+    rows = _phantom_rows(Session)
+    if cache == "reachable":
+        assert rows == {}, "the database is used only while the cache cannot be reached"
+        return
+    # The address's count and the count from everywhere, by the name's keyed stand-in, never the name.
+    assert len(rows) == 2 and not any("nobody-here" in key for key in rows), rows
+    assert min(rows.values()) > clock.t, rows
+    clock.t = min(rows.values()) - timedelta(seconds=1)
+    s = Session()
+    L.prune_stale(s)
+    s.commit()
+    s.close()
+    assert _phantom_rows(Session) == rows, "a count still read is kept"
+    clock.t = max(rows.values())
+    s = Session()
+    L.prune_stale(s)
+    s.commit()
+    s.close()
+    assert _phantom_rows(Session) == {}
 
 
 def test_attempts_on_one_account_are_checked_one_at_a_time(Session, limits, monkeypatch):

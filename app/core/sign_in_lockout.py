@@ -59,8 +59,9 @@ What a lock does, and does not do:
 Names that are no account are counted the same way in the cache (the "phantom" functions), with the
 same counts and the same lock timing, one attempt after another through their stand-in password check
 (phantom_attempt: a hold on the name in the cache is its turn), so being refused, for how long, and how
-long a burst of attempts takes, tell nobody whether an account by that name exists. That mimicry fails
-open: while the cache is down, an unknown name is simply never refused by it.
+long a burst of attempts takes, tell nobody whether an account by that name exists. While the cache
+cannot be reached they are counted the same way in the database (sign_in_phantoms), so an outage does
+not tell them apart either.
 
 Nothing here commits: the caller's transaction carries each count, lock and audit row.
 """
@@ -71,7 +72,7 @@ from typing import Dict, Iterable, NamedTuple, Optional
 
 from sqlalchemy import text, update
 
-from app.core.models import RoleEnum, SignInLockout, User
+from app.core.models import RoleEnum, SignInLockout, SignInPhantom, User
 
 ACCOUNT_WIDE = "*"
 SCOPE_ADDRESS = "address"
@@ -106,6 +107,9 @@ BUSY_RETRY_SECONDS = 5
 # The class of the account's turn among the database's advisory locks: stable and arbitrary, distinct
 # from every other (app/services/auth_service.py holds another). The account's id, hashed, is the key.
 _TURN_LOCK_CLASS = 0x5349
+# The class of a name's turn when the name is no account and the cache cannot be reached (phantom_attempt,
+# _DatabaseStore). The name's keyed stand-in, hashed, is the key.
+_PHANTOM_TURN_LOCK_CLASS = 0x5350
 
 
 class Busy(Exception):
@@ -235,15 +239,22 @@ def take_turn(db, user_id) -> None:
     the connection's lock_timeout, raised to TURN_WAIT_SECONDS for this one statement. Elsewhere (the
     tests' SQLite) it is the database's write lock, taken by a first write that changes nothing; it too
     ends with the transaction."""
+    _wait_for_turn(db, _TURN_LOCK_CLASS, str(user_id),
+                   "UPDATE sign_in_lockouts SET failed_attempts = failed_attempts WHERE 1 = 0")
+
+
+def _wait_for_turn(db, lock_class, key, write_nothing) -> None:
+    """take_turn's wait, for any turn: a transaction-scoped advisory lock of ``lock_class`` on ``key``
+    on PostgreSQL, elsewhere the database's write lock, taken by ``write_nothing``. Raises Busy, with
+    the transaction rolled back, when it did not come within TURN_WAIT_SECONDS."""
     if db.get_bind().dialect.name != "postgresql":
-        db.execute(text("UPDATE sign_in_lockouts SET failed_attempts = failed_attempts WHERE 1 = 0"))
+        db.execute(text(write_nothing))
         return
     from sqlalchemy.exc import OperationalError
     was = db.execute(text("SELECT current_setting('lock_timeout')")).scalar()
     db.execute(text("SELECT set_config('lock_timeout', :wait, true)"), {"wait": f"{int(TURN_WAIT_SECONDS)}s"})
     try:
-        db.execute(text("SELECT pg_advisory_xact_lock(:cls, hashtext(:account))"),
-                   {"cls": _TURN_LOCK_CLASS, "account": str(user_id)})
+        db.execute(text("SELECT pg_advisory_xact_lock(:cls, hashtext(:key))"), {"cls": lock_class, "key": key})
     except OperationalError as exc:
         db.rollback()
         if getattr(getattr(exc, "orig", None), "pgcode", None) == "55P03":   # lock_not_available
@@ -438,13 +449,15 @@ def release_expired(db, *, user_id=None, ip_address=None, now=None) -> int:
 def prune_stale(db, *, now=None) -> int:
     """Drop counts that hold no lock and have nothing left to count: an account-wide count that has
     lost every failure (it holds at most the backstop, and loses all of them within ACCOUNT_PERIOD of
-    window_start), and an address count untouched for a day. Keeps the table small."""
+    window_start), and an address count untouched for a day. Keeps the table small. A name's count kept
+    in the database (sign_in_phantoms) goes when it is no longer read, as it would leave the cache."""
     now = now or utcnow()
     tbl = SignInLockout
     removed = db.query(tbl).filter(tbl.locked_at.is_(None), tbl.source == ACCOUNT_WIDE,
                                    tbl.window_start < now - ACCOUNT_PERIOD).delete(synchronize_session=False)
     removed += db.query(tbl).filter(tbl.locked_at.is_(None), tbl.source != ACCOUNT_WIDE,
                                     tbl.last_failure_at < now - STALE_ADDRESS_COUNT).delete(synchronize_session=False)
+    removed += db.query(SignInPhantom).filter(SignInPhantom.expires_at <= now).delete(synchronize_session=False)
     return removed
 
 
@@ -499,9 +512,12 @@ def blocks_by_user(db, user_ids: Iterable, *, now=None) -> Dict:
 #     the lockout duration or until the count has lost a failure;
 #   * a lock whose time ran out is released at the next attempt (address: the count goes with it;
 #     account-wide: the count stays), as release_expired does for an account.
-# Each state is one small JSON value in the cache, kept as long as the database row would be. The
-# mimicry fails open: while the cache cannot be read or written, a name that is no account is never
-# refused by it.
+# Each state is one small JSON value in the cache, kept as long as the database row would be. While the
+# cache cannot be reached, an attempt is counted the same way in the database instead (sign_in_phantoms,
+# _DatabaseStore), so a name that is no account is still refused where an account would be: an account's
+# counts are in the database, and do not stop while the cache is down. A count made in the cache is not
+# read from the database, nor the other way round, so the count a name had when the cache went (or came
+# back) starts again; an account's carries on.
 
 PHANTOM_PREFIX = "login_phantom"
 # How long a phantom lock with no end (a lockout duration of 0) is kept. An account's lasts until an
@@ -552,7 +568,7 @@ class _CacheStore:
     def hold(self, key):
         """Take ``key`` for one attempt, waiting up to WAIT_SECONDS while another attempt holds it: what
         its turn is to an account (take_turn). Returns the token to let it go with, or None when the
-        cache cannot be reached, and the attempt goes on without it: the mimicry fails open. Raises
+        cache cannot be reached: the attempt is then taken in the database (phantom_attempt). Raises
         Busy when the wait ran out, as an account's turn does."""
         import secrets
         import time
@@ -586,6 +602,46 @@ class _CacheStore:
         redis_guard.best_effort("sign_in_lockout.phantom_release", _release)
 
 
+class _DatabaseStore:
+    """The mimicry's state in the database (sign_in_phantoms), for an attempt made while the cache cannot be
+    reached: the same values under the same keys, kept as long, written in the caller's transaction, which
+    commits them with the attempt as an account's count is committed with its failure. Its hold is the
+    name's turn in the database, as an account's is (take_turn), and lasts until that transaction ends."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def get(self, key):
+        import json
+        row = (self.db.query(SignInPhantom.state, SignInPhantom.expires_at)
+               .filter(SignInPhantom.key == key).first())
+        if row is None or row[1] <= utcnow():
+            return None
+        try:
+            value = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def set(self, key, value: dict, ttl_seconds: int) -> None:
+        import json
+        tbl = SignInPhantom.__table__
+        stmt = _insert(self.db)(tbl).values(key=key, state=json.dumps(value),
+                                            expires_at=utcnow() + timedelta(seconds=max(1, int(ttl_seconds))))
+        self.db.execute(stmt.on_conflict_do_update(
+            index_elements=[tbl.c.key], set_={"state": stmt.excluded.state, "expires_at": stmt.excluded.expires_at}))
+
+    def hold(self, key):
+        """Wait for the name's turn: raises Busy, with the transaction rolled back, when it did not come in
+        time. The transaction's end lets it go."""
+        _wait_for_turn(self.db, _PHANTOM_TURN_LOCK_CLASS, key,
+                       "UPDATE sign_in_phantoms SET expires_at = expires_at WHERE 1 = 0")
+        return key
+
+    def release(self, key, token) -> None:
+        """Nothing to do: the turn ends with the caller's transaction."""
+
+
 def _phantom_store():
     return _CacheStore()
 
@@ -610,14 +666,15 @@ def _phantom_ended(state, now) -> bool:
     return bool(state) and bool(state.get("locked")) and not _phantom_in_force(state, now)
 
 
-def phantom_failure(identifier, address, *, now=None) -> None:
+def phantom_failure(identifier, address, *, now=None, store=None) -> None:
     """Count a wrong sign-in for a name that is no account, the way record_failure counts one for an
-    account (see the section comment above). Best-effort: never raises."""
+    account (see the section comment above), in ``store`` (the cache unless given). Best-effort: never
+    raises."""
     try:
         threshold, backstop, _window, minutes = limits()
         now = now or utcnow()
         until = now + timedelta(minutes=minutes) if minutes > 0 else None
-        store = _phantom_store()
+        store = store or _phantom_store()
         by_address, account_wide = _phantom_keys(identifier, address)
 
         state = store.get(by_address)
@@ -666,13 +723,13 @@ def phantom_failure(identifier, address, *, now=None) -> None:
         pass
 
 
-def phantom_lock(identifier, address, *, now=None) -> Optional[Lock]:
+def phantom_lock(identifier, address, *, now=None, store=None) -> Optional[Lock]:
     """The lock a name that is no account is refused with: the account-wide one if in force, else the
-    address's, as lock_in_force answers for an account. None when neither is, or when the cache cannot
-    be read."""
+    address's, as lock_in_force answers for an account, read from ``store`` (the cache unless given). None
+    when neither is, or when the store cannot be read."""
     try:
         now = now or utcnow()
-        store = _phantom_store()
+        store = store or _phantom_store()
         by_address, account_wide = _phantom_keys(identifier, address)
         for key, scope, source in ((account_wide, SCOPE_ACCOUNT, ACCOUNT_WIDE),
                                    (by_address, SCOPE_ADDRESS, source_of(address))):
@@ -686,14 +743,18 @@ def phantom_lock(identifier, address, *, now=None) -> Optional[Lock]:
     return None
 
 
-def phantom_attempt(identifier, address, check, *, now=None) -> Optional[Lock]:
+def phantom_attempt(identifier, address, check, *, now=None, db=None) -> Optional[Lock]:
     """A sign-in attempt for a name that is no account, taken as an account's attempt is: under a hold
     on the name in the cache (its turn), refused as phantom_lock refuses it, or else ``check`` is run
     (the stand-in password check, which is always wrong) and counted as phantom_failure counts a
     failure. So attempts arriving at once are checked one after another, as an account's are, and meet
     the refusal at the same count. Returns the refusing lock, or None once the check ran and was
-    counted. Raises Busy when the hold did not come in time, as an account's turn does; otherwise it
-    never raises, and while the cache is down it fails open (checked, never refused, not counted)."""
+    counted. Raises Busy when the hold did not come in time, as an account's turn does.
+
+    While the cache cannot be reached, the attempt is taken the same way in the database, in ``db``'s
+    transaction (the caller commits it, which also ends the turn): an account's counts are there, and go
+    on while the cache is down, so a name's must too. Without ``db`` it fails open then (checked, never
+    refused, not counted)."""
     store = _phantom_store()
     key = token = None
     hold = getattr(store, "hold", None)
@@ -706,12 +767,15 @@ def phantom_attempt(identifier, address, check, *, now=None) -> Optional[Lock]:
             raise
         except Exception:  # noqa: BLE001 - the mimicry is best-effort
             token = None
+        if token is None and key is not None and db is not None:
+            store = _DatabaseStore(db)
+            token = store.hold(key)           # Busy, or a database error, as an account's turn raises
     try:
-        lock = phantom_lock(identifier, address, now=now)
+        lock = phantom_lock(identifier, address, now=now, store=store)
         if lock is not None:
             return lock
         check()
-        phantom_failure(identifier, address, now=now)
+        phantom_failure(identifier, address, now=now, store=store)
         return None
     finally:
         if token is not None:

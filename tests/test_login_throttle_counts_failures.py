@@ -224,7 +224,7 @@ def test_a_right_password_gives_back_its_own_charge_and_not_the_failures(Session
 
 def test_a_name_that_is_no_account_keeps_its_charges(Session, limits, cache, monkeypatch):
     from app.core import sign_in_lockout as L
-    monkeypatch.setattr(L, "phantom_attempt", lambda name, address, check: (check(), None)[1])
+    monkeypatch.setattr(L, "phantom_attempt", lambda name, address, check, **kw: (check(), None)[1])
     assert [_sign_in(Session, "nobody-here", "x") for _ in range(LIMIT + 1)] == [401] * LIMIT + [429]
 
 
