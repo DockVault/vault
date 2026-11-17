@@ -238,6 +238,10 @@ redis_client = _RedisClientProxy()
 
 _monitor_redis_client = None
 
+# The live sockets' pool: one connection for each open socket in this process (monitor_redis_client). 100 is
+# also redis-py's own default for a pool; it is stated here so that the limit does not change with the library.
+MONITOR_MAX_CONNECTIONS = 100
+
 
 def monitor_redis_client():
     """A client of its own for the live sockets' subscriptions (app/core/monitor_feed.py): the same settings as
@@ -248,8 +252,12 @@ def monitor_redis_client():
         _require_redis_client()
         with _consumer_lock:
             if _monitor_redis_client is None:
-                # A client of its own makes a connection pool of its own.
-                _monitor_redis_client = redis.Redis(**_cache_settings())
+                # A client of its own makes a connection pool of its own. Each open live socket that subscribes
+                # holds one of its connections for as long as it stays open, so the pool's size is how many such
+                # sockets the process serves at once: past it, a new socket fails to subscribe, and the server's
+                # Redis commands keep their own pool. (The sockets' polls do share the server's default thread
+                # pool with other work run off the event loop.)
+                _monitor_redis_client = redis.Redis(**_cache_settings(), max_connections=MONITOR_MAX_CONNECTIONS)
     return _monitor_redis_client
 
 
