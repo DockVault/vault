@@ -236,6 +236,36 @@ def test_a_stored_codes_map_without_one_of_its_fields_is_refused_and_the_code_ke
     assert o.verify(db, purpose="email_change", user_id="u7", code=code, pepper=PEP, redis=r).ok
 
 
+class _ExpiringRedis(FakeRedis):
+    """The fake Redis, recording the expiry each key is given."""
+
+    def __init__(self):
+        super().__init__()
+        self.ttl = {}
+
+    def expire(self, k, ttl):
+        self._guard()
+        self.ttl[k] = ttl
+
+    def delete(self, k):
+        self.ttl.pop(k, None)
+        return super().delete(k)
+
+
+def test_a_strike_that_lands_after_the_code_is_gone_leaves_a_key_that_expires():
+    """Two guesses read the code at once; the right one consumes it, then the wrong one strikes. The strike creates
+    the key again holding only its count, which must lapse as the code would have, not stay for good."""
+    r, db = _ExpiringRedis(), FakeDB()
+    code = o.issue(db, purpose="email_change", user_id="u8", destination="d", ttl_minutes=5, pepper=PEP, redis=r)
+    key = o.redis_key("email_change", "u8")
+    stale = o._redis_load(r, "email_change", "u8")          # the wrong guess's read, before the right one lands
+    assert o.verify(db, purpose="email_change", user_id="u8", code=code, pepper=PEP, redis=r).ok
+    assert key not in r.h and key not in r.ttl
+    wrong = o._redis_consume_verify(r, "email_change", "u8", o.hash_code("bad", PEP), stale)
+    assert wrong.reason == "invalid" and r.h[key] == {"attempts": "1"}
+    assert 0 < r.ttl.get(key, 0) <= 5 * 60 + o._REDIS_GRACE_SECONDS, r.ttl
+
+
 # ---- DB fallback path (Redis down at issue) ------------------------------------------------------
 def test_issue_falls_back_to_db_when_redis_is_down():
     down, db = FakeRedis(down=True), FakeDB()

@@ -75,7 +75,7 @@ _REGISTRY = {
     },
     "core/otp_service.py": {
         "_redis_put": ("C", 4), "_redis_load": ("C", 1),
-        "_redis_delete": ("C", 1), "_redis_consume_verify": ("C", 2),
+        "_redis_delete": ("C", 1), "_redis_consume_verify": ("C", 3),
     },
     "services/activity_monitor.py": {
         "broadcast_sync": ("D", 1), "start_operation": ("D", 1), "complete_operation": ("D", 1),
