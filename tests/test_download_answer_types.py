@@ -544,6 +544,10 @@ def test_the_stored_type_goes_out_as_it_is_only_to_a_signed_in_user():
     servers = sorted(fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
                      for c in _calls(fn) if _name(c.func) == "_serve_file")
     assert servers == ["download_file", "preview_file"]
+    # Who may read through each: the download route never opens a view-only share's claim, whatever its purpose.
+    opens = {route: [ast.unparse(k.value) for c in _calls(_function(tree, route)) if _name(c.func) == "_serve_file"
+                     for k in c.keywords if k.arg == "view_only_ok"] for route in servers}
+    assert opens == {"download_file": ["False"], "preview_file": ["True"]}, opens
     for route in servers:
         signed_in = _function(tree, route)
         defaults = dict(zip([a.arg for a in signed_in.args.args][-len(signed_in.args.defaults):],

@@ -34,6 +34,13 @@ def test_the_view_only_option_says_what_a_recipient_can_do():
         assert "browser but not download them" not in page
         assert "(no download)" not in page and "in the browser, no download)" not in page
     assert "<span>Allow view-only shares (no Download button)</span>" in html
+    # The words the dialog sets for the chosen tag (static/js/app.js) are the same as the page's own.
+    label = _read("static/js/app.js").split("function _shareViewOnlyLabel(t) {", 1)[1].split("\n}\n", 1)[0]
+    assert "? 'View only (recipients can view files in the browser, with no Download button)'" in label
+    assert ('? "A preview sends the file to their browser to show it, so it cannot stop them keeping a copy (from the '
+            "browser's own viewer, or a screenshot). It removes the Download button, and each preview spends their "
+            'preview allowance, counted apart from downloads."') in label
+    assert ">A preview sends the file to their browser to show it, so it cannot stop them keeping a copy" in html
     assert "' View only (preview in the browser, no Download button)'" in _read("static/js/app.js")
 
 

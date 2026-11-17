@@ -5,9 +5,9 @@ as "File download started" and "File download finished". The route now takes ``p
 a preview: the content was sent to the browser for a preview (file_previewed, then file_preview_completed; a ranged
 read, which is how the text window reads the start of a large file, ends in a file_previewed row too). It is also
 answered as the preview route answers (inline, never cached, the preview's headers and types), and a capped share
-spends its recipient's preview allowance, counted apart from downloads. Every gate and the transfer slot are exactly
-a download's, and a view-only share's recipient is still refused on this route: a preview discloses the content as
-a download does, and the word from the client never opens what a download would not.
+spends its recipient's preview allowance, counted apart from downloads. Who may read, and the transfer slot, are a
+download's: a view-only share's recipient is still refused on this route. A preview discloses the content as a
+download does, and the word from the client never opens what the preview route would not.
 """
 import os
 import subprocess
