@@ -74,8 +74,8 @@ def test_invite_modal_shows_link_once_and_lists_pending(page: Page, admin, admin
         row = page.locator(f'#invites-list .invite-row:has-text("{uname}")')
         expect(row).to_contain_text("pending")
         row.locator('button:has-text("Revoke")').click()
-        # after revoke the row is no longer pending (either drops from the list or flips status)
-        expect(page.locator(f'#invites-list .invite-row:has-text("{uname}")')).not_to_contain_text("pending", timeout=10000)
+        # after revoke the invitation is no longer pending, and the list shows only pending ones
+        expect(page.locator(f'#invites-list .invite-row:has-text("{uname}")')).to_have_count(0, timeout=10000)
     finally:
         # clean up any invite left for this username
         for inv in admin.get("/invites").json():

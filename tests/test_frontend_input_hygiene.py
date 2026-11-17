@@ -6,9 +6,10 @@ Two complementary layers, both defence-in-depth against markup injection into op
 1. Server-side: name fields (vault/user/group/file) reject angle brackets + control characters at
    the source, and group chip colours are constrained to a strict #hex or a named palette preset.
    These run against the live instance.
-2. Client-side: the DOM render paths that were previously unescaped now pass their user-controlled
-   values through escapeHtml() / a strict hex validator, and the login flow no longer logs the
-   bearer token to the console. These are asserted against the shipped static/js/app.js source.
+2. Client-side: the render paths build their markup with DOM calls that set text (or pass a colour
+   through a strict hex validator), and the login flow no longer logs the bearer token to the
+   console. These are asserted against the shipped static/js source, need no stack, and are marked
+   unit so the offline lane runs them.
 """
 from pathlib import Path
 
@@ -105,6 +106,7 @@ def test_hostile_origin_gets_no_cors_grant(admin):
 # --------------------------------------------------------------------------------------------------
 # Client-side output encoding (shipped app.js source)
 # --------------------------------------------------------------------------------------------------
+@pytest.mark.unit
 def test_audit_log_serialised_details_are_escaped():
     # The Activity page's event detail renders the serialised details blob into a <pre> through el(),
     # which sets textContent (never innerHTML or string interpolation), so an attacker-influenced value
@@ -120,20 +122,32 @@ def test_audit_log_serialised_details_are_escaped():
     assert "JSON.stringify(log.details" not in APP_JS
 
 
+@pytest.mark.unit
 def test_dashboard_feed_username_and_action_escaped():
-    assert "${escapeHtml(event.username || 'System')}" in APP_JS
-    assert "${escapeHtml(event.description || event.action)}" in APP_JS
-    # The whole feed template is uniformly escaped — the details branch too (no raw ${event.details}).
-    assert "${escapeHtml(event.details)}" in APP_JS
-    assert '<div class="event-details">${event.details}</div>' not in APP_JS
+    # The feed is built with DOM calls only: the person as a chip (or the text 'System'), and the action and the
+    # details as text, so nothing an event carries is read as markup.
+    start = APP_JS.index("async function loadRecentEvents() {")
+    feed = APP_JS[start:APP_JS.index("\n}\n", start)]
+    for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+        assert sink not in feed, sink
+    assert ("if (event.username) who.appendChild(People.chip({ id: event.user_id, username: event.username }, "
+            "{ small: true }));\n            else who.textContent = 'System';") in feed
+    assert "head.appendChild(_el('span', 'event-action', event.description || event.action || ''));" in feed
+    assert "if (event.details) item.appendChild(_el('div', 'event-details', String(event.details)));" in feed
+    # _el sets text, never markup.
+    helper = APP_JS[APP_JS.index("function _el(tag, cls, text) {"):]
+    helper = helper[:helper.index("\n}\n")]
+    assert "if (text != null) e.textContent = text;" in helper and "HTML" not in helper
 
 
+@pytest.mark.unit
 def test_chip_colour_is_strict_hex_validated():
     # chipColorValue must not hand a raw '#'-prefixed value straight into the style attribute.
     assert "CHIP_HEX_RE" in APP_JS
     assert "if (color.charAt(0) === '#') return color;" not in APP_JS
 
 
+@pytest.mark.unit
 def test_login_flow_does_not_log_bearer_token():
     assert "console.log('Auth token:'" not in APP_JS
     assert "Auth token:" not in APP_JS
