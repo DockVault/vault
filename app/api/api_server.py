@@ -24228,6 +24228,10 @@ async def _serve_file(vault_id, file_id, request, file_password, current_user, d
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
         )
+    except RateLimitExceededError as e:
+        # Too many wrong vault or file passwords: refused before any password was read, with 429 as everywhere
+        # else (the generic handler below answered it with 500). Like a wrong password, it keeps a burned share.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (VaultNotFoundError, FolderNotFoundError, FileNotFoundError) as e:
         # A missing vault / folder / file is a clean 404. VaultNotFoundError and
         # FolderNotFoundError are FileServiceError SIBLINGS of FileNotFoundError, so they must be named
@@ -24603,6 +24607,9 @@ async def preview_render_file(
         return resp
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except RateLimitExceededError as e:
+        # Too many wrong file passwords: 429, as everywhere else (the clause below answered it with 404).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (FileNotFoundError, FileServiceError):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     except PermissionDeniedError as e:

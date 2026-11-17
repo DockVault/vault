@@ -1327,9 +1327,31 @@ class VaultService:
         # Create physical directory, synced into its parent (see durable_write).
         folder_path = self._get_folder_path(vault_id, folder.id)
         durable_write.make_directories(folder_path)
-        
+
         return folder
-    
+
+    def _check_own_password(self, kind: str, item, user: User, supplied: Optional[str]) -> None:
+        """A file's or a folder's own password (``kind`` is "file" or "folder"), under the vault password's
+        attempt limit: the same limit and window (rate_limit_vault_attempts, or ..._admin for an administrator,
+        and rate_limit_vault_window_seconds) and the same fail-closed, failure-only counter
+        (app/core/vault_attempt_throttle.py), counted per file or folder and account. At the limit every attempt
+        is refused before any password is read, the right one included, until the window ends; only a wrong
+        password counts. A temporary session runs as its account and shares the account's count."""
+        from app.core.models import RoleEnum
+        from app.core import rate_limit_settings
+        from app.core import vault_attempt_throttle
+        rate_key = f"rate_limit:{kind}:{item.id}:{user.id}"
+        limit = rate_limit_settings.effective(
+            "rate_limit_vault_attempts_admin" if user.role == RoleEnum.ADMIN else "rate_limit_vault_attempts")
+        window = rate_limit_settings.effective("rate_limit_vault_window_seconds")
+        if vault_attempt_throttle.over_limit(rate_key, limit, window):
+            raise RateLimitExceededError(f"Too many {kind} password attempts. Please try again later.")
+        if not supplied:
+            raise PasswordRequiredError(f"{kind.capitalize()} password is required")
+        if not verify_password(supplied, item.password_hash):
+            vault_attempt_throttle.burn(rate_key, window)
+            raise InvalidPasswordError(f"Invalid {kind} password")
+
     def get_folder(
         self,
         folder_id: uuid.UUID,
@@ -1365,14 +1387,10 @@ class VaultService:
             user, folder.vault_id, VaultPermissionEnum.READ
         )
         
-        # Check folder password if set
+        # Check folder password if set, under the vault password's attempt limit
         if folder.password_hash:
-            if not folder_password:
-                raise PasswordRequiredError("Folder password is required")
-            
-            if not verify_password(folder_password, folder.password_hash):
-                raise InvalidPasswordError("Invalid folder password")
-        
+            self._check_own_password("folder", folder, user, folder_password)
+
         return folder
     
     def upload_file(
@@ -2149,13 +2167,9 @@ class VaultService:
             else:
                 require_download_scope(self.db, user, file.vault_id, file_id)
 
-        # Check file password if set
+        # Check file password if set, under the vault password's attempt limit
         if file.password_hash:
-            if not file_password:
-                raise PasswordRequiredError("File password is required")
-
-            if not verify_password(file_password, file.password_hash):
-                raise InvalidPasswordError("Invalid file password")
+            self._check_own_password("file", file, user, file_password)
 
         # Get vault for decryption
         vault = self.db.query(Vault).filter(Vault.id == file.vault_id).first()
