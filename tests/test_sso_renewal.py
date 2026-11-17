@@ -407,6 +407,7 @@ def test_an_account_with_a_password_keeps_its_own_session_whatever_its_provider_
 # --------------------------------------------------------------------------- which time the limit counts from
 
 LIMIT = "You have been signed in for as long as this vault allows at a stretch; sign in again."
+ADMINISTRATORS = "Administrators sign in with their password. Sign in again."
 
 
 def test_a_provider_session_days_old_still_renews_within_the_vaults_own_limit(db):
@@ -431,3 +432,29 @@ def test_the_limit_ends_a_provider_sign_in_by_the_vaults_time_however_fresh_the_
         sign_in.renew(db, user, {**old, "auth_time": now - 25 * 3600}, client_ip="127.0.0.1")
     assert refused.value.status_code == 403 and refused.value.detail == LIMIT
     assert _untouched(db)
+
+
+# --------------------------------------------------------------------------- a promotion since the sign-in
+
+def test_a_provider_session_is_not_renewed_once_the_account_is_an_administrator(db):
+    """An administrator always types the password, after a provider too. The session the provider made for the
+    account before its promotion would stop at the password step if made now, so it is not kept going."""
+    provider = _provider(db, sso_trust_idp_mfa=True)
+    user, identity, old = _through(db, provider, mfa_at=1)
+    user.role = RoleEnum.ADMIN
+    db.commit()
+    with pytest.raises(HTTPException) as refused:
+        sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    assert refused.value.status_code == 403 and refused.value.detail == ADMINISTRATORS
+    assert _untouched(db)
+    # The provider and then the password, what an administrator gives: renewed.
+    assert sign_in.renew(db, user, {**old, "amr": ["pwd"]}, client_ip="127.0.0.1").access_token
+
+
+def test_a_passkey_given_after_a_provider_is_the_second_factor_not_a_passkey_alone(db, monkeypatch):
+    provider = _provider(db)
+    user, identity, old = _through(db, provider, amr=["swk"], mfa_at=1)
+    asked = []
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, user: asked.append(1) or False)
+    assert sign_in.renew(db, user, old, client_ip="127.0.0.1").access_token
+    assert asked == []
