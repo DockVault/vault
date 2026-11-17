@@ -8392,14 +8392,17 @@ async def second_factor_login_verify(
     db: Session = Depends(get_db),
 ):
     """The login second step: verify the factor for action=login with the pre-auth token, then mint the
-    real session + full JWT. Bounded by a fail-CLOSED rate limit AND a DURABLE per-attempt cap on the
-    pending row, so online guessing is capped even during a Redis outage."""
+    real session + full JWT. Bounded by a fail-CLOSED rate limit (refused with 503 while it cannot count)
+    AND a DURABLE per-attempt cap on the pending row, which a Redis restart does not reset."""
     from app.core import second_factor as sf
-    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     user, pending = principal
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{user.id}",
-                                             limit=10, window=300, prefix="sf_login_verify", fail_open=False)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{user.id}",
+                                                 limit=10, window=300, prefix="sf_login_verify", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed:
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -8527,18 +8530,22 @@ async def second_factor_step_up(
     db: Session = Depends(get_db),
 ):
     """Verify every factor `action` requires of the caller and mint a single session-bound receipt to
-    present back in X-Second-Factor. Bounded by a fail-CLOSED rate limit."""
+    present back in X-Second-Factor. Bounded by a fail-CLOSED rate limit (refused with 503 while it cannot
+    count)."""
     from app.core import second_factor as sf
     from app.core import second_factor_actions as acts
     from app.core.security import verify_password
-    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot perform a step-up.")
     if not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{current_user.id}",
-                                             limit=10, window=300, prefix="sf_step_up", fail_open=False)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=f"{source_of(client_ip)}:{current_user.id}",
+                                                 limit=10, window=300, prefix="sf_step_up", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed:
         import time as _t
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,

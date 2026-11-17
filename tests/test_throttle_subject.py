@@ -500,6 +500,23 @@ def test_every_public_route_budget_keys_one_subject_per_client(monkeypatch):
             assert m[prefix] == p[prefix] and "198.51.100.7" in p[prefix], (fn.__name__, prefix, m, p)
 
 
+def test_every_public_route_budget_answers_503_while_the_limiter_cannot_count(monkeypatch):
+    """Each of these budgets fails closed: while the limiter cannot count (Redis down, or its breaker open), the
+    route refuses with 503 and goes no further, never with 500. The second-factor sign-in step and the step-up let
+    the limiter's own error through, which the server answered with 500."""
+    from fastapi import HTTPException
+    from app.core import rate_limiter as RL
+
+    def _cannot_count(*a, **kw):
+        raise RL.RateLimiterUnavailable("down")
+
+    monkeypatch.setattr(RL.rate_limiter, "check_rate_limit", _cannot_count)
+    for fn, kwargs, _prefixes in _routes():
+        with pytest.raises(HTTPException) as refused:
+            run_coroutine(fn(request=_request(PLAIN), db=None, **kwargs))
+        assert refused.value.status_code == 503, (fn.__name__, refused.value.status_code, refused.value.detail)
+
+
 def test_every_compliance_step_up_counts_one_subject_per_client(monkeypatch):
     """The steps of compliance access are earned at the same step-up route as any other action, on the same
     budget: two addresses in one /64 share it and another /64 has its own, for each of the steps."""
