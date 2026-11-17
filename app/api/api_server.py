@@ -8992,8 +8992,11 @@ def _ws_session_invalid(session_token: str, user_id: str, is_temporary: bool) ->
             revoked, is_active = row
             if revoked:
                 return True
+            # A temporary credential's session that is no longer active (_revoke_sessions) ends it as a revoked one
+            # does. A regular session's row can be inactive while the session is valid (superseded by another
+            # sign-in, or idle): as for every other request, only `revoked` ends it.
             if is_temporary and not is_active:
-                return True  # temp credential invalidated (_revoke_sessions flips is_active)
+                return True
             u = db.query(_U).filter(_U.id == uuid.UUID(user_id)).first()
             # Only an administrator's lock ends a live session; an automatic one never does.
             if not u or not u.is_active or admin_locked(u):
@@ -9041,11 +9044,17 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
     """
     import asyncio
     from app.core.database import monitor_redis_client
-    from app.core.monitor_feed import MonitorFeed
+    from app.core.monitor_feed import MonitorFeed, SOCKET_SLOTS, TOO_MANY_SOCKETS, slot_key
+    import time as _ws_time
 
     # Accept the WebSocket connection
     await websocket.accept()
-    
+    # What this socket's place is counted against, once it holds one (given back in the finally below), and the
+    # socket's subscription, which a temporary credential's socket never has.
+    slot_of = None
+    feed = None
+    temporary_credential_id = None
+
     try:
         # Wait for authentication message (timeout after 5 seconds)
         try:
@@ -9095,6 +9104,8 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             # (a revoked ADMIN token would stream the whole fleet feed).
             session_token = payload.get("session_token")
             is_temporary = payload.get("is_temporary", False)
+            # The token's end: the socket closes then, whatever the session's row says.
+            token_exp = payload.get("exp")
             if not session_token:
                 raise ValueError("Invalid token payload")
             from app.core.database import SessionLocal
@@ -9145,6 +9156,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     ).filter(_WsTC.id == _sess[1]).first()
                     if _tc is None:
                         raise ValueError("Session terminated")
+                    temporary_credential_id = _sess[1]
                     # A credential whose connection has FINISHED (slot released on close) is
                     # done: the live-monitor socket must not open for it even within validity.
                     if _tc[2] is not None:
@@ -9182,7 +9194,16 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             })
             await websocket.close(code=1008)
             return
-        
+
+        # One account holds at most SOCKETS_PER_ACCOUNT live sockets in this process; a temporary credential's
+        # sockets are counted on their own, per credential, never among the account's (slot_key).
+        if not SOCKET_SLOTS.take(slot_key(user_id, temporary_credential_id if is_temporary else None)):
+            print("[WS] live socket refused: the limit of live connections for this session's place is reached")
+            await websocket.send_json({"type": "error", "message": TOO_MANY_SOCKETS})
+            await websocket.close(code=1008)
+            return
+        slot_of = slot_key(user_id, temporary_credential_id if is_temporary else None)
+
         # Send connection success message
         await websocket.send_json({
             "type": "connected",
@@ -9202,9 +9223,13 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                 None, _ws_sees_activity, user_id, is_temporary))
 
         # Subscribe to the Redis channels. Every call on the subscription goes through the feed, one at a time,
-        # and its own client (app/core/monitor_feed.py).
-        feed = MonitorFeed(monitor_redis_client(), _socket_frames.CHANNELS)
-        await asyncio.get_event_loop().run_in_executor(None, feed.subscribe)
+        # and its own client (app/core/monitor_feed.py). A temporary credential's socket receives no frame of
+        # either channel (socket_frames.frame_for), so it subscribes to nothing and holds no connection. It answers
+        # keep-alives and closes when its session is revoked or no longer active, its account is locked, or its
+        # token ends.
+        if not is_temporary:
+            feed = MonitorFeed(monitor_redis_client(), _socket_frames.CHANNELS)
+            await asyncio.get_event_loop().run_in_executor(None, feed.subscribe)
         
         # Create tasks for sending and receiving
         async def send_events():
@@ -9215,12 +9240,16 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             # revoked session (an admin's, streaming the whole fleet feed) would keep receiving events
             # until natural expiry, and the "terminate sessions" control would not cut the live socket.
             nonlocal viewer
-            loops = 0
+            # Re-checked every five seconds by the clock: a loop takes about a tenth of a second when the
+            # executor is free, and much longer when it is busy.
+            checked_at = _ws_time.monotonic()
             while True:
                 try:
-                    loops += 1
-                    if loops >= 45:  # each loop ~0.11s -> re-check about every 5s
-                        loops = 0
+                    # The token's own end closes the socket, whatever the session's row says.
+                    if token_exp and _ws_time.time() >= token_exp:
+                        break
+                    if _ws_time.monotonic() - checked_at >= 5:
+                        checked_at = _ws_time.monotonic()
                         revoked = await asyncio.get_event_loop().run_in_executor(
                             None, _ws_session_invalid, session_token, user_id, is_temporary)
                         if revoked:
@@ -9229,6 +9258,10 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                         if viewer.sees_activity and not await asyncio.get_event_loop().run_in_executor(
                                 None, _ws_sees_activity, user_id, is_temporary):
                             viewer = viewer._replace(sees_activity=False)
+                    if feed is None:
+                        # Nothing to forward: wait as long as a poll would, then check again.
+                        await asyncio.sleep(0.11)
+                        continue
                     # Get message from Redis (non-blocking with timeout)
                     message = await asyncio.get_event_loop().run_in_executor(None, feed.poll, 0.1)
 
@@ -9292,10 +9325,13 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         except:
             pass
     finally:
+        # The socket's slot first, so nothing below can keep it from being given back.
+        if slot_of is not None:
+            SOCKET_SLOTS.give_back(slot_of)
         # Cleanup. The task that polled may be cancelled with a poll still running in its thread; the feed's
         # close waits for that poll, and no later one touches the subscription.
         try:
-            if 'feed' in locals():
+            if feed is not None:
                 await asyncio.get_event_loop().run_in_executor(None, feed.close)
         except Exception:
             pass

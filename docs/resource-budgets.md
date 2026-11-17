@@ -352,7 +352,12 @@ message, so its messages are bounded too (`app/core/websocket_guard.py`):
 - one address may open `RATE_LIMIT_WS_CONNECT` sockets (120 by default) per
   `RATE_LIMIT_WS_CONNECT_WINDOW` seconds (60), an IPv6 address counted as its /64; the HTTP rate
   limiter never sees a socket. A refused connect is closed before it opens, and the page polls until
-  it reconnects.
+  it reconnects;
+- one account holds at most ten live sockets per server process (each of its temporary credentials
+  has ten of its own), and a process serves at most 100 subscribed sockets, from a Redis connection
+  pool of their own: the server's Redis commands never share it (`app/core/monitor_feed.py`,
+  `database.monitor_redis_client`). A temporary credential's socket subscribes to nothing, so it
+  holds no connection of that pool and is not among the 100.
 
 Measured on this change: a 15 MiB first message is closed with 1009 in 0.1 s on its header, the API's
 memory rises by 0.4 MiB and `/health` keeps answering within 0.07 s. Before it, one 16 MiB message
