@@ -261,7 +261,7 @@ In memory only with the shipped compose files. Every key below expires on its ow
 | Key | Holds | Lifetime |
 |---|---|---|
 | `denylist:session:*` | Ended sessions: a session token's hash. **Gone in 0.35.1:** `session:*`, a copy of a session's id and its account's id that nothing read (the session's database row is what every request reads). | A token's remaining life. |
-| `temp_cred:<name>` | A temporary credential's ids and times. | The credential's lifetime. |
+| `temp_cred:<name>` **Gone in 0.35.1** | Was a copy of a temporary credential's ids and times that nothing read; the credential's database row is what every sign-in reads. Keys written before the upgrade lapse within the credential's lifetime. | The credential's lifetime. |
 | `otp:<purpose>:<account>` | A pending code's hash and the new email address it was sent to. | The code's lifetime. |
 | `rate_limit:login_user:<name key>\|<address>`, `rate_limit:login_ip:<address>` | Failed sign-ins per name and address, and per address. **Changed in 0.34.0:** the address is its throttle subject (an IPv6 address as its /64, an IPv4 address written as IPv6 as the IPv4 one), as in every per-address count. **Changed in 0.33.0:** the name is a keyed stand-in, 128 bits of an HMAC of it under the deployment's secret (`LOG_TOKEN_PEPPER`, else one derived from `JWT_SECRET_KEY`), which cannot be reversed or confirmed without that secret; it was the name as typed. | The login window (`RATE_LIMIT_LOGIN_WINDOW_SECONDS`, 5 minutes by default). |
 | `login_phantom:<address>\|<name key>`, `login_phantom:*\|<name key>` **New in 0.33.0** | Failed sign-ins for a name that is no account, counted and paused exactly like an account's so a refusal does not reveal whether it exists. The name is a keyed stand-in, as above. | Like the database's rows for an account: the address count, a day after its last failure or its lock's end; the account-wide count, about a day, or until its pause ends if later. A lock with no end (`ACCOUNT_LOCKOUT_MINUTES` of 0): 30 days. |
@@ -641,7 +641,8 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
 
 ## What 0.35.1 adds
 
-- The cache no longer holds `session:*`, a copy of each session's ids that nothing read.
+- The cache no longer holds `session:*`, a copy of each session's ids that nothing read, nor `temp_cred:<name>`,
+  a copy of each temporary credential's ids and times that nothing read either.
 - `sign_in_phantoms`: while the cache cannot be reached, failed sign-ins for a name that is no account are
   counted in the database as an account's are, under a keyed stand-in for the name and the source address, and
   each row goes when the cache's key would have expired. Counts do not carry between the cache and the database,

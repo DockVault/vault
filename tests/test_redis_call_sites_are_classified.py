@@ -82,7 +82,6 @@ _REGISTRY = {
         "is_cancelled": ("D", 1), "cancel_operation": ("D", 1),
     },
     "services/auth_service.py": {
-        "create_temporary_credential": ("E", 1), "mint_device_sync_credential": ("E", 1),
         "denylist_token": ("E", 1), "is_token_denylisted": ("E", 1),
     },
     "services/security_monitor.py": {

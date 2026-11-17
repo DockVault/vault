@@ -5,7 +5,6 @@ Implements secure authentication flows and session management.
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 import uuid
-import json
 import time
 import functools
 
@@ -1409,22 +1408,9 @@ class AuthService:
             self.db.rollback()
             raise
         self.db.refresh(temp_cred)
-        
-        # Store in Redis for quick expiration checks. Best-effort: the credential row is already
-        # committed above and is the source of truth (this cache is write-only — no reader falls back
-        # to the DB), so a cache outage must not 500 the mint and leave a committed, never-returned
-        # orphan counting against the caller's cap. The key is kept, not deleted.
-        redis_key = f"temp_cred:{temp_username}"
-        redis_value = json.dumps({
-            'id': str(temp_cred.id),
-            'user_id': str(user_id),
-            'deactivate_at': deactivate_at.isoformat(),
-            'expires_at': expires_at.isoformat()
-        })
-        _best_effort_cache(
-            'temp-cred.cache-write.skipped',
-            lambda: redis_client.setex(redis_key, total_lifetime * 60, redis_value))
-        
+
+        # The committed row is the credential: every sign-in and request reads it. Nothing keeps a copy
+        # of it in Redis.
         return {
             'id': str(temp_cred.id),
             'temp_username': temp_username,
@@ -1629,17 +1615,6 @@ class AuthService:
             self.db.rollback()
             raise
         self.db.refresh(temp_cred)
-
-        redis_key = f"temp_cred:{temp_username}"
-        redis_value = json.dumps({
-            'id': str(temp_cred.id),
-            'user_id': str(device.user_id),
-            'deactivate_at': deactivate_at.isoformat(),
-            'expires_at': expires_at.isoformat(),
-        })
-        _best_effort_cache(
-            'temp-cred.cache-write.skipped',
-            lambda: redis_client.setex(redis_key, total_lifetime * 60, redis_value))
 
         return {
             'id': str(temp_cred.id),

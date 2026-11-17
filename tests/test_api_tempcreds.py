@@ -491,3 +491,28 @@ def test_id_scope_stored_and_delegation_clamps(admin):
         assert _stored_scope(r2.json()["temp_username"]) == {"files": [], "folders": [D]}
     finally:
         admin.delete_vault(vid)
+
+
+def _cache_keys(pattern):
+    container = os.environ.get("VAULT_REDIS_CONTAINER", "vault-redis")
+    r = subprocess.run(["docker", "exec", container, "redis-cli", "--scan", "--pattern", pattern],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        pytest.skip(f"cannot read the stack's cache: {r.stderr.strip()[:200]}")
+    return r.stdout.split()
+
+
+def test_minting_a_temporary_credential_writes_no_copy_to_the_cache(admin, temp_vault):
+    """A temporary credential is its database row, which every sign-in and request reads. Nothing read the
+    temp_cred:<name> copy that both mints wrote to Redis, a hand-out credential and a device's sync credential,
+    so neither writes one now."""
+    from conftest import unique
+    from _device_boundary_helpers import grant, mint_sync_cred, register_device
+    handed_out = admin.post("/auth/temp-credentials", json={"note": unique("no-cache-copy")})
+    assert handed_out.status_code in (200, 201), handed_out.text
+    device = register_device(admin)
+    grant(admin, device["device_id"], temp_vault["id"])
+    synced = mint_sync_cred(device["secret"], temp_vault["id"])
+    assert synced.status_code in (200, 201), synced.text
+    for name in (handed_out.json()["temp_username"], synced.json()["temp_username"]):
+        assert _cache_keys(f"temp_cred:{name}") == [], name

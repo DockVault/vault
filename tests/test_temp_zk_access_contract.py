@@ -75,7 +75,8 @@ def test_selected_grants_are_validated_before_one_atomic_database_commit():
     assert "self.db.flush()" in method
     assert method.count("self.db.commit()") == 1
     assert method.index("self.db.flush()") < method.index("self.db.commit()")
-    assert method.index("self.db.commit()") < method.index("redis_client.setex(")
+    # The committed row is the credential; nothing writes a copy of it to Redis.
+    assert "redis_client" not in method
 
 
 def test_central_policy_has_exact_capability_and_live_state_inputs():
