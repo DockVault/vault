@@ -1,4 +1,4 @@
-FROM python:3.14-alpine@sha256:eb2c62658b8d51bff0acc408504b76521d02030de56a8a3c1e830083e89b89d2
+FROM python:3.14-alpine@sha256:5862d971d1f0ae26b258cefa4e893556b1d3aba81bd2ff30888704ad378bab67
 
 # Patch base-OS packages against the alpine security repository. The pinned base image is rebuilt
 # less often than the repo publishes fixes, so it can still carry an openssl (libcrypto3/libssl3)
