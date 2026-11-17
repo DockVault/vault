@@ -17045,6 +17045,10 @@ async def create_share(
         "allow_view_only": tag.allow_view_only, "default_view_only": tag.default_view_only,
         "force_view_only": tag.force_view_only, "allow_custom": tag.allow_custom,
     }
+    # The maker was shown a view-only share and the tag no longer allows one: it changed while the dialog was open.
+    # Neither a view-only share nor a downloadable one is what the tag and the maker now agree on.
+    if payload.view_only_shown is True and not tag.allow_view_only:
+        raise HTTPException(status_code=409, detail="this tag does not allow view-only shares")
     limits, err = sharing_policy.resolve_share_limits(tag_limits, {
         "lifetime_minutes": payload.lifetime_minutes, "max_recipients": payload.max_recipients,
         "max_downloads": payload.max_downloads, "view_only": payload.view_only,

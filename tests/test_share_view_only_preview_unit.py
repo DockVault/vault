@@ -326,6 +326,15 @@ def test_a_share_its_maker_was_shown_as_view_only_is_never_made_downloadable():
     assert narrowed in body
     # After the tag's limits are resolved, and before the share is made from them.
     assert body.index("sharing_policy.resolve_share_limits(") < body.index(narrowed) < body.index("share = Share(")
+    # A tag that no longer allows view-only refuses such a share, with the sentence a view-only request on it gets,
+    # before the tag's limits are resolved.
+    refused = ("if payload.view_only_shown is True and (not tag.allow_view_only):\n"
+               "        raise HTTPException(status_code=409, detail='this tag does not allow view-only shares')")
+    assert refused in body
+    assert body.index(refused) < body.index("sharing_policy.resolve_share_limits(")
+    from app.core import sharing_policy
+    _, err = sharing_policy.resolve_share_limits({"allow_view_only": False, "allow_custom": True}, {"view_only": True})
+    assert err == "this tag does not allow view-only shares"
     # Only ever narrowed: nothing sets view_only to False from what the maker was shown.
     assert "view_only_shown is False" not in body and "limits['view_only'] = False" not in body
     from app.api.api_server import ShareCreate

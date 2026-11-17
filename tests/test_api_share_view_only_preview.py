@@ -215,6 +215,17 @@ def test_a_share_its_maker_was_shown_as_view_only_stays_view_only(admin, sharing
         assert _share(admin, vault, free, view_only=None)["view_only"] is False
         forced = _tag(admin, force_view_only=True)
         assert _share(admin, vault, forced, view_only=None, view_only_shown=False)["view_only"] is True
+        # A tag that makes its shares view-only by its default stays so, whatever the dialog says.
+        assert _share(admin, vault, _tag(admin, allow_custom=False, default_view_only=True), view_only=None,
+                      view_only_shown=False)["view_only"] is True
+        # A tag that no longer allows view-only refuses a share its maker was shown as view-only, and makes none.
+        before = {s["id"] for s in admin.get("/shares").json()}
+        no_vo = _tag(admin, allow_view_only=False)
+        r = admin.post("/shares", json={"vault_id": vault["id"], "tag_id": no_vo["id"], "target_type": "vault",
+                                        "claim_audience": "anyone_internal", "view_only_shown": True})
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == "this tag does not allow view-only shares", r.text
+        assert {s["id"] for s in admin.get("/shares").json()} == before
         # The record of the share made says whether it is viewable.
         made = _share(admin, vault, _tag(admin, view_only_preview=False))
         assert _psql("SELECT details->>'view_only_preview' FROM audit_logs WHERE action='share_created' "
