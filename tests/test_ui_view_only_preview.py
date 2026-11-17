@@ -293,8 +293,9 @@ def test_a_share_made_after_the_tag_changed_keeps_what_its_maker_was_shown(page:
 @pytest.mark.parametrize("kind", ["forced", "fixed_default"])
 def test_a_share_made_after_the_tag_stopped_requiring_view_only_stays_view_only(page: Page, admin, admin_creds, kind):
     """The dialog read a tag whose view-only the maker cannot change (forced, or the tag's own default on a tag
-    that allows no changes) and showed "View only"; an administrator lets the tag share with downloads before the
-    maker presses Create. The dialog says what it showed, and the share is made view-only."""
+    that allows no changes) and showed "View only"; before the maker presses Create, an administrator lets the tag
+    share with downloads, and the same PATCH turns allow_custom off, so the server no longer takes view-only from
+    the request. The dialog says what it showed, and the share is made view-only."""
     before = admin.get("/settings").json().get("sharing_enabled")
     admin.put("/settings", json={"sharing_enabled": True})
     vault = admin.create_vault(name=unique("vorace"))
@@ -329,7 +330,9 @@ def test_a_share_made_after_the_tag_stopped_requiring_view_only_stays_view_only(
         assert resp.value.ok, resp.value.status
         sent = resp.value.request.post_data_json
         assert sent["view_only_shown"] is True and sent["view_only_preview_shown"] is True, sent
-        assert "view_only" not in sent, sent
+        # A tag that allows no changes gets no view_only from the dialog (the tag decides, and what the dialog
+        # showed narrows it); a forced tag that allows changes gets the box as shown, checked.
+        assert sent.get("view_only") is (None if kind == "fixed_default" else True), sent
         made = resp.value.json()
         assert made["view_only"] is True and made["view_only_preview"] is True, made
     finally:
