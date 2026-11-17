@@ -1466,6 +1466,38 @@ def test_a_line_older_than_every_supported_one_says_it_gets_no_fixes(tmp_path, m
             "supported)") in capsys.readouterr().out
 
 
+def _with_032_end_of_life():
+    m = _two_lines()
+    m["versions"]["0.32.3"] = {"released": "2026-09-01", "notes": "an older release of the 0.32 line",
+                               "support": {"eol": True, "secure": False},
+                               "vulnerabilities": [dict(r) for r in m["versions"]["0.32.6"]["vulnerabilities"]]
+                               + [{"advisory": "older-issue-2", "severity": "high"}]}
+    m["versions"]["0.32.6"]["support"]["eol"] = True
+    return m
+
+
+def test_a_release_this_checkout_marks_end_of_life_is_never_named_the_newest_of_the_line(
+        tmp_path, monkeypatch, capsys):
+    """An install on a line this checkout marks end-of-life is not pointed at that line's newest release: it is
+    neither listed nor a place to move to. The release-line note already says the line gets no fixes."""
+    tags = _LISTED + ["v0.32.3"]
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.32.3", bundled=_with_032_end_of_life(), tags=tags)
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "release line    : 0.32 -- no longer receives security fixes" in out, out
+    assert "newest on line" not in out and "newest of your line" not in out, out
+    assert "v0.32.6" not in out, out
+    with pytest.raises(SystemExit):                     # and moving to it is refused
+        _update(tool, tag="v0.32.6", dry_run=True)
+    assert "v0.32.6 is end-of-life and cannot be upgraded or downgraded to" in capsys.readouterr().out
+    # A supported line, whose newest release is not end-of-life, is named as before.
+    tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.1", bundled=_with_032_end_of_life(), tags=tags)
+    _list_only(tool)
+    out = capsys.readouterr().out
+    assert "newest on line  : v0.33.2 (fixes 1 known vulnerability in 0.33.1)" in out, out
+    assert "    v0.33.2   <- newest of your line" in out, out
+
+
 def _row(out, tag):
     return next(line for line in out.splitlines() if line == "    " + tag or line.startswith("    %s " % tag))
 

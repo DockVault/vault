@@ -8073,9 +8073,10 @@ class DockVault:
         merged_lifecycle, lifecycle_source = merge_lifecycle_matrix(
             local_matrix, fetch_main_lifecycle_matrix(), _lifecycle_ceiling)
         # The install's release line: how long it gets security fixes, and its newest release, taken
-        # from the releases list so only a release that exists is named.
+        # from the releases list so only a release that exists is named, and never one this checkout
+        # marks end-of-life: such a release is neither listed nor a place to move to (see below).
         _line_note = line_support_note(merged_lifecycle, current)
-        _line_newest = newest_on_line(_release_tags, current)
+        _line_newest = newest_on_line([t for t in _release_tags if not is_eol(local_matrix, t)], current)
         if release_line(current) and _line_note:
             text = "  release line    : %s -- %s" % (release_line(current), _line_note)
             ended = _line_note.startswith(("security fixes ended", "no longer"))
