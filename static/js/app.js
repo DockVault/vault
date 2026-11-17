@@ -357,7 +357,8 @@ function tempVaultCaps(vaultId) {
 // True if the current open vault's scope permits `cap` (or the session is not a
 // scoped temp credential, in which case the vault-role gating alone applies).
 function vaultCapAllowed(cap) {
-    // A view-only share recipient (GET /vaults/{id} says via_share.view_only) never downloads, and previews only
+    // A view-only share recipient (GET /vaults/{id} says via_share.view_only) never downloads through the download
+    // route (a preview still sends the file to their browser), and previews only
     // when the share allows it (via_share.preview), so nothing download-shaped (Download, Copy, Copy SHA-256,
     // Render) is offered: the server refuses each.
     if (cap === 'file.download' && viaShareViewOnly()) return false;
@@ -3776,9 +3777,15 @@ function _sharedCard(it) {
             : ' View only (names and sizes only)'));
         meta.appendChild(s);
     }
-    if (it.max_downloads != null) {
+    if (it.max_downloads != null && !it.view_only) {
         const s = _el('span'); s.appendChild(_svgIcon('download', 'icon-sm'));
         s.appendChild(document.createTextNode(' ' + it.download_count + '/' + it.max_downloads + ' downloads'));
+        meta.appendChild(s);
+    } else if (it.max_downloads != null && it.view_only_preview) {
+        // A viewable view-only share's recipient never downloads: their previews count against the same cap. A
+        // names-only recipient does neither, so nothing is counted for them.
+        const s = _el('span', 'shared-previews'); s.appendChild(_svgIcon('eye', 'icon-sm'));
+        s.appendChild(document.createTextNode(' ' + (it.preview_count || 0) + '/' + it.max_downloads + ' previews'));
         meta.appendChild(s);
     }
     if (it.status === 'available') meta.appendChild(_el('span', 'text-secondary', 'Shared with you — claim to open'));
@@ -16970,8 +16977,8 @@ async function openFilePreview(fileId, fileName, mime) {
     const dlBtn = document.getElementById('file-preview-download');
     if (dlBtn) {
         // Offered only when a download would be allowed (a view-only share recipient, or a scoped credential
-        // without the download capability, never downloads; a view-only recipient previews only when the share
-        // lets view-only recipients view files).
+        // without the download capability, never downloads through the download route; a preview still sends the
+        // file, and a view-only recipient previews only when the share lets view-only recipients view files).
         dlBtn.style.display = vaultCapAllowed('file.download') ? '' : 'none';
         dlBtn.onclick = () => downloadFile(fileId, fileName);
     }

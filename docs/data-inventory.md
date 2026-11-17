@@ -630,8 +630,8 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
   vault, a note or a file, given once even when dismissed (`notice_ledger`), each with an optional email that an
   administrator turns on; the account's table sorts and density (`user_preferences`); and "Stay signed in", which adds a
   session row (`active_sessions`) and a `session_extended` audit row.
-- Shares: how many times each claim previewed a file (`share_claims.preview_count`), counted against the
-  share's download limit; a preview is recorded as a preview.
+- Shares: how many times each claim previewed a file (`share_claims.preview_count`), counted apart from
+  downloads, against the same per-recipient limit; a preview is recorded as a preview.
 - The upload page's own rate-limit key in the cache (`receiver_page:<address>`).
 - Sign-in length: the "Stay signed in for at most" setting (`session_renewal_max_hours` in the general settings,
   24 hours by default). A save that lets a sign-in last longer (a longer session timeout or renewal limit) asks

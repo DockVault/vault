@@ -605,8 +605,8 @@ class ShareTag(Base):
     # request or allow_custom — so an admin can require non-download while still letting creators customize
     # the other limits (lifetime/recipients/downloads). Distinct from default_view_only (a mere default).
     force_view_only = Column(Boolean, nullable=False, default=False)
-    # Whether a view-only recipient of a share made under this tag may view its files in the browser (never
-    # download them). Copied into each share when it is made, like the limits, unless its maker was told names and
+    # Whether a view-only recipient of a share made under this tag may view its files in the browser (never through
+    # the download route; a preview still sends the file to their browser). Copied into each share when it is made, like the limits, unless its maker was told names and
     # sizes: switching it later changes no existing share. A tag made through the API or the editor has it on unless the request says otherwise;
     # the column's own default (off) is for the tags that existed before it, made under "cannot open".
     view_only_preview = Column(Boolean, nullable=False, default=False, server_default='false')
@@ -695,7 +695,7 @@ class ShareClaim(Base):
     last_access_at = Column(DateTime, nullable=True)
     download_count = Column(Integer, nullable=False, default=0)
     # Previews in the browser, counted apart from downloads against the same per-recipient cap: a
-    # view-only share's recipient may preview, never download.
+    # view-only share's recipient may preview, never through the download route (a preview still sends the file).
     preview_count = Column(Integer, nullable=False, default=0, server_default='0')
     revoked = Column(Boolean, nullable=False, default=False)  # single-recipient kick
 
