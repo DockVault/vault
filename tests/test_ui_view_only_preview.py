@@ -508,10 +508,13 @@ def test_a_recipient_with_no_download_button_is_not_sent_a_file_the_preview_show
         assert asked == [], asked
         assert previews() == 0
         # A file the preview shows is fetched and spends a preview, and the card counts it.
-        page.evaluate("closeFilePreview()")
+        page.click("#file-preview-modal .close-modal-btn")
+        expect(page.locator("#file-preview-modal")).to_be_hidden()
         page.click(f'.file-name[data-file-id="{txt}"]')
         expect(page.locator("#file-preview-body")).to_contain_text("first line", timeout=10000)
         assert previews() == 1
+        page.click("#file-preview-modal .close-modal-btn")
+        expect(page.locator("#file-preview-modal")).to_be_hidden()
         page.click('.sidebar-item[data-section="shared"]')
         card = page.locator("[data-share-id]", has_text=vault["name"]).first
         expect(card.locator(".shared-previews")).to_have_text("1/3 previews", timeout=15000)
