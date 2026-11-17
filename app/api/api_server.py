@@ -10296,7 +10296,8 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             return
 
         # One account holds at most SOCKETS_PER_ACCOUNT live sockets in this process; a temporary credential's
-        # sockets are counted on their own, per credential, never among the account's (slot_key).
+        # sockets are counted on their own, per credential, never among the account's, and all of an account's
+        # credentials together hold at most TEMPORARY_SOCKETS_PER_ACCOUNT (slot_key).
         if not SOCKET_SLOTS.take(slot_key(user_id, temporary_credential_id if is_temporary else None)):
             print("[WS] live socket refused: the limit of live connections for this session's place is reached")
             await websocket.send_json({"type": "error", "message": TOO_MANY_SOCKETS})

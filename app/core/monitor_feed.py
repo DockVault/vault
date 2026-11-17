@@ -15,6 +15,12 @@ import threading
 # sockets are counted apart, each credential on its own (slot_key), so they never take the places of the account
 # it belongs to.
 SOCKETS_PER_ACCOUNT = 10
+# How many all the temporary credentials of one account may hold together, in one server process, besides each
+# credential's own SOCKETS_PER_ACCOUNT: an account with many credentials holds no more than this many of their
+# sockets. Such a socket subscribes to nothing (it receives no frame), so it holds no connection of the live
+# sockets' pool and is not among its MONITOR_MAX_CONNECTIONS; it costs a task and the 5-second session check.
+TEMPORARY_SOCKETS_PER_ACCOUNT = 20
+_TEMPORARY_TOTAL = "temporary-credentials-of:"
 
 # The close code of a socket past that number (a private-use code): the web app tries again after a minute.
 SOCKET_REFUSED_CLOSE = 4429
@@ -22,12 +28,13 @@ SOCKET_REFUSED_CLOSE = 4429
 TOO_MANY_SOCKETS = "Too many live connections for this account; close another tab."
 
 
-def slot_key(user_id, temporary_credential_id=None) -> str:
-    """What a socket's place is counted against: the account, or, for a temporary credential's session, that
+def slot_key(user_id, temporary_credential_id=None):
+    """What a socket's place is counted against: the account; or, for a temporary credential's session, that
     credential (its token names the account it belongs to, so the account's id would put its sockets among the
-    account's own)."""
+    account's own) together with the total its account's temporary credentials share. A place is one key, or a
+    tuple of keys that are taken and given back together."""
     if temporary_credential_id is not None:
-        return f"temporary-credential:{temporary_credential_id}"
+        return (f"temporary-credential:{temporary_credential_id}", f"{_TEMPORARY_TOTAL}{user_id}")
     return f"account:{user_id}"
 
 
@@ -35,28 +42,38 @@ class SocketSlots:
     """The live sockets each account holds open, counted per process. take() before the socket subscribes;
     give_back() once for each take() that succeeded, whichever way the socket ends."""
 
-    def __init__(self, per_account: int = SOCKETS_PER_ACCOUNT):
+    def __init__(self, per_account: int = SOCKETS_PER_ACCOUNT,
+                 temporary_per_account: int = TEMPORARY_SOCKETS_PER_ACCOUNT):
         self._per_account = per_account
+        self._temporary_per_account = temporary_per_account
         self._lock = threading.Lock()
         self._held = {}
 
-    def take(self, account) -> bool:
-        key = str(account)
+    @staticmethod
+    def _keys(place) -> tuple:
+        return (str(place),) if isinstance(place, str) else tuple(str(key) for key in place)
+
+    def _limit(self, key) -> int:
+        return self._temporary_per_account if key.startswith(_TEMPORARY_TOTAL) else self._per_account
+
+    def take(self, place) -> bool:
+        """Take a place: every key of it, or none when any of them is full."""
+        keys = self._keys(place)
         with self._lock:
-            held = self._held.get(key, 0)
-            if held >= self._per_account:
+            if any(self._held.get(key, 0) >= self._limit(key) for key in keys):
                 return False
-            self._held[key] = held + 1
+            for key in keys:
+                self._held[key] = self._held.get(key, 0) + 1
             return True
 
-    def give_back(self, account) -> None:
-        key = str(account)
+    def give_back(self, place) -> None:
         with self._lock:
-            held = self._held.get(key, 0) - 1
-            if held > 0:
-                self._held[key] = held
-            else:
-                self._held.pop(key, None)
+            for key in self._keys(place):
+                held = self._held.get(key, 0) - 1
+                if held > 0:
+                    self._held[key] = held
+                else:
+                    self._held.pop(key, None)
 
     def held(self, account) -> int:
         with self._lock:

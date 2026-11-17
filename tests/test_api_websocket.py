@@ -415,3 +415,71 @@ def test_a_temporary_credentials_sockets_never_take_the_places_of_its_account(ba
                 ws.close()
             except Exception:
                 pass
+
+
+@pytest.mark.websocket
+def test_an_accounts_temporary_credentials_hold_at_most_twenty_live_sockets_together(base_url, admin):
+    """Each temporary credential has ten live sockets of its own, and all of one account's credentials hold at most
+    twenty together: a third credential's first socket is refused once two credentials hold ten each, while the
+    account's own places are untouched. The sockets held are read now and then, so that the server's keep-alive
+    pings are answered."""
+    from conftest import unique, ApiClient
+
+    tokens = []
+    for _ in range(3):
+        tc = admin.post("/auth/temp-credentials", json={"note": unique("ws-total")}).json()
+        client = ApiClient()
+        client.login(tc["temp_username"], tc["credential"])
+        tokens.append(client.token)
+    held = []
+
+    def _open(token):
+        ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+        ws.send(json.dumps({"type": "auth", "token": token}))
+        return ws, json.loads(ws.recv())
+
+    def _read_all():
+        for ws in held:
+            ws.settimeout(0.05)
+            try:
+                ws.recv()
+            except Exception:
+                pass
+
+    refused = {"type": "error", "message": "Too many live connections for this account; close another tab."}
+    try:
+        for token in [tokens[0]] * 10 + [tokens[1]] * 10:
+            ws, first = _open(token)
+            held.append(ws)
+            assert first["type"] == "connected", first
+        _read_all()
+        ws, first = _open(tokens[2])
+        try:
+            assert first == refused, first
+            opcode, data = ws.recv_data(control_frame=True)
+            assert opcode == websocket.ABNF.OPCODE_CLOSE and int.from_bytes(data[:2], "big") == 4429, data
+        finally:
+            ws.close()
+        own, first = _open(admin.token)
+        own.close()
+        assert first["type"] == "connected", first
+        # One of the twenty closes: the third credential gets its place (the server gives it back when it sees the
+        # close).
+        import time as _t
+        held.pop().close()
+        deadline = _t.time() + 10
+        while True:
+            ws, first = _open(tokens[2])
+            if first["type"] == "connected":
+                held.append(ws)
+                break
+            ws.close()
+            assert _t.time() < deadline, "a closed socket's place in the total was not given back"
+            _read_all()
+            _t.sleep(0.5)
+    finally:
+        for ws in held:
+            try:
+                ws.close()
+            except Exception:
+                pass

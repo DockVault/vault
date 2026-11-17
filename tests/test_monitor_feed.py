@@ -274,7 +274,7 @@ def test_the_live_sockets_pool_takes_its_size_from_the_constant(monkeypatch):
 def test_a_temporary_credentials_sockets_are_counted_apart_from_the_account_it_belongs_to():
     from app.core.monitor_feed import SOCKETS_PER_ACCOUNT, SocketSlots, slot_key
     assert slot_key("u1") == "account:u1"
-    assert slot_key("u1", "c1") == "temporary-credential:c1"
+    assert slot_key("u1", "c1")[0] == "temporary-credential:c1"
     assert slot_key("u1", "c1") != slot_key("u1") and slot_key("u1", "c1") != slot_key("u1", "c2")
     slots = SocketSlots()
     assert all(slots.take(slot_key("u1")) for _ in range(SOCKETS_PER_ACCOUNT))
@@ -282,6 +282,29 @@ def test_a_temporary_credentials_sockets_are_counted_apart_from_the_account_it_b
     assert all(slots.take(slot_key("u1", "c1")) for _ in range(SOCKETS_PER_ACCOUNT))
     assert slots.take(slot_key("u1", "c1")) is False and slots.take(slot_key("u1")) is False
     assert slots.take(slot_key("u1", "c2")) is True
+
+
+def test_an_accounts_temporary_credentials_hold_at_most_their_total_together():
+    # Each temporary credential has ten places of its own, and all of one account's credentials share a total, so
+    # an account with many credentials cannot hold sockets without bound. The account's own places are apart.
+    from app.core.monitor_feed import SOCKETS_PER_ACCOUNT, TEMPORARY_SOCKETS_PER_ACCOUNT, SocketSlots, slot_key
+    assert TEMPORARY_SOCKETS_PER_ACCOUNT == 2 * SOCKETS_PER_ACCOUNT == 20
+    assert slot_key("u1", "c1")[1] == slot_key("u1", "c2")[1] == "temporary-credentials-of:u1"
+    slots = SocketSlots()
+    for credential in ("c1", "c2"):
+        assert all(slots.take(slot_key("u1", credential)) for _ in range(SOCKETS_PER_ACCOUNT))
+    assert slots.held("temporary-credentials-of:u1") == TEMPORARY_SOCKETS_PER_ACCOUNT
+    assert slots.take(slot_key("u1", "c3")) is False, "a third credential's first socket is past the total"
+    # A refused socket holds nothing, not even its credential's own place.
+    assert slots.held("temporary-credential:c3") == 0
+    # The account's own ten are untouched, and another account's credentials have their own total.
+    assert all(slots.take(slot_key("u1")) for _ in range(SOCKETS_PER_ACCOUNT))
+    assert slots.take(slot_key("u2", "c9")) is True
+    # A credential's socket that ends frees a place in the total too.
+    slots.give_back(slot_key("u1", "c1"))
+    assert slots.held("temporary-credential:c1") == SOCKETS_PER_ACCOUNT - 1
+    assert slots.take(slot_key("u1", "c3")) is True
+    assert slots.take(slot_key("u1", "c3")) is False and slots.take(slot_key("u1", "c1")) is False
 
 
 def test_the_handler_counts_a_temporary_session_by_its_credential():
