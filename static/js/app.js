@@ -16775,12 +16775,12 @@ function setupImageZoom(img, wrap, controls) {
 }
 
 // Above this size, a media/image/PDF file is NOT pulled into memory just to preview it inline --
-// loading a multi-GB blob can crash the tab. It is refused with a "download it" message instead, where there is a
-// Download button.
+// loading a multi-GB blob can crash the tab. It is refused with a message instead, which points at Download where
+// there is a Download button.
 const MEDIA_PREVIEW_MAX_BYTES = 150 * 1024 * 1024;   // 150 MB
 // An SVG is shown from a data: address (see _blobToDataUrl), a string about a third larger than
-// the file, which some browsers cap well below the media limit; a larger SVG is offered as a
-// download instead.
+// the file, which some browsers cap well below the media limit; a larger SVG is not shown, and is offered as a
+// download instead where there is a Download button.
 const SVG_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;      // 20 MB
 // Above this size, a Standard-vault text file is previewed from just its FIRST WINDOW (a Range
 // request) rather than loaded whole; the window itself is capped at MEDIA-independent bytes below.
@@ -17018,10 +17018,10 @@ async function openFilePreview(fileId, fileName, mime) {
 
         // Bound memory BEFORE fetching the body. Type + size come from the listing meta + name/MIME,
         // so we can decide without loading anything: a large media/image/PDF is refused for inline
-        // preview (download it), and a big text file on a Standard vault is previewed from just its
-        // first window via a Range request. ZK content is decrypted end-to-end in the browser, so a
-        // windowed range can't apply there -- ZK keeps the whole-blob path (its own size guard is the
-        // <2MB text check below).
+        // preview (download it, where there is a Download button), and a big text file on a Standard
+        // vault is previewed from just its first window via a Range request. ZK content is decrypted
+        // end-to-end in the browser, so a windowed range can't apply there -- ZK keeps the whole-blob
+        // path (its own size guard is the <2MB text check below).
         const _meta = (state.currentFiles || []).find(i => i.id === fileId);
         const _fsize = _meta ? (_meta.size || 0) : 0;
         const _ext0 = (fileName.split('.').pop() || '').toLowerCase();
