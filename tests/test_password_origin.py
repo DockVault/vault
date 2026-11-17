@@ -289,7 +289,9 @@ def test_without_email_the_promoting_administrator_gets_a_link_to_hand_over(db, 
     db.commit()
     answer = _answer(PROMOTE[route](db, carol, bob))
     assert world.sent == []
-    assert answer["emailed"] is False and answer["reset_link"].startswith("https://vault.example.com/?reset=")
+    # No public address is configured here, so the link comes back relative, for the page to complete from its
+    # own address (emailed links are built on the configured address only, never on the request's).
+    assert answer["emailed"] is False and answer["reset_link"].startswith("/?reset=")
     assert answer["expires_in_minutes"]
     (link,) = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == bob.id).all()
     assert (link.created_by, link.made_by_other) == (carol.id, True), "judged again when used"

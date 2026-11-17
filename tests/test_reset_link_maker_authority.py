@@ -331,7 +331,7 @@ def test_an_automatic_lock_on_the_maker_does_not_refuse_the_link(db):
 
 def test_a_credential_change_records_whether_another_account_made_the_link(db, monkeypatch):
     from app.core import email_actions
-    monkeypatch.setattr(email_actions, "public_base_url", lambda request: "https://vault.example.com")
+    monkeypatch.setattr(email_actions, "public_base_url", lambda: "https://vault.example.com")
     dana = _user(db, "dana", manages_users=True)
     carol = _user(db, "carol")
 
@@ -425,7 +425,7 @@ def held_link(db, monkeypatch):
     from app.core import email_actions
     from app.core.models import CredentialChange
     CredentialChange.__table__.create(db.get_bind())
-    monkeypatch.setattr(email_actions, "public_base_url", lambda request: "https://vault.example.com")
+    monkeypatch.setattr(email_actions, "public_base_url", lambda: "https://vault.example.com")
     monkeypatch.setattr(api, "_announce_decided_change", lambda *a, **k: None)
     alice, bob = _user(db, "alice", RoleEnum.ADMIN), _user(db, "bob", RoleEnum.ADMIN)
     carol = _user(db, "carol")

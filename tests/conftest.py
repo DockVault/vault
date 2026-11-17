@@ -1002,3 +1002,12 @@ def skip_if_container_absent(completed, container):
     """
     if completed is not None and "No such container" in (completed.stderr or ""):
         pytest.skip(f"no {container} container on this host to run the setup in")
+
+
+def skip_without_a_public_address(admin):
+    """Skip when the stack has no public address (ALLOWED_HOSTS). Every emailed link is built on it, never on a
+    request's Host header, so a stack without one emails no reset or invitation link, and an administrator's
+    "email a reset link" is refused. A test that needs such an email skips there, saying so; a stack brought up
+    for email tests sets ALLOWED_HOSTS."""
+    if admin.get("/settings").json().get("public_address_configured") is False:
+        pytest.skip("this stack has no public address (ALLOWED_HOSTS), so it emails no reset or invitation link")

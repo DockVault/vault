@@ -73,49 +73,44 @@ def test_system_failsafe_restores_default_when_body_is_empty(key, token):
     assert ea._fallback_body_if_missing_required_token(ea.SYSTEM, kept, spec) == kept
 
 
-class _FakeReq:
-    def __init__(self, base):
-        self.base_url = base
-
-
-def test_public_base_url_prefers_configured_host_over_request(monkeypatch):
-    # A configured trusted host (from ALLOWED_HOSTS via vault_url) must win over the request's own —
-    # attacker-controllable — Host header, so an emailed reset/invite token can't be pointed elsewhere.
-    monkeypatch.setattr(ea, "vault_url", lambda: "https://vault.example.com")
-    assert ea.public_base_url(_FakeReq("http://evil.tld/")) == "https://vault.example.com"
-
-
-def test_public_base_url_falls_back_to_request_host_when_unconfigured(monkeypatch):
-    # With no trusted host configured the vault already trusts the request host everywhere, so fall back
-    # to it (feature keeps working on a default LAN deploy); a None request yields "" without raising.
+def test_public_base_url_is_the_configured_address_and_takes_no_request(monkeypatch):
+    # Every emailed link is built on the configured public address (ALLOWED_HOSTS, through vault_url), never on
+    # a request's Host header, which is whatever the request's sender wrote: the helper is not even given the
+    # request. With no address configured it is empty, and the callers send no tokened link by email.
+    import inspect
+    assert list(inspect.signature(ea.public_base_url).parameters) == []
+    monkeypatch.setattr(ea, "vault_url", lambda: "https://vault.example.com/")
+    assert ea.public_base_url() == "https://vault.example.com"
     monkeypatch.setattr(ea, "vault_url", lambda: "")
-    assert ea.public_base_url(_FakeReq("https://myvault.lan/")) == "https://myvault.lan"
-    assert ea.public_base_url(None) == ""
+    assert ea.public_base_url() == ""
 
 
-def test_tokened_email_links_are_wired_through_public_base_url():
-    # Regression guard for the Host-header link-poisoning fix. The reset/invite links carry a single-use
-    # token in the URL, so each must build its base via _public_base_url(request) (which prefers the
-    # configured host over a spoofed Host header) — never str(request.base_url) directly. The
-    # ea.public_base_url unit tests above cover the helper's logic; this pins the CALL-SITE wiring, so
-    # reverting one site back to the request Host can't slip through green (re-opening poisoning for an
-    # ALLOWED_HOSTS-configured deployment).
+def test_no_emailed_link_is_built_from_the_request():
+    # Pins every caller. The server builds no URL from a request's base_url or Host header anywhere, and every
+    # link base comes from _public_base_url(), called with nothing.
+    import ast
     src = (Path(__file__).resolve().parent.parent / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "base_url":
+            raise AssertionError(f"a URL built from the request at line {node.lineno}: {ast.unparse(node)}")
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_public_base_url":
+            assert not node.args and not node.keywords, f"line {node.lineno}: {ast.unparse(node)}"
+        # A request's Host header, read as headers.get("host") or headers["host"].
+        read = (node.args[0] if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and node.args else
+                node.slice if isinstance(node, ast.Subscript) else None)
+        holder = node.func.value if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) else (
+            node.value if isinstance(node, ast.Subscript) else None)
+        if (isinstance(holder, ast.Attribute) and holder.attr == "headers" and isinstance(read, ast.Constant)
+                and str(read.value).lower() in ("host", "x-forwarded-host")):
+            raise AssertionError(f"a Host header read at line {node.lineno}: {ast.unparse(node)}")
+    callers = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_public_base_url"]
+    # invitation create and resend, self-service reset, an administrator's reset link, the promotion reset, the
+    # SSH-key notice, the share notice, the expiry reminder and the upload notice
+    assert len(callers) >= 9, len(callers)
     norm = re.sub(r"\s+", " ", src)
-    assert "_mint_and_send_reset_async(user.id, _public_base_url(request))" in norm     # public forgot-password
-    # admin send-reset-link and copy-reset-link, both applied by _apply_credential_change: the request's
-    # link base, or with no request (the host operator) the configured host alone
-    assert ("base_url = _public_base_url(request) if request is not None else _configured_base_url(None)"
-            in norm)
-    # (and whether another account made the link, so it is judged again when used)
-    assert ("_mint_and_send_reset(db, target, base_url, created_by_id=maker_id, made_by_other=made_by_other)"
-            in norm)
-    assert "_mint_reset_link(db, target, base_url, created_by_id=maker_id, made_by_other=made_by_other)" in norm
-    assert 'base = _public_base_url(request) if request is not None else ""' in norm     # invitation mint
-    # the tokened links still exist AND are never assembled straight from the request Host
     assert "/?reset=" in norm and "/?invite=" in norm
-    assert "str(request.base_url)}/?reset=" not in norm
-    assert "str(request.base_url)}/?invite=" not in norm
 
 
 def test_optional_action_has_no_failsafe_fallback():

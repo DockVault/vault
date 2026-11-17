@@ -128,9 +128,11 @@ def test_a_user_who_manages_users_still_makes_a_reset_link_for_an_ordinary_user(
         if name == "reset link, copied":
             assert r.status_code == 200 and "?reset=" in r.json()["reset_link"], r.text
         else:
-            # Sent, or refused for this deployment's email set-up, as before: either way past the rule.
+            # Sent, or refused for this deployment's email set-up (no sending profile, or no public address to
+            # build the link on): either way past the rule.
             assert r.status_code == 200 or (
-                r.status_code == 400 and "Email is not configured" in r.json()["detail"]), r.text
+                r.status_code == 400 and ("Email is not configured" in r.json()["detail"]
+                                          or "ALLOWED_HOSTS" in r.json()["detail"])), r.text
         assert _refusals(dave["id"]) == 0
     finally:
         admin.delete_user(dave["id"])

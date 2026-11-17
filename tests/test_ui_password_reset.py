@@ -8,7 +8,7 @@ import pytest
 import requests
 from playwright.sync_api import Page, expect
 
-from conftest import unique
+from conftest import skip_without_a_public_address, unique
 
 pytestmark = pytest.mark.ui
 
@@ -79,6 +79,7 @@ def test_forgot_password_link_hidden_when_disabled(page: Page, admin):
 
 @_mailpit
 def test_reset_page_sets_a_new_password(page: Page, admin, reset_enabled, mailpit_profile):
+    skip_without_a_public_address(admin)
     requests.delete(f"{MAILPIT_URL}/api/v1/messages", timeout=10)
     email = f"uireset-{unique('u')}@example.com"
     u = admin.create_user(email=email)

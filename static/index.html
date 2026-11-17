@@ -3091,7 +3091,8 @@
                                         <input type="checkbox" id="setting-password-reset-enabled">
                                         <span>Let people reset their own password</span>
                                     </label>
-                                    <p class="text-secondary text-sm mt-sm">When on, a “Forgot password?” link appears on the sign-in screen and emails a one-time reset link. An administrator can always send a reset link from the Users page, regardless of this switch. Off by default. Requires email (SMTP) configured.</p>
+                                    <p class="text-secondary text-sm mt-sm">When on, a “Forgot password?” link appears on the sign-in screen and emails a one-time reset link. An administrator can always send a reset link from the Users page, regardless of this switch. Off by default. Requires email (SMTP) configured, and this server’s public address (ALLOWED_HOSTS), on which the emailed link is built.</p>
+                                    <p id="password-reset-address-note" class="form-error text-sm mt-sm" style="display:none"></p>
                                 </div>
                                 <div data-setting="password_reset_link_lifetime" class="form-group mt-md">
                                     <label for="setting-password-reset-ttl-minutes">Reset link lifetime (minutes)</label>

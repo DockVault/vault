@@ -436,12 +436,17 @@ def _referrer_policy(path: str, query: str) -> str:
     return "strict-origin-when-cross-origin"
 
 
-def _public_base_url(request) -> str:
-    """Absolute base URL for the tokened links we email (reset/invite). Delegates to
-    ``email_actions.public_base_url`` (offline-testable): prefer the configured public host so a spoofed
-    ``Host`` header can't poison an emailed token, else fall back to the request host."""
+def _public_base_url() -> str:
+    """Absolute base URL for the links we email: the configured public address (ALLOWED_HOSTS), or "" when
+    none is configured. Never the request's Host header (email_actions.public_base_url says why)."""
     from app.core.email_actions import public_base_url
-    return public_base_url(request)
+    return public_base_url()
+
+
+# Why a link that must be emailed is not: there is no configured public address to build it on.
+NO_PUBLIC_ADDRESS_FOR_EMAILED_LINKS = (
+    "Emailed links need this server's public address, and none is set. Set ALLOWED_HOSTS in .env "
+    "(python dockvault.py setup sets it) and restart, or copy the link and send it yourself.")
 
 
 def _install_access_log_redaction() -> None:
@@ -4531,6 +4536,10 @@ async def get_settings(
     # config) is usable. The Accounts tab gates email-change verification on this rather than on the
     # now-removed inline SMTP fields.
     data["smtp_configured"] = _smtp_configured(db)
+    # Whether a public address is configured (ALLOWED_HOSTS): every emailed link is built on it, and with none
+    # the self-service reset sends nothing (Settings says so beside its switch) and invitations are copied
+    # rather than emailed.
+    data["public_address_configured"] = bool(_public_base_url())
     return data
 
 
@@ -5448,7 +5457,9 @@ async def create_invite(
     except Exception:
         pass
 
-    base = _public_base_url(request) if request is not None else ""
+    # The configured public address, or none: then the link is relative (the administrator's page completes it
+    # from its own address) and no email carries it.
+    base = _public_base_url()
     invite_url = f"{base}/?invite={plaintext}"
 
     # Send the invitation email carrying the freshly-minted link (the {{action.link}} token). This is
@@ -5456,7 +5467,7 @@ async def create_invite(
     # and SMTP is configured. The link is ALSO returned below for the admin to copy, so a mail failure
     # (or an invite with no email) never blocks the invite — email_sent just tells the UI which to show.
     email_sent = False
-    if email:
+    if email and base:      # emailed only on the configured public address
         try:
             from app.core.email_actions import send_action_email
             _ttl_h = int(pol.get("invite_ttl_hours") or 24)
@@ -5472,6 +5483,8 @@ async def create_invite(
         "token": plaintext,                       # shown ONCE — never stored, never re-returned
         "invite_url": invite_url,
         "email_sent": email_sent,
+        # False: no public address is configured (ALLOWED_HOSTS), so the link is relative and was not emailed.
+        "public_address_configured": bool(base),
     }
 
 
@@ -5601,10 +5614,12 @@ async def resend_invite(
                      "token_prefix": prefix, "replaced_token_prefix": old_prefix})
     except Exception:
         pass
-    base = _public_base_url(request) if request is not None else ""
+    # The configured public address, or none: then the link is relative (the administrator's page completes it
+    # from its own address) and no email carries it.
+    base = _public_base_url()
     invite_url = f"{base}/?invite={plaintext}"
     email_sent = False
-    if inv.email:
+    if inv.email and base:      # emailed only on the configured public address
         try:
             from app.core.email_actions import send_action_email
             email_sent = bool(send_action_email(
@@ -5618,6 +5633,7 @@ async def resend_invite(
         "token": plaintext,                       # shown ONCE, as at creation
         "invite_url": invite_url,
         "email_sent": email_sent,
+        "public_address_configured": bool(base),
         "resent": True,
     }
 
@@ -6066,10 +6082,12 @@ def _mint_and_send_reset(db: Session, user, base_url: str, *, created_by_id, to:
     password_reset action with the freshly-minted {{action.link}}, and return whether it was sent.
     Never raises — the caller (public or admin) must not fail on mail trouble. Requires an email.
     ``to`` sends it to that address instead of the account's own, with ``note_html`` appended to say
-    why (see _self_service_reset_destination)."""
+    why (see _self_service_reset_destination). With no public address configured (``base_url`` empty) it
+    mints and sends nothing: an emailed link is only ever built on the configured address
+    (email_actions.public_base_url)."""
     from app.core.email_actions import send_action_email
     email = ((to if to is not None else getattr(user, "email", "")) or "").strip()
-    if not email:
+    if not email or not (base_url or "").strip():
         return False
     try:
         link = _mint_reset_link(db, user, base_url, created_by_id=created_by_id, made_by_other=made_by_other)
@@ -6276,13 +6294,15 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Ses
                             detail="Too many requests; please wait a few minutes.",
                             headers={"Retry-After": str(retry_after_seconds(reset, settings.rate_limit_api_auth_window))})
     enabled, _ttl = _password_reset_policy(db)
-    if enabled and _smtp_configured(db):
+    # The link is built on the configured public address only, never the request's Host (which its sender
+    # chooses): with none configured nothing is sent, and the answer below is the same as ever.
+    base_url = _public_base_url()
+    if enabled and _smtp_configured(db) and base_url:
         user = _resolve_reset_user(db, body.identifier)
         if user is not None:
             # Background the mint+send so a resolved identifier can't be told apart from an unknown one
-            # by response timing (both do only the resolution query on the request path). The link base
-            # prefers the configured public host so a spoofed Host header can't poison the emailed token.
-            _mint_and_send_reset_async(user.id, _public_base_url(request))
+            # by response timing (both do only the resolution query on the request path).
+            _mint_and_send_reset_async(user.id, base_url)
     try:
         AuditLogger(db).log_action(action="password_reset_requested", status="success", user=None,
                                    ip_address=ip, details={})
@@ -6384,8 +6404,7 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
         return {}
     if kind == cc.RESET_LINK:
-        from app.core.email_actions import public_base_url as _configured_base_url
-        base_url = _public_base_url(request) if request is not None else _configured_base_url(None)
+        base_url = _public_base_url()
         # Made by another account (an administrator, or a user who manages users, or the administrator who
         # approved a held request): judged again when it is used. Not one the server's operator makes.
         maker_id = actor_id if link_maker_id is _LINK_MAKER_IS_ACTOR else link_maker_id
@@ -6397,8 +6416,12 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             if not _smtp_configured(db):
                 raise HTTPException(status_code=400, detail="Email is not configured. Add a sending "
                                     "profile in Settings -> Email first.")
+            if not base_url:
+                raise HTTPException(status_code=400, detail=NO_PUBLIC_ADDRESS_FOR_EMAILED_LINKS)
             return {"email_sent": bool(_mint_and_send_reset(db, target, base_url, created_by_id=maker_id,
                                                             made_by_other=made_by_other))}
+        # Copied, not emailed: with no public address configured the link is relative, and the
+        # administrator's page completes it from its own address.
         link = _mint_reset_link(db, target, base_url, created_by_id=maker_id, made_by_other=made_by_other)
         if not link:
             raise HTTPException(status_code=400, detail="Password reset is not configured on this "
@@ -6911,11 +6934,10 @@ def _hand_over_promotion_reset(db, taken, *, by, request=None) -> Optional[dict]
     ``promotion_password_reset``: {"emailed", "reset_link", "expires_in_minutes"}."""
     if not taken:
         return None
-    from app.core.email_actions import public_base_url
     user = db.get(User, taken["user_id"])
     if user is None:
         return None
-    base_url = _public_base_url(request) if request is not None else public_base_url(None)
+    base_url = _public_base_url()
     by_name = by.username if by is not None else None
     destination = _self_service_reset_destination(db, user)
     if destination is not None and destination[0] and _smtp_configured(db):
@@ -7223,11 +7245,12 @@ def _announce_keys_reported(db, report, request=None) -> None:
     """Tell each account's owner, in the app and by email with the way to remove them, that the
     administrator who added SSH keys to their account has left (_report_keys_added_by), and tell every
     other active administrator in the app which accounts hold such keys. After the commit; best-effort."""
-    from app.core.email_actions import public_base_url
     maker = report["maker"]
     why = _WITHDRAWN_BECAUSE.get(report["because"], "can no longer act as an administrator")
     # "Your account", where the owner removes a key; the page opens it after signing in (#profile).
-    link = f"{public_base_url(request)}/#profile"
+    # With no public address configured, the email goes without the link.
+    base = _public_base_url()
+    link = f"{base}/#profile" if base else ""
     for owner in report["owners"]:
         keys = owner["keys"]
         many = len(keys) > 1
@@ -13502,7 +13525,7 @@ def _tell_about_expiry(item: dict) -> bool:
         with get_db_context() as db:
             owner = db.query(User).filter(User.id == uuid.UUID(str(item["owner_id"]))).first()
             if owner is not None and owner.email:
-                base = _public_base_url(None)      # the configured public address, or no link at all
+                base = _public_base_url()          # the configured public address, or no link at all
                 send_action_email(db, "expiry_reminder", recipient={"email": owner.email, "username": owner.username},
                                   action_context={"link": f"{base}/{item['target']}" if base else "",
                                                   "change": f"{item['title']} expires {when}.", "expires": when})
@@ -16240,7 +16263,7 @@ def _tell_receiver_owner(db, request, receiver, owner, vault, file) -> None:
             # the request is the anonymous uploader's. With no address configured the email carries no link.
             # Sent on a thread of its own (_fire_action_email), never on the event loop of the upload that is
             # still holding its transfer slot.
-            base = _public_base_url(None)
+            base = _public_base_url()
             _fire_action_email(db, "receiver_upload_received", email=owner.email, username=owner.username,
                                action_context={"link": f"{base}/#uploadlinks/drops" if base else "",
                                                "change": f"A file arrived on your upload link {label} on "
@@ -17120,8 +17143,8 @@ async def create_share(
             # Optionally ALSO email each recipient the "File / folder shared" notice (opt-in). Resolve
             # addresses now (one query), then fan the SMTP out on a background thread. NEVER email the
             # link_token (the bearer secret for anyone_internal shares) — link into "Shared with me".
-            from app.core.email_actions import vault_url as _email_vault_url
-            _base = (_email_vault_url() or str(request.base_url).rstrip("/"))
+            # The configured public address only: never the request's Host, which its sender chooses.
+            _base = _public_base_url()
             _share_ctx = {"link": (_base.rstrip("/") + "/#shared") if _base else "",
                           "expires": (f"until {share.expires_at.strftime('%Y-%m-%d')} UTC" if share.expires_at else "")}
             _share_pairs = [(u.email, u.username) for u in

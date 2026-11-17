@@ -289,3 +289,27 @@ def test_mint_and_revoke_are_audited_without_the_plaintext(admin, invites_on):
     # the plaintext token never appears in any audit row
     leak = _psql(f"SELECT count(*) FROM audit_logs WHERE details::text LIKE {_q('%' + inv['token'] + '%')}")
     assert int(leak) == 0
+
+
+def test_a_forged_host_reaches_neither_an_invitation_nor_a_reset_link(admin, invites_on):
+    """A request's Host header is whatever its sender wrote, and no link is built on it. With no public address
+    configured (ALLOWED_HOSTS empty, as on a test stack) an invitation's link and an administrator's reset link come
+    back relative, for the page to complete from its own address, and the invitation is not emailed; with one
+    configured, a forged Host is refused before the route runs."""
+    forged = "evil.example"
+    invited = admin.post("/invites", json={"username": unique("inv-host"), "email": f"{unique('host')}@example.com"},
+                         headers={"Host": forged})
+    if invited.status_code == 400 and "host" in invited.text.lower():
+        pytest.skip("this deployment has ALLOWED_HOSTS set: a forged Host is refused outright")
+    assert invited.status_code == 200, invited.text
+    body = invited.json()
+    assert forged not in invited.text, body
+    assert body["invite_url"].startswith("/?invite=") and body["public_address_configured"] is False, body
+    assert body["email_sent"] is False, body
+    person = admin.create_user(role="user", email=None)
+    try:
+        reset = admin.post(f"/users/{person['id']}/reset-link", headers={"Host": forged})
+        assert reset.status_code == 200, reset.text
+        assert forged not in reset.text and reset.json()["reset_link"].startswith("/?reset="), reset.json()
+    finally:
+        admin.delete_user(person["id"])

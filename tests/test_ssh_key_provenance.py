@@ -74,7 +74,7 @@ def told(monkeypatch):
     monkeypatch.setattr(api, "_fire_action_email", lambda _db, key, *, email, username=None, action_context=None:
                         out.emails.append((key, email, username, dict(action_context or {}))))
     monkeypatch.setattr(api, "_notify_account_change", lambda *a, **k: None)
-    monkeypatch.setattr(ea, "vault_url", lambda: "")   # the link's base is then the request's own
+    monkeypatch.setattr(ea, "vault_url", lambda: "https://vault.example.com")   # the configured public address
     return out
 
 

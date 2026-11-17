@@ -12,7 +12,7 @@ import time
 import pytest
 import requests
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import skip_without_a_public_address, ApiClient, BASE_URL, unique
 
 pytestmark = pytest.mark.integration
 
@@ -206,6 +206,7 @@ def test_share_created_emails_the_recipient(admin, mailpit_profile, welcome_off)
 
 @_mailpit
 def test_invitation_email_sent_on_mint_carries_the_link(admin, mailpit_profile):
+    skip_without_a_public_address(admin)
     # account_invite is a SYSTEM action (always on): minting an invite with an email sends it, with the
     # freshly-minted link injected as {{action.link}}. The link is also returned for the admin to copy.
     _mp_clear()

@@ -6098,19 +6098,22 @@ function updateInviteSendNote() {
     if (!note) return;
     const email = (document.getElementById('invite-email').value || '').trim();
     if (!email) note.textContent = 'Without an email address, you copy the invitation link and send it yourself.';
+    else if (currentSettings.smtp_configured === true && currentSettings.public_address_configured === false) note.textContent = 'Emailed links need this server’s public address (ALLOWED_HOSTS), which is not set, so you copy the invitation link and send it yourself.';
     else if (currentSettings.smtp_configured === true) note.textContent = `The invitation will be emailed to ${email}. You also get the link to copy.`;
     else note.textContent = 'Email is not set up here, so you copy the invitation link and send it yourself.';
 }
 
 // Show a minted link (a new invitation's, or a resent one's) in the dialog's result step.
 function showInviteLink(res, intro) {
-    _lastInviteLink = res.invite_url || res.token;
+    _lastInviteLink = _linkFromThisPage(res.invite_url) || res.token;
     document.getElementById('invite-link-value').textContent = _lastInviteLink;
     let note = (intro ? intro + ' ' : '') + 'This link expires ' + formatServerTime(res.expires_at) + '.';
     if (res.email) {
         note += res.email_sent
             ? ' We emailed the invitation to ' + res.email + '.'
-            : ' We couldn’t email it — copy the link above and send it yourself.';
+            : res.public_address_configured === false
+                ? ' It was not emailed: emailed links need this server’s public address (ALLOWED_HOSTS), which is not set. Copy the link above and send it yourself.'
+                : ' We couldn’t email it — copy the link above and send it yourself.';
     }
     document.getElementById('invite-link-expiry').textContent = note;
     document.getElementById('invite-user-fields').style.display = 'none';
@@ -6584,7 +6587,16 @@ function renderUsersTable() {
 
 // Show an admin-minted password-reset link ONCE in a copyable overlay. The link is a single-use secret
 // (never logged server-side); this modal is the only place it appears. DOM-built (no innerHTML).
+// A link the server hands over for copying (an invitation's, a password reset's). With no public address
+// configured (ALLOWED_HOSTS) the server sends it without its address, since it never builds a link on a
+// request's Host header; this page completes it from its own address, the administrator's own.
+function _linkFromThisPage(link) {
+    if (!link || /^https?:\/\//i.test(link)) return link;
+    try { return new URL(link, window.location.origin).href; } catch (_) { return link; }
+}
+
 function _showResetLinkModal(link, username, ttlMinutes) {
+    link = _linkFromThisPage(link);
     document.querySelectorAll('.reset-link-overlay').forEach(o => o.remove());
     const overlay = _el('div', 'reset-link-overlay');
     overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; z-index:10000; padding:16px;';
@@ -9281,13 +9293,16 @@ function setupUpdateControls() {
 // controls honest. The server (PUT /settings) is authoritative and re-validates everything.
 let accountsDomains = [];
 let accountsSmtpConfigured = false;
+// Whether this server has a public address (ALLOWED_HOSTS): every emailed link is built on it.
+let accountsPublicAddress = true;
 let _accountsPolicyWired = false;
 
 function setupAccountsPolicyUI() {
     if (_accountsPolicyWired) return;
     _accountsPolicyWired = true;
     ['setting-invite-enabled', 'setting-signup-enabled', 'setting-signup-domain-mode',
-     'setting-email-requirement', 'setting-login-identifier', 'setting-email-change-verification']
+     'setting-email-requirement', 'setting-login-identifier', 'setting-email-change-verification',
+     'setting-password-reset-enabled']
         .forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('change', refreshAccountsPolicyUI); });
     const ttl = document.getElementById('setting-invite-ttl-hours');
     if (ttl) ttl.addEventListener('input', updateAccountsSummary);
@@ -9359,6 +9374,15 @@ function refreshAccountsPolicyUI() {
         help.textContent = accountsSmtpConfigured
             ? "A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt."
             : "A user changing their own email must confirm a one-time code sent to the new address; administrators setting an email are exempt. Configure email (SMTP) on the Email tab to enable this.";
+    }
+    // Self-service reset emails a link built on the public address: with none set it sends nothing, which is
+    // said beside its switch (on or off: it may be turned on before the address is set).
+    const reset = document.getElementById('setting-password-reset-enabled');
+    const resetNote = document.getElementById('password-reset-address-note');
+    if (resetNote) {
+        resetNote.style.display = accountsPublicAddress ? 'none' : '';
+        resetNote.textContent = (reset && reset.checked ? 'This is on, but no reset email is sent: ' : 'No reset email is sent while ')
+            + 'this server’s public address (ALLOWED_HOSTS) is not set, because the email carries a link built on it. Set it in .env (python dockvault.py setup sets it) and restart.';
     }
     renderLoginIdentifierWarning();
     updateAccountsSummary();
@@ -9461,6 +9485,7 @@ function populateAccountsPolicy(settings) {
     accountsDomains = Array.isArray(settings.signup_email_domains) ? settings.signup_email_domains.slice() : [];
     // Profile-aware: the backend reports whether a usable sending profile (or legacy config) exists.
     accountsSmtpConfigured = settings.smtp_configured === true;
+    accountsPublicAddress = settings.public_address_configured !== false;
     setupAccountsPolicyUI();
     renderAccountsDomains();
     refreshAccountsPolicyUI();

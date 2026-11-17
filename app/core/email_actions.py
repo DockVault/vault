@@ -433,19 +433,15 @@ def vault_url() -> str:
     return ""
 
 
-def public_base_url(request) -> str:
-    """Absolute base URL for links we EMAIL that carry a single-use token in the URL (password-reset,
-    invitation). Prefer the operator-configured public host (``vault_url()`` from ``ALLOWED_HOSTS``) so
-    a spoofed ``Host`` header can't poison an emailed token; fall back to the request's own host only
-    when no trusted host is configured. When ``ALLOWED_HOSTS`` is set (the posture an internet-facing
-    vault should adopt — it also enables ``TrustedHostMiddleware``) the emailed link is pinned to the
-    canonical host regardless of the incoming ``Host`` header, closing reset/invite-link poisoning;
-    when unset the vault already trusts the request host everywhere, so this adds no new assumption.
-    Mirrors the ``share_created`` pattern. ``request`` may be None (returns the configured host or "")."""
-    configured = (vault_url() or "").rstrip("/")
-    if configured:
-        return configured
-    return str(getattr(request, "base_url", "") or "").rstrip("/")
+def public_base_url() -> str:
+    """Absolute base URL for every link we EMAIL: the operator-configured public address (``vault_url()``,
+    the first usable ``ALLOWED_HOSTS`` entry), or "" when none is configured. Never the request's own
+    ``Host``: a request's Host header is whatever its sender wrote, so a link built from it would carry a
+    reset or invitation token to an address an attacker chose. With no public address configured, a caller
+    sends no tokened link by email at all (a self-service reset sends nothing; an invitation and an
+    administrator's reset link are given to the administrator, whose page completes them from its own
+    address), and a notice's email goes without its link."""
+    return (vault_url() or "").rstrip("/")
 
 
 def _load_resource(db: Session, rid: str):

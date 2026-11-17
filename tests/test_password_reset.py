@@ -13,7 +13,7 @@ import time
 import pytest
 import requests
 
-from conftest import ApiClient, BASE_URL, unique
+from conftest import skip_without_a_public_address, ApiClient, BASE_URL, unique
 from app.core.password_reset import hash_reset_token, mint_reset_token, reset_pepper
 
 pytestmark = pytest.mark.integration
@@ -134,6 +134,7 @@ def test_forgot_password_off_by_default_sends_nothing(admin, restore_reset, mail
 
 @_mailpit
 def test_forgot_password_delivers_a_working_single_use_link(admin, restore_reset, mailpit_profile):
+    skip_without_a_public_address(admin)
     admin.put("/settings", json={"password_reset_enabled": True})
     _mp_clear()
     email = f"reset-{unique('u')}@example.com"
@@ -201,6 +202,7 @@ def test_reset_revokes_existing_sessions(admin, restore_reset):
 
 @_mailpit
 def test_a_new_link_invalidates_the_prior_one(admin, restore_reset, mailpit_profile):
+    skip_without_a_public_address(admin)
     # Needs a configured mail path: the public re-mint only fires when SMTP is configured (so it's
     # gated on a real sink, present locally / absent in CI). The mint runs on a daemon thread and
     # commits the invalidation BEFORE the (best-effort) send, so poll for the old link to go dead
@@ -225,6 +227,7 @@ def test_a_new_link_invalidates_the_prior_one(admin, restore_reset, mailpit_prof
 # ---- admin-triggered --------------------------------------------------------------------------
 @_mailpit
 def test_admin_send_reset_link_delivers(admin, restore_reset, mailpit_profile):
+    skip_without_a_public_address(admin)
     _mp_clear()
     email = f"admreset-{unique('u')}@example.com"
     u = admin.create_user(email=email)
@@ -268,6 +271,7 @@ def test_password_reset_ttl_config_validates(admin, restore_reset):
 @_mailpit
 def test_after_an_administrator_moves_the_email_a_reset_link_goes_to_the_old_address(
         admin, restore_reset, mailpit_profile):
+    skip_without_a_public_address(admin)
     # The takeover: an administrator moves someone's email to an address they control, then
     # asks for a reset link on the public form. For 14 days the link goes to the address before.
     admin.put("/settings", json={"password_reset_enabled": True})
