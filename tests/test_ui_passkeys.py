@@ -8,6 +8,8 @@ entry): its host is the relying-party id."""
 import pytest
 from playwright.sync_api import Page, expect
 
+from _ui_hand_over import expect_reason, mark_old, replaced, still_old, wait_new_page
+
 pytestmark = pytest.mark.ui
 
 
@@ -87,13 +89,20 @@ def _close_account(page: Page):
     expect(page.locator("#user-settings-modal")).to_be_hidden(timeout=8000)
 
 
-def _sign_out(page: Page, wait_for_login: bool = True):
+def _sign_out(page: Page, stays: bool = False):
+    """Sign out with the button. The page that showed the app is replaced by a new one on the sign-in screen, and
+    that is the page the next sign-in is made on; ``stays`` is for a test that holds the replacement back and reads
+    the page the session ended on."""
     if page.locator("#user-settings-modal").is_visible():
         _close_account(page)
-    page.click("#profile-btn")
-    page.click("#dropdown-logout-btn")
-    if wait_for_login:
+    if stays:
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
         expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+        return
+    with replaced(page):
+        page.click("#profile-btn")
+        page.click("#dropdown-logout-btn")
 
 
 def test_a_person_adds_a_passkey_signs_in_with_it_and_manages_it(page: Page, no_offer, authenticator, fresh_user):
@@ -276,3 +285,56 @@ def test_a_structured_refusal_is_shown_in_words(page: Page, no_offer, fresh_user
         .then(() => 'accepted', (e) => e.message)""")
     assert said and said != "[object Object]" and said != "accepted", said
 
+
+
+def _signed_out_with_the_replacement_waiting(page: Page, user):
+    """Signed out with a passkey on the account, on the page the session ended on: the page that replaces it waits
+    for the server to answer (/health), and it does not answer yet."""
+    _login(page, user["_username"], user["_password"])
+    _add_first_passkey(page, user["_password"], "Laptop")
+    _close_account(page)
+    mark_old(page)
+    page.route("**/health", lambda route: route.abort())
+    _sign_out(page, stays=True)
+    expect(page.locator("#passkey-sign-in-btn")).to_be_visible(timeout=8000)
+    assert still_old(page)
+
+
+def _hold_the_passkey_answer(page: Page):
+    held = []
+    page.route("**/auth/passkeys/sign-in/verify", lambda route: held.append(route))
+    page.click("#passkey-sign-in-btn")
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert len(held) == 1, "the passkey's answer never left the page"
+    # The server answers again: without a sign-in under way the page would be replaced within a few seconds.
+    page.unroute("**/health")
+    page.wait_for_timeout(4500)
+    assert still_old(page), "the page was replaced under a passkey sign-in"
+    return held[0]
+
+
+def test_a_passkey_sign_in_under_way_is_not_cut_off_by_the_page_that_replaces_a_signed_out_one(
+        page: Page, no_offer, authenticator, fresh_user):
+    """After a sign-out a fresh page replaces the one the session ended on. A person who pressed the passkey button
+    meanwhile is signing in: the page waits for that sign-in, as it does for a password, and the session it makes
+    is opened by the new page."""
+    _signed_out_with_the_replacement_waiting(page, fresh_user)
+    answer = _hold_the_passkey_answer(page)
+    answer.continue_()
+    wait_new_page(page, 20000)                # never the app on the page that ended a session
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=20000)
+
+
+def test_a_refused_passkey_sign_in_lets_the_page_be_replaced_and_the_new_page_says_why(
+        page: Page, no_offer, authenticator, fresh_user):
+    _signed_out_with_the_replacement_waiting(page, fresh_user)
+    answer = _hold_the_passkey_answer(page)
+    answer.fulfill(status=401, content_type="application/json",
+                   body='{"detail": "That passkey was not accepted here."}')
+    wait_new_page(page, 15000)
+    expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
+    expect(page.locator("#dashboard-screen")).to_be_hidden()
+    expect_reason(page, "That passkey was not accepted here.")

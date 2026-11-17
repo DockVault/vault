@@ -1722,10 +1722,11 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     errorDiv.style.display = 'none';
     errorDiv.className = 'alert alert-error mt-md';
 
+    // A password sent supersedes any passkey sign-in under way, and ends that sign-in's hold on the page first.
+    _stopPasskeyOffer();
     // From here until the app is shown or the sign-in fails (its second step included), the page is not replaced
     // under the person signing in (_replacePageAfterSignOut).
     _signingIn = true;
-    _stopPasskeyOffer();          // a password sent supersedes any passkey sign-in under way
     _passwordSending = true;
     try {
         const headers = { 'Content-Type': 'application/json' };
@@ -1851,8 +1852,27 @@ let _passkeyFlow = 0;              // the latest passkey sign-in: only it may ch
                                    // completes on its own must not race the button or a password being typed)
 let _passwordSending = false;      // a password sign-in is on its way: no passkey sign-in starts meanwhile
 let _passkeyRenewal = null;        // renews the field's offer before its challenge lapses
+let _passkeyHolds = false;         // a passkey sign-in is what keeps the page from being replaced (_signingIn)
+
+// A passkey sign-in is a sign-in under way on this page from the moment the person acts (the button, or a passkey
+// picked from the field's offer) until the app is shown or it ends: the page is not replaced under it after a
+// sign-out (_replacePageAfterSignOut), as for a password. The offer waiting on the username field is no sign-in yet
+// and holds nothing: it may wait for as long as the page is open.
+function _passkeyHoldsPage() {
+    _passkeyHolds = true;
+    _signingIn = true;
+}
+
+// The passkey sign-in that held the page has ended without showing the app (refused, cancelled, given up at its
+// password step, or superseded): a replacement put off meanwhile happens now, with what the screen said as its reason.
+function _passkeyLetsGo(message) {
+    if (!_passkeyHolds) return;
+    _passkeyHolds = false;
+    _signInEnded(message);
+}
 
 function _stopPasskeyOffer() {
+    _passkeyLetsGo();              // whoever stops it takes the page's sign-in for itself, or there is none
     _passkeyFlow++;                // whatever passkey sign-in is under way no longer speaks for the page
     if (_passkeyRenewal) { clearTimeout(_passkeyRenewal); _passkeyRenewal = null; }
     if (_passkeyOffer) { try { _passkeyOffer.abort(); } catch (_) {} }
@@ -1930,6 +1950,12 @@ async function _passkeySignIn({ conditional = false } = {}) {
     const controller = new AbortController();
     if (conditional) _passkeyOffer = controller;
     else if (errorDiv) errorDiv.style.display = 'none';
+    // The button is the person acting: the sign-in is under way from here. The field's offer only from the passkey
+    // the person picks (below).
+    if (!conditional) _passkeyHoldsPage();
+    let wentOn = false;            // the sign-in went on to a further step or into the app: not this flow's to end
+    let said = '';                 // what the screen said when it ended here
+    const refuse = (message) => { said = message; _showLoginError(message); };
     try {
         // No username is sent: the options are the same for everyone and the authenticator offers its own keys.
         const start = await fetch(`${API_BASE}/auth/passkeys/sign-in/options`, {
@@ -1939,7 +1965,8 @@ async function _passkeySignIn({ conditional = false } = {}) {
         if (!start.ok) {
             if (!conditional) {
                 const e = await start.json().catch(() => ({}));
-                _showLoginError((e && typeof e.detail === 'string') ? e.detail : 'Passkey sign-in is not available right now.');
+                if (!current()) return;
+                refuse((e && typeof e.detail === 'string') ? e.detail : 'Passkey sign-in is not available right now.');
             }
             return;
         }
@@ -1960,6 +1987,7 @@ async function _passkeySignIn({ conditional = false } = {}) {
         }
         const credential = await Passkeys.get(options, { conditional, signal: controller.signal });
         if (!current()) return;
+        if (conditional) _passkeyHoldsPage();        // a passkey picked from the field's offer: a sign-in from here
         const resp = await fetch(`${API_BASE}/auth/passkeys/sign-in/verify`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ challenge_id, credential })
@@ -1968,17 +1996,21 @@ async function _passkeySignIn({ conditional = false } = {}) {
         if (!current()) return;
         if (!resp.ok) {
             const detail = data && data.detail;
-            _showLoginError(typeof detail === 'string' ? detail : (detail && detail.message) || 'That passkey was not accepted.');
+            refuse(typeof detail === 'string' ? detail : (detail && detail.message) || 'That passkey was not accepted.');
             return;
         }
         _markPasskeyUsedHere();
+        wentOn = true;
         await _passkeySignInAnswer(data);
     } catch (error) {
+        wentOn = false;            // a further step that failed to start ends the sign-in here
         if (!current() || (window.Passkeys && Passkeys.cancelled(error))) return;
-        if (!conditional) _showLoginError(window.Passkeys ? Passkeys.failureText(error) : 'The passkey did not work.');
+        if (!conditional) refuse(window.Passkeys ? Passkeys.failureText(error) : 'The passkey did not work.');
     } finally {
         if (_passkeyOffer === controller) _passkeyOffer = null;
         if (current() && _passkeyRenewal) { clearTimeout(_passkeyRenewal); _passkeyRenewal = null; }
+        // Ended here, and still this flow's to end (a flow that was stopped gave the page up when it was stopped).
+        if (current() && !wentOn) _passkeyLetsGo(said);
     }
 }
 
@@ -2020,6 +2052,7 @@ function _endPasswordStage() {
 
 // Leave the passkey's sign-in for an ordinary one: the name free again, the passkey button back.
 function _cancelPasswordStage() {
+    _passkeyLetsGo();              // the passkey's sign-in is given up: the page may be replaced again
     _endPasswordStage();
     const input = document.getElementById('username');
     if (input) { input.value = ''; input.focus(); }
