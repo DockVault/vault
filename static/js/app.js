@@ -4292,18 +4292,25 @@ function setupShareCreateModalOnce() {
 const SHARE_TAG_CHANGED = "This tag changed while the dialog was open. Check the share's settings and press Create share again.";
 const SHARE_TAG_GONE = 'That tag is no longer available. Pick a tag and press Create share again.';
 const SHARE_AUDIENCE_GONE = 'This tag no longer allows sharing with the people you picked. Pick who to share with and press Create share again.';
+// The dialog showed the share as view-only and the tag no longer allows view-only shares (the server's 409 says
+// so): a share made now can be downloaded, so the dialog says that rather than only that the tag changed.
+const SHARE_VIEW_ONLY_GONE = "This tag no longer allows view-only shares, so a share made now can be downloaded. Check the share's settings and press Create share again.";
+const SHARE_AUDIENCE_AND_VIEW_ONLY_GONE = 'This tag no longer allows view-only shares or sharing with the people you picked, so a share made now can be downloaded. Pick who to share with and press Create share again.';
 
 // Returns what the reload found: 'kept' (the tag and who to share with kept, the recipients put back), 'audience'
 // (the tag kept, who to share with no longer offered), 'tag' (the tag no longer offered: the first one is picked),
 // 'none' (sharing off or no tag for this person: populateShareTags has said so) or 'unread' (the tags could not be
-// read: the dialog keeps everything as it was).
+// read: the dialog keeps everything as it was). What the maker picked is read once the tags are back, so a change
+// made in the dialog while they were being read is kept too; nothing waits between that and populateShareTags.
 async function _shareReloadPolicyKeepingTag(tagId) {
-    const audSel = document.getElementById('share-audience-select');
-    const audience = audSel.value;
-    const userIds = _shareCreate.userIds.slice();
-    const deptIds = _shareCreate.deptIds.slice();
     try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
     catch (_) { return 'unread'; }
+    const audSel = document.getElementById('share-audience-select');
+    const voInput = document.getElementById('share-view-only');
+    const audience = audSel.value;
+    const ticked = voInput.checked;
+    const userIds = _shareCreate.userIds.slice();
+    const deptIds = _shareCreate.deptIds.slice();
     populateShareTags();
     const policy = _shareCreate.policy;
     if (!policy || !policy.sharing_enabled || !(policy.tags || []).length) return 'none';
@@ -4311,6 +4318,9 @@ async function _shareReloadPolicyKeepingTag(tagId) {
     if (!Array.from(tagSel.options).some(o => o.value === tagId)) return 'tag';
     tagSel.value = tagId;
     onShareTagChange();                     // the tag's rules now; it empties the recipients
+    // The maker's own view-only choice stays where the tag still lets them make it.
+    const kept = currentShareTag();
+    if (kept && kept.allow_view_only && kept.allow_custom && !kept.force_view_only) voInput.checked = ticked;
     if (!Array.from(audSel.options).some(o => o.value === audience)) return 'audience';
     audSel.value = audience;
     _shareCreate.userIds = userIds;
@@ -4372,8 +4382,11 @@ async function submitCreateShare() {
         if (e && e.status === 409) {
             const found = await _shareReloadPolicyKeepingTag(t.id);
             if (found !== 'none') {
+                const now = (found === 'kept' || found === 'audience') ? currentShareTag() : null;
+                const viewOnlyGone = shownViewOnly && !!now && !now.allow_view_only;
                 _shareSetError(found === 'tag' ? SHARE_TAG_GONE
-                    : found === 'audience' ? SHARE_AUDIENCE_GONE : SHARE_TAG_CHANGED);
+                    : found === 'audience' ? (viewOnlyGone ? SHARE_AUDIENCE_AND_VIEW_ONLY_GONE : SHARE_AUDIENCE_GONE)
+                    : viewOnlyGone ? SHARE_VIEW_ONLY_GONE : SHARE_TAG_CHANGED);
                 submitBtn.disabled = false;
             }
             return;

@@ -377,7 +377,8 @@ def test_a_share_refused_because_the_tag_changed_shows_the_tags_rules_again(page
             page.click("#share-create-submit")
         assert resp.value.status == 409, resp.value.status
         expect(page.locator("#share-create-error")).to_have_text(
-            "This tag changed while the dialog was open. Check the share's settings and press Create share again.")
+            "This tag no longer allows view-only shares, so a share made now can be downloaded. "
+            "Check the share's settings and press Create share again.")
         expect(page.locator("#share-tag-select")).to_have_value(tag["id"])
         expect(page.locator("#share-view-only")).not_to_be_checked()
         expect(page.locator("#share-viewonly-group")).to_be_hidden()
@@ -426,15 +427,18 @@ def test_a_share_refused_because_the_tag_changed_keeps_the_people_picked(page: P
         page.fill("#share-user-search", person["_username"])
         page.locator("#share-user-results .pick-row", has_text=person["_username"]).click()
         expect(page.locator("#share-user-chips")).to_contain_text(person["_username"])
+        expect(page.locator("#share-users-group")).to_be_visible()
         page.check("#share-view-only")
         assert admin.patch(f"/share-tags/{tag['id']}", json={"allow_view_only": False}).status_code == 200
         with page.expect_response(lambda r: r.url.rstrip("/").endswith("/shares") and r.request.method == "POST") as resp:
             page.click("#share-create-submit")
         assert resp.value.status == 409, resp.value.status
         expect(page.locator("#share-create-error")).to_have_text(
-            "This tag changed while the dialog was open. Check the share's settings and press Create share again.")
+            "This tag no longer allows view-only shares, so a share made now can be downloaded. "
+            "Check the share's settings and press Create share again.")
         expect(page.locator("#share-audience-select")).to_have_value("users")
         expect(page.locator("#share-user-chips")).to_contain_text(person["_username"])
+        expect(page.locator("#share-users-group")).to_be_visible()
         expect(page.locator("#share-viewonly-group")).to_be_hidden()
         with page.expect_response(lambda r: r.url.rstrip("/").endswith("/shares") and r.request.method == "POST") as resp:
             page.click("#share-create-submit")
@@ -448,4 +452,60 @@ def test_a_share_refused_because_the_tag_changed_keeps_the_people_picked(page: P
         admin.delete(f"/share-tags/{tag['id']}")
         admin.delete_vault(vault["id"])
         admin.delete_user(person["id"])
+        admin.put("/settings", json={"sharing_enabled": before})
+
+
+def test_a_recipient_with_no_download_button_is_not_sent_a_file_the_preview_shows_nothing_of(page: Page, admin):
+    """A view-only share's recipient opens a document the preview shows nothing of: nothing is fetched, no preview
+    is spent, and the words do not point at a Download button they do not have. Their card counts their previews
+    against the share's cap, the count that moves for them."""
+    before = admin.get("/settings").json().get("sharing_enabled")
+    admin.put("/settings", json={"sharing_enabled": True})
+    recipient = admin.create_user(role="user")
+    client = ApiClient(BASE_URL)
+    client.login(recipient["_username"], recipient["_password"])
+    vault = admin.create_vault(name=unique("vodocx"))
+    docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    r = admin.post(f"/vaults/{vault['id']}/files", files=[("files", ("report.docx", b"PK\x03\x04 not a document", docx))])
+    assert r.status_code == 200, r.text
+    fid = next(f["id"] for f in admin.get(f"/vaults/{vault['id']}/files").json()["items"] if f["name"] == "report.docx")
+    tag = admin.post("/share-tags", json={"name": unique("vodocxtag"), "auto_enroll_new_users": True,
+                                          "allowed_audiences": ["anyone_internal"], "max_recipients_cap": 10,
+                                          "allow_view_only": True, "view_only_preview": True}).json()
+    share = admin.post("/shares", json={"vault_id": vault["id"], "tag_id": tag["id"], "target_type": "vault",
+                                        "claim_audience": "anyone_internal", "view_only": True, "max_downloads": 3})
+    assert share.status_code == 200, share.text
+    assert client.post("/shares/claim", json={"token": share.json()["link_token"]}).status_code == 200
+
+    def previews():
+        mine = [s for s in client.get("/shares/shared-with-me").json() if s["vault_id"] == vault["id"]]
+        assert len(mine) == 1, mine
+        return mine[0]["preview_count"]
+
+    try:
+        assert previews() == 0
+        _login(page, recipient)
+        page.click('.sidebar-item[data-section="shared"]')
+        card = page.locator("[data-share-id]", has_text=vault["name"]).first
+        expect(card).to_be_visible(timeout=15000)
+        expect(card.locator(".shared-previews")).to_have_text("0/3 previews")
+        expect(card).not_to_contain_text("downloads")
+        page.evaluate("id => openSharedItem(id)", vault["id"])
+        expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
+        asked = []
+        page.on("request", lambda req: asked.append(req.url) if f"/files/{fid}/" in req.url else None)
+        page.click(f'.file-name[data-file-id="{fid}"]')
+        expect(page.locator("#file-preview-modal")).to_be_visible(timeout=10000)
+        expect(page.locator("#file-preview-body")).to_contain_text("No inline preview for this file type.")
+        expect(page.locator("#file-preview-body")).to_contain_text(
+            "This share does not include downloads; ask the person who shared it for a copy.")
+        expect(page.locator("#file-preview-body")).not_to_contain_text("Use Download")
+        expect(page.locator("#file-preview-download")).to_be_hidden()
+        page.wait_for_timeout(500)
+        assert asked == [], asked
+        assert previews() == 0
+    finally:
+        admin.delete_vault(vault["id"])
+        admin.delete_user(recipient["id"])
+        admin.delete(f"/share-tags/{tag['id']}")
         admin.put("/settings", json={"sharing_enabled": before})
