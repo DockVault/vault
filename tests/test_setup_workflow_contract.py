@@ -187,9 +187,18 @@ def test_the_unpublished_version_scenario_runs_setup_again_until_it_read_the_rel
                  "| tee /tmp/setup-unpublished.log", "python3 .github/scripts/mask_env_secrets.py .env"):
         assert step.count(line) == 1 and line in loop, line
     assert 'grep -qi "not published" /tmp/setup-unpublished.log && break' in loop
+    # The sentence is the loop's only way out before its fifth try: one break, and only on it.
+    assert loop.count("break") == 1 and loop.count("&& break") == 1, loop
     assert loop.index("tee /tmp/setup-unpublished.log") < loop.index("&& break") < loop.index("sleep 10")
+    # It waits between tries, not after the last.
+    assert 'if [ "$attempt" -lt 5 ]; then sleep 10; fi' in loop and loop.count("sleep") == 1, loop
     after = step[end:]
     # The checkout's own VERSION comes back once, after the loop, before anything is judged.
     assert step.count('cp "$RUNNER_TEMP/VERSION.checkout" VERSION') == 1
     assert after.index('cp "$RUNNER_TEMP/VERSION.checkout" VERSION') < after.index("::error::setup did not report")
-    assert "::error::setup pinned an image that was never published" in after
+    # Each judgement fails the step.
+    for error in ("::error::setup did not report the unpublished version",
+                  "::error::setup pinned an image that was never published"):
+        group = after[after.index(error):]
+        group = group[:group.index("}")]
+        assert group.rstrip().endswith("exit 1;"), group

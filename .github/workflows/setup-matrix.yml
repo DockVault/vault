@@ -749,9 +749,10 @@ jobs:
           printf '99.0.0\n' > VERSION
 
           # Retried, like Scenario I. Setup reads GitHub's releases list without a token, and an
-          # answer it cannot read (the anonymous rate limit, shared with every job on the runner
-          # fleet, or a degraded API) leaves it nothing to compare with, so it goes on and pins the
-          # version it was given. Only an attempt that read the list can say 99.0.0 is not published.
+          # answer it cannot read (a transient or degraded answer) leaves it nothing to compare
+          # with, so it goes on and pins the version it was given. Only an attempt that read the
+          # list can say 99.0.0 is not published. Five tries 10 s apart outlast a passing fault, not
+          # a spent hourly budget.
           for attempt in $(seq 1 5); do
             python3 dockvault.py reset --non-interactive --confirm
             rm -f .env
@@ -764,7 +765,7 @@ jobs:
             python3 .github/scripts/mask_env_secrets.py .env
             grep -qi "not published" /tmp/setup-unpublished.log && break
             echo "setup did not say 99.0.0 is unpublished: it could not read the releases list (attempt ${attempt} of 5)"
-            sleep 10
+            if [ "$attempt" -lt 5 ]; then sleep 10; fi
           done
           cp "$RUNNER_TEMP/VERSION.checkout" VERSION
 
