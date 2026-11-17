@@ -883,15 +883,26 @@ async function _apiRequestNow(endpoint, options = {}) {
             data = { detail: `Server error: ${response.status} ${response.statusText}` };
         }
         
+        // A refusal's detail is the sentence to show, or a structured {reason, message}: its sentence, and the reason a
+        // caller may branch on. It is read as text here, once, before any branch below looks into it.
+        const refusal = data ? data.detail : undefined;
+        const structuredRefusal = !!refusal && typeof refusal === 'object' && !Array.isArray(refusal);
+        const refusalText = structuredRefusal ? (typeof refusal.message === 'string' ? refusal.message : '')
+            : (typeof refusal === 'string' ? refusal : '');
+        const refusalReason = (data && typeof data.reason === 'string') ? data.reason
+            : ((structuredRefusal && typeof refusal.reason === 'string') ? refusal.reason : undefined);
+
         // Handle 401 Unauthorized - distinguish between password required vs session expired
         if (response.status === 401) {
-            const errorDetail = data?.detail || '';
-            
+            const errorDetail = refusalText;
+
             // Check if it's a password requirement (vault access) vs session expiration
             if (errorDetail.includes('password') || errorDetail.includes('Password')) {
                 // Password required for resource - don't log out, just throw error
                 console.log('Password required for resource');
-                throw new Error(errorDetail);
+                const needsPassword = new Error(errorDetail);
+                if (refusalReason !== undefined) needsPassword.reason = refusalReason;
+                throw needsPassword;
             } else {
                 // Session expired - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
@@ -936,10 +947,13 @@ async function _apiRequestNow(endpoint, options = {}) {
                 throw new Error('This action needs an extra confirmation.');
             }
 
-            const errorDetail = data?.detail || '';
+            const errorDetail = refusalText;
 
-            // Check if this is an account issue (inactive/terminated)
-            if (errorDetail.includes('inactive') || errorDetail.includes('terminated') || errorDetail.includes('locked')) {
+            // Check if this is an account issue (inactive/terminated): the server's plain sentence about this
+            // session's account. A structured refusal is about the action asked, whatever words its message uses,
+            // and never signs the person out.
+            if (!structuredRefusal
+                    && (errorDetail.includes('inactive') || errorDetail.includes('terminated') || errorDetail.includes('locked'))) {
                 // Account issue - log out user (only the session this request was sent for: sentToken)
                 if (sentToken && sentToken === authToken) {
                     console.error('Account issue, logging out');
@@ -955,6 +969,8 @@ async function _apiRequestNow(endpoint, options = {}) {
                 const err = new Error(errorDetail || 'Permission denied');
                 err.status = 403;  // a refusal, which callers may tell apart from a failure
                 err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
+                // A structured refusal carries its reason inside the detail.
+                if (err.reason === undefined && refusalReason !== undefined) err.reason = refusalReason;
                 throw err;
             }
         }
