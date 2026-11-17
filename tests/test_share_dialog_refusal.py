@@ -62,7 +62,8 @@ function _svgIcon() { return new El(null, 'svg'); }
 let deptPickerDrawn = null;   // the departments the picker was last drawn with
 function _renderGroupPickerInto(hostId, get) { deptPickerDrawn = get().slice(); }
 function openModal() {}
-function showToast() {}
+const toasts = [];            // each toast shown: [sentence, kind]
+function showToast(m, k) { toasts.push([m, k]); }
 async function loadSftpPolicyGroups() {}
 const state = { currentVault: { id: 'v1', name: 'V', type: 'standard' } };
 const navigator = { clipboard: { writeText: async () => {} } };
@@ -71,6 +72,8 @@ let shareAnswers = [];        // what each POST /shares answers, in order (an ob
 let policyReads = 0;
 let policyGate = null;        // a promise the next /share-policy waits on
 let policyAsked = null;       // resolved when /share-policy is asked for
+let shareGate = null;         // a promise the next POST /shares waits on
+let shareAsked = null;        // resolved when POST /shares is asked for
 const posted = [];
 async function apiRequest(path, opts) {
     if (path === '/share-policy') {
@@ -83,6 +86,8 @@ async function apiRequest(path, opts) {
     }
     if (path === '/shares') {
         posted.push(JSON.parse(opts.body));
+        if (shareAsked) { const a = shareAsked; shareAsked = null; a(); }
+        if (shareGate) { const g = shareGate; shareGate = null; await g; }
         const a = shareAnswers.shift();
         if (a && a.status) { const e = new Error(a.detail || 'refused'); e.status = a.status; throw e; }
         return a || { link_token: 'tok' };
@@ -228,6 +233,57 @@ function people() {
     shareAnswers = [{ status: 400, detail: 'max_downloads exceeds the cap' }];
     await submitCreateShare();
     out.other = { reads: policyReads - readsBefore, after: snap() };
+    // The dialog closed and opened again while something the earlier open started is still on its way: whatever it
+    // finds out later is dropped, and the newer dialog shows only its own.
+    function shown() {
+        return Object.assign(snap(), { tags: els['share-tag-select'].children.map(o => o.value),
+            policyTags: ((_shareCreate.policy && _shareCreate.policy.tags) || []).map(t => t.id),
+            target: _shareCreate.targetType, link: els['share-link-value'].textContent,
+            fieldsShown: els['share-create-fields'].style.display !== 'none',
+            resultShown: els['share-create-result'].style.display !== 'none',
+            submitShown: els['share-create-submit'].style.display !== 'none' });
+    }
+    // An open whose tags come back after a newer open's.
+    policyAnswer = { sharing_enabled: true, tags: [tag('Old')] };
+    let releaseFirst; policyGate = new Promise(r => { releaseFirst = r; });
+    const askedFirst = new Promise(r => { policyAsked = r; });
+    const firstOpen = openCreateShareModal('file', 'f1', 'F');
+    await askedFirst;
+    await open([tag('New')]);
+    const reopened = shown();
+    policyAnswer = { sharing_enabled: true, tags: [tag('Old')] };
+    releaseFirst();
+    await firstOpen;
+    out.open_superseded = { before: reopened, after: shown() };
+    // A share being made when the dialog is opened again: the new dialog is not turned into its result.
+    await open([tag('Normal')]);
+    pick('Normal', 'anyone_internal');
+    shareAnswers = [{ link_token: 'earlier-one' }];
+    toasts.length = 0;
+    let releaseCreate; shareGate = new Promise(r => { releaseCreate = r; });
+    const askedCreate = new Promise(r => { shareAsked = r; });
+    const pendingCreate = submitCreateShare();
+    await askedCreate;
+    await open([tag('Other')]);
+    const beforeCreate = shown();
+    releaseCreate();
+    await pendingCreate;
+    out.create_superseded = { before: beforeCreate, after: shown(), toasts: toasts.slice() };
+    // A refusal whose tags are being read again when the dialog is opened again: neither its tags nor its sentence
+    // reach the new dialog.
+    await open([first, tag('Normal')]);
+    people();
+    shareAnswers = [{ status: 409 }];
+    let releaseReload; policyGate = new Promise(r => { releaseReload = r; });
+    const askedReload = new Promise(r => { policyAsked = r; });
+    const pendingRefusal = submitCreateShare();
+    await askedReload;
+    await open([tag('Fresh')]);
+    const beforeRefusal = shown();
+    policyAnswer = { sharing_enabled: true, tags: [first, tag('Normal', noVo)] };
+    releaseReload();
+    await pendingRefusal;
+    out.refusal_superseded = { before: beforeRefusal, after: shown() };
     process.stdout.write(JSON.stringify(out));
 })().catch(e => { console.error(e); process.exit(1); });
 """
@@ -324,3 +380,25 @@ def test_any_other_refusal_reads_nothing_again(out):
     other = out["other"]
     assert other["reads"] == 0, other
     assert other["after"]["error"] == "max_downloads exceeds the cap" and other["after"]["users"] == ["u1"], other
+
+
+def test_an_open_superseded_by_a_newer_one_leaves_the_newer_dialog_as_it_is(out):
+    seen = out["open_superseded"]
+    assert seen["before"]["tags"] == ["New"] and seen["before"]["policyTags"] == ["New"], seen
+    assert seen["after"] == seen["before"], seen
+
+
+def test_a_share_made_while_the_dialog_was_opened_again_does_not_become_the_new_dialogs_result(out):
+    seen = out["create_superseded"]
+    before, after = seen["before"], seen["after"]
+    assert before["fieldsShown"] and not before["resultShown"] and before["link"] != "earlier-one", before
+    assert after == before, seen
+    # The share was made: the person is told, outside the dialog.
+    assert seen["toasts"] == [["Share created", "success"]], seen
+
+
+def test_a_refusal_read_again_while_the_dialog_was_opened_again_does_not_reach_the_new_dialog(out):
+    seen = out["refusal_superseded"]
+    before, after = seen["before"], seen["after"]
+    assert before["tags"] == ["Fresh"] and before["error"] == "" and before["submitDisabled"] is False, before
+    assert after == before, seen

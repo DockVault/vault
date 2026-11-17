@@ -4001,8 +4001,10 @@ async function kickShareRecipient(shareId, userId, username, wrap) {
 // ---- Create-share modal (creator) ----
 // DOM-built (no innerHTML). Reuses the existing openModal/closeModal, copyToClipboard, and the
 // department chip picker (_renderGroupPickerInto); the user picker is a small /users/search wrapper.
+// `seq` counts the dialog's opens. Whatever an open, or a share it started making, finds out after the dialog
+// was opened again belongs to a dialog that is gone: it is dropped, so it never writes into the newer one.
 const _shareCreate = { targetType: null, targetId: null, vaultId: null, targetName: null,
-                       policy: null, userIds: [], usersById: {}, deptIds: [], lastLink: '' };
+                       policy: null, userIds: [], usersById: {}, deptIds: [], lastLink: '', seq: 0 };
 
 // A share requires a Standard, non-password vault (the backend refuses zero-knowledge + password-
 // protected). Hide the Share affordances for those so they aren't a dead-end.
@@ -4015,6 +4017,7 @@ function vaultShareable() {
 async function openCreateShareModal(targetType, targetId, targetName) {
     const vaultId = state.currentVault && state.currentVault.id;
     if (!vaultId) { showToast('Open a vault first', 'error'); return; }
+    const seq = ++_shareCreate.seq;
     _shareCreate.targetType = targetType;
     _shareCreate.targetId = (targetType === 'vault') ? null : targetId;
     _shareCreate.vaultId = vaultId;
@@ -4047,9 +4050,14 @@ async function openCreateShareModal(targetType, targetId, targetName) {
     const tagSel = document.getElementById('share-tag-select');
     tagSel.replaceChildren(_el('option', null, 'Loading…'));
     tagSel.disabled = true;
-    try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
-    catch (e) { _shareCreate.policy = { sharing_enabled: false, tags: [] }; }
+    let policy;
+    try { policy = await apiRequest('/share-policy', { silent: true }); }
+    catch (e) { policy = { sharing_enabled: false, tags: [] }; }
     await loadSftpPolicyGroups().catch(() => {});  // for the department picker (idempotent)
+    // The tags are this dialog's only if it was not opened again meanwhile; then they are kept and shown in one
+    // step, with nothing awaited between.
+    if (seq !== _shareCreate.seq) return;
+    _shareCreate.policy = policy;
     populateShareTags();
 }
 
@@ -4299,13 +4307,17 @@ const SHARE_AUDIENCE_AND_VIEW_ONLY_GONE = 'This tag no longer allows view-only s
 
 // Returns what the reload found: 'kept' (the tag and who to share with kept, the recipients put back), 'audience'
 // (the tag kept, who to share with no longer offered), 'tag' (the tag no longer offered: the first one is picked),
-// 'none' (sharing off or no tag for this person: populateShareTags has said so) or 'unread' (the tags could not be
-// read: the dialog keeps everything as it was). What the maker picked is read once the tags are back, so a change
-// to who to share with, made while they were being read, is kept too; the tag goes back to the one the server
-// refused. Nothing waits between that read and populateShareTags.
-async function _shareReloadPolicyKeepingTag(tagId) {
-    try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
-    catch (_) { return 'unread'; }
+// 'none' (sharing off or no tag for this person: populateShareTags has said so), 'unread' (the tags could not be
+// read: the dialog keeps everything as it was) or 'superseded' (the dialog was opened again while they were read:
+// nothing is changed, the newer dialog is left as it is). What the maker picked is read once the tags are back, so
+// a change to who to share with, made while they were being read, is kept too; the tag goes back to the one the
+// server refused. Nothing waits between that read and populateShareTags.
+async function _shareReloadPolicyKeepingTag(tagId, seq) {
+    let read;
+    try { read = await apiRequest('/share-policy', { silent: true }); }
+    catch (_) { return seq !== _shareCreate.seq ? 'superseded' : 'unread'; }
+    if (seq !== _shareCreate.seq) return 'superseded';
+    _shareCreate.policy = read;
     const audSel = document.getElementById('share-audience-select');
     const voInput = document.getElementById('share-view-only');
     const audience = audSel.value;
@@ -4371,8 +4383,11 @@ async function submitCreateShare() {
     const submitBtn = document.getElementById('share-create-submit');
     submitBtn.disabled = true;
     _shareSetError('');
+    const seq = _shareCreate.seq;
     try {
         const res = await apiRequest('/shares', { method: 'POST', body: JSON.stringify(payload) });
+        // Opened again meanwhile: the share was made, but the dialog that asked for it is gone.
+        if (seq !== _shareCreate.seq) { showToast('Share created', 'success'); return; }
         _shareCreate.lastLink = res.link_token || '';
         document.getElementById('share-link-value').textContent = res.link_token || '';
         document.getElementById('share-create-fields').style.display = 'none';
@@ -4380,8 +4395,10 @@ async function submitCreateShare() {
         submitBtn.style.display = 'none';
         showToast('Share created', 'success');
     } catch (e) {
+        if (seq !== _shareCreate.seq) return;
         if (e && e.status === 409) {
-            const found = await _shareReloadPolicyKeepingTag(t.id);
+            const found = await _shareReloadPolicyKeepingTag(t.id, seq);
+            if (found === 'superseded') return;
             if (found !== 'none') {
                 const now = (found === 'kept' || found === 'audience') ? currentShareTag() : null;
                 const viewOnlyGone = shownViewOnly && !!now && !now.allow_view_only;
