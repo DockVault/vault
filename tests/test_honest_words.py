@@ -36,6 +36,13 @@ def test_the_view_only_option_says_what_a_recipient_can_do():
     assert "<span>Allow view-only shares (no Download button)</span>" in html
     # The words the dialog sets for the chosen tag (static/js/app.js) are the same as the page's own.
     label = _read("static/js/app.js").split("function _shareViewOnlyLabel(t) {", 1)[1].split("\n}\n", 1)[0]
+    # The viewable words go with a tag whose recipients view files, never the other way round.
+    assert "const views = !!(t && t.view_only_preview);" in label
+    assert ("if (text) text.textContent = views\n"
+            "        ? 'View only (recipients can view files in the browser, with no Download button)'\n"
+            "        : 'View only (recipients see names and sizes; they cannot open or download)';") in label
+    assert ('if (help) help.textContent = views\n'
+            '        ? "A preview sends the file to their browser') in label
     assert "? 'View only (recipients can view files in the browser, with no Download button)'" in label
     assert ('? "A preview sends the file to their browser to show it, so it cannot stop them keeping a copy (from the '
             "browser's own viewer, or a screenshot). It removes the Download button, and each preview spends their "

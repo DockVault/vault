@@ -189,6 +189,37 @@ function people() {
     release();
     await pending;
     out.after_held = snap();
+    // The same, where the maker changes who to share with while the tags are read: the change is kept and sent.
+    async function heldRefusal(setup, change) {
+        posted.length = 0; deptPickerDrawn = null;
+        await open([first, tag('Normal')]);
+        setup();
+        shareAnswers = [{ status: 409 }, null];
+        policyAnswer = { sharing_enabled: true, tags: [first, tag('Normal', noVo)] };
+        let release; policyGate = new Promise(r => { release = r; });
+        const asked = new Promise(r => { policyAsked = r; });
+        const pending = submitCreateShare();
+        await asked;
+        change();
+        release();
+        await pending;
+        const after = snap();
+        await submitCreateShare();
+        return { after, first: post(posted[0]), second: post(posted[1]) };
+    }
+    // From anyone internal to one named person.
+    out.held_audience = await heldRefusal(() => {
+        pick('Normal', 'anyone_internal'); els['share-view-only'].checked = true;
+    }, () => {
+        els['share-audience-select'].value = 'users'; onShareAudienceChange();
+        _shareCreate.userIds.push('u9'); _shareCreate.usersById.u9 = 'zed';
+    });
+    // One of two departments removed.
+    out.held_depts = await heldRefusal(() => {
+        pick('Normal', 'departments'); _shareCreate.deptIds.push('d1', 'd2'); els['share-view-only'].checked = true;
+    }, () => {
+        _shareCreate.deptIds = _shareCreate.deptIds.filter(id => id !== 'd2');
+    });
     // Any other refusal reads nothing again and shows the server's sentence.
     posted.length = 0;
     await open([tag('Normal')]);
@@ -276,6 +307,17 @@ def test_while_the_tags_are_read_the_button_is_off_and_a_change_made_then_is_kep
     after = out["after_held"]
     assert after["users"] == ["u1"] and after["chips"] == ["alice"] and after["audience"] == "users", after
     assert after["error"] == VIEW_ONLY_GONE and after["submitDisabled"] is False, after
+
+
+def test_who_to_share_with_changed_while_the_tags_are_read_is_what_the_next_press_sends(out):
+    audience = out["held_audience"]
+    assert audience["first"]["aud"] == "anyone_internal", audience
+    assert audience["after"]["audience"] == "users" and audience["after"]["chips"] == ["zed"], audience
+    assert audience["second"] == {"aud": "users", "users": ["u9"], "depts": None, "vo": False, "voSent": None}
+    depts = out["held_depts"]
+    assert depts["first"]["depts"] == ["d1", "d2"], depts
+    assert depts["after"]["depts"] == ["d1"] and depts["after"]["deptPicker"] == ["d1"], depts
+    assert depts["second"] == {"aud": "departments", "users": None, "depts": ["d1"], "vo": False, "voSent": None}
 
 
 def test_any_other_refusal_reads_nothing_again(out):

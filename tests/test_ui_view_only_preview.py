@@ -466,9 +466,12 @@ def test_a_recipient_with_no_download_button_is_not_sent_a_file_the_preview_show
     client.login(recipient["_username"], recipient["_password"])
     vault = admin.create_vault(name=unique("vodocx"))
     docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    r = admin.post(f"/vaults/{vault['id']}/files", files=[("files", ("report.docx", b"PK\x03\x04 not a document", docx))])
+    r = admin.post(f"/vaults/{vault['id']}/files", files=[("files", ("report.docx", b"PK\x03\x04 not a document", docx)),
+                                                          ("files", ("notes.txt", b"first line", "text/plain"))])
     assert r.status_code == 200, r.text
-    fid = next(f["id"] for f in admin.get(f"/vaults/{vault['id']}/files").json()["items"] if f["name"] == "report.docx")
+    items = admin.get(f"/vaults/{vault['id']}/files").json()["items"]
+    fid = next(f["id"] for f in items if f["name"] == "report.docx")
+    txt = next(f["id"] for f in items if f["name"] == "notes.txt")
     tag = admin.post("/share-tags", json={"name": unique("vodocxtag"), "auto_enroll_new_users": True,
                                           "allowed_audiences": ["anyone_internal"], "max_recipients_cap": 10,
                                           "allow_view_only": True, "view_only_preview": True}).json()
@@ -504,6 +507,15 @@ def test_a_recipient_with_no_download_button_is_not_sent_a_file_the_preview_show
         page.wait_for_timeout(500)
         assert asked == [], asked
         assert previews() == 0
+        # A file the preview shows is fetched and spends a preview, and the card counts it.
+        page.evaluate("closeFilePreview()")
+        page.click(f'.file-name[data-file-id="{txt}"]')
+        expect(page.locator("#file-preview-body")).to_contain_text("first line", timeout=10000)
+        assert previews() == 1
+        page.click('.sidebar-item[data-section="shared"]')
+        card = page.locator("[data-share-id]", has_text=vault["name"]).first
+        expect(card.locator(".shared-previews")).to_have_text("1/3 previews", timeout=15000)
+        expect(card).not_to_contain_text("downloads")
     finally:
         admin.delete_vault(vault["id"])
         admin.delete_user(recipient["id"])

@@ -3782,8 +3782,8 @@ function _sharedCard(it) {
         s.appendChild(document.createTextNode(' ' + it.download_count + '/' + it.max_downloads + ' downloads'));
         meta.appendChild(s);
     } else if (it.max_downloads != null && it.view_only_preview) {
-        // A viewable view-only share's recipient never downloads: their previews count against the same cap. A
-        // names-only recipient does neither, so nothing is counted for them.
+        // A viewable view-only share's recipient never downloads through the download route: their previews count
+        // against the same cap. A names-only recipient does neither, so nothing is counted for them.
         const s = _el('span', 'shared-previews'); s.appendChild(_svgIcon('eye', 'icon-sm'));
         s.appendChild(document.createTextNode(' ' + (it.preview_count || 0) + '/' + it.max_downloads + ' previews'));
         meta.appendChild(s);
@@ -4301,7 +4301,8 @@ const SHARE_AUDIENCE_AND_VIEW_ONLY_GONE = 'This tag no longer allows view-only s
 // (the tag kept, who to share with no longer offered), 'tag' (the tag no longer offered: the first one is picked),
 // 'none' (sharing off or no tag for this person: populateShareTags has said so) or 'unread' (the tags could not be
 // read: the dialog keeps everything as it was). What the maker picked is read once the tags are back, so a change
-// made in the dialog while they were being read is kept too; nothing waits between that and populateShareTags.
+// to who to share with, made while they were being read, is kept too; the tag goes back to the one the server
+// refused. Nothing waits between that read and populateShareTags.
 async function _shareReloadPolicyKeepingTag(tagId) {
     try { _shareCreate.policy = await apiRequest('/share-policy', { silent: true }); }
     catch (_) { return 'unread'; }
