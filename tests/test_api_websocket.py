@@ -256,6 +256,75 @@ def test_ws_temp_cred_past_validity_window_closed(base_url, admin):
             pass
 
 
+def _open_temporary_socket(base_url, admin, note):
+    """A temporary credential signed in, with its live socket open and answering: (the credential, the socket)."""
+    from conftest import unique, ApiClient
+
+    tc = admin.post("/auth/temp-credentials", json={"note": unique(note)}).json()
+    tclient = ApiClient()
+    tclient.login(tc["temp_username"], tc["credential"])
+    ws = websocket.create_connection(_ws_url(base_url), timeout=10)
+    ws.send(json.dumps({"type": "auth", "token": tclient.token}))
+    ws.settimeout(8)
+    assert json.loads(ws.recv())["type"] == "connected"
+    ws.send(json.dumps({"type": "ping"}))
+    assert json.loads(ws.recv())["type"] == "pong", "control: the open socket answers"
+    return tc, ws
+
+
+def _seconds_until_the_server_closes(ws, within):
+    """Read the socket until the server closes it; how long that took, or None if it was still open after `within`
+    seconds. Keep-alive pings are answered as they come."""
+    import time as _t
+    began = _t.monotonic()
+    ws.settimeout(1)
+    while _t.monotonic() - began < within:
+        try:
+            if ws.recv() == "":          # the server's close frame
+                return _t.monotonic() - began
+        except websocket.WebSocketTimeoutException:
+            continue
+        except Exception:                # closed under us
+            return _t.monotonic() - began
+    return None
+
+
+@pytest.mark.websocket
+def test_an_open_temporary_socket_is_closed_when_its_credential_is_revoked(base_url, admin):
+    """The handshake refuses a revoked temporary credential (test_ws_revoked_temp_cred_closed); a socket it opened
+    before the revocation is closed by the check its session gets every five seconds."""
+    tc, ws = _open_temporary_socket(base_url, admin, "ws-open-rev")
+    try:
+        assert admin.post(f"/temp-creds/{tc['temp_username']}/deactivate").status_code == 200
+        took = _seconds_until_the_server_closes(ws, within=15)
+        assert took is not None, "the open socket of a revoked temporary credential stayed open"
+    finally:
+        ws.close()
+
+
+@pytest.mark.websocket
+def test_an_open_temporary_socket_is_closed_at_the_end_of_its_validity_window(base_url, admin):
+    """A credential's validity window can end before its token does. Requests are refused from then on, and so is a
+    new socket (test_ws_temp_cred_past_validity_window_closed); a socket already open is closed by its session's
+    check every five seconds. The window's end is moved into the past directly, its session row left active."""
+    import os
+    import subprocess
+
+    tc, ws = _open_temporary_socket(base_url, admin, "ws-open-window")
+    try:
+        sql = ("UPDATE temporary_credentials SET deactivate_at = NOW() - INTERVAL '1 minute' "
+               "WHERE temp_username = '%s'" % tc["temp_username"])
+        moved = subprocess.run(
+            ["docker", "exec", os.environ.get("VAULT_DB_CONTAINER", "vault-db"), "sh", "-c",
+             'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "%s"' % sql],
+            capture_output=True, text=True, timeout=20)
+        assert moved.returncode == 0 and "UPDATE 1" in moved.stdout, moved.stdout + moved.stderr
+        took = _seconds_until_the_server_closes(ws, within=15)
+        assert took is not None, "the open socket stayed open past its credential's validity window"
+    finally:
+        ws.close()
+
+
 @pytest.mark.websocket
 def test_ws_handshake_rejects_a_token_whose_session_row_is_gone(base_url, admin):
     """A non-temporary token whose ActiveSession row has been DELETED must be rejected at the
