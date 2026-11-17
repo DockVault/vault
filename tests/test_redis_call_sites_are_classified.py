@@ -18,7 +18,7 @@ Classes: A security counter (Redis->DB fallback, fail-closed; its sites call the
 appear here); B anonymous lockout/grant (raise or return the locked/absent value BEFORE the socket
 while open); C OTP store (routes to its DB path via _resolve_redis when open); D best-effort
 (read-through guard, skip while open); E already-correct (guarded before the sweep, skip-to-fallback,
-off-loop pubsub/listener, or the dead verify_session kept only for a source-text security pin).
+or an off-loop pubsub/listener).
 """
 import ast
 import re
@@ -85,7 +85,6 @@ _REGISTRY = {
         "_create_session": ("E", 1), "_terminate_session": ("E", 1),
         "create_temporary_credential": ("E", 1), "mint_device_sync_credential": ("E", 1),
         "denylist_token": ("E", 1), "is_token_denylisted": ("E", 1),
-        "verify_session": ("E", 2),              # dead (no production caller); source-text security pin
     },
     "services/security_monitor.py": {
         "_broadcast_alert": ("E", 1), "_windowed_count": ("E", 2),

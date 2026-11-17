@@ -158,14 +158,11 @@ def test_create_session_stores_the_hash_not_the_plaintext():
         "_create_session must persist the hash, not the raw token")
 
 
-def test_verify_session_matches_on_the_hash_and_fails_closed_on_revocation():
+def test_the_unused_session_lookup_stays_gone():
+    """Requests are authorized by get_current_user, from the database row (by the token's hash). AuthService had a
+    second session lookup that nothing called; it is gone, so it cannot drift from the one in use."""
     src = _read("app/services/auth_service.py")
-    # DB fallback matches the stored hash and excludes revoked rows
-    assert "ActiveSession.session_token == hash_session_token(session_token)" in src
-    assert re.search(r"ActiveSession\.revoked == False", src), "the DB fallback must exclude revoked"
-    # the Redis-cache short-circuit also re-checks revoked (fail closed)
-    assert "session.is_active and not session.revoked" in src, (
-        "the cache path must reject a session revoked after it was cached")
+    assert "def verify_session(" not in src
 
 
 def test_terminate_uses_the_stored_hash_directly_no_double_hash():
