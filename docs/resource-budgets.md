@@ -402,7 +402,8 @@ message, so its messages are bounded too (`app/core/websocket_guard.py`):
   has ten of its own), and a process serves at most 100 subscribed sockets, from a Redis connection
   pool of their own: the server's Redis commands never share it (`app/core/monitor_feed.py`,
   `database.monitor_redis_client`). A temporary credential's socket subscribes to nothing, so it
-  holds no connection of that pool and is not among the 100.
+  holds no connection of that pool and is not among the 100. A socket past the ten is told why and
+  closed with code 4429, and the page tries again after a minute instead of the usual five seconds.
 
 Measured on this change: a 15 MiB first message is closed with 1009 in 0.1 s on its header, the API's
 memory rises by 0.4 MiB and `/health` keeps answering within 0.07 s. Before it, one 16 MiB message

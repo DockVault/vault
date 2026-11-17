@@ -402,8 +402,13 @@ def test_a_temporary_credentials_sockets_never_take_the_places_of_its_account(ba
         _read_all()
         for token in (temporary.token, admin.token):
             ws, first = _open(token)
-            ws.close()
-            assert first == refused, first
+            try:
+                assert first == refused, first
+                # Then closed with the code the web app waits a minute on.
+                opcode, data = ws.recv_data(control_frame=True)
+                assert opcode == websocket.ABNF.OPCODE_CLOSE and int.from_bytes(data[:2], "big") == 4429, data
+            finally:
+                ws.close()
     finally:
         for ws in held:
             try:
