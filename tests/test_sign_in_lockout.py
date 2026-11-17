@@ -635,6 +635,16 @@ def test_an_address_count_left_for_a_day_is_gone_for_both(clocked):
     assert "address" not in [x[0] for x in seen["real-person"] if isinstance(x, tuple)]
 
 
+def test_an_unlocked_count_left_for_a_day_and_ten_minutes_starts_again_for_both(clocked):
+    # One failure short of the lock, then a day and ten minutes with none: the count is gone, for an account and
+    # for a name that is no account alike (in the cache or, with it down, in the database), so the next THRESHOLD
+    # tries are all checked and none is refused. A count kept longer would refuse the name's last two tries alone.
+    steps = [(ATTACKER, 1)] * (THRESHOLD - 2) + [(ATTACKER, 24 * 60 + 10)] + [(ATTACKER, 1)] * THRESHOLD
+    seen = _both(clocked, steps)
+    assert seen["real-person"] == seen["nobody-here"], seen
+    assert seen["real-person"] == ["wrong"] * (2 * THRESHOLD - 1), seen
+
+
 @pytest.fixture
 def closed_guards():
     """Both guards in front of the cache closed, as a test that talks to a fake Redis needs them, and
@@ -951,7 +961,9 @@ def test_a_names_count_is_kept_in_the_database_only_while_the_cache_is_down_and_
         return
     # The address's count and the count from everywhere, by the name's keyed stand-in, never the name.
     assert len(rows) == 2 and not any("nobody-here" in key for key in rows), rows
-    assert min(rows.values()) > clock.t, rows
+    # An unlocked count is kept a day after its failure, the address's and the one from everywhere alike, as the
+    # cache keeps it (the data inventory says so).
+    assert set(rows.values()) == {clock.t + timedelta(days=1)}, rows
     clock.t = min(rows.values()) - timedelta(seconds=1)
     s = Session()
     L.prune_stale(s)
