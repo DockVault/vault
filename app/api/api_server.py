@@ -23581,8 +23581,12 @@ async def download_file(
 ):
     """Download a file while exposing a cancellable, principal-bound operation.
 
-    ``purpose=preview`` (an older web app's way of asking) records the transfer as a preview; it changes
-    nothing else. The preview route below is what the web app uses now."""
+    ``purpose=preview`` is how the web app of 0.34.1 to 0.34.4 asks for a preview here (earlier web apps, and the
+    desktop app so far, ask for the plain download). It answers as the preview route below does: inline and never
+    cached, under the preview's sandboxing Content-Security-Policy and nosniff, every type a browser would run sent
+    as plain text, recorded as a preview, and for a share recipient spending the preview allowance instead of a
+    download. Who may read stays a download's: a view-only share's recipient is refused here (view_only_ok=False).
+    The preview route is what the web app uses now."""
     return await _serve_file(vault_id, file_id, request, file_password, current_user, db, x_vault_password,
                              as_preview=(purpose == 'preview'), view_only_ok=False)
 
