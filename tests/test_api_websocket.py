@@ -338,6 +338,9 @@ def test_an_account_holds_at_most_ten_live_sockets_and_a_closed_one_frees_its_pl
         extra, first = _open(client.token)
         assert first == {"type": "error",
                          "message": "Too many live connections for this account; close another tab."}, first
+        # Then closed with the code the web app waits a minute on.
+        opcode, data = extra.recv_data(control_frame=True)
+        assert opcode == websocket.ABNF.OPCODE_CLOSE and int.from_bytes(data[:2], "big") == 4429, (opcode, data)
         extra.close()
         # Another account is served as before.
         other, first = _open(admin.token)

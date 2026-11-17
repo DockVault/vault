@@ -206,7 +206,12 @@ def test_the_socket_takes_a_slot_after_its_session_is_checked_and_always_gives_i
     take = src.index("if not SOCKET_SLOTS.take(slot_key(user_id, temporary_credential_id if is_temporary else None)):")
     assert src.index("verify_access_token(token)") < take < src.index("MonitorFeed(")
     refusal = src[take:src.index("slot_of = slot_key(user_id, temporary_credential_id if is_temporary else None)")]
-    assert "'message': TOO_MANY_SOCKETS" in refusal and "websocket.close(" in refusal and "return" in refusal
+    assert "'message': TOO_MANY_SOCKETS" in refusal and "return" in refusal
+    # Closed with a code of its own, after the sentence, so the web app can tell it from any other close.
+    assert refusal.index("'message': TOO_MANY_SOCKETS") < refusal.index("websocket.close(code=SOCKET_REFUSED_CLOSE)")
+    assert refusal.count("websocket.close(") == 1
+    from app.core.monitor_feed import SOCKET_REFUSED_CLOSE
+    assert SOCKET_REFUSED_CLOSE == 4429
     # Every way out of the handler's try runs its finally, whose first statement gives the slot back.
     first = ast.unparse(_try_with_finally(handler).finalbody[0])
     assert first == "if slot_of is not None:\n    SOCKET_SLOTS.give_back(slot_of)", first

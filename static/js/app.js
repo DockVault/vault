@@ -8026,6 +8026,10 @@ async function submitGroupTemplate() {
 
 let appSocket = null;
 let appSocketReconnectTimer = null;   // single pending reconnect timer (coalesced; never stacks)
+// The server closes a socket with this code when the account already holds as many live connections as it may
+// (app/core/monitor_feed.py). The tab then tries again after a minute, and nothing opens it sooner.
+const APP_SOCKET_REFUSED_CLOSE = 4429;
+let appSocketRefused = false;
 
 // Tell the page how the socket is doing: the "dockvault:socket" event with detail.state one of
 // connecting, open, closed or error, and the latest in window.dockvaultSocketState for a page opened
@@ -8040,18 +8044,21 @@ function setAppSocketState(state) {
 // Schedule at most ONE pending reconnect. Any newer schedule (or a direct connect) cancels the prior
 // timer, so repeated failures across the entry points (sign-in, navigation, onclose, and a
 // WebSocket-constructor throw) can't stack into a burst of connection attempts.
-function scheduleAppSocketReconnect() {
+function scheduleAppSocketReconnect(refused) {
     clearTimeout(appSocketReconnectTimer);
+    appSocketRefused = refused === true;
     appSocketReconnectTimer = setTimeout(() => {
         appSocketReconnectTimer = null;
+        appSocketRefused = false;
         if (authToken) connectAppSocket();
-    }, 5000);
+    }, appSocketRefused ? 60000 : 5000);
 }
 
 function connectAppSocket() {
     // A direct (re)connect supersedes any pending auto-reconnect — don't let them stack.
     clearTimeout(appSocketReconnectTimer);
     appSocketReconnectTimer = null;
+    appSocketRefused = false;
     if (appSocket) appSocket.close();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -8083,12 +8090,12 @@ function connectAppSocket() {
         ws.onerror = () => {
             if (appSocket === ws) setAppSocketState('error');   // onclose follows and reconnects
         };
-        ws.onclose = () => {
+        ws.onclose = (event) => {
             // A stale close from a socket already replaced must not re-arm the reconnect (it would
             // tear down the healthy replacement 5s later).
             if (appSocket !== ws) return;
             setAppSocketState('closed');
-            scheduleAppSocketReconnect();
+            scheduleAppSocketReconnect(!!event && event.code === APP_SOCKET_REFUSED_CLOSE);
         };
     } catch (error) {
         console.error('Failed to open the socket:', error);
@@ -8152,6 +8159,7 @@ function handleSocketFrame(data) {
 function closeAppSocket() {
     clearTimeout(appSocketReconnectTimer);
     appSocketReconnectTimer = null;
+    appSocketRefused = false;
     if (appSocket) {
         const ws = appSocket;
         appSocket = null;          // first, so its onclose does not schedule a reconnect
@@ -8163,7 +8171,7 @@ function closeAppSocket() {
 // (Re)open the socket if it isn't open. A cheap no-op when it's connected; covers a socket that
 // dropped while the user was on a page, so live notifications keep working across navigation.
 function ensureAppSocket() {
-    if (!authToken) return;
+    if (!authToken || appSocketRefused) return;   // refused: its own retry is a minute away
     const ws = appSocket;
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
         connectAppSocket();

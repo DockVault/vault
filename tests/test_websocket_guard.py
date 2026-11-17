@@ -205,8 +205,38 @@ def test_the_shipped_default_leaves_room_for_many_tabs_behind_one_address():
     assert fields["rate_limit_ws_connect"].default >= 10 * 12
     assert fields["rate_limit_ws_connect_window"].default == 60
     app_js = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
-    reconnect = app_js.split("function scheduleAppSocketReconnect()", 1)[1].split("\n}", 1)[0]
-    assert "}, 5000);" in reconnect
+    reconnect = app_js.split("function scheduleAppSocketReconnect(refused)", 1)[1].split("\n}", 1)[0]
+    assert "}, appSocketRefused ? 60000 : 5000);" in reconnect
+
+
+def _js_function(app_js, head):
+    return app_js.split(head, 1)[1].split("\n}", 1)[0]
+
+
+def test_a_socket_refused_for_too_many_connections_waits_a_minute_and_nothing_opens_it_sooner():
+    # The server closes a socket past the account's limit with 4429 (app/core/monitor_feed.py). The tab then
+    # schedules its one retry a minute away; any other close keeps its 5 s.
+    set_bare_api_env()
+    from app.core.monitor_feed import SOCKET_REFUSED_CLOSE
+    app_js = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    assert f"const APP_SOCKET_REFUSED_CLOSE = {SOCKET_REFUSED_CLOSE};" in app_js
+    connect = _js_function(app_js, "function connectAppSocket() {")
+    onclose = connect.split("ws.onclose = (event) => {", 1)[1].split("};", 1)[0]
+    assert "scheduleAppSocketReconnect(!!event && event.code === APP_SOCKET_REFUSED_CLOSE);" in onclose
+    assert onclose.index("if (appSocket !== ws) return;") < onclose.index("scheduleAppSocketReconnect(")
+    reconnect = _js_function(app_js, "function scheduleAppSocketReconnect(refused) {")
+    assert "appSocketRefused = refused === true;" in reconnect
+    timer = reconnect.split("setTimeout(() => {", 1)[1]
+    assert timer.index("appSocketRefused = false;") < timer.index("connectAppSocket();")
+    # Navigation (ensureAppSocket) does not open it while the minute runs; signing out, or a direct connect at
+    # sign-in, clears the wait.
+    ensure = _js_function(app_js, "function ensureAppSocket() {")
+    assert ensure.lstrip().startswith("if (!authToken || appSocketRefused) return;")
+    assert "appSocketRefused = false;" in _js_function(app_js, "function closeAppSocket() {")
+    assert "appSocketRefused = false;" in connect.split("const protocol", 1)[0]
+    # The only other call (a socket that could not be made) schedules the 5 s retry.
+    calls = [c.split(")", 1)[0] for c in app_js.split("scheduleAppSocketReconnect(")[1:]]
+    assert sorted(calls) == sorted(["refused", "", "!!event && event.code === APP_SOCKET_REFUSED_CLOSE"]), calls
 
 
 @pytest.mark.parametrize("client,source", [

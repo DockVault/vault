@@ -17,6 +17,8 @@ import threading
 SOCKETS_PER_ACCOUNT = 10
 
 # What a socket past that number is told before it is closed.
+# The close code of a socket refused for that (a private-use code): the web app tries again after a minute.
+SOCKET_REFUSED_CLOSE = 4429
 TOO_MANY_SOCKETS = "Too many live connections for this account; close another tab."
 
 

@@ -10137,7 +10137,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
     """
     import asyncio
     from app.core.database import monitor_redis_client
-    from app.core.monitor_feed import MonitorFeed, SOCKET_SLOTS, TOO_MANY_SOCKETS, slot_key
+    from app.core.monitor_feed import MonitorFeed, SOCKET_REFUSED_CLOSE, SOCKET_SLOTS, TOO_MANY_SOCKETS, slot_key
     import time as _ws_time
 
     # Accept the WebSocket connection
@@ -10293,7 +10293,8 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
         if not SOCKET_SLOTS.take(slot_key(user_id, temporary_credential_id if is_temporary else None)):
             print("[WS] live socket refused: the limit of live connections for this session's place is reached")
             await websocket.send_json({"type": "error", "message": TOO_MANY_SOCKETS})
-            await websocket.close(code=1008)
+            # Its own code, so the web app waits longer before it tries again (static/js/app.js).
+            await websocket.close(code=SOCKET_REFUSED_CLOSE)
             return
         slot_of = slot_key(user_id, temporary_credential_id if is_temporary else None)
 
