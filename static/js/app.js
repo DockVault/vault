@@ -16774,7 +16774,8 @@ function setupImageZoom(img, wrap, controls) {
 }
 
 // Above this size, a media/image/PDF file is NOT pulled into memory just to preview it inline --
-// loading a multi-GB blob can crash the tab. It is refused with a "download it" message instead.
+// loading a multi-GB blob can crash the tab. It is refused with a "download it" message instead, where there is a
+// Download button.
 const MEDIA_PREVIEW_MAX_BYTES = 150 * 1024 * 1024;   // 150 MB
 // An SVG is shown from a data: address (see _blobToDataUrl), a string about a third larger than
 // the file, which some browsers cap well below the media limit; a larger SVG is offered as a
@@ -16830,7 +16831,9 @@ function _renderNoInlinePreview(bodyEl) {
     const p2 = document.createElement('p');
     p2.className = 'text-sm';
     p2.textContent = _previewSaveHint('Use Download to save it.');
-    wrap.append(_svgIcon('file', 'icon-lg'), p1, p2);
+    const icon = _svgIcon('file', 'icon-lg');
+    icon.setAttribute('aria-hidden', 'true');
+    wrap.append(icon, p1, p2);
     bodyEl.replaceChildren(wrap);
 }
 
@@ -16848,7 +16851,7 @@ function _renderPreviewTooLarge(bodyEl, fsize) {
 }
 
 // A browser with no inline PDF viewer (Chrome on Android, for one) paints an empty frame for a PDF.
-// Say so, and point at Download, instead of fetching a file the page cannot show.
+// Say so, and point at Download where there is one, instead of fetching a file the page cannot show.
 function _renderPdfNotInline(bodyEl) {
     const wrap = document.createElement('div');
     wrap.className = 'preview-none text-center text-secondary p-xl';
@@ -16896,8 +16899,12 @@ async function _renderTextWindow(bodyEl, fileId, fileName, fsize, headers) {
     container.className = 'preview-render-container';
     const note = document.createElement('div');
     note.className = 'preview-window-note';
-    note.textContent = `Showing the first ${formatBytes ? formatBytes(got) : got + ' B'} of `
-        + `${formatBytes ? formatBytes(fsize) : fsize + ' B'} — download the file to view all of it.`;
+    const shown = `Showing the first ${formatBytes ? formatBytes(got) : got + ' B'} of `
+        + `${formatBytes ? formatBytes(fsize) : fsize + ' B'}`;
+    // Points at Download only where there is a Download button; otherwise says what is true instead.
+    note.textContent = vaultCapAllowed('file.download')
+        ? `${shown} — download the file to view all of it.`
+        : `${shown}. ${_previewSaveHint('')}`;
     const pre = document.createElement('pre');
     pre.className = 'preview-text';
     pre.textContent = text;
@@ -17029,20 +17036,21 @@ async function openFilePreview(fileId, fileName, mime) {
             _renderPdfNotInline(bodyEl);
             return;
         }
-        // Nothing of this type would be shown, and there is no Download button: say so without fetching it, so no
-        // preview is spent on it. Decided by the rules the page applies after the fetch, from the stored type (which
-        // the page goes by then too); with no stored type, the type the server answers with decides, after the fetch.
+        const _isTextish = _mt0.startsWith('text/') || WINDOWABLE_TEXT_EXTS.has(_ext0);
+        if (_isTextish && _fsize > TEXT_PREVIEW_WINDOW_BYTES && !isZkVault(state.currentVault)) {
+            await _renderTextWindow(bodyEl, fileId, fileName, _fsize, headers);
+            return;
+        }
+        // A file the text window above did not take, of a type nothing would be shown of, and no Download button: say
+        // so without fetching it, so no preview is spent on it. Decided by the rules the page applies to the whole
+        // file after the fetch, from the stored type (which the page goes by then too); with no stored type, the type
+        // the server answers with decides, after the fetch.
         if (_mt0 && !vaultCapAllowed('file.download')) {
             const k = _previewKinds(_mt0, _ext0);
             if (!(k.isText || k.isImg || k.isPdf || k.isVideo || k.isAudio)) {
                 _renderNoInlinePreview(bodyEl);
                 return;
             }
-        }
-        const _isTextish = _mt0.startsWith('text/') || WINDOWABLE_TEXT_EXTS.has(_ext0);
-        if (_isTextish && _fsize > TEXT_PREVIEW_WINDOW_BYTES && !isZkVault(state.currentVault)) {
-            await _renderTextWindow(bodyEl, fileId, fileName, _fsize, headers);
-            return;
         }
 
         // The preview route: served inline and never cached, recorded as a preview, and open to a view-only

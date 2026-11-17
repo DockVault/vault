@@ -187,8 +187,10 @@ MIMES = ["", "image/png", "IMAGE/PNG", "image/svg+xml", "image/svg", "IMAGE/SVG+
          "image/png,text/html", "image/pngé", "image/png\u0000", "video/mp4", "video/html",
          "audio/x-thing+xml", "application/pdf", "text/plain", "application/octet-stream", "image/avif",
          "video/x-matroska", "audio/mp4", "image/x-foo+xml", "text/html; x=pdf", "application/x-pdf+xml",
-         "image/vnd.microsoft.icon", "text/xsl", "audio/ogg ,text/xsl", "image/heic", "image/tiff"]
-EXTS = ["png", "svg", "html", "xhtml", "xml", "mp4", "mp3", "pdf", "txt", "bin", "avif", "webm", None]
+         "image/vnd.microsoft.icon", "text/xsl", "audio/ogg ,text/xsl", "image/heic", "image/tiff",
+         "application/sql", "application/x-php", "application/toml"]
+EXTS = ["png", "svg", "html", "xhtml", "xml", "mp4", "mp3", "pdf", "txt", "bin", "avif", "webm", "sql", "php", "go",
+        "toml", None]
 PAGE = '<html xmlns="http://www.w3.org/1999/xhtml"><script>document.title="ran"</script></html>'
 
 
@@ -200,7 +202,9 @@ def test_no_combination_mints_an_address_a_browser_could_run_as_a_page():
         "for (const mime of MIMES) for (const ext of EXTS) {\n"
         "  const size = big ? 3 * 1024 * 1024 : PAGE.length;\n"
         "  const r = await run(ext ? 'file.' + ext : 'file', mime, size, zk, big ? Buffer.alloc(size, 'a') : Buffer.from(PAGE), download);\n"
-        "  delete r.urls; r.previewOnly = fetched.every((u) => String(u).endsWith('/preview')); rows.push(r);\n"
+        "  delete r.urls; r.previewOnly = fetched.every((u) => String(u).endsWith('/preview'));\n"
+        "  r.none = bodyEl.children.some((c) => String(c.className || '').split(' ').includes('preview-none'));\n"
+        "  rows.push(r);\n"
         "}\n"
         "process.stdout.write(JSON.stringify(rows));")
     assert len(rows) == 2 * 2 * 2 * len(MIMES) * len(EXTS)
@@ -224,6 +228,20 @@ def test_no_combination_mints_an_address_a_browser_could_run_as_a_page():
     tags = {s.split(" ", 1)[0] for r in rows for s in r["srcs"]}
     assert tags == {"img", "video", "audio", "iframe"}, tags
     assert any(s.startswith("img data:image/svg+xml;") for r in rows for s in r["srcs"])
+    # A file refused before the fetch for want of a Download button is one the preview shows nothing of anyway:
+    # the same file with the button is fetched and shows nothing either. No picture, PDF, video, song or text
+    # window is taken away by deciding early.
+    twin = {(r["name"], r["mime"], r["size"], r["zk"]): r for r in rows if r["download"]}
+    early = [r for r in rows if not r["download"] and r["fetched"] == 0 and r["none"]]
+    assert early, "no file was refused before the fetch: the property below would be vacuous"
+    bad = []
+    for r in early:
+        t = twin[(r["name"], r["mime"], r["size"], r["zk"])]
+        if not (t["none"] and t["fetched"] == 1):
+            bad.append((r["name"], r["mime"], r["size"], r["zk"], t["branch"]))
+    assert not bad, bad[:20]
+    # The walk holds the case that gave the property its teeth: a large file the text window takes by its name.
+    assert any(r["branch"] == "text-window" and not r["download"] and r["mime"] == "application/sql" for r in rows)
 
 
 def test_each_kind_still_shows_and_is_minted_under_its_own_type():
@@ -345,6 +363,13 @@ def test_with_no_download_button_a_type_shown_nothing_of_is_not_fetched():
         "o.refusedZk = await run('report.docx', DOCX, 4, true, b, false);\n"
         "o.refusedUntyped = await run('report.docx', '', 4, false, b, false); o.refusedUntyped.text = texts(bodyEl);\n"
         "o.refusedImage = await run('a.png', 'image/png', 1, false, Buffer.from('x'), false);\n"
+        "const big = 3 * 1024 * 1024; o.window = {};\n"
+        "for (const [n, t] of [['dump.sql', 'application/sql'], ['app.php', 'application/x-php'],\n"
+        "                      ['conf.toml', 'application/toml'], ['subs.srt', 'application/x-subrip']])\n"
+        "  o.window[n] = await run(n, t, big, false, b, false);\n"
+        "o.smallSql = await run('dump.sql', 'application/sql', 4, false, b, false);\n"
+        "o.smallSqlTwin = await run('dump.sql', 'application/sql', 4, false, b, true);\n"
+        "o.smallSqlTwin.text = texts(bodyEl);\n"
         "state.currentVault.via_share = null;\n"
         "o.scoped = await run('report.docx', DOCX, 4, false, b, false); o.scoped.text = texts(bodyEl);\n"
         "o.allowed = await run('report.docx', DOCX, 4, false, b, true); o.allowed.text = texts(bodyEl);\n"
@@ -359,6 +384,12 @@ def test_with_no_download_button_a_type_shown_nothing_of_is_not_fetched():
     assert out["refusedUntyped"]["text"] == ["No inline preview for this file type.", NO_DOWNLOADS]
     # A type the preview shows is fetched as before.
     assert out["refusedImage"]["fetched"] == 1 and out["refusedImage"]["minted"] == ["image/png"]
+    # A large file whose name the text window takes keeps its window, whatever type was stored for it.
+    for name, r in out["window"].items():
+        assert r["branch"] == "text-window", (name, r)
+    # Small, the same file is one the whole-file preview shows nothing of, with the button or without it.
+    assert out["smallSql"]["fetched"] == 0 and out["smallSql"]["branch"] is None, out["smallSql"]
+    assert out["smallSqlTwin"]["text"] == ["No inline preview for this file type.", "Use Download to save it."]
     # With the Download button nothing changes: fetched (and recorded) as before, pointing at Download.
     assert out["allowed"]["fetched"] == 1
     assert out["allowed"]["text"] == ["No inline preview for this file type.", "Use Download to save it."]
@@ -366,14 +397,18 @@ def test_with_no_download_button_a_type_shown_nothing_of_is_not_fetched():
 
 def test_the_too_large_and_pdf_notes_point_at_download_only_when_there_is_one():
     page = r"""
-class El { constructor(t) { this.tagName = t; this.children = []; this.textContent = ''; this.className = ''; }
+class El { constructor(t) { this.tagName = t; this.children = []; this.textContent = ''; this.className = '';
+  this.attrs = {}; }
+  setAttribute(k, v) { this.attrs[k] = String(v); } appendChild(c) { this.children.push(c); }
   append(...c) { this.children.push(...c); } replaceChildren(...c) { this.children = c; } }
-global.document = { createElement: (t) => new El(t) };
-const _svgIcon = () => new El('svg');
+global.document = { createElement: (t) => new El(t), createElementNS: (ns, t) => new El(t) };
 const formatBytes = (n) => n + ' B';
 let canDownload = true;
 const vaultCapAllowed = (cap) => cap !== 'file.download' || canDownload;
-const state = { currentVault: {} };
+const state = { currentVault: { id: 'v1' } };
+const API_BASE = 'https://vault';
+global.fetch = async () => ({ ok: false, status: 206, body: null,
+                              arrayBuffer: async () => new TextEncoder().encode('line one').buffer });
 """
     lifted = "\n".join([
         _block("function viaShareViewOnly(vault) {", "\n}\n"),
@@ -381,8 +416,13 @@ const state = { currentVault: {} };
         _block("function _renderNoInlinePreview(bodyEl) {", "\n}\n"),
         _block("function _renderPreviewTooLarge(bodyEl, fsize) {", "\n}\n"),
         _block("function _renderPdfNotInline(bodyEl) {", "\n}\n"),
+        _block("const TEXT_WINDOW_FETCH_BYTES", ";"),
+        _block("async function _renderTextWindow(", "\n}\n"),
+        _block("const _SVGNS =", ";\n"),
+        _block("function _svgIcon(name, cls) {", "\n}\n"),
     ])
     script = r"""
+(async () => {
 const texts = (el) => [el.textContent, ...(el.children || []).flatMap(texts)].filter(Boolean);
 const out = {};
 for (const [who, download, via] of [['downloader', true, null], ['recipient', false, { view_only: true }],
@@ -393,13 +433,29 @@ for (const [who, download, via] of [['downloader', true, null], ['recipient', fa
                                 ['none', _renderNoInlinePreview]]) {
         const body = new El('div'); draw(body); row[name] = texts(body).slice(-1)[0];
     }
+    const win = new El('div');
+    await _renderTextWindow(win, 'f', 'big.log', 9000000, {});
+    row.window = win.children[0].children[0].textContent;
     out[who] = row;
 }
+const none = new El('div'); _renderNoInlinePreview(none);
+const [wrap] = none.children, [icon, p1, p2] = wrap.children;
+out.noneShape = { wrap: wrap.className, icon: [icon.tagName, icon.attrs.class, icon.attrs['aria-hidden'],
+                  icon.children[0].attrs.href], p1: p1.className, p2: p2.className };
 process.stdout.write(JSON.stringify(out));
+})().catch((e) => { console.log(String(e && e.stack)); process.exit(1); });
 """
     out = _node(page + lifted + script)
+    shown = "Showing the first 8 B of 9000000 B"
     assert out["downloader"] == {"large": "Use Download to save it, then open it locally.",
                                  "pdf": "Use Download to open it in your PDF app.",
-                                 "none": "Use Download to save it."}, out
-    assert out["recipient"] == {k: NO_DOWNLOADS for k in ("large", "pdf", "none")}, out
-    assert out["scoped"] == {k: "This sign-in cannot download files." for k in ("large", "pdf", "none")}, out
+                                 "none": "Use Download to save it.",
+                                 "window": shown + " \u2014 download the file to view all of it."}, out
+    assert out["recipient"] == {**{k: NO_DOWNLOADS for k in ("large", "pdf", "none")},
+                                "window": shown + ". " + NO_DOWNLOADS}, out
+    assert out["scoped"] == {**{k: "This sign-in cannot download files." for k in ("large", "pdf", "none")},
+                             "window": shown + ". This sign-in cannot download files."}, out
+    # The note on a file shown nothing of: its icon is hidden from screen readers, and the classes are the page's.
+    assert out["noneShape"] == {"wrap": "preview-none text-center text-secondary p-xl",
+                                "icon": ["svg", "icon icon-lg", "true", "#i-file"],
+                                "p1": "mt-sm", "p2": "text-sm"}, out
