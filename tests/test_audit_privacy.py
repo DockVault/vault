@@ -233,6 +233,10 @@ def _paths(node, prefix=""):
                 yield from _paths(v, prefix + k.value + ".")
             elif k is None:
                 yield from _paths(v, prefix)              # **{...}: the keys it spreads in
+    elif isinstance(node, ast.IfExp):
+        # **({"key": v} if c else {}), or a key whose value is one of two: the keys either branch spells out.
+        yield from _paths(node.body, prefix)
+        yield from _paths(node.orelse, prefix)
     elif isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dict":
         for kw in node.keywords:
             if kw.arg:
@@ -365,6 +369,26 @@ def test_the_scan_finds_a_key_through_a_variable_and_a_wrapper_and_reports_it(tm
                           "fourth_made_up", "fifth_made_up", "fifth_made_up.sixth_made_up", "seventh_made_up",
                           "eighth_made_up"}
     assert [p for p in found if ap.kind_of(p) is not None] == []
+
+
+def test_the_scan_reads_keys_a_conditional_spreads_in_or_nests(tmp_path):
+    source = textwrap.dedent('''
+        def route(db, c):
+            AuditLogger(db).log_action(action="x", status="success", details={
+                "plain_made_up": 1, **({"when_made_up": 2} if c else {"otherwise_made_up": 3}),
+                "outer_made_up": ({"inner_when_made_up": 4} if c else {"inner_otherwise_made_up": 5})})
+            details = {"first_made_up": 1}
+            details.update(**({"update_when_made_up": 6} if c else {}))
+            AuditLogger(db).log_action(action="y", status="success", details=details)
+    ''')
+    found = detail_paths({tmp_path / "fake.py": ast.parse(source)}, root=tmp_path)
+    assert set(found) == {"plain_made_up", "when_made_up", "otherwise_made_up", "outer_made_up",
+                          "outer_made_up.inner_when_made_up", "outer_made_up.inner_otherwise_made_up",
+                          "first_made_up", "update_when_made_up"}
+    # The application's own: a share made records whether a view-only share is viewable, spread in on a condition.
+    paths = detail_paths(_trees())
+    assert any(where.startswith("app/api/api_server.py:") for where in paths["view_only_preview"]), paths.get(
+        "view_only_preview")
 
 
 def test_the_scan_reads_keys_added_with_update_and_spread_in(tmp_path):
