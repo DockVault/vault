@@ -218,6 +218,24 @@ def test_a_reply_that_is_not_a_codes_map_is_refused_and_the_code_kept(reply):
     assert o.verify(db, purpose="email_change", user_id="u6", code=code, pepper=PEP, redis=r).ok
 
 
+@pytest.mark.parametrize("missing", ["code_hash", "destination", "attempts", "max_attempts", "expires_at",
+                                     "issued_at"])
+def test_a_stored_codes_map_without_one_of_its_fields_is_refused_and_the_code_kept(missing):
+    """Every field the store writes is required: the code's own map with any one of them gone is refused, the
+    code stays, and the next read verifies it."""
+    r, db = _MixedUpRedis([]), FakeDB()
+    code = o.issue(db, purpose="email_change", user_id="u7", destination="d", ttl_minutes=5, pepper=PEP, redis=r)
+    key = o.redis_key("email_change", "u7")
+    stored = dict(r.h[key])
+    assert set(stored) == {"code_hash", "destination", "attempts", "max_attempts", "expires_at", "issued_at"}
+    del stored[missing]
+    r.replies = [stored]
+    first = o.verify(db, purpose="email_change", user_id="u7", code=code, pepper=PEP, redis=r)
+    assert not first.ok and first.reason == "not_found", (missing, first.reason)
+    assert key in r.h and r.h[key].get("attempts") == "0", "the stored code was deleted or struck"
+    assert o.verify(db, purpose="email_change", user_id="u7", code=code, pepper=PEP, redis=r).ok
+
+
 # ---- DB fallback path (Redis down at issue) ------------------------------------------------------
 def test_issue_falls_back_to_db_when_redis_is_down():
     down, db = FakeRedis(down=True), FakeDB()
