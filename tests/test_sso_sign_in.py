@@ -351,7 +351,7 @@ def test_a_known_identity_signs_in_through_a_one_time_code(monkeypatch):
     h = Harness(monkeypatch, [alice], [p], identities=[identity])
     status, out = h.start(p, return_to="#notes")
     state, record = h.state_of(out["authorization_url"])
-    provider_auth_time = int(time.time()) - 3000
+    provider_auth_time = int(time.time()) - 3 * 86400          # the provider's own session is three days old
     h.claims_override = {"auth_time": provider_auth_time}
     status, location, _ = h.callback(p, state, iss=ISSUER)
     assert status == 302 and location.startswith("/#sso=") and "return_to=notes" in location, location
@@ -362,13 +362,13 @@ def test_a_known_identity_signs_in_through_a_one_time_code(monkeypatch):
     assert form["redirect_uri"] == [f"{BASE}/auth/sso/{p.id}/callback"] and headers["Authorization"].startswith("Basic ")
     # The state is spent, and nothing is stamped on the identity until the code is redeemed.
     assert h.callback(p, state)[1] == "/#sso-error=state_unknown" and identity.last_sign_in_at is None
-    # The web app redeems the code with the tab's verifier: a session with the provider on the token, no password,
-    # and the provider's own authentication time.
+    # The web app redeems the code with the tab's verifier: a session with the provider on the token, no password.
+    # Its time is when the sign-in completed here (what the renewal limit counts from), never the provider's.
     status, body = h.finish(location)
     assert status == 200, body
     claims = _claims(body["access_token"])
     assert claims["idp"] == str(p.id) and claims["amr"] == [] and "mfa_at" not in claims and claims["sub"] == str(alice.id)
-    assert abs(int(claims["auth_time"]) - provider_auth_time) <= 1
+    assert abs(int(claims["auth_time"]) - time.time()) <= 60 and "idp_auth_time" not in claims
     assert ("login_success", "alice", []) in h.audits and identity.last_sign_in_at is not None
     # The code is spent too.
     assert h.finish(location)[0] == 401
@@ -1166,3 +1166,25 @@ def test_a_handover_the_providers_refusal_overtook_is_not_redeemed(monkeypatch):
     status, body = h.finish(location)
     assert status == 200, body
     assert identity.last_sign_in_at is not None and identity.last_sign_in_at > identity.refused_at
+
+
+@pytest.mark.parametrize("ahead, refused", [(30, False), (90, True), (7 * 86400, True)])
+def test_a_provider_sign_in_time_that_has_not_come_yet_is_refused_beyond_the_skew(monkeypatch, ahead, refused):
+    """The provider's own sign-in time feeds the rules that read the provider's standing, so one that lies ahead of
+    now by more than the skew every token check allows is refused at the callback, with a reason that names the
+    clock. Within the skew it is a clock a few seconds fast, and the sign-in goes on."""
+    alice, p = _user(), _provider()
+    identity = _identity(alice, p)
+    h = Harness(monkeypatch, [alice], [p], identities=[identity])
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"auth_time": int(time.time()) + ahead}
+    status, location, _ = h.callback(p, state, iss=ISSUER)
+    if not refused:
+        assert status == 302 and location.startswith("/#sso="), location
+        return
+    assert location == "/#sso-error=provider_clock_ahead", location
+    assert identity.last_sign_in_at is None and all(a[0] != "login_success" for a in h.audits)
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "provider_clock_ahead" for a in h.audits), h.audits
+    from app.services import sso_sign_in as sso
+    assert "clock" in sso.REASON_TEXTS["provider_clock_ahead"]

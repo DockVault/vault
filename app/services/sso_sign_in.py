@@ -22,6 +22,7 @@ text never reaches the person. Nothing here commits for a ``test``.
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -39,6 +40,7 @@ ALREADY_LINKED = "already_linked"
 NOT_THIS_ACCOUNT = "not_this_account"
 PURPOSE_NOT_READY = "purpose_not_ready"
 REAUTH_STALE = "reauth_stale"
+PROVIDER_CLOCK_AHEAD = "provider_clock_ahead"     # the provider's own sign-in time lies in the future
 PRIVILEGED_ON_PASSWORD_LESS = "privileged_on_password_less"
 REAUTH_NO_MFA = "reauth_no_mfa"
 REAUTH_MAX_AGE_SECONDS = 60
@@ -70,6 +72,8 @@ REASON_TEXTS = {
     NOT_THIS_ACCOUNT: "That organisation identity belongs to another account here.",
     PURPOSE_NOT_READY: "This step is not available yet.",
     REAUTH_STALE: "Your organisation's sign-in did not ask you to sign in again just now. Start again.",
+    PROVIDER_CLOCK_AHEAD: ("Your organisation's sign-in reports a sign-in time that has not come yet, so its clock or "
+                           "this vault's is wrong. Tell your administrator."),
     PRIVILEGED_ON_PASSWORD_LESS: ("An administrator's or auditor's account keeps a local password, so it cannot be linked "
                                   "to a provider whose people sign in without one."),
     REAUTH_NO_MFA: "Your organisation's sign-in did not confirm you with a second factor. Start again.",
@@ -216,6 +220,10 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     tenant = tenant.strip() if isinstance(tenant, str) else None
     tenant = tenant if tenant and len(tenant) <= 255 else None      # the column's width; longer is no tenant id
     auth_time = _as_time(claims.get("auth_time"))
+    # The provider's own sign-in cannot lie ahead of now: beyond the skew every token check allows, its clock (or
+    # this server's) is wrong, and a time the freshness rules would trust is refused, not kept.
+    if auth_time is not None and auth_time.timestamp() > (time.time() if now is None else now) + oc.SKEW_SECONDS:
+        raise oc.OidcError(PROVIDER_CLOCK_AHEAD, "auth_time lies in the future")
     amr = claims.get("amr")
     amr = [a for a in amr if isinstance(a, str)] if isinstance(amr, list) else []
     acr = claims.get("acr")
@@ -726,7 +734,7 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
     return SignInResult(user, [], client_ip, provider_id=provider_id, provider_mfa_trusted=mfa_trusted(row, answer),
-                        auth_time=answer.auth_time or datetime.now(timezone.utc), provider_auth_time=answer.auth_time,
+                        provider_auth_time=answer.auth_time,
                         provider_sid=answer.sid, provider_sub=answer.subject,
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)
 

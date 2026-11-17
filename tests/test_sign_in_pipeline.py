@@ -5,6 +5,7 @@ Offline: the policy table is pure; the pending and finishing paths run against t
 database (tests/_memory_db.py) with the record-making patched out and observed.
 """
 import base64
+import dataclasses
 import json
 import types
 import uuid
@@ -356,20 +357,22 @@ def test_a_finished_token_carries_the_claims_it_always_did_plus_the_proofs(quiet
 
 
 def test_every_sign_in_gets_a_sign_in_id_of_its_own_whatever_its_time(quiet_records):
-    """A renewal keeps the id, and a page tells its own sign-in by it. Two sign-ins of one person through one
-    provider session share a time, so the id is made by the vault for each, never read from what came in."""
+    """A renewal keeps the id, and a page tells its own sign-in by it. Two sign-ins may complete in the same second,
+    and two through one provider session share the provider's time, so the id is made by the vault for each, never
+    read from what came in. The token's own time is when the sign-in completed here, never the provider's."""
     user = _user()
-    at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    at = datetime.now(timezone.utc) - timedelta(days=3)         # the provider's own session, three days old
     ids = []
-    for methods, extra in ((["pwd"], {}), (["pwd", "totp"], {}), ([], {"provider_id": "p1", "auth_time": at}),
-                           ([], {"provider_id": "p1", "auth_time": at}), (["pwd"], {"is_temporary": True})):
+    for methods, extra in ((["pwd"], {}), (["pwd", "totp"], {}),
+                           ([], {"provider_id": "p1", "provider_auth_time": at}),
+                           ([], {"provider_id": "p1", "provider_auth_time": at}), (["pwd"], {"is_temporary": True})):
         _, claims = _complete(user, methods, quiet_records, **extra)
         assert isinstance(claims["sign_in_id"], str) and len(claims["sign_in_id"]) >= 16
         ids.append(claims["sign_in_id"])
+        assert abs(claims["auth_time"] - datetime.now(timezone.utc).timestamp()) < 60
     assert len(set(ids)) == len(ids)
-    same_time = [_complete(user, [], quiet_records, provider_id="p1", auth_time=at)[1] for _ in range(2)]
-    assert same_time[0]["auth_time"] == same_time[1]["auth_time"]
-    assert same_time[0]["sign_in_id"] != same_time[1]["sign_in_id"]
+    # No door hands the pipeline a sign-in time of its own: the result has no such field.
+    assert "auth_time" not in {f.name for f in dataclasses.fields(_sign_in().SignInResult)}
     # The vault's own helper is what makes it: one place, the one every other sign-in uses.
     S = _api()
     quiet = S._new_sign_in_id

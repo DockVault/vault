@@ -402,3 +402,32 @@ def test_an_account_with_a_password_keeps_its_own_session_whatever_its_provider_
     user, identity, old = _through(db, p, signed_in=signed_in, refused=signed_in + timedelta(hours=1), record=False)
     without = {**{k: v for k, v in old.items() if k != "idp"}, "amr": ["pwd"]}
     assert sign_in.renew(db, user, without, client_ip="127.0.0.1").access_token
+
+
+# --------------------------------------------------------------------------- which time the limit counts from
+
+LIMIT = "You have been signed in for as long as this vault allows at a stretch; sign in again."
+
+
+def test_a_provider_session_days_old_still_renews_within_the_vaults_own_limit(db):
+    """The renewal limit counts from the moment the vault's sign-in completed (the token's ``auth_time``), never
+    from the provider's own session, which may be days old: that time stays with the provider's session."""
+    provider = _provider(db)
+    long_ago = datetime.utcnow() - timedelta(days=3)
+    user, identity, old = _through(db, provider, signed_in=long_ago)
+    assert [r.auth_time for r in _records(db).values()] == [long_ago]
+    renewed = sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    claims = jwt.decode(renewed.access_token, options={"verify_signature": False})
+    assert claims["auth_time"] == old["auth_time"]                 # the vault's own, carried by the renewal
+    kept = _records(db)                                            # the provider's, with its session, old and new
+    assert len(kept) == 2 and {r.auth_time for r in kept.values()} == {long_ago}
+
+
+def test_the_limit_ends_a_provider_sign_in_by_the_vaults_time_however_fresh_the_providers_session(db):
+    provider = _provider(db)
+    user, identity, old = _through(db, provider)                   # the provider's session: ten minutes old
+    now = int(datetime.now(timezone.utc).timestamp())
+    with pytest.raises(HTTPException) as refused:
+        sign_in.renew(db, user, {**old, "auth_time": now - 25 * 3600}, client_ip="127.0.0.1")
+    assert refused.value.status_code == 403 and refused.value.detail == LIMIT
+    assert _untouched(db)

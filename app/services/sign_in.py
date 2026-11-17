@@ -128,7 +128,10 @@ class SignInResult:
     provider_sub: Optional[str] = None
     # The ID token, for the provider's own logout; only when wanted. Never in the result's text form.
     provider_logout_hint: Optional[str] = field(default=None, repr=False)
-    provider_auth_time: Optional[datetime] = None   # when the provider says the person authenticated (its session)
+    # When the provider says the person authenticated there (its own session, which may be days old). Kept with the
+    # provider's session for the rules that read the provider's standing; never the token's ``auth_time``, which is
+    # the moment the vault's own sign-in completed, for every door (complete_sign_in).
+    provider_auth_time: Optional[datetime] = None
     # A passkey: whether the authenticator verified the person (the UV flag), and whether the policy lets
     # this person sign in with a user-verified passkey alone.
     user_verified: bool = False
@@ -138,7 +141,6 @@ class SignInResult:
     # judged and written where it is written, in the account's turn, on the account as it is read again there:
     # written on the account before that, it was lost when the account was read again.
     passkey_grace: Optional[str] = None
-    auth_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     channel: str = "web"
     # How many times the account's sessions had been ended when the first proof of this sign-in read the account
     # (:func:`as_read`; a held sign-in carries it in its token, :func:`ended_of`). A door passes what it read
@@ -828,7 +830,8 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
     ``amr`` (the proofs), ``auth_time``, ``mfa_at`` when two kinds of factor were present, and ``idp`` for
     a single sign-on. Every sign-in gets a ``sign_in_id`` of its own, made here and never taken from a
     provider: a renewal keeps it, so a page can tell a renewal of its own sign-in from another sign-in of the
-    same person even when both share one time (a provider's session gives two sign-ins one ``auth_time``).
+    same person even when both share one time (two sign-ins may complete in the same second). ``auth_time`` is
+    the moment the sign-in completed here, never a time a provider reports: the renewal limit counts from it.
     A regular session honours the session-timeout setting; a temporary credential keeps the default token
     life, its own validity window being enforced separately.
     """
@@ -853,7 +856,8 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
     claims = {
         "sub": str(user.id), "username": user.username, "session_token": session_token,
         "is_temporary": result.is_temporary, "amr": list(result.methods),
-        "auth_time": int(result.auth_time.timestamp()),
+        # When this sign-in completed at the vault: what the renewal limit counts from, whichever door was used.
+        "auth_time": int(now.timestamp()),
         "sign_in_id": api._new_sign_in_id(),
     }
     if second_kind_present(result):
@@ -882,7 +886,7 @@ def _record_provider_session(db, result: SignInResult, session_token: Optional[s
         row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(session_token)).first()
         if row is None:
             return
-        at = result.provider_auth_time or result.auth_time
+        at = result.provider_auth_time or datetime.now(timezone.utc)
         auth_time = at.astimezone(timezone.utc).replace(tzinfo=None) if at.tzinfo else at
         db.add(SsoSession(session_id=row.id, provider_id=uuid.UUID(str(result.provider_id)),
                           idp_sid=(result.provider_sid or None), idp_sub=(result.provider_sub or None),
