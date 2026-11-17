@@ -255,6 +255,23 @@ def test_the_slot_is_taken_after_every_session_check_and_recorded_at_once():
     assert ast.unparse(body[i + 1]) == "slot_of = slot_key(user_id, temporary_credential_id if is_temporary else None)"
 
 
+def test_every_socket_asks_after_its_own_session_and_closes_on_the_answer():
+    # The check is asked for this socket's own session, as temporary or not, and a "no longer stands" closes every
+    # socket, a temporary one included. Asked as a regular session, a temporary credential that ran out keeps its
+    # socket; that is what tests/test_live_session.py holds the check itself to.
+    send_events = next(n for n in ast.walk(_handler())
+                       if isinstance(n, ast.AsyncFunctionDef) and n.name == "send_events")
+    calls = [n for n in ast.walk(send_events) if isinstance(n, ast.Call)
+             and any(isinstance(a, ast.Name) and a.id == "_ws_session_invalid" for a in n.args)]
+    assert len(calls) == 1, [ast.unparse(c) for c in calls]
+    assert [ast.unparse(a) for a in calls[0].args] == [
+        "None", "_ws_session_invalid", "session_token", "user_id", "is_temporary"], ast.unparse(calls[0])
+    answers = [n for n in ast.walk(send_events) if isinstance(n, ast.Assign) and calls[0] in ast.walk(n.value)]
+    assert len(answers) == 1 and ast.unparse(answers[0].targets[0]) == "revoked"
+    closes = [n for n in ast.walk(send_events) if isinstance(n, ast.If) and ast.unparse(n.test) == "revoked"]
+    assert len(closes) == 1 and isinstance(closes[0].body[-1], ast.Break), [ast.unparse(n) for n in closes]
+
+
 def test_the_timed_check_restarts_its_clock_each_time():
     send_events = next(n for n in ast.walk(_handler())
                        if isinstance(n, ast.AsyncFunctionDef) and n.name == "send_events")

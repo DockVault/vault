@@ -4,7 +4,9 @@ The request-body limit (app/core/body_limit.py) gives a body larger than the ano
 such a session, because the framework reads a body before the route authenticates anyone. A token's
 signature and expiry alone are not enough for that: they also pass a logged-out or revoked session, a
 deactivated or administrator-locked account, and a temporary credential that was switched off, has
-finished or has run out. So this makes the checks get_current_user makes, and no others:
+finished or has run out. So this makes the checks get_current_user makes, and no others. The live socket
+(/ws/monitor) asks the same question every five seconds (api_server._ws_session_invalid) and closes when the
+answer is no, so a change here also changes when live sockets close:
 
 - the token is signed by this server, has not expired, and names an account and a session;
 - the session has not been logged out (the denylist); a regular session's row exists and is not
