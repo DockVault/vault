@@ -26581,7 +26581,7 @@ _DEFAULT_SHARE_TAGS = [
     },
     {
         "name": "Confidential (Read)", "color": "rose",
-        "description": "Sensitive, view-only — recipients can view the files in the browser but not download them.",
+        "description": "Sensitive, view-only — recipients can view the files in the browser, with no Download button.",
         "allowed_audiences": ["users", "departments"],
         "allow_view_only": True, "default_view_only": True, "force_view_only": True, "view_only_preview": True,
         "allow_custom": True, "auto_enroll_new_users": True,

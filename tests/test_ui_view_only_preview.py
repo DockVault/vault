@@ -1,7 +1,7 @@
-"""A view-only share's recipient can view a file in the browser, and still cannot download it.
+"""A view-only share's recipient can view a file in the browser, and is given no Download button.
 
-The share dialog says "View only (recipients can view files in the browser but not download them)" and that a
-preview cannot stop copying. In the recipient's own session the shared vault opens from the Shared page, a
+The share dialog says "View only (recipients can view files in the browser, with no Download button)" and that a
+preview cannot stop them keeping a copy. In the recipient's own session the shared vault opens from the Shared page, a
 file's preview shows its content through the preview route, and the download route refuses them.
 """
 import pytest
@@ -54,7 +54,7 @@ def test_the_recipient_previews_in_the_browser_and_cannot_download(page: Page, v
     page.click('.sidebar-item[data-section="shared"]')
     card = page.locator(f'[data-share-id]', has_text=vault["name"]).first
     expect(card).to_be_visible(timeout=15000)
-    expect(card).to_contain_text("View only (preview in the browser, no download)")
+    expect(card).to_contain_text("View only (preview in the browser, no Download button)")
     page.evaluate("id => openSharedItem(id)", vault["id"])
     expect(page.locator("#vault-view-section")).to_be_visible(timeout=15000)
     # The vault says the claim is view-only, and the recipient is offered only what works: no Download on the
@@ -126,8 +126,8 @@ def test_the_share_dialog_says_what_view_only_means(page: Page, admin_creds):
     page.click("#login-form button[type=submit]")
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
     label = page.locator('label:has(#share-view-only)')
-    expect(label).to_have_text("View only (recipients can view files in the browser but not download them)")
-    expect(page.locator("#share-viewonly-group .form-help")).to_contain_text("cannot stop copying")
+    expect(label).to_have_text("View only (recipients can view files in the browser, with no Download button)")
+    expect(page.locator("#share-viewonly-group .form-help")).to_contain_text("cannot stop them keeping a copy")
 
 
 NAMES_AND_SIZES = "This share shows names and sizes only"
@@ -239,8 +239,8 @@ def test_the_share_dialog_says_what_view_only_gives_under_the_chosen_tag(page: P
         expect(label).to_have_text("View only (recipients see names and sizes; they cannot open or download)")
         expect(page.locator("#share-view-only-help")).not_to_contain_text("preview")
         select.select_option(tags[True]["id"])
-        expect(label).to_have_text("View only (recipients can view files in the browser but not download them)")
-        expect(page.locator("#share-view-only-help")).to_contain_text("cannot stop copying")
+        expect(label).to_have_text("View only (recipients can view files in the browser, with no Download button)")
+        expect(page.locator("#share-view-only-help")).to_contain_text("cannot stop them keeping a copy")
     finally:
         for t in tags.values():
             admin.delete(f"/share-tags/{t['id']}")

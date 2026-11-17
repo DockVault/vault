@@ -3772,7 +3772,7 @@ function _sharedCard(it) {
     if (it.expires_at && active) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(it.expires_at)); meta.appendChild(ex); }
     if (it.view_only) {
         const s = _el('span', 'shared-view-only'); s.appendChild(_svgIcon('eye', 'icon-sm'));
-        s.appendChild(document.createTextNode(it.view_only_preview ? ' View only (preview in the browser, no download)'
+        s.appendChild(document.createTextNode(it.view_only_preview ? ' View only (preview in the browser, no Download button)'
             : ' View only (names and sizes only)'));
         meta.appendChild(s);
     }
@@ -3894,7 +3894,7 @@ function _sharedByMeCard(sh) {
     if (sh.created_at) { const on = _el('span', 'shared-on'); on.appendChild(document.createTextNode('Shared ')); on.appendChild(People.time(sh.created_at)); meta.appendChild(on); }
     if (sh.expires_at) { const ex = _el('span', 'shared-expires'); ex.appendChild(document.createTextNode('Expires ')); ex.appendChild(People.time(sh.expires_at)); meta.appendChild(ex); }
     if (sh.view_only) meta.appendChild(_el('span', 'shared-view-only', sh.view_only_preview
-        ? 'View only (preview in the browser, no download)' : 'View only (names and sizes only)'));
+        ? 'View only (preview in the browser, no Download button)' : 'View only (names and sizes only)'));
     if (sh.max_downloads != null) meta.appendChild(_el('span', null, sh.max_downloads + ' downloads/recipient'));
     main.appendChild(meta);
     body.appendChild(main);
@@ -4099,17 +4099,17 @@ function onShareTagChange() {
     onShareAudienceChange();
 }
 
-// What view-only gives a recipient under the chosen tag: viewing in the browser without download, or names and
+// What view-only gives a recipient under the chosen tag: viewing in the browser with no Download button, or names and
 // sizes alone (a tag that does not let view-only recipients view files).
 function _shareViewOnlyLabel(t) {
     const text = document.getElementById('share-view-only-text');
     const help = document.getElementById('share-view-only-help');
     const views = !!(t && t.view_only_preview);
     if (text) text.textContent = views
-        ? 'View only (recipients can view files in the browser but not download them)'
+        ? 'View only (recipients can view files in the browser, with no Download button)'
         : 'View only (recipients see names and sizes; they cannot open or download)';
     if (help) help.textContent = views
-        ? 'A preview shows the content on their screen, so it cannot stop copying or a screenshot; it does stop saving the file and spends their preview allowance, counted apart from downloads.'
+        ? "A preview sends the file to their browser to show it, so it cannot stop them keeping a copy (from the browser's own viewer, or a screenshot). It removes the Download button, and each preview spends their preview allowance, counted apart from downloads."
         : "Recipients see the shared files' names, sizes, types and dates; they cannot open or download them.";
 }
 

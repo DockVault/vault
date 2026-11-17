@@ -276,7 +276,7 @@ def test_the_shared_cards_keep_the_view_only_note_inside(page: Page, view_only_s
     _login(page, recipient["_username"], recipient["_password"], skin, size)
     _section(page, "shared")
     expect(page.locator(f"{card} .shared-view-only")).to_be_visible(timeout=15000)
-    expect(page.locator(f"{card} .shared-view-only")).to_contain_text("View only (preview in the browser, no download)")
+    expect(page.locator(f"{card} .shared-view-only")).to_contain_text("View only (preview in the browser, no Download button)")
     got = page.evaluate(INSIDE_JS, [card, ".vault-meta > span"])
     assert got["count"] >= 3 and got["out"] == [], got   # Shared by, Expires, View only
     # The sharer's own card: its View only badge stays inside too.

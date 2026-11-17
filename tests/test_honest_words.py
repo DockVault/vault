@@ -2,7 +2,8 @@
 
 Three promises had outlived what was built. The share dialog's "view only" option said recipients could preview
 but not download while the preview read through the download path, so a view-only recipient could open nothing;
-the preview route has since made the words true again, and they now also say what a preview cannot stop. The log
+the preview route has since made viewing true again. The words now say that a preview sends the file to the
+recipient's browser, which can keep a copy: view-only removes the Download button, it does not stop a copy. The log
 access page listed two log components with a "coming soon" badge that the server cannot serve, and a help text
 said allow-lists were "managed via the API for now". The security monitor's docstring promised email and webhook
 delivery of alerts, which does not exist.
@@ -25,14 +26,21 @@ def test_the_view_only_option_says_what_a_recipient_can_do():
     says what a preview cannot stop."""
     html = _read("static/index.html")
     assert "recipients see the item's name and size" not in html
-    assert "View only (recipients can view files in the browser but not download them)" in html
-    assert "cannot stop copying" in html
+    assert "View only (recipients can view files in the browser, with no Download button)" in html
+    assert "so it cannot stop them keeping a copy" in html
+    # Nothing says a viewable view-only share stops a copy or a download.
+    for page in (html, _read("static/js/app.js")):
+        assert "stop saving" not in page and "still cannot download" not in page
+        assert "browser but not download them" not in page
+        assert "(no download)" not in page and "in the browser, no download)" not in page
+    assert "<span>Allow view-only shares (no Download button)</span>" in html
+    assert "' View only (preview in the browser, no Download button)'" in _read("static/js/app.js")
 
 
 def test_the_seeded_confidential_tag_says_what_a_recipient_can_do():
     src = _read("app/api/api_server.py")
     assert "recipients can read but not download" not in src
-    assert "recipients can view the files in the browser but not download them" in src
+    assert "recipients can view the files in the browser, with no Download button." in src
 
 
 def test_the_view_only_test_describes_the_behaviour_it_tests():
@@ -66,14 +74,15 @@ def test_view_only_says_what_the_chosen_tag_gives():
     js = _read("static/js/app.js")
     html = _read("static/index.html")
     assert "View only (recipients see names and sizes; they cannot open or download)" in js
-    assert "View-only recipients may view files in the browser (they still cannot download)" in html
+    assert "View-only recipients may view files in the browser (no Download button)" in html
+    assert "A preview sends the file to the recipient's browser, which can keep a copy." in html
 
 
 def test_every_place_a_view_only_share_is_named_says_what_it_gives():
     """The maker's card and the administrator's tag list say whether view-only recipients view files; the share
     dialog says what names-only recipients do see; a names-only recipient's file list offers no preview."""
     js = _read("static/js/app.js")
-    assert "sh.view_only_preview\n        ? 'View only (preview in the browser, no download)' : 'View only (names and sizes only)'" in js
+    assert "sh.view_only_preview\n        ? 'View only (preview in the browser, no Download button)' : 'View only (names and sizes only)'" in js
     assert "'view-only: viewable' : 'view-only: names and sizes'" in js
     assert "Recipients see the shared files' names, sizes, types and dates; they cannot open or download them." in js
     assert "and nothing more." not in js.split("function _shareViewOnlyLabel", 1)[1].split("\n}\n", 1)[0]
