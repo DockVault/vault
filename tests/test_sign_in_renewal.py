@@ -404,10 +404,13 @@ def test_a_role_past_its_passkey_grace_is_not_renewed_and_is_told_how_to_sign_in
     assert refused.value.detail == "Your role must hold a passkey now. Sign in again: you will be asked to add one."
     rows = _rows(db)
     assert made == [] and len(rows) == 1 and not rows[0].revoked and rows[0].is_active
-    # A token that shows a passkey changes nothing: the account holds none now.
+    # A token that shows a passkey changes nothing: the account holds none now. (A passkey alone still signs this
+    # account in, so it is the passkey the role must hold that refuses, not the password rule.)
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, user: True)
     with pytest.raises(HTTPException) as refused:
         sign_in.renew(db, user, {**old, "amr": ["hwk"]}, client_ip="127.0.0.1")
     assert refused.value.status_code == 403 and made == []
+    assert refused.value.detail == "Your role must hold a passkey now. Sign in again: you will be asked to add one."
 
 
 @pytest.mark.parametrize("case", ["within the grace", "the grace not started", "holds a passkey", "cleared by the operator",
@@ -431,3 +434,94 @@ def test_the_passkey_rule_refuses_nothing_else(db, monkeypatch, case):
         old = {**old, "amr": ["pwd", "hwk"]}        # a passkey is a second factor, so the token must show one
     renewed = sign_in.renew(db, user, old, client_ip="127.0.0.1")
     assert renewed.access_token and len(_rows(db)) == 2
+
+
+# --------------------------------------------------------------------------- a session made without the password
+
+ADMINISTRATORS = "Administrators sign in with their password. Sign in again."
+PASSKEY_ALONE = "A passkey alone no longer signs you in. Sign in again with your password."
+
+
+def _refused_with_nothing_made(db, monkeypatch, user, old):
+    made = []
+    monkeypatch.setattr(auth_service.AuthService, "_create_session", lambda *a, **k: made.append(1) or "x")
+    with pytest.raises(HTTPException) as refused:
+        sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    rows = _rows(db)
+    assert made == [] and len(rows) == 1 and not rows[0].revoked and rows[0].is_active
+    assert refused.value.status_code == 403
+    return refused.value.detail
+
+
+@pytest.mark.parametrize("proofs", [
+    {"amr": ["swk"], "mfa_at": 1},                      # a synced passkey that verified the person
+    {"amr": ["hwk"], "mfa_at": 1},                      # a device-bound one
+    {"amr": [], "idp": "a-provider", "mfa_at": 1},      # an identity provider, its second factor trusted
+    {"amr": ["totp"], "idp": "a-provider"},             # a provider, then the vault's own code
+    {"amr": "pwd"},                                     # not a list of proofs: it names none
+])
+def test_a_session_without_the_password_is_not_renewed_once_the_account_is_an_administrator(db, monkeypatch, proofs):
+    """Signing in now would stop at the administrator's password step, so the session a passkey or a provider made
+    for the account before its promotion is not kept going."""
+    user, old = _signed_in(db, **proofs)
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, user: True)
+    user.role = RoleEnum.ADMIN
+    db.commit()
+    assert _refused_with_nothing_made(db, monkeypatch, user, old) == ADMINISTRATORS
+
+
+@pytest.mark.parametrize("proofs", [
+    {"amr": ["pwd"]},
+    {"amr": ["pwd", "totp"], "mfa_at": 1},
+    {"amr": ["hwk", "pwd"], "mfa_at": 1},               # a passkey, then the password: what an administrator gives
+    {"amr": None},                                      # a token from before the proofs were written on it
+])
+def test_an_administrators_session_that_shows_the_password_is_renewed(db, monkeypatch, proofs):
+    user, old = _signed_in(db)
+    old = {k: v for k, v in {**old, **proofs}.items() if v is not None}
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, user: False)
+    user.role = RoleEnum.ADMIN
+    db.commit()
+    renewed = sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    assert renewed.access_token and len(_rows(db)) == 2
+
+
+@pytest.mark.parametrize("key", ["swk", "hwk"])
+def test_a_passkey_alone_is_renewed_only_while_the_account_may_sign_in_without_the_password(db, monkeypatch, key):
+    user, old = _signed_in(db, amr=[key], mfa_at=1)
+    asked = []
+    allowed = {"now": False}
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed",
+                        lambda db, account: asked.append(account.id) or allowed["now"])
+    # The role left the passwordless roles, or the account was given the auditor right: the password follows now.
+    assert _refused_with_nothing_made(db, monkeypatch, user, old) == PASSKEY_ALONE
+    assert asked == [user.id]
+    monkeypatch.undo()
+    monkeypatch.setattr(api, "_force_close_after_commit", lambda *a, **k: None)
+    monkeypatch.setattr(auth_service, "denylist_token", lambda token, ttl: None)
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, account: True)
+    renewed = sign_in.renew(db, user, old, client_ip="127.0.0.1")
+    assert renewed.access_token and len(_rows(db)) == 2
+
+
+def test_the_passwordless_rule_is_the_sign_in_rule_itself(db, monkeypatch):
+    """The rule asked at a renewal is the one the passkey sign-in asks: a role taken off the passwordless roles is
+    refused by the settings alone, with nothing stubbed."""
+    from app.core import webauthn_settings
+    user, old = _signed_in(db, amr=["swk"], mfa_at=1)
+    monkeypatch.setattr(webauthn_settings, "sign_in_roles", lambda: ())
+    assert _refused_with_nothing_made(db, monkeypatch, user, old) == PASSKEY_ALONE
+
+
+def test_a_passkey_given_with_the_password_or_after_a_provider_is_not_a_passkey_alone(db, monkeypatch):
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, user: False)
+    user, old = _signed_in(db, amr=["pwd", "swk"], mfa_at=1)
+    assert sign_in.renew(db, user, old, client_ip="127.0.0.1").access_token
+    # After a provider the passkey is the second factor: the passwordless rule is not asked for that session.
+    asked = []
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, user: asked.append(1) or False)
+    try:
+        sign_in.refuse_renewal_by_the_sign_in_rules(db, user, {**old, "amr": ["swk"], "idp": "a-provider"})
+    except HTTPException as other_rule:                 # what vouches for the provider is another rule's question
+        assert other_rule.detail not in (PASSKEY_ALONE, ADMINISTRATORS)
+    assert asked == []
