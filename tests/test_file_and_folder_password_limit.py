@@ -155,40 +155,65 @@ def test_an_administrator_has_the_administrators_vault_limit(counter):
         _open("file", svc, item, admin, RIGHT)
 
 
-def _routes_that_check_a_password():
-    """Every function in api_server that asks for a vault password (get_vault(require_password=True)) or passes a
-    file password on, with the try around that call: (name, try node)."""
+def _password_checks():
+    """Every call in api_server that asks for a vault password (get_vault(require_password=True)) or passes a file
+    password on, with the try blocks whose body holds it, innermost first, within its own function: (name, tries)."""
     tree = ast.parse((ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8"))
     found = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and (
+
+    def checks(n):
+        return isinstance(n, ast.Call) and (
             (getattr(n.func, "attr", None) == "get_vault" and any(
                 k.arg == "require_password" and isinstance(k.value, ast.Constant) and k.value.value is True
                 for k in n.keywords))
-            or any(k.arg in ("file_password", "source_file_password") for k in n.keywords))]
-        tries = [t for t in ast.walk(fn) if isinstance(t, ast.Try) and any(c in ast.walk(t) for c in calls)]
-        if calls and tries:
-            found.append((fn.name, min(tries, key=lambda t: t.lineno)))
+            or any(k.arg in ("file_password", "source_file_password") for k in n.keywords))
+
+    def visit(node, name, tries):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            name, tries = getattr(node, "name", name), []     # a nested function's tries are its own
+        if checks(node):
+            found.append((name, list(reversed(tries))))
+        for field, value in ast.iter_fields(node):
+            for child in value if isinstance(value, list) else [value]:
+                if isinstance(child, ast.AST):
+                    inner = tries + [node] if isinstance(node, ast.Try) and field == "body" else tries
+                    visit(child, name, inner)
+
+    visit(tree, None, [])
     return found
 
 
+def _catches(handler, names):
+    if handler.type is None:
+        return True
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(ast.unparse(t).split(".")[-1] in names for t in types)
+
+
+_LIMIT = {"RateLimitExceededError", "FileServiceError", "Exception", "BaseException"}
+_HTTP = {"HTTPException", "Exception", "BaseException"}
+
+
 def test_every_route_that_checks_a_password_answers_the_limit_with_429():
-    """The vault password's limit, and a file's, are refused with 429 wherever a password is checked: each route
-    either answers it before a catch-all that would make it 500 (or the rendered preview's 404), or has no catch-all,
-    and the application-wide FileServiceError handler answers 429 (copy and move)."""
-    routes = _routes_that_check_a_password()
-    names = {name for name, _ in routes}
+    """The vault password's limit, and a file's, are refused with 429 wherever a password is checked. From the call
+    out, the first handler that would catch the limit is a clause that answers 429 (the catch-alls after it would
+    make it 500, or the rendered preview's 404), or there is none and the application-wide FileServiceError handler
+    answers 429 (copy and move). No try further out turns that 429 into anything else."""
+    checks = _password_checks()
+    names = {name for name, _ in checks}
     assert {"_serve_file", "preview_render_file", "get_file_info", "delete_file", "rename_file", "delete_vault",
             "change_vault_password", "upload_file", "create_folder", "delete_folder"} <= names, names
-    for name, outer in routes:
-        handlers = [ast.unparse(h.type) if h.type is not None else "" for h in outer.handlers]
-        catch_alls = [i for i, n in enumerate(handlers) if n in ("Exception", "") or "FileServiceError" in n]
-        if not catch_alls:
+    assert len(checks) >= 23, len(checks)
+    for name, tries in checks:
+        caught = next(((i, h) for i, t in enumerate(tries) for h in t.handlers if _catches(h, _LIMIT)), None)
+        if caught is None:
             continue
-        assert "RateLimitExceededError" in handlers, (name, handlers)
-        at = handlers.index("RateLimitExceededError")
-        assert all(at < i for i in catch_alls), (name, handlers)
-        body = ast.unparse(outer.handlers[at])
+        at, handler = caught
+        body = ast.unparse(handler)
+        assert ast.unparse(handler.type) == "RateLimitExceededError", (name, ast.unparse(handler.type))
         assert "HTTP_429_TOO_MANY_REQUESTS" in body and "raise HTTPException" in body, (name, body)
+        for outer in tries[at + 1:]:
+            http = next((h for h in outer.handlers if _catches(h, _HTTP)), None)
+            if http is not None:
+                assert ast.unparse(http.body[0]) == "raise" and len(http.body) == 1, (name, ast.unparse(http))
+                break
