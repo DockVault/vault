@@ -194,3 +194,14 @@ def test_an_administrators_emailed_reset_link_is_refused_before_anything_is_made
         run_coroutine(route(user_id=carol.id, request=_forged_request(), current_user=alice, db=db))
     assert refused.value.status_code == 400 and "ALLOWED_HOSTS" in refused.value.detail
     assert asked == [] and sent == [] and db.query(CredentialChange).count() == 0
+
+
+def test_settings_report_whether_a_public_address_is_configured():
+    """The page shows the reset switch's note and the invitation dialog's reason from this flag, which is the
+    helper's own answer. (get_settings runs PostgreSQL-only SQL, so it is read here rather than called.)"""
+    import ast
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "get_settings")
+    flags = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+             and ast.unparse(n.targets[0]) == "data['public_address_configured']"]
+    assert len(flags) == 1 and ast.unparse(flags[0].value) == "bool(_public_base_url())", [ast.unparse(f) for f in flags]

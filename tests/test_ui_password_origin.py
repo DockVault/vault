@@ -50,7 +50,8 @@ def test_promoting_warns_then_hands_over_the_link(page: Page, admin, admin_creds
         overlay = page.locator(".reset-link-overlay")
         expect(overlay).to_be_visible(timeout=15000)
         expect(overlay).to_contain_text(f"Password reset link for {bob['_username']}")
-        assert "?reset=" in overlay.locator("input").input_value()
+        from conftest import link_base_for
+        assert overlay.locator("input").input_value().startswith(link_base_for(admin, page) + "/?reset=")
         assert psql(f"SELECT role FROM users WHERE id = '{bob['id']}'").lower() == "admin"
     finally:
         admin.delete_user(bob["id"])

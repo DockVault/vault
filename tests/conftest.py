@@ -1016,3 +1016,16 @@ def skip_without_a_public_address(admin):
 def public_address_configured(admin) -> bool:
     """Whether the stack has a public address (ALLOWED_HOSTS), on which every emailed link is built."""
     return admin.get("/settings").json().get("public_address_configured") is not False
+
+
+def link_base_for(admin, page) -> str:
+    """Where a link the page shows for copying (an invitation's, a reset link) must start: the stack's configured
+    public address, or, with none, the page's own address (the page completes the server's relative link)."""
+    if not public_address_configured(admin):
+        return page.evaluate("location.origin")
+    import subprocess
+    from app.core.allowed_hosts import link_base
+    api = os.environ.get("VAULT_API_CONTAINER", "vault-api")
+    configured = subprocess.run(["docker", "exec", api, "printenv", "ALLOWED_HOSTS"], capture_output=True,
+                                text=True, timeout=15).stdout.strip()
+    return link_base(configured)

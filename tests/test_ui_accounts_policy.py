@@ -170,3 +170,17 @@ def test_no_console_errors_on_the_tab(page: Page, admin_creds):
     page.select_option("#setting-signup-domain-mode", "denylist")
     page.wait_for_timeout(800)
     assert not errors, f"Accounts & Access tab produced console errors: {errors}"
+
+
+def test_the_reset_note_shows_exactly_when_there_is_no_public_address(page: Page, admin_creds, admin):
+    """Self-service reset emails a link built on the public address: Settings says beside its switch that no reset
+    email is sent while ALLOWED_HOSTS is not set, and says nothing when it is."""
+    from conftest import public_address_configured
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_accounts_tab(page)
+    note = page.locator("#password-reset-address-note")
+    if public_address_configured(admin):
+        expect(note).to_be_hidden()
+    else:
+        expect(note).to_be_visible()
+        expect(note).to_contain_text("public address (ALLOWED_HOSTS) is not set")

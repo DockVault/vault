@@ -18,7 +18,8 @@ def invites_on(admin):
     snap = {k: before.get(k) for k in ACCOUNT_KEYS}
     admin.put("/settings", json={"invite_enabled": True, "email_requirement": "optional",
                                  "signup_email_domain_mode": "off", "signup_email_domains": []})
-    yield before.get("smtp_configured") is True
+    # (email can be sent, a public address is configured): an invitation is emailed only with both.
+    yield before.get("smtp_configured") is True, before.get("public_address_configured") is not False
     admin.put("/settings", json=snap)
 
 
@@ -32,7 +33,7 @@ def _login_admin(page: Page, admin_creds):
 
 
 def test_the_dialog_says_how_the_invitation_goes_out(page: Page, admin_creds, invites_on):
-    mail_ready = invites_on
+    mail_ready, has_address = invites_on
     _login_admin(page, admin_creds)
     page.click('.sidebar-item[data-section="users"]')
     page.click("#invite-user-btn")
@@ -40,7 +41,9 @@ def test_the_dialog_says_how_the_invitation_goes_out(page: Page, admin_creds, in
     note = page.locator("#invite-send-note")
     expect(note).to_contain_text("Without an email address, you copy the invitation link")
     page.fill("#invite-email", "someone@example.test")
-    if mail_ready:
+    if mail_ready and not has_address:
+        expect(note).to_contain_text("Emailed links need this server’s public address (ALLOWED_HOSTS)")
+    elif mail_ready:
         expect(note).to_contain_text("will be emailed to someone@example.test")
     else:
         expect(note).to_contain_text("Email is not set up here")
@@ -61,7 +64,8 @@ def test_a_pending_invitation_can_be_sent_again_from_its_row(page: Page, admin, 
         page.locator('#confirm-modal button:has-text("Send again")').click()
         expect(page.locator("#invite-link-result")).to_be_visible(timeout=10000)
         link = page.locator("#invite-link-value").inner_text()
-        assert "invite=" in link and inv["token"] not in link
+        from conftest import link_base_for
+        assert link.startswith(link_base_for(admin, page) + "/?invite=") and inv["token"] not in link
         expect(page.locator("#invite-link-expiry")).to_contain_text("no longer works")
         page.click("#invite-done-footer .close-modal-btn")
         # The resend made a new invitation: the old row is gone, the new one is pending under the same name.
