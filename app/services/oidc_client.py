@@ -62,6 +62,7 @@ TOKEN_AUTH_POST = "client_secret_post"
 PROVIDER_ERROR = "provider_error"
 ISSUER_MISMATCH = "issuer_mismatch"
 TOKEN_INVALID = "token_invalid"
+PROVIDER_CLOCK_AHEAD = "provider_clock_ahead"     # a time the provider states lies ahead of now, beyond the skew
 NONCE_MISMATCH = "nonce_mismatch"
 ENDPOINT_REFUSED = "endpoint_refused"
 TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
@@ -595,7 +596,8 @@ def _key_for(provider, discovery, header, *, fetch, cache, resolve, now, stale_o
         raise OidcError(TOKEN_INVALID, "key unusable") from exc
 
 
-def _decode(token: str, key, alg: str, *, issuer: str, audience: str, now: float, require: Iterable[str]) -> dict:
+def _decode(token: str, key, alg: str, *, issuer: str, audience: str, now: float, require: Iterable[str],
+            ahead: str = TOKEN_INVALID) -> dict:
     """Signature, required claims, issuer and audience by PyJWT; the time claims by :func:`_check_times` against
     the caller's clock (PyJWT would read the wall clock itself, and one clock must rule every check)."""
     try:
@@ -606,19 +608,22 @@ def _decode(token: str, key, alg: str, *, issuer: str, audience: str, now: float
         raise OidcError(ISSUER_MISMATCH, "the token's issuer is not the provider's") from exc
     except jwt.PyJWTError as exc:
         raise OidcError(TOKEN_INVALID, type(exc).__name__) from exc
-    _check_times(claims, now)
+    _check_times(claims, now, ahead)
     return claims
 
 
-def _check_times(claims: dict, now: float) -> None:
-    """``exp`` and ``iat`` are required numbers, ``nbf`` a number when present; each gets 60 seconds of skew."""
+def _check_times(claims: dict, now: float, ahead: str = TOKEN_INVALID) -> None:
+    """``exp`` and ``iat`` are required numbers, ``nbf`` a number when present; each gets 60 seconds of skew.
+
+    An ``iat`` ahead of now is refused with ``ahead``: for an ID token the reason that names the provider's clock,
+    so the person is told what is wrong; for a logout token an invalid token, as it always was."""
     exp, iat, nbf = claims.get("exp"), claims.get("iat"), claims.get("nbf", 0)
     if not all(_is_time(v) for v in (exp, iat, nbf)):
         raise OidcError(TOKEN_INVALID, "a time claim is not a number")
     if exp + SKEW_SECONDS < now:
         raise OidcError(TOKEN_INVALID, "expired")
     if iat > now + SKEW_SECONDS:
-        raise OidcError(TOKEN_INVALID, "iat in the future")
+        raise OidcError(ahead, "iat in the future")
     if nbf > now + SKEW_SECONDS:
         raise OidcError(TOKEN_INVALID, "not yet valid")
 
@@ -665,6 +670,7 @@ def verify_id_token(provider: ProviderConfig, discovery: Discovery, token: str, 
     header = _header(token)
     key, alg = _key_for(provider, discovery, header, fetch=fetch, cache=cache, resolve=resolve, now=now)
     claims = _decode(token, key, alg, issuer=provider.issuer, audience=provider.client_id, now=now,
+                     ahead=PROVIDER_CLOCK_AHEAD,
                      require=("exp", "iat", "iss", "aud", "sub", "nonce"))
     _check_azp(claims, provider)
     if claims.get("nonce") != nonce:

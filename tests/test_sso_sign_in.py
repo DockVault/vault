@@ -474,13 +474,19 @@ def test_an_identity_linked_before_the_provider_named_a_tenant_learns_it(monkeyp
 def test_a_provider_auth_time_the_platform_cannot_place_is_not_a_crash(monkeypatch):
     alice, p = _user(), _provider()
     h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
-    for odd in (10 ** 11, -5, 2 ** 40, True, "yesterday"):
+    for odd in (-5, True, "yesterday"):
         status, out = h.start(p)
         state, _ = h.state_of(out["authorization_url"])
         h.claims_override = {"auth_time": odd}
         status, location, _ = h.callback(p, state)
         assert status == 302 and location.startswith("/#sso="), (odd, location)
         assert h.finish(location)[0] == 200
+    # A number too large to place is not "no time": it lies further ahead than any clock, and is refused as one.
+    for ahead in (2 ** 33, 10 ** 11, 2 ** 40):
+        status, out = h.start(p)
+        state, _ = h.state_of(out["authorization_url"])
+        h.claims_override = {"auth_time": ahead}
+        assert h.callback(p, state)[1] == "/#sso-error=provider_clock_ahead", ahead
 
 
 # --------------------------------------------------------------------------- linking

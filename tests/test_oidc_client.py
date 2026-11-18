@@ -636,7 +636,7 @@ def _raw_token(header: dict, payload: dict) -> str:
     (lambda s: s.token(s.id_claims(aud=[CLIENT, "other"])), "token_invalid"),                 # several, no azp
     (lambda s: s.token(s.id_claims(aud=[CLIENT, "other"], azp="other")), "token_invalid"),
     (lambda s: s.token(s.id_claims(exp=NOW - 61)), "token_invalid"),
-    (lambda s: s.token(s.id_claims(iat=NOW + 61)), "token_invalid"),
+    (lambda s: s.token(s.id_claims(iat=NOW + 61)), "provider_clock_ahead"),      # the provider's clock, by name
     (lambda s: s.token(s.id_claims(nbf=NOW + 61)), "token_invalid"),
     (lambda s: s.token(s.id_claims(nonce="other")), "nonce_mismatch"),
     (lambda s: s.token(s.id_claims(exp=float("nan"))), "token_invalid"),
@@ -1029,3 +1029,25 @@ def test_a_logout_token_is_never_verified_with_a_stale_key_set():
     assert oc.verify_id_token(_provider(oc), d, token, nonce="n1", fetch=down, cache=cache, resolve=_PUBLIC,
                               now=at)["sub"] == "user-1"
 
+
+
+def test_an_issue_time_ahead_names_the_clock_for_an_id_token_and_stays_an_invalid_token_for_a_logout_token():
+    """A provider whose clock runs ahead issues ID tokens the vault refuses: the person is told it is the clock.
+    A logout token with such a time is an invalid token, as before, so the provider is answered that it need not
+    send it again."""
+    oc = _oc()
+    signer = Signer()
+    d = _disc(oc, signer)
+    token = signer.token(_logout_claims(signer, jti="j-ahead", iat=NOW + 61, exp=NOW + 180))
+    with pytest.raises(oc.OidcError) as e:
+        oc.verify_logout_token(_provider(oc), d, token, seen_jti=lambda jti, ttl: False, fetch=_fetch_for(signer),
+                               resolve=_PUBLIC, now=NOW)
+    assert e.value.code == oc.TOKEN_INVALID
+    with pytest.raises(oc.OidcError) as e:
+        oc._check_times({"exp": NOW + 300, "iat": NOW + 61}, NOW, oc.PROVIDER_CLOCK_AHEAD)
+    assert e.value.code == oc.PROVIDER_CLOCK_AHEAD
+    oc._check_times({"exp": NOW + 300, "iat": NOW + 60}, NOW, oc.PROVIDER_CLOCK_AHEAD)        # within the skew
+    # Only the issue time is the clock's: a token past its end is an invalid one, whoever asks.
+    with pytest.raises(oc.OidcError) as e:
+        oc._check_times({"exp": NOW - 61, "iat": NOW - 300}, NOW, oc.PROVIDER_CLOCK_AHEAD)
+    assert e.value.code == oc.TOKEN_INVALID
