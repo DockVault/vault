@@ -4919,6 +4919,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.35.1": {
+      "released": "2026-11-18",
+      "notes": "A maintenance release of the 0.35 line with hardening; it publishes no advisory. Every emailed link (password reset, invitations, notices) is now built only on the server's configured public address, the first entry of ALLOWED_HOSTS, never on a request's Host header: an install without ALLOWED_HOSTS sends no reset or invitation email, and Settings says so. ALLOWED_HOSTS entries may be full addresses (https://name:port); the Host check uses their names, a wildcard is never the link base, and an entry with no readable host stops the start with its name. dockvault.py setup sets ALLOWED_HOSTS and now asks whether people reach the web UI through a reverse proxy or another port. If you installed with dockvault.py setup on a web port other than 443 and people open the vault on that port, change ALLOWED_HOSTS to the address they open (for example https://vault.example.com:8443) and restart the vault (python dockvault.py restart). File passwords have the vault password's attempt limit, and routes that answered 500 or 404 when a password was locked out answer 429. While the cache is down, sign-ins for unknown names are counted in the database (a new table, sign_in_phantoms) so they look like known ones, and the second-factor steps answer 503. A live socket whose temporary session ran out closes; an account's temporary credentials hold at most twenty live sockets together. The share dialog keeps an earlier dialog's answers out of one opened again. Going back to 0.35.0 needs no restore, but 0.35.0 reads ALLOWED_HOSTS entries as host names only: first add the bare name of each full address as another entry (https://vault.example.com:8443,vault.example.com), or 0.35.0 refuses every request made by that name.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -5596,6 +5604,20 @@
           "id": "stay-signed-in",
           "summary": "From 0.35.0 the web app offers, a minute before a session ends, to keep it going. Each renewal lasts the session timeout, up to 24 hours after the sign-in by default (Settings, Security, under Show advanced settings: Stay signed in for at most, from the session timeout up to 720 hours). In 0.34 a sign-in ended at the session timeout. To keep sign-ins about as short as before, set that limit to the session timeout rounded up to whole hours.",
           "detect": "SELECT (SELECT value->>'session_timeout' FROM system_settings WHERE key = 'global') AS session_timeout_minutes, (SELECT value->>'session_renewal_max_hours' FROM system_settings WHERE key = 'global') AS stay_signed_in_hours"
+        }
+      ]
+    },
+    {
+      "from": "0.35.0",
+      "to": "0.35.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "emailed-links-need-allowed-hosts",
+          "summary": "From 0.35.1 every emailed link (password reset, invitations, notices) is built on the first entry of ALLOWED_HOSTS in .env, never on a request's Host header. With ALLOWED_HOSTS empty, no reset or invitation email is sent until it is set. Set it to the address people open the vault by: a bare name means https://name; write another port or plain http as the full address (https://vault.example.com:8443). An entry with no readable host now stops the start and names the entry. dockvault.py setup writes it; an install made by setup on a web port other than 443 should check it. 0.35.0 reads entries as host names only: before going back to it, add the bare name of each full address as another entry.",
+          "detect": "SELECT value->>'password_reset_enabled' AS self_service_reset_enabled FROM system_settings WHERE key = 'global'"
         }
       ]
     }
