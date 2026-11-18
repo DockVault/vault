@@ -122,6 +122,12 @@ def test_a_second_change_of_every_kind_is_held_and_changes_nothing(admin, temp_u
     before = _state(admin, temp_user)
 
     r = MAKERS[second](other_client, temp_user)
+    if second == "send_reset_link" and not public_address_configured(admin):
+        # No public address to build the link on: refused before anything is held, and nothing changes.
+        assert r.status_code == 400 and "ALLOWED_HOSTS" in r.json()["detail"], r.text
+        assert _state(admin, temp_user) == before
+        assert not [q for q in _requests(admin) if q["target_user_id"] == temp_user["id"]], "nothing held"
+        return
     assert r.status_code == 202, r.text
     body = r.json()
     held = body["held_changes"][0] if "held_changes" in body else body
