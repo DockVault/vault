@@ -662,13 +662,61 @@ def profile_reconciliation_args(profile):
 
 
 def _allowed_hosts_name(value):
-    """The host name of ALLOWED_HOSTS's first entry (a bare name, or a full origin such as https://name:8443, which
-    setup writes on a web port other than 443), for a .env that has no SERVER_NAME."""
-    first = ((value or "").strip().strip("'\"").split(",")[0]).strip()
-    if "://" in first:
-        first = first.split("://", 1)[1]
-    first = first.split("/", 1)[0]
-    return first.split(":", 1)[0] if first.count(":") == 1 else first
+    """The host name of ALLOWED_HOSTS's first entry that is not a wildcard (a bare name, or a full origin such as
+    https://name:8443, which setup writes on a web port other than 443), in lower case as the application reads it
+    (app/core/allowed_hosts.py), for a .env that has no SERVER_NAME. "" when there is none."""
+    for entry in (e.strip() for e in (value or "").strip().strip("'\"").split(",")):
+        if "://" in entry:
+            entry = entry.split("://", 1)[1]
+        entry = entry.split("/", 1)[0].lower()
+        name = entry.split(":", 1)[0] if entry.count(":") == 1 else entry
+        if name and "*" not in name and not name.startswith(".") and name != "0.0.0.0":
+            return name
+    return ""
+
+
+def public_web_address(value):
+    """The address people open the web UI at when it is not this server's name on its web port (a reverse proxy,
+    port forwarding), as setup writes it first in ALLOWED_HOSTS: a bare name for https on 443, else the full origin.
+    None for a blank answer; ValueError, saying what an address is, for anything else."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    scheme, rest = "https", text
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+        scheme = scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError("an address starts with https:// or http://")
+    rest = rest.rstrip("/")
+    host, _, port = rest.partition(":")
+    if not validate_server_name(host):          # a path fails here or as the port
+        raise ValueError("an address is a name or an IPv4 address (letters, digits, dots, hyphens), with an optional "
+                         "port, and no path")
+    if port and not (port.isdigit() and 1 <= int(port) <= 65535):
+        raise ValueError("a port is a number from 1 to 65535")
+    host = host.lower()
+    if scheme == "https" and not port:
+        return host
+    return "%s://%s%s" % (scheme, host, ":%d" % int(port) if port else "")
+
+
+def allowed_hosts_value(cfg):
+    """ALLOWED_HOSTS as setup writes it. Its first entry is the base of every emailed link, and the Host check reads
+    each entry's host name (app/core/allowed_hosts.py).
+    - A fresh volume set keeps the current .env's value (cfg["allowed_hosts"], from new_set_config).
+    - When setup was told the address people use (a reverse proxy, port forwarding), that address comes first, then
+      this server's name when it is another, for the Host check.
+    - Otherwise this server's name: bare on web port 443, else its full origin (https://name:port)."""
+    kept = ",".join(e.strip() for e in (cfg.get("allowed_hosts") or "").split(",") if e.strip())
+    if kept and not re.search(r"['\"\s]", kept):      # a value that cannot be written back quoted is set anew
+        return kept
+    server = cfg["server_name"]
+    public = cfg.get("web_public_address")
+    if public:
+        return public if _allowed_hosts_name(public) == server.lower() else "%s,%s" % (public, server)
+    port = int(cfg.get("web_host_port") or 443)
+    return server if port == 443 else "https://%s:%d" % (server, port)
 
 
 def build_env_lines(cfg):
@@ -696,11 +744,9 @@ def build_env_lines(cfg):
     q("JWT_SECRET_KEY")
     q("VAULT_DB_PASSWORD")
     q("REDIS_PASSWORD")
-    # The first entry is also the base of every emailed link (reset, invitation): on a web port other than 443 it
-    # is the full origin, whose host name the Host check reads (app/core/allowed_hosts.py).
-    _web_port = int(cfg.get("web_host_port") or 443)
-    bare("ALLOWED_HOSTS", "'%s'" % (cfg["server_name"] if _web_port == 443
-                                     else "https://%s:%d" % (cfg["server_name"], _web_port)))
+    # The first entry is also the base of every emailed link (reset, invitation): the address people use
+    # (allowed_hosts_value).
+    bare("ALLOWED_HOSTS", "'%s'" % allowed_hosts_value(cfg))
     bare("SERVER_NAME", "'%s'" % cfg["server_name"])
     q("ADMIN_USERNAME")
     q("ADMIN_EMAIL")
@@ -1983,6 +2029,8 @@ def new_set_config(current_env, new_prefix, new_id):
         # Keep where SFTP clients are told to connect (NAT / port forwarding) across a fresh volume set.
         "sftp_public_host": (current_env.get("SFTP_PUBLIC_HOST") or "").strip() or None,
         "sftp_public_port": (current_env.get("SFTP_PUBLIC_PORT") or "").strip() or None,
+        # And the address people open the web UI at, with the rest of ALLOWED_HOSTS, as it is.
+        "allowed_hosts": (current_env.get("ALLOWED_HOSTS") or "").strip() or None,
         "update_check_enabled": truthy("UPDATE_CHECK_ENABLED"),
         "plan_log_pull": truthy("PLAN_LOG_PULL"),
         "log_token_pepper": gen_hex(32) if truthy("PLAN_LOG_PULL") else "",
@@ -3214,8 +3262,10 @@ def gateway_trust_note(trusted, gateways, current, target):
             "upgrade they are recorded as the gateway and their X-Forwarded-For is ignored. A reverse proxy on "
             "this host arrives from the gateway too: for one, set TRUSTED_PROXIES=gateway and WEB_BIND=127.0.0.1 "
             "in .env (WEB_BIND needs the compose files of 0.33.1 or later; an install that updates by pulling "
-            "images keeps its own, so publish the web port as 127.0.0.1:<port>:8000 there by hand). A proxy "
-            "container on the vault's network is unaffected: list its address."
+            "images keeps its own, so publish the web port as 127.0.0.1:<port>:8000 there by hand), and make the "
+            "first ALLOWED_HOSTS entry the address people open, the proxy's (usually the bare name), not the "
+            "published port: emailed links are built on it. A proxy container on the vault's network is "
+            "unaffected: list its address."
             % ((trusted or "").strip(), where))
 
 
@@ -5421,10 +5471,22 @@ class DockVault:
         if prob:
             self._fail("admin password %s" % prob)
 
+        web_public = None
         if interactive:
             enable_sftp = confirm("Enable SFTP (SSH-encrypted, publishes a second port)?", pal, default=False)
             split = confirm("Run web + SFTP as TWO containers (split) instead of one combined?", pal, default=False)
             web_port = prompt_free_port(pal, "Web (HTTPS)", 443)
+            # Where people open the web UI, when it is not this name on this port: emailed links are built on it.
+            if a("web_public_address") is None and confirm(
+                    "Do people reach the web UI at a different address or port "
+                    "(a reverse proxy, port forwarding)?", pal, default=False):
+                while True:
+                    answer = ask("Address people open in their browser", pal, "https://%s" % server)
+                    try:
+                        web_public = public_web_address(answer)
+                        break
+                    except ValueError as exc:
+                        print(pal.paint("  %s." % exc, "red"))
             # split mode always runs the SFTP container, so offer a custom SFTP port there too.
             sftp_port = prompt_free_port(pal, "SFTP", 2322) if (enable_sftp or split) else 2322
             sftp_public_host, sftp_public_port = None, None
@@ -5473,6 +5535,11 @@ class DockVault:
                     break
                 print(pal.paint("  enter a number of GB, 0 to turn it off, or leave it blank", "red"))
 
+        if web_public is None and a("web_public_address") is not None:
+            try:
+                web_public = public_web_address(a("web_public_address"))
+            except ValueError as exc:
+                self._fail("invalid web address (%s): %r" % (exc, a("web_public_address")))
         if sftp_public_host and not validate_server_name(sftp_public_host):
             self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
         if sftp_public_port is not None and not (1 <= int(sftp_public_port) <= 65535):
@@ -5493,6 +5560,7 @@ class DockVault:
             "run_sftp": enable_sftp,
             "web_host_port": web_port,
             "sftp_host_port": sftp_port,
+            "web_public_address": web_public,
             "sftp_public_host": sftp_public_host,
             "sftp_public_port": sftp_public_port,
             # SFTP staging tmpfs size — install-time only (a deploy-time infra knob, not a live
@@ -9741,6 +9809,10 @@ def build_parser():
     sp.add_argument("--key-path", dest="key_path", help="bring-your-own private key (PEM)")
     sp.add_argument("--web-port", dest="web_port", type=int, help="host port for HTTPS (default 443)")
     sp.add_argument("--sftp-port", dest="sftp_port", type=int, help="host port for SFTP (default 2322)")
+    sp.add_argument("--web-public-address", dest="web_public_address",
+                    help="address people open the web UI at, when it is not the server name on --web-port "
+                         "(a reverse proxy, port forwarding), e.g. https://vault.example.com; written first "
+                         "in ALLOWED_HOSTS, the base of every emailed link")
     sp.add_argument("--sftp-public-host", dest="sftp_public_host",
                     help="address SFTP clients connect to, when it is not the server name (NAT)")
     sp.add_argument("--sftp-public-port", dest="sftp_public_port", type=int,

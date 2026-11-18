@@ -118,7 +118,7 @@ If you'd rather manage `.env` and TLS yourself, provide `./.env` (start from `.e
 `./certs/{cert.pem,key.pem}`, then start the production stack straight from the repo root. Set
 `ALLOWED_HOSTS` to the name people reach the vault by: emailed links (a password reset, an invitation, the
 links in notices) are built on it and never on a request's `Host` header, so without it no reset or
-invitation email is sent (an administrator copies invitation and reset links instead). The first entry that is not a wildcard is the base of every emailed link: a bare name means `https://name`, so on another port, or over plain http, write that entry as the full origin (`https://name:8443`); the Host check reads each entry's host name without its scheme or port, and a wildcard is never the link base.
+invitation email is sent (an administrator copies invitation and reset links instead). The first entry that is not a wildcard is the base of every emailed link, so make it the address people open in their browser: a bare name means `https://name`; when people use another port, or plain http, write that entry as the full origin (`https://name:8443`). Behind a reverse proxy or port forwarding, that is the proxy's or the forwarded address (usually the bare name), not the port the vault publishes. The Host check reads each entry's host name without its scheme or port; a wildcard is never the link base; an entry with no host name stops the vault at start, naming it; IPv6 literals and `0.0.0.0` match no request.
 
 ```bash
 cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD,
@@ -834,11 +834,14 @@ them, but a README-only reader can miss them (the off-host key backup is always 
   internal network. Set `REDIS_PASSWORD` for defense-in-depth.
 - **Set `ALLOWED_HOSTS`** to the name people reach the vault by. It rejects a forged `Host` header, and every
   emailed link (a password reset, an invitation, the links in notices) is built on it: without it, self-service
-  password reset sends nothing and invitations are not emailed. The first entry that is not a wildcard is the base of every emailed link: a bare name means `https://name`, so on another port, or over plain http, write that entry as the full origin (`https://name:8443`); the Host check reads each entry's host name without its scheme or port, and a wildcard is never the link base.
+  password reset sends nothing and invitations are not emailed. The first entry that is not a wildcard is the base of every emailed link, so make it the address people open in their browser: a bare name means `https://name`; when people use another port, or plain http, write that entry as the full origin (`https://name:8443`). Behind a reverse proxy or port forwarding, that is the proxy's or the forwarded address (usually the bare name), not the port the vault publishes. The Host check reads each entry's host name without its scheme or port; a wildcard is never the link base; an entry with no host name stops the vault at start, naming it; IPv6 literals and `0.0.0.0` match no request.
 - **Behind a reverse proxy, name it in `TRUSTED_PROXIES`** so the audit log and the sign-in limits see real
   client addresses: a proxy container's address, or `gateway` for a proxy on the same host together with
   `WEB_BIND=127.0.0.1` (the port published on loopback only). A range never trusts the Docker gateway, which
-  every connection relayed to a published port comes from.
+  every connection relayed to a published port comes from. Make the first `ALLOWED_HOSTS` entry the address
+  people open, the proxy's (usually the bare name), not the published port: emailed links are built on it.
+  `dockvault.py setup` asks for it ("Do people reach the web UI at a different address or port", or
+  `--web-public-address`).
 - **Use fresh `ENCRYPTION_KEY` / `JWT_SECRET_KEY` per deployment.** You can rotate `JWT_SECRET_KEY` (it just
   forces re-login) and passwords on a schedule, but **NEVER rotate `ENCRYPTION_KEY` on a vault that already
   holds data** — it makes every stored file permanently undecryptable.
