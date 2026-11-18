@@ -29,9 +29,10 @@ import app.api.api_server as api
 from app.core.rate_limiter import rate_limiter
 
 def call(path, addr):
+    # localhost: a Host the Host check admits whatever ALLOWED_HOSTS holds (it always admits the health probe's).
     scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
              "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
-             "headers": [(b"host", b"vault.test")], "client": (addr, 40000), "server": ("127.0.0.1", 8000)}
+             "headers": [(b"host", b"localhost:8000")], "client": (addr, 40000), "server": ("127.0.0.1", 8000)}
     sent = []
     async def receive():
         return {"type": "http.request", "body": b"", "more_body": False}
