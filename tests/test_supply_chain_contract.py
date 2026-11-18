@@ -432,6 +432,94 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert not (_ROOT / ".github" / "scripts" / "release_push_digest.py").exists()
 
 
+# The reviewed texts of the five OpenSSL statements (security/vex.openvex.json) and of their paragraph
+# in docs/supply-chain-controls.md, word for word.
+_OPENSSL_USERS = (
+    "In this image the system OpenSSL, Alpine's libssl3 and libcrypto3 3.5.9-r0, is used by "
+    "Python's _ssl module (TLS over TCP), Python's _hashlib module (digests, HMAC, PBKDF2 "
+    "and scrypt, no ciphers), busybox's ssl_client (TLS over TCP), apk-tools (TLS over TCP "
+    "and signature checks), ca-certificates' c_rehash (certificate hashing), and the legacy "
+    "provider and engines OpenSSL loads on request. None of them imports a QUIC or CMS "
+    "function or names the AES-GCM-SIV cipher, and the image has no openssl command."
+)
+_OPENSSL_END = (
+    "The statement is bound to libssl3 and libcrypto3 3.5.9-r0 and ends when the image moves "
+    "to an OpenSSL with the fix (3.5.10, or Alpine's patched 3.5.9-r1). Verified for source "
+    "revision __SOURCE_REVISION__."
+)
+_OPENSSL_REASON = {
+    "quic": (
+        "Python's ssl module has no QUIC support, and dnspython's DNS over QUIC needs aioquic, "
+        "which the image does not install and which implements QUIC itself, not with OpenSSL."
+    ),
+    "siv": (
+        "TLS has no AES-GCM-SIV cipher suite, and the application's own encryption uses AES-GCM "
+        "and Fernet (AES-CBC with HMAC) through the cryptography package, which carries its own "
+        "OpenSSL; nothing in the image uses AES-GCM-SIV."
+    ),
+    "cms": (
+        "Python's standard library has no CMS interface."
+    ),
+}
+_OPENSSL_WHAT = {
+    "CVE-2026-88822": ("quic", (
+        "CVE-2026-88822 is a flaw in OpenSSL's QUIC implementation, rated Low by OpenSSL: "
+        "automated peer detection on an already connected socket passes getpeername() a length "
+        "too small for an IPv6 address, so uninitialised stack bytes become the destination of "
+        "outgoing QUIC packets. It is reached only by an application that runs a QUIC connection "
+        "with OpenSSL."
+    )),
+    "CVE-2026-88823": ("siv", (
+        "CVE-2026-88823 is a flaw in OpenSSL's AES-GCM-SIV cipher, rated Low by OpenSSL: an "
+        "empty additional-data update discards the additional data given before it, and setting "
+        "a new key or nonce keeps the old additional data. It is reached only by an application "
+        "that encrypts or decrypts with AES-GCM-SIV through OpenSSL."
+    )),
+    "CVE-2026-95691": ("quic", (
+        "CVE-2026-95691 is a use-after-free in OpenSSL's QUIC client, rated Low by OpenSSL, when "
+        "a QUIC server retransmits a CRYPTO frame that fully overlaps one already received. It "
+        "is reached only by an application that opens a QUIC connection with OpenSSL."
+    )),
+    "CVE-2026-95692": ("siv", (
+        "CVE-2026-95692 is an out-of-bounds read in OpenSSL's AES-GCM-SIV cipher, rated Low by "
+        "OpenSSL, when it is given an IV shorter than its 12-byte nonce. It is reached only by "
+        "an application that encrypts or decrypts with AES-GCM-SIV through OpenSSL."
+    )),
+    "CVE-2026-107496": ("cms", (
+        "CVE-2026-107496 is an endless loop in OpenSSL's CMS_encrypt() and CMS_encrypt_ex(), "
+        "rated Low by OpenSSL, when they encrypt to an EC certificate whose group order is 1. It "
+        "is reached only by an application that encrypts a CMS message to a certificate an "
+        "attacker supplies; OpenSSL's TLS and QUIC code do not use it."
+    )),
+}
+_OPENSSL_IMPACT = {
+    name: " ".join((what, _OPENSSL_USERS, _OPENSSL_REASON[kind], _OPENSSL_END))
+    for name, (kind, what) in _OPENSSL_WHAT.items()
+}
+_OPENSSL_PARAGRAPH = (
+    "The other five come from OpenSSL's advisory of 10 November 2026, which rates all five "
+    "Low: `CVE-2026-88822` and `CVE-2026-95691` in its QUIC implementation, `CVE-2026-88823` "
+    "and `CVE-2026-95692` in its AES-GCM-SIV cipher, and `CVE-2026-107496` in "
+    "`CMS_encrypt()`. The fixed release, OpenSSL 3.5.10, is scheduled for 1 December 2026. "
+    "When they were reviewed, on 18 November 2026, only Alpine's edge branch had a patched "
+    "package (3.5.9-r1); Alpine 3.24, the base image's release, still served 3.5.9-r0. In "
+    "this image the system OpenSSL is used by Python's `_ssl` module (TLS over TCP), "
+    "Python's `_hashlib` module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's "
+    "`ssl_client` (TLS over TCP), apk-tools (TLS over TCP and signature checks), "
+    "ca-certificates' `c_rehash` (certificate hashing), and the legacy provider and engines "
+    "OpenSSL loads on request. None of them imports a QUIC or CMS function or names the "
+    "AES-GCM-SIV cipher, and the image has no `openssl` command. Python's `ssl` module has "
+    "no QUIC support; dnspython's DNS over QUIC needs `aioquic`, which the image does not "
+    "install and which implements QUIC itself, not with OpenSSL; TLS has no AES-GCM-SIV "
+    "cipher suite; and the application's own encryption uses AES-GCM and Fernet (AES-CBC "
+    "with HMAC) through the `cryptography` package, which carries its own OpenSSL, and never "
+    "AES-GCM-SIV. Each statement binds the `pkg:apk/alpine/libssl3@3.5.9-r0` and "
+    "`pkg:apk/alpine/libcrypto3@3.5.9-r0` subcomponents: the build's `apk upgrade` installs "
+    "a patched package as soon as Alpine 3.24 serves one, the pins stop matching, the image "
+    "scan says so, and the five statements are removed."
+)
+
+
 def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     assert "only-fixed" not in _RELEASE
     assert "severity-cutoff: high" in _RELEASE
@@ -479,12 +567,10 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     # The five findings of OpenSSL's advisory of 10 November 2026, all rated Low by OpenSSL, are in
     # QUIC, the AES-GCM-SIV cipher and CMS_encrypt(); nothing that links the system OpenSSL in the
     # image reaches any of them. Bound to the exact Alpine packages, so the build's apk upgrade to a
-    # patched OpenSSL ends the exceptions (check_vex_sbom.py fails the scan on the stale pins).
+    # patched OpenSSL ends the exceptions (check_vex_sbom.py fails the scan on the stale pins). Each
+    # statement is pinned whole: a fact that changes is a statement reviewed again.
     openssl_subs = [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r0"},
                     {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r0"}]
-    reason = {**{n: "no QUIC support" for n in quic_cves},
-              **{n: "no code in the image uses AES-GCM-SIV" for n in siv_cves},
-              **{n: "Python has no CMS interface" for n in cms_cves}}
     for name in openssl_cves:
         statement = by_name[name]
         assert statement["status"] == "not_affected", name
@@ -500,15 +586,7 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
             {"@id": "__IMAGE_REFERENCE__", "subcomponents": openssl_subs},
         ], name
         assert statement["timestamp"] == "__GENERATED_AT__", name
-        impact = statement["impact_statement"]
-        assert impact.startswith(f"{name} is "), name
-        assert "__SOURCE_REVISION__" in impact, name
-        for fact in ("rated Low by OpenSSL", "Alpine's libssl3 and libcrypto3 3.5.9-r0",
-                     "TLS over TCP", "no ciphers", "has no openssl command", reason[name],
-                     "bound to libssl3 and libcrypto3 3.5.9-r0"):
-            assert fact in impact, (name, fact)
-        for other in set(reason.values()) - {reason[name]}:
-            assert other not in impact, (name, other)
+        assert statement["impact_statement"] == _OPENSSL_IMPACT[name], name
 
     evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
     assert "There is no blanket `only-fixed` bypass" in evidence
@@ -519,10 +597,7 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
             "OpenSSL's advisory of 10 November 2026 in Alpine's `libssl3` and `libcrypto3` 3.5.9-r0") in flat
     assert "vulnerable_code_not_in_execute_path" in flat
     assert "`pkg:generic/python@3.14.10` subcomponent" in flat
-    for name in openssl_cves:
-        assert f"`{name}`" in flat, name
-    assert ("Each statement binds the `pkg:apk/alpine/libssl3@3.5.9-r0` and "
-            "`pkg:apk/alpine/libcrypto3@3.5.9-r0` subcomponents") in flat
+    assert _OPENSSL_PARAGRAPH in flat
     assert "While the template holds the statements below, a release attaches its VEX." in flat
     assert ("The GitHub Release publishes the rendered VEX beside the SBOMs only when the template "
             "holds at least one statement.") in flat

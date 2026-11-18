@@ -109,7 +109,8 @@ module absent rather than broken, and every other extension module of the standa
 The reviewed OpenVEX template, `security/vex.openvex.json`, holds the findings the maintainers have
 reviewed as not affecting the image, each with its justification. It holds six statements now: one
 for `CVE-2026-119170` in Python 3.14.10, and five for OpenSSL's advisory of 10 November 2026 in
-Alpine's `libssl3` and `libcrypto3` 3.5.9-r0 (their paragraphs are below). Four earlier statements were removed
+Alpine's `libssl3` and `libcrypto3` 3.5.9-r0 (their paragraphs are below). Four earlier
+statements were removed
 once they were bound to package versions the image no longer contained: three findings in Python's
 standard library, bound to Python 3.14.7, whose release already carries their fixes, and one in
 Alpine's `zlib` 1.3.2-r0, which the build's `apk upgrade` replaces with the fixed 1.3.2-r1. They
@@ -137,14 +138,14 @@ template, its entry in `tests/test_supply_chain_contract.py`, and its paragraph 
 from all three, or, if the new version is still affected and the reasoning still holds, reviewed
 again and its version changed in all three.
 
-Every exception is reviewed with the `vulnerable_code_not_in_execute_path` justification. The first is
-`CVE-2026-119170`, a regression in Python 3.14.10 in how the `hashlib` module enforces the
+Every exception is reviewed with the `vulnerable_code_not_in_execute_path` justification. The first
+is `CVE-2026-119170`, a regression in Python 3.14.10 in how the `hashlib` module enforces the
 algorithms OpenSSL allows in FIPS mode. Only a Python whose OpenSSL runs in FIPS mode is affected,
 and only 3.14.10; Python 3.14.11 fixes it. When it was reviewed, in November 2026, the official
 `python:3.14.11-alpine` image was not published, so the base image could not move to it. OpenSSL in
-this image cannot run in FIPS mode: the image ships no FIPS provider (`/usr/lib/ossl-modules/`
-holds only `legacy.so`), its `/etc/ssl/openssl.cnf` enables none, neither the image nor the Compose
-files set `OPENSSL_CONF` or `OPENSSL_MODULES`, and nothing in the application enables FIPS mode, so
+this image cannot run in FIPS mode: the image ships no FIPS provider (`/usr/lib/ossl-modules/` holds
+only `legacy.so`), its `/etc/ssl/openssl.cnf` enables none, neither the image nor the Compose files
+set `OPENSSL_CONF` or `OPENSSL_MODULES`, and nothing in the application enables FIPS mode, so
 `_hashlib.get_fips_mode()` returns 0 and the code with the flaw never runs. The statement binds the
 `pkg:generic/python@3.14.10` subcomponent: when the base image moves to a Python release without the
 flaw, the pin stops matching, the image scan says so, and the statement is removed.
@@ -156,12 +157,14 @@ release, OpenSSL 3.5.10, is scheduled for 1 December 2026. When they were review
 2026, only Alpine's edge branch had a patched package (3.5.9-r1); Alpine 3.24, the base image's
 release, still served 3.5.9-r0. In this image the system OpenSSL is used by Python's `_ssl` module
 (TLS over TCP), Python's `_hashlib` module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's
-`ssl_client` and apk-tools (TLS over TCP), and the legacy provider and engines OpenSSL loads on
-request. None of them imports a QUIC or CMS function or names the AES-GCM-SIV cipher, and the image
-has no `openssl` command. Python's `ssl` module has no QUIC support, dnspython's DNS over QUIC needs
-`aioquic`, which the image does not install, TLS has no AES-GCM-SIV cipher suite, and the
-application's own encryption uses AES-GCM through the `cryptography` package, which carries its own
-OpenSSL. Each statement binds the `pkg:apk/alpine/libssl3@3.5.9-r0` and
+`ssl_client` (TLS over TCP), apk-tools (TLS over TCP and signature checks), ca-certificates'
+`c_rehash` (certificate hashing), and the legacy provider and engines OpenSSL loads on request. None
+of them imports a QUIC or CMS function or names the AES-GCM-SIV cipher, and the image has no
+`openssl` command. Python's `ssl` module has no QUIC support; dnspython's DNS over QUIC needs
+`aioquic`, which the image does not install and which implements QUIC itself, not with OpenSSL; TLS
+has no AES-GCM-SIV cipher suite; and the application's own encryption uses AES-GCM and Fernet
+(AES-CBC with HMAC) through the `cryptography` package, which carries its own OpenSSL, and never
+AES-GCM-SIV. Each statement binds the `pkg:apk/alpine/libssl3@3.5.9-r0` and
 `pkg:apk/alpine/libcrypto3@3.5.9-r0` subcomponents: the build's `apk upgrade` installs a patched
 package as soon as Alpine 3.24 serves one, the pins stop matching, the image scan says so, and the
 five statements are removed.
