@@ -397,7 +397,8 @@ class Settings(BaseSettings):
     # self-hosted vault's served hostname is deployment-specific and unknown at build time. Set it to
     # the served name(s) to reject a forged/unexpected Host / X-Forwarded-Host (the classic primitive
     # for link-poisoning / cache-poisoning). 'localhost'/'127.0.0.1' are always allowed in addition so
-    # the container's own /health probe keeps working.
+    # the container's own /health probe keeps working. An entry may also be a full origin (https://name:port):
+    # the first entry that is not a wildcard is the base of every emailed link (app/core/allowed_hosts.py).
     allowed_hosts: str = Field(default="")
     rate_limit_vault_attempts: int = Field(default=5)  # Regular users
     rate_limit_vault_attempts_admin: int = Field(default=20)  # Admins get higher limit

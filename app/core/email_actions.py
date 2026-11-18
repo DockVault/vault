@@ -417,20 +417,15 @@ def brand_name(db: Session) -> str:
 
 
 def vault_url() -> str:
-    """Best-effort public base URL for ``{{vault.url}}`` from the first ALLOWED_HOSTS entry; empty
-    when nothing usable is configured. Never raises."""
+    """The public base URL (``{{vault.url}}``, and the base of every emailed link): the first ALLOWED_HOSTS entry
+    that is not a wildcard, as an origin (app/core/allowed_hosts.link_base); empty when there is none. Never
+    raises."""
     try:
         from app.core.config import settings
-        raw = (settings.allowed_hosts or "").strip()
+        from app.core.allowed_hosts import link_base
+        return link_base(settings.allowed_hosts)
     except Exception:
         return ""
-    for host in (h.strip() for h in raw.split(",")):
-        if not host or host in ("*", "0.0.0.0") or host.startswith("."):
-            continue
-        if host.startswith("http://") or host.startswith("https://"):
-            return host.rstrip("/")
-        return f"https://{host}".rstrip("/")
-    return ""
 
 
 def public_base_url() -> str:

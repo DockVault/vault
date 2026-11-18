@@ -661,6 +661,16 @@ def profile_reconciliation_args(profile):
     return ("--profile", "split", "rm", "-s", "-f", "vault-api", "vault-sftp")
 
 
+def _allowed_hosts_name(value):
+    """The host name of ALLOWED_HOSTS's first entry (a bare name, or a full origin such as https://name:8443, which
+    setup writes on a web port other than 443), for a .env that has no SERVER_NAME."""
+    first = ((value or "").strip().strip("'\"").split(",")[0]).strip()
+    if "://" in first:
+        first = first.split("://", 1)[1]
+    first = first.split("/", 1)[0]
+    return first.split(":", 1)[0] if first.count(":") == 1 else first
+
+
 def build_env_lines(cfg):
     """Build the .env content (list of lines) from a collected-config dict — deterministic + pure
     (it does NOT generate secrets; the caller passes them in). Values are single-quoted, matching
@@ -686,7 +696,11 @@ def build_env_lines(cfg):
     q("JWT_SECRET_KEY")
     q("VAULT_DB_PASSWORD")
     q("REDIS_PASSWORD")
-    bare("ALLOWED_HOSTS", "'%s'" % cfg["server_name"])
+    # The first entry is also the base of every emailed link (reset, invitation): on a web port other than 443 it
+    # is the full origin, whose host name the Host check reads (app/core/allowed_hosts.py).
+    _web_port = int(cfg.get("web_host_port") or 443)
+    bare("ALLOWED_HOSTS", "'%s'" % (cfg["server_name"] if _web_port == 443
+                                     else "https://%s:%d" % (cfg["server_name"], _web_port)))
     bare("SERVER_NAME", "'%s'" % cfg["server_name"])
     q("ADMIN_USERNAME")
     q("ADMIN_EMAIL")
@@ -1936,7 +1950,7 @@ def new_set_config(current_env, new_prefix, new_id):
     # set, and it is the only place it is ever printed).
     src_admin_pw = (current_env.get("ADMIN_PASSWORD") or "").strip()
     cfg = {
-        "server_name": current_env.get("SERVER_NAME") or current_env.get("ALLOWED_HOSTS") or "localhost",
+        "server_name": current_env.get("SERVER_NAME") or _allowed_hosts_name(current_env.get("ALLOWED_HOSTS")) or "localhost",
         "encryption_key": gen_fernet_key(), "jwt_secret_key": gen_hex(32),
         "vault_db_password": gen_hex(16), "redis_password": gen_hex(24),
         "admin_username": current_env.get("ADMIN_USERNAME") or "admin",
@@ -5164,7 +5178,7 @@ class DockVault:
             # bootstrapped deployment the seed is marker-guarded, so this is inert and the value is
             # dropped again after a healthy boot. Not passed -> the existing .env is left untouched.
             existing = self._apply_cli_admin_overrides(env_path, existing, args)
-            summary = {"server_name": existing.get("SERVER_NAME") or existing.get("ALLOWED_HOSTS") or "",
+            summary = {"server_name": existing.get("SERVER_NAME") or _allowed_hosts_name(existing.get("ALLOWED_HOSTS")) or "",
                        "admin_username": existing.get("ADMIN_USERNAME") or "admin",
                        "compose_profiles": migrated,
                        "run_sftp": (existing.get("RUN_SFTP") or "").strip() in ("1", "true", "yes", "on"),
@@ -5260,7 +5274,7 @@ class DockVault:
         env_now = self._load_env()
         generated_password = summary.get("admin_password")
         summary.update({
-            "server_name": env_now.get("SERVER_NAME") or env_now.get("ALLOWED_HOSTS") or "",
+            "server_name": env_now.get("SERVER_NAME") or _allowed_hosts_name(env_now.get("ALLOWED_HOSTS")) or "",
             "admin_username": env_now.get("ADMIN_USERNAME") or "admin",
             "compose_profiles": profiles,
             "run_sftp": (

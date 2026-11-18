@@ -761,11 +761,11 @@ app.add_middleware(ClientIPMiddleware)
 # operator declares the served name(s) — then a forged Host / X-Forwarded-Host is rejected (a
 # link-/cache-poisoning primitive). 'localhost'/'127.0.0.1' are always kept so the container's own
 # /health probe still passes. Added last => OUTERMOST, so a bad Host is rejected before other work.
-_allowed_hosts = [h.strip() for h in (getattr(settings, 'allowed_hosts', '') or '').split(',') if h.strip()]
+# Each entry's host name, without a scheme or a port (an entry may be a full origin, which is also the base of the
+# emailed links): app/core/allowed_hosts.py reads ALLOWED_HOSTS one way for both.
+from app.core.allowed_hosts import middleware_hosts as _middleware_hosts
+_allowed_hosts = _middleware_hosts(getattr(settings, 'allowed_hosts', '') or '')
 if _allowed_hosts:
-    for _h in ('localhost', '127.0.0.1'):
-        if _h not in _allowed_hosts:
-            _allowed_hosts.append(_h)
     from starlette.middleware.trustedhost import TrustedHostMiddleware
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
 

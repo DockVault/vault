@@ -458,21 +458,10 @@ def _brand_name(db: Session) -> str:
 
 
 def _vault_url() -> str:
-    """Best-effort public base URL for the ``{{vault.url}}`` token, derived from the first configured
-    ALLOWED_HOSTS entry. Empty when nothing usable is set (a wildcard or unset host) — the token then
-    renders empty rather than guessing. Never raises."""
-    try:
-        from app.core.config import settings
-        raw = (settings.allowed_hosts or "").strip()
-    except Exception:
-        return ""
-    for host in (h.strip() for h in raw.split(",")):
-        if not host or host in ("*", "0.0.0.0") or host.startswith("."):
-            continue
-        if host.startswith("http://") or host.startswith("https://"):
-            return host.rstrip("/")
-        return f"https://{host}".rstrip("/")
-    return ""
+    """The public base URL for the ``{{vault.url}}`` token: the same address every emailed link is built on
+    (email_actions.vault_url). Empty when none is configured; the token then renders empty rather than guessing."""
+    from app.core.email_actions import vault_url
+    return vault_url()
 
 
 def _template_action_map(db: Session) -> dict:

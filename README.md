@@ -48,7 +48,7 @@ different address or port — through NAT or port forwarding — set `SFTP_PUBLI
 Everything is driven by **`dockvault.py`** — an interactive management tool at the repo root
 (stdlib-only; needs **Python 3** on the host). **`python dockvault.py setup` is the supported way to
 install**: it sets the safe defaults a hand-written `.env` can miss, `ALLOWED_HOSTS` among them (your
-server's name, on which every emailed link is built). Run it with no arguments for the full menu -- Setup;
+server's name, or its full origin on a web port other than 443: every emailed link is built on it). Run it with no arguments for the full menu -- Setup;
 Start, Stop, Down and Restart; Status; Lock, Unlock and Change passphrase (seal `.env` at rest);
 Backup & Restore; Volumes; Limits; Reset; Update; Logs -- or go straight to setup:
 
@@ -118,7 +118,7 @@ If you'd rather manage `.env` and TLS yourself, provide `./.env` (start from `.e
 `./certs/{cert.pem,key.pem}`, then start the production stack straight from the repo root. Set
 `ALLOWED_HOSTS` to the name people reach the vault by: emailed links (a password reset, an invitation, the
 links in notices) are built on it and never on a request's `Host` header, so without it no reset or
-invitation email is sent (an administrator copies invitation and reset links instead).
+invitation email is sent (an administrator copies invitation and reset links instead). The first entry that is not a wildcard is the base of every emailed link: a bare name means `https://name`, so on another port, or over plain http, write that entry as the full origin (`https://name:8443`); the Host check reads each entry's host name without its scheme or port, and a wildcard is never the link base.
 
 ```bash
 cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD,
@@ -834,7 +834,7 @@ them, but a README-only reader can miss them (the off-host key backup is always 
   internal network. Set `REDIS_PASSWORD` for defense-in-depth.
 - **Set `ALLOWED_HOSTS`** to the name people reach the vault by. It rejects a forged `Host` header, and every
   emailed link (a password reset, an invitation, the links in notices) is built on it: without it, self-service
-  password reset sends nothing and invitations are not emailed.
+  password reset sends nothing and invitations are not emailed. The first entry that is not a wildcard is the base of every emailed link: a bare name means `https://name`, so on another port, or over plain http, write that entry as the full origin (`https://name:8443`); the Host check reads each entry's host name without its scheme or port, and a wildcard is never the link base.
 - **Behind a reverse proxy, name it in `TRUSTED_PROXIES`** so the audit log and the sign-in limits see real
   client addresses: a proxy container's address, or `gateway` for a proxy on the same host together with
   `WEB_BIND=127.0.0.1` (the port published on loopback only). A range never trusts the Docker gateway, which
