@@ -66,9 +66,11 @@ def test_a_structured_403_never_signs_out_for_a_word_in_its_message(word):
     assert out["shown"] == [message]
 
 
-def test_the_plain_account_sentence_still_signs_the_session_out():
-    out = _refused(403, {"detail": "User account is inactive"})
-    assert out["settled"] == "rejected" and out["message"] == "User account is inactive", out
+@pytest.mark.parametrize("sentence", ["User account is inactive", "User account is locked",
+                                      "Session has been terminated by an administrator"])
+def test_the_plain_account_sentence_still_signs_the_session_out(sentence):
+    out = _refused(403, {"detail": sentence})
+    assert out["settled"] == "rejected" and out["message"] == sentence, out
     assert out["signed_out"] == 1 and out["shown"] == []
 
 
@@ -98,3 +100,20 @@ def test_a_401_with_any_other_structured_detail_ends_the_session_as_a_401_does_a
     assert out["settled"] == "rejected" and out["kind"] == "Error", out
     assert out["message"] == "Session expired. Please log in again."
     assert out["signed_out"] == 1 and out["held"] is False
+
+
+def test_a_404_with_a_structured_detail_is_its_sentence_with_its_reason():
+    """A route's own refusal answered 404 (a sign-in method that is turned off) names its reason inside the detail:
+    the person reads its sentence, and a caller can tell it from a route the server does not have."""
+    message = "This sign-in method is not available."
+    out = _refused(404, {"detail": {"reason": "provider_disabled", "message": message}})
+    assert out["settled"] == "rejected" and out["kind"] == "Error", out
+    assert out["message"] == message and out["reason"] == "provider_disabled" and out["status"] == 404
+    assert out["signed_out"] == 0 and out["held"] is True
+    # A plain 404 is as before: its sentence, no reason; with no detail the page's own words.
+    plain = _refused(404, {"detail": "Not Found"})
+    assert plain["message"] == "Not Found" and plain["reason"] is None and plain["status"] == 404
+    bare = _refused(404, {})
+    assert bare["message"] == "Resource not found" and bare["reason"] is None and bare["status"] == 404
+    beside = _refused(404, {"detail": "No such vault", "reason": "gone"})
+    assert beside["message"] == "No such vault" and beside["reason"] == "gone"

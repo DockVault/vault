@@ -977,12 +977,14 @@ async function _apiRequestNow(endpoint, options = {}) {
         
         // Handle 404 Not Found - provide context
         if (response.status === 404) {
-            const errorDetail = data?.detail || 'Resource not found';
+            const errorDetail = refusalText || 'Resource not found';
             // Its status and reason, like every other refusal: a caller tells a route this server
             // does not have (a plain 404, no reason) from a refusal of its own (see zkKeyProofChallenge).
             const err = new Error(errorDetail);
             err.status = 404;
             err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
+            // A structured refusal carries its reason inside the detail.
+            if (err.reason === undefined && refusalReason !== undefined) err.reason = refusalReason;
 
             // Check for specific scenarios
             if (endpoint.includes('/files') && errorDetail.includes('Folder')) {
