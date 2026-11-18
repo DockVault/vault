@@ -65,6 +65,7 @@ from app.services.vault_service import (
     FolderNotFoundError,
     PasswordRequiredError,
     InvalidPasswordError,
+    RateLimitExceededError,
     require_file_scope,
     require_folder_scope,
     require_item_scope,
@@ -1649,7 +1650,9 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
                 # password, through the same function the web path uses. Opens the blob and reads
                 # its framing; it does not read the file.
                 reader = vault_service.open_random_reader(f.id, user)
-            except (PermissionDeniedError, PasswordRequiredError, InvalidPasswordError):
+            except (PermissionDeniedError, PasswordRequiredError, InvalidPasswordError, RateLimitExceededError):
+                # A file at its password limit (from web guesses; SFTP never passes a file password) is denied
+                # as a missing password is, not logged as a failed download.
                 return paramiko.SFTP_PERMISSION_DENIED
             except VaultFileNotFoundError:
                 return paramiko.SFTP_NO_SUCH_FILE
