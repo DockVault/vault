@@ -1009,5 +1009,10 @@ def skip_without_a_public_address(admin):
     request's Host header, so a stack without one emails no reset or invitation link, and an administrator's
     "email a reset link" is refused. A test that needs such an email skips there, saying so; a stack brought up
     for email tests sets ALLOWED_HOSTS."""
-    if admin.get("/settings").json().get("public_address_configured") is False:
+    if not public_address_configured(admin):
         pytest.skip("this stack has no public address (ALLOWED_HOSTS), so it emails no reset or invitation link")
+
+
+def public_address_configured(admin) -> bool:
+    """Whether the stack has a public address (ALLOWED_HOSTS), on which every emailed link is built."""
+    return admin.get("/settings").json().get("public_address_configured") is not False

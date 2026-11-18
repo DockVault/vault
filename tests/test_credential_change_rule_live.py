@@ -31,7 +31,7 @@ import uuid
 
 import pytest
 
-from conftest import skip_without_a_public_address, ApiClient, BASE_URL, unique
+from conftest import public_address_configured, ApiClient, BASE_URL, unique
 from _account_change_helpers import (in_api_container, mail_sink, make_independent, notifications, own_password,
                                      psql, second_admin, signed_in)
 from _sf_helpers import enroll_totp
@@ -138,8 +138,14 @@ def test_a_second_change_of_every_kind_is_held_and_changes_nothing(admin, temp_u
 
 @pytest.mark.parametrize("first", sorted(MAKERS))
 def test_every_kind_opens_the_window(admin, temp_user, other_admin, third_admin, mail, first):
-    if first == "send_reset_link":
-        skip_without_a_public_address(admin)     # refused there, so it opens nothing
+    if first == "send_reset_link" and not public_address_configured(admin):
+        # No public address to build the link on: refused, so it opens no window, and a change by another
+        # administrator after it is made at once.
+        r = MAKERS[first](other_admin[1], temp_user)
+        assert r.status_code == 400 and "ALLOWED_HOSTS" in r.json()["detail"], r.text
+        assert MAKERS["ssh_key"](third_admin[1], temp_user).status_code == 200
+        assert [q for q in _requests(admin) if q["target_user_id"] == temp_user["id"]] == []
+        return
     if first == "second_factor":
         enroll_totp(temp_user, signed_in(temp_user))
     r = MAKERS[first](other_admin[1], temp_user)

@@ -15,7 +15,7 @@ import struct
 
 import pytest
 
-from conftest import skip_without_a_public_address, unique
+from conftest import public_address_configured, unique
 from _account_change_helpers import MAILPIT_URL, mail_sink, mail_to, psql, signed_in
 from _sf_helpers import enroll_totp
 
@@ -89,8 +89,12 @@ CHANGES = {
 @pytest.mark.parametrize("change", sorted(CHANGES))
 def test_the_user_is_told_in_the_app(admin, temp_user, mail, change):
     make, title, words = CHANGES[change]
-    if change == "emailed reset link":
-        skip_without_a_public_address(admin)     # refused there: nothing is made, nobody is told
+    if change == "emailed reset link" and not public_address_configured(admin):
+        # No public address to build the link on: refused, nothing made, nobody told.
+        r = make(admin, temp_user)
+        assert r.status_code == 400 and "ALLOWED_HOSTS" in r.json()["detail"], r.text
+        assert title not in [t for t, _b in _notices(temp_user["id"])]
+        return
     if change == "second factor":
         enroll_totp(temp_user, signed_in(temp_user))
     r = make(admin, temp_user)

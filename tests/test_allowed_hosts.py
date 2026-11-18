@@ -107,3 +107,15 @@ def test_setup_writes_the_origin_on_a_web_port_other_than_443(monkeypatch, port,
     assert ah.link_base(env["ALLOWED_HOSTS"]) == ("https://vault.example.com" if port == 443
                                                   else "https://vault.example.com:8443")
     assert dv._allowed_hosts_name(env["ALLOWED_HOSTS"]) == "vault.example.com"
+
+
+def test_ci_sets_the_public_address_to_the_tests_base_url_in_both_stacks():
+    """CI's two stacks set ALLOWED_HOSTS alike; its link base is the tests' base URL, so emailed links in CI point
+    where the tests reach the stack."""
+    import re
+    workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    values = re.findall(r'echo "ALLOWED_HOSTS=([^"]*)"', workflow)
+    assert len(values) == 2 and values[0] == values[1], values
+    base_url = re.search(r"--base-url=(\S+)", (ROOT / "pytest.ini").read_text(encoding="utf-8")).group(1)
+    assert ah.link_base(values[0]) == base_url.rstrip("/")
+    assert "vault-api" in ah.middleware_hosts(values[0])

@@ -169,6 +169,9 @@ jobs:
             echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
             echo "API_USE_HTTPS=false"
             echo "ENVIRONMENT=development"
+            # The public address: every emailed link is built on its first entry (the tests' base URL), and the
+            # Host check admits it, the SFTP container's sign-ins at vault-api, and localhost/127.0.0.1.
+            echo "ALLOWED_HOSTS=http://localhost:8200,vault-api"
             echo "JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240"
             echo "RATE_LIMIT_LOGIN_ATTEMPTS=2000"
             echo "RATE_LIMIT_VAULT_ATTEMPTS=2000"
@@ -428,6 +431,9 @@ jobs:
             echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
             echo "API_USE_HTTPS=false"
             echo "ENVIRONMENT=development"
+            # The public address: every emailed link is built on its first entry (the tests' base URL), and the
+            # Host check admits it, the SFTP container's sign-ins at vault-api, and localhost/127.0.0.1.
+            echo "ALLOWED_HOSTS=http://localhost:8200,vault-api"
             echo "JWT_ACCESS_TOKEN_EXPIRE_MINUTES=240"
             echo "RATE_LIMIT_LOGIN_ATTEMPTS=2000"
             echo "RATE_LIMIT_VAULT_ATTEMPTS=2000"
