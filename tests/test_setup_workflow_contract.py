@@ -202,3 +202,14 @@ def test_the_unpublished_version_scenario_runs_setup_again_until_it_read_the_rel
         group = after[after.index(error):]
         group = group[:group.index("}")]
         assert group.rstrip().endswith("exit 1;"), group
+    # And each is decided by its own grep, written right before it: the sentence setup prints, and the image key
+    # setup writes (taken from dockvault.py, so a renamed key cannot leave the check matching nothing).
+    import re
+    key = re.search(r'bare\("([A-Z_]+)", cfg\["dockvault_image"\]\)',
+                    (_ROOT / "dockvault.py").read_text(encoding="utf-8")).group(1)
+    judged = re.sub(r"\s+", " ", after.replace("\\\n", " "))     # the shell's line continuations folded
+    for grep, error in (('grep -qi "not published" /tmp/setup-unpublished.log || {',
+                         "::error::setup did not report the unpublished version"),
+                        (f"grep -q '^{key}=' .env && {{", "::error::setup pinned an image that was never published")):
+        assert judged.count(grep) == 1, grep
+        assert judged.index(grep) + len(grep) == judged.index(f'echo "{error}"') - 1, (grep, error)

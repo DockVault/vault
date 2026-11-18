@@ -684,12 +684,14 @@ def test_the_cache_store_reads_back_what_it_wrote_and_fails_open(monkeypatch, cl
     class _Redis:
         def __init__(self):
             self.values = {}
+            self.expiries = {}
 
         def get(self, key):
             return self.values.get(key)
 
         def set(self, key, value, ex=None):
             self.values[key] = value
+            self.expiries[key] = ex
 
     fake = _Redis()
     monkeypatch.setattr(database, "redis_client", fake)
@@ -698,6 +700,8 @@ def test_the_cache_store_reads_back_what_it_wrote_and_fails_open(monkeypatch, cl
     assert store.get("k") is None
     store.set("k", {"n": 2}, 60)
     assert store.get("k") == {"n": 2}
+    # The copy in the cache lapses with the count it holds (an address and a name's stand-in), never kept.
+    assert fake.expiries == {"k": 60}
     fake.values["k"] = "not json"
     assert store.get("k") is None
 

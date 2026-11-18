@@ -509,11 +509,21 @@ def test_every_public_route_budget_answers_503_while_the_limiter_cannot_count(mo
     from app.core import rate_limiter as RL
 
     def _cannot_count(*a, **kw):
+        # As the real limiter does: a budget that fails open lets the request through while it cannot count.
+        if kw.get("fail_open", True):
+            return True, 0, 0
         raise RL.RateLimiterUnavailable("down")
 
     monkeypatch.setattr(RL.rate_limiter, "check_rate_limit", _cannot_count)
     routes = _routes()
-    assert len(routes) == 13, "every public route with a fail-closed budget (grep fail_open=False in app/)"
+    # The table is every route of the server with a fail-closed budget, but the signed-in user search's
+    # (download_public_link's sits in the helper it calls).
+    tree = ast.parse((ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8"))
+    closed = {fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and any(isinstance(k, ast.keyword) and k.arg == "fail_open" and getattr(k.value, "value", None) is False
+                      for k in ast.walk(fn))}
+    closed = {"download_public_link" if name == "_serve_public_link_download" else name for name in closed}
+    assert closed - {"search_users"} == {fn.__name__ for fn, _k, _p in routes}, sorted(closed)
     for fn, kwargs, _prefixes in routes:
         with pytest.raises(HTTPException) as refused:
             run_coroutine(fn(request=_request(PLAIN), db=None, **kwargs))

@@ -270,6 +270,11 @@ def test_every_socket_asks_after_its_own_session_and_closes_on_the_answer():
     assert len(answers) == 1 and ast.unparse(answers[0].targets[0]) == "revoked"
     closes = [n for n in ast.walk(send_events) if isinstance(n, ast.If) and ast.unparse(n.test) == "revoked"]
     assert len(closes) == 1 and isinstance(closes[0].body[-1], ast.Break), [ast.unparse(n) for n in closes]
+    # The answer is acted on as given: the close is the very next statement, so nothing can rebind it between.
+    block = next(stmts for n in ast.walk(send_events) for field in ("body", "orelse", "finalbody")
+                 for stmts in [getattr(n, field, None)] if isinstance(stmts, list) and answers[0] in stmts)
+    i = block.index(answers[0])
+    assert i + 1 < len(block) and block[i + 1] is closes[0], ast.unparse(block[i + 1]) if i + 1 < len(block) else ""
 
 
 def test_the_timed_check_restarts_its_clock_each_time():
