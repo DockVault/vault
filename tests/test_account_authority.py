@@ -127,6 +127,8 @@ def made(monkeypatch):
     calls = []
     monkeypatch.setattr(api, "_enforce_step_up", lambda *a, **k: None)
     monkeypatch.setattr(api, "_smtp_configured", lambda db: True)
+    # An emailed link needs the public address, which the route checks before anything is made.
+    monkeypatch.setattr(api, "_public_base_url", lambda: "https://vault.example.com")
     monkeypatch.setattr(api, "_notify_credential_change", lambda *a, **k: None)
     from app.core import password_reset
     monkeypatch.setattr(password_reset, "pepper_ok", lambda pepper: True)
