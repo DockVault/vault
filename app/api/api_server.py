@@ -761,8 +761,9 @@ app.add_middleware(ClientIPMiddleware)
 # operator declares the served name(s) — then a forged Host / X-Forwarded-Host is rejected (a
 # link-/cache-poisoning primitive). 'localhost'/'127.0.0.1' are always kept so the container's own
 # /health probe still passes. Added last => OUTERMOST, so a bad Host is rejected before other work.
-# Each entry's host name, without a scheme or a port (an entry may be a full origin, which is also the base of the
-# emailed links): app/core/allowed_hosts.py reads ALLOWED_HOSTS one way for both.
+# Each entry's host name, in lower case, without a scheme, a port or a path (an entry may be a full origin, which is
+# also the base of the emailed links): app/core/allowed_hosts.py reads ALLOWED_HOSTS one way for both. An entry with
+# no host name that can be read has already stopped the start (config._validate_runtime_settings).
 from app.core.allowed_hosts import middleware_hosts as _middleware_hosts
 _allowed_hosts = _middleware_hosts(getattr(settings, 'allowed_hosts', '') or '')
 if _allowed_hosts:
