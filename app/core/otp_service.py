@@ -199,9 +199,11 @@ def _redis_consume_verify(redis, purpose, user_id, presented_hash, cand) -> OtpR
         attempts = cand["max_attempts"]            # if we can't count, fail closed by invalidating
     # A strike read before a right guess (or the last strike) deleted the code makes HINCRBY create the key again,
     # holding the count alone and no expiry. It gets the code's own remaining life, so it lapses as the code would.
+    # Only a key with no expiry gets one (nx): a live code keeps its own, and a strike read before the code was
+    # issued again never shortens the new code's.
     try:
         redis_guard.timed_redis("otp._redis_consume_verify", lambda: redis.expire(
-            key, max(1, cand["expires_at"] - int(time.time())) + _REDIS_GRACE_SECONDS))
+            key, max(1, cand["expires_at"] - int(time.time())) + _REDIS_GRACE_SECONDS, nx=True))
     except Exception:
         pass
     if attempts >= cand["max_attempts"]:

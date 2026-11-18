@@ -6,6 +6,7 @@ user), (purpose, user, destination) binding, single-use, 3-strike lockout, expir
 the Redis-primary / DB-fallback orchestration (including a code issued during a Redis outage that
 verifies once Redis returns).
 """
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -34,7 +35,7 @@ class FakeRedis:
     def hset(self, k, mapping=None):
         self._guard(); self.h.setdefault(k, {}).update({kk: str(vv) for kk, vv in (mapping or {}).items()})
 
-    def expire(self, k, ttl):
+    def expire(self, k, ttl, nx=False):
         self._guard()
 
     def hgetall(self, k):
@@ -243,9 +244,11 @@ class _ExpiringRedis(FakeRedis):
         super().__init__()
         self.ttl = {}
 
-    def expire(self, k, ttl):
+    def expire(self, k, ttl, nx=False):
+        """As Redis: with nx, a key that already has an expiry keeps it."""
         self._guard()
-        self.ttl[k] = ttl
+        if not (nx and k in self.ttl):
+            self.ttl[k] = ttl
 
     def delete(self, k):
         self.ttl.pop(k, None)
@@ -263,7 +266,24 @@ def test_a_strike_that_lands_after_the_code_is_gone_leaves_a_key_that_expires():
     assert key not in r.h and key not in r.ttl
     wrong = o._redis_consume_verify(r, "email_change", "u8", o.hash_code("bad", PEP), stale)
     assert wrong.reason == "invalid" and r.h[key] == {"attempts": "1"}
-    assert 0 < r.ttl.get(key, 0) <= 5 * 60 + o._REDIS_GRACE_SECONDS, r.ttl
+    # Exactly the code's own remaining life plus the grace, as the code's key had.
+    expected = stale["expires_at"] - int(time.time()) + o._REDIS_GRACE_SECONDS
+    assert abs(r.ttl.get(key, 0) - expected) <= 1, (r.ttl, expected)
+
+
+def test_a_wrong_guess_on_a_live_code_leaves_its_expiry_and_never_shortens_a_code_issued_again():
+    r, db = _ExpiringRedis(), FakeDB()
+    key = o.redis_key("email_change", "u9")
+    o.issue(db, purpose="email_change", user_id="u9", destination="d", ttl_minutes=1, pepper=PEP, redis=r)
+    stale = o._redis_load(r, "email_change", "u9")           # a guess that read the first code
+    o.issue(db, purpose="email_change", user_id="u9", destination="d", ttl_minutes=5, pepper=PEP, redis=r)
+    issued_again = r.ttl[key]
+    assert abs(issued_again - (5 * 60 + o._REDIS_GRACE_SECONDS)) <= 1, issued_again
+    assert o._redis_consume_verify(r, "email_change", "u9", o.hash_code("bad", PEP), stale).reason == "invalid"
+    assert r.ttl[key] == issued_again, "a strike read before the code was issued again shortened it"
+    fresh = o._redis_load(r, "email_change", "u9")
+    assert o._redis_consume_verify(r, "email_change", "u9", o.hash_code("bad2", PEP), fresh).reason == "invalid"
+    assert r.ttl[key] == issued_again, "a wrong guess changed a live code's expiry"
 
 
 # ---- DB fallback path (Redis down at issue) ------------------------------------------------------
@@ -325,7 +345,7 @@ def test_partial_redis_write_does_not_leave_a_dual_store_code():
     # FIX-2: if the Redis write can't complete, issue falls back to the DB and must NOT also leave the
     # code in Redis (which would allow a second redemption via the DB after the Redis one is consumed).
     class HalfRedis(FakeRedis):
-        def expire(self, k, ttl):
+        def expire(self, k, ttl, nx=False):
             raise RuntimeError("dropped right after HSET")
     r, db = HalfRedis(), FakeDB()
     code = o.issue(db, purpose="email_change", user_id="p1", destination="d", ttl_minutes=5, pepper=PEP, redis=r)

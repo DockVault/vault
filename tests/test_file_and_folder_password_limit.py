@@ -41,12 +41,14 @@ class _Counter:
     def __init__(self):
         self.counts = {}
         self.asked = []
+        self.burned = []
 
     def over_limit(self, key, limit, window):
         self.asked.append((key, limit, window))
         return self.counts.get(key, 0) >= limit
 
     def burn(self, key, window):
+        self.burned.append((key, window))
         self.counts[key] = self.counts.get(key, 0) + 1
 
     def window_ends(self):
@@ -118,6 +120,9 @@ def test_wrong_passwords_reach_the_limit_and_then_even_the_right_one_is_refused_
     key = f"rate_limit:{kind}:{item.id}:{user.id}"
     assert counter.counts == {key: LIMIT}, "only the wrong passwords count; a refused attempt does not"
     assert counter.asked[-1] == (key, LIMIT, WINDOW), "the vault password's limit and window"
+    # Each wrong password is counted over the vault password's window (a shorter one would let guesses spaced
+    # just past it go on without end).
+    assert counter.burned == [(key, WINDOW)] * LIMIT, counter.burned
     counter.window_ends()
     assert _open(kind, svc, item, user, RIGHT) is item
 
