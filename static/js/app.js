@@ -3035,7 +3035,28 @@ const SIGNED_OUT_REASONS = {
     told: 'Signed out in another tab.',
     inactive: 'User account is inactive',
     locked: 'User account is locked',
+    // What a refused renewal says when a rule of the sign-in is no longer met (app/services/sign_in.py).
+    administrator_password: 'Administrators sign in with their password. Sign in again.',
+    passkey_alone: 'A passkey alone no longer signs you in. Sign in again with your password.',
+    passkey_required: 'Your role must hold a passkey now. Sign in again: you will be asked to add one.',
+    // And when the sign-in came through an identity provider that no longer vouches for it. The server names the
+    // provider; a code names nothing, so the sentence a code stands for says "your identity provider" (the shapes
+    // below).
+    provider_unlinked: 'Your account is no longer linked to the identity provider this sign-in came through. Sign in again.',
+    provider_again: 'Sign in through your identity provider again to stay signed in.',
+    provider_off: 'Signing in through your identity provider is turned off. Sign in again another way, or ask an administrator.',
+    provider_only: 'Your organisation signs this account in through its own sign-in. Use it on the sign-in page.',
+    provider_only_unavailable: 'Your organisation signs this account in through its own sign-in, which is not available on this vault right now. Ask your administrator.',
 };
+
+// The sentences the server words with a provider's name, told by their shape. The reason kept in the tab's storage
+// is the server's own sentence, name and all; the tab's name carries a code only, and the code's sentence above
+// names no provider.
+const SIGNED_OUT_SHAPES = [
+    ['provider_again', /^Sign in through .{1,300} again to stay signed in\.$/],
+    ['provider_off', /^Signing in through .{1,300} is turned off\. Sign in again another way, or ask an administrator\.$/],
+    ['provider_only', /^Your organisation signs this account in through .{1,600}\.$/],
+];
 
 // The app's own sentences with their codes: these, and the stay-or-sign-out warning's (static/js/session-watch.js:
 // a session that ran out).
@@ -3046,6 +3067,9 @@ function _knownReasons() {
 
 function _reasonCode(reason) {
     for (const [code, said] of Object.entries(_knownReasons())) if (said === reason) return code;
+    if (typeof reason === 'string') {
+        for (const [code, shape] of SIGNED_OUT_SHAPES) if (shape.test(reason)) return code;
+    }
     return '';
 }
 
