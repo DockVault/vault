@@ -67,7 +67,15 @@ def test_each_trust_setting_resolves_to_what_the_vault_is_started_with(addr):
     assert pm.trusted_value(configs["all"], addr) == "" and configs["all"].trust_all
     assert pm.trusted_value(configs["subnet"], addr) == _SUBNET
     assert pm.trusted_value(configs["gateway"], addr) == "gateway"
+    assert pm.trusted_value(configs["public"], addr) == "127.0.0.1"
     assert [c.key for c in pm.CONFIGS if c.publish] == ["subnet", "gateway"]
+    # Only the public-address setting sets ALLOWED_HOSTS: the public address first, then the names the matrix's own
+    # requests reach the API by, so the Host check admits them.
+    assert {c.key: c.allowed_hosts.format(**addr) for c in pm.CONFIGS if c.allowed_hosts} == {
+        "public": pm.PUBLIC_ADDRESS + f",{addr['api']},{addr['nginx']}"}
+    # ... and the API is started with it (empty for every other setting: no Host check, no public address).
+    import inspect
+    assert '"ALLOWED_HOSTS": config.allowed_hosts.format(**self.addr),' in inspect.getsource(pm.Matrix.start_api)
 
 
 def test_every_check_resolves_to_a_concrete_url_and_expectation(addr):
@@ -89,9 +97,13 @@ def test_every_check_resolves_to_a_concrete_url_and_expectation(addr):
         expect = pm.expected_value(check, addr)
         if check.probe == "address":
             ipaddress.ip_address(expect)
-        elif check.probe == "scheme":
-            assert expect in ("http", "https")
-            assert check.via in ("direct", "local-tls", "nginx-tls")
+        elif check.probe == "link":
+            # No public address: a relative link. One set: it, as the first entry of ALLOWED_HOSTS.
+            config = next(c for c in pm.CONFIGS if c.key == check.config)
+            assert expect == (config.allowed_hosts.split(",")[0] if config.allowed_hosts else pm.RELATIVE)
+            # Through a set-up whose Host the check admits: the API's own address, directly or by the proxy on
+            # 127.0.0.1, or nginx's.
+            assert check.via in ("direct", "local-tls", "local-append", "nginx-tls")
         elif check.probe == "log":
             assert expect == "warned" and check.config == "subnet"
         elif check.probe == "key-proof":
@@ -124,11 +136,17 @@ def test_the_table_holds_the_set_ups_that_have_mattered():
     assert table[("all", "edge", "address", None)] == "edge"
     assert table[("subnet", "edge", "address", None)] == "client"
     assert table[("subnet", "edge", "address", pm.FORGED)] == "forged"
-    assert table[("none", "local-tls", "scheme", None)] == "http"
-    assert table[("loopback", "local-tls", "scheme", None)] == "https"
-    assert table[("proxies", "nginx-tls", "scheme", None)] == "https"
+    # A link follows no request: with no public address it is relative, whatever proxy and scheme it came
+    # through; with one it starts with that address, whatever X-Forwarded-Proto says, believed or not.
+    assert table[("none", "local-tls", "link", None)] == pm.RELATIVE
+    assert table[("loopback", "local-tls", "link", None)] == pm.RELATIVE
+    assert table[("proxies", "nginx-tls", "link", None)] == pm.RELATIVE
+    assert table[("public", "local-tls", "link", None)] == pm.PUBLIC_ADDRESS
+    assert table[("public", "local-append", "link", None)] == pm.PUBLIC_ADDRESS
+    assert pm.PUBLIC_ADDRESS.startswith("https://")
     forged_proto = [c for c in pm.CHECKS if c.xfp]
-    assert [(c.config, c.via, c.expect) for c in forged_proto] == [("none", "direct", "http")]
+    assert [(c.config, c.via, c.xfp, c.expect) for c in forged_proto] == [
+        ("none", "direct", "https", pm.RELATIVE), ("public", "direct", "http", pm.PUBLIC_ADDRESS)]
     assert [c.config for c in pm.CHECKS if c.probe == "budget"] == ["none"]
 
 
@@ -217,18 +235,20 @@ def test_unusable_probe_output_is_a_harness_error(out, message):
         pm.parse_client_output(out)
 
 
-@pytest.mark.parametrize("body, scheme", [
-    ('{"reset_link": "https://vault.test/?reset=abc"}', "https"),
-    ('{"reset_link": "http://10.0.0.2:8000/?reset=abc"}', "http"),
+@pytest.mark.parametrize("body, base", [
+    ('{"reset_link": "https://vault.test/?reset=abc"}', "https://vault.test"),
+    ('{"reset_link": "http://10.0.0.2:8000/?reset=abc"}', "http://10.0.0.2:8000"),
+    ('{"reset_link": "/?reset=abc"}', "relative"),
 ])
-def test_the_scheme_is_read_from_the_reset_link(body, scheme):
-    assert pm.link_scheme(body) == scheme
+def test_what_the_reset_link_is_built_on_is_read_from_it(body, base):
+    assert pm.link_base(body) == base
 
 
-def test_a_response_without_a_link_is_described_not_mistaken_for_a_scheme():
-    assert pm.link_scheme("<html>").startswith("(not JSON")
-    assert pm.link_scheme('{"detail": "x"}').startswith("(no link")
-    assert pm.link_scheme('{"reset_link": 5}').startswith("(no link")
+def test_a_response_without_a_link_is_described_not_mistaken_for_a_base():
+    assert pm.link_base("<html>").startswith("(not JSON")
+    assert pm.link_base('{"detail": "x"}').startswith("(no link")
+    assert pm.link_base('{"reset_link": 5}').startswith("(no link")
+    assert pm.link_base('{"reset_link": "https://vault.test/other"}').startswith("(no link")
 
 
 # --- cleanup only ever touches its own ---------------------------------------------------------------
@@ -586,7 +606,7 @@ def test_an_unusable_key_proof_outcome_is_a_harness_error(out, message):
 
 # --- the run itself, with the probes stubbed --------------------------------------------------------------
 
-PROBE_METHODS = {"address": "probe_address", "scheme": "probe_scheme", "budget": "probe_budget",
+PROBE_METHODS = {"address": "probe_address", "link": "probe_link", "budget": "probe_budget",
                  "log": "probe_log", "key-proof": "probe_key_proof"}
 
 

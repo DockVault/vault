@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a vault image behind real reverse proxies and check the client address and scheme it records.
+"""Run a vault image behind real reverse proxies and check the client address it records and its links.
 
 Unit tests prove the address parser on strings; this proves it on the wire. It starts one private
 Docker network and puts on it: the vault API, its Postgres and Redis, nginx (plain and TLS), a second
@@ -9,13 +9,15 @@ namespace (it connects from 127.0.0.1). Clients are containers at fixed addresse
 an attacker, and an operator that signs in as the administrator.
 
 Each address check is a failed sign-in under a new, unique name, sent through one proxy set-up; the
-address the vault stored for it is read back from the audit log. Each scheme check mints a
-password-reset link through a TLS proxy and reads the scheme the link was built with. Each key-proof
+address the vault stored for it is read back from the audit log. Each link check mints a
+password-reset link through one proxy set-up and reads what the link was built on: with no public
+address (ALLOWED_HOSTS) it is relative, and the page completes it from its own address; with one, it
+starts with that address whatever X-Forwarded-Proto says, never with what the request carried. Each key-proof
 check creates a zero-knowledge vault and rotates its key through one proxy, both requests carrying a
 key proof: the proof is a MAC over the exact request body and travels in the X-ZK-Key-Proof header,
 so it verifies only when the proxy passes both on unchanged. The API is restarted once per trust
 setting (nothing trusted, 127.0.0.1, the three proxies, trust all, the whole network, the gateway by
-name).
+name, and 127.0.0.1 with a public address set).
 
 Two trust settings also publish the API's port on the Docker host's loopback (IPv4, and IPv6 where the
 host allows it), as the shipped secure compose publishes it: connections Docker relays to a published
@@ -87,6 +89,11 @@ PROBE_PASSWORD = "not-the-password-1"
 KEY_PROOF_ACTION = "zero-knowledge vault created and its key rotated, each with a key proof"
 KEY_PROOF_PASSED = "proved"
 
+# The link checks: a link built on no address (the page completes it from its own address), and the public address
+# a deployment sets (ALLOWED_HOSTS), which every emailed and copied link starts with.
+RELATIVE = "relative"
+PUBLIC_ADDRESS = "https://vault.example.com"
+
 # Host numbers inside the test network. The API keeps .2 across restarts, so the proxies in front
 # of it never need reconfiguring.
 HOSTS = {
@@ -132,6 +139,7 @@ class Config:
     trusted: str          # TRUSTED_PROXIES, with {role} placeholders
     trust_all: bool = False
     publish: bool = False  # also publish the API on the Docker host's loopback (the gateway checks)
+    allowed_hosts: str = ""  # ALLOWED_HOSTS, with {role} placeholders: its first entry is the links' base
 
 
 CONFIGS = (
@@ -143,6 +151,10 @@ CONFIGS = (
            publish=True),
     Config("gateway", "TRUSTED_PROXIES=gateway, the port published on loopback only", "gateway",
            publish=True),
+    # The public address first; the names the matrix's own requests use (the API's and nginx's addresses) after
+    # it, so the Host check admits them.
+    Config("public", "TRUSTED_PROXIES=127.0.0.1, ALLOWED_HOSTS has a public address", "127.0.0.1",
+           allowed_hosts=PUBLIC_ADDRESS + ",{api},{nginx}"),
 )
 
 
@@ -151,11 +163,11 @@ class Check:
     config: str
     setup: str
     action: str
-    probe: str                        # "address" | "scheme" | "budget" | "log" | "key-proof"
+    probe: str                        # "address" | "link" | "budget" | "log" | "key-proof"
     via: str                          # a key of VIA
-    expect: str                       # a role ("client", "loopback", "forged", "edge", "gateway"), a
-                                      # scheme, "baseline" for the budget check, "warned" for a log
-                                      # check, or KEY_PROOF_PASSED
+    expect: str                       # a role ("client", "loopback", "forged", "edge", "gateway"), what a
+                                      # link is built on (RELATIVE or an origin), "baseline" for the
+                                      # budget check, "warned" for a log check, or KEY_PROOF_PASSED
     xff: Optional[str] = None         # X-Forwarded-For the client sends
     xfp: Optional[str] = None         # X-Forwarded-Proto the client sends
     note: str = ""
@@ -171,17 +183,17 @@ CHECKS = (
           "client sends junk in X-Forwarded-For", "address", "local-pass", "loopback", xff=JUNK),
     Check("none", "proxy on 127.0.0.1 that appends", "real client",
           "address", "local-append", "loopback"),
-    Check("none", "TLS proxy on 127.0.0.1", "reset link scheme",
-          "scheme", "local-tls", "http"),
-    Check("none", "no proxy", "client sends X-Forwarded-Proto: https, reset link scheme",
-          "scheme", "direct", "http", xfp="https"),
+    Check("none", "TLS proxy on 127.0.0.1", "reset link, no public address",
+          "link", "local-tls", RELATIVE),
+    Check("none", "no proxy", "client sends X-Forwarded-Proto: https, reset link, no public address",
+          "link", "direct", RELATIVE, xfp="https"),
     Check("none", "no proxy", f"another client signs in {LOGIN_LIMIT} times as the victim's address",
           "budget", "direct", "baseline",
           note="the victim keeps every sign-in it had without the attacker"),
     Check("loopback", "proxy on 127.0.0.1 that appends, listed",
           "client sends a forged X-Forwarded-For", "address", "local-append", "client", xff=FORGED),
-    Check("loopback", "TLS proxy on 127.0.0.1, listed", "reset link scheme",
-          "scheme", "local-tls", "https"),
+    Check("loopback", "TLS proxy on 127.0.0.1, listed", "reset link, no public address",
+          "link", "local-tls", RELATIVE),
     Check("proxies", "no proxy, while proxies are listed", "client sends a forged X-Forwarded-For",
           "address", "direct", "client", xff=FORGED),
     Check("proxies", "nginx that appends, listed", "client sends a forged X-Forwarded-For",
@@ -190,8 +202,8 @@ CHECKS = (
           "client sends a forged X-Forwarded-For", "address", "haproxy", "client", xff=FORGED),
     Check("proxies", "two nginx in a chain, both listed", "client sends a forged X-Forwarded-For",
           "address", "edge", "client", xff=FORGED),
-    Check("proxies", "TLS nginx on another host, listed", "reset link scheme",
-          "scheme", "nginx-tls", "https"),
+    Check("proxies", "TLS nginx on another host, listed", "reset link, no public address",
+          "link", "nginx-tls", RELATIVE),
     Check("proxies", "nginx that appends, listed", KEY_PROOF_ACTION,
           "key-proof", "nginx", KEY_PROOF_PASSED),
     Check("proxies", "TLS nginx on another host, listed", KEY_PROOF_ACTION,
@@ -231,6 +243,13 @@ CHECKS = (
           "client sends a forged X-Forwarded-For", "address", "relayed", "forged", xff=FORGED,
           note="documented: with the gateway named, a client on the host is believed as its proxy is; "
                "publish the port on loopback only"),
+    # With a public address the link starts with it, whatever X-Forwarded-Proto says, believed or not.
+    Check("public", "TLS proxy on 127.0.0.1, listed", "reset link (the proxy says https)",
+          "link", "local-tls", PUBLIC_ADDRESS),
+    Check("public", "proxy on 127.0.0.1 that appends, listed", "reset link (the proxy says http)",
+          "link", "local-append", PUBLIC_ADDRESS),
+    Check("public", "no proxy", "client sends X-Forwarded-Proto: http, reset link",
+          "link", "direct", PUBLIC_ADDRESS, xfp="http"),
 )
 
 # What the web process must say at start when a range covers the gateway (probe "log").
@@ -259,7 +278,7 @@ def url_for(check: Check, addr: dict[str, str]) -> str:
 
 
 def expected_value(check: Check, addr: dict[str, str]) -> str:
-    """The concrete value a check expects: an address for a role, or the scheme (or word) itself."""
+    """The concrete value a check expects: an address for a role, or the link base (or word) itself."""
     if check.probe == "address":
         return addr[check.expect]
     return check.expect
@@ -389,15 +408,18 @@ def parse_client_output(stdout: str) -> list[dict]:
     return data
 
 
-def link_scheme(body: str) -> str:
-    """The scheme of the reset link in a reset-link response, or a description of what came back."""
+def link_base(body: str) -> str:
+    """What the reset link in a reset-link response is built on: RELATIVE for a link on no address, else its
+    origin (scheme://host[:port]); or a description of what came back."""
     try:
         link = json.loads(body).get("reset_link", "")
     except (ValueError, AttributeError):
         return f"(not JSON: {body[:80]})"
-    if not isinstance(link, str) or "://" not in link:
+    if isinstance(link, str) and link.startswith("/?reset="):
+        return RELATIVE
+    if not isinstance(link, str) or "://" not in link or "/?reset=" not in link:
         return f"(no link: {str(link)[:60]})"
-    return link.split("://", 1)[0]
+    return link.split("/?reset=", 1)[0]
 
 
 def key_proof_outcome(stdout: str) -> str:
@@ -886,6 +908,7 @@ class Matrix:
             "RATE_LIMIT_LOGIN_ATTEMPTS": str(LOGIN_LIMIT), "RATE_LIMIT_LOGIN_WINDOW_SECONDS": "300",
             "TRUSTED_PROXIES": trusted_value(config, self.addr),
             "TRUST_ALL_PROXIES": "true" if config.trust_all else "false",
+            "ALLOWED_HOSTS": config.allowed_hosts.format(**self.addr),
         }
         args = [a for k, v in env.items() for a in ("-e", f"{k}={v}")]
         args += [a for k in ("ENCRYPTION_KEY", "JWT_SECRET_KEY", "LOG_TOKEN_PEPPER",
@@ -989,9 +1012,9 @@ class Matrix:
             raise HarnessError(f"the administrator could not sign in: {res['status']} {res['body'][:200]}")
         return json.loads(res["body"])["access_token"]
 
-    def probe_scheme(self, check: Check) -> str:
+    def probe_link(self, check: Check) -> str:
         """Mint a reset link through the check's set-up, for an account made for it alone (so no
-        account ever has a second credential change made to it), and return the link's scheme."""
+        account ever has a second credential change made to it), and return what it is built on."""
         token = self.admin_token()
         auth = {"Authorization": f"Bearer {token}"}
         name = "linkuser" + secrets.token_hex(5)
@@ -1009,7 +1032,7 @@ class Matrix:
                                         "body": {}, "headers": headers}])[0]
         if res["status"] != 200:
             return f"(status {res['status']}: {res['body'][:120]})"
-        return link_scheme(res["body"])
+        return link_base(res["body"])
 
     def probe_budget(self, check: Check) -> Result:
         """Sign in as the victim (under new names each time) until refused, first on its own and
@@ -1072,8 +1095,8 @@ class Matrix:
                                     skipped=True)
                 elif check.probe == "budget":
                     result = self.probe_budget(check)
-                elif check.probe == "scheme":
-                    result = judge(check, self.probe_scheme(check), self.addr)
+                elif check.probe == "link":
+                    result = judge(check, self.probe_link(check), self.addr)
                 elif check.probe == "log":
                     result = judge(check, self.probe_log(check), self.addr)
                 elif check.probe == "key-proof":

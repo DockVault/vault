@@ -1,7 +1,7 @@
 name: Proxy matrix
 
-# Runs the candidate image behind real reverse proxies and checks the client address and scheme it
-# records: nginx (plain and TLS), two nginx in a chain, HAProxy with `option forwardfor` (which adds
+# Runs the candidate image behind real reverse proxies and checks the client address it records and what
+# its reset links are built on: nginx (plain and TLS), two nginx in a chain, HAProxy with `option forwardfor` (which adds
 # its own X-Forwarded-For line), and an nginx inside the API's own network namespace (connecting from
 # 127.0.0.1), under each trust setting, with clients at fixed addresses on a private network, and
 # connections Docker relays through the network's gateway to a port published on loopback. The

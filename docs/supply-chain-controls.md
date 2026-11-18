@@ -71,8 +71,8 @@ The same runs, and every pull request, also run the proxy matrix
 (`.github/scripts/proxy_matrix.py`): the candidate image behind real nginx (plain and TLS), two nginx
 in a chain, HAProxy with `option forwardfor`, and an nginx inside the API's own network namespace,
 under each `TRUSTED_PROXIES` / `TRUST_ALL_PROXIES` setting, with clients at fixed addresses on a
-private Docker network. It checks the client address the audit log records, the scheme a reset link
-is built with, and that a client cannot spend another client's sign-in allowance by typing its
+private Docker network. It checks the client address the audit log records, that a reset link
+follows no request (relative with no public address, on `ALLOWED_HOSTS`'s address whatever `X-Forwarded-Proto` says), and that a client cannot spend another client's sign-in allowance by typing its
 address. With the API also published on the Docker host's loopback, it checks the connections Docker
 relays through the network's gateway (a client on the host, over IPv4 and IPv6, and an nginx on the
 host): a range that contains the gateway does not trust it, the token `gateway` does, and the web
