@@ -46,7 +46,9 @@ different address or port — through NAT or port forwarding — set `SFTP_PUBLI
 `SFTP_PUBLIC_PORT` (setup asks when you enable SFTP).
 
 Everything is driven by **`dockvault.py`** — an interactive management tool at the repo root
-(stdlib-only; needs **Python 3** on the host). Run it with no arguments for the full menu -- Setup;
+(stdlib-only; needs **Python 3** on the host). **`python dockvault.py setup` is the supported way to
+install**: it sets the safe defaults a hand-written `.env` can miss, `ALLOWED_HOSTS` among them (your
+server's name, on which every emailed link is built). Run it with no arguments for the full menu -- Setup;
 Start, Stop, Down and Restart; Status; Lock, Unlock and Change passphrase (seal `.env` at rest);
 Backup & Restore; Volumes; Limits; Reset; Update; Logs -- or go straight to setup:
 
@@ -113,7 +115,10 @@ and the shell keeps it in its history.
 ### Production without the script (advanced)
 
 If you'd rather manage `.env` and TLS yourself, provide `./.env` (start from `.env.example`) and
-`./certs/{cert.pem,key.pem}`, then start the production stack straight from the repo root:
+`./certs/{cert.pem,key.pem}`, then start the production stack straight from the repo root. Set
+`ALLOWED_HOSTS` to the name people reach the vault by: emailed links (a password reset, an invitation, the
+links in notices) are built on it and never on a request's `Host` header, so without it no reset or
+invitation email is sent (an administrator copies invitation and reset links instead).
 
 ```bash
 cp .env.example .env      # then edit it: set ENCRYPTION_KEY, JWT_SECRET_KEY, VAULT_DB_PASSWORD,
@@ -826,7 +831,10 @@ them, but a README-only reader can miss them (the off-host key backup is always 
   the request body as they are (no re-encoding of JSON bodies): changes to a zero-knowledge vault's keys carry a
   proof over the body's exact bytes, and are refused without it. Stock nginx and HAProxy do this by default.
 - **Restrict network exposure:** publish only the web/API (and SFTP if used) ports; keep Postgres/Redis on the
-  internal network. Set `REDIS_PASSWORD` and `ALLOWED_HOSTS` for defense-in-depth.
+  internal network. Set `REDIS_PASSWORD` for defense-in-depth.
+- **Set `ALLOWED_HOSTS`** to the name people reach the vault by. It rejects a forged `Host` header, and every
+  emailed link (a password reset, an invitation, the links in notices) is built on it: without it, self-service
+  password reset sends nothing and invitations are not emailed.
 - **Behind a reverse proxy, name it in `TRUSTED_PROXIES`** so the audit log and the sign-in limits see real
   client addresses: a proxy container's address, or `gateway` for a proxy on the same host together with
   `WEB_BIND=127.0.0.1` (the port published on loopback only). A range never trusts the Docker gateway, which

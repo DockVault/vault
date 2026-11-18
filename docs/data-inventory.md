@@ -318,7 +318,10 @@ files except to serve them, and cannot read zero-knowledge ones.
 ## Email
 
 Sent only when you configure SMTP. DockVault keeps no copy; what is sent stays in your mail system and
-the recipients' mailboxes.
+the recipients' mailboxes. **New in 0.35.1:** every link in an email is built on the server's configured
+public address (`ALLOWED_HOSTS`, which `python dockvault.py setup` sets) and never on a request's `Host`
+header. With none configured, no password reset or invitation email is sent, and a notice goes without its
+link.
 
 | Email | Sent to | Holds |
 |---|---|---|
