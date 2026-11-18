@@ -295,12 +295,24 @@ def test_a_forged_host_reaches_neither_an_invitation_nor_a_reset_link(admin, inv
     """A request's Host header is whatever its sender wrote, and no link is built on it. With no public address
     configured (ALLOWED_HOSTS empty, as on a test stack) an invitation's link and an administrator's reset link come
     back relative, for the page to complete from its own address, and the invitation is not emailed; with one
-    configured, a forged Host is refused before the route runs."""
+    configured, a forged Host is refused before the route runs, and a request with a valid Host gets links built on
+    the configured address."""
+    from conftest import public_address_configured
+    from app.core.allowed_hosts import link_base
     forged = "evil.example"
-    invited = admin.post("/invites", json={"username": unique("inv-host"), "email": f"{unique('host')}@example.com"},
-                         headers={"Host": forged})
-    if invited.status_code == 400 and "host" in invited.text.lower():
-        pytest.skip("this deployment has ALLOWED_HOSTS set: a forged Host is refused outright")
+    invitation = {"username": unique("inv-host"), "email": f"{unique('host')}@example.com"}
+    invited = admin.post("/invites", json=invitation, headers={"Host": forged})
+    if public_address_configured(admin):
+        assert invited.status_code == 400 and invited.text == "Invalid host header", invited.text
+        configured = subprocess.run(["docker", "exec", API, "printenv", "ALLOWED_HOSTS"], capture_output=True,
+                                    text=True, timeout=15).stdout.strip()
+        base = link_base(configured)
+        assert base, configured
+        valid = admin.post("/invites", json=invitation)
+        assert valid.status_code == 200, valid.text
+        assert valid.json()["invite_url"].startswith(f"{base}/?invite="), (base, valid.json()["invite_url"])
+        assert valid.json()["public_address_configured"] is True
+        return
     assert invited.status_code == 200, invited.text
     body = invited.json()
     assert forged not in invited.text, body
