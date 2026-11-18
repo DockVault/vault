@@ -440,12 +440,16 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     vex = json.loads(
         (_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8")
     )
-    # One reviewed exception. An exception is a deliberate, reviewed addition: its statement, its
+    # Six reviewed exceptions. An exception is a deliberate, reviewed addition: its statement, its
     # entry here and its paragraph in the evidence document, together. Any OTHER statement fails here.
     python_cve = "CVE-2026-119170"
+    quic_cves = ("CVE-2026-88822", "CVE-2026-95691")
+    siv_cves = ("CVE-2026-88823", "CVE-2026-95692")
+    cms_cves = ("CVE-2026-107496",)
+    openssl_cves = (*quic_cves, *siv_cves, *cms_cves)
     by_name = {s["vulnerability"]["name"]: s for s in vex["statements"]}
-    assert set(by_name) == {python_cve}
-    assert len(vex["statements"]) == 1
+    assert set(by_name) == {python_cve, *openssl_cves}
+    assert len(vex["statements"]) == 6
     assert vex["@id"].endswith("/__SOURCE_REVISION__")
 
     # CVE-2026-119170 is a regression in Python 3.14.10's hashlib FIPS enforcement, reached only
@@ -472,15 +476,54 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
                  "_hashlib.get_fips_mode() returns 0", "bound to Python 3.14.10"):
         assert fact in python["impact_statement"], fact
 
+    # The five findings of OpenSSL's advisory of 10 November 2026, all rated Low by OpenSSL, are in
+    # QUIC, the AES-GCM-SIV cipher and CMS_encrypt(); nothing that links the system OpenSSL in the
+    # image reaches any of them. Bound to the exact Alpine packages, so the build's apk upgrade to a
+    # patched OpenSSL ends the exceptions (check_vex_sbom.py fails the scan on the stale pins).
+    openssl_subs = [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r0"},
+                    {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r0"}]
+    reason = {**{n: "no QUIC support" for n in quic_cves},
+              **{n: "no code in the image uses AES-GCM-SIV" for n in siv_cves},
+              **{n: "Python has no CMS interface" for n in cms_cves}}
+    for name in openssl_cves:
+        statement = by_name[name]
+        assert statement["status"] == "not_affected", name
+        assert statement["justification"] == "vulnerable_code_not_in_execute_path", name
+        assert statement["products"] == [
+            {
+                "@id": (
+                    "pkg:oci/vault@__IMAGE_DIGEST__"
+                    "?repository_url=ghcr.io/dockvault/vault"
+                ),
+                "subcomponents": openssl_subs,
+            },
+            {"@id": "__IMAGE_REFERENCE__", "subcomponents": openssl_subs},
+        ], name
+        assert statement["timestamp"] == "__GENERATED_AT__", name
+        impact = statement["impact_statement"]
+        assert impact.startswith(f"{name} is "), name
+        assert "__SOURCE_REVISION__" in impact, name
+        for fact in ("rated Low by OpenSSL", "Alpine's libssl3 and libcrypto3 3.5.9-r0",
+                     "TLS over TCP", "no ciphers", "has no openssl command", reason[name],
+                     "bound to libssl3 and libcrypto3 3.5.9-r0"):
+            assert fact in impact, (name, fact)
+        for other in set(reason.values()) - {reason[name]}:
+            assert other not in impact, (name, other)
+
     evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
     assert "There is no blanket `only-fixed` bypass" in evidence
     assert "fails for every unexcepted vulnerability" in evidence
     assert "It holds no statements now." not in evidence
     flat = " ".join(evidence.split())
-    assert "It holds one statement now, for `CVE-2026-119170` in Python 3.14.10" in flat
+    assert ("It holds six statements now: one for `CVE-2026-119170` in Python 3.14.10, and five for "
+            "OpenSSL's advisory of 10 November 2026 in Alpine's `libssl3` and `libcrypto3` 3.5.9-r0") in flat
     assert "vulnerable_code_not_in_execute_path" in flat
     assert "`pkg:generic/python@3.14.10` subcomponent" in flat
-    assert "While the template holds the statement below, a release attaches its VEX." in flat
+    for name in openssl_cves:
+        assert f"`{name}`" in flat, name
+    assert ("Each statement binds the `pkg:apk/alpine/libssl3@3.5.9-r0` and "
+            "`pkg:apk/alpine/libcrypto3@3.5.9-r0` subcomponents") in flat
+    assert "While the template holds the statements below, a release attaches its VEX." in flat
     assert ("The GitHub Release publishes the rendered VEX beside the SBOMs only when the template "
             "holds at least one statement.") in flat
     assert "OpenVEX requires a document to hold at least one" in flat
@@ -552,12 +595,14 @@ def test_the_committed_vex_renders_bound_to_the_scanned_image(tmp_path):
         source_revision=revision,
         generated_at="2026-10-16T00:00:00Z",
     )
-    assert [s["vulnerability"]["name"] for s in document["statements"]] == ["CVE-2026-119170"]
-    (statement,) = document["statements"]
-    assert {p["@id"] for p in statement["products"]} == {
-        f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault", reference}
-    assert revision in statement["impact_statement"]
-    assert statement["timestamp"] == "2026-10-16T00:00:00Z"
+    assert [s["vulnerability"]["name"] for s in document["statements"]] == [
+        "CVE-2026-119170", "CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692",
+        "CVE-2026-107496"]
+    for statement in document["statements"]:
+        assert {p["@id"] for p in statement["products"]} == {
+            f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault", reference}
+        assert revision in statement["impact_statement"]
+        assert statement["timestamp"] == "2026-10-16T00:00:00Z"
     assert document["@id"] == f"https://github.com/DockVault/vault/security/vex/{revision}"
     assert document["timestamp"] == "2026-10-16T00:00:00Z"
     assert "__" not in output.read_text(encoding="utf-8")
@@ -612,10 +657,13 @@ def test_a_release_publishes_the_committed_vex(tmp_path):
     )
     written = json.loads(output.read_text(encoding="utf-8"))
     assert written == document
-    assert [s["vulnerability"]["name"] for s in written["statements"]] == ["CVE-2026-119170"]
-    assert {p["@id"] for p in written["statements"][0]["products"]} == {
-        f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault",
-        "ghcr.io/dockvault/vault:v0.33.4"}
+    assert [s["vulnerability"]["name"] for s in written["statements"]] == [
+        "CVE-2026-119170", "CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692",
+        "CVE-2026-107496"]
+    for statement in written["statements"]:
+        assert {p["@id"] for p in statement["products"]} == {
+            f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault",
+            "ghcr.io/dockvault/vault:v0.33.4"}
 
 
 def test_a_release_publishes_the_vex_when_it_holds_a_statement(tmp_path):

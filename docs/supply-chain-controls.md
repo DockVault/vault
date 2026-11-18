@@ -107,8 +107,9 @@ module absent rather than broken, and every other extension module of the standa
 (but `_tkinter`, which the base ships without the Tk library it needs).
 
 The reviewed OpenVEX template, `security/vex.openvex.json`, holds the findings the maintainers have
-reviewed as not affecting the image, each with its justification. It holds one statement now, for
-`CVE-2026-119170` in Python 3.14.10 (its paragraph is below). Four earlier statements were removed
+reviewed as not affecting the image, each with its justification. It holds six statements now: one
+for `CVE-2026-119170` in Python 3.14.10, and five for OpenSSL's advisory of 10 November 2026 in
+Alpine's `libssl3` and `libcrypto3` 3.5.9-r0 (their paragraphs are below). Four earlier statements were removed
 once they were bound to package versions the image no longer contained: three findings in Python's
 standard library, bound to Python 3.14.7, whose release already carries their fixes, and one in
 Alpine's `zlib` 1.3.2-r0, which the build's `apk upgrade` replaces with the fixed 1.3.2-r1. They
@@ -123,7 +124,7 @@ one statement. OpenVEX requires a document to hold at least one, so a release wi
 exception has no VEX to publish: the renderer writes no file and the release attaches none, and the
 release is refused before it is created if any file it does list is missing. The scans still apply
 the document they render for the image they scan; with no statement it suppresses nothing, and it is
-never published. While the template holds the statement below, a release attaches its VEX.
+never published. While the template holds the statements below, a release attaches its VEX.
 
 Each statement names the exact package versions it was reviewed for, so an image that has moved on
 (a newer base image, or a newer Alpine package from the build's `apk upgrade`) is no longer covered
@@ -136,7 +137,7 @@ template, its entry in `tests/test_supply_chain_contract.py`, and its paragraph 
 from all three, or, if the new version is still affected and the reasoning still holds, reviewed
 again and its version changed in all three.
 
-One exception is reviewed with the `vulnerable_code_not_in_execute_path` justification:
+Every exception is reviewed with the `vulnerable_code_not_in_execute_path` justification. The first is
 `CVE-2026-119170`, a regression in Python 3.14.10 in how the `hashlib` module enforces the
 algorithms OpenSSL allows in FIPS mode. Only a Python whose OpenSSL runs in FIPS mode is affected,
 and only 3.14.10; Python 3.14.11 fixes it. When it was reviewed, in November 2026, the official
@@ -147,6 +148,23 @@ files set `OPENSSL_CONF` or `OPENSSL_MODULES`, and nothing in the application en
 `_hashlib.get_fips_mode()` returns 0 and the code with the flaw never runs. The statement binds the
 `pkg:generic/python@3.14.10` subcomponent: when the base image moves to a Python release without the
 flaw, the pin stops matching, the image scan says so, and the statement is removed.
+
+The other five come from OpenSSL's advisory of 10 November 2026, which rates all five Low:
+`CVE-2026-88822` and `CVE-2026-95691` in its QUIC implementation, `CVE-2026-88823` and
+`CVE-2026-95692` in its AES-GCM-SIV cipher, and `CVE-2026-107496` in `CMS_encrypt()`. The fixed
+release, OpenSSL 3.5.10, is scheduled for 1 December 2026. When they were reviewed, on 18 November
+2026, only Alpine's edge branch had a patched package (3.5.9-r1); Alpine 3.24, the base image's
+release, still served 3.5.9-r0. In this image the system OpenSSL is used by Python's `_ssl` module
+(TLS over TCP), Python's `_hashlib` module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's
+`ssl_client` and apk-tools (TLS over TCP), and the legacy provider and engines OpenSSL loads on
+request. None of them imports a QUIC or CMS function or names the AES-GCM-SIV cipher, and the image
+has no `openssl` command. Python's `ssl` module has no QUIC support, dnspython's DNS over QUIC needs
+`aioquic`, which the image does not install, TLS has no AES-GCM-SIV cipher suite, and the
+application's own encryption uses AES-GCM through the `cryptography` package, which carries its own
+OpenSSL. Each statement binds the `pkg:apk/alpine/libssl3@3.5.9-r0` and
+`pkg:apk/alpine/libcrypto3@3.5.9-r0` subcomponents: the build's `apk upgrade` installs a patched
+package as soon as Alpine 3.24 serves one, the pins stop matching, the image scan says so, and the
+five statements are removed.
 
 ### Base-package patching: a deliberate reproducibility exception
 
