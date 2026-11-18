@@ -19167,6 +19167,10 @@ async def delete_vault(
         return {"message": f"Vault {vault_name} deleted successfully" if vault_name
                 else "Vault deleted successfully"}
 
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except HTTPException:
         raise
     except PermissionDeniedError as e:
@@ -19467,6 +19471,10 @@ async def change_vault_password(
         
         return {"message": f"Vault password {action} successfully"}
         
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -21761,6 +21769,10 @@ async def upload_file(
             'files': uploaded_files
         }
         
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -24401,6 +24413,10 @@ async def delete_file(
 
         return {'message': f'File "{disp_name}" deleted successfully'}
         
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -24504,6 +24520,10 @@ async def get_file_info(
             "checksum_algorithm": "SHA-256" if checksum else None,
             "is_zero_knowledge": is_zk,
         }
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
     except PermissionDeniedError as e:
@@ -24745,6 +24765,10 @@ async def rename_file(
             **result
         }
         
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -25351,6 +25375,10 @@ async def create_folder(
             }
         }
         
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -25451,6 +25479,10 @@ async def delete_folder(
         )
 
         return {'message': f'Folder "{folder_name}" deleted'}
+    except RateLimitExceededError as e:
+        # Too many wrong vault passwords: 429, as the application's own handler answers it (the catch-all
+        # below would answer 500).
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except (PasswordRequiredError, InvalidPasswordError) as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
     except HTTPException:

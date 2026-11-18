@@ -150,18 +150,40 @@ def test_an_administrator_has_the_administrators_vault_limit(counter):
         _open("file", svc, item, admin, RIGHT)
 
 
-@pytest.mark.parametrize("route", ["_serve_file", "preview_render_file"])
-def test_the_web_routes_answer_the_refusal_with_429(route):
-    """Each route that takes a file password answers the limit's refusal with 429, before the handlers that would
-    answer it as 500 (the download) or 404 (the rendered preview). The copy and move routes leave it to the
-    application-wide FileServiceError handler, which answers 429."""
+def _routes_that_check_a_password():
+    """Every function in api_server that asks for a vault password (get_vault(require_password=True)) or passes a
+    file password on, with the try around that call: (name, try node)."""
     tree = ast.parse((ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8"))
-    fn = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == route)
-    outer = next(n for n in fn.body if isinstance(n, ast.Try))
-    names = [ast.unparse(h.type) if h.type is not None else "" for h in outer.handlers]
-    assert "RateLimitExceededError" in names, names
-    at = names.index("RateLimitExceededError")
-    catch_alls = [i for i, n in enumerate(names) if n in ("Exception", "") or "FileServiceError" in n]
-    assert all(at < i for i in catch_alls), names
-    body = ast.unparse(outer.handlers[at])
-    assert "HTTP_429_TOO_MANY_REQUESTS" in body and "raise HTTPException" in body, body
+    found = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and (
+            (getattr(n.func, "attr", None) == "get_vault" and any(
+                k.arg == "require_password" and isinstance(k.value, ast.Constant) and k.value.value is True
+                for k in n.keywords))
+            or any(k.arg in ("file_password", "source_file_password") for k in n.keywords))]
+        tries = [t for t in ast.walk(fn) if isinstance(t, ast.Try) and any(c in ast.walk(t) for c in calls)]
+        if calls and tries:
+            found.append((fn.name, min(tries, key=lambda t: t.lineno)))
+    return found
+
+
+def test_every_route_that_checks_a_password_answers_the_limit_with_429():
+    """The vault password's limit, and a file's, are refused with 429 wherever a password is checked: each route
+    either answers it before a catch-all that would make it 500 (or the rendered preview's 404), or has no catch-all,
+    and the application-wide FileServiceError handler answers 429 (copy and move)."""
+    routes = _routes_that_check_a_password()
+    names = {name for name, _ in routes}
+    assert {"_serve_file", "preview_render_file", "get_file_info", "delete_file", "rename_file", "delete_vault",
+            "change_vault_password", "upload_file", "create_folder", "delete_folder"} <= names, names
+    for name, outer in routes:
+        handlers = [ast.unparse(h.type) if h.type is not None else "" for h in outer.handlers]
+        catch_alls = [i for i, n in enumerate(handlers) if n in ("Exception", "") or "FileServiceError" in n]
+        if not catch_alls:
+            continue
+        assert "RateLimitExceededError" in handlers, (name, handlers)
+        at = handlers.index("RateLimitExceededError")
+        assert all(at < i for i in catch_alls), (name, handlers)
+        body = ast.unparse(outer.handlers[at])
+        assert "HTTP_429_TOO_MANY_REQUESTS" in body and "raise HTTPException" in body, (name, body)
