@@ -177,3 +177,20 @@ def test_the_ssh_key_notice_links_only_to_the_public_address(db, monkeypatch, ad
                           "keys": [("laptop", "SHA256:abc")]}]}
     api._announce_keys_reported(db, report, request=_forged_request())
     assert [c["link"] for c in fired] == ([f"{CONFIGURED}/#profile"] if address else [""]), fired
+
+
+def test_an_administrators_emailed_reset_link_is_refused_before_anything_is_made_or_held(db, monkeypatch, sent):
+    """With no public address the route refuses at once, beside its other pre-checks: a reset link that would be the
+    account's second change in 14 days was held, its approvers told, and refused only at approval."""
+    import inspect
+    monkeypatch.setattr(email_actions, "vault_url", lambda: "")
+    monkeypatch.setattr(api, "_smtp_configured", lambda db: True)
+    asked = []
+    monkeypatch.setattr(api, "_credential_change", lambda *a, **k: asked.append(a) or pytest.fail("reached"))
+    alice = _user(db, "alice")
+    carol = _user(db, "carol", RoleEnum.USER, email="carol@example.com")
+    route = inspect.unwrap(api.admin_send_reset_link)
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(route(user_id=carol.id, request=_forged_request(), current_user=alice, db=db))
+    assert refused.value.status_code == 400 and "ALLOWED_HOSTS" in refused.value.detail
+    assert asked == [] and sent == [] and db.query(CredentialChange).count() == 0

@@ -7376,6 +7376,10 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     if not _smtp_configured(db):
         raise HTTPException(status_code=400,
                             detail="Email is not configured. Add a sending profile in Settings -> Email first.")
+    # Refused before anything is made or held: an emailed link is built on the public address only. (The same
+    # check in _make_credential_change covers the host operator and requests held before it existed.)
+    if not _public_base_url():
+        raise HTTPException(status_code=400, detail=NO_PUBLIC_ADDRESS_FOR_EMAILED_LINKS)
     # A reset link for someone else is a credential change: the second one within 14 days waits for
     # another administrator (app/core/credential_changes.py).
     outcome = _credential_change(db, current_user, user, "reset_link",
