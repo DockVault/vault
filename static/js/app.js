@@ -3039,13 +3039,18 @@ const SIGNED_OUT_REASONS = {
     administrator_password: 'Administrators sign in with their password. Sign in again.',
     passkey_alone: 'A passkey alone no longer signs you in. Sign in again with your password.',
     passkey_required: 'Your role must hold a passkey now. Sign in again: you will be asked to add one.',
+    // What the renewal rules themselves refuse with (app/api/api_server.py, _renewal_terms).
+    renewal_limit: 'You have been signed in for as long as this vault allows at a stretch; sign in again.',
+    second_factor_needed: 'Signing in now needs your second factor; sign in again.',
+    not_renewable: 'This session cannot be renewed; sign in again.',
     // And when the sign-in came through an identity provider that no longer vouches for it. The server names the
     // provider; a code names nothing, so the sentence a code stands for says "your identity provider" (the shapes
     // below).
     provider_unlinked: 'Your account is no longer linked to the identity provider this sign-in came through. Sign in again.',
     provider_again: 'Sign in through your identity provider again to stay signed in.',
     provider_off: 'Signing in through your identity provider is turned off. Sign in again another way, or ask an administrator.',
-    provider_only: 'Your organisation signs this account in through its own sign-in. Use it on the sign-in page.',
+    provider_only: 'Your organisation signs this account in through its own sign-in. Use its button on the sign-in page.',
+    provider_only_link: 'Your organisation signs this account in through its own sign-in. Use the sign-in link your organisation gave you.',
     provider_only_unavailable: 'Your organisation signs this account in through its own sign-in, which is not available on this vault right now. Ask your administrator.',
 };
 
@@ -3055,7 +3060,8 @@ const SIGNED_OUT_REASONS = {
 const SIGNED_OUT_SHAPES = [
     ['provider_again', /^Sign in through .{1,300} again to stay signed in\.$/],
     ['provider_off', /^Signing in through .{1,300} is turned off\. Sign in again another way, or ask an administrator\.$/],
-    ['provider_only', /^Your organisation signs this account in through .{1,600}\.$/],
+    ['provider_only', /^Your organisation signs this account in through .{1,300}\. Use the .{1,300} button on the sign-in page\.$/],
+    ['provider_only_link', /^Your organisation signs this account in through .{1,300}\. Use the sign-in link your organisation gave you\.$/],
 ];
 
 // The app's own sentences with their codes: these, and the stay-or-sign-out warning's (static/js/session-watch.js:

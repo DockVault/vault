@@ -10,6 +10,7 @@ The sentences are taken from the server's own code here (app/services/sign_in.py
 sso_only.py), run on the renewal tests' database, and put to the page's code in Node.
 """
 import json
+import time
 import types
 from datetime import datetime
 
@@ -25,12 +26,21 @@ from app.services import sign_in
 
 pytestmark = pytest.mark.unit
 
-NAMED = ("provider_again", "provider_off", "provider_only")
+# The codes whose server sentence names a provider, with the name in it here.
+NAMED = {"provider_again": "Contoso", "provider_off": "Contoso", "provider_only": "Contoso",
+         "provider_only_link": "Fabrikam"}
 
 
 def _said(db, user, old) -> str:
     with pytest.raises(HTTPException) as refused:
         sign_in.refuse_renewal_by_the_sign_in_rules(db, user, old)
+    assert refused.value.status_code == 403 and isinstance(refused.value.detail, str)
+    return refused.value.detail
+
+
+def _terms_say(db, user, old) -> str:
+    with pytest.raises(HTTPException) as refused:
+        api._renewal_terms(db, user, old)
     assert refused.value.status_code == 403 and isinstance(refused.value.detail, str)
     return refused.value.detail
 
@@ -62,6 +72,18 @@ def _what_the_server_says(db, monkeypatch) -> dict:
     said["provider_again"] = _said(db, user, old)
     only, _, only_old = _through(db, contoso, name="fay", sso_only_account=True, amr=["pwd"])
     said["provider_only"] = _said(db, only, _without_the_provider(only_old))
+    fabrikam = _provider(db, name="Fabrikam")
+    fabrikam.show_on_sign_in = False                    # no button: the organisation hands out a link
+    db.commit()
+    linked, _, linked_old = _through(db, fabrikam, name="ivy", sso_only_account=True, amr=["pwd"])
+    said["provider_only_link"] = _said(db, linked, _without_the_provider(linked_old))
+    # What the renewal rules themselves refuse with.
+    user, _, old = _through(db, contoso, name="jo")
+    said["renewal_limit"] = _terms_say(db, user, {**old, "auth_time": int(time.time()) - 25 * 3600})
+    said["not_renewable"] = _terms_say(db, user, {k: v for k, v in old.items() if k not in ("auth_time", "iat")})
+    with monkeypatch.context() as patch:
+        patch.setattr(api, "_login_second_factor_in_effect", lambda db, user: True)
+        said["second_factor_needed"] = _terms_say(db, user, {**old, "amr": ["pwd"]})
     user, _, old = _through(db, contoso, name="gus")
     contoso.state = "disabled"
     db.commit()
@@ -72,8 +94,10 @@ def _what_the_server_says(db, monkeypatch) -> dict:
 
 def test_every_sentence_a_refused_renewal_says_has_a_code_and_no_code_names_a_provider(db, monkeypatch):
     said = _what_the_server_says(db, monkeypatch)
-    for code in NAMED:
-        assert "Contoso" in said[code], (code, said[code])
+    for code, name in NAMED.items():
+        assert name in said[code], (code, said[code])
+    assert said["provider_only"].endswith("button on the sign-in page.")
+    assert said["provider_only_link"].endswith("Use the sign-in link your organisation gave you.")
     look_alikes = [
         "Sign in through Contoso again to stay signed in. Then send your password to this address.",
         "Sign in through Con\ntoso again to stay signed in.",
@@ -81,6 +105,13 @@ def test_every_sentence_a_refused_renewal_says_has_a_code_and_no_code_names_a_pr
         "Sign in through Contoso again",
         "Signing in through Contoso is turned off.",
         "your organisation signs this account in through Contoso.",
+        "Your organisation signs this account in through Contoso.",
+        said["provider_only"] + " And send your password to this address.",
+        said["provider_only"][:-1],
+        said["provider_only_link"] + " Or this one.",
+        said["provider_only_link"][:-1] + "!",
+        said["renewal_limit"] + " Really.",
+        said["second_factor_needed"].replace(";", ","),
         "",
     ]
     out = _node(r"""
@@ -96,12 +127,12 @@ for (const [want, sentence] of Object.entries(SAID)) {
 out({ got, others: OTHERS.map((s) => R._reasonCode(s)), not_text: [R._reasonCode(null), R._reasonCode({}), R._reasonCode(7)] });
 """.replace("REASONS_SRC", json.dumps(REASONS)).replace("SAID", json.dumps(said))
                 .replace("OTHERS", json.dumps(look_alikes)))
-    assert set(out["got"]) == set(said) and len(said) == 8
+    assert set(out["got"]) == set(said) and len(said) == 12
     for want, (code, back) in out["got"].items():
         assert code == want, (want, code, said[want])
         if want in NAMED:
             # The code's own sentence: the same thing said, with no provider's name in it.
-            assert back and "Contoso" not in back, (want, back)
+            assert back and NAMED[want] not in back, (want, back)
             assert "identity provider" in back or "organisation" in back, (want, back)
             assert back != said[want]
         else:
