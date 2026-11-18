@@ -321,6 +321,10 @@ def test_an_allowed_hosts_entry_with_no_host_stops_the_start_and_is_named(tmp_pa
     assert proc.returncode == 1, output
     bad = [e.strip() for e in allowed_hosts.split(",")][-1]
     assert "allowed-hosts-invalid" in proc.stderr and repr(bad) in proc.stderr, output
+    # The restart it asks for is the one that keeps the install's own Compose file: a bare
+    # `docker compose up -d` from the checkout starts the local trial's stack instead.
+    assert "then restart the vault (python dockvault.py restart)." in proc.stderr, output
+    assert "docker compose up -d" not in output
     assert "Traceback" not in output
 
 

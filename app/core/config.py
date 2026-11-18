@@ -738,7 +738,7 @@ def _validate_runtime_settings(candidate: Settings) -> None:
             "allowed-hosts-invalid",
             "ALLOWED_HOSTS has an entry with no host name that can be read: " + ", ".join(unreadable)
             + ". Write each entry as a name (vault.example.com), a wildcard (*.example.com) or an address "
-            "(https://vault.example.com:8443), then run docker compose up -d.",
+            "(https://vault.example.com:8443), then restart the vault (python dockvault.py restart).",
         )
 
     if (candidate.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
