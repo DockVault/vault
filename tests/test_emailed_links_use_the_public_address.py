@@ -205,3 +205,30 @@ def test_settings_report_whether_a_public_address_is_configured():
     flags = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
              and ast.unparse(n.targets[0]) == "data['public_address_configured']"]
     assert len(flags) == 1 and ast.unparse(flags[0].value) == "bool(_public_base_url())", [ast.unparse(f) for f in flags]
+
+
+def test_the_share_notice_links_only_to_the_public_address(address):
+    """The share is made on the sharer's request, Host and all; the notice's context is built without it."""
+    share = SimpleNamespace(expires_at=None)
+    assert api._share_notice_context(share) == {"link": f"{CONFIGURED}/#shared" if address else "", "expires": ""}
+    import ast
+    import inspect
+    assert list(inspect.signature(api._share_notice_context).parameters) == ["share"], "it must not see the request"
+    body = ast.parse(inspect.getsource(inspect.unwrap(api.create_share)).lstrip())
+    uses = [ast.unparse(n) for n in ast.walk(body) if isinstance(n, ast.Name) and n.id == "_share_ctx"]
+    assigned = [ast.unparse(n) for n in ast.walk(body) if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", None) == "_share_ctx" for t in n.targets)]
+    assert assigned == ["_share_ctx = _share_notice_context(share)"] and len(uses) == 2, (assigned, uses)
+    assert "_fire_action_email_bulk(db, 'share_created', _share_pairs, _share_ctx)" in ast.unparse(body)
+
+
+def test_the_upload_notice_links_only_to_the_public_address(db, monkeypatch, address):
+    """The upload's request is the anonymous uploader's, and the notice goes to the link's owner by email."""
+    fired = []
+    monkeypatch.setattr(api, "_notify_users", lambda *a, **k: True)
+    monkeypatch.setattr(api, "_fire_action_email", lambda db, action, **kw: fired.append(kw["action_context"]))
+    owner = SimpleNamespace(id=uuid.uuid4(), email="owner@example.com", username="owner")
+    api._tell_receiver_owner(db, _forged_request(), SimpleNamespace(id=uuid.uuid4(), label="drop"), owner,
+                             SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4()))
+    assert [c["link"] for c in fired] == ([f"{CONFIGURED}/#uploadlinks/drops"] if address else [""]), fired
+    _no_forged_host(fired)

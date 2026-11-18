@@ -17147,10 +17147,7 @@ async def create_share(
             # Optionally ALSO email each recipient the "File / folder shared" notice (opt-in). Resolve
             # addresses now (one query), then fan the SMTP out on a background thread. NEVER email the
             # link_token (the bearer secret for anyone_internal shares) — link into "Shared with me".
-            # The configured public address only: never the request's Host, which its sender chooses.
-            _base = _public_base_url()
-            _share_ctx = {"link": (_base.rstrip("/") + "/#shared") if _base else "",
-                          "expires": (f"until {share.expires_at.strftime('%Y-%m-%d')} UTC" if share.expires_at else "")}
+            _share_ctx = _share_notice_context(share)
             _share_pairs = [(u.email, u.username) for u in
                             db.query(User).filter(User.id.in_([str(x) for x in recipient_ids])).all()]
             _fire_action_email_bulk(db, "share_created", _share_pairs, _share_ctx)
@@ -17159,6 +17156,14 @@ async def create_share(
     out["link_token"] = link_token  # SHOW ONCE — only the hash is stored; this is never returned again
     return out
 
+
+
+def _share_notice_context(share) -> dict:
+    """The "File / folder shared" email's link and expiry: a link into "Shared with me" on the configured public
+    address only, never on the request's Host (its sender chooses it); with no address configured, no link."""
+    base = _public_base_url()
+    return {"link": (base.rstrip("/") + "/#shared") if base else "",
+            "expires": (f"until {share.expires_at.strftime('%Y-%m-%d')} UTC" if share.expires_at else "")}
 
 @app.get("/shares")
 async def list_my_shares(

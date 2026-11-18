@@ -105,6 +105,21 @@ def test_no_emailed_link_is_built_from_the_request():
         if (isinstance(holder, ast.Attribute) and holder.attr == "headers" and isinstance(read, ast.Constant)
                 and str(read.value).lower() in ("host", "x-forwarded-host")):
             raise AssertionError(f"a Host header read at line {node.lineno}: {ast.unparse(node)}")
+    # Nor from the request's URL: its host, port and whole address are the Host header too. The one read allowed is the
+    # download sink's, which asks only whether the page is on a secure context (localhost counts), and builds no link.
+    owner = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for n in ast.walk(fn):
+                owner.setdefault(id(n), fn.name)
+    allowed = {("hostname", "_resolved_download_sink")}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr in ("netloc", "hostname", "port")
+                and isinstance(node.value, ast.Attribute) and node.value.attr == "url"):
+            assert (node.attr, owner.get(id(node))) in allowed, f"line {node.lineno}: {ast.unparse(node)}"
+        if (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "str" and node.args
+                and isinstance(node.args[0], ast.Attribute) and node.args[0].attr == "url"):
+            raise AssertionError(f"the request's whole URL at line {node.lineno}: {ast.unparse(node)}")
     callers = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_public_base_url"]
     # invitation create and resend, self-service reset, an administrator's reset link, the promotion reset, the
     # SSH-key notice, the share notice, the expiry reminder and the upload notice
