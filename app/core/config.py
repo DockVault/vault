@@ -728,6 +728,18 @@ def _validate_runtime_settings(candidate: Settings) -> None:
     if weak:
         raise RuntimeBootstrapError("audit-chain-key-weak", weak + ".")
 
+    # An ALLOWED_HOSTS entry with no host name to check would otherwise be dropped (with it alone, no Host check at
+    # all) or stop the API with a traceback. Host names are not secrets, so the entry is named.
+    from app.core.allowed_hosts import problems as allowed_hosts_problems
+    unreadable = allowed_hosts_problems(candidate.allowed_hosts)
+    if unreadable:
+        raise RuntimeBootstrapError(
+            "allowed-hosts-invalid",
+            "ALLOWED_HOSTS has an entry with no host name that can be read: " + ", ".join(unreadable)
+            + ". Write each entry as a name (vault.example.com), a wildcard (*.example.com) or an address "
+            "(https://vault.example.com:8443), then run docker compose up -d.",
+        )
+
     if (candidate.jwt_algorithm or "").strip() not in {"HS256", "HS384", "HS512"}:
         raise RuntimeBootstrapError(
             "jwt-algorithm-invalid",

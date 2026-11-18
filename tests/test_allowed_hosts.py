@@ -28,6 +28,13 @@ CASES = [
     ("vault.example.com:8443", "https://vault.example.com:8443", "vault.example.com:8443"),
     ("https://vault.example.com:8443", "https://vault.example.com:8443", "vault.example.com:8443"),
     ("http://localhost:8200,vault-api", "http://localhost:8200", "localhost:8200"),
+    # A wildcard written as an origin is still a wildcard: never the link base.
+    ("https://*.example.com,https://vault.example.com", "https://vault.example.com", "vault.example.com"),
+    # Read as a browser sends the Host: in lower case, a bare name without a path.
+    ("Vault.Example.COM", "https://vault.example.com", "vault.example.com"),
+    ("vault.example.com/", "https://vault.example.com", "vault.example.com"),
+    ("Vault.Example.COM:8443/vault", "https://vault.example.com:8443", "vault.example.com:8443"),
+    ("HTTPS://Vault.Example.COM:8443/vault", "https://vault.example.com:8443", "vault.example.com:8443"),
 ]
 
 
@@ -68,8 +75,23 @@ def test_the_link_base_and_the_host_check_read_each_form_alike(raw, base, host):
 def test_a_wildcard_is_never_a_link_base_and_nothing_usable_gives_none():
     assert ah.link_base("*.example.com") == ""
     assert ah.link_base("*,0.0.0.0,.example.com") == ""
+    assert ah.link_base("https://*.example.com,http://*:8443,https://*") == ""
+    assert ah.link_base("https://*:8443,vault.example.com") == "https://vault.example.com"
+    # A wildcard port: the host reads (the Host check gets it), but no link can be built on it.
+    assert ah.link_base("https://vault.example.com:*,https://vault.example.com") == "https://vault.example.com"
+    assert ah.middleware_hosts("https://vault.example.com:*")[0] == "vault.example.com"
     assert ah.link_base("") == "" and ah.middleware_hosts("") == []
     assert ah.link_base("ftp://vault.example.com,vault.example.com") == "https://vault.example.com"
+
+
+def test_an_entry_with_no_readable_host_is_named_and_never_a_link_base_or_host():
+    raw = "https://,:8443,https://[vault,http://:8443,vault.example.com"
+    assert ah.problems(raw) == ["'https://'", "':8443'", "'https://[vault'", "'http://:8443'"]
+    assert ah.middleware_hosts(raw) == ["vault.example.com", "localhost", "127.0.0.1"]
+    assert ah.link_base(raw) == "https://vault.example.com"
+    for good in ("*", "*.example.com", "https://*.example.com", "vault.example.com:8443", "http://localhost:8200",
+                 "0.0.0.0", "Vault.Example.COM/"):
+        assert ah.problems(good) == [], good
 
 
 def test_the_ci_value_also_admits_the_sftp_containers_sign_ins():

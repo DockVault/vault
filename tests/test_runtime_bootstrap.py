@@ -310,6 +310,27 @@ def test_entrypoint_fatal_conditions_are_nonzero_and_sanitized(
     assert "Traceback" not in output
 
 
+@pytest.mark.parametrize("allowed_hosts", ["vault.example.com,https://", "https://[vault", ":8443", "http://:8443"])
+def test_an_allowed_hosts_entry_with_no_host_stops_the_start_and_is_named(tmp_path, allowed_hosts):
+    """Dropped, an entry alone would turn the Host check off; read as before, one stopped the API with a traceback.
+    A host name is no secret, so the error names the entry."""
+    env = _runtime_env(tmp_path)
+    env["ALLOWED_HOSTS"] = allowed_hosts
+    proc = _run("from app.core.config import bootstrap_entrypoint; bootstrap_entrypoint('api')", tmp_path, env)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    bad = [e.strip() for e in allowed_hosts.split(",")][-1]
+    assert "allowed-hosts-invalid" in proc.stderr and repr(bad) in proc.stderr, output
+    assert "Traceback" not in output
+
+
+def test_every_readable_allowed_hosts_form_starts(tmp_path):
+    env = _runtime_env(tmp_path)
+    env["ALLOWED_HOSTS"] = "https://*.example.com,Vault.Example.COM/,vault.example.com:8443,http://localhost:8200,*"
+    proc = _run("from app.core.config import initialize_runtime; initialize_runtime(interactive=False)", tmp_path, env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_bad_encrypted_credentials_fail_without_secret_output(tmp_path):
     script = """
 import os
