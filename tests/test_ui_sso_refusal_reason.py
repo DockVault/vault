@@ -10,6 +10,7 @@ from playwright.sync_api import Page
 
 from _ui_hand_over import expect_reason_once, mark_old, wait_replaced
 from test_ui_session_stay_refused import _login, _warn, _watch_toasts, person  # noqa: F401 -- person is the fixture
+from test_ui_sign_out_ends_session import _is_sign_out
 
 pytestmark = pytest.mark.ui
 
@@ -24,7 +25,9 @@ def test_a_renewal_the_provider_no_longer_vouches_for_signs_out_with_the_servers
         status=403, content_type="application/json", body='{"detail": "' + SENTENCE + '"}'))
     toasts = _watch_toasts(page)
     mark_old(page)
-    page.click("#session-stay")
+    # The refusal ends the session on the server too: the tab's sign-out request goes out before the page does.
+    with page.expect_request(_is_sign_out):
+        page.click("#session-stay")
     # The page is replaced, and the new one's sign-in screen says why, in the server's words, provider and all.
     wait_replaced(page)
     page.unroute("**/auth/session/extend")
