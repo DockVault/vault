@@ -105,7 +105,6 @@ class Handover:
     verifier_hash: Optional[str] = None
     code_challenge: Optional[str] = None
     # When the person authenticated at the identity provider (seconds since the epoch), when it said so.
-    auth_time: Optional[int] = None
     # What the provider session remembers for the provider's logouts: its session id and subject, and the hint the
     # provider's own logout takes (the ID token), encrypted, only when the provider logout option wants it.
     provider_sid: Optional[str] = None
@@ -132,8 +131,6 @@ class Handover:
         if not isinstance(handover.methods, list) or not all(isinstance(m, str) for m in handover.methods):
             return None
         if handover.purpose not in PURPOSES:
-            return None
-        if handover.auth_time is not None and (isinstance(handover.auth_time, bool) or not isinstance(handover.auth_time, int)):
             return None
         # Every proof is a plain value of its kind: a flag is a boolean (never a truthy word), a hash or an id
         # a string or absent; anything else is not a record this module wrote.
@@ -223,7 +220,6 @@ def from_result(result, *, verifier_hash: Optional[str] = None, code_challenge: 
         pending_id=str(result.pending.id) if result.pending is not None else None,
         purpose=purpose, verifier_hash=verifier_hash, code_challenge=code_challenge,
         ended=result.sessions_ended,
-        auth_time=int(result.auth_time.timestamp()) if getattr(result, "auth_time", None) is not None else None,
         provider_sid=getattr(result, "provider_sid", None), provider_sub=getattr(result, "provider_sub", None),
         provider_logout_hint_enc=_encrypted(getattr(result, "provider_logout_hint", None)),
         provider_auth_time=(int(result.provider_auth_time.timestamp())
@@ -311,8 +307,6 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
         # minute ends the sign-in it carries.
         sessions_ended=handover.ended if isinstance(handover.ended, int) else -1,
     )
-    if isinstance(handover.auth_time, int) and not isinstance(handover.auth_time, bool) and 0 <= handover.auth_time < 2 ** 33:
-        result.auth_time = datetime.fromtimestamp(handover.auth_time, tz=timezone.utc)
     at = handover.provider_auth_time
     if isinstance(at, int) and not isinstance(at, bool) and 0 <= at < 2 ** 33:
         result.provider_auth_time = datetime.fromtimestamp(at, tz=timezone.utc)

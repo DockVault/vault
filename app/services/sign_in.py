@@ -129,8 +129,9 @@ class SignInResult:
     # The ID token, for the provider's own logout; only when wanted. Never in the result's text form.
     provider_logout_hint: Optional[str] = field(default=None, repr=False)
     # When the provider says the person authenticated there (its own session, which may be days old). Kept with the
-    # provider's session for the rules that read the provider's standing; never the token's ``auth_time``, which is
-    # the moment the vault's own sign-in completed, for every door (complete_sign_in).
+    # provider's session as a record of it: no rule reads it (an identity's freshness counts from the vault's own
+    # stamp of its last sign-in), and it is never the token's ``auth_time``, which is the moment the vault's own
+    # sign-in completed, for every door (complete_sign_in).
     provider_auth_time: Optional[datetime] = None
     # A passkey: whether the authenticator verified the person (the UV flag), and whether the policy lets
     # this person sign in with a user-verified passkey alone.
