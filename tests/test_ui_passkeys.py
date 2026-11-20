@@ -403,3 +403,153 @@ def test_the_questions_asked_around_a_passkey_are_the_pages_ordinary_dialogs(pag
     _open_account(page)
     expect(page.locator("#us-passkeys-body .passkey-row").first).to_contain_text("Laptop")
     expect(page.locator("#us-passkeys-body .passkey-row").first).not_to_contain_text("Something else")
+
+
+# --------------------------------------------------------------------------- a passkey the role must hold, at the sign-in
+
+def _held(pre_auth_token, **fields):
+    """A sign-in held for one more step, as the server answers it."""
+    body = {"access_token": None, "second_factor_required": True, "stage": "second_factor", "enrollment_required": False,
+            "methods": [], "enrollment_methods": [], "pre_auth_token": pre_auth_token}
+    body.update(fields)
+    return body
+
+
+class HeldSignIn:
+    """The server's side of a sign-in that is held step by step, stood in for at the page's requests: a grace that
+    has run out cannot be made on a running vault, so the holds are answered here. The registration options are the
+    account's own from the vault (the device makes a real key), and the last answer carries a real session of the
+    account, so the page ends signed in. ``seen`` is every request, in order, with the token it carried."""
+
+    def __init__(self, page: Page, user, *, first, after_code=None):
+        from conftest import ApiClient
+        self.user = user
+        self.api = ApiClient()
+        self.api.login(user["_username"], user["_password"])
+        self.options = self.fresh_options()
+        self.seen = []
+        self.sent = None
+        self.verify_answer = (201, {"passkey": {"id": "k"}, "access_token": self.api.token, "token_type": "bearer"})
+
+        def bearer(route):
+            return (route.request.headers.get("authorization") or "").replace("Bearer ", "")
+
+        def login(route):
+            self.seen.append(("login", ""))
+            route.fulfill(status=200, json=first)
+
+        def code(route):
+            self.seen.append(("code", bearer(route)))
+            route.fulfill(status=200, json=after_code)
+
+        def options(route):
+            self.seen.append(("options", bearer(route)))
+            route.fulfill(status=200, json=self.options)
+
+        def verify(route):
+            self.sent = route.request.post_data_json or {}
+            self.seen.append(("verify", bearer(route)))
+            route.fulfill(status=self.verify_answer[0], json=self.verify_answer[1])
+
+        page.route("**/auth/login", login)
+        page.route("**/auth/second-factor/verify", code)
+        page.route("**/users/me/passkeys/register/options", options)
+        page.route("**/users/me/passkeys/register/verify", verify)
+
+    def fresh_options(self):
+        r = self.api.post("/users/me/passkeys/register/options", json={"current_password": self.user["_password"]})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+
+@pytest.fixture(autouse=True)
+def _no_stand_in_outlives_its_test(page: Page):
+    yield
+    page.unroute_all(behavior="ignoreErrors")
+
+
+def _type_the_password(page: Page, user):
+    page.goto("/")
+    expect(page.locator("#login-screen")).to_be_visible()
+    page.fill("#username", user["_username"])
+    page.fill("#password", user["_password"])
+    page.click("#login-form button[type=submit]")
+
+
+def test_a_required_passkey_is_set_up_at_the_sign_in_after_the_accounts_code(page: Page, no_offer, authenticator,
+                                                                             fresh_user):
+    """An account that holds an authenticator and owes the passkey of its role: the page asks for the code, then
+    shows the enrollment that follows the code (a hold after a step is shown, not dropped), and the answer to the
+    new key signs the person in. Each request carries the token of the hold it answers."""
+    held = HeldSignIn(page, fresh_user, first=_held("held-1", methods=["totp", "recovery"]),
+                      after_code=_held("held-2", enrollment_required=True, enrollment_methods=["passkey"]))
+    _type_the_password(page, fresh_user)
+    expect(page.locator("#sf-code-input")).to_be_visible(timeout=8000)
+    expect(page.locator("#sf-passkey-enroll")).to_have_count(0)            # no enrollment before the code
+    page.fill("#sf-code-input", "123456")
+    page.keyboard.press("Enter")
+    expect(page.locator("#sf-passkey-enroll")).to_be_visible(timeout=8000)
+    expect(page.locator("#login-second-factor")).to_contain_text("Add a passkey to finish signing in")
+    expect(page.locator("#sf-enroll-authenticator")).to_have_count(0)      # only the passkey is owed
+    expect(page.locator("#sf-code-input")).to_have_count(0)
+    page.click("#sf-passkey-enroll")
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert held.seen == [("login", ""), ("code", "held-1"), ("options", "held-2"), ("verify", "held-2")], held.seen
+    assert held.sent["challenge_id"] == held.options["challenge_id"] and held.sent["credential"]["id"], held.sent
+    assert held.sent["credential"]["type"] == "public-key" and held.sent["label"] is None
+
+
+def test_an_account_with_no_factor_sets_its_required_passkey_up_after_the_password(page: Page, no_offer, authenticator,
+                                                                                   fresh_user):
+    """The first hold is the enrollment itself: the passkey card, never the authenticator-app wizard nobody asked
+    for. A refusal is shown in the words the server gave and the card stays; the next try signs in."""
+    held = HeldSignIn(page, fresh_user, first=_held("held-1", enrollment_required=True, enrollment_methods=["passkey"]))
+    refusal = "Your role needs a passkey bound to one device: this one is synced between devices."
+    held.verify_answer = (400, {"detail": {"reason": "synced_not_allowed", "message": refusal}})
+    _type_the_password(page, fresh_user)
+    expect(page.locator("#sf-passkey-enroll")).to_be_visible(timeout=8000)
+    expect(page.locator("#sf-enroll-secret")).to_have_count(0)
+    page.click("#sf-passkey-enroll")
+    expect(page.locator("#login-second-factor [role=alert]")).to_have_text(refusal, timeout=10000)
+    expect(page.locator("#sf-passkey-enroll")).to_be_enabled()
+    expect(page.locator("#dashboard-screen")).to_be_hidden()
+    held.verify_answer = (201, {"passkey": {"id": "k"}, "access_token": held.api.token, "token_type": "bearer"})
+    held.options = held.fresh_options()
+    page.click("#sf-passkey-enroll")
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    assert [kind for kind, _token in held.seen] == ["login", "options", "verify", "options", "verify"], held.seen
+    assert {token for kind, token in held.seen if kind != "login"} == {"held-1"}
+
+
+def test_where_an_authenticator_is_owed_too_the_passkey_comes_first_with_the_app_as_the_other_way(
+        page: Page, no_offer, authenticator, fresh_user):
+    """Both may be set up: the passkey card, with a way to the authenticator-app wizard, which starts with the same
+    held sign-in and the password just typed. A browser that cannot make a passkey goes to the wizard at once."""
+    HeldSignIn(page, fresh_user, first=_held("held-1", enrollment_required=True, enrollment_methods=["totp", "passkey"]))
+    asked = []
+
+    def enroll(route):
+        asked.append((route.request.headers.get("authorization"), route.request.post_data_json))
+        route.fulfill(status=409, json={"detail": "Stopped here by the test."})
+    page.route("**/users/me/second-factor/totp/enroll", enroll)
+    _type_the_password(page, fresh_user)
+    expect(page.locator("#sf-passkey-enroll")).to_be_visible(timeout=8000)
+    page.click("#sf-enroll-authenticator")
+    expect(page.locator("#login-second-factor")).to_contain_text("Stopped here by the test.", timeout=8000)
+    assert asked == [("Bearer held-1", {"current_password": fresh_user["_password"]})], asked
+    # The same answer in a browser without passkeys: the wizard, with no passkey card before it.
+    page.add_init_script("delete window.PublicKeyCredential;")
+    asked.clear()
+    _type_the_password(page, fresh_user)
+    expect(page.locator("#login-second-factor")).to_contain_text("Stopped here by the test.", timeout=8000)
+    expect(page.locator("#sf-passkey-enroll")).to_have_count(0)
+    assert len(asked) == 1
+
+
+def test_a_required_passkey_in_a_browser_that_cannot_make_one_says_so(page: Page, no_offer, fresh_user):
+    page.add_init_script("delete window.PublicKeyCredential;")
+    HeldSignIn(page, fresh_user, first=_held("held-1", enrollment_required=True, enrollment_methods=["passkey"]))
+    _type_the_password(page, fresh_user)
+    expect(page.locator("#login-second-factor")).to_contain_text("this browser cannot make one here", timeout=8000)
+    expect(page.locator("#sf-passkey-enroll")).to_have_count(0)
+    expect(page.locator("#login-second-factor")).to_contain_text("Back to sign in")

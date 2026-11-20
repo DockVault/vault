@@ -2040,6 +2040,22 @@ async function _passkeySignInAnswer(data) {
     await finishSecondFactorLogin(data.access_token);
 }
 
+// What a step of a sign-in answered: the session, or a hold for one more step (the password, the second factor, an
+// enrollment). Every step after the first proof goes through here, so a hold that follows a step is shown and
+// never dropped: a code may be followed by the passkey the account's role must hold.
+async function _signInStepAnswer(data) {
+    if (data && data.second_factor_required && data.stage === 'password') {
+        const box = _sfBox();
+        if (box) { box.replaceChildren(); box.style.display = 'none'; }
+        const form = document.getElementById('login-form');
+        if (form) form.style.display = '';
+        _beginPasswordStage(data);
+        return;
+    }
+    if (data && data.second_factor_required) { beginSecondFactor(data); return; }
+    await finishSecondFactorLogin(data && data.access_token);
+}
+
 function _beginPasswordStage(data) {
     _passwordStage = { token: data.pre_auth_token, username: data.username || '' };
     const input = document.getElementById('username');
@@ -2161,7 +2177,16 @@ function beginSecondFactor(data) {
     box.style.display = '';
     const pre = data.pre_auth_token;
     if (data.enrollment_required) {
-        renderEnrollmentWizard(box, { preAuthToken: pre, password: pw });
+        // What may be set up: an authenticator app, a passkey, or either. A passkey is offered first where this
+        // browser can make one (it meets a pending authenticator enrollment too); a required passkey with no
+        // authenticator pending is the passkey's card whatever the browser, which then says what to do.
+        const kinds = Array.isArray(data.enrollment_methods) && data.enrollment_methods.length ? data.enrollment_methods : ['totp'];
+        const canMake = !!window.Passkeys && Passkeys.supported();
+        if (kinds.includes('passkey') && (canMake || !kinds.includes('totp'))) {
+            renderPasskeyEnrollment(box, { preAuthToken: pre, password: pw, authenticatorToo: kinds.includes('totp') });
+        } else {
+            renderEnrollmentWizard(box, { preAuthToken: pre, password: pw });
+        }
     } else {
         renderVerifyCard(box, { preAuthToken: pre, methods: Array.isArray(data.methods) ? data.methods : ['totp', 'recovery'] });
     }
@@ -2244,7 +2269,7 @@ function renderVerifyCard(box, opts) {
                 verify.disabled = false; return;
             }
             const d = await resp.json();
-            await finishSecondFactorLogin(d.access_token);
+            await _signInStepAnswer(d);
         } catch (e) {
             _sfError(err, 'Could not reach the server. Please try again.');
             verify.disabled = false;
@@ -2280,7 +2305,7 @@ function renderVerifyCard(box, opts) {
                     return;
                 }
                 _markPasskeyUsedHere();
-                await finishSecondFactorLogin(d.access_token);
+                await _signInStepAnswer(d);
             } catch (e) {
                 if (!Passkeys.cancelled(e)) _sfError(err, Passkeys.failureText(e));
             } finally {
@@ -2300,6 +2325,70 @@ function renderVerifyCard(box, opts) {
     box.appendChild(back);
     if (hasCode) applyMode();
     else if (passkey) passkey.focus();
+}
+
+// The passkey a role must hold, set up at the sign-in: the held sign-in's own token starts the registration, the
+// device makes the key, and the server's answer is the session or one more step.
+function renderPasskeyEnrollment(box, opts) {
+    const preAuthToken = opts.preAuthToken;
+    const canMake = !!window.Passkeys && Passkeys.supported();
+    box.replaceChildren();
+    box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Add a passkey to finish signing in'));
+    box.appendChild(_el('p', 'text-secondary text-sm mb-md', canMake
+        ? 'Your administrator requires a passkey for your account. Your device will ask for its PIN, fingerprint or face, or for a security key.'
+        : 'Your administrator requires a passkey for your account, and this browser cannot make one here. Sign in from a browser that can, or ask an administrator.'));
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert');
+    box.appendChild(err);
+    const said = (answer, fallback) => {
+        const detail = answer && answer.detail;
+        if (typeof detail === 'string') return detail;
+        return (detail && typeof detail.message === 'string') ? detail.message : fallback;
+    };
+    if (canMake) {
+        const add = _el('button', 'btn btn-primary btn-block mt-sm', 'Add a passkey');
+        add.type = 'button'; add.id = 'sf-passkey-enroll';
+        add.addEventListener('click', async () => {
+            err.style.display = 'none';
+            add.disabled = true;
+            try {
+                const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${preAuthToken}` };
+                const start = await fetch(`${API_BASE}/users/me/passkeys/register/options`, { method: 'POST', headers, body: '{}' });
+                if (!start.ok) {
+                    _sfError(err, said(await start.json().catch(() => ({})), 'A passkey cannot be added right now.'));
+                    return;
+                }
+                const { challenge_id, options } = await start.json();
+                const credential = await Passkeys.create(options);
+                const resp = await fetch(`${API_BASE}/users/me/passkeys/register/verify`, {
+                    method: 'POST', headers, body: JSON.stringify({ challenge_id, credential, label: null })
+                });
+                const d = await resp.json().catch(() => ({}));
+                if (!resp.ok) { _sfError(err, said(d, 'The passkey was not added.')); return; }
+                _markPasskeyUsedHere();
+                await _signInStepAnswer(d);
+            } catch (e) {
+                if (!Passkeys.cancelled(e)) _sfError(err, Passkeys.failureText(e));
+            } finally {
+                add.disabled = false;
+            }
+        });
+        box.appendChild(add);
+    }
+    if (opts.authenticatorToo) {
+        const other = _el('a', 'mt-sm', 'Set up an authenticator app instead'); other.href = '#'; other.setAttribute('role', 'button');
+        other.id = 'sf-enroll-authenticator'; other.style.display = 'block';
+        other.addEventListener('click', (e) => {
+            e.preventDefault();
+            box.replaceChildren();
+            renderEnrollmentWizard(box, { preAuthToken, password: opts.password || '' });
+        });
+        box.appendChild(other);
+    }
+    const back = _el('a', 'mt-md', '← Back to sign in'); back.href = '#'; back.setAttribute('role', 'button'); back.style.display = 'block';
+    back.addEventListener('click', (e) => { e.preventDefault(); _sfCancel(preAuthToken); });
+    box.appendChild(back);
+    const first = box.querySelector('#sf-passkey-enroll') || back;
+    first.focus();
 }
 
 function renderEnrollmentWizard(box, opts) {
@@ -2416,7 +2505,7 @@ function renderEnrollmentWizard(box, opts) {
                     _sfError(e3, (e && e.detail) || 'Could not finish enrollment.'); done.disabled = false; return;
                 }
                 const dd = await resp.json();
-                if (dd.access_token) await finishSecondFactorLogin(dd.access_token);
+                if (dd.access_token || dd.second_factor_required) await _signInStepAnswer(dd);   // signed in, or one more step
                 else if (onComplete) onComplete();          // settings path: already signed in
                 else _sfRestoreLoginForm();
             } catch (_) { _sfError(e3, 'Could not reach the server.'); done.disabled = false; }
@@ -7335,7 +7424,7 @@ async function renderAccountPasskeys() {
     body.replaceChildren();
     const requirement = data.requirement || {};
     if (requirement.required && !requirement.cleared) {
-        body.appendChild(_el('p', requirement.overdue ? 'text-danger text-sm mb-sm' : 'text-warning text-sm mb-sm',
+        body.appendChild(_el('p', requirement.overdue ? 'text-error text-sm mb-sm' : 'text-warning text-sm mb-sm',
             requirement.overdue ? 'Your role must hold a passkey: add one now to keep signing in.'
                 : 'Your role must hold a passkey' + (requirement.due ? ' by ' + (_passkeyWhen(requirement.due) || requirement.due) : '')
                   + '.'));

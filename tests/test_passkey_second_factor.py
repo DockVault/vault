@@ -48,7 +48,7 @@ class Harness(SignInHarness):
         from app.core import security
         monkeypatch.setattr(security, "verify_password", lambda plain, hashed: plain == "pw" and hashed == "x")
 
-    def pending_for(self, user, methods=("pwd",), provider=None):
+    def pending_for(self, user, methods=("pwd",), provider=None, provider_mfa=False):
         from app.core.models import PendingLogin
         from app.core.security import create_access_token
         pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, consumed_at=None, attempts=0,
@@ -59,6 +59,8 @@ class Harness(SignInHarness):
                   "stage": "second_factor", "methods_so_far": list(methods)}
         if provider is not None:
             claims["idp"] = provider            # the sign-in came through an identity provider
+        if provider_mfa:
+            claims["provider_mfa"] = True       # and carried the provider's trusted MFA
         token = create_access_token(claims)
         return pending, {"Authorization": f"Bearer {token}"}
 

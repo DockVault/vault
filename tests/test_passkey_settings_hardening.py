@@ -5,6 +5,7 @@ the rows stay; the passwordless roles; the device-bound rule in a compliance ste
 route; the enrolling principal; the bounds refused before the step-up; the managed-settings route knowing nothing
 of the Sign-in page; direct attestation without anchors refusing registrations. Offline."""
 import types
+import uuid
 from datetime import datetime, timedelta
 
 import pytest
@@ -60,6 +61,151 @@ def test_a_requirement_past_its_grace_is_met_by_a_passkey_and_nothing_else(monke
     # Within the grace nothing is held.
     alice.passkey_required_since = datetime.utcnow() - timedelta(days=2)
     assert isinstance(finish(alice, ["pwd", "totp"]), sign_in.SignedIn)
+
+
+def _authenticator(h, user):
+    from app.core.models import SecondFactorEnrollment
+    h.db.rows_of(SecondFactorEnrollment).append(
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, method="totp", status="active"))
+
+
+def test_an_overdue_requirement_asks_the_accounts_own_factor_before_the_enrollment(monkeypatch):
+    """An account that holds an authenticator and owes a passkey past its grace gives the authenticator's code first:
+    its first proof alone (the password, a provider without trusted MFA) never reaches the enrollment, where whoever
+    knows only the password would add a passkey of their own. The harness has the login switch off, the case in
+    which nothing else would ask for the code. An account with no factor still enrolls after its first proof."""
+    registry, wss = _mod()
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    bob = _user("bob", passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    root = _user("root", role="admin", passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = SignInHarness(monkeypatch, [alice, bob, root])
+    _authenticator(h, alice)
+    _authenticator(h, root)
+    _required(monkeypatch, registry, wss, ["user", "admin"])
+    from app.services import sign_in
+
+    def finish(user, methods, **kw):
+        return sign_in.finish(h.db, sign_in.SignInResult(user, methods, "203.0.113.9", **kw))
+
+    for methods, kw in ((["pwd"], {}), ([], {"provider_id": "p"})):
+        outcome = finish(alice, methods, **kw)
+        assert isinstance(outcome, sign_in.PendingStep), (methods, kw)
+        assert outcome.body["stage"] == "second_factor" and outcome.body["enrollment_required"] is False, (methods, kw)
+        assert outcome.body["methods"] == ["totp", "recovery"] and outcome.body["enrollment_methods"] == [], (methods, kw)
+        assert outcome.body["access_token"] is None
+    # The code given, or a trusted provider's MFA in its place: now the passkey is asked for.
+    for methods, kw in ((["pwd", "totp"], {}), (["pwd", "recovery"], {}), (["totp"], {"provider_id": "p"}),
+                        ([], {"provider_id": "p", "provider_mfa_trusted": True})):
+        outcome = finish(alice, methods, **kw)
+        assert isinstance(outcome, sign_in.PendingStep), (methods, kw)
+        assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["passkey"], (methods, kw)
+        assert outcome.body["methods"] == []
+    # An administrator: the password, then the code, then the passkey.
+    outcome = finish(root, [], provider_id="p")
+    assert outcome.body["stage"] == "password"
+    outcome = finish(root, ["pwd"], provider_id="p")
+    assert outcome.body["enrollment_required"] is False and outcome.body["methods"] == ["totp", "recovery"]
+    outcome = finish(root, ["pwd", "totp"], provider_id="p")
+    assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["passkey"]
+    # No factor of its own: the enrollment follows the first proof, as it did.
+    outcome = finish(bob, ["pwd"])
+    assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["passkey"]
+    assert all(a[0] != "success" for a in h.audits)
+    # Within the grace the login switch decides, as before: nothing is held.
+    alice.passkey_required_since = datetime.utcnow() - timedelta(days=2)
+    assert isinstance(finish(alice, ["pwd"]), sign_in.SignedIn)
+
+
+def test_a_requirement_waits_while_no_passkey_can_be_made_at_the_address(monkeypatch):
+    """The address changed under a saved requirement (emptied, plain http, an IP put first): nobody is held for a
+    passkey there is no way to make. A user and an administrator past the grace sign in as without the requirement,
+    the grace is forgotten, and the profile is told that it waits; with an address again the requirement is back
+    and the grace starts over."""
+    registry, wss = _mod()
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    root = _user("root", role="admin", passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = SignInHarness(monkeypatch, [alice, root])
+    _required(monkeypatch, registry, wss, ["user", "admin"])
+    from app.services import sign_in
+
+    def finish(user, methods, **kw):
+        return sign_in.finish(h.db, sign_in.SignInResult(user, methods, "203.0.113.9", **kw))
+
+    assert wss.requirement(h.db, alice).overdue is True and wss.requirement_paused() is False
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: False)
+    waiting = wss.requirement(h.db, alice)
+    assert waiting == wss.Requirement(False, paused=True) and wss.requirement_paused() is True
+    assert wss.requirement_public(waiting) == {"required": False, "since": None, "due": None, "overdue": False,
+                                               "cleared": False, "paused": True}
+    for user in (alice, root):
+        outcome = finish(user, ["pwd"])
+        assert isinstance(outcome, sign_in.SignedIn), user.username
+        assert user.passkey_required_since is None, user.username          # the grace does not run meanwhile
+    # An account the host operator cleared stays cleared, not paused; a role not named is not paused either.
+    alice.passkey_requirement_cleared_at = datetime.utcnow()
+    assert wss.requirement(h.db, alice) == wss.Requirement(False, cleared=True)
+    alice.passkey_requirement_cleared_at = None
+    assert wss.requirement(h.db, _user("eve", role="external")) == wss.Requirement(False)
+    # The address is back: required again, and the grace starts at this sign-in.
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: True)
+    assert isinstance(finish(alice, ["pwd"]), sign_in.SignedIn)
+    back = wss.requirement(h.db, alice)
+    assert back.required is True and back.overdue is False and back.paused is False
+    assert alice.passkey_required_since is not None and datetime.utcnow() - alice.passkey_required_since < timedelta(minutes=1)
+
+
+def test_whether_a_passkey_can_be_made_is_what_the_address_says(monkeypatch):
+    registry, wss = _mod()
+    import app.core.public_url as public_url
+    monkeypatch.setattr(public_url, "readiness", lambda: {"usable": False, "rp_id": "", "origin": "", "reason": "no_public_host"})
+    assert wss.passkeys_can_be_made() is False
+    monkeypatch.setattr(public_url, "readiness", lambda: {"usable": False, "rp_id": "10.0.0.5", "origin": "https://10.0.0.5",
+                                                         "reason": "ip_address"})
+    assert wss.passkeys_can_be_made() is False
+    monkeypatch.setattr(public_url, "readiness", lambda: {"usable": True, "rp_id": "vault.example.test",
+                                                         "origin": "https://vault.example.test", "reason": "ok"})
+    assert wss.passkeys_can_be_made() is True
+
+
+def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monkeypatch):
+    """The registration routes refuse a held sign-in that would enroll a passkey before the account's own factor
+    was given, whatever made the token; with the code among its proofs, or a trusted provider's MFA, it registers,
+    and the sign-in then finishes with the new key."""
+    registry, wss = _mod()
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = StepHarness(monkeypatch, [alice])
+    _authenticator(h, alice)
+    _required(monkeypatch, registry, wss, ["user"])
+    from app.core.models import WebAuthnCredential
+    options_path, verify_path = "/users/me/passkeys/register/options", "/users/me/passkeys/register/verify"
+    pending, headers = h.pending_for(alice)                     # the password alone
+    pending.enrollment_required = True
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == 401 and body["detail"] == "Confirm your second factor first; start the sign-in again.", body
+    status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)
+    assert status == 401 and body["detail"] == "Confirm your second factor first; start the sign-in again.", body
+    pending, headers = h.pending_for(alice, methods=(), provider="p")       # a provider, its MFA not trusted
+    pending.enrollment_required = True
+    assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 401
+    assert h.db.rows_of(WebAuthnCredential) == [] and pending.consumed_at is None
+    # A provider whose MFA is trusted stands in for the code.
+    pending, headers = h.pending_for(alice, methods=(), provider="p", provider_mfa=True)
+    pending.enrollment_required = True
+    assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 200
+    # The code among the proofs: the registration goes through and finishes the sign-in.
+    pending, headers = h.pending_for(alice, methods=("pwd", "totp"))
+    pending.enrollment_required = True
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == 200, body
+    credential = SoftAuthenticator().make_credential(body["options"], ORIGIN)
+    status, out = _call_h(h.S, "POST", verify_path,
+                          {"challenge_id": body["challenge_id"], "credential": credential, "label": "k"}, headers)
+    assert status == 201 and out.get("access_token"), out
+    assert set(_claims(out["access_token"])["amr"]) >= {"pwd", "totp"}
+    assert len(h.db.rows_of(WebAuthnCredential)) == 1
 
 
 def test_mode_off_stops_passkeys_at_every_step_but_keeps_the_rows(monkeypatch):

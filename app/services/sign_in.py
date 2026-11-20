@@ -504,11 +504,19 @@ def finish(db, result: SignInResult):
         # sign-in stops at the enrollment (a user-verified passkey meets a pending authenticator enrollment too).
         passkey = api._passkey_requirement(db, user)
         enrollment_methods = list(ENROLLMENT_METHODS) if enrollment_pending else []
+        if passkey.paused:
+            api._passkey_pause_grace(user)
         if passkey.required:
             api._passkey_mark_required(user)
             enrollment_methods.append("passkey")
             if passkey.overdue:
-                in_effect, enrollment_pending = True, True
+                # An account that holds a factor of its own gives it before it enrolls the passkey, whatever the
+                # login switch says: an enrollment straight after the first proof would let whoever knows the
+                # password add a passkey of their own, past the factor the account set up. Only an account with no
+                # factor at all enrolls after its first proof, as a required authenticator is enrolled.
+                in_effect = True
+                if not holds_a_factor(db, user):
+                    enrollment_pending = True
         try:
             stage = second_factor_due(user, result.methods, factor_in_effect=bool(in_effect),
                                       enrollment_pending=enrollment_pending,
@@ -518,10 +526,11 @@ def finish(db, result: SignInResult):
                                       provider_id=result.provider_id)
         except NoFirstProof:
             raise HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")
-        if passkey.overdue and stage != STAGE_PASSWORD and not (set(result.methods) & PASSKEYS):
-            # The table may be done (the password with a code, a provider's trusted MFA): the passkey the role must
-            # hold is still missing, and past the grace the sign-in stops at its enrollment whatever else was proved.
-            # Only an administrator's password step comes first.
+        if passkey.overdue and stage == DONE and not (set(result.methods) & PASSKEYS):
+            # The table is done (the password with a code, a provider's trusted MFA, an account with no factor): the
+            # passkey the role must hold is still missing, and past the grace the sign-in stops at its enrollment
+            # whatever else was proved. A step the table still asks for (an administrator's password, the
+            # account's own second factor) comes first.
             stage = ENROLL
     if stage == DONE:
         return complete_sign_in(db, result)
@@ -538,6 +547,24 @@ def finish(db, result: SignInResult):
         return begin_pending(db, result, STAGE_SECOND_FACTOR, enrollment_required=True,
                              enrollment_methods=enrollment_methods)
     return begin_pending(db, result, stage)
+
+
+def holds_a_factor(db, user) -> bool:
+    """Whether the account holds a second factor of its own right now: an authenticator or a passkey."""
+    from app.core.active_factors import active_factors
+    return active_factors(db, user.id).any
+
+
+def refuse_enrollment_before_the_accounts_factor(db, user, pending) -> None:
+    """A held sign-in sets a passkey up only when nothing of the account's own is still owed: an account that holds
+    a second factor gives it (or comes with a trusted provider's MFA) before it enrolls another. The pipeline
+    makes no enrollment hold that skips the factor; this refuses one at the registration routes all the same,
+    whatever made the token."""
+    if pending is None or not holds_a_factor(db, user):
+        return
+    if (set(methods_so_far(pending)) & SECOND_KINDS) or provider_mfa_of(pending):
+        return
+    raise HTTPException(status_code=401, detail="Confirm your second factor first; start the sign-in again.")
 
 
 def refuse_unless_the_account_may_sign_in(db, user, client_ip: Optional[str]) -> None:

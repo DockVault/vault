@@ -388,6 +388,7 @@ def _passkey_rule(monkeypatch, *, roles=("user",), grace=7, held=0):
     monkeypatch.setattr(webauthn_settings, "mode", lambda: webauthn_settings.REQUIRED_FOR_ROLES)
     monkeypatch.setattr(webauthn_settings, "required_roles", lambda: tuple(roles))
     monkeypatch.setattr(webauthn_settings, "grace_days", lambda: grace)
+    monkeypatch.setattr(webauthn_settings, "passkeys_can_be_made", lambda: True)    # the vault has an address for them
     monkeypatch.setattr(active_factors, "_passkey_count", lambda db, user_id: held)
 
 

@@ -166,7 +166,9 @@
         } else {
             line.className = 'alert alert-warning mb-md';
             line.textContent = 'No passkey can be made at this vault yet, whatever is chosen below. '
-                + (data.why_not || '');
+                + (data.why_not || '')
+                + (data.requirement_paused ? ' The passkey requirement below is paused until then: nobody is held at '
+                    + 'the sign-in for a passkey that cannot be made, and the time to set one up starts over.' : '');
         }
     }
 

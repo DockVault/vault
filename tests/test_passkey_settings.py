@@ -28,9 +28,12 @@ def _mod():
 
 
 def _resolving(monkeypatch, registry, values: dict):
-    """The registry answers ``values`` for the keys named, its defaults for the rest."""
+    """The registry answers ``values`` for the keys named, its defaults for the rest. The vault has an address a
+    passkey can be made at, unless the test says otherwise afterwards (a requirement waits without one)."""
+    from app.core import webauthn_settings
     real = registry.resolve
     monkeypatch.setattr(registry, "resolve", lambda key: values[key] if key in values else real(key))
+    monkeypatch.setattr(webauthn_settings, "passkeys_can_be_made", lambda: True)
 
 
 # --------------------------------------------------------------------------- the specs and the policy
@@ -230,6 +233,19 @@ def test_the_settings_route_lists_and_writes_under_the_step_up(monkeypatch):
     assert status == 200 and {s["key"] for s in body["settings"]} == set(wss.KEYS) and body["readiness"]["usable"] is True
     assert body["step_up"] == "admin.auth_policy.write" and body["trust_anchors"] == 0
     assert body["why_not"] == ""                          # a passkey can be made here: nothing to change
+    assert body["requirement_paused"] is False
+    # A requirement saved while the address worked, and the address gone since: the page is told that it waits.
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["user"]})
+    assert _call(S, "GET", "/settings/sign-in")[1]["requirement_paused"] is False
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: False)
+    assert _call(S, "GET", "/settings/sign-in")[1]["requirement_paused"] is True
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: []})
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: False)
+    assert _call(S, "GET", "/settings/sign-in")[1]["requirement_paused"] is False      # no role is named
+    _resolving(monkeypatch, registry, {wss.MODE: "optional", wss.REQUIRED_ROLES: ["user"]})
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: False)
+    assert _call(S, "GET", "/settings/sign-in")[1]["requirement_paused"] is False      # nothing is required
+    _resolving(monkeypatch, registry, {})
     # A refusal from the registry, one from the guards, an unknown key: nothing written, no step-up asked.
     assert _call(S, "PUT", "/settings/sign-in/webauthn_sign_in", {"value": ["admin"]})[0] == 400
     assert _call(S, "PUT", "/settings/sign-in/webauthn_attestation", {"value": "direct"})[0] == 400

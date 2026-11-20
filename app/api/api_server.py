@@ -11454,6 +11454,11 @@ def _passkey_mark_required(user) -> bool:
     return webauthn_settings.mark_required(user)
 
 
+def _passkey_pause_grace(user) -> bool:
+    from app.core import webauthn_settings
+    return webauthn_settings.pause_grace(user)
+
+
 def _passkey_algorithm_check(db, user, row) -> None:
     """A stored key whose algorithm left the allowed list: usable for 30 days with a notice to the owner, then
     refused (webauthn_service.Refused, as any other refusal of the key)."""
@@ -11645,6 +11650,8 @@ async def passkey_register_options(
         raise HTTPException(status_code=404, detail="User not found")
     if pending is None:
         _passkey_first_proof(db, user, request, body.current_password)
+    else:
+        sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     try:
         allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=PASSKEY_OPTIONS_LIMIT,
                                                  window=PASSKEY_OPTIONS_WINDOW, prefix="passkey_register",
@@ -11698,6 +11705,7 @@ async def passkey_register_verify(
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     try:
         challenge = webauthn_challenges.take(body.challenge_id, purpose=webauthn_challenges.REGISTER)
     except webauthn_challenges.Unavailable:

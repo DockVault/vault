@@ -19,6 +19,10 @@ name.
 The requirement's grace window starts the first time it applies to an account (``users.passkey_required_since``);
 the server's operator can clear the requirement for one account from the host (``passkey_requirement_cleared_at``),
 the break-glass for a person whose browser cannot make a passkey. Turning the mode ``off`` keeps every row.
+
+A requirement waits while no passkey can be made at the vault's address (none configured, plain http, an address
+reached by IP): nobody is held at the sign-in for a passkey there is no way to make, and the grace starts over
+once one can be made again. The page and the host tool say that it waits.
 """
 from __future__ import annotations
 
@@ -212,6 +216,7 @@ class Requirement:
     due: Optional[datetime] = None      # when the grace ends
     overdue: bool = False               # the grace ended: the sign-in stops at the enrollment
     cleared: bool = False               # the host operator cleared it for this account
+    paused: bool = False                # the role must hold one, and none can be made at the vault's address now
 
 
 def requirement(db, user, *, now: Optional[datetime] = None) -> Requirement:
@@ -226,9 +231,33 @@ def requirement(db, user, *, now: Optional[datetime] = None) -> Requirement:
         return Requirement(False)
     if active_factors(db, user.id).passkeys > 0:
         return Requirement(False)
+    if not passkeys_can_be_made():
+        # The address changed under the requirement (emptied, plain http, an IP put first): it waits. An account is
+        # never shut out by a rule it has no way to meet; the guard at save could not know.
+        return Requirement(False, paused=True)
     since = getattr(user, "passkey_required_since", None)
     due = since + timedelta(days=grace_days()) if since is not None else None
     return Requirement(True, since=since, due=due, overdue=bool(due is not None and now > due))
+
+
+def passkeys_can_be_made() -> bool:
+    """Whether a browser can make a passkey at the vault's address as it is configured now."""
+    from app.core.public_url import readiness
+    return bool(readiness().get("usable"))
+
+
+def requirement_paused() -> bool:
+    """Whether a requirement is set and waits: some role must hold a passkey, and none can be made here now."""
+    return mode() == REQUIRED_FOR_ROLES and bool(required_roles()) and not passkeys_can_be_made()
+
+
+def pause_grace(user) -> bool:
+    """The grace does not run while the requirement waits: it starts over at the first sign-in after a passkey can
+    be made again. Returns whether anything changed; the caller commits."""
+    if getattr(user, "passkey_required_since", None) is None:
+        return False
+    user.passkey_required_since = None
+    return True
 
 
 def mark_required(user, *, now: Optional[datetime] = None) -> bool:
@@ -244,7 +273,7 @@ def requirement_public(req: Requirement) -> dict:
     def _t(value):
         return value.isoformat() + "Z" if value else None
     return {"required": req.required, "since": _t(req.since), "due": _t(req.due), "overdue": req.overdue,
-            "cleared": req.cleared}
+            "cleared": req.cleared, "paused": req.paused}
 
 
 # --------------------------------------------------------------------------- the 30-day algorithm grace

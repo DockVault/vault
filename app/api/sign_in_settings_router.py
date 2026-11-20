@@ -44,9 +44,11 @@ def _spec_or_404(key: str) -> registry.SettingSpec:
 def get_sign_in_settings(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """The passkey settings as the page shows them: each with its value in force, where it comes from and whether
     the deployment locked it; the public address's readiness (passkeys need one) and, when no passkey can be made at
-    it, what to change, in words; whether trust anchors exist."""
+    it, what to change, in words, and whether a requirement on some role waits because of it; whether trust anchors
+    exist."""
     from app.core.public_url import readiness, why_no_passkeys
     return {"settings": registry.describe(ws_settings.KEYS), "readiness": readiness(), "why_not": why_no_passkeys(),
+            "requirement_paused": ws_settings.requirement_paused(),
             "trust_anchors": len(ws_settings.trust_anchors()), "step_up": ws_settings.STEP_UP_ACTION}
 
 
