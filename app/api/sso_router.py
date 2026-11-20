@@ -425,7 +425,8 @@ async def sign_in_callback(
                 _record_resolution(db, row, found, client_ip=client_ip, details=details)
         sso_groups.tell(db, row, user, applied, client_ip=client_ip)
         from app.core import sign_in_codes
-        result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip)
+        result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip,
+                                     identity=found.identity)
         try:
             handover_code = sign_in_codes.store(sign_in_codes.from_result(
                 result, verifier_hash=login.verifier_hash, code_challenge=login.code_challenge,

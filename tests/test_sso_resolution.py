@@ -620,21 +620,52 @@ def test_the_providers_mfa_is_the_second_factor_only_when_the_policy_trusts_the_
     assert ("mfa_at" in token) is trusted and token["amr"] == []
 
 
-def test_an_account_with_its_own_second_factor_is_never_linked_by_email(monkeypatch):
+def _factor(h, user, kind):
+    """Give ``user`` a second factor of its own as real rows, or what is left of one: an authenticator, a passkey,
+    an administrator's reset of the factor that was there (its rows gone, its passkeys retired), and the states
+    that are no factor (an enrollment never confirmed, a passkey that was retired without a reset)."""
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential
+    now = datetime.utcnow()
+    enrollments, passkeys = h.db.rows_of(SecondFactorEnrollment), h.db.rows_of(WebAuthnCredential)
+    if kind == "authenticator":
+        enrollments.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, method="totp", status="active"))
+    elif kind == "enrollment never confirmed":
+        enrollments.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, method="totp", status="pending"))
+    elif kind == "passkey":
+        passkeys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, retired_at=None))
+    elif kind == "passkey retired":
+        passkeys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, retired_at=now))
+    elif kind == "factor reset by an administrator":
+        passkeys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, retired_at=now))
+        user.second_factor_reset_at = now
+    else:
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", ["authenticator", "passkey", "factor reset by an administrator"])
+@pytest.mark.parametrize("passkeys", ["off", "optional"])
+def test_an_account_with_its_own_second_factor_is_never_linked_by_email(monkeypatch, kind, passkeys):
     """The attack: somebody holds, at the provider, the verified address of an account that set up its own second
     factor. A link by email would stand from the moment the provider answered, before the account's factor is given.
     Started twice, the second sign-in would come through an identity the vault already knows, on the provider's MFA
     alone; and at a provider whose people hold no password, the account's password would be gone at the first. So
     nothing is linked: no identity, no code, the password and the flag as they were, however often it is tried,
     and the page says where the owner links the provider. An account with no factor of its own is linked as before,
-    and the provider's MFA counts for it as the policy says."""
-    from app.services import sign_in as pipeline
+    and the provider's MFA counts for it as the policy says.
+
+    The account's factor is real rows here, of each kind, and counts also while it is between two states: a
+    passkey while passkeys are switched off (it is a factor again the day they are switched on), and an
+    administrator's reset that the account has not answered yet (its next factor is to be set up behind its own
+    password, not by whoever holds its address at the provider)."""
+    from app.core import webauthn_settings
     from app.services import sso_sign_in as sso
+    monkeypatch.setattr(webauthn_settings, "enabled", lambda: passkeys != "off")
     bob, carol, root = _user("bob"), _user("carol"), _user("root", role="admin")
-    monkeypatch.setattr(pipeline, "holds_a_factor", lambda db, user: user.username == "bob")
     p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"], "sso_trust_idp_mfa": True,
                           "sso_accepted_amr": ["mfa"], "sso_password_login": "disabled"})
     h = Resolving(monkeypatch, [bob, carol, root], [p])
+    _factor(h, bob, kind)
+    assert sso.set_up_its_own_factor(h.db, bob) is True and sso.set_up_its_own_factor(h.db, carol) is False
     before = (bob.password_hash, bob.sso_only, bob.sftp_password_auth)
     for _ in range(3):                                   # the first try, and the ones that would ride on it
         location, _state = _sign_in(h, p, sub="someone-at-the-provider", email="bob@example.test", amr=["pwd", "mfa"])
@@ -656,6 +687,50 @@ def test_an_account_with_its_own_second_factor_is_never_linked_by_email(monkeypa
     location, _ = _sign_in(h, p, sub="carol-subject", email="carol@example.test", amr=["pwd", "mfa"])
     status, body = h.finish(location)
     assert status == 200 and "mfa_at" in _claims(body["access_token"]) and len(h.identities()) == 1
+
+
+@pytest.mark.parametrize("kind", ["enrollment never confirmed", "passkey retired"])
+def test_what_is_no_factor_of_the_accounts_own_does_not_keep_a_link_by_email_out(monkeypatch, kind):
+    """The control of the rule above: an authenticator the account began to set up and never confirmed, and a
+    passkey that was retired, are no factor, and the account is linked as one that has none."""
+    from app.services import sso_sign_in as sso
+    bob, root = _user("bob"), _user("root", role="admin")
+    p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [bob, root], [p])
+    _factor(h, bob, kind)
+    assert sso.set_up_its_own_factor(h.db, bob) is False
+    location, _ = _sign_in(h, p, sub="bob-subject", email="bob@example.test")
+    assert location.startswith("/#sso=") and len(h.identities()) == 1, location
+
+
+def test_an_identity_linked_by_email_does_not_stand_in_for_a_factor_the_account_set_up_later(monkeypatch):
+    """The rule in the other order. An account with no factor is linked by its email address, on the provider's
+    word, and the provider's trusted MFA counts for it. Later it sets up a factor of its own. From then on a sign-in
+    through that identity is asked for the account's factor: the provider's MFA stands in for it only at an
+    identity the account itself put there (from its profile), which the same account links afterwards."""
+    bob = _user("bob")
+    p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"], "sso_trust_idp_mfa": True,
+                          "sso_accepted_amr": ["mfa"]})
+    h = Resolving(monkeypatch, [bob], [p])
+    location, _ = _sign_in(h, p, email="bob@example.test", amr=["pwd", "mfa"])
+    status, body = h.finish(location)
+    assert status == 200 and "mfa_at" in _claims(body["access_token"]), body
+    (identity,) = h.identities()
+    assert identity.linked_by == "email"
+    # The account sets up an authenticator of its own.
+    _factor(h, bob, "authenticator")
+    monkeypatch.setattr(h.S, "_login_second_factor_in_effect", lambda db, user: True)
+    monkeypatch.setattr(h.S, "_second_factor_effective", lambda db, user: {"state": "active", "in_effect": True,
+                                                                          "required": False})
+    monkeypatch.setattr(h.S, "_sf_login_methods", lambda db, user: ["totp", "recovery"])
+    location, _ = _sign_in(h, p, email="bob@example.test", amr=["pwd", "mfa"])
+    status, body = h.finish(location)
+    assert status == 200 and body["access_token"] is None and body["stage"] == "second_factor", body
+    # The same identity as the account's own (linked again from its profile): the provider's MFA counts.
+    identity.linked_by = "self"
+    location, _ = _sign_in(h, p, email="bob@example.test", amr=["pwd", "mfa"])
+    status, body = h.finish(location)
+    assert status == 200 and "mfa_at" in _claims(body["access_token"]), body
 
 
 def test_an_account_made_at_its_first_sign_in_comes_in_on_the_providers_trusted_mfa(monkeypatch):
@@ -807,11 +882,12 @@ def test_a_test_sign_in_reports_the_restriction_and_what_the_vault_would_do(monk
                                                                              "the vault never confirmed"), summary
     __import__("app.core.email_confirmation", fromlist=["confirm"]).confirm(bob)
     # An account that set up its own second factor: the administrator reads where its owner links the provider.
-    from app.services import sign_in as pipeline
-    monkeypatch.setattr(pipeline, "holds_a_factor", lambda db, user: True)
+    from app.core.models import SecondFactorEnrollment
+    factor = types.SimpleNamespace(id=uuid.uuid4(), user_id=bob.id, method="totp", status="active")
+    h.db.rows_of(SecondFactorEnrollment).append(factor)
     summary = run(email="bob@example.test")
     assert summary["would"].startswith("refuse: the account that owns this address set up its own second factor"), summary
-    monkeypatch.setattr(pipeline, "holds_a_factor", lambda db, user: False)
+    h.db.rows_of(SecondFactorEnrollment).remove(factor)
     summary = run(email="nobody@example.test")
     assert summary["would"].startswith("refuse: no account is linked")
     h.db.rows_of(type(h.identities()[0]) if h.identities() else __import__("app.core.models", fromlist=["ExternalIdentity"]).ExternalIdentity).append(_identity(root, p))

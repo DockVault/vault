@@ -605,8 +605,7 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         raise Refusal(RESTRICTED, f"privileged_account:{kind}")
     if not email_confirmation.confirmed(user):
         raise Refusal(NO_ACCOUNT, ADDRESS_NOT_CONFIRMED)
-    from app.services import sign_in as pipeline
-    if pipeline.holds_a_factor(db, user):
+    if set_up_its_own_factor(db, user):
         # The account set up a second factor of its own. A link made here would stand before that factor is given:
         # the identity is on the account from the moment the provider answered (and at a provider whose people hold
         # no password, the account's password is gone with it), and whoever holds the address at the provider
@@ -628,6 +627,28 @@ HOLDS_A_FACTOR = "account_holds_a_factor"
 # How an identity linked by its verified email address is recorded (external_identities.linked_by): nobody at the
 # vault asked for such a link, the provider's word put it on the account.
 LINKED_BY_EMAIL = "email"
+
+
+def set_up_its_own_factor(db, user) -> bool:
+    """For the link by email: whether the account set up a second factor of its own, also while that factor is
+    between two states. It did when it holds an authenticator; when it holds any passkey that was not retired,
+    whether or not passkeys are switched on now (switched off they are no factor for a sign-in, and are one
+    again the day they are switched back on); and when an administrator reset its second factor and it has not
+    set the next one up yet (``second_factor_reset_at``: the next one is to be set up behind the account's own
+    password). What a sign-in can be asked for right now (app/core/active_factors.py) is less than that: an
+    account in between would be linked on the provider's word and its next factor set up by whoever holds its
+    address there."""
+    if getattr(user, "second_factor_reset_at", None) is not None:
+        return True
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential
+    from app.core.table_presence import has_table
+    if db.query(SecondFactorEnrollment.id).filter(SecondFactorEnrollment.user_id == user.id,
+                                                  SecondFactorEnrollment.status == "active").first() is not None:
+        return True
+    if not has_table(db, WebAuthnCredential.__tablename__):
+        return False
+    return db.query(WebAuthnCredential.id).filter(WebAuthnCredential.user_id == user.id,
+                                                  WebAuthnCredential.retired_at.is_(None)).first() is not None
 
 
 def _link_by_email(db, row, answer: ProviderAnswer, policy: dict):
@@ -851,15 +872,24 @@ def _group_names(row, answer: ProviderAnswer) -> list:
     return sorted(answer.groups or [])[:200]
 
 
-def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str]):
+def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str],
+                    identity=None):
     """The pipeline's result for a provider sign-in: the provider is the first proof (``amr`` carries what the
     vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
-    provider's policy trusts the values the token carried. (No identity is on an account that holds a second
-    factor of its own unless that account put it there itself: see :func:`_email_match`.)"""
+    provider's policy trusts the values the token carried, and never for an identity that stands on the provider's
+    word alone once the account has a factor of its own.
+
+    ``identity``: the identity the sign-in came through. An identity is put on an account that set up its own
+    second factor only by that account, from its profile (:func:`_email_match`, :func:`set_up_its_own_factor`).
+    One linked by email before the account set a factor up stays linked; from the day the account has its own
+    factor, the provider's MFA no longer stands in for it at sign-ins through that identity, and the account's
+    factor is asked. Its owner makes the link their own by linking the provider again from Your account."""
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
+    on_the_providers_word = (identity is not None and getattr(identity, "linked_by", None) == LINKED_BY_EMAIL
+                             and set_up_its_own_factor(db, user))
     return SignInResult(user, [], client_ip, provider_id=provider_id,
-                        provider_mfa_trusted=mfa_trusted(row, answer),
+                        provider_mfa_trusted=mfa_trusted(row, answer) and not on_the_providers_word,
                         provider_auth_time=answer.auth_time,
                         provider_sid=answer.sid, provider_sub=answer.subject,
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)
