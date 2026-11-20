@@ -41,7 +41,44 @@ def test_a_host_name_or_nothing_gets_no_note(name):
 ])
 def test_the_note_judges_the_address_as_setup_writes_it(cfg, hidden):
     written = dv.allowed_hosts_value(cfg)
-    assert bool(dv.passkey_address_note(dv._allowed_hosts_name(written))) is hidden, written
+    assert bool(dv.sign_in_address_note(written)) is hidden, written
+
+
+# What the vault says of an address (app/core/public_url.readiness), for what the tool says of it.
+AS_THE_VAULT_SAYS = {None: "ok", "none": "no_public_host", "http": "address_not_usable", "script": "address_not_usable",
+                     "ip": "ip_address"}
+
+
+@pytest.mark.parametrize("written, reason", [
+    ("vault.example.com", None), ("vault.example.com:8443", None), ("https://vault.example.com:8443", None),
+    ("*.example.com,vault.example.com", None), ("http://localhost:8443", None),
+    ("http://vault.lan:8080", "http"), ("http://10.0.0.5:8080", "http"), ("http://vault.lan:8080,vault.example.com", "http"),
+    ("203.0.113.9", "ip"), ("https://203.0.113.9:8443", "ip"), ("http://127.0.0.1:8080", "ip"),
+    ("http://[::1]:8080", "ip"), ("https://[2001:db8::1]:8443", "ip"),
+    ("", "none"), ("*.example.com", "none"), (None, "none"),
+    ("https://b\u00fccher.example", "script"), ("stra\u00dfe.example", "script"),
+])
+def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypatch):
+    """Setup and status speak before the vault runs, so the tool has the rule in its own words; this holds the two
+    to one answer for every kind of address: none, plain http, a name in another script, an IP, and one that works."""
+    from app.core import allowed_hosts, public_url
+    assert dv.sign_in_address_reason(written) == reason
+    monkeypatch.setattr(public_url, "link_base", lambda: allowed_hosts.link_base(written or ""))
+    ready = public_url.readiness()
+    assert ready["reason"] == AS_THE_VAULT_SAYS[reason], (written, ready)
+    assert ready["usable"] is (reason is None)
+    note = dv.sign_in_address_note(written)
+    assert (note is None) is (reason is None)
+    if note:
+        assert note.startswith("passkeys stay hidden") and "waits meanwhile, and locks nobody out" in note
+        assert "ALLOWED_HOSTS" in note
+
+
+def test_each_reason_says_what_to_change():
+    assert "only over https" in dv.sign_in_address_note("http://vault.lan:8080")
+    assert "xn-- form" in dv.sign_in_address_note("https://b\u00fccher.example")
+    assert "has no address" in dv.sign_in_address_note("")
+    assert "reached by IP" in dv.sign_in_address_note("https://203.0.113.9:8443")
 
 
 def test_the_rule_the_vault_checks_is_the_tools_too():
@@ -67,6 +104,11 @@ def test_status_says_passkeys_are_hidden_at_an_ip(monkeypatch, tmp_path):
     monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
     tool._print_status("combined")
     assert any("Passkeys: hidden" in line and "reached by IP" in line for line in printed), printed
+    for written, said in (("http://vault.lan:8080", "only over https"), ("", "has no address")):
+        printed.clear()
+        monkeypatch.setattr(tool, "_load_env", lambda env={"ALLOWED_HOSTS": written, "SERVER_NAME": "vault"}: env)
+        tool._print_status("combined")
+        assert any("Passkeys: hidden" in line and said in line and "waits meanwhile" in line for line in printed), printed
     for named in ({"ALLOWED_HOSTS": "vault.example.com"}, {"ALLOWED_HOSTS": "*.example.com,vault.example.com"}, {}):
         printed.clear()
         monkeypatch.setattr(tool, "_load_env", lambda env=named: env)
@@ -77,12 +119,13 @@ def test_status_says_passkeys_are_hidden_at_an_ip(monkeypatch, tmp_path):
 def test_setup_says_it_once_the_address_is_known():
     source = io.open(ROOT / "dockvault.py", encoding="utf-8").read()
     setup = source[source.index("def _collect_setup_config"):source.index("def _resolve_cert_cfg")]
-    assert "passkey_address_note(_allowed_hosts_name(allowed_hosts_value(" in setup
-    assert setup.index("web_public = public_web_address(") < setup.index("passkey_address_note(")
+    assert "sign_in_address_note(allowed_hosts_value(" in setup
+    assert setup.index("web_public = public_web_address(") < setup.index("sign_in_address_note(")
 
 
 def test_the_example_environment_says_it_beside_the_address():
     text = io.open(ROOT / ".env.example", encoding="utf-8").read()
     before, _, _after = text.partition("\nALLOWED_HOSTS=")
     tail = before[-2500:]
-    assert "Passkeys need a HOST NAME" in tail and "reached by IP" in tail and "dockvault.py setup and status say so" in tail
+    assert "Passkeys need https and a HOST NAME" in tail and "reached by IP" in tail and "plain http" in tail
+    assert "xn-- form" in tail and "waits meanwhile" in tail and "dockvault.py setup and status say so" in tail

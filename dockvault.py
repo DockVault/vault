@@ -753,6 +753,70 @@ def passkey_address_note(name):
             "either way.")
 
 
+def _allowed_hosts_first(value):
+    """(scheme, host name) of ALLOWED_HOSTS's first entry that is not a wildcard, as the application takes it for
+    the address it gives out (app/core/allowed_hosts.py): a bare name is https, a full origin says its own scheme,
+    an IPv6 address stands without its brackets. ("", "") when there is none."""
+    for entry in (e.strip() for e in (value or "").strip().strip("'\"").split(",")):
+        scheme = "https"
+        if "://" in entry:
+            scheme, entry = entry.split("://", 1)
+            scheme = scheme.lower()
+        entry = entry.split("/", 1)[0].lower()
+        if entry.startswith("["):
+            name = entry[1:].split("]", 1)[0]
+        else:
+            name = entry.split(":", 1)[0] if entry.count(":") == 1 else entry
+        if name and "*" not in name and not name.startswith(".") and name != "0.0.0.0":
+            return scheme, name
+    return "", ""
+
+
+# Plain http carries sign-in on this computer only, as the application has it (app/core/public_url.py).
+SIGN_IN_PLAIN_HTTP_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def sign_in_address_reason(allowed_hosts):
+    """Why no passkey can be made at the address the vault gives out (ALLOWED_HOSTS's first entry that is not a
+    wildcard), judged as the application judges it (app/core/public_url.py), or None when one can: ``none`` (no
+    such entry), ``script`` (a host name not written in its xn-- form), ``http`` (plain http anywhere but this
+    computer) or ``ip`` (an address reached by IP)."""
+    import ipaddress
+    scheme, name = _allowed_hosts_first(allowed_hosts)
+    if not name:
+        return "none"
+    if not name.isascii():
+        return "script"
+    if scheme == "http" and name not in SIGN_IN_PLAIN_HTTP_HOSTS:
+        return "http"
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return None
+    return "ip"
+
+
+def sign_in_address_note(allowed_hosts):
+    """What setup and status say when no passkey can be made at the address the vault gives out, or None: what is
+    in the way, what to change, and that a passkey requirement set for a role waits meanwhile."""
+    reason = sign_in_address_reason(allowed_hosts)
+    if reason is None:
+        return None
+    if reason == "ip":
+        said = passkey_address_note(_allowed_hosts_first(allowed_hosts)[1])
+    elif reason == "http":
+        said = ("passkeys stay hidden at this address: browsers make a passkey only over https (plain http carries "
+                "one on this computer alone, at localhost). Put an https address first in ALLOWED_HOSTS when you "
+                "want them; the emailed links work either way.")
+    elif reason == "script":
+        said = ("passkeys stay hidden at this address: its host name is written in another script. Write it first "
+                "in ALLOWED_HOSTS in its xn-- form, as the browser's address bar shows it.")
+    else:
+        said = ("passkeys stay hidden: the vault has no address (ALLOWED_HOSTS has no entry that names one). Set "
+                "it to the address people open the vault at; until then no reset or invitation link is sent either.")
+    return said + " A passkey requirement set for a role in Settings waits meanwhile, and locks nobody out."
+
+
 def build_env_lines(cfg):
     """Build the .env content (list of lines) from a collected-config dict — deterministic + pure
     (it does NOT generate secrets; the caller passes them in). Values are single-quoted, matching
@@ -5219,7 +5283,7 @@ class DockVault:
             print(pal.paint("  (containers not listed while .env is locked - unlock first)", "yellow"))
             return
         env = self._load_env()
-        passkey_note = passkey_address_note(_allowed_hosts_name(env.get("ALLOWED_HOSTS")))
+        passkey_note = sign_in_address_note(env.get("ALLOWED_HOSTS")) if env else None
         if passkey_note:
             print(pal.paint("  Passkeys: hidden - %s" % passkey_note, "yellow"))
         try:
@@ -5597,9 +5661,10 @@ class DockVault:
             self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
         if sftp_public_port is not None and not (1 <= int(sftp_public_port) <= 65535):
             self._fail("invalid SFTP client port (1-65535): %r" % sftp_public_port)
-        # The address people open, as it will be written: passkeys need a host name there, so an IP is said now.
-        passkey_note = passkey_address_note(_allowed_hosts_name(allowed_hosts_value(
-            {"server_name": server, "web_public_address": web_public, "web_host_port": web_port})))
+        # The address people open, as it will be written: passkeys need https and a host name there, so plain http
+        # and an IP are said now.
+        passkey_note = sign_in_address_note(allowed_hosts_value(
+            {"server_name": server, "web_public_address": web_public, "web_host_port": web_port}))
         if passkey_note:
             print(pal.paint("  Note: %s" % passkey_note, "yellow"))
 
