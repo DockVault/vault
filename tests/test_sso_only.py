@@ -161,7 +161,7 @@ def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(mon
     """A password set by an administrator would go live the moment the flag clears; the administrator role needs a
     password for the fixed step-ups. Both are refused while the account signs in only through its provider: at the
     credential change a held approval applies as well as at the route, and the auditor right's preconditions name
-    it; a restore re-randomizes the hash before the link is minted."""
+    it. Letting the account hold a password again clears the flag, sets a hash nobody knows and mints no link."""
     privileged_accounts, sso_only = _mod()
     from fastapi import HTTPException
     from app.core import credential_changes as cc
@@ -190,16 +190,16 @@ def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(mon
     monkeypatch.setattr(cc, "last_applied", lambda db, user_id, now: None)
     assert auditor_rights.preconditions(types.SimpleNamespace(), alice) == [auditor_rights.SSO_ONLY]
     assert "identity provider" in auditor_rights.text(auditor_rights.SSO_ONLY)
-    # A restore sets a fresh unknown hash before minting the link: nothing set meanwhile is a password.
+    # Allowing a password again sets a fresh unknown hash: nothing written meanwhile is a password. No reset link
+    # is minted here; one is made the ordinary way, for this one account, under that route's own rules.
     monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
     alice.password_hash = "admins-choice"
-    bases = []
-    monkeypatch.setattr(S, "_public_base_url", lambda: "https://vault.example.test")
-    monkeypatch.setattr(S, "_mint_reset_link", lambda db, user, base_url, **kw: bases.append(base_url) or "https://x/reset/t")
-    link = sso_only.restore_password_sign_in(types.SimpleNamespace(), alice, created_by_id=None)
-    assert link == "https://x/reset/t" and alice.sso_only is False and alice.password_hash.startswith("argon2:")
-    assert bases == ["https://vault.example.test"]         # the configured address, which no caller hands in
-    assert alice.password_hash != "admins-choice"
+    minted = []
+    monkeypatch.setattr(S, "_mint_reset_link", lambda *a, **kw: minted.append(a) or "https://x/reset/t")
+    assert sso_only.allow_password_sign_in(types.SimpleNamespace(), alice) is None
+    assert alice.sso_only is False and alice.password_hash.startswith("argon2:")
+    assert alice.password_hash != "admins-choice" and minted == []
+    assert not hasattr(sso_only, "restore_password_sign_in")
 
 
 def test_the_sftp_door_refuses_an_sso_only_account_too(monkeypatch):
@@ -234,19 +234,23 @@ def test_the_provider_setting_is_refused_while_a_privileged_account_is_linked_an
     monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: object() if user_id == carol.id else None)
     why = sso_only.disabled_refusal(h.db, p)
     assert "root (an administrator)" in why and "carol (holding the auditor right" in why and "bob" not in why
-    # Without them: bob becomes SSO-only; back to allowed: restored with a reset link.
+    # Without them: bob becomes SSO-only; back to allowed: bob may hold a password again, and no link is minted
+    # for anyone (a provider's setting never hands out a way into its linked accounts).
     h.identities()[:] = [i for i in h.identities() if i.user_id == bob.id]
     assert sso_only.disabled_refusal(h.db, p) is None
     minted = []
     monkeypatch.setattr(h.S, "_mint_reset_link", lambda db, user, base_url, **kw: minted.append((user.username, kw)) or "https://x/reset/t")
-    changed = sso_only.apply_password_login(h.db, p, "disabled", created_by_id=root.id)
+    changed = sso_only.apply_password_login(h.db, p, "disabled")
     assert changed == {"made_sso_only": ["bob"], "restored": []}
     assert bob.sso_only is True and bob.sftp_password_auth is False and bob.password_hash.startswith("argon2:")
-    changed = sso_only.apply_password_login(h.db, p, "disabled", created_by_id=root.id)
+    unknown = bob.password_hash
+    changed = sso_only.apply_password_login(h.db, p, "disabled")
     assert changed == {"made_sso_only": [], "restored": []}                    # already so
-    changed = sso_only.apply_password_login(h.db, p, "allowed", created_by_id=root.id)
-    assert changed == {"made_sso_only": [], "restored": [("bob", "https://x/reset/t")]}
-    assert bob.sso_only is False and minted == [("bob", {"created_by_id": root.id, "made_by_other": True})]
+    changed = sso_only.apply_password_login(h.db, p, "allowed")
+    assert changed == {"made_sso_only": [], "restored": ["bob"]}
+    assert bob.sso_only is False and minted == []
+    assert bob.password_hash.startswith("argon2:") and bob.password_hash != unknown    # still one nobody knows
+    assert sso_only.apply_password_login(h.db, p, "allowed") == {"made_sso_only": [], "restored": []}
 
 
 # --------------------------------------------------------------------------- a passkey does not stand in for the provider

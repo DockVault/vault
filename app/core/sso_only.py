@@ -5,8 +5,10 @@ is replaced by a real hash of 32 random bytes thrown away (the column stays NOT 
 password sign-in cleanly, and nothing can be timed), SFTP password sign-in is turned off, the password door refuses
 the account after the hash check, reset links are not minted or honoured for it, and it cannot set a password.
 The setting is refused while a linked account is privileged (app/core/privileged_accounts.py): those need a local
-password for the fixed step-ups. Setting the provider back to ``allowed``, or an administrator's unlink, clears the
-flag and mints the reset link the person sets a password with. Nothing here commits.
+password for the fixed step-ups. Setting the provider back to ``allowed`` clears the flag and mints nothing: each
+person sets a password by a reset link made the ordinary way (their own request from the sign-in page, or an
+administrator's for that one account), so no change of a provider's setting hands anyone a link to many accounts and
+every link stays under the rules of the route that makes it. Nothing here commits.
 """
 from __future__ import annotations
 
@@ -31,19 +33,13 @@ def make_sso_only(db, user) -> None:
     user.sftp_password_auth = False
 
 
-def restore_password_sign_in(db, user, *, created_by_id) -> Optional[str]:
-    """Let ``user`` sign in with a password again: the flag cleared and a reset link minted for them to set one (the
-    hash stays unusable until then). Returns the link, or None when no link can be minted (the reset pepper is not
-    configured). ``_mint_reset_link`` commits on its own.
-
-    The link is built on the vault's configured address, which no caller hands in and no request supplies
-    (app/core/allowed_hosts.py). With none configured it is relative, for an administrator to complete and pass on,
-    as an administrator's own reset link is."""
-    from app.api import api_server as api
+def allow_password_sign_in(db, user) -> None:
+    """Let ``user`` hold a password again, in the caller's transaction: the flag cleared, so a reset link can be made
+    for the account and it may set a password. The hash stays one nobody knows until such a link is used (whatever
+    was written to it meanwhile is not a password), and nothing is minted here."""
     from app.core.security import hash_password
     user.sso_only = False
-    user.password_hash = hash_password(secrets.token_urlsafe(32))     # whatever was set meanwhile is not a password
-    return api._mint_reset_link(db, user, api._public_base_url(), created_by_id=created_by_id, made_by_other=True)
+    user.password_hash = hash_password(secrets.token_urlsafe(32))
 
 
 def provider_only_message(db, user) -> str:
@@ -113,15 +109,17 @@ def disabled_refusal(db, provider) -> Optional[str]:
             f"linked to it: {', '.join(sorted(named))}. Unlink them, or leave password sign-in allowed.")
 
 
-def apply_password_login(db, provider, value: str, *, created_by_id) -> dict:
+def apply_password_login(db, provider, value: str) -> dict:
     """Apply a saved ``sso_password_login`` to the provider's linked accounts: ``disabled`` makes each SSO-only;
-    ``allowed`` restores each SSO-only one with a reset link. Returns what changed: ``{"made_sso_only": [usernames],
-    "restored": [(username, link or None)]}``. Call :func:`disabled_refusal` first for ``disabled``."""
+    ``allowed`` lets each SSO-only one hold a password again (:func:`allow_password_sign_in`: no link is minted).
+    Returns the usernames changed: ``{"made_sso_only": [...], "restored": [...]}``, each sorted. Call
+    :func:`disabled_refusal` first for ``disabled``."""
     made, restored = [], []
     for user in linked_accounts(db, provider):
         if value == "disabled" and not getattr(user, "sso_only", False):
             make_sso_only(db, user)
             made.append(user.username)
         elif value == "allowed" and getattr(user, "sso_only", False):
-            restored.append((user.username, restore_password_sign_in(db, user, created_by_id=created_by_id)))
-    return {"made_sso_only": made, "restored": restored}
+            allow_password_sign_in(db, user)
+            restored.append(user.username)
+    return {"made_sso_only": sorted(made), "restored": sorted(restored)}
