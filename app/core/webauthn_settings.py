@@ -358,8 +358,9 @@ def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) ->
         from app.core.public_url import why_no_passkeys
         return "Requiring passkeys needs the vault's public address. " + why_no_passkeys()
     if proposed[ATTESTATION] == DIRECT and not trust_anchors():
-        return ("Direct attestation needs trust anchors: set WEBAUTHN_ATTESTATION_ROOTS to a PEM bundle of root "
-                "certificates in .env, restart, and try again.")
+        return ("Direct attestation needs trust anchors: put a PEM bundle of root certificates in the deployment's "
+                "certs folder, set WEBAUTHN_ATTESTATION_ROOTS in .env to its path as the server sees it "
+                "(/app/certs/<file name>), restart, and try again.")
     if proposed[ALLOWED_AAGUIDS] and proposed[ATTESTATION] != DIRECT:
         return "A list of allowed authenticator makes proves nothing without direct attestation: turn that on first."
     if key in (MODE, REQUIRED_ROLES, GRACE_DAYS) and proposed[MODE] == REQUIRED_FOR_ROLES \

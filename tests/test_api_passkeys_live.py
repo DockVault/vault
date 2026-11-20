@@ -4,7 +4,6 @@ administrator's removal goes through the two-person rule, and a second-factor re
 stack whose configured address (the first ALLOWED_HOSTS entry) is the address the test opens (the relying party is
 bound to it); skipped otherwise."""
 import json
-import os
 import uuid
 
 import pytest
@@ -16,7 +15,7 @@ pytestmark = pytest.mark.integration
 
 
 def _public_url():
-    return (os.environ.get("VAULT_PUBLIC_URL") or BASE_URL).rstrip("/")
+    return BASE_URL.rstrip("/")
 
 
 def _skip_unless_ready(client):
