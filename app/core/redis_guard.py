@@ -109,3 +109,42 @@ def best_effort(function: str, op, *, default=None):
         return default
     guard_record_success()
     return result
+
+
+class Skipped(Exception):
+    """The guard is open: the op was not tried, and the socket was not touched."""
+
+
+def _is_an_outage(error: BaseException) -> bool:
+    """Whether ``error`` says Redis could not be reached: its connection, or its timeout. Anything else says nothing
+    of whether Redis is there: a value the client would not write as bytes (raised before Redis is asked at all),
+    or an answer Redis itself gave."""
+    if isinstance(error, OSError):                  # the built-in ConnectionError and TimeoutError among them
+        return True
+    try:
+        from redis import exceptions as redis_errors
+    except Exception:  # noqa: BLE001 -- no client library: nothing more to tell them by
+        return False
+    return isinstance(error, (redis_errors.ConnectionError, redis_errors.TimeoutError))
+
+
+def required(function: str, op):
+    """Run an on-loop Redis op that its caller cannot do without (a one-time code, a ceremony's challenge, a
+    login state: stores with no fallback, which fail closed) behind the read-through guard.
+
+    While the guard is open the socket is skipped and :class:`Skipped` is raised at once, so an outage costs the
+    server one discovery and not one socket timeout for every request that reaches such a store. Otherwise the
+    op runs through ``timed_redis``: a success clears the private memory and returns the result; a failure is
+    raised as it is, and opens the private memory when it says Redis could not be reached. A failure of another
+    kind opens nothing: these stores are reached by anyone, and one request whose value could not be written must
+    not make every such store answer "unavailable" for the next while. Never writes the limiter's breaker."""
+    if guard_is_open(time.time()):
+        raise Skipped(function)
+    try:
+        result = timed_redis(function, op)
+    except Exception as error:
+        if _is_an_outage(error):
+            guard_record_failure(time.time())
+        raise
+    guard_record_success()
+    return result

@@ -212,6 +212,65 @@ def test_without_the_store_the_exchange_fails_closed():
         c.take(c.make_secret(), verifier="v", redis=r)
 
 
+@pytest.fixture
+def own_store(monkeypatch):
+    """The vault's own client replaced by the fake, with the outage guard and the limiter's breaker closed before
+    and after."""
+    _codes()
+    from app.core import database, rate_limiter, redis_guard
+
+    def closed():
+        rate_limiter._cb_record_success()
+        redis_guard.guard_record_success()
+    closed()
+    r = _Redis()
+    monkeypatch.setattr(database, "redis_client", r)
+    yield r
+    closed()
+
+
+def test_while_redis_is_known_to_be_down_the_vaults_own_store_is_not_touched(own_store, monkeypatch):
+    c = _codes()
+    from app.core import redis_guard
+    code = c.store(_handover(verifier_hash=c.digest("v")))
+    calls = []
+    monkeypatch.setattr(own_store, "set", lambda *a, **k: calls.append("set"))
+    monkeypatch.setattr(own_store, "getdel", lambda *a, **k: calls.append("getdel"))
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda now: True)
+    with pytest.raises(c.Unavailable):
+        c.store(_handover(verifier_hash=c.digest("v")))
+    with pytest.raises(c.Unavailable):
+        c.take(code, verifier="v")
+    assert calls == []                      # refused before the socket, both ways
+
+
+def test_a_failure_of_the_vaults_own_store_is_remembered_for_the_next_call(own_store):
+    c = _codes()
+    from app.core import redis_guard
+    code = c.store(_handover(verifier_hash=c.digest("v")))
+    assert not redis_guard.guard_private_open(time.time())
+    own_store.broken = True
+    with pytest.raises(c.Unavailable):
+        c.take(c.make_secret(), verifier="v")
+    assert redis_guard.guard_private_open(time.time())     # the first failure opens the shared memory
+    own_store.broken = False                                # the store is back, the memory is not yet over:
+    with pytest.raises(c.Unavailable):
+        c.take(code, verifier="v")                          # still refused, and the code is not spent by it
+    redis_guard.guard_record_success()
+    assert c.take(code, verifier="v") is not None
+    assert not redis_guard.guard_private_open(time.time())
+
+
+def test_a_client_handed_in_is_called_whatever_the_guard_says(own_store, monkeypatch):
+    c = _codes()
+    from app.core import redis_guard
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda now: True)
+    r = _Redis()
+    code = c.store(_handover(verifier_hash=c.digest("v")), redis=r)
+    assert c.take(code, verifier="v", redis=r) is not None
+    assert own_store.rows == {}
+
+
 def test_a_record_round_trips_through_the_pipelines_result():
     c = _codes()
     from app.core.models import PendingLogin, User

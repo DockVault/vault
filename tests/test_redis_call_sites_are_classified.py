@@ -62,6 +62,9 @@ _REGISTRY = {
         "get": ("D", 1), "set": ("D", 1),        # _CacheStore, behind the read-through guard, fails open
         "hold": ("D", 1), "release": ("D", 2),   # one attempt at a time per name: guarded, fails open
     },
+    "core/sign_in_codes.py": {                   # a one-time sign-in code: no fallback; refused at once,
+        "store": ("B", 1), "take": ("B", 1),     # before the socket, while the guard is open
+    },
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated
     },                                           # short-timeout client (the constructor uses redis.Redis)

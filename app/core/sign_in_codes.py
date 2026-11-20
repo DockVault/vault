@@ -14,7 +14,8 @@ worthless on its own:
 
 The record lives in Redis under the code's SHA-256 for sixty seconds and is read with ``GETDEL``, so a code
 is spent by its first use, right or wrong: a stolen code gives one guess. Without Redis the exchange fails
-closed (``Unavailable``); nothing falls back to the database. The record carries what the sign-in proved
+closed (``Unavailable``); nothing falls back to the database. While Redis is known to be down it fails at once,
+without a try (the shared outage guard, app/core/redis_guard.py). The record carries what the sign-in proved
 (the pipeline's inputs: app/services/sign_in.py), never a session or a token.
 """
 from __future__ import annotations
@@ -71,10 +72,22 @@ def _key(code: str) -> str:
 
 
 def _redis(redis):
+    """The client a call uses: the one handed in, else the vault's own."""
     if redis is not None:
         return redis
     from app.core.database import redis_client
     return redis_client
+
+
+def _run(redis, function: str, op):
+    """One store call; ``op`` is given the client. On the vault's own client the call goes behind the shared outage
+    guard: while Redis is known to be down the socket is not touched and the call fails at once, so an outage
+    costs the server one discovery and not one timeout for every code. Any other client is called as it is."""
+    from app.core import database, redis_guard
+    client = _redis(redis)
+    if client is not database.redis_client:
+        return op(client)
+    return redis_guard.required(function, lambda: op(client))
 
 
 @dataclass
@@ -138,7 +151,7 @@ def store(handover: Handover, *, redis=None, ttl_seconds: int = CODE_TTL_SECONDS
     code = make_secret()
     payload = json.dumps(asdict(handover), separators=(",", ":"))
     try:
-        written = _redis(redis).set(_key(code), payload, ex=int(ttl_seconds), nx=True)
+        written = _run(redis, "sign_in_codes.store", lambda r: r.set(_key(code), payload, ex=int(ttl_seconds), nx=True))
     except Exception as exc:  # noqa: BLE001 -- any store failure is an outage for this exchange
         raise Unavailable("the sign-in code store cannot be reached") from exc
     if not written:
@@ -158,7 +171,7 @@ def take(code: str, *, verifier: Optional[str] = None, code_verifier: Optional[s
     if not isinstance(code, str) or not code or len(code) > _MAX_CODE_LENGTH:
         return None
     try:
-        raw = _redis(redis).getdel(_key(code))
+        raw = _run(redis, "sign_in_codes.take", lambda r: r.getdel(_key(code)))
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in code store cannot be reached") from exc
     if not raw:
