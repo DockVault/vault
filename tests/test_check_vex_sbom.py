@@ -209,37 +209,21 @@ def test_the_command_refuses_an_sbom_it_cannot_read(tmp_path, capsys, sbom_text)
     assert capsys.readouterr().out.startswith("::error::")
 
 
-_OPENSSL_FINDINGS = ("CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692",
-                     "CVE-2026-107496")
-_OPENSSL_PINS = ("pkg:apk/alpine/libssl3@3.5.9-r0", "pkg:apk/alpine/libcrypto3@3.5.9-r0")
-
-
-def test_the_committed_template_pins_the_versions_it_was_reviewed_for(tmp_path, capsys):
-    """The committed template holds one statement bound to Python 3.14.10 and five bound to Alpine's
-    libssl3 and libcrypto3 3.5.9-r0: the check passes for an image with those versions, and fails once
-    the image has moved to another one, so a statement is removed or reviewed again instead of being
-    carried forward."""
+def test_the_committed_template_pins_the_python_it_was_reviewed_for(tmp_path, capsys):
+    """The committed template holds one statement, bound to Python 3.14.10: the check passes for an
+    image with that Python, and fails once the base image has moved to another one, so the statement
+    is removed or reviewed again instead of being carried forward."""
     committed = json.loads(_TEMPLATE.read_text(encoding="utf-8"))
-    assert [s["vulnerability"]["name"] for s in committed["statements"]] == [
-        "CVE-2026-119170", *_OPENSSL_FINDINGS]
-    assert {purl for _, purl, _ in _CHECK.vex_pins(committed)} == {
-        "pkg:generic/python@3.14.10", *_OPENSSL_PINS}
+    assert [s["vulnerability"]["name"] for s in committed["statements"]] == ["CVE-2026-119170"]
+    assert {purl for _, purl, _ in _CHECK.vex_pins(committed)} == {"pkg:generic/python@3.14.10"}
 
-    openssl = tuple(f"{pin}{_ALPINE}" for pin in _OPENSSL_PINS)
     sbom = tmp_path / "sbom.json"
     sbom.write_text(json.dumps(_spdx("pkg:generic/python@3.14.10",
-                                     f"pkg:apk/alpine/zlib@1.3.2-r1{_ALPINE}", *openssl)),
-                    encoding="utf-8")
+                                     f"pkg:apk/alpine/zlib@1.3.2-r1{_ALPINE}")), encoding="utf-8")
     assert _CHECK.main(["--vex", str(_TEMPLATE), "--sbom", str(sbom)]) == 0
-    assert "every package version the VEX names is in the image (11 checked)" in capsys.readouterr().out
+    assert "every package version the VEX names is in the image (1 checked)" in capsys.readouterr().out
 
-    patched = _spdx("pkg:generic/python@3.14.10", f"pkg:apk/alpine/zlib@1.3.2-r1{_ALPINE}",
-                    *(p.replace("@3.5.9-r0", "@3.5.9-r1") for p in openssl))
-    assert _CHECK.stale_pins(committed, patched) == [
-        _CHECK.Stale(name, pin, (pin.replace("@3.5.9-r0", "@3.5.9-r1"),))
-        for name in _OPENSSL_FINDINGS for pin in _OPENSSL_PINS]
-
-    moved = _spdx("pkg:generic/python@3.14.11", f"pkg:apk/alpine/zlib@1.3.2-r1{_ALPINE}", *openssl)
+    moved = _spdx("pkg:generic/python@3.14.11", f"pkg:apk/alpine/zlib@1.3.2-r1{_ALPINE}")
     assert _CHECK.stale_pins(committed, moved) == [
         _CHECK.Stale("CVE-2026-119170", "pkg:generic/python@3.14.10", ("pkg:generic/python@3.14.11",))]
     sbom.write_text(json.dumps(moved), encoding="utf-8")
