@@ -381,7 +381,7 @@ def apply(db, row, changes: dict, stored_policy) -> dict:
             row.policy = stored_policy
             changed.extend("policy." + key for key in keys)
         if now["sso_password_login"] != was["sso_password_login"]:
-            accounts = sso_only.apply_password_login(db, row, now["sso_password_login"])
+            accounts = sso_only.apply_password_login(db, row)       # the row holds the new setting
     return {"changed": changed, "connection_changed": fingerprint(row) != before, **accounts}
 
 
@@ -409,12 +409,16 @@ def remove_refusal(db, row) -> Optional[Conflict]:
     """Why ``row`` may not be removed now, or None."""
     if row.state == ENABLED:
         return Conflict(STILL_ON, "Turn the provider off before removing it.")
+    from app.core import sso_only
     counts = _counts(db, row)
-    if counts["sso_only_accounts"]:
+    if counts["sso_only_accounts"] and sso_only.password_less(row):
+        # These accounts hold no password because of this provider's own setting. Allowing passwords first tells
+        # each of them, and leaves them a way back in (a reset link). Accounts that sign in only through a provider
+        # because of another one they are linked to keep that one, and are not in the way here.
         n = counts["sso_only_accounts"]
         return Conflict(ONLY_WAY_IN, (
-            f"{n} account{'s' if n != 1 else ''} sign{'s' if n == 1 else ''} in only through a provider and "
-            f"{'is' if n == 1 else 'are'} linked to this one. Allow password sign-in for this provider first (Access)."))
+            f"{n} account{'s' if n != 1 else ''} linked to this provider hold{'s' if n == 1 else ''} no password "
+            "because of it. Allow password sign-in for this provider first (Access), so they can set one."))
     if counts["refusals"]:
         n = counts["refusals"]
         return Conflict(REFUSALS_IN_FORCE, (

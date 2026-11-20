@@ -32,6 +32,7 @@ from app.api.user_management_api import get_current_user, require_interactive_ad
 from app.core import sso_state
 from app.core.database import get_db
 from app.core.models import ExternalIdentity, SsoProvider, User
+from app.core import sso_only
 from app.core import sso_policy
 from app.services import oidc_client as oc
 from app.services import sso_freshness
@@ -760,7 +761,8 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
            details={"provider_id": details.get("provider_id"), "linked_by": found.linked_by})
     if found.linked_by == "self":
         _tell_owner(db, user, row, "A sign-in method was added",
-                    f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address.")
+                    f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address."
+                    + (PASSWORD_STOPPED.format(label=label) if found.password_stopped else ""))
         # A link nobody at the vault asked for: the administrators are told of each, as of an account made at a
         # first sign-in.
         try:
@@ -772,6 +774,11 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
                               target="#users")
         except Exception as exc:  # noqa: BLE001
             log.info("sso link-by-email notices skipped: %s", type(exc).__name__)
+
+
+# What an owner is told when a link made their account sign in only through the provider.
+PASSWORD_STOPPED = (" {label} signs its people in without a vault password, so your password and SFTP password "
+                    "sign-in no longer work: you sign in through {label} from now on.")
 
 
 def _claim_handover(db, request, current_user, body: SsoHandoverFinishRequest, *, purpose: str):
@@ -829,8 +836,13 @@ async def finish_link(
                                                      "message": sso.reason_text(sso.PROVIDER_DISABLED)})
     answer = sso.answer_from_record(record)
     from sqlalchemy.exc import IntegrityError
+    # The account as this transaction holds it: the link may also end its password (a provider whose people hold
+    # none), and that is written with the link or not at all.
+    account = db.query(User).filter(User.id == current_user.id).first() or current_user
+    had_password = not getattr(account, "sso_only", False)
     try:
-        identity = sso.link_identity(db, row, current_user, answer, linked_by="self")
+        identity = sso.link_identity(db, row, account, answer, linked_by="self")
+        password_stopped = had_password and bool(getattr(account, "sso_only", False))
         db.commit()
     except (sso.Refusal, IntegrityError) as exc:
         db.rollback()
@@ -840,9 +852,14 @@ async def finish_link(
         raise HTTPException(status_code=409, detail={"reason": code, "message": sso.reason_text(code)})
     _audit(db, "sso_identity_linked", user=current_user, ip=client_ip,
            details={"provider_id": str(row.id), "purpose": sso_state.LINK, "identity_id": str(identity.id), "linked_by": "self"})
+    label = row.label or row.name
     _tell_owner(db, current_user, row, "A sign-in method was added to your account",
-                f"You linked your account to {row.label or row.name}: it can now sign in through it.")
-    return {"linked": True, "identity": _identity_public(identity, row)}
+                f"You linked your account to {label}: it can now sign in through it."
+                + (PASSWORD_STOPPED.format(label=label) if password_stopped else ""))
+    answer = {"linked": True, "identity": _identity_public(identity, row)}
+    if password_stopped:
+        answer["password_stopped"] = True
+    return answer
 
 
 @router.post("/admin/sso/providers/{provider_id}/test/start")
@@ -957,6 +974,9 @@ async def list_my_identities(
     return {"identities": [_identity_public(i, providers.get(str(i.provider_id))) for i in rows],
             "providers": [{"id": str(p.id), "label": p.label or p.name, "icon": p.icon or "generic",
                            "linked": str(p.id) in linked,
+                           # Linking it ends the account's password: the page says so before it starts the link.
+                           "ends_password": (str(p.id) not in linked and sso_only.password_less(p)
+                                             and not getattr(current_user, "sso_only", False)),
                            "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)} for p in offered]}
 
 
@@ -1034,12 +1054,17 @@ async def unlink_my_identity(
                                                  ExternalIdentity.user_id == current_user.id).first()
     if identity is None:
         raise HTTPException(status_code=404, detail="That identity was not found.")
-    others = db.query(ExternalIdentity.id).filter(ExternalIdentity.user_id == current_user.id,
-                                                  ExternalIdentity.id != identity.id).count()
-    if getattr(current_user, "sso_only", False) and others == 0:
-        raise HTTPException(status_code=409, detail=(
-            "Your account signs in only through single sign-on, and this is its only identity. Ask an "
-            "administrator for a password first."))
+    account = db.query(User).filter(User.id == current_user.id).first() or current_user
+    if getattr(account, "sso_only", False):
+        # The account holds no password: after the unlink it must still have a provider that is on to sign in
+        # through. One that is off, or not finished, is no way in.
+        others = [i for i in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == account.id,
+                                                               ExternalIdentity.id != identity.id).all()]
+        ways_in = [i for i in others if getattr(_provider(db, i.provider_id), "state", None) == "enabled"]
+        if not ways_in:
+            raise HTTPException(status_code=409, detail=(
+                "Your account signs in only through single sign-on, and this is its only identity on a provider "
+                "that is on. Ask an administrator for a password first."))
     row = _provider(db, identity.provider_id)
     # An identity whose provider refused the person, or whose freshness has lapsed, is not unlinked by its owner:
     # unlinking would end the provider's say over the account's keys and credentials.
@@ -1050,11 +1075,20 @@ async def unlink_my_identity(
             if standing.refused else
             f"Sign in through {standing.provider_name} again before you unlink it.")})
     provider_id = str(identity.provider_id)
+    # The flag follows the providers the account is still linked to: unlinking the one that held it to no password
+    # lets it hold one again (nothing is minted), in the same transaction as the unlink.
+    settled = sso_only.settle(db, account, without=identity)
     db.delete(identity)
     db.commit()
     _audit(db, "sso_identity_unlinked", user=current_user, ip=api.get_client_ip(request),
            details={"provider_id": provider_id, "identity_id": str(identity_id), "linked_by": "self"})
     label = (row.label or row.name) if row is not None else "an organisation provider"
+    may_set_password = settled == sso_only.RESTORED
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",
-                f"You unlinked your account from {label}: it can no longer sign in through it.")
-    return {"removed": True}
+                f"You unlinked your account from {label}: it can no longer sign in through it."
+                + (" Your account may hold a password again and has none yet: set one with \"Forgot password\" on the "
+                   "sign-in page, or ask an administrator for a reset link." if may_set_password else ""))
+    answer = {"removed": True}
+    if may_set_password:
+        answer["may_set_password"] = True
+    return answer

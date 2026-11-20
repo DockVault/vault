@@ -43,6 +43,9 @@ class Admin(Harness):
         self.db = _Rows(tables)
         monkeypatch.setitem(self.S.app.dependency_overrides, get_db, lambda: self.db)
         self.order, self.told, self.is_locked = [], [], False
+        self.accounts_told = []            # what account owners were told: (usernames, title, text)
+        monkeypatch.setattr(R, "_tell_accounts", lambda users, title, change: users and self.accounts_told.append(
+            (sorted(name for _id, name, _email in users), title, change)))
         monkeypatch.setattr(R, "_step_up", lambda db, user, request: self.order.append("step_up"))
         monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: self.told.append((by, title, body)))
         monkeypatch.setattr(sso_settings, "locked", lambda settings=None: self.is_locked)
@@ -164,9 +167,16 @@ def test_turning_password_sign_in_off_names_the_accounts_and_says_so_to_the_admi
     assert out["provider"]["sso_only_accounts"] == 2
     assert h.audit("sso_provider_updated")[0][2]["made_sso_only"] == 2
     assert h.told[0][2].endswith("2 linked account(s) now sign in only through it.")
+    # A change another person made to how an account signs in is told to its owner.
+    label = row.label or row.name
+    assert h.accounts_told == [(["alice", "bob"], "Your password no longer works on this vault", (
+        f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
+        "its password and its SFTP password sign-in no longer work."))]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_password_login": "allowed"}})
     assert status == 200 and out["restored"] == ["alice", "bob"] and alice.sso_only is False
     assert "reset" not in str(out).lower() and h.told[1][2].endswith("2 linked account(s) may hold a password again.")
+    assert len(h.accounts_told) == 2 and h.accounts_told[1][:2] == (["alice", "bob"], "You can set a password again")
+    assert "Forgot password" in h.accounts_told[1][2] and f"still sign in through {label}" in h.accounts_told[1][2]
     # An administrator linked to it keeps the setting from being turned off at all.
     h.db.rows_of(type(_identity(h.root, row))).clear()
     from app.core.models import ExternalIdentity
@@ -214,11 +224,17 @@ def test_a_provider_is_removed_with_its_links_only_when_nothing_depends_on_it(mo
     status, out = h.call("DELETE", path)
     assert status == 409 and out["detail"]["reason"] == "still_on" and h.order == [] and h.rows() == [row]
     row.state = "disabled"
+    row.policy = {"sso_password_login": "disabled"}          # its people hold no password because of it
     alice.sso_only = True
-    assert h.call("DELETE", path)[1]["detail"]["reason"] == "only_way_in"
+    status, out = h.call("DELETE", path)
+    assert out["detail"]["reason"] == "only_way_in" and "Allow password sign-in for this provider first" in out["detail"]["message"]
+    row.policy = None                                           # allowed again (the save settles the accounts)
     alice.sso_only = False
     status, out = h.call("DELETE", path)
     assert status == 200 and out == {"removed": True} and h.rows() == [] and h.order == ["step_up"]
+    # Each account that was linked is told it lost a way to sign in.
+    assert h.accounts_told == [(["alice"], "A sign-in method was removed from your account", (
+        f"An administrator removed {row.label or row.name} from this vault: your account can no longer sign in through it."))]
     assert h.audit("sso_provider_deleted") == [("sso_provider_deleted", "success", {
         "provider_id": str(row.id), "name": row.name, "identities": 1})]
     assert h.told == [("root", "A single sign-on provider was removed",
@@ -395,9 +411,18 @@ def test_your_account_lists_the_providers_it_is_linked_to_or_could_link(monkeypa
     assert status == 200, out
     assert sorted(i["provider"] for i in out["identities"]) == ["a-first", "hidden-linked", "off-linked"]
     assert out["providers"] == [
-        {"id": str(first.id), "label": "a-first", "icon": "generic", "linked": True, "reauth": True},
-        {"id": str(shown.id), "label": "Company sign-in", "icon": "microsoft", "linked": False, "reauth": False},
-        {"id": str(hidden_linked.id), "label": "hidden-linked", "icon": "generic", "linked": True, "reauth": False}]
+        # An administrator confirms with a password of its own: no provider stands in for it.
+        {"id": str(first.id), "label": "a-first", "icon": "generic", "linked": True, "ends_password": False, "reauth": False},
+        {"id": str(shown.id), "label": "Company sign-in", "icon": "microsoft", "linked": False, "ends_password": False,
+         "reauth": False},
+        {"id": str(hidden_linked.id), "label": "hidden-linked", "icon": "generic", "linked": True, "ends_password": False,
+         "reauth": False}]
+    # A provider whose people hold no password: the page is told before the link that linking ends the password.
+    shown.policy = {"sso_password_login": "disabled"}
+    status, out = h.call("GET", "/users/me/identities")
+    assert [(p["label"], p["ends_password"]) for p in out["providers"]] == [
+        ("a-first", False), ("Company sign-in", True), ("hidden-linked", False)]
+    shown.policy = None
     # Nothing of a provider's connection rides along.
     assert not {"issuer", "client_id", "name", "state"} & set(out["providers"][0])
     # Without an address a provider can send the browser back to, nothing can be linked: none is offered.

@@ -192,7 +192,7 @@
         { provider: providerId, action, then: then || '' }, { action });
 
     // What a signed-in page does with what came back, once the app is shown. Returns what happened, for the caller
-    // to act on: {kind: 'linked'} | {kind: 'tested', provider, summary} | {kind: 'confirmed', action, then} |
+    // to act on: {kind: 'linked', passwordStopped} | {kind: 'tested', provider, summary} | {kind: 'confirmed', action, then} |
     // {kind: 'error', message} | null.
     async function resume(back) {
         if (!back) return null;
@@ -206,8 +206,8 @@
         const claim = { method: 'POST', silent: true, body: JSON.stringify({ code: back.value, verifier: flow.verifier }) };
         try {
             if (back.kind === 'sso-linked') {
-                await apiRequest('/users/me/identities/finish', claim);
-                return { kind: 'linked' };
+                const linked = await apiRequest('/users/me/identities/finish', claim);
+                return { kind: 'linked', passwordStopped: !!(linked && linked.password_stopped) };
             }
             if (back.kind === 'sso-test') {
                 const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(flow.provider)}/test/finish`, claim);
@@ -277,6 +277,13 @@
             link.type = 'button';
             link.dataset.provider = provider.id;
             link.addEventListener('click', async () => {
+                if (provider.ends_password) {
+                    // The provider's people hold no vault password: said before the link, since linking ends it.
+                    const ok = await showConfirm((provider.label || 'This provider') + ' signs its people in without a '
+                        + 'vault password. If you link it, your password and your SFTP password sign-in stop working, and '
+                        + 'you sign in only through it.', 'Link and stop using your password?', null, 'Link');
+                    if (!ok) return;
+                }
                 link.disabled = true;
                 try { await startLink(provider.id); }
                 catch (e) { link.disabled = false; showError((e && e.message) || 'The link could not be started.'); }

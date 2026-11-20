@@ -390,6 +390,7 @@ class Resolution:
     created: bool = False                 # an account was made at this sign-in (an invitation, or just in time)
     linked_now: bool = False              # the identity was linked at this sign-in
     linked_by: Optional[str] = None       # invitation | self (by verified email) | jit
+    password_stopped: bool = False        # the link made the account sign in only through its provider
     invitation: object = None             # the invitation accepted, when one was
     inviter_name: Optional[str] = None    # for an administrator's invitation: who made it
 
@@ -583,8 +584,10 @@ def _link_by_email(db, row, answer: ProviderAnswer, policy: dict):
     user = _email_match(db, row, answer, policy)
     if user is None:
         return None
+    had_password = not getattr(user, "sso_only", False)
     identity = link_identity(db, row, user, answer, linked_by="self")
-    return Resolution(user, identity, linked_now=True, linked_by="self")
+    return Resolution(user, identity, linked_now=True, linked_by="self",
+                      password_stopped=had_password and bool(getattr(user, "sso_only", False)))
 
 
 def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolution:
@@ -732,7 +735,9 @@ def link_refusal(db, row, user, answer: ProviderAnswer) -> None:
 
 def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str):
     """Link ``answer``'s identity to ``user``: refused when the subject already belongs to another account, or
-    the account already has an identity on this provider. In the caller's transaction."""
+    the account already has an identity on this provider. In the caller's transaction, and in the same one the
+    provider's password rule is applied to the account (app/core/sso_only.settle): linked to a provider whose
+    people hold no password, the account holds none from this moment, however it came to be linked."""
     from app.core.models import ExternalIdentity
     _password_less_refusal(db, row, user)
     existing = subject_owner(db, row, answer)
@@ -751,6 +756,8 @@ def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str):
                                 display_name=answer.display_name, linked_at=datetime.utcnow(), linked_by=linked_by,
                                 last_sign_in_at=None)
     db.add(identity)
+    from app.core import sso_only
+    sso_only.settle(db, user, also=row)
     return identity
 
 

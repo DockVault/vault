@@ -240,17 +240,111 @@ def test_the_provider_setting_is_refused_while_a_privileged_account_is_linked_an
     assert sso_only.disabled_refusal(h.db, p) is None
     minted = []
     monkeypatch.setattr(h.S, "_mint_reset_link", lambda db, user, base_url, **kw: minted.append((user.username, kw)) or "https://x/reset/t")
-    changed = sso_only.apply_password_login(h.db, p, "disabled")
+    p.policy = {"sso_password_login": "disabled"}
+    changed = sso_only.apply_password_login(h.db, p)
     assert changed == {"made_sso_only": ["bob"], "restored": []}
     assert bob.sso_only is True and bob.sftp_password_auth is False and bob.password_hash.startswith("argon2:")
     unknown = bob.password_hash
-    changed = sso_only.apply_password_login(h.db, p, "disabled")
+    changed = sso_only.apply_password_login(h.db, p)
     assert changed == {"made_sso_only": [], "restored": []}                    # already so
-    changed = sso_only.apply_password_login(h.db, p, "allowed")
+    p.policy = {"sso_password_login": "allowed"}
+    changed = sso_only.apply_password_login(h.db, p)
     assert changed == {"made_sso_only": [], "restored": ["bob"]}
     assert bob.sso_only is False and minted == []
     assert bob.password_hash.startswith("argon2:") and bob.password_hash != unknown    # still one nobody knows
-    assert sso_only.apply_password_login(h.db, p, "allowed") == {"made_sso_only": [], "restored": []}
+    assert sso_only.apply_password_login(h.db, p) == {"made_sso_only": [], "restored": []}
+
+
+def test_a_provider_that_holds_its_people_to_no_password_covers_the_accounts_linked_later(monkeypatch):
+    """The setting was saved, and then an account is linked: by its owner from Your account, or by its email
+    address at a sign-in. Its password ends with the link, in the same transaction, so a person who leaves and
+    is turned off at the provider cannot come back with the vault password. The owner is told."""
+    privileged_accounts, sso_only = _mod()
+    from app.core import security
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    alice, bob, carol = _user("alice"), _user("bob"), _user("carol")
+    strict = _provider(name="strict", label="Company sign-in", policy={
+        "sso_password_login": "disabled", "sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    lenient = _provider(name="lenient", label="Partner sign-in")
+    h = Resolving(monkeypatch, [alice, bob, carol], [strict, lenient])
+    assert sso_only.password_less(strict) and not sso_only.password_less(lenient)
+
+    def self_link(user, provider, subject):
+        h.current_user = user
+        status, out = h.start_link(provider)
+        assert status == 200, out
+        state, _ = h.state_of(out["authorization_url"])
+        h.claims_override = {"sub": subject}
+        status, location, _ = h.callback(provider, state)
+        assert location.startswith("/#sso-linked="), location
+        return h.finish_link(location)
+
+    # By its owner: the answer says so, the password is gone, SFTP password sign-in is off.
+    status, out = self_link(alice, strict, "s-alice")
+    assert status == 200 and out["linked"] is True and out["password_stopped"] is True, out
+    assert alice.sso_only is True and alice.password_hash.startswith("argon2:") and alice.sftp_password_auth is False
+    said = [body for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
+    assert said and "no longer work" in said[-1] and "Company sign-in" in said[-1], h.notice_bodies
+    # By its email address at a sign-in: the same, and the owner's notice says it.
+    location, _ = _sign_in(h, strict, sub="s-bob", email="bob@example.test")
+    assert location.startswith("/#sso="), location
+    assert bob.sso_only is True and bob.password_hash.startswith("argon2:") and bob.sftp_password_auth is False
+    said = [body for ids, title, body in h.notice_bodies if ids == [str(bob.id)]]
+    assert said and "no longer work" in said[-1], h.notice_bodies
+    # A provider that lets its people keep a password changes nothing at the link, and says nothing of it.
+    status, out = self_link(carol, lenient, "s-carol")
+    assert status == 200 and "password_stopped" not in out, out
+    assert carol.sso_only is False and carol.password_hash == "x" and carol.sftp_password_auth is True
+    said = [body for ids, title, body in h.notice_bodies if ids == [str(carol.id)]]
+    assert said and "no longer work" not in said[-1]
+    # And linked to both, an account is held by the stricter one.
+    status, out = self_link(carol, strict, "s-carol-2")
+    assert status == 200 and out["password_stopped"] is True and carol.sso_only is True
+
+
+def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatch):
+    """An account signs in only through its providers exactly while it is linked to one that holds its people to no
+    password, whatever that provider's state. Unlinking that one lets the account hold a password again; allowing
+    passwords at one provider does not lift another provider's rule; and the unlink that would leave a password-less
+    account with no provider that is on is refused."""
+    privileged_accounts, sso_only = _mod()
+    from app.core import security
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    alice = _user("alice", sso_only=True)
+    a = _provider(name="a", label="A", policy={"sso_password_login": "disabled"})
+    b = _provider(name="b", label="B")
+    c = _provider(name="c", label="C", policy={"sso_password_login": "disabled"})
+    on_a, on_b = _identity(alice, a, subject="s-a"), _identity(alice, b, subject="s-b")
+    h = Resolving(monkeypatch, [alice], [a, b, c], identities=[on_a, on_b])
+    assert sso_only.should_be_sso_only(h.db, alice) is True
+    assert sso_only.should_be_sso_only(h.db, alice, without=on_a) is False
+    assert sso_only.should_be_sso_only(h.db, alice, without=on_a, also=c) is True
+    a.state = "disabled"                                  # a provider that is off still holds its people to no password
+    assert sso_only.should_be_sso_only(h.db, alice) is True
+    a.state = "enabled"
+    # The remaining provider is off: the unlink would leave no way in, and is refused.
+    b.state = "disabled"
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_a.id}")
+    assert status == 409 and "only identity on a provider that is on" in out["detail"], out
+    assert alice.sso_only is True and len(h.identities()) == 2
+    # With it on, the unlink goes through and the account may hold a password again; it is told how to set one.
+    b.state = "enabled"
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_a.id}")
+    assert status == 200 and out == {"removed": True, "may_set_password": True}, out
+    assert alice.sso_only is False and h.identities() == [on_b]
+    said = [body for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
+    assert "may hold a password again" in said[-1] and "Forgot password" in said[-1]
+    # Linked to two that hold their people to no password: allowing passwords at one lifts nothing.
+    from app.core.models import ExternalIdentity
+    on_a2, on_c = _identity(alice, a, subject="s-a"), _identity(alice, c, subject="s-c")
+    h.db.rows_of(ExternalIdentity)[:] = [on_a2, on_c]
+    alice.sso_only = True
+    a.policy = {"sso_password_login": "allowed"}
+    assert sso_only.apply_password_login(h.db, a) == {"made_sso_only": [], "restored": []}
+    assert alice.sso_only is True
+    c.policy = {"sso_password_login": "allowed"}
+    assert sso_only.apply_password_login(h.db, c) == {"made_sso_only": [], "restored": ["alice"]}
+    assert alice.sso_only is False
 
 
 # --------------------------------------------------------------------------- a passkey does not stand in for the provider

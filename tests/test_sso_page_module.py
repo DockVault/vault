@@ -213,10 +213,14 @@ await round(() => window.Sso.startTest('p-1'), '#sso-test=c-test', '/admin/sso/p
 answers['/users/me/identities/p-1/reauth'] = { authorization_url: 'https://idp.example.org/a' };
 await round(() => window.Sso.startConfirm('p-1', 'account.second_factor', 'add-passkey'), '#sso-stepup=c-up',
             '/users/me/identities/reauth/finish', { staged: true, action: 'account.second_factor' });
+await round(() => window.Sso.startLink('p-1'), '#sso-linked=c-ends', '/users/me/identities/finish',
+            { linked: true, password_stopped: true });
 out(results);
 """)
-    link, test, confirm = got
-    assert link["result"] == {"kind": "linked"} and link["claimPath"] == "/users/me/identities/finish"
+    link, test, confirm, ends = got
+    assert link["result"] == {"kind": "linked", "passwordStopped": False} and link["claimPath"] == "/users/me/identities/finish"
+    # A link that ended the account's password says so, for the page to tell the person.
+    assert ends["result"] == {"kind": "linked", "passwordStopped": True}
     assert link["started"]["path"] == "/users/me/identities/p-1/start" and link["started"]["method"] == "POST"
     assert test["result"] == {"kind": "tested", "provider": "p-1", "summary": {"outcome": "ok"}}
     assert test["claimPath"] == "/admin/sso/providers/p-1/test/finish"

@@ -242,8 +242,9 @@ class Harness:
         monkeypatch.setattr(S, "_fire_offloop", lambda fn, *a, **kw: None)
         monkeypatch.setattr(S, "_fire_action_email", lambda db, key, *, email, username=None, action_context=None: (
             self.emails.append((key, email, action_context))))
+        self.notice_bodies = []            # the same notices with what they say: (ids, title, body)
         monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
-            self.notices.append((list(ids), title)) or list(ids)))
+            self.notice_bodies.append((list(ids), title, body)) or self.notices.append((list(ids), title)) or list(ids)))
         monkeypatch.setattr(S, "_enforce_step_up", lambda db, user, request, action: self.step_ups.append(action))
         self.session_hash = "sess-hash"
         monkeypatch.setattr(S, "_current_session_hash", lambda request: self.session_hash)
@@ -1113,6 +1114,9 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     assert A._step_up.action == "admin.auth_policy.write"
     steps = []
     monkeypatch.setattr(A, "_step_up", lambda db, user, request: steps.append(user.username))
+    from app.api import sso_providers_router as R
+    told = []
+    monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append((by, title, body)))
     # The provider is disabled, and the refusal it recorded still pauses alice's keys.
     assert F.lapsed(h.db, alice.id) is not None
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{own.id}/clear-refusal")
@@ -1120,12 +1124,16 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
     assert status == 200 and body == {"cleared": True} and steps == ["root"]
     assert identity.refused_at is None and F.lapsed(h.db, alice.id) is None
+    # Lifting it hands a person their keys back: the other administrators are told, once, and only when it was lifted.
+    assert len(told) == 1 and told[0][:2] == ("root", "A single sign-on refusal was lifted")
+    assert "alice" in told[0][2] and "work again" in told[0][2]
     assert ("sso_refusal_cleared", "success", {"user_id": str(alice.id), "provider_id": str(p.id),
                                                "identity_id": str(identity.id)}) in h.audits
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
     assert status == 409 and body["detail"]["reason"] == "not_refused" and steps == ["root"]
     assert _call(h.S, "POST", f"/admin/sso/identities/{uuid.uuid4()}/clear-refusal")[0] == 404
     assert _call(h.S, "POST", "/admin/sso/identities/not-an-id/clear-refusal")[0] == 404
+    assert len(told) == 1
 
 
 def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_owner(monkeypatch):

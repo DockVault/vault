@@ -95,6 +95,37 @@ def _row_or_404(db, provider_id, *, lock: bool = False) -> SsoProvider:
     return row
 
 
+def _tell_accounts(users, title: str, change: str) -> None:
+    """Tell each of ``users`` of a change an administrator made to how their account signs in: in the app, and by
+    email when the account has an address and email is configured. After the commit; never raises."""
+    api = _api()
+    try:
+        from app.core.database import get_db_context
+        with get_db_context() as db:
+            for user_id, username, email in users:
+                try:
+                    api._notify_users([str(user_id)], "account_changed", title=title, body=change, target="#profile")
+                    if (email or "").strip():
+                        api._fire_action_email(db, "sign_in_method_changed", email=email, username=username,
+                                               action_context={"change": change, "when": api._change_time_text()})
+                except Exception as exc:  # noqa: BLE001 -- one notice that fails does not stop the others
+                    log.info("sso account notice skipped: %s", type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001
+        log.info("sso account notices skipped: %s", type(exc).__name__)
+
+
+def _accounts_named(db, usernames) -> list:
+    """(id, username, email) of the accounts ``usernames`` names, for a notice sent after the commit."""
+    names = list(usernames or [])
+    if not names:
+        return []
+    return [(u.id, u.username, u.email) for u in db.query(User).filter(User.username.in_(names)).all()]
+
+
+SET_A_PASSWORD = ("Your account has no password yet: set one with \"Forgot password\" on the sign-in page, or ask an "
+                  "administrator for a reset link.")
+
+
 def _refused(exc) -> HTTPException:
     if isinstance(exc, providers.Invalid):
         return HTTPException(status_code=400, detail={"reason": "invalid", "field": exc.field, "message": exc.said})
@@ -177,10 +208,19 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         changes = providers.clean(body, row=row)
         stored_policy = providers.check(db, row, changes, account_policy=api._account_policy(db))
         outcome = providers.apply(db, row, changes, stored_policy)
+        made, restored = _accounts_named(db, outcome["made_sso_only"]), _accounts_named(db, outcome["restored"])
         db.commit()
     except (providers.Invalid, providers.Conflict) as exc:
         db.rollback()
         raise _refused(exc)
+    label = row.label or row.name
+    # A change another person made to how an account signs in is told to its owner.
+    _tell_accounts(made, "Your password no longer works on this vault", (
+        f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
+        "its password and its SFTP password sign-in no longer work."))
+    _tell_accounts(restored, "You can set a password again", (
+        f"An administrator allowed password sign-in again for accounts linked to {label}. {SET_A_PASSWORD} You can "
+        f"still sign in through {label}."))
     if outcome["changed"]:
         _audit(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
                details={"provider_id": str(row.id), "name": row.name, "changed": outcome["changed"],
@@ -246,9 +286,24 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     if refusal is not None:
         db.rollback()
         raise _refused(refusal)
+    from app.core import sso_only
+    from app.core.models import ExternalIdentity
     gone = {"provider_id": str(row.id), "name": row.name, "identities": providers.public(db, row)["identities"]}
+    label = row.label or row.name
+    # Each account linked to it loses a way to sign in, and its flag follows the providers it is still linked to
+    # (one held to no password by this provider alone may hold a password again; nothing is minted).
+    kept, may_set = [], []
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
+        user = db.query(User).filter(User.id == identity.user_id).first()
+        if user is None:
+            continue
+        settled = sso_only.settle(db, user, without=identity)
+        (may_set if settled == sso_only.RESTORED else kept).append((user.id, user.username, user.email))
     db.delete(row)
     db.commit()
+    removed = f"An administrator removed {label} from this vault: your account can no longer sign in through it."
+    _tell_accounts(kept, "A sign-in method was removed from your account", removed)
+    _tell_accounts(may_set, "A sign-in method was removed from your account", f"{removed} {SET_A_PASSWORD}")
     _audit(db, "sso_provider_deleted", user=current_user, ip=api.get_client_ip(request), row_id=gone["provider_id"],
            details={"provider_id": gone["provider_id"], "name": gone["name"], "identities": gone["identities"]})
     _tell_administrators(current_user.username, "A single sign-on provider was removed",

@@ -185,4 +185,15 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
            resource_id=str(identity.user_id),
            details={"user_id": str(identity.user_id), "provider_id": str(identity.provider_id),
                     "identity_id": str(identity.id)})
+    # Lifting a refusal hands a person their keys back: the other administrators are told, as of every change to
+    # the providers.
+    try:
+        from app.api import sso_providers_router
+        sso_providers_router._tell_administrators(
+            current_user.username, "A single sign-on refusal was lifted",
+            f"{current_user.username} lifted the refusal {label} recorded for "
+            f"{user.username if user is not None else 'an account'}: its SSH keys, temporary credentials and devices "
+            "work again unless another rule pauses them.")
+    except Exception as exc:  # noqa: BLE001 -- the clearing stands without its notice
+        log.info("sso refusal-cleared notice to administrators skipped: %s", type(exc).__name__)
     return {"cleared": True}

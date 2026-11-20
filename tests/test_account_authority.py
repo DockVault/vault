@@ -259,6 +259,11 @@ CHANGES_AN_ACCOUNT = {
     ("POST", "/users"),
     ("POST", "/invites"),
     ("POST", "/invites/{invite_id}/resend"),     # makes the invitation anew: a new link to an account to be
+    # A provider's settings reach every account linked to it: whether each signs in with a password, and its
+    # sessions when the provider is turned off, changed or removed. An interactive administrator only.
+    ("PATCH", "/admin/sso/providers/{provider_id}"),
+    ("POST", "/admin/sso/providers/{provider_id}/state"),
+    ("DELETE", "/admin/sso/providers/{provider_id}"),
 }
 
 # Routes that name an account, or look as if they change one, but change something else, with the reason.
@@ -294,6 +299,13 @@ OWN_ACCOUNT = {
     ("POST", "/auth/sign-out"): "the session of the token sent, which is the caller's own",
     ("POST", "/auth/second-factor/step-up"): "the caller's own second factor, used for a step-up",
     ("POST", "/auth/second-factor/verify"): "the second factor of the account signing in, after its password",
+}
+
+# Routes that change the caller's own account through a row of the caller's own that the path names. The row is
+# looked up by the caller's id (checked below), so the path can name no one else's.
+OWN_ROW = {
+    ("DELETE", "/users/me/identities/{identity_id}"): (
+        "the caller's own linked identity; without its last one the account may set a password again"),
 }
 
 # Routes that remove a device or a temporary credential: the caller's own, and another account's only
@@ -517,7 +529,7 @@ def _changes_or_names_an_account(path, route):
             or _names_an_account_in_its_path(path, route.endpoint))
 
 
-_LISTED = (CHANGES_AN_ACCOUNT | set(NOT_THE_ACCOUNT) | set(OWN_ACCOUNT) | OWN_UNLESS_ADMINISTRATOR
+_LISTED = (CHANGES_AN_ACCOUNT | set(NOT_THE_ACCOUNT) | set(OWN_ACCOUNT) | set(OWN_ROW) | OWN_UNLESS_ADMINISTRATOR
            | set(LINK_USE))
 
 
@@ -719,6 +731,19 @@ def test_a_device_or_temporary_credential_is_removed_only_by_its_owner_or_an_adm
 def test_a_route_for_the_callers_own_account_names_no_account(method, path):
     (route,) = [r for p, r in _routes() if p == path and method in r.methods]
     assert not re.findall(r"{(\w+)}", path), f"{method} {path} takes a parameter"
+
+
+@pytest.mark.parametrize("method,path", sorted(OWN_ROW))
+def test_a_row_of_the_callers_own_is_looked_up_by_the_callers_id(method, path):
+    (route,) = [r for p, r in _routes() if p == path and method in r.methods]
+    assert path.startswith("/users/me/"), path
+    tree = ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(route.endpoint))))
+    compares = {ast.unparse(n).replace(" ", "") for n in ast.walk(tree) if isinstance(n, ast.Compare)}
+    assert any(c.endswith(".user_id==current_user.id") for c in compares), (
+        f"{method} {path} does not look its row up by the caller's id: {sorted(compares)}")
+    # And it changes no account it looks up by anything else: the only account it reads is the caller's.
+    lookups = {c for c in compares if c.startswith("User.id==")}
+    assert lookups <= {"User.id==current_user.id"}, lookups
 
 
 @pytest.mark.parametrize("method,path", sorted(CHANGES_AN_ACCOUNT))

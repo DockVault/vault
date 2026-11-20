@@ -242,6 +242,41 @@ def test_your_account_lists_the_linked_providers_and_links_and_unlinks(page: Pag
     assert "#" not in page.url
 
 
+def test_linking_a_provider_whose_people_hold_no_password_asks_first_and_says_what_happened(page: Page, base_url,
+                                                                                           fresh_user):
+    """The provider holds its people to no vault password: the person is told before the link that linking ends
+    their password, nothing is started until they agree, and after the link the page says the password is gone."""
+    stand = Stand(page, base_url, providers=[])
+    stand.finish_answer = (200, {"linked": True, "password_stopped": True})
+    state = {"identities": [],
+             "providers": [{"id": PROVIDER, "label": "Company sign-in", "icon": "microsoft", "linked": False,
+                            "ends_password": True, "reauth": False}]}
+    page.route("**/users/me/identities", lambda route: route.fulfill(status=200, json=state))
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    page.click("#profile-btn")
+    page.click("#settings-btn")
+    section = page.locator("#us-identities-section")
+    expect(section.locator(".identity-link")).to_have_text(["Link Company sign-in"], timeout=10000)
+    section.locator(".identity-link").click()
+    asked = page.locator("#confirm-modal.active")
+    expect(asked).to_be_visible(timeout=8000)
+    expect(asked).to_contain_text("Company sign-in signs its people in without a vault password")
+    expect(asked).to_contain_text("your password and your SFTP password sign-in stop working")
+    page.keyboard.press("Escape")                              # no: nothing is started
+    expect(asked).to_be_hidden(timeout=8000)
+    assert stand.starts == []
+    expect(section.locator(".identity-link")).to_be_enabled()
+    stand.returns = "sso-linked=link-code"
+    section.locator(".identity-link").click()
+    page.click("#confirm-modal-confirm-btn")
+    for _ in range(100):
+        if stand.finishes:
+            break
+        page.wait_for_timeout(200)
+    assert stand.starts[-1][0].endswith(f"/users/me/identities/{PROVIDER}/start")
+    expect(page.locator(".toast", has_text="Your password no longer works here").first).to_be_visible(timeout=20000)
+
+
 def test_a_provider_only_account_is_told_what_a_passkey_is_for_and_confirms_at_its_provider_first(page: Page, base_url,
                                                                                                fresh_user):
     sentence = ("Your organisation signs you in through Company sign-in; this passkey confirms it's you after that, it "

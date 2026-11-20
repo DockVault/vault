@@ -411,9 +411,14 @@ def test_a_provider_is_removed_only_when_nothing_depends_on_it(P, db):
     assert P.remove_refusal(db, row) is None
     alice, bob = _user(db, "alice", sso_only=True), _user(db, "bob")
     link = _link(db, alice, row)
+    # The account holds no password because of another provider it is linked to: nothing of this one is in the way.
+    assert P.remove_refusal(db, row) is None
+    row.policy = {"sso_password_login": "disabled"}
     refusal = P.remove_refusal(db, row)
     assert refusal.reason == P.ONLY_WAY_IN
-    assert str(refusal).startswith("1 account signs in only through a provider and is linked to this one.")
+    assert str(refusal) == ("1 account linked to this provider holds no password because of it. Allow password sign-in "
+                            "for this provider first (Access), so they can set one.")
+    row.policy = None
     alice.sso_only = False
     held = _link(db, bob, row, refused_at=datetime(2026, 11, 1))
     refusal = P.remove_refusal(db, row)

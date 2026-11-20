@@ -1983,7 +1983,9 @@ async function _ssoResume(back) {
     if (!out) return;
     if (out.kind === 'error') { showError(out.message); return; }
     if (out.kind === 'linked') {
-        showSuccess('Your account is linked: you can now sign in through it.');
+        showSuccess(out.passwordStopped
+            ? 'Your account is linked. Your password no longer works here: you sign in through your organisation from now on.'
+            : 'Your account is linked: you can now sign in through it.');
         openUserSettingsModal();
         return;
     }
