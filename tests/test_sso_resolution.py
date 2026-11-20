@@ -393,7 +393,15 @@ def test_an_address_the_vault_never_confirmed_links_nothing(monkeypatch):
     assert len(refused) == 2 and all(r.get("reason") == "no_account" and r.get("refused_because") == "address_not_confirmed"
                                      for r in refused), h.audits
     assert not any(a[0] == "sso_identity_linked" for a in h.audits)
+    # A mark alone is not a confirmation of this address: one given for another address the account held before,
+    # and left behind by a change made where nothing clears it (a release from before the mark, run for a while
+    # after going back to it), links nothing either.
+    from app.core import email_confirmation as ec
     mallory.email_confirmed_at = datetime.utcnow()
+    mallory.email_confirmed_for = ec.mark_for("mallory@example.test")
+    location, _state = _sign_in(h, p, sub="victim-subject", email="victim@example.test")
+    assert location == "/#sso-error=no_account" and h.identities() == [], location
+    ec.confirm(mallory)
     location, _state = _sign_in(h, p, sub="victim-subject", email="victim@example.test")
     assert location.startswith("/#sso=") and len(h.identities()) == 1
 
@@ -778,7 +786,7 @@ def test_a_test_sign_in_reports_the_restriction_and_what_the_vault_would_do(monk
     summary = run(email="bob@example.test")
     assert summary["restriction"] == "passes" and summary["would"].startswith("refuse: an account holds this address, but "
                                                                              "the vault never confirmed"), summary
-    bob.email_confirmed_at = datetime.utcnow()
+    __import__("app.core.email_confirmation", fromlist=["confirm"]).confirm(bob)
     summary = run(email="nobody@example.test")
     assert summary["would"].startswith("refuse: no account is linked")
     h.db.rows_of(type(h.identities()[0]) if h.identities() else __import__("app.core.models", fromlist=["ExternalIdentity"]).ExternalIdentity).append(_identity(root, p))
@@ -826,6 +834,20 @@ def test_an_address_is_confirmed_only_until_it_changes():
     # A mark given before the address is not a mark for it.
     eve = User(email_confirmed_at=datetime.utcnow(), username="eve", email="eve@example.test")
     assert not ec.confirmed(eve)
+    # The mark names its address. An address written where the listener does not run (a statement over many rows,
+    # an earlier release) leaves the mark and what it was given for: it is no confirmation of the new address, and
+    # is one again only if the account holds the old address again.
+    from sqlalchemy.orm.attributes import set_committed_value
+    carol = User(username="carol", email="carol@example.test")
+    ec.confirm(carol)
+    assert carol.email_confirmed_for == ec.mark_for("Carol@Example.test ") and len(carol.email_confirmed_for) == 64
+    assert "carol" not in carol.email_confirmed_for                 # a digest: no second copy of the address
+    set_committed_value(carol, "email", "victim@example.test")
+    assert carol.email_confirmed_at is not None and not ec.confirmed(carol)
+    set_committed_value(carol, "email", "CAROL@example.test")
+    assert ec.confirmed(carol)
+    carol.email = "other@example.test"
+    assert carol.email_confirmed_at is None and carol.email_confirmed_for is None
     # What is not an account object at all is unconfirmed.
     assert not ec.confirmed(types.SimpleNamespace(email="x@example.test"))
 

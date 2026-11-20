@@ -28824,6 +28824,7 @@ def _run_lightweight_migrations():
             # When the vault confirmed the account's address (see User.email_confirmed_at), and the one case an
             # existing account's address is proved by what is stored (app/core/email_confirmation.py).
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_confirmed_for VARCHAR(64)",
             _EMAIL_CONFIRMATION_BACKFILL,
             # Per-vault confidentiality tier; 'standard' = today's server-encrypted,
             # SFTP-capable vault (zero-knowledge slots in later, web-only).

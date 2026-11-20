@@ -12,32 +12,54 @@ Linking a provider identity to an account by its email address reads it: an acco
 confirmed is never linked by that address, because anyone could have written it there and so taken the sign-ins
 of the person the address really belongs to.
 
+The mark names the address it was given for (``users.email_confirmed_for``, a digest of the address in lower case:
+the row needs no second copy of it), and counts only while the account holds that address. The listener is not the
+only guard, then: an address changed where no listener runs (a statement over many rows, or an earlier release of
+the vault, run for a while after going back to it, which knows neither column) leaves a mark that no longer fits
+and is not one.
+
 Accounts from before the column start unconfirmed. One case is proved by what is stored and is confirmed at start:
 an account made from an invitation that carried the address the account still holds (``BACKFILL``).
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Optional
 
 # Run at start, after the column exists; harmless to run again. An administrator wrote the address into the
 # invitation this account was made from, and the account holds that address now: confirmed, as of the acceptance.
+# The digest is the one :func:`mark_for` makes; where the database and Python would lower-case an address
+# differently the two do not match, and the address reads as unconfirmed.
 BACKFILL = (
-    "UPDATE users SET email_confirmed_at = i.accepted_at FROM account_invitations i "
-    "WHERE users.email_confirmed_at IS NULL AND users.email IS NOT NULL AND i.accepted_user_id = users.id "
+    "UPDATE users SET email_confirmed_at = i.accepted_at, "
+    "email_confirmed_for = encode(sha256(convert_to(lower(btrim(users.email)), 'UTF8')), 'hex') "
+    "FROM account_invitations i "
+    "WHERE (users.email_confirmed_at IS NULL OR users.email_confirmed_for IS NULL) AND users.email IS NOT NULL "
+    "AND i.accepted_user_id = users.id "
     "AND i.accepted_at IS NOT NULL AND i.email IS NOT NULL AND lower(i.email) = lower(users.email)"
 )
+
+
+def mark_for(address: str) -> str:
+    """What a mark is given for: the address in lower case, as a digest."""
+    return hashlib.sha256(address.strip().lower().encode("utf-8")).hexdigest()
 
 
 def confirm(user, *, now: Optional[datetime] = None) -> None:
     """Mark ``user``'s address as confirmed by the vault, as of now. Call it after the address is set (setting an
     address clears the mark). An account without an address has nothing to confirm."""
-    user.email_confirmed_at = (now or datetime.utcnow()) if (getattr(user, "email", None) or "").strip() else None
+    address = (getattr(user, "email", None) or "").strip()
+    user.email_confirmed_at = (now or datetime.utcnow()) if address else None
+    user.email_confirmed_for = mark_for(address) if address else None
 
 
 def confirmed(user) -> bool:
-    """Whether the vault confirmed the address ``user`` holds now."""
-    return bool((getattr(user, "email", None) or "").strip()) and getattr(user, "email_confirmed_at", None) is not None
+    """Whether the vault confirmed the address ``user`` holds now: a mark, given for this very address."""
+    address = (getattr(user, "email", None) or "").strip()
+    if not address or getattr(user, "email_confirmed_at", None) is None:
+        return False
+    return getattr(user, "email_confirmed_for", None) == mark_for(address)
 
 
 def address_changed(target, value, oldvalue, initiator) -> None:
@@ -47,3 +69,4 @@ def address_changed(target, value, oldvalue, initiator) -> None:
     new = value if isinstance(value, str) else ""
     if new.strip().lower() != old.strip().lower():
         target.email_confirmed_at = None
+        target.email_confirmed_for = None

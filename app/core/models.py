@@ -218,6 +218,9 @@ class User(Base):
     # change of the address (the listener below the models). NULL = never confirmed. Nullable and added by the
     # boot DDL, so an earlier release reads the table without it.
     email_confirmed_at = Column(DateTime, nullable=True)
+    # The address that mark was given for, as a digest of it in lower case: the mark counts only while the account
+    # holds that address, so an address changed where the listener does not run leaves no confirmation behind.
+    email_confirmed_for = Column(String(64), nullable=True)
     # The account signs in only through its linked identity provider: it has no usable password (the
     # stored hash is of random bytes, never given out) and the password form, SFTP password sign-in and
     # self-service reset refuse it. Set for an account created at its first provider sign-in, or when

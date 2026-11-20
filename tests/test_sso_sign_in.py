@@ -133,6 +133,10 @@ def _user(username="alice", role="user", **extra):
                   failed_login_attempts=0, sso_only=False, _is_temp_session=False,
                   email_confirmed_at=now)          # an address an administrator set, unless the test says otherwise
     fields.update(extra)
+    if "email_confirmed_for" not in fields:          # the mark is for the address the account is made with
+        from app.core import email_confirmation
+        fields["email_confirmed_for"] = (email_confirmation.mark_for(fields["email"])
+                                         if fields.get("email") and fields.get("email_confirmed_at") else None)
     return types.SimpleNamespace(**fields)
 
 
