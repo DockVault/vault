@@ -699,6 +699,20 @@ def test_the_sign_out_routes_drop_the_hint_only_after_the_provider_logout_addres
     assert inspect.getsource(S.logout).count("forget_provider_logout_hints(") == 1
 
 
+def test_a_sign_out_names_a_provider_logout_address_only_when_there_is_one():
+    """A sign-out's callers compare its whole answer (signed out, and whether the session was ended), so the answer
+    gains the provider's logout address only for a session that has one, and is otherwise what it always was."""
+    import inspect
+    set_bare_api_env()
+    import app.api.api_server as S
+    source = inspect.getsource(S.sign_out)
+    assert 'answer = {"signed_out": True, "session_ended": ended}' in source
+    assert source.count('answer["provider_logout_url"] = logout_url') == 1
+    guarded = source[source.index("if logout_url:"):source.index("return answer")]
+    assert 'answer["provider_logout_url"] = logout_url' in guarded
+    assert '"provider_logout_url": logout_url' not in source and "provider_logout_url\": None" not in source
+
+
 def test_the_back_channel_logout_fetches_the_providers_keys_off_the_event_loop():
     """Discovery and the keys are fetched over the network (a slow provider would hold every request on the loop):
     the verification runs in the thread pool, and one limiter bucket is kept per source address."""

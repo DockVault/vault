@@ -27647,7 +27647,12 @@ def sign_out(
             db.commit()
         except Exception:  # noqa: BLE001
             db.rollback()
-    return {"signed_out": True, "session_ended": ended, "provider_logout_url": logout_url}
+    answer = {"signed_out": True, "session_ended": ended}
+    if logout_url:
+        # Only a session that came through a provider whose logout the administrator turned on has one. Every other
+        # sign-out answers exactly what it always answered: its callers compare the whole answer.
+        answer["provider_logout_url"] = logout_url
+    return answer
 
 
 @app.get("/api/monitoring/metrics")
