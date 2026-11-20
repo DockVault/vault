@@ -7056,10 +7056,12 @@ function groupChip(g, removable, userId) {
 }
 
 // Render the filtered users table (re-runs on each search/filter change)
-// The ways an account signs in, for the Users table: the password, an authenticator app, its passkeys. Every word
-// here is the page's own and the count is a number, so the result is safe to place as markup.
+// The ways an account signs in, for the Users table: the password, the providers it is linked to (an administrator
+// named them, so they are escaped like any other text), an authenticator app, its passkeys.
 function signInMethods(u) {
-    const methods = ['Password'];
+    // An account that signs in only through its provider has no password of its own, and the column says so.
+    const methods = [u.sso_only ? 'No password' : 'Password'];
+    (Array.isArray(u.sso_providers) ? u.sso_providers : []).forEach((name) => { if (name) methods.push(String(name)); });
     if (u.second_factor_enabled) methods.push('Authenticator');
     const passkeys = Number(u.passkey_count) || 0;
     if (passkeys === 1) methods.push('Passkey');

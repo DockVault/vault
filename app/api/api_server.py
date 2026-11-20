@@ -1096,6 +1096,7 @@ class UserResponse(BaseModel):
     sftp_enabled: bool = True
     sftp_password_auth: bool = True
     sso_only: Optional[bool] = None       # signs in only through its identity provider
+    sso_providers: List[str] = Field(default_factory=list)   # the providers the account is linked to, by label
     # The account's storage override in bytes: null = inherits the deployment default,
     # -1 = exempt, otherwise an exact budget. The effective number (and what the account has
     # already allocated) comes from /users/{id}/storage.
@@ -10885,6 +10886,8 @@ async def list_users(
     users = db.query(User).all()
     # The passkeys each account can use and the ones it cannot, in one query (the list's sign-in methods column).
     passkey_tally = _passkey_tally(db, [u.id for u in users])
+    # The providers each account is linked to, in one query (the same column).
+    provider_names = _sso_provider_names(db, [u.id for u in users])
     # Batch the "has an active second factor?" lookup so the list stays one extra query, not one
     # per row. A user with any active TOTP enrollment shows MFA On in the accounts table.
     mfa_user_ids = {
@@ -10911,6 +10914,7 @@ async def list_users(
         item.second_factor_enabled = user.id in mfa_user_ids
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
         item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))
+        item.sso_providers = provider_names.get(user.id, [])
         block = blocks.get(user.id)
         if block is not None:
             item.sign_in_block = {"scope": block["scope"], "addresses": block["addresses"],
@@ -11828,6 +11832,28 @@ def _passkey_counts(db, user_ids) -> dict:
     """How many passkeys each of ``user_ids`` can sign in with now (:func:`_passkey_tally`); an account with
     none is absent."""
     return {user_id: usable for user_id, (usable, _not) in _passkey_tally(db, user_ids).items() if usable}
+
+
+def _sso_provider_names(db, user_ids) -> dict:
+    """The providers each of ``user_ids`` is linked to, by what their button says (the label, else the name), in the
+    sign-in page's order, in two queries for the whole list (the links, then the few providers); an account linked
+    to none is absent. A provider that is off is still named: the link stands."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    from app.services import sign_in
+    ids = list(user_ids)
+    if not ids or not sign_in.table_present(db, "external_identities"):
+        return {}
+    links = db.query(ExternalIdentity).filter(ExternalIdentity.user_id.in_(ids)).all()
+    if not links:
+        return {}
+    providers = {p.id: p for p in db.query(SsoProvider).all()}
+    named = {}
+    for link in links:
+        provider = providers.get(link.provider_id)
+        shown = ((provider.label or "").strip() or (provider.name or "").strip()) if provider is not None else ""
+        if shown:
+            named.setdefault(link.user_id, []).append((provider.sort_order or 0, shown.lower(), shown))
+    return {user_id: [shown for _order, _key, shown in sorted(found)] for user_id, found in named.items()}
 
 
 def _passkey_of(db, user_id, passkey_id):
