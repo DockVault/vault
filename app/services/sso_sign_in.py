@@ -798,15 +798,20 @@ def reauth_available(db, user) -> bool:
     """Whether a provider re-authentication may be offered to ``user`` for a step-up: an enabled provider the
     account has an identity on, whose last test sign-in carried ``auth_time`` (without it no freshness can be
     judged). False where the database holds no identities at all."""
+    return bool(reauth_providers(db, user))
+
+
+def reauth_providers(db, user) -> list:
+    """The providers that may confirm ``user`` afresh (see :func:`reauth_available`), in the sign-in page's order."""
     from app.core.models import ExternalIdentity, SsoProvider
     if user is None or getattr(user, "id", None) is None or not _has_identities(db):
-        return False
-    rows = db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all()
-    for identity in rows:
+        return []
+    found = []
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
         provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
-        if provider is not None and reauth_offered(provider):
-            return True
-    return False
+        if provider is not None and reauth_offered(provider) and provider not in found:
+            found.append(provider)
+    return sorted(found, key=lambda p: (getattr(p, "sort_order", 0) or 0, (p.label or p.name or "").lower()))
 
 
 def reauth_offered(row) -> bool:

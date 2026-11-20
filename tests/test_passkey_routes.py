@@ -234,10 +234,12 @@ def test_an_account_with_a_factor_proves_the_step_up_not_the_password(monkeypatc
     assert status == 200 and h.receipts[-1] == ("account.second_factor", "ok")
 
 
-def test_a_password_less_account_with_no_factor_is_told_to_wait_for_the_provider_step_up(monkeypatch):
+def test_a_password_less_account_with_no_factor_and_no_provider_is_told_to_ask_an_administrator(monkeypatch):
+    """With a provider that can confirm it afresh, such an account registers after that confirmation
+    (tests/test_passkey_provider_proof.py); with none, nothing here can prove the request."""
     h = Harness(monkeypatch, _user(password_hash=None))
     status, body = _call(h.S, "POST", "/users/me/passkeys/register/options", {})
-    assert status == 409 and "identity-provider" in body["detail"]
+    assert status == 409 and "Ask an administrator." in body["detail"]
 
 
 def test_an_account_whose_password_nobody_knows_is_not_asked_to_prove_a_passkey_with_it(monkeypatch):

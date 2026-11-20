@@ -74,6 +74,25 @@ def provider_only_message(db, user) -> str:
             "gave you.")
 
 
+def passkey_note(db, user) -> Optional[str]:
+    """What the passkey section tells an account that signs in only through its provider, or None for any other
+    account: a passkey there confirms the person after the provider's sign-in and never stands in for it."""
+    if not getattr(user, "sso_only", False):
+        return None
+    from app.core.models import ExternalIdentity, SsoProvider
+    names = []
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
+        row = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+        if row is None or getattr(row, "state", None) != "enabled":
+            continue
+        name = (getattr(row, "label", None) or "").strip() or (getattr(row, "name", None) or "").strip()
+        if name and name not in names:
+            names.append(name)
+    through = " or ".join(names) if names else "its own sign-in"
+    return (f"Your organisation signs you in through {through}; this passkey confirms it's you after that, it does "
+            "not replace it.")
+
+
 def linked_accounts(db, provider) -> List:
     from app.core.models import ExternalIdentity, User
     ids = [row.user_id for row in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == provider.id).all()]

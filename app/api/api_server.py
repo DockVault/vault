@@ -11854,27 +11854,59 @@ def _passkey_refuse_temp(user) -> None:
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage passkeys.")
 
 
+# The action a provider's fresh sign-in is staged for when it proves a first passkey: managing one's own factors.
+PASSKEY_FIRST_PROOF_ACTION = "account.second_factor"
+
+
+def _passkey_first_proof_kind(db, user) -> tuple:
+    """How ``user`` proves a passkey registration, and the providers that can confirm them when that is the way:
+    ``step_up`` (the account has a factor), ``password`` (it has none, and a password it can type), ``provider``
+    (it has none and no password to type, and a provider it is linked to can confirm it afresh) or ``none``
+    (nothing here can prove the request)."""
+    from app.core.active_factors import active_factors
+    from app.services import sso_sign_in
+    if active_factors(db, user.id).any:
+        return "step_up", []
+    from app.core import password_origin
+    if user.password_hash and not getattr(user, "sso_only", False) and not password_origin.nobody_knows(user):
+        return "password", []
+    providers = sso_sign_in.reauth_providers(db, user)
+    return ("provider", providers) if providers else ("none", [])
+
+
 def _passkey_first_proof(db, user, request, current_password) -> None:
     """The proof a registration needs: an account with a factor presents the account.second_factor step-up (a
-    code, a recovery code, or later a passkey); one with none proves its password in the body, as the TOTP
-    enrollment does. An account with neither a factor nor a password (signed in only through a provider) must
-    wait for the provider re-authentication step-up."""
-    from app.core.active_factors import active_factors
+    code, a recovery code, or a passkey); one with none proves its password in the body, as the TOTP enrollment
+    does. An account with no factor and no password it could type (it signs in only through its provider) proves
+    a fresh sign-in at that provider: the re-authentication this session staged for managing its own factors,
+    spent here once. The password in the body counts for nothing there: nobody knows it."""
     from app.core.security import verify_password
-    if active_factors(db, user.id).any:
+    kind, providers = _passkey_first_proof_kind(db, user)
+    if kind == "step_up":
         _enforce_step_up(db, user, request, "account.second_factor")
         return
-    from app.core import password_origin
-    if not user.password_hash or password_origin.nobody_knows(user):
+    if kind == "password":
+        if not current_password or not verify_password(current_password, user.password_hash):
+            if current_password:
+                # A wrong password, not a missing one (the page asks once without, to learn what is owed).
+                _passkey_audit(db, user, request, "passkey_registration_failed", {"reason": "wrong_password"},
+                               status="failure")
+            raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+        return
+    if kind == "none":
         raise HTTPException(status_code=409, detail=(
-            "Your account has no password and no second factor yet, so it cannot prove this request here. "
-            "Ask an administrator to set a password, or wait for the identity-provider confirmation step-up."))
-    if not current_password or not verify_password(current_password, user.password_hash):
-        if current_password:
-            # A wrong password, not a missing one (the page asks once without, to learn what is owed).
-            _passkey_audit(db, user, request, "passkey_registration_failed", {"reason": "wrong_password"},
-                           status="failure")
-        raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+            "Your account has no password and no second factor yet, and no sign-in of your organisation can confirm "
+            "you here. Ask an administrator."))
+    from app.core import sso_state
+    try:
+        staged = sso_state.take_reauth(_current_session_hash(request), PASSKEY_FIRST_PROOF_ACTION)
+    except sso_state.Unavailable:
+        raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
+    if not staged:
+        raise HTTPException(status_code=403, detail={
+            "reason": "provider_confirmation_required", "action": PASSKEY_FIRST_PROOF_ACTION,
+            "message": "Confirm with your organisation's sign-in first, then add the passkey.",
+            "providers": [{"id": str(p.id), "label": p.label or p.name} for p in providers]})
 
 
 def _passkey_notice(db, user, title: str, change: str) -> None:
@@ -12128,16 +12160,22 @@ async def list_my_passkeys(
     db: Session = Depends(get_db),
 ):
     """The caller's own passkeys (never a retired one), oldest first, with the account's limit, whether passkeys are
-    on here, and the role's requirement with its grace (the profile shows the date)."""
-    from app.core import webauthn_settings
+    on here, the role's requirement with its grace (the profile shows the date), how the account proves adding
+    one (``first_proof``, with the providers that can confirm it when that is the way), and, for an account that
+    signs in only through its provider, the sentence saying a passkey does not replace that."""
+    from app.core import sso_only, webauthn_settings
     _passkey_refuse_temp(current_user)
     now = datetime.utcnow()
     from app.core import public_url
+    kind, providers = _passkey_first_proof_kind(db, current_user)
     return {"passkeys": [_passkey_public(db, r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
             "require_user_verification": webauthn_settings.require_uv(),
             "attestation": webauthn_settings.attestation(), "origin": public_url.expected_origin() or None,
             "enabled": _passkeys_enabled(db),
-            "requirement": webauthn_settings.requirement_public(webauthn_settings.requirement(db, current_user))}
+            "requirement": webauthn_settings.requirement_public(webauthn_settings.requirement(db, current_user)),
+            "first_proof": {"kind": kind, "action": PASSKEY_FIRST_PROOF_ACTION,
+                            "providers": [{"id": str(p.id), "label": p.label or p.name} for p in providers]},
+            "provider_only": sso_only.passkey_note(db, current_user)}
 
 
 @app.patch("/users/me/passkeys/{passkey_id}")

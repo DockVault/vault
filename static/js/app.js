@@ -7495,6 +7495,8 @@ async function renderAccountPasskeys() {
                 : 'Your role must hold a passkey' + (requirement.due ? ' by ' + (_passkeyWhen(requirement.due) || requirement.due) : '')
                   + '.'));
     }
+    // An account that signs in only through its provider: a passkey never stands in for that sign-in.
+    if (data.provider_only) body.appendChild(_el('p', 'text-secondary text-sm mb-sm passkey-provider-only', data.provider_only));
     const keys = (data && data.passkeys) || [];
     const limit = (data && data.limit) || 0;
     if (!keys.length) {
