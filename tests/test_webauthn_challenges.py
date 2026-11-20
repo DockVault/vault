@@ -95,3 +95,61 @@ def test_garbage_is_no_challenge_and_the_store_down_fails_closed():
         wc.issue(wc.SIGN_IN, redis=r)
     with pytest.raises(wc.Unavailable):
         wc.take(cid, purpose=wc.SIGN_IN, redis=r)
+
+
+@pytest.fixture
+def own_store(monkeypatch):
+    """The vault's own client replaced by the fake, with the outage guard and the limiter's breaker closed before
+    and after."""
+    _chal()
+    from app.core import database, rate_limiter, redis_guard
+
+    def closed():
+        rate_limiter._cb_record_success()
+        redis_guard.guard_record_success()
+    closed()
+    r = _Redis()
+    monkeypatch.setattr(database, "redis_client", r)
+    yield r
+    closed()
+
+
+def test_while_redis_is_known_to_be_down_the_vaults_own_store_is_not_touched(own_store, monkeypatch):
+    wc = _chal()
+    from app.core import redis_guard
+    made = wc.issue(wc.SIGN_IN)
+    calls = []
+    monkeypatch.setattr(own_store, "set", lambda *a, **k: calls.append("set"))
+    monkeypatch.setattr(own_store, "getdel", lambda *a, **k: calls.append("getdel"))
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda now: True)
+    with pytest.raises(wc.Unavailable):
+        wc.issue(wc.SIGN_IN)
+    with pytest.raises(wc.Unavailable):
+        wc.take(made.id, purpose=wc.SIGN_IN)
+    assert calls == []                      # refused before the socket, both ways
+
+
+def test_a_failure_of_the_vaults_own_store_is_remembered_for_the_next_ceremony(own_store):
+    import time
+    wc = _chal()
+    from app.core import redis_guard
+    made = wc.issue(wc.SIGN_IN)
+    own_store.broken = True
+    with pytest.raises(wc.Unavailable):
+        wc.take("ab" * 16, purpose=wc.SIGN_IN)
+    assert redis_guard.guard_private_open(time.time())
+    own_store.broken = False                # the store is back, the memory is not yet over
+    with pytest.raises(wc.Unavailable):
+        wc.take(made.id, purpose=wc.SIGN_IN)
+    redis_guard.guard_record_success()
+    assert wc.take(made.id, purpose=wc.SIGN_IN) is not None     # and the refusal did not spend the challenge
+
+
+def test_a_client_handed_in_is_called_whatever_the_guard_says(own_store, monkeypatch):
+    wc = _chal()
+    from app.core import redis_guard
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda now: True)
+    r = _Redis()
+    made = wc.issue(wc.SIGN_IN, redis=r)
+    assert wc.take(made.id, purpose=wc.SIGN_IN, redis=r) is not None
+    assert own_store.rows == {}

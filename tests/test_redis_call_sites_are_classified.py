@@ -65,6 +65,9 @@ _REGISTRY = {
     "core/sign_in_codes.py": {                   # a one-time sign-in code: no fallback; refused at once,
         "store": ("B", 1), "take": ("B", 1),     # before the socket, while the guard is open
     },
+    "core/webauthn_challenges.py": {             # a passkey ceremony's challenge: no fallback; refused at
+        "issue": ("B", 1), "take": ("B", 1),     # once, before the socket, while the guard is open
+    },
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated
     },                                           # short-timeout client (the constructor uses redis.Redis)

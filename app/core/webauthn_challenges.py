@@ -4,7 +4,8 @@ A WebAuthn ceremony starts with the server handing the browser a random challeng
 returning it signed. The challenge is kept in Redis under its own id with the purpose it was made for (a
 registration, a sign-in, the second factor, a step-up), the account it was bound to when there was one, and
 the credential ids the browser was offered; it is read with ``GETDEL``, so the first use spends it, right or
-wrong. Without Redis a ceremony fails closed (``Unavailable``); nothing falls back to the database.
+wrong. Without Redis a ceremony fails closed (``Unavailable``); nothing falls back to the database. While Redis is
+known to be down it fails at once, without a try (the shared outage guard, app/core/redis_guard.py).
 """
 from __future__ import annotations
 
@@ -34,10 +35,22 @@ def _b64(raw: bytes) -> str:
 
 
 def _redis(redis):
+    """The client a call uses: the one handed in, else the vault's own."""
     if redis is not None:
         return redis
     from app.core.database import redis_client
     return redis_client
+
+
+def _run(redis, function: str, op):
+    """One store call; ``op`` is given the client. On the vault's own client the call goes behind the shared outage
+    guard: while Redis is known to be down the socket is not touched and the call fails at once, so an outage
+    costs the server one discovery and not one timeout for every ceremony. Any other client is called as it is."""
+    from app.core import database, redis_guard
+    client = _redis(redis)
+    if client is not database.redis_client:
+        return op(client)
+    return redis_guard.required(function, lambda: op(client))
 
 
 @dataclass
@@ -82,8 +95,9 @@ def issue(purpose: str, *, user_id: Optional[str] = None, allow_ids=(), redis=No
     challenge = Challenge(id=secrets.token_hex(16), challenge=_b64(secrets.token_bytes(32)), purpose=purpose,
                           user_id=str(user_id) if user_id is not None else None, allow_ids=list(allow_ids))
     try:
-        written = _redis(redis).set(KEY_PREFIX + challenge.id, json.dumps(asdict(challenge), separators=(",", ":")),
-                                    ex=int(ttl_seconds), nx=True)
+        payload = json.dumps(asdict(challenge), separators=(",", ":"))
+        written = _run(redis, "webauthn_challenges.issue",
+                       lambda r: r.set(KEY_PREFIX + challenge.id, payload, ex=int(ttl_seconds), nx=True))
     except Exception as exc:  # noqa: BLE001 -- any store failure is an outage for this ceremony
         raise Unavailable("the challenge store cannot be reached") from exc
     if not written:
@@ -100,7 +114,7 @@ def take(challenge_id, *, purpose: str, redis=None) -> Optional[Challenge]:
     if not all(ch in "0123456789abcdef" for ch in challenge_id):
         return None
     try:
-        raw = _redis(redis).getdel(KEY_PREFIX + challenge_id)
+        raw = _run(redis, "webauthn_challenges.take", lambda r: r.getdel(KEY_PREFIX + challenge_id))
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the challenge store cannot be reached") from exc
     if not raw:
