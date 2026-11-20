@@ -703,6 +703,76 @@ def test_what_is_no_factor_of_the_accounts_own_does_not_keep_a_link_by_email_out
     assert location.startswith("/#sso=") and len(h.identities()) == 1, location
 
 
+def _provider_locks(h):
+    from app.core.models import SsoProvider
+    return [entry[2] for entry in h.db.log if entry[0] == "lock" and entry[1] is SsoProvider]
+
+
+def test_a_provider_turned_off_while_it_answered_links_nobody_and_changes_no_account(monkeypatch):
+    """The callback waits for the provider's answer, up to the whole wait. An administrator who turns the provider
+    off in that time (an incident, or a change to its connection) turns it off for this answer too: the row is
+    read again as it stands before the account is looked at. Nobody is linked, no account is made, and the rule of
+    a provider whose people hold no password replaces no password; left on, the same sign-ins link the account
+    and make the new one."""
+    bob, root = _user("bob"), _user("root", role="admin")
+    links = _provider(name="links", label="Links", policy={
+        "sso_link_by_email": True, "sso_allowed_domains": ["example.test"], "sso_password_login": "disabled"})
+    makes = _provider(name="makes", label="Makes", policy={
+        "sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [bob, root], [links, makes])
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    before = (bob.password_hash, bob.sso_only, bob.sftp_password_auth)
+    tries = [(links, {"sub": "bob-subject", "email": "bob@example.test"}),
+             (makes, {"sub": "new-subject", "email": "new@example.test", "preferred_username": "newcomer"})]
+    for p, claims in tries:
+        h.db.on_lock.append(lambda p=p: setattr(p, "state", "disabled"))      # turned off while the provider answers
+        location, _state = _sign_in(h, p, **claims)
+        assert location == "/#sso-error=provider_disabled", location
+        assert h.identities() == [] and h.codes() == [] and h.users_named("newcomer") == []
+        assert (bob.password_hash, bob.sso_only, bob.sftp_password_auth) == before
+    # The row was read again for this, with a lock other readers share and a save waits for.
+    assert len(_provider_locks(h)) == 2 and all(lock == {"read": True} for lock in _provider_locks(h))
+    refused = [a[2] for a in h.audits if a[0] == "sso_sign_in_refused"]
+    assert [r.get("reason") for r in refused] == ["provider_disabled", "provider_disabled"]
+    # The control: left on, the account is linked and held to the provider's rule, and the new account is made.
+    for p, claims in tries:
+        p.state = "enabled"
+        location, _state = _sign_in(h, p, **claims)
+        assert location.startswith("/#sso="), location
+    assert len(h.identities()) == 2 and bob.sso_only is True and len(h.users_named("newcomer")) == 1
+
+
+def test_a_link_from_your_account_is_made_on_the_provider_as_it_stands_when_the_person_is_back(monkeypatch):
+    """The person was away at the provider. The link is made on the provider row as it is when they are back, read
+    again and held until the link is written: a change of the password rule made meanwhile holds for this link
+    (the save waits for the row, so it settles this account with the others), and a provider turned off meanwhile
+    links nothing."""
+    alice = _user("alice")
+    p = _provider(name="a", label="A")
+    h = Resolving(monkeypatch, [alice], [p])
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-linked="), location
+    seen = len(_provider_locks(h))
+    # While the person was away, the provider's people came to hold no password.
+    h.db.on_lock.append(lambda: p.policy.update({"sso_password_login": "disabled"}) if isinstance(p.policy, dict)
+                        else setattr(p, "policy", {"sso_password_login": "disabled"}))
+    status, out = h.finish_link(location)
+    assert status == 200 and out.get("password_stopped") is True and alice.sso_only is True, out
+    assert _provider_locks(h)[seen:] == [{"read": True}]
+    # Turned off meanwhile: nothing is linked.
+    carol = _user("carol")
+    q = _provider(name="b", label="B")
+    h = Resolving(monkeypatch, [carol], [q])
+    status, out = h.start_link(q)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(q, state)
+    h.db.on_lock.append(lambda: setattr(q, "state", "disabled"))
+    status, out = h.finish_link(location)
+    assert status == 409 and out["detail"]["reason"] == "provider_disabled" and h.identities() == [], out
+
+
 def test_an_identity_linked_by_email_does_not_stand_in_for_a_factor_the_account_set_up_later(monkeypatch):
     """The rule in the other order. An account with no factor is linked by its email address, on the provider's
     word, and the provider's trusted MFA counts for it. Later it sets up a factor of its own. From then on a sign-in

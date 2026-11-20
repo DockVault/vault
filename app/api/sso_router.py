@@ -168,6 +168,24 @@ def _provider(db, provider_id) -> Optional[SsoProvider]:
     return db.query(SsoProvider).filter(SsoProvider.id == pid).first()
 
 
+def _provider_as_it_stands(db, provider_id) -> Optional[SsoProvider]:
+    """The provider row as it is in the database now, held against a change until this request's transaction ends.
+
+    A link is made after the provider's round trip: the person was away at the provider, or the callback waited
+    for the provider's answer. What the row said before is not what a link is made on. An administrator who
+    meanwhile turned the provider off, or changed whether its people hold a password, changed it for this link
+    too; and a save that comes while the link is being made waits for it (the save, the state change and the
+    removal take the row for themselves), so it settles this account with the others. What this session has
+    pending is written first: the row is read again whole."""
+    try:
+        pid = uuid.UUID(str(provider_id))
+    except ValueError:
+        return None
+    db.flush()
+    return (db.query(SsoProvider).filter(SsoProvider.id == pid)
+            .populate_existing().with_for_update(read=True).first())
+
+
 def _limit_start(client_ip: str) -> None:
     from app.core import sign_in_lockout
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable, retry_after_seconds
@@ -372,6 +390,15 @@ async def sign_in_callback(
         log.info("sso callback refused for provider %s: %s", login.provider_id, exc)
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
         return _redirect("sso-error=" + exc.code)
+    # The provider's answer took its time (up to the whole wait). The row is read again as it stands, and held:
+    # a provider turned off meanwhile, by an administrator or by a change to its connection, links nobody, makes
+    # no account and applies no password rule on the strength of an answer it gave before.
+    row = _provider_as_it_stands(db, login.provider_id)
+    why = sso.usable_for(row, login.purpose) if row is not None else sso.PROVIDER_DISABLED
+    if why is not None:
+        db.rollback()
+        _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": why})
+        return _redirect("sso-error=" + why)
     # The provider's restriction (tenant, domain, group, the sign-up domain list) is judged before who the person
     # is, known identity included; a test reports it instead of refusing.
     if login.purpose != sso_state.TEST:
@@ -860,7 +887,7 @@ async def finish_link(
     _refuse_temp(current_user)
     client_ip = api.get_client_ip(request)
     record = _claim_handover(db, request, current_user, body, purpose=sso_state.LINK)
-    row = _provider(db, record["provider_id"])
+    row = _provider_as_it_stands(db, record["provider_id"])      # as it stands now, held until the link is written
     if row is None or sso.usable_for(row, sso_state.LINK) is not None:
         raise HTTPException(status_code=409, detail={"reason": sso.PROVIDER_DISABLED,
                                                      "message": sso.reason_text(sso.PROVIDER_DISABLED)})

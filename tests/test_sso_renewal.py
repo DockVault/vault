@@ -170,6 +170,25 @@ def test_a_session_with_no_record_of_the_identity_it_came_through_is_not_renewed
     assert sign_in.provider_subject_of_session(db, OLD) is None and sign_in.provider_subject_of_session(db, None) is None
 
 
+def test_the_provider_row_a_link_is_made_on_is_read_again_whole_and_loses_nothing_pending(db):
+    """Where a link resumes after the provider's round trip, the provider row is read again. A session keeps a
+    row as it first read it, so a plain query would hand the same stale object back: turned off by somebody else
+    meanwhile, it would still read as on. The read asks for the row afresh; and what this session had pending on
+    it is written first, not lost to the fresh read."""
+    from app.api import sso_router
+    row = _provider(db, name="Contoso")
+    table = SsoProvider.__tablename__
+    assert db.query(SsoProvider).filter(SsoProvider.id == row.id).first() is row and row.state == "enabled"
+    db.execute(sa.text(f"UPDATE {table} SET state = 'disabled'"))            # somebody else turned it off
+    assert db.query(SsoProvider).filter(SsoProvider.id == row.id).first().state == "enabled"   # the stale object
+    row.label = "Sign in with Contoso, renamed"                              # pending here, not written yet
+    again = sso_router._provider_as_it_stands(db, str(row.id))
+    assert again is row and again.state == "disabled" and again.label == "Sign in with Contoso, renamed"
+    assert db.execute(sa.text(f"SELECT label FROM {table}")).scalar() == "Sign in with Contoso, renamed"
+    assert sso_router._provider_as_it_stands(db, "not-an-id") is None
+    assert sso_router._provider_as_it_stands(db, uuid.uuid4()) is None
+
+
 def test_an_unlink_followed_by_a_link_on_the_same_provider_keeps_no_session_of_the_first_identity(db):
     """Somebody was linked to the account at the provider (by its address, or a provider account taken over) and
     signed in. The owner unlinks that identity, then links their own on the same provider, as their organisation
