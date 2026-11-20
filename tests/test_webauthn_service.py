@@ -133,6 +133,34 @@ def test_the_person_must_be_present_and_verified_when_the_policy_says_so():
     assert _register(ws, SoftAuthenticator(ES256), lax, flags=FLAG.UP)[0].uv_initialized is False
 
 
+def test_the_vault_checks_user_verification_itself_and_does_not_lean_on_the_library(monkeypatch):
+    """The library refuses a ceremony without user verification when it was told that the ceremony required it. The
+    vault's own check stands beside that one, not behind it: with the library told that verification was only
+    preferred (as a later version, or a changed call, might read it), a registration and an assertion without
+    user verification are refused all the same, and one with it is accepted."""
+    from fido2.server import Fido2Server
+    ws = _svc()
+    auth = SoftAuthenticator(ES256)
+    registered, _, _ = _register(ws, auth)
+    key = _key(ws, registered)
+    register, authenticate = Fido2Server.register_complete, Fido2Server.authenticate_complete
+
+    def lax(state):
+        assert state["user_verification"] == "required"          # what the vault told the library
+        return {**state, "user_verification": "preferred"}
+    monkeypatch.setattr(Fido2Server, "register_complete", lambda self, state, response: register(self, lax(state), response))
+    monkeypatch.setattr(Fido2Server, "authenticate_complete",
+                        lambda self, state, credentials, response: authenticate(self, lax(state), credentials, response))
+    with pytest.raises(ws.Refused) as e:
+        _assert(ws, auth, key, flags=FLAG.UP)
+    assert e.value.code == "user_not_verified"
+    with pytest.raises(ws.Refused) as e:
+        _register(ws, SoftAuthenticator(ES256), flags=FLAG.UP)
+    assert e.value.code == "user_not_verified"
+    assert _assert(ws, auth, key, flags=FLAG.UP | FLAG.UV).uv is True
+    assert _register(ws, SoftAuthenticator(ES256))[0].uv_initialized is True
+
+
 def test_the_algorithm_is_the_policys_at_registration_and_the_keys_at_assertion():
     ws = _svc()
     only_es256 = ws.PasskeyPolicy(allowed_algs=(ES256,))

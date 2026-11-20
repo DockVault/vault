@@ -346,6 +346,37 @@ def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monke
     assert len(h.db.rows_of(WebAuthnCredential)) == 1
 
 
+def test_a_challenge_made_for_one_account_is_no_challenge_for_another(monkeypatch):
+    """A second-step challenge is made for one account. Presented by another account, with that other account's own
+    key, it is unknown: refused before any key is looked up, and spent. (The keys offered with a challenge are its
+    account's own, which refuses the same today; this is the rule itself.)"""
+    registry, wss = _mod()
+    alice, bob = _user(), _user("bob")
+    h = StepHarness(monkeypatch, [alice, bob])
+    S = h.S
+    alices, _row = h.enroll(alice)
+    _bobs, _row = h.enroll(bob)
+    _pending, bobs_headers = h.pending_for(bob)
+    status, made_for_bob = _call_h(S, "POST", "/auth/second-factor/passkey/options", {}, bobs_headers)
+    assert status == 200, made_for_bob
+    _pending, alices_headers = h.pending_for(alice)
+    status, made_for_alice = _call_h(S, "POST", "/auth/second-factor/passkey/options", {}, alices_headers)
+    assert status == 200, made_for_alice
+    looked_up = []
+    real = S._passkeys_of
+    monkeypatch.setattr(S, "_passkeys_of", lambda db, user_id: looked_up.append(user_id) or real(db, user_id))
+    # Alice signs with her own key, over her own options, and names the challenge made for Bob.
+    credential = alices.get_assertion(made_for_alice["options"], ORIGIN, flags=FLAG.UP | FLAG.UV, sign_count=1)
+    status, body = _call_h(S, "POST", "/auth/second-factor/passkey/verify",
+                           {"challenge_id": made_for_bob["challenge_id"], "credential": credential}, alices_headers)
+    assert status == 400 and body["detail"]["reason"] == "challenge_unknown", body
+    assert looked_up == []
+    # The control: her own challenge, the same key.
+    status, body = _call_h(S, "POST", "/auth/second-factor/passkey/verify",
+                           {"challenge_id": made_for_alice["challenge_id"], "credential": credential}, alices_headers)
+    assert status == 200 and body.get("access_token"), body
+
+
 def test_mode_off_stops_passkeys_at_every_step_but_keeps_the_rows(monkeypatch):
     registry, wss = _mod()
     alice = _user()
