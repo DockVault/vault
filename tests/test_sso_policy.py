@@ -95,6 +95,35 @@ def test_the_domain_rule(answer, verdict):
 
 
 @pytest.mark.parametrize("answer, verdict", [
+    ({"hosted_domain": "Example.TEST"}, None),
+    ({"hosted_domain": "example.test", "email": "a@gmail.com", "email_verified": True}, None),
+    ({"hosted_domain": "other.test", "email": "a@example.test", "email_verified": True}, P.RESTRICTED),
+    # A consumer account that carries the work address: verified, on the list, and no member of the organisation.
+    ({"email": "a@example.test", "email_verified": True}, P.RESTRICTION_CLAIM_MISSING),
+    ({"hosted_domain": "  ", "email": "a@example.test", "email_verified": True}, P.RESTRICTION_CLAIM_MISSING),
+    ({}, P.RESTRICTION_CLAIM_MISSING),
+])
+def test_where_the_provider_has_a_hosted_domain_claim_the_address_proves_nothing(answer, verdict):
+    assert _judge({"sso_allowed_domains": ["example.test"]}, hosted_domain_only=True, **answer) == verdict
+
+
+def test_a_single_knowledge_factor_is_never_a_second_factor():
+    """A password, a PIN or a question is one factor. Such a value is refused at save, with the reason, and counts
+    for nothing when a stored list holds it all the same: a sign-in with a password alone is not two factors."""
+    for value in ("pwd", "PWD", "pin", "kba"):
+        with pytest.raises(P.PolicyInvalid) as refused:
+            P.validate({"sso_accepted_amr": ["mfa", value]})
+        assert refused.value.key == "sso_accepted_amr" and "one factor, not a second one" in str(refused.value)
+    assert P.validate({"sso_accepted_amr": ["mfa", "otp", "hwk", "swk", "fpt", "sms"]})["sso_accepted_amr"] == [
+        "mfa", "otp", "hwk", "swk", "fpt", "sms"]
+    assert P.validate({"sso_accepted_acr": ["pwd"]}) == {"sso_accepted_acr": ["pwd"]}      # an acr value is a name
+    stored = P.effective({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["pwd", "pin", "kba", "mfa"]})
+    assert P.mfa_trusted(stored, ["pwd"], None) is False
+    assert P.mfa_trusted(stored, ["pwd", "pin", "kba"], None) is False
+    assert P.mfa_trusted(stored, ["pwd", "mfa"], None) is True
+
+
+@pytest.mark.parametrize("answer, verdict", [
     ({"groups": ["Vault Users", "Other"]}, None),
     ({"groups": [123]}, None),                                      # a numeric group id matches its string
     ({"groups": ["Other"]}, P.RESTRICTED),

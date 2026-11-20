@@ -87,13 +87,19 @@ def effective(stored) -> dict:
     return policy
 
 
+# ``amr`` values that name one knowledge factor (RFC 8176): a password, a PIN, a question. A sign-in that shows
+# only one of them proved one factor; none is a second one, whatever a list says.
+SINGLE_FACTOR_AMR = frozenset({"pwd", "pin", "kba"})
+
+
 def mfa_trusted(policy: dict, amr, acr) -> bool:
     """Whether the token's ``amr`` values or ``acr`` value count as the second factor under this policy: trust on, and
-    an accepted value present. Nothing is trusted by default."""
+    an accepted value present. Nothing is trusted by default, and a value that names a single knowledge factor
+    (``pwd``, ``pin``, ``kba``) never counts, also when a stored list holds it."""
     if not policy["sso_trust_idp_mfa"]:
         return False
     values = {str(v) for v in amr} if isinstance(amr, (list, tuple, set)) else set()
-    if values & set(policy["sso_accepted_amr"]):
+    if values & (set(policy["sso_accepted_amr"]) - SINGLE_FACTOR_AMR):
         return True
     return isinstance(acr, str) and acr in set(policy["sso_accepted_acr"])
 
@@ -121,7 +127,8 @@ def is_restricted(policy: dict, account_policy: Optional[dict] = None) -> bool:
 
 
 def restriction(policy: dict, *, tenant_id, email, email_verified: bool, hosted_domain, groups,
-                groups_overage: bool, account_policy: Optional[dict] = None) -> Optional[str]:
+                groups_overage: bool, account_policy: Optional[dict] = None,
+                hosted_domain_only: bool = False) -> Optional[str]:
     """Why the restriction keeps this person out (``RESTRICTED`` or ``RESTRICTION_CLAIM_MISSING``), or None when
     it admits them or there is none. Every rule that is set is judged; a claim that excludes the person outright
     wins over one that is missing, since an exclusion is definite and a missing claim is not."""
@@ -134,7 +141,7 @@ def restriction(policy: dict, *, tenant_id, email, email_verified: bool, hosted_
             return RESTRICTED
     domains = policy["sso_allowed_domains"]
     if domains:
-        domain = _domain_of(hosted_domain, email, email_verified)
+        domain = _domain_of(hosted_domain, email, email_verified, claim_only=hosted_domain_only)
         if domain is None:
             missing = True
         elif domain not in set(domains):
@@ -165,11 +172,16 @@ def address_admitted(policy: dict, email: str) -> bool:
     return email.rsplit("@", 1)[1].strip().lower() in set(domains)
 
 
-def _domain_of(hosted_domain, email, email_verified) -> Optional[str]:
+def _domain_of(hosted_domain, email, email_verified, *, claim_only: bool = False) -> Optional[str]:
     """The domain a domain rule judges: the hosted-domain claim when the provider sends one, else the verified
-    email's; a consumer account has neither, or an address whose domain the list does not name."""
+    email's. ``claim_only`` is for a provider that has such a claim (Google's ``hd``): there the claim alone says
+    that an account belongs to the organisation. A consumer account at the same provider carries no claim and may
+    carry any verified address, a former employee's work address among them, so its address proves nothing and a
+    token without the claim is missing what the rule needs."""
     if isinstance(hosted_domain, str) and hosted_domain.strip():
         return hosted_domain.strip().lower()
+    if claim_only:
+        return None
     if email_verified and isinstance(email, str) and email.count("@") == 1:
         return email.rsplit("@", 1)[1].strip().lower() or None
     return None
@@ -213,6 +225,11 @@ def _saved_list(key: str, value) -> list:
                 raise PolicyInvalid(key, f"“{item}” is not a domain name (write it like example.org).")
         elif key != "sso_required_groups" and any(ch.isspace() for ch in item):
             raise PolicyInvalid(key, "An entry holds no spaces.")
+        if key == "sso_accepted_amr" and item.lower() in SINGLE_FACTOR_AMR:
+            raise PolicyInvalid(key, (
+                f"“{item}” says that a password, a PIN or a question was used: one factor, not a second one. With "
+                "it on the list, every sign-in with a password alone would count as the second factor. List a value "
+                "that names a second kind, such as mfa."))
         mark = item.lower() if key in ("sso_allowed_domains", "sso_allowed_tenants") else item
         if mark not in seen:
             seen.add(mark)

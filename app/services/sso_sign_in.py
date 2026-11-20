@@ -365,7 +365,22 @@ def restriction_of(db, row, answer: ProviderAnswer) -> Optional[str]:
     return sso_policy.restriction(policy, tenant_id=answer.tenant_id, email=answer.email,
                                   email_verified=answer.email_verified, hosted_domain=answer.hosted_domain,
                                   groups=answer.groups, groups_overage=answer.groups_overage,
-                                  account_policy=account_policy)
+                                  account_policy=account_policy, hosted_domain_only=hosted_domain_only(row))
+
+
+GOOGLE_ISSUER = "https://accounts.google.com"
+
+
+def hosted_domain_only(row) -> bool:
+    """Whether ``row``'s domain list is judged on the provider's hosted-domain claim alone: Google, whatever the row
+    says of its claims (it signs consumer accounts and Workspace accounts as one issuer, and tells them apart by
+    ``hd`` only), and any provider whose row names such a claim. A provider with no such claim has only the
+    verified address to go by, and there the address's domain is judged."""
+    claims = getattr(row, "claims", None)
+    named = claims.get("domain") if isinstance(claims, dict) else None
+    if isinstance(named, str) and named.strip():
+        return True
+    return (getattr(row, "issuer", None) or "").strip().rstrip("/").lower() == GOOGLE_ISSUER
 
 
 def mfa_trusted(row, answer: ProviderAnswer) -> bool:
