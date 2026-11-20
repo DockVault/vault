@@ -475,6 +475,7 @@ def _routes():
         (A.open_receiver_upload_session,
          {"token": "t" * 40, "payload": A.ReceiverUploadOpen(filename="a", total_size=1, total_chunks=1)},
          ["receiver_open", "receiver_open_ip"]),
+        (A.finish_sign_in, {"body": A.SignInFinishRequest(code="c" * 43, verifier="v" * 43)}, ["sign_in_finish"]),
     ]
 
 
