@@ -147,6 +147,18 @@ def _accounts_named(db, usernames) -> list:
     return [(u.id, u.username, u.email) for u in db.query(User).filter(User.username.in_(names)).all()]
 
 
+def _accounts_linked(db, row, *, but=None) -> list:
+    """(id, username, email) of the active accounts linked to ``row``, without the account ``but`` names, for a
+    notice sent after the commit."""
+    from app.core.models import ExternalIdentity
+    ids = {identity.user_id for identity in
+           db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all()}
+    ids.discard(but)
+    if not ids:
+        return []
+    return [(u.id, u.username, u.email) for u in db.query(User).filter(User.id.in_(ids)).all() if u.is_active]
+
+
 SET_A_PASSWORD = ("Your account has no password yet: set one with \"Forgot password\" on the sign-in page, or ask an "
                   "administrator for a reset link.")
 
@@ -238,6 +250,11 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         outcome = providers.apply(db, row, changes, stored_policy)
         made, restored = _accounts_named(db, outcome["made_sso_only"]), _accounts_named(db, outcome["restored"])
         turned_off = outcome["connection_changed"] and row.state == providers.ENABLED
+        # Where the provider is found says who a linked account's sign-in is vouched for by. A change of it is one
+        # administrator's word: the people linked to it are told, whether it was on or off when it was changed
+        # (turning it off first hides nothing), beside the other administrators.
+        pointed_elsewhere = any(field in outcome["changed"] for field in providers.WHERE_IT_IS)
+        owners = _accounts_linked(db, row, but=current_user.id) if pointed_elsewhere else []
         held = providers.hold_lapsed(db, row) if turned_off else 0
         if turned_off:
             row.state = providers.DISABLED
@@ -246,8 +263,13 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         db.rollback()
         raise _refused(exc)
     ended = _end_sessions_of(db, row.id) if turned_off else 0
-    outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "held": held}
+    outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "held": held,
+               "owners_told": len(owners)}
     label = row.label or row.name
+    _tell_accounts(owners, f"{label} was pointed somewhere else", (
+        f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "
+        f"in through {label} until an administrator has tested it again and turned it on. If the sign-in you meet "
+        "there next does not look like the one you know, stop and tell an administrator."))
     # A change another person made to how an account signs in is told to its owner.
     _tell_accounts(made, "Your password no longer works on this vault", (
         f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
@@ -264,8 +286,12 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
             said += f" {len(outcome['made_sso_only'])} linked account(s) now sign in only through it."
         if outcome["restored"]:
             said += f" {len(outcome['restored'])} linked account(s) may hold a password again."
-        if outcome["secret_cleared"]:
-            said += " It was pointed somewhere else, so its stored client secret was dropped and must be entered again."
+        if pointed_elsewhere:
+            said += " It was pointed somewhere else" + (
+                ", so its stored client secret was dropped and must be entered again." if outcome["secret_cleared"]
+                else ".")
+            if owners:
+                said += f" The {len(owners)} account(s) linked to it were told."
         if turned_off:
             said += (" Its connection changed, so it was turned off until a test sign-in passes again"
                      + (f", and {ended} session(s) that came through it were ended." if ended else "."))

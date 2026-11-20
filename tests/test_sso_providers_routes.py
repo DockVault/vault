@@ -489,6 +489,7 @@ def test_a_change_to_the_connection_of_a_provider_that_is_on_turns_it_off_until_
     status, out = h.call("PATCH", path, {"discovery_url": "https://elsewhere.example.net/.well-known/openid-configuration"})
     assert status == 200, out
     assert out["turned_off"] is True and out["secret_cleared"] is True and out["sessions_ended"] == 3 and out["held"] == 2
+    assert out["owners_told"] == 0 and h.accounts_told == []           # nobody is linked to it here
     assert row.state == "disabled" and row.client_secret_enc is None
     assert out["provider"]["state"] == "disabled" and out["provider"]["has_client_secret"] is False
     assert seen == [("held", "enabled"), ("ended", str(row.id))]       # held while it still read as on, then ended
@@ -519,6 +520,45 @@ def test_a_change_to_the_connection_of_a_provider_that_is_on_turns_it_off_until_
     row.state = "disabled"
     status, out = h.call("PATCH", path, {"client_id": "a-third-client"})
     assert status == 200 and out["turned_off"] is False and seen == []
+
+
+@pytest.mark.parametrize("state", ["enabled", "disabled"])
+@pytest.mark.parametrize("change", [{"discovery_url": "https://elsewhere.example.net/.well-known/openid-configuration"},
+                                    {"issuer": ISSUER_2}, {"private_network": True},
+                                    {"issuer": ISSUER_2, "client_secret": "their-own"}])
+def test_the_people_linked_to_a_provider_are_told_when_it_is_pointed_somewhere_else(monkeypatch, state, change):
+    """Where a provider is found says who vouches for a linked account's sign-in. One administrator can change it
+    (to a provider they run, with their own secret), test it and turn it on again. The other administrators are
+    told; so is every person linked to it, who is the one it would be used against. Turning it off first hides
+    nothing: the people are told whichever state it was in. The administrator who made the change is not told of
+    their own change, an account that is off is told nothing, and a change that points it nowhere else (another
+    client, a new secret, its label) tells nobody."""
+    row = _tested(_provider(state=state, created_at=None, updated_at=None))
+    other = _provider(name="other", label="Other", created_at=None, updated_at=None)
+    alice, bob, gone, carol = _user("alice"), _user("bob", email=None), _user("gone", is_active=False), _user("carol")
+    linked = [(alice, row), (bob, row), (gone, row), (carol, other)]
+    h = Admin(monkeypatch, [row, other], users=[alice, bob, gone, carol],
+              identities=[_identity(user, provider, subject=f"subject-{n}") for n, (user, provider) in enumerate(linked)])
+    from app.core.models import ExternalIdentity
+    h.db.tables[ExternalIdentity].append(_identity(h.root, row, subject="subject-root"))
+    _watch_turn_off(monkeypatch, h)
+    path = f"/admin/sso/providers/{row.id}"
+    status, out = h.call("PATCH", path, change)
+    assert status == 200 and out["owners_told"] == 2, out
+    (names, title, text), = h.accounts_told
+    assert names == ["alice", "bob"] and title == "Sign in with Contoso was pointed somewhere else"
+    assert "changed where this vault finds Sign in with Contoso" in text and "tested it again" in text
+    assert "stop and tell an administrator" in text
+    said = h.told[-1][2]
+    assert "pointed somewhere else" in said and "The 2 account(s) linked to it were told." in said
+    assert ("must be entered again" in said) is ("client_secret" not in change)
+    # What points it nowhere else tells nobody linked to it.
+    h.accounts_told.clear()
+    for quiet in ({"client_id": "another-client"}, {"client_secret": "rotated"}, {"label": "Staff sign-in"},
+                  {"scopes": "openid email"}):
+        status, out = h.call("PATCH", path, quiet)
+        assert status == 200 and out["owners_told"] == 0 and h.accounts_told == [], (quiet, out)
+        assert "pointed somewhere else" not in h.told[-1][2]
 
 
 def test_turning_a_provider_off_ends_its_sessions_and_holds_the_lapsed_accounts(monkeypatch):
