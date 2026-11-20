@@ -11764,6 +11764,11 @@ async def passkey_register_verify(
     if getattr(user, "second_factor_reset_at", None) is not None:
         user.second_factor_reset_at = None
         db.commit()
+    # The passkey a role must hold is held now: its grace is over. Should the account's last passkey leave it
+    # later (removed, or retired by a reset), the time to set one up starts again, as for a new requirement.
+    if getattr(user, "passkey_required_since", None) is not None:
+        user.passkey_required_since = None
+        db.commit()
     if pending is not None:
         # Forced enrollment: the pipeline spends the pending login and finishes the sign-in with the new key as
         # the second proof (or holds it for another step the table asks for).

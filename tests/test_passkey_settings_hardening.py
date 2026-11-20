@@ -156,6 +156,26 @@ def test_a_requirement_waits_while_no_passkey_can_be_made_at_the_address(monkeyp
     assert alice.passkey_required_since is not None and datetime.utcnow() - alice.passkey_required_since < timedelta(minutes=1)
 
 
+def test_the_grace_starts_over_when_the_last_passkey_leaves_the_account(monkeypatch):
+    """A role must hold a passkey, and the account set one up long ago. Removing it (a lost device) is not refused,
+    and the next sign-in is not stopped at once on a grace that ran out before the key existed: registering a
+    passkey ends the grace, so the time to set one up starts again at the sign-in after the last one left."""
+    registry, wss = _mod()
+    long_ago = datetime.utcnow() - timedelta(days=200)
+    alice = _user(passkey_required_since=long_ago, passkey_requirement_cleared_at=None)
+    h = RouteHarness(monkeypatch, alice)
+    _required(monkeypatch, registry, wss, ["user"])
+    assert wss.requirement(h.db, alice).overdue is True
+    status, shown, _auth = h.register()
+    assert status == 201, shown
+    assert alice.passkey_required_since is None and wss.requirement(h.db, alice) == wss.Requirement(False)
+    status, body = _rcall(h.S, "DELETE", f"/users/me/passkeys/{shown['id']}", None, {"X-Second-Factor": "ok"})
+    assert status == 200 and body == {"removed": True}, body
+    after = wss.requirement(h.db, alice)
+    assert after.required is True and after.overdue is False and after.since is None
+    assert wss.mark_required(alice) is True and wss.requirement(h.db, alice).overdue is False
+
+
 def test_whether_a_passkey_can_be_made_is_what_the_address_says(monkeypatch):
     registry, wss = _mod()
     import app.core.public_url as public_url
