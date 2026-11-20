@@ -50,6 +50,15 @@ def _tables_present(db) -> bool:
     return table_present(db, "external_identities") and table_present(db, "sso_providers")
 
 
+def refusal_in_force(identity) -> bool:
+    """Whether the refusal recorded on ``identity`` still holds the person: there is one, and no sign-in the
+    provider admitted came after it (such a sign-in writes ``last_sign_in_at`` and leaves the stamp where it is).
+    An answered stamp holds nobody: it pauses no key, is counted nowhere, and stands in the way of nothing."""
+    refused_at = getattr(identity, "refused_at", None)
+    last = getattr(identity, "last_sign_in_at", None)
+    return refused_at is not None and (last is None or refused_at >= last)
+
+
 def deadline_of(identity, provider) -> Optional[Deadline]:
     """The deadline ``identity`` keeps on ``provider``, or None when the provider asks nothing. A refusal the provider
     made since the person's last sign-in through it pauses the keys whatever the window and whatever has become of
@@ -61,7 +70,7 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
     the rule."""
     last = identity.last_sign_in_at
     refused_at = getattr(identity, "refused_at", None)
-    refused = refused_at is not None and (last is None or refused_at >= last)
+    refused = refusal_in_force(identity)
     days = sso_policy.effective(getattr(provider, "policy", None))["sso_freshness_days"] if provider is not None else 0
     if not refused and days <= 0:
         return None

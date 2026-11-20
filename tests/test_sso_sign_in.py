@@ -10,7 +10,7 @@ import json
 import time
 import types
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -1157,6 +1157,20 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
                                                "identity_id": str(identity.id)}) in h.audits
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
     assert status == 409 and body["detail"]["reason"] == "not_refused" and steps == ["root"]
+    # A refusal the person answered since (the provider admitted a later sign-in) holds nobody: there is nothing to
+    # lift, no step-up is asked, nobody is told, and the stamp is left as the record it is.
+    stamp = datetime.utcnow() - timedelta(days=3)
+    identity.refused_at, identity.last_sign_in_at = stamp, stamp + timedelta(days=1)
+    assert F.refusal_in_force(identity) is False and F.lapsed(h.db, alice.id) is None
+    status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
+    assert status == 409 and body["detail"]["reason"] == "not_refused" and steps == ["root"]
+    assert identity.refused_at == stamp
+    # Answered while the administrator confirmed who they are: nothing is lifted either.
+    identity.last_sign_in_at = stamp - timedelta(days=1)
+    assert F.refusal_in_force(identity) is True
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: setattr(identity, "last_sign_in_at", datetime.utcnow()))
+    status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
+    assert status == 409 and body["detail"]["reason"] == "changed" and identity.refused_at == stamp
     assert _call(h.S, "POST", f"/admin/sso/identities/{uuid.uuid4()}/clear-refusal")[0] == 404
     assert _call(h.S, "POST", "/admin/sso/identities/not-an-id/clear-refusal")[0] == 404
     assert len(told) == 1

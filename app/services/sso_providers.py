@@ -281,8 +281,10 @@ def addresses(row) -> Optional[dict]:
 
 def _counts(db, row) -> dict:
     """How many accounts are linked to ``row``, how many of them sign in only through a provider, and how many
-    identities carry a refusal."""
+    identities a refusal still holds. A refusal the person has answered since, by a sign-in the provider admitted,
+    is not one of them: it holds nobody, and nothing could clear it."""
     from app.core.models import ExternalIdentity, User
+    from app.services import sso_freshness
     identities = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all()
     only = 0
     for identity in identities:
@@ -290,7 +292,7 @@ def _counts(db, row) -> dict:
         if user is not None and getattr(user, "sso_only", False):
             only += 1
     return {"identities": len(identities), "sso_only_accounts": only,
-            "refusals": sum(1 for i in identities if getattr(i, "refused_at", None) is not None)}
+            "refusals": sum(1 for i in identities if sso_freshness.refusal_in_force(i))}
 
 
 def public(db, row) -> dict:

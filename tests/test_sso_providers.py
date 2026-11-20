@@ -488,6 +488,20 @@ def test_a_provider_is_removed_only_when_nothing_depends_on_it(P, db):
     held = _link(db, bob, row, refused_at=datetime(2026, 11, 1))
     refusal = P.remove_refusal(db, row)
     assert refusal.reason == P.REFUSALS_IN_FORCE and str(refusal).startswith("1 account is held by a refusal")
+    assert P.public(db, row)["refusals"] == 1
+    # The person answered it since: the provider admitted a later sign-in. The stamp stays where it is (nothing
+    # clears it), and it holds nobody: it is not counted and does not stand in the way. A sign-in from before the
+    # refusal, or at the same moment, answers nothing.
+    for last, in_force in ((datetime(2026, 10, 1), True), (datetime(2026, 11, 1), True), (datetime(2026, 11, 2), False)):
+        held.last_sign_in_at = last
+        db.commit()
+        refusal = P.remove_refusal(db, row)
+        assert (refusal is not None and refusal.reason == P.REFUSALS_IN_FORCE) is in_force, last
+        assert P.public(db, row)["refusals"] == (1 if in_force else 0), last
+    assert held.refused_at == datetime(2026, 11, 1)
+    held.last_sign_in_at = None
+    db.commit()
+    assert P.remove_refusal(db, row).reason == P.REFUSALS_IN_FORCE
     held.refused_at = None
     db.commit()
     assert P.remove_refusal(db, row) is None and link.id is not None

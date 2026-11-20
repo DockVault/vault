@@ -156,15 +156,16 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     api = _api()
     client_ip = api.get_client_ip(request)
     identity = _identity_or_404(db, identity_id)
-    if getattr(identity, "refused_at", None) is None:
+    from app.services import sso_freshness
+    if not sso_freshness.refusal_in_force(identity):       # none, or one the person has answered since
         raise HTTPException(status_code=409, detail={"reason": "not_refused",
-                                                     "message": "No refusal is recorded for this identity."})
+                                                     "message": "No refusal holds this identity."})
     if str(identity.user_id) == str(current_user.id):
         raise HTTPException(status_code=409, detail={"reason": "own_identity", "message": (
             "Another administrator must clear a refusal of your own identity.")})
     _step_up(db, current_user, request)       # may commit (a receipt is used once)
     identity = _identity_or_404(db, identity_id, lock=True)
-    if identity.refused_at is None:
+    if not sso_freshness.refusal_in_force(identity):
         raise HTTPException(status_code=409, detail={"reason": "changed", "message": "The identity changed meanwhile."})
     identity.refused_at = None
     user = db.query(User).filter(User.id == identity.user_id).first()
