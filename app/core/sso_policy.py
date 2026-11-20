@@ -9,6 +9,7 @@ refuse the sign-in; only the first may ever count as a refusal that ends access 
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 ACCOUNT_CREATION_VALUES = ("invite_only", "jit")
@@ -172,3 +173,80 @@ def _domain_of(hosted_domain, email, email_verified) -> Optional[str]:
     if email_verified and isinstance(email, str) and email.count("@") == 1:
         return email.rsplit("@", 1)[1].strip().lower() or None
     return None
+
+
+# --------------------------------------------------------------------------- an administrator's save
+
+class PolicyInvalid(ValueError):
+    """A policy value an administrator's save may not hold; ``key`` names the setting."""
+
+    def __init__(self, key: str, message: str):
+        super().__init__(message)
+        self.key = key
+
+
+_DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+
+def _plain(text: str) -> bool:
+    """No control character, and nothing a browser or a log would not show as itself."""
+    return all(ch.isprintable() for ch in text)
+
+
+def _saved_list(key: str, value) -> list:
+    if not isinstance(value, list):
+        raise PolicyInvalid(key, "A list is expected.")
+    if len(value) > MAX_LIST_ITEMS:
+        raise PolicyInvalid(key, f"At most {MAX_LIST_ITEMS} entries.")
+    out, seen = [], set()
+    for item in value:
+        if not isinstance(item, str):
+            raise PolicyInvalid(key, "Every entry is a text.")
+        item = item.strip()
+        if not item:
+            continue
+        if len(item) > MAX_ITEM_LENGTH or not _plain(item):
+            raise PolicyInvalid(key, f"An entry is at most {MAX_ITEM_LENGTH} characters, without control characters.")
+        if key == "sso_allowed_domains":
+            item = item.lower()
+            if not _DOMAIN.match(item):
+                raise PolicyInvalid(key, f"“{item}” is not a domain name (write it like example.org).")
+        elif key != "sso_required_groups" and any(ch.isspace() for ch in item):
+            raise PolicyInvalid(key, "An entry holds no spaces.")
+        mark = item.lower() if key in ("sso_allowed_domains", "sso_allowed_tenants") else item
+        if mark not in seen:
+            seen.add(mark)
+            out.append(item)
+    return out
+
+
+def validate(changes) -> dict:
+    """An administrator's policy changes, checked strictly: where :func:`effective` forgives a stored value of the
+    wrong shape, a save is refused. Only known settings, each of its own type and within its bounds; lists trimmed,
+    without empty or repeated entries, domains lowered. Returns the values to store; raises :class:`PolicyInvalid`."""
+    if not isinstance(changes, dict):
+        raise PolicyInvalid("policy", "The policy is a set of named settings.")
+    out = {}
+    for key, value in changes.items():
+        if key not in DEFAULTS:
+            raise PolicyInvalid(str(key)[:80], "Unknown setting.")
+        if key in _ENUMS:
+            if value not in _ENUMS[key]:
+                raise PolicyInvalid(key, "One of: " + ", ".join(_ENUMS[key]) + ".")
+            out[key] = value
+        elif key in _BOOLS:
+            if not isinstance(value, bool):
+                raise PolicyInvalid(key, "On or off.")
+            out[key] = value
+        elif key in _INTS:
+            low, high = _INTS[key]
+            if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+                raise PolicyInvalid(key, f"A whole number from {low} to {high}.")
+            out[key] = value
+        elif key in _LISTS:
+            out[key] = _saved_list(key, value)
+        else:
+            if not isinstance(value, str) or len(value.strip()) > MAX_ITEM_LENGTH or not _plain(value.strip()):
+                raise PolicyInvalid(key, f"A text of at most {MAX_ITEM_LENGTH} characters.")
+            out[key] = value.strip()
+    return out

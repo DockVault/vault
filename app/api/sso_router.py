@@ -828,6 +828,44 @@ async def finish_link(
     return {"linked": True, "identity": _identity_public(identity, row)}
 
 
+@router.post("/admin/sso/providers/{provider_id}/test/start")
+async def start_test(
+    provider_id: str,
+    body: SsoLinkStartRequest,
+    request: Request,
+    current_user: User = Depends(require_interactive_admin),
+    db: Session = Depends(get_db),
+):
+    """Start a test sign-in at a provider whose connection is filled in, whatever its state: the administrator signs
+    in at the provider in this browser, and the callback hands what the provider sent to the tab that started it
+    (``POST .../test/finish``). Nobody is signed in or linked, and nothing changes but the summary on the provider's
+    row. Asks no step-up: a test is how an administrator finds out, before anything is turned on."""
+    from app.services import sso_providers
+    api = _api()
+    client_ip = api.get_client_ip(request)
+    _limit_start(client_ip)
+    row = _provider(db, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown provider.")
+    if not sso_providers.configured(row):
+        raise HTTPException(status_code=409, detail={
+            "reason": sso_providers.NOT_CONFIGURED,
+            "message": "Enter the issuer, the client id and the client secret first."})
+    why = sso.usable_for(row, sso_state.TEST)
+    if why is not None:
+        raise _refused_start(sso.Refusal(why))
+    from app.core import sign_in_lockout
+    view, user_id, session_hash = _provider_view(row), current_user.id, api._current_session_hash(request)
+    _release_database(db)
+    try:
+        url = await _provider_call(sso.start, view, purpose=sso_state.TEST, source=sign_in_lockout.source_of(client_ip),
+                                   client_ip=client_ip, verifier_hash=body.verifier_hash, user_id=user_id,
+                                   session_hash=session_hash, deadline=_provider_deadline())
+    except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
+        raise _refused_start(exc)
+    return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
+
+
 @router.post("/admin/sso/providers/{provider_id}/test/finish")
 async def finish_test(
     provider_id: str,

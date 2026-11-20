@@ -747,6 +747,7 @@ def _password_less_refusal(db, row, user) -> None:
 def test_summary(db, row, answer: ProviderAnswer, tester) -> dict:
     """What an administrator reads after a test sign-in: the claim names (never the values but the tester's own
     identifiers), the proofs the token carried, and what the vault would do with this identity."""
+    from app.services import sso_providers
     return {
         "outcome": "ok", "at": datetime.utcnow().isoformat() + "Z", "tester": tester.username,
         "claim_names": sorted(str(k) for k in answer.claims.keys()),
@@ -754,6 +755,8 @@ def test_summary(db, row, answer: ProviderAnswer, tester) -> dict:
         "email_verified": answer.email_verified, "email_present": answer.email is not None,
         "groups": _group_names(row, answer), "subject_length": len(answer.subject),
         "mfa_trusted": mfa_trusted(row, answer), **would_do(db, row, answer, tester),
+        # The connection settings this sign-in passed with: a provider is turned on only while they still stand.
+        "config": sso_providers.fingerprint(row),
     }
 
 

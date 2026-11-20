@@ -39,6 +39,8 @@ NOT_RECORDED = {
         "issues a challenge for a step-up; the step-up records its outcome",
     ("app/api/sso_router.py", "POST /auth/sso/{provider_id}/start"):
         "writes the login state and answers the provider's address; the callback records the sign-in or its refusal",
+    ("app/api/sso_router.py", "POST /admin/sso/providers/{provider_id}/test/start"):
+        "starts a test sign-in; the test is recorded when the tab that started it claims the provider's answer",
     ("app/api/sso_router.py", "POST /users/me/identities/{provider_id}/start"):
         "starts a link; the link is recorded when the tab that started it claims it",
     ("app/api/sso_router.py", "POST /users/me/identities/{provider_id}/reauth"):

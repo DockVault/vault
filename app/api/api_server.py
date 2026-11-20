@@ -853,6 +853,9 @@ app.include_router(sso_router)
 # The held administrator requests a provider group raises (app/api/sso_admin_router.py).
 from app.api.sso_admin_router import router as sso_admin_router  # noqa: E402
 app.include_router(sso_admin_router)
+# The providers themselves, for administrators (app/api/sso_providers_router.py).
+from app.api.sso_providers_router import router as sso_providers_router  # noqa: E402
+app.include_router(sso_providers_router)
 # Compliance access: the auditor right, cases, legal holds and their step-ups.
 from app.api.compliance_router import router as compliance_router  # noqa: E402
 app.include_router(compliance_router)
@@ -6032,12 +6035,33 @@ def _sign_in_methods(db) -> dict:
     ``{id, label, kind, icon, order}``: never a secret, never an issuer). Nothing else rides along: the page
     renders from this object and from nothing in the settings blob. The passkey and provider settings fill it
     in as they land; the passkey button shows when the deployment can take a passkey sign-in (a usable
-    public address), the provider buttons when their items land. ``origin`` is the address those work at: the
-    vault's configured address as a browser writes an origin (public already: every emailed link carries it), or
-    none when sign-in cannot be built on it. A page opened at any other address says so and offers neither."""
+    public address). A provider has a button when it is on, shown on the sign-in page, and the vault has an
+    address the provider can send the browser back to; the buttons come in the administrator's order.
+    ``origin`` is the address those work at: the vault's configured address as a browser writes an origin
+    (public already: every emailed link carries it), or none when sign-in cannot be built on it. A page
+    opened at any other address says so and offers neither."""
     from app.core import public_url
-    return {"password": "visible", "passkeys": _passkey_sign_in_ready(db), "providers": [],
+    return {"password": "visible", "passkeys": _passkey_sign_in_ready(db), "providers": _sign_in_providers(db),
             "origin": public_url.public_base_url() or None}
+
+
+def _sign_in_providers(db) -> list:
+    """The single sign-on buttons of the sign-in page: ``{id, label, kind, icon, order}`` for each provider that
+    is on and shown there, in the administrator's order. Empty without an address a provider can send the browser
+    back to (no sign-in could start), and on a database that holds no providers table."""
+    from app.core.models import SsoProvider
+    from app.services import sign_in as _sign_in, sso_sign_in
+    try:
+        if not _sign_in.table_present(db, "sso_providers") or sso_sign_in.address_refusal():
+            return []
+        rows = db.query(SsoProvider).filter(SsoProvider.state == "enabled").all()
+    except Exception as exc:     # noqa: BLE001 -- the sign-in page still shows its form
+        print(f"⚠ sign-in providers not read: {type(exc).__name__}")
+        return []
+    shown = [r for r in rows if r.show_on_sign_in and sso_sign_in.usable_for(r, "sign_in") is None]
+    shown.sort(key=lambda r: (r.sort_order or 0, (r.label or r.name or "").lower(), str(r.id)))
+    return [{"id": str(r.id), "label": r.label or r.name, "kind": r.kind, "icon": r.icon or "generic",
+             "order": r.sort_order or 0} for r in shown]
 
 
 def _email_has_pending_invite(db: Session, email: str) -> bool:
