@@ -279,6 +279,41 @@ def test_whether_a_passkey_can_be_made_is_what_the_address_says(monkeypatch):
     assert wss.passkeys_can_be_made() is True
 
 
+@pytest.mark.parametrize("state", ["locked", "turned off", "locked out here"])
+def test_a_held_enrollment_registers_no_passkey_for_an_account_that_may_not_sign_in(monkeypatch, state):
+    """A sign-in held for the passkey a role must hold stays open five minutes. An account locked or turned off
+    in that time (an incident) was refused by the pipeline only after its new key was stored, and a passkey signs
+    in by itself afterwards. The registration routes ask first: no challenge is made, none is spent, no key is
+    stored, and the held sign-in is not used up."""
+    registry, wss = _mod()
+    from app.core import sign_in_lockout
+    from app.core.models import WebAuthnCredential
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = StepHarness(monkeypatch, [alice])
+    _required(monkeypatch, registry, wss, ["user"])
+    options_path, verify_path = "/users/me/passkeys/register/options", "/users/me/passkeys/register/verify"
+    pending, headers = h.pending_for(alice)                     # the password: an account with no factor of its own
+    pending.enrollment_required = True
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == 200, body                                  # in order: the enrollment starts
+    status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)
+    assert status == 400 and body["detail"]["reason"] == "challenge_unknown", body
+    if state == "locked":
+        alice.is_locked = True
+    elif state == "turned off":
+        alice.is_active = False
+    else:
+        lock = types.SimpleNamespace(locked_until=datetime.utcnow() + timedelta(minutes=5), scope="address")
+        monkeypatch.setattr(sign_in_lockout, "lock_in_force", lambda db, user_id, ip: lock)
+    refused_with = 401 if state == "turned off" else 403
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == refused_with, body
+    status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)
+    assert status == refused_with, body                         # refused before the challenge is looked at
+    assert h.db.rows_of(WebAuthnCredential) == [] and pending.consumed_at is None
+
+
 def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monkeypatch):
     """The registration routes refuse a held sign-in that would enroll a passkey before the account's own factor
     was given, whatever made the token, a trusted provider's MFA included; with the code among its proofs it

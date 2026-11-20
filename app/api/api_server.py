@@ -11681,6 +11681,7 @@ async def passkey_register_options(
     if pending is None:
         _passkey_first_proof(db, user, request, body.current_password)
     else:
+        sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, get_client_ip(request))
         sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     existing = _passkeys_of(db, user.id)
     if len(existing) >= PASSKEY_LIMIT:
@@ -11726,6 +11727,9 @@ async def passkey_register_verify(
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    # A held sign-in stores a key only where it could still finish: a passkey signs in after the sign-in it was
+    # set up at, so one stored for an account the pipeline then refuses would stay.
+    sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, get_client_ip(request))
     sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     try:
         challenge = webauthn_challenges.take(body.challenge_id, purpose=webauthn_challenges.REGISTER)
