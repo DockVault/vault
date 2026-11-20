@@ -753,46 +753,95 @@ def passkey_address_note(name):
             "either way.")
 
 
-def _allowed_hosts_first(value):
-    """(scheme, host name) of ALLOWED_HOSTS's first entry that is not a wildcard, as the application takes it for
-    the address it gives out (app/core/allowed_hosts.py): a bare name is https, a full origin says its own scheme,
-    an IPv6 address stands without its brackets. ("", "") when there is none."""
+def _allowed_hosts_link_base(value):
+    """The address the vault gives out, as the application reads ALLOWED_HOSTS for it
+    (app/core/allowed_hosts.link_base): the first entry that is not a wildcard, a bare name as https://name, an
+    origin by its scheme and network location. "" when there is none."""
+    from urllib.parse import urlsplit
+
+    def wildcard(name):
+        return name in ("*", "0.0.0.0") or name.startswith(".") or "*" in name
     for entry in (e.strip() for e in (value or "").strip().strip("'\"").split(",")):
-        scheme = "https"
+        if not entry:
+            continue
         if "://" in entry:
-            scheme, entry = entry.split("://", 1)
-            scheme = scheme.lower()
-        entry = entry.split("/", 1)[0].lower()
-        if entry.startswith("["):
-            name = entry[1:].split("]", 1)[0]
-        else:
-            name = entry.split(":", 1)[0] if entry.count(":") == 1 else entry
-        if name and "*" not in name and not name.startswith(".") and name != "0.0.0.0":
-            return scheme, name
-    return "", ""
+            try:
+                parts = urlsplit(entry)
+                host = parts.hostname or ""
+            except ValueError:
+                continue
+            if host and parts.scheme.lower() in ("http", "https") and not wildcard(host) and "*" not in parts.netloc:
+                return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+            continue
+        bare = entry.split("/", 1)[0].lower()
+        if bare and not wildcard(bare):
+            return f"https://{bare}"
+    return ""
 
 
 # Plain http carries sign-in on this computer only, as the application has it (app/core/public_url.py).
 SIGN_IN_PLAIN_HTTP_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
+def _host_no_browser_accepts(host):
+    """Whether ``host`` is not one a browser puts in an origin, as the application judges it
+    (app/core/public_url._host_problem): an IP address, or a name of letters, digits, hyphens and dots whose labels
+    start and end with a letter or digit."""
+    import ipaddress
+    if not host or "%" in host:
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    try:
+        name = host.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return True
+    if not name or len(name) > 253:
+        return True
+    for label in name.split("."):
+        if not label or len(label) > 63 or label[0] == "-" or label[-1] == "-":
+            return True
+        if not all(ch.isascii() and (ch.isalnum() or ch == "-") for ch in label):
+            return True
+    return False
+
+
 def sign_in_address_reason(allowed_hosts):
     """Why no passkey can be made at the address the vault gives out (ALLOWED_HOSTS's first entry that is not a
-    wildcard), judged as the application judges it (app/core/public_url.py), or None when one can: ``none`` (no
-    such entry), ``script`` (a host name not written in its xn-- form), ``dot`` (a host name written with a dot
-    at its end), ``http`` (plain http anywhere but this computer) or ``ip`` (an address reached by IP)."""
+    wildcard), or None when one can. The address is read, and judged, in the application's own steps
+    (app/core/allowed_hosts.link_base, then app/core/public_url.problem), so the tool says nothing else than the
+    server does: ``none`` (no such entry), ``script`` (a host name not written in its xn-- form), ``dot`` (a host
+    name written with a dot at its end), ``http`` (plain http anywhere but this computer), ``unusable`` (anything
+    else the server will not build sign-in on: a user name in the address, a port that is none, a host name no
+    browser accepts, an IPv6 address without its brackets) or ``ip`` (a usable address reached by IP)."""
     import ipaddress
-    scheme, name = _allowed_hosts_first(allowed_hosts)
-    if not name:
+    from urllib.parse import urlsplit
+    base = _allowed_hosts_link_base(allowed_hosts)
+    if not base:
         return "none"
-    if not name.isascii():
+    try:
+        parts = urlsplit(base)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "unusable"
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https") or parts.username is not None or parts.password is not None or not host:
+        return "unusable"
+    if not host.isascii():
         return "script"
-    if name.endswith("."):
+    if host.endswith("."):
         return "dot"
-    if scheme == "http" and name not in SIGN_IN_PLAIN_HTTP_HOSTS:
+    if _host_no_browser_accepts(host) or (port is not None and not 1 <= port <= 65535):
+        return "unusable"
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        return "unusable"
+    if scheme == "http" and host.lower() not in SIGN_IN_PLAIN_HTTP_HOSTS:
         return "http"
     try:
-        ipaddress.ip_address(name)
+        ipaddress.ip_address(host)
     except ValueError:
         return None
     return "ip"
@@ -910,6 +959,15 @@ def passkeys_elsewhere_note(answer, host):
                "was" if keys == 1 else "were", where, here, follows))
 
 
+def _sign_in_address_host(allowed_hosts):
+    """The host of the address the vault gives out, for the words about an address reached by IP."""
+    from urllib.parse import urlsplit
+    try:
+        return urlsplit(_allowed_hosts_link_base(allowed_hosts)).hostname or ""
+    except ValueError:
+        return ""
+
+
 def sign_in_address_note(allowed_hosts):
     """What setup and status say when no passkey can be made at the address the vault gives out, or None: what is
     in the way, what it turns off (passkeys alone at an address reached by IP; passkeys and single sign-on where
@@ -919,7 +977,12 @@ def sign_in_address_note(allowed_hosts):
     if reason is None:
         return None
     if reason == "ip":
-        said = passkey_address_note(_allowed_hosts_first(allowed_hosts)[1])
+        said = passkey_address_note(_sign_in_address_host(allowed_hosts))
+    elif reason == "unusable":
+        said = ("passkeys and single sign-on stay off at this address: the first address in ALLOWED_HOSTS is not "
+                "one a browser accepts as the vault's. Write it as https://host or https://host:port: a host name "
+                "of letters, digits, hyphens and dots (an IPv6 address in brackets), no user name, and a port "
+                "between 1 and 65535.")
     elif reason == "http":
         said = ("passkeys and single sign-on stay off at this address: both need https (plain http carries them on "
                 "this computer alone, at localhost). Put an https address first in ALLOWED_HOSTS when you want "

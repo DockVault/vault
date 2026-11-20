@@ -46,7 +46,7 @@ def test_the_note_judges_the_address_as_setup_writes_it(cfg, hidden):
 
 # What the vault says of an address (app/core/public_url.readiness), for what the tool says of it.
 AS_THE_VAULT_SAYS = {None: "ok", "none": "no_public_host", "http": "address_not_usable", "script": "address_not_usable",
-                     "dot": "address_not_usable", "ip": "ip_address"}
+                     "dot": "address_not_usable", "unusable": "address_not_usable", "ip": "ip_address"}
 
 
 @pytest.mark.parametrize("written, reason", [
@@ -60,7 +60,17 @@ AS_THE_VAULT_SAYS = {None: "ok", "none": "no_public_host", "http": "address_not_
     # An address with two faults is refused for one of them, the same one on both sides: another script before
     # the dot, the dot before plain http and before an address reached by IP.
     ("http://vault.lan.", "dot"), ("https://b\u00fccher.example.", "script"), ("http://b\u00fccher.example", "script"),
-    ("https://203.0.113.9.", "dot"), ("http://203.0.113.9.:8080", "dot"), ("vault.example.com.", "dot"),
+    ("https://203.0.113.9.", "dot"), ("http://203.0.113.9.:8080", "dot"),
+    # What else the vault will not build sign-in on: the tool said nothing of these, and of the last it said that
+    # single sign-on works.
+    ("https://user@vault.example.com", "unusable"), ("https://user:secret@vault.example.com", "unusable"),
+    ("https://vault_x.example.com", "unusable"), ("vault_x.example.com", "unusable"),
+    ("https://-bad-.example", "unusable"), ("https://vault.example.com:99999", "unusable"),
+    ("vault.example.com:99999", "unusable"), ("https://vault.example.com:0", "unusable"),
+    ("2001:db8::1", "unusable"), ("https://vault.example.com:notaport", "unusable"),
+    # And what it does: a path after an origin is dropped by the vault, a trailing dot is a name.
+    ("https://vault.example.com/some/page", None), ("vault.example.com/x", None), ("vault.example.com.", None),
+    ("xn--bcher-kva.example", None),
 ])
 def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypatch):
     """Setup and status speak before the vault runs, so the tool has the rule in its own words; this holds the two
