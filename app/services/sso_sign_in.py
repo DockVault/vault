@@ -41,6 +41,7 @@ NOT_THIS_ACCOUNT = "not_this_account"
 PURPOSE_NOT_READY = "purpose_not_ready"
 REAUTH_STALE = "reauth_stale"
 PROVIDER_CLOCK_AHEAD = oc.PROVIDER_CLOCK_AHEAD    # a time the provider states (its sign-in, its token) lies ahead
+NO_PUBLIC_ADDRESS = "no_public_address"          # the vault has no address a provider can send the browser back to
 PRIVILEGED_ON_PASSWORD_LESS = "privileged_on_password_less"
 REAUTH_NO_MFA = "reauth_no_mfa"
 REAUTH_MAX_AGE_SECONDS = 60
@@ -74,6 +75,8 @@ REASON_TEXTS = {
     REAUTH_STALE: "Your organisation's sign-in did not ask you to sign in again just now. Start again.",
     PROVIDER_CLOCK_AHEAD: ("Your organisation's sign-in reports a time that has not come yet, so its clock or this "
                            "vault's is wrong. Tell your administrator."),
+    NO_PUBLIC_ADDRESS: ("Single sign-on is not available: this vault has no address your organisation's sign-in can "
+                        "send you back to. Tell your administrator."),
     PRIVILEGED_ON_PASSWORD_LESS: ("An administrator's or auditor's account keeps a local password, so it cannot be linked "
                                   "to a provider whose people sign in without one."),
     REAUTH_NO_MFA: "Your organisation's sign-in did not confirm you with a second factor. Start again.",
@@ -120,19 +123,47 @@ def provider_config(row) -> oc.ProviderConfig:
 
 def usable_for(row, purpose: str) -> Optional[str]:
     """Why ``row`` cannot serve ``purpose`` now, or None: a sign-in or a link needs an enabled OpenID Connect
-    provider; a test needs one that is configured (any state but a bare draft without an issuer)."""
+    provider; a test needs one that is configured (any state but a bare draft without an issuer). Every purpose needs
+    the vault to have an address the provider can send the browser back to (``address_refusal``)."""
     if row is None or getattr(row, "kind", None) != "oidc":
         return PROVIDER_DISABLED
     if not (row.issuer and row.client_id and row.client_secret_enc):
         return PROVIDER_DISABLED
-    if purpose == sso_state.TEST:
+    if purpose != sso_state.TEST and row.state != "enabled":
+        return PROVIDER_DISABLED
+    return NO_PUBLIC_ADDRESS if address_refusal() else None
+
+
+def address_refusal() -> Optional[str]:
+    """Why single sign-on cannot be built on the vault's address as it is configured, in words for an administrator,
+    or None when it can.
+
+    A provider is given a redirect address on the vault's own and sends the browser back to it. That address is the
+    configured one (the first ALLOWED_HOSTS entry that is not a wildcard), never the Host of the request that asked.
+    With none, or one that is not https (plain http only on localhost), nothing is started, no provider is turned on
+    and no test runs."""
+    from app.core import public_url
+    if public_url.public_base_url():
         return None
-    return None if row.state == "enabled" else PROVIDER_DISABLED
+    return "Single sign-on needs the vault's public address. " + public_url.why_not_usable()
 
 
 def redirect_uri(provider_id) -> str:
+    """The address a provider sends the browser back to, on the vault's configured address. Refused when the vault
+    has none: a provider is never handed an address made of anything else."""
     from app.core.public_url import public_base_url
-    return f"{public_base_url()}/auth/sso/{provider_id}/callback"
+    base = public_base_url()
+    if not base:
+        raise Refusal(NO_PUBLIC_ADDRESS)
+    return f"{base}/auth/sso/{provider_id}/callback"
+
+
+def post_logout_address() -> Optional[str]:
+    """Where a provider sends the browser after its own logout: the vault's sign-in page, on the configured address.
+    None when the vault has none to give."""
+    from app.core.public_url import public_base_url
+    base = public_base_url()
+    return f"{base}/" if base else None
 
 
 def claim_name(row, vault_name: str, default: str) -> str:
@@ -828,15 +859,17 @@ def renewal_refusal(db, user, provider_id, *, methods=(), now: Optional[datetime
 def provider_logout_url(db, session_row) -> Optional[str]:
     """Where the browser goes after a vault sign-out when the session's provider wants its own logout: the
     provider's end-session address with the ID token as the hint and the vault's sign-in page to come back to.
-    None when the session was not a provider's, the option is off, the provider has no such address, or anything
-    fails: the vault's sign-out stands on its own."""
+    None when the session was not a provider's, the option is off, the provider has no such address, the vault has
+    no configured address to come back to, or anything fails: the vault's sign-out stands on its own."""
     if session_row is None:
         return None
     try:
         from urllib.parse import urlencode
         from app.core.models import SsoProvider, SsoSession
-        from app.core.public_url import public_base_url
         from app.core.security import decrypt_secret
+        come_back_to = post_logout_address()
+        if come_back_to is None:
+            return None
         sso_session = db.query(SsoSession).filter(SsoSession.session_id == session_row.id).first()
         if sso_session is None or not sso_session.id_token_enc:
             return None
@@ -848,7 +881,7 @@ def provider_logout_url(db, session_row) -> Optional[str]:
             return None
         import secrets
         query = urlencode({"id_token_hint": decrypt_secret(sso_session.id_token_enc),
-                           "post_logout_redirect_uri": public_base_url() + "/", "state": secrets.token_urlsafe(16)})
+                           "post_logout_redirect_uri": come_back_to, "state": secrets.token_urlsafe(16)})
         separator = "&" if "?" in discovery.end_session_endpoint else "?"
         return f"{discovery.end_session_endpoint}{separator}{query}"
     except Exception:  # noqa: BLE001

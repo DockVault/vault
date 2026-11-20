@@ -31,15 +31,19 @@ def make_sso_only(db, user) -> None:
     user.sftp_password_auth = False
 
 
-def restore_password_sign_in(db, user, *, base_url: str, created_by_id) -> Optional[str]:
+def restore_password_sign_in(db, user, *, created_by_id) -> Optional[str]:
     """Let ``user`` sign in with a password again: the flag cleared and a reset link minted for them to set one (the
     hash stays unusable until then). Returns the link, or None when no link can be minted (the reset pepper is not
-    configured). ``_mint_reset_link`` commits on its own."""
+    configured). ``_mint_reset_link`` commits on its own.
+
+    The link is built on the vault's configured address, which no caller hands in and no request supplies
+    (app/core/allowed_hosts.py). With none configured it is relative, for an administrator to complete and pass on,
+    as an administrator's own reset link is."""
     from app.api import api_server as api
     from app.core.security import hash_password
     user.sso_only = False
     user.password_hash = hash_password(secrets.token_urlsafe(32))     # whatever was set meanwhile is not a password
-    return api._mint_reset_link(db, user, base_url, created_by_id=created_by_id, made_by_other=True)
+    return api._mint_reset_link(db, user, api._public_base_url(), created_by_id=created_by_id, made_by_other=True)
 
 
 def provider_only_message(db, user) -> str:
@@ -90,7 +94,7 @@ def disabled_refusal(db, provider) -> Optional[str]:
             f"linked to it: {', '.join(sorted(named))}. Unlink them, or leave password sign-in allowed.")
 
 
-def apply_password_login(db, provider, value: str, *, base_url: str, created_by_id) -> dict:
+def apply_password_login(db, provider, value: str, *, created_by_id) -> dict:
     """Apply a saved ``sso_password_login`` to the provider's linked accounts: ``disabled`` makes each SSO-only;
     ``allowed`` restores each SSO-only one with a reset link. Returns what changed: ``{"made_sso_only": [usernames],
     "restored": [(username, link or None)]}``. Call :func:`disabled_refusal` first for ``disabled``."""
@@ -100,5 +104,5 @@ def apply_password_login(db, provider, value: str, *, base_url: str, created_by_
             make_sso_only(db, user)
             made.append(user.username)
         elif value == "allowed" and getattr(user, "sso_only", False):
-            restored.append((user.username, restore_password_sign_in(db, user, base_url=base_url, created_by_id=created_by_id)))
+            restored.append((user.username, restore_password_sign_in(db, user, created_by_id=created_by_id)))
     return {"made_sso_only": made, "restored": restored}

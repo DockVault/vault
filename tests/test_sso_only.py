@@ -193,9 +193,12 @@ def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(mon
     # A restore sets a fresh unknown hash before minting the link: nothing set meanwhile is a password.
     monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
     alice.password_hash = "admins-choice"
-    monkeypatch.setattr(S, "_mint_reset_link", lambda db, user, base_url, **kw: "https://x/reset/t")
-    link = sso_only.restore_password_sign_in(types.SimpleNamespace(), alice, base_url="https://x", created_by_id=None)
+    bases = []
+    monkeypatch.setattr(S, "_public_base_url", lambda: "https://vault.example.test")
+    monkeypatch.setattr(S, "_mint_reset_link", lambda db, user, base_url, **kw: bases.append(base_url) or "https://x/reset/t")
+    link = sso_only.restore_password_sign_in(types.SimpleNamespace(), alice, created_by_id=None)
     assert link == "https://x/reset/t" and alice.sso_only is False and alice.password_hash.startswith("argon2:")
+    assert bases == ["https://vault.example.test"]         # the configured address, which no caller hands in
     assert alice.password_hash != "admins-choice"
 
 
@@ -236,12 +239,12 @@ def test_the_provider_setting_is_refused_while_a_privileged_account_is_linked_an
     assert sso_only.disabled_refusal(h.db, p) is None
     minted = []
     monkeypatch.setattr(h.S, "_mint_reset_link", lambda db, user, base_url, **kw: minted.append((user.username, kw)) or "https://x/reset/t")
-    changed = sso_only.apply_password_login(h.db, p, "disabled", base_url="https://vault.example.test", created_by_id=root.id)
+    changed = sso_only.apply_password_login(h.db, p, "disabled", created_by_id=root.id)
     assert changed == {"made_sso_only": ["bob"], "restored": []}
     assert bob.sso_only is True and bob.sftp_password_auth is False and bob.password_hash.startswith("argon2:")
-    changed = sso_only.apply_password_login(h.db, p, "disabled", base_url="https://vault.example.test", created_by_id=root.id)
+    changed = sso_only.apply_password_login(h.db, p, "disabled", created_by_id=root.id)
     assert changed == {"made_sso_only": [], "restored": []}                    # already so
-    changed = sso_only.apply_password_login(h.db, p, "allowed", base_url="https://vault.example.test", created_by_id=root.id)
+    changed = sso_only.apply_password_login(h.db, p, "allowed", created_by_id=root.id)
     assert changed == {"made_sso_only": [], "restored": [("bob", "https://x/reset/t")]}
     assert bob.sso_only is False and minted == [("bob", {"created_by_id": root.id, "made_by_other": True})]
 
