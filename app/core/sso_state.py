@@ -54,11 +54,30 @@ class TooManyAbandoned(Exception):
     """This address has left too many sign-ins unfinished in the last hour."""
 
 
+class _Guarded:
+    """The vault's own client behind the shared outage guard (app/core/redis_guard.py): while Redis is known to be
+    down a call fails at once, without touching the socket, and a failure is remembered for the calls that follow.
+    These stores have no fallback and fail closed, and the provider's callback reaches them before any limiter:
+    without the guard every request would hold the server for a socket timeout for as long as the outage lasts."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        call = getattr(self._client, name)
+
+        def guarded(*args, **kwargs):
+            from app.core import redis_guard
+            return redis_guard.required("sso_state." + name, lambda: call(*args, **kwargs))
+        return guarded
+
+
 def _redis(redis):
+    """The client a call uses: the one handed in, as it is; else the vault's own, behind the outage guard."""
     if redis is not None:
         return redis
     from app.core.database import redis_client
-    return redis_client
+    return _Guarded(redis_client)
 
 
 def _b64(raw: bytes) -> str:
@@ -132,11 +151,11 @@ def begin(*, provider_id: str, purpose: str, source: str, client_ip: Optional[st
     if purpose in (SIGN_IN, APP) and not (verifier_hash or code_challenge):
         raise ValueError("a sign-in needs the tab's verifier hash or an app's PKCE challenge")
     now = time.time() if now is None else now
-    client = _redis(redis)
+    r = _redis(redis)
     started_key = STARTED_PREFIX + source
     try:
-        client.zremrangebyscore(started_key, "-inf", now - ABANDONED_WINDOW_SECONDS)
-        abandoned = client.zcount(started_key, now - ABANDONED_WINDOW_SECONDS, now - STATE_TTL_SECONDS)
+        r.zremrangebyscore(started_key, "-inf", now - ABANDONED_WINDOW_SECONDS)
+        abandoned = r.zcount(started_key, now - ABANDONED_WINDOW_SECONDS, now - STATE_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in state store cannot be reached") from exc
     if int(abandoned or 0) >= ABANDONED_LIMIT:
@@ -149,11 +168,11 @@ def begin(*, provider_id: str, purpose: str, source: str, client_ip: Optional[st
         step_up_action=step_up_action, client_ip=client_ip, source=source, started_at=int(now),
         extras=dict(extras or {}))
     try:
-        written = client.set(_key(record.state), json.dumps(asdict(record), separators=(",", ":")),
+        written = r.set(_key(record.state), json.dumps(asdict(record), separators=(",", ":")),
                              ex=STATE_TTL_SECONDS, nx=True)
         if written:
-            client.zadd(started_key, {record.state: now})
-            client.expire(started_key, ABANDONED_WINDOW_SECONDS + STATE_TTL_SECONDS)
+            r.zadd(started_key, {record.state: now})
+            r.expire(started_key, ABANDONED_WINDOW_SECONDS + STATE_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in state store cannot be reached") from exc
     if not written:
@@ -168,9 +187,9 @@ def take(state, *, redis=None) -> Optional[LoginState]:
         return None
     if not all(ch.isalnum() or ch in "-_" for ch in state):
         return None
-    client = _redis(redis)
+    r = _redis(redis)
     try:
-        raw = client.getdel(_key(state))
+        raw = r.getdel(_key(state))
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in state store cannot be reached") from exc
     if not raw:
@@ -185,7 +204,7 @@ def take(state, *, redis=None) -> Optional[LoginState]:
         return None
     if record.source:
         try:
-            client.zrem(STARTED_PREFIX + record.source, state)
+            r.zrem(STARTED_PREFIX + record.source, state)
         except Exception:  # noqa: BLE001 -- the count is advisory; the sign-in goes on
             pass
     return record

@@ -36,7 +36,8 @@ APP = ROOT / "app"
 # so unmatched) and its off-loop probe is registered by function below.
 _EXEMPT_FILES = {"rate_limiter.py", "redis_guard.py", "vault_attempt_throttle.py"}
 _CALL = re.compile(
-    r"(?:redis_client|self\.redis|_redis_probe_client|\bredis\b|\br\b|\bpipe\b|\bpubsub\b)\.([a-z_]+)\(")
+    r"(?:redis_client|self\.redis|_redis_probe_client|_redis\(redis\)|\bredis\b|\br\b|\bpipe\b|\bpubsub\b)"
+    r"\.([a-z_]+)\(")
 # Not Redis commands that touch the socket in their own right: the pipeline constructor and its flush
 # (the queued commands are counted individually), the Lua redis.call/pcall inside script strings, and
 # .read (a bare `r` handle is also used for urllib HTTP responses, which have .read()).
@@ -67,6 +68,13 @@ _REGISTRY = {
     },
     "core/webauthn_challenges.py": {             # a passkey ceremony's challenge: no fallback; refused at
         "issue": ("B", 1), "take": ("B", 1),     # once, before the socket, while the guard is open
+    },
+    "core/sso_state.py": {                       # the single sign-on stores: no fallback; the vault's own
+        "begin": ("B", 5), "take": ("B", 2),     # client is handed out behind the outage guard (_redis), so
+        "store_handover": ("B", 1), "take_handover": ("B", 1),   # each call is refused before the socket
+        "abandoned_count": ("B", 1), "stage_reauth": ("B", 1), "take_reauth": ("B", 1),   # while it is open
+        "seen_logout_jti": ("B", 1), "forget_logout_jti": ("B", 1),
+        "stage_logout_hint": ("B", 1), "read_logout_hint": ("B", 1),
     },
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated

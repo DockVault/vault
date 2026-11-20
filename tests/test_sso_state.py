@@ -248,3 +248,65 @@ def test_a_pending_sign_ins_logout_hint_waits_encrypted_for_the_step_that_comple
         st.stage_logout_hint("pending-2", "enc:x", 600, redis=down)
     with pytest.raises(st.Unavailable):
         st.read_logout_hint("pending-2", redis=down)
+
+
+@pytest.fixture
+def own_store(monkeypatch):
+    """The vault's own client replaced by the fake, with the outage guard and the limiter's breaker closed before
+    and after."""
+    _mod()
+    from app.core import database, rate_limiter, redis_guard
+
+    def closed():
+        rate_limiter._cb_record_success()
+        redis_guard.guard_record_success()
+    closed()
+    r = FakeRedis()
+    monkeypatch.setattr(database, "redis_client", r)
+    yield r
+    closed()
+
+
+def test_while_redis_is_known_to_be_down_no_store_here_touches_the_socket(own_store, monkeypatch):
+    """Every store of this module on the vault's own client: refused at once while the outage guard is open, the
+    socket untouched. The provider's callback reaches these before any limiter, so without the guard each request
+    would hold the server for a socket timeout for as long as the outage lasts."""
+    s = _mod()
+    from app.core import redis_guard
+    started = s.begin(provider_id="p", purpose=s.SIGN_IN, source="src", verifier_hash="h" * 64)
+    code = s.store_handover({"purpose": s.LINK})
+    touched = []
+    for name in ("set", "getdel", "get", "delete", "zadd", "zrem", "zremrangebyscore", "zcount", "expire"):
+        monkeypatch.setattr(own_store, name, lambda *a, _n=name, **k: touched.append(_n))
+    monkeypatch.setattr(redis_guard, "guard_is_open", lambda now: True)
+    with pytest.raises(s.Unavailable):
+        s.begin(provider_id="p", purpose=s.SIGN_IN, source="src", verifier_hash="h" * 64)
+    with pytest.raises(s.Unavailable):
+        s.take(started.state)
+    with pytest.raises(s.Unavailable):
+        s.store_handover({"purpose": s.LINK})
+    with pytest.raises(s.Unavailable):
+        s.take_handover(code)
+    with pytest.raises(s.Unavailable):
+        s.stage_reauth("sess", "admin.retention.write")
+    with pytest.raises(s.Unavailable):
+        s.take_reauth("sess", "admin.retention.write")
+    with pytest.raises(s.Unavailable):
+        s.seen_logout_jti("jti-1", 60, scope="p")
+    assert touched == []
+
+
+def test_a_failure_of_the_vaults_own_store_is_remembered_and_a_client_handed_in_is_not_guarded(own_store, monkeypatch):
+    import time
+    s = _mod()
+    from app.core import redis_guard
+
+    def down(*a, **k):
+        raise ConnectionError("down")
+    monkeypatch.setattr(own_store, "getdel", down)
+    with pytest.raises(s.Unavailable):
+        s.take("a" * 43)
+    assert redis_guard.guard_private_open(time.time())          # the first failure opens the shared memory
+    other = FakeRedis()                                          # a client handed in is called whatever it says
+    started = s.begin(provider_id="p", purpose=s.SIGN_IN, source="src", verifier_hash="h" * 64, redis=other)
+    assert s.take(started.state, redis=other) is not None
