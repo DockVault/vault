@@ -302,6 +302,90 @@ def test_a_provider_that_holds_its_people_to_no_password_covers_the_accounts_lin
     assert status == 200 and out["password_stopped"] is True and carol.sso_only is True
 
 
+@pytest.mark.parametrize("standing", ["administrator", "auditor right"])
+def test_a_privileged_account_flagged_provider_only_gets_its_password_back_and_fails_no_request(monkeypatch, standing):
+    """An earlier release, run for a while after going back to it, knows nothing of the flag: it makes an account
+    that signs in only through its provider an administrator, or gives it the auditor right. On this release such an
+    account could not type a password at the step an administrator always meets, and could be sent no reset link.
+    It is never held to its provider: settling it gives the password back, wherever it is met, and raises nothing
+    (it used to fail the request that met it: a provider's removal, an unlink, a change of the password setting).
+    At start every such account is settled, and named for the notices."""
+    privileged_accounts, sso_only = _mod()
+    from app.core import auditor_rights, security
+    from app.core.models import RoleEnum, User
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    monkeypatch.setattr(auditor_rights, "_has_grants", lambda db: True)
+    root = _user("root", role="admin")
+    held = _user("held", sso_only=True, sftp_password_auth=False, password_hash="argon2:nobody-knows")
+    plain = _user("plain", sso_only=True, sftp_password_auth=False, password_hash="argon2:nobody-knows-either")
+    if standing == "administrator":
+        held.role = RoleEnum.ADMIN
+        monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: None)
+    else:
+        monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: object() if user_id == held.id else None)
+    p = _provider(name="a", label="A", policy={"sso_password_login": "disabled"})
+    h = Resolving(monkeypatch, [root, held, plain], [p],
+                  identities=[_identity(held, p, subject="s-held"), _identity(plain, p, subject="s-plain")])
+    assert privileged_accounts.kind(h.db, held) is not None and privileged_accounts.kind(h.db, plain) is None
+    # The rule: never provider-only, whatever it is linked to; the ordinary account beside it still is.
+    assert sso_only.should_be_sso_only(h.db, held) is False and sso_only.should_be_sso_only(h.db, held, also=p) is False
+    assert sso_only.should_be_sso_only(h.db, plain) is True
+    # Met by any settling (a removal, an unlink, a change of the setting): the password back, nothing raised.
+    before = held.password_hash
+    assert sso_only.settle(h.db, held) == sso_only.RESTORED
+    assert held.sso_only is False and held.password_hash != before and held.password_hash.startswith("argon2:")
+    assert sso_only.settle(h.db, held) is None and sso_only.settle(h.db, plain) is None and plain.sso_only is True
+    # At start: every such account, and only those.
+    held.sso_only = True
+    restored = sso_only.settle_privileged(h.db)
+    assert [(r[1], r[3]) for r in restored] == [("held", privileged_accounts.TEXTS[privileged_accounts.kind(h.db, held)])]
+    assert held.sso_only is False and plain.sso_only is True and root.sso_only is False
+    assert sso_only.settle_privileged(h.db) == []
+
+
+def test_the_privileged_accounts_are_settled_at_start_recorded_and_told(monkeypatch):
+    """The start-up step: each account is recorded, its owner is told how to set a password, the administrators are
+    told who they are; with none there is nothing to say; and it is among the steps the server runs at start."""
+    import contextlib
+    import inspect
+    privileged_accounts, sso_only = _mod()
+    from app.api import api_server as api
+    from app.api import sso_providers_router as providers_router
+    from app.core import audit_catalog, database
+    rows, committed, told = [], [], []
+
+    class _Db:
+        def add(self, row):
+            rows.append(row)
+
+        def commit(self):
+            committed.append(len(rows))
+
+    monkeypatch.setattr(database, "get_db_context", lambda: contextlib.nullcontext(_Db()))
+    monkeypatch.setattr(api.AuditLogger, "build_row", lambda self, **kw: kw)
+    monkeypatch.setattr(providers_router, "_tell_accounts", lambda users, title, change: told.append(("owners", users, title, change)))
+    monkeypatch.setattr(providers_router, "_tell_administrators", lambda by, title, body: told.append(("administrators", by, title, body)))
+    one, two = uuid.uuid4(), uuid.uuid4()
+    monkeypatch.setattr(sso_only, "settle_privileged", lambda db: [
+        (one, "zoe", "zoe@example.test", "an administrator"), (two, "amy", None, "a holder of the auditor right")])
+    api._settle_privileged_provider_only_accounts()
+    assert [(r["action"], r["resource_id"], r["details"]["username"], r["details"]["reason"]) for r in rows] == [
+        ("sso_password_sign_in_restored", str(one), "zoe", "an administrator"),
+        ("sso_password_sign_in_restored", str(two), "amy", "a holder of the auditor right")]
+    assert committed == [2]
+    owners, administrators = told
+    assert owners[1] == [(one, "zoe", "zoe@example.test"), (two, "amy", None)]
+    assert "may hold a password again" in owners[2] and "Forgot password" in owners[3]
+    assert administrators[0] == "administrators" and "amy, zoe" in administrators[3] and "reset link" in administrators[3]
+    assert audit_catalog.lookup("sso_password_sign_in_restored").severity == "warning"
+    # None to settle: nothing recorded beyond the empty commit, nobody told.
+    rows.clear(), committed.clear(), told.clear()
+    monkeypatch.setattr(sso_only, "settle_privileged", lambda db: [])
+    api._settle_privileged_provider_only_accounts()
+    assert rows == [] and told == []
+    assert inspect.getsource(api).count("    _settle_privileged_provider_only_accounts()") == 1
+
+
 def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatch):
     """An account signs in only through its providers exactly while it is linked to one that holds its people to no
     password, whatever that provider's state. Unlinking that one lets the account hold a password again; allowing

@@ -56,9 +56,19 @@ def password_less(provider) -> bool:
 
 
 def should_be_sso_only(db, user, *, also=None, without=None) -> bool:
-    """The rule the flag follows: linked to at least one provider whose people hold no password. ``also`` is a
-    provider being linked in this transaction, ``without`` an identity being removed in it."""
+    """The rule the flag follows: linked to at least one provider whose people hold no password, and not an
+    account that must keep a password of its own (an administrator, a holder of the auditor right), whatever it
+    is linked to. ``also`` is a provider being linked in this transaction, ``without`` an identity being removed
+    in it.
+
+    The links and settings that would put a privileged account on such a provider are refused where they are
+    made. The state exists all the same: an account that signs in only through its provider was made an
+    administrator, or given the auditor right, by an earlier release run for a while after going back to it,
+    which knows nothing of the flag. Such an account is never flagged here, so settling it gives it its password
+    back and never fails the request that met it."""
     from app.core.models import ExternalIdentity, SsoProvider
+    if privileged_accounts.kind(db, user) is not None:
+        return False
     if also is not None and password_less(also):
         return True
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
@@ -76,9 +86,9 @@ MADE, RESTORED = "made_sso_only", "restored"
 def settle(db, user, *, also=None, without=None) -> Optional[str]:
     """Bring ``user``'s flag in line with the providers it is linked to, in the caller's transaction: ``MADE`` when
     the account now signs in only through its providers (its password replaced, SFTP password sign-in off),
-    ``RESTORED`` when it may hold a password again (nothing is minted), None when nothing changed. Raises
-    :class:`Privileged` for an account that must keep a local password; the callers refuse such a link or setting
-    before they get here."""
+    ``RESTORED`` when it may hold a password again (nothing is minted), None when nothing changed. An account
+    that must keep a password of its own is never made provider-only and is given its password back when it is
+    met flagged (:func:`should_be_sso_only`); nothing is raised for it."""
     should = should_be_sso_only(db, user, also=also, without=without)
     flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:
@@ -88,6 +98,22 @@ def settle(db, user, *, also=None, without=None) -> Optional[str]:
         allow_password_sign_in(db, user)
         return RESTORED
     return None
+
+
+def settle_privileged(db) -> list:
+    """Give every privileged account that is flagged as signing in only through its provider its password back,
+    in the caller's transaction, and return them as (id, username, email, what it is). Run at start: the state
+    comes from a release that knew nothing of the flag, and such an account could neither type a password at the
+    step an administrator always meets nor be sent a reset link while flagged."""
+    from app.core.models import User
+    restored = []
+    for user in db.query(User).filter(User.sso_only.is_(True)).all():
+        kind = privileged_accounts.kind(db, user)
+        if kind is None:
+            continue
+        allow_password_sign_in(db, user)
+        restored.append((user.id, user.username, user.email, privileged_accounts.TEXTS[kind]))
+    return restored
 
 
 def provider_only_message(db, user) -> str:

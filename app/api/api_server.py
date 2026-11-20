@@ -29567,6 +29567,41 @@ def _confirm_invited_addresses():
         print(f"⚠ address confirmation backfill skipped: {e}")
 
 
+def _settle_privileged_provider_only_accounts():
+    """At start: an account that signs in only through its provider and is an administrator, or holds the auditor
+    right, may hold a password again (app/core/sso_only.settle_privileged). An earlier release, run for a while
+    after going back to it, makes such an account without knowing the flag; it could not finish a sign-in here.
+    Each is recorded, its owner is told how to set a password, and the administrators are told. Best-effort:
+    never blocks boot."""
+    try:
+        from app.core import sso_only
+        from app.core.database import get_db_context
+        with get_db_context() as db:
+            restored = sso_only.settle_privileged(db)
+            for user_id, username, _email, what in restored:
+                db.add(AuditLogger(db).build_row(
+                    action="sso_password_sign_in_restored", status="success", user=None, ip_address=None,
+                    resource_type="user", resource_id=str(user_id),
+                    details={"username": username, "reason": what}))
+            db.commit()
+        if not restored:
+            return
+        from app.api import sso_providers_router as providers_router
+        providers_router._tell_accounts(
+            [(user_id, username, email) for user_id, username, email, _what in restored],
+            "Your account may hold a password again",
+            "Your account signed in only through your organisation's sign-in, and it is one that always keeps a "
+            "password of its own. " + providers_router.SET_A_PASSWORD)
+        names = ", ".join(sorted(username for _id, username, _email, _what in restored))
+        providers_router._tell_administrators(
+            "the vault", "Accounts were given their password sign-in back",
+            f"{names}: signed in only through a provider, and must keep a password (an administrator, or a holder "
+            "of the auditor right). Each may set a password with a reset link.")
+        print(f"[OK] Gave {len(restored)} privileged provider-only account(s) their password sign-in back")
+    except Exception as e:  # noqa: BLE001 -- best-effort, never block boot
+        print(f"⚠ settling privileged provider-only accounts skipped: {e}")
+
+
 def _purge_audit_log_names():
     """Strip residual plaintext names (file/folder/old/new/vault_name) from legacy audit-log rows
     written before the AuditLogger began redacting them (idempotent; a marker makes it a no-op after
@@ -29862,6 +29897,7 @@ async def lifespan(app: FastAPI):
     _relabel_name_index_keys()          # name-index-key rows: the label that names their bytes
     _release_finished_cred_slots()      # free cap slots of credentials finished before this upgrade
     _confirm_invited_addresses()        # once: addresses an invitation carried are confirmed for their accounts
+    _settle_privileged_provider_only_accounts()   # an administrator flagged provider-only by an earlier release
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _admin_bootstrap_status = _seed_admin_user()
     # Once the admin is bootstrapped, ADMIN_PASSWORD is spent: drop it (remove a writable mounted
