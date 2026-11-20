@@ -11580,6 +11580,10 @@ def _passkey_first_proof(db, user, request, current_password) -> None:
             "Your account has no password and no second factor yet, so it cannot prove this request here. "
             "Ask an administrator to set a password, or wait for the identity-provider confirmation step-up."))
     if not current_password or not verify_password(current_password, user.password_hash):
+        if current_password:
+            # A wrong password, not a missing one (the page asks once without, to learn what is owed).
+            _passkey_audit(db, user, request, "passkey_registration_failed", {"reason": "wrong_password"},
+                           status="failure")
         raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
 
 
@@ -11632,8 +11636,8 @@ async def passkey_register_options(
     principal=Depends(get_enrolling_principal),
     db: Session = Depends(get_db),
 ):
-    """Start registering a passkey for the caller's own account: the proof the account owes (the step-up, or the
-    password for a first factor), the account's limit, then a fresh challenge and the options the browser hands
+    """Start registering a passkey for the caller's own account: the account's limit, the proof the account owes
+    (the step-up, or the password for a first factor), then a fresh challenge and the options the browser hands
     to ``navigator.credentials.create``. The answer says whether the key will be provisional (registered within
     14 days after an administrator changed this account's sign-in details). Reachable with a normal session OR a
     forced-enrollment pre-auth token (a role that must hold a passkey, past its grace): the password was given at
@@ -11648,10 +11652,8 @@ async def passkey_register_options(
     user = db.query(User).filter(User.id == current_user.id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    if pending is None:
-        _passkey_first_proof(db, user, request, body.current_password)
-    else:
-        sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
+    # The account's budget comes before the proof, so a wrong password is counted like every other try: a stolen
+    # session gets a bounded number of guesses at the password here, not as many as it can send.
     try:
         allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=PASSKEY_OPTIONS_LIMIT,
                                                  window=PASSKEY_OPTIONS_WINDOW, prefix="passkey_register",
@@ -11661,6 +11663,10 @@ async def passkey_register_options(
     if not allowed:
         raise HTTPException(status_code=429, detail="Too many registration attempts. Try again later.",
                             headers={"Retry-After": str(retry_after_seconds(reset, PASSKEY_OPTIONS_WINDOW))})
+    if pending is None:
+        _passkey_first_proof(db, user, request, body.current_password)
+    else:
+        sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     existing = _passkeys_of(db, user.id)
     if len(existing) >= PASSKEY_LIMIT:
         raise HTTPException(status_code=409, detail=f"An account can hold {PASSKEY_LIMIT} passkeys. Remove one first.")

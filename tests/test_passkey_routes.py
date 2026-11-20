@@ -204,8 +204,9 @@ def test_a_first_passkey_is_proved_by_the_password_and_registered_end_to_end(mon
     assert row.provisional_until is None and row.label == "work laptop"
     # The challenge was spent, the owner told in the app and by email, the audit row written.
     assert h.redis.rows == {}
-    assert [a["action"] for a in h.audits] == ["passkey_registered"]
-    assert h.audits[0]["details"] == {"passkey_id": str(row.id), "provisional": False}
+    assert [a["action"] for a in h.audits] == ["passkey_registration_failed", "passkey_registered"]   # the wrong password, then the key
+    assert h.audits[0]["details"] == {"reason": "wrong_password"} and h.audits[0]["status"] == "failure"
+    assert h.audits[1]["details"] == {"passkey_id": str(row.id), "provisional": False}
     assert h.notices[0]["title"] == "A passkey was added to your account" and "work laptop" in h.notices[0]["body"]
     assert h.emails[0]["key"] == "sign_in_method_changed" and h.emails[0]["email"] == "alice@example.test"
     assert "work laptop" in h.emails[0]["context"]["change"]
@@ -510,6 +511,42 @@ def test_registration_has_a_budget_per_account_that_fails_closed(monkeypatch):
     monkeypatch.setattr(rate_limiter, "check_rate_limit", _down)
     status, body = _call(h.S, "POST", "/users/me/passkeys/register/options", {"current_password": "pw"})
     assert status == 503 and "temporarily unavailable" in body["detail"], body
+    assert h.redis.rows == {}
+
+
+def test_a_wrong_password_for_a_first_passkey_is_counted_before_it_is_checked_and_is_recorded(monkeypatch):
+    """The account's budget is asked before the password is looked at, so a guess is counted whether it is right or
+    wrong, and a spent budget checks no password at all. A wrong password leaves a record; a missing one (the page
+    asks once without, to learn what is owed) does not."""
+    alice = _user("alice")
+    h = Harness(monkeypatch, alice)
+    from app.core import security
+    from app.core.rate_limiter import rate_limiter
+    order, allow = [], [True]
+
+    def budget(*a, **kw):
+        if kw.get("prefix") == "passkey_register":
+            order.append("budget")
+            return allow[0], 0, 0
+        return True, 1, 0
+
+    def password(plain, hashed):
+        order.append("password")
+        return plain == "pw" and hashed == "x"
+    monkeypatch.setattr(rate_limiter, "check_rate_limit", budget)
+    monkeypatch.setattr(security, "verify_password", password)
+    path = "/users/me/passkeys/register/options"
+    status, body = _call(h.S, "POST", path, {"current_password": "guess"})
+    assert status == 400 and order == ["budget", "password"], (status, body, order)
+    failed = [a for a in h.audits if a.get("action") == "passkey_registration_failed"]
+    assert [(a["details"], a["status"]) for a in failed] == [({"reason": "wrong_password"}, "failure")]
+    order.clear()
+    assert _call(h.S, "POST", path, {})[0] == 400 and order == ["budget"]              # nothing to check
+    assert len([a for a in h.audits if a.get("action") == "passkey_registration_failed"]) == 1
+    order.clear()
+    allow[0] = False
+    status, body = _call(h.S, "POST", path, {"current_password": "pw"})
+    assert status == 429 and order == ["budget"], (status, body, order)                 # the right password, not looked at
     assert h.redis.rows == {}
 
 
