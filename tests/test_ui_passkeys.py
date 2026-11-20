@@ -361,3 +361,35 @@ def test_the_users_page_lists_how_each_account_signs_in(page: Page, no_offer, au
     detail = table.locator("tbody td[colspan]").first
     expect(detail).to_be_visible()
     assert detail.get_attribute("colspan") == str(len(titles))
+
+
+def test_the_questions_asked_around_a_passkey_are_the_pages_ordinary_dialogs(page: Page, no_offer, authenticator,
+                                                                           fresh_user):
+    """Removing and naming a passkey ask through the page's own dialogs: named for assistive technology, closed by
+    Escape as an answer of no, with focus back on the button that asked and the account dialog under them standing."""
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    _add_first_passkey(page, fresh_user["_password"], "Laptop")
+    row = page.locator("#us-passkeys-body .passkey-row").first
+    confirm = page.locator("#confirm-modal")
+    row.get_by_role("button", name="Remove").click()
+    expect(page.locator("#confirm-modal.active")).to_be_visible(timeout=8000)
+    assert confirm.get_attribute("role") == "dialog" and confirm.get_attribute("aria-modal") == "true"
+    expect(page.locator("#confirm-modal-title")).to_have_text("Remove passkey")
+    assert page.evaluate("() => document.getElementById('confirm-modal').contains(document.activeElement)")
+    page.keyboard.press("Escape")
+    expect(page.locator("#confirm-modal.active")).to_have_count(0)
+    expect(page.locator("#user-settings-modal")).to_be_visible()
+    expect(page.locator("#stepup-modal.active")).to_have_count(0)      # an answer of no asks nothing of the server
+    expect(page.locator("#us-passkeys-body .passkey-row")).to_have_count(1)
+    assert page.evaluate("() => document.activeElement && document.activeElement.textContent") == "Remove"
+    # The name: the cursor is in the field, and Escape leaves the name as it was.
+    row.get_by_role("button", name="Rename").click()
+    expect(page.locator("#confirm-modal-input")).to_be_focused(timeout=8000)
+    page.fill("#confirm-modal-input", "Something else")
+    page.keyboard.press("Escape")
+    expect(page.locator("#confirm-modal.active")).to_have_count(0)
+    assert page.evaluate("() => document.activeElement && document.activeElement.textContent") == "Rename"
+    _close_account(page)
+    _open_account(page)
+    expect(page.locator("#us-passkeys-body .passkey-row").first).to_contain_text("Laptop")
+    expect(page.locator("#us-passkeys-body .passkey-row").first).not_to_contain_text("Something else")
