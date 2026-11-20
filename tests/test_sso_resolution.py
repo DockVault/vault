@@ -416,8 +416,8 @@ def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_
     told = [ids for ids, title in h.notices if title == "An account was linked to single sign-on by its email address"]
     assert told == [[str(root.id), str(other.id)]], h.notices
     (identity,) = h.identities()
-    assert identity.user_id == bob.id and identity.linked_by == "self" and identity.email_at_link == "bob@example.test"
-    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "self"}) in h.audits
+    assert identity.user_id == bob.id and identity.linked_by == "email" and identity.email_at_link == "bob@example.test"
+    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "email"}) in h.audits
     assert ([str(bob.id)], "A sign-in method was added") in h.notices
     assert any(e[0] == "sign_in_method_changed" and e[1] == "bob@example.test" for e in h.emails), h.emails
     status, body = h.finish(location)
@@ -620,32 +620,51 @@ def test_the_providers_mfa_is_the_second_factor_only_when_the_policy_trusts_the_
     assert ("mfa_at" in token) is trusted and token["amr"] == []
 
 
-def test_a_link_made_by_email_does_not_count_the_providers_mfa_at_that_sign_in(monkeypatch):
-    """The provider's word alone put the identity on the account at this sign-in, so its MFA does not also stand in
-    for the factor the account set up: the account's own factor is asked for, which is what stops an address taken
-    over at the provider. The next sign-in is a known identity's, and the provider's MFA counts as the policy says."""
-    bob = _user("bob")
+def test_an_account_with_its_own_second_factor_is_never_linked_by_email(monkeypatch):
+    """The attack: somebody holds, at the provider, the verified address of an account that set up its own second
+    factor. A link by email would stand from the moment the provider answered, before the account's factor is given.
+    Started twice, the second sign-in would come through an identity the vault already knows, on the provider's MFA
+    alone; and at a provider whose people hold no password, the account's password would be gone at the first. So
+    nothing is linked: no identity, no code, the password and the flag as they were, however often it is tried,
+    and the page says where the owner links the provider. An account with no factor of its own is linked as before,
+    and the provider's MFA counts for it as the policy says."""
+    from app.services import sign_in as pipeline
+    from app.services import sso_sign_in as sso
+    bob, carol, root = _user("bob"), _user("carol"), _user("root", role="admin")
+    monkeypatch.setattr(pipeline, "holds_a_factor", lambda db, user: user.username == "bob")
     p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"], "sso_trust_idp_mfa": True,
-                          "sso_accepted_amr": ["mfa"]})
-    h = Resolving(monkeypatch, [bob], [p])
-    monkeypatch.setattr(h.S, "_login_second_factor_in_effect", lambda db, user: True)
-    monkeypatch.setattr(h.S, "_second_factor_effective", lambda db, user: {"state": "active", "in_effect": True,
-                                                                          "required": False})
-    monkeypatch.setattr(h.S, "_sf_login_methods", lambda db, user: ["totp", "recovery"])
-    location, _ = _sign_in(h, p, email="bob@example.test", amr=["pwd", "mfa"])
-    assert location.startswith("/#sso=") and len(h.identities()) == 1
-    status, body = h.finish(location)
-    assert status == 200 and body["access_token"] is None, body
-    assert body["stage"] == "second_factor" and body["methods"] == ["totp", "recovery"] and not body["enrollment_required"]
-    location, _ = _sign_in(h, p, email="bob@example.test", amr=["pwd", "mfa"])
+                          "sso_accepted_amr": ["mfa"], "sso_password_login": "disabled"})
+    h = Resolving(monkeypatch, [bob, carol, root], [p])
+    before = (bob.password_hash, bob.sso_only, bob.sftp_password_auth)
+    for _ in range(3):                                   # the first try, and the ones that would ride on it
+        location, _state = _sign_in(h, p, sub="someone-at-the-provider", email="bob@example.test", amr=["pwd", "mfa"])
+        assert location == "/#sso-error=link_from_profile", location
+        assert h.identities() == [] and h.codes() == [] and h.notices == [] and h.emails == []
+        assert (bob.password_hash, bob.sso_only, bob.sftp_password_auth) == before
+    refused = [a[2] for a in h.audits if a[0] == "sso_sign_in_refused"]
+    assert len(refused) == 3 and all(r.get("reason") == "link_from_profile"
+                                     and r.get("refused_because") == "account_holds_a_factor" for r in refused), h.audits
+    assert "under Your account" in sso.REASON_TEXTS[sso.LINK_FROM_PROFILE]
+    # The account without a factor of its own: linked, held to no password by the provider's rule, and signed in.
+    location, _ = _sign_in(h, p, sub="carol-subject", email="carol@example.test", amr=["pwd", "mfa"])
+    assert location.startswith("/#sso="), location
     status, body = h.finish(location)
     assert status == 200 and "mfa_at" in _claims(body["access_token"]), body
-    # Only a link by email is treated so. An account made at its first sign-in has no factor of its own to ask
-    # for: there the provider's trusted MFA counts from the start.
-    from app.core.models import SsoProvider
+    (identity,) = h.identities()
+    assert identity.user_id == carol.id and identity.linked_by == "email" and carol.sso_only is True
+    # The second sign-in of that account is an ordinary one.
+    location, _ = _sign_in(h, p, sub="carol-subject", email="carol@example.test", amr=["pwd", "mfa"])
+    status, body = h.finish(location)
+    assert status == 200 and "mfa_at" in _claims(body["access_token"]) and len(h.identities()) == 1
+
+
+def test_an_account_made_at_its_first_sign_in_comes_in_on_the_providers_trusted_mfa(monkeypatch):
+    """An account made at its first sign-in has no factor of its own to ask for: the provider's trusted MFA counts
+    from the start."""
+    root = _user("root", role="admin")
     q = _provider(name="makes", policy={"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"],
                                         "sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]})
-    h.db.rows_of(SsoProvider).append(q)
+    h = Resolving(monkeypatch, [root], [q])
     monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
     location, _ = _sign_in(h, q, sub="new-subject", email="new@example.test", preferred_username="newcomer", amr=["pwd", "mfa"])
     assert location.startswith("/#sso="), location
@@ -787,6 +806,12 @@ def test_a_test_sign_in_reports_the_restriction_and_what_the_vault_would_do(monk
     assert summary["restriction"] == "passes" and summary["would"].startswith("refuse: an account holds this address, but "
                                                                              "the vault never confirmed"), summary
     __import__("app.core.email_confirmation", fromlist=["confirm"]).confirm(bob)
+    # An account that set up its own second factor: the administrator reads where its owner links the provider.
+    from app.services import sign_in as pipeline
+    monkeypatch.setattr(pipeline, "holds_a_factor", lambda db, user: True)
+    summary = run(email="bob@example.test")
+    assert summary["would"].startswith("refuse: the account that owns this address set up its own second factor"), summary
+    monkeypatch.setattr(pipeline, "holds_a_factor", lambda db, user: False)
     summary = run(email="nobody@example.test")
     assert summary["would"].startswith("refuse: no account is linked")
     h.db.rows_of(type(h.identities()[0]) if h.identities() else __import__("app.core.models", fromlist=["ExternalIdentity"]).ExternalIdentity).append(_identity(root, p))
@@ -804,6 +829,7 @@ def test_every_reason_has_words_the_sign_in_page_can_fetch(monkeypatch):
     assert status == 200, body
     reasons = body["reasons"]
     for code in (sso.RESTRICTED, sso.RESTRICTION_CLAIM_MISSING, sso.INVITATION_UNUSABLE, sso.EMAIL_REQUIRED, sso.ACCOUNT_LIMIT,
+                 sso.LINK_FROM_PROFILE,
                  sso.NO_ACCOUNT, sso.ACCOUNT_DISABLED, sso.STATE_UNKNOWN, sso.PROVIDER_MIX_UP, sso.PROVIDER_DISABLED,
                  sso.ALREADY_LINKED, sso.NOT_THIS_ACCOUNT, sso.PURPOSE_NOT_READY, oc.PROVIDER_ERROR, oc.ISSUER_MISMATCH,
                  oc.TOKEN_INVALID, oc.NONCE_MISMATCH, oc.ENDPOINT_REFUSED, oc.TEMPORARILY_UNAVAILABLE, oc.DISCOVERY_INVALID):

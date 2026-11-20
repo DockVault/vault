@@ -37,6 +37,7 @@ PROVIDER_DISABLED = "provider_disabled"
 NO_ACCOUNT = "no_account"
 ACCOUNT_DISABLED = "account_disabled"
 ALREADY_LINKED = "already_linked"
+LINK_FROM_PROFILE = "link_from_profile"
 NOT_THIS_ACCOUNT = "not_this_account"
 PURPOSE_NOT_READY = "purpose_not_ready"
 REAUTH_STALE = "reauth_stale"
@@ -71,6 +72,9 @@ REASON_TEXTS = {
                  "invite you."),
     ACCOUNT_DISABLED: "Your account cannot sign in. Contact your administrator.",
     ALREADY_LINKED: "That organisation identity is already linked to an account.",
+    LINK_FROM_PROFILE: ("An account with your address is protected by its own second factor, so it is not linked on "
+                        "your organisation's word alone. Sign in with your password, then link your organisation's "
+                        "sign-in under Your account."),
     NOT_THIS_ACCOUNT: "That organisation identity belongs to another account here.",
     PURPOSE_NOT_READY: "This step is not available yet.",
     REAUTH_STALE: "Your organisation's sign-in did not ask you to sign in again just now. Start again.",
@@ -408,7 +412,7 @@ class Resolution:
     identity: object
     created: bool = False                 # an account was made at this sign-in (an invitation, or just in time)
     linked_now: bool = False              # the identity was linked at this sign-in
-    linked_by: Optional[str] = None       # invitation | self (by verified email) | jit
+    linked_by: Optional[str] = None       # invitation | email (by verified email) | jit
     password_stopped: bool = False        # the link made the account sign in only through its provider
     invitation: object = None             # the invitation accepted, when one was
     inviter_name: Optional[str] = None    # for an administrator's invitation: who made it
@@ -572,9 +576,10 @@ def _username_taken(db, name: str) -> bool:
 def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     """The one account a verified email may link to (the design's step 4), or None: the provider must be
     restricted (the save-time rule's condition, held here too so a hand-edited row never widens the door), the
-    address verified by the provider, owned by exactly one active account that is not an administrator and has no
-    identity on this provider yet, and confirmed for that account by the vault itself (an administrator or an
-    invitation set it, or the person typed the code sent there: app/core/email_confirmation.py).
+    address verified by the provider, owned by exactly one active account that is not an administrator, holds no
+    second factor of its own and has no identity on this provider yet, and confirmed for that account by the vault
+    itself (an administrator or an invitation set it, or the person typed the code sent there:
+    app/core/email_confirmation.py).
 
     The last condition is the vault's side of "verified". Without it, anyone with an account could write a
     colleague's address on their own account (a change of one's own address asks for the current password, not
@@ -600,6 +605,15 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         raise Refusal(RESTRICTED, f"privileged_account:{kind}")
     if not email_confirmation.confirmed(user):
         raise Refusal(NO_ACCOUNT, ADDRESS_NOT_CONFIRMED)
+    from app.services import sign_in as pipeline
+    if pipeline.holds_a_factor(db, user):
+        # The account set up a second factor of its own. A link made here would stand before that factor is given:
+        # the identity is on the account from the moment the provider answered (and at a provider whose people hold
+        # no password, the account's password is gone with it), and whoever holds the address at the provider
+        # could leave the first sign-in at the account's factor, start a second one through the link now made, and
+        # be asked for nothing of the account's. Such an account links the provider from its own profile, where
+        # its own sign-in and its own factor stand behind the link.
+        raise Refusal(LINK_FROM_PROFILE, HOLDS_A_FACTOR)
     if db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
                                             ExternalIdentity.user_id == user.id).first() is not None:
         return None          # the account's identity on this provider is another one: an administrator sorts it out
@@ -608,6 +622,12 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
 
 # The audit's word for a link by email refused because the vault never confirmed the account's address.
 ADDRESS_NOT_CONFIRMED = "address_not_confirmed"
+# The audit's word for a link by email refused because the account holds a second factor of its own (the reason
+# shown is LINK_FROM_PROFILE: it is linked from its own profile only).
+HOLDS_A_FACTOR = "account_holds_a_factor"
+# How an identity linked by its verified email address is recorded (external_identities.linked_by): nobody at the
+# vault asked for such a link, the provider's word put it on the account.
+LINKED_BY_EMAIL = "email"
 
 
 def _link_by_email(db, row, answer: ProviderAnswer, policy: dict):
@@ -615,8 +635,8 @@ def _link_by_email(db, row, answer: ProviderAnswer, policy: dict):
     if user is None:
         return None
     had_password = not getattr(user, "sso_only", False)
-    identity = link_identity(db, row, user, answer, linked_by="self")
-    return Resolution(user, identity, linked_now=True, linked_by="self",
+    identity = link_identity(db, row, user, answer, linked_by=LINKED_BY_EMAIL)
+    return Resolution(user, identity, linked_now=True, linked_by=LINKED_BY_EMAIL,
                       password_stopped=had_password and bool(getattr(user, "sso_only", False)))
 
 
@@ -744,6 +764,10 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
             return {"restriction": "passes", "would": (
                 "refuse: an account holds this address, but the vault never confirmed it is that account's (an "
                 "administrator or an invitation sets an address, or its owner confirms it with an emailed code)")}
+        if refused.detail == HOLDS_A_FACTOR:
+            return {"restriction": "passes", "would": (
+                "refuse: the account that owns this address set up its own second factor; its owner links this "
+                "provider under Your account")}
         return {"restriction": "passes", "would": "refuse: the account that owns this address is " + (
             "an administrator" if refused.detail.endswith("administrator") else "holding the auditor right") +
             "; it links only from its own signed-in profile"}
@@ -827,20 +851,15 @@ def _group_names(row, answer: ProviderAnswer) -> list:
     return sorted(answer.groups or [])[:200]
 
 
-def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str],
-                    linked_by_email_now: bool = False):
+def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str]):
     """The pipeline's result for a provider sign-in: the provider is the first proof (``amr`` carries what the
     vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
-    provider's policy trusts the values the token carried.
-
-    ``linked_by_email_now``: this very sign-in linked the identity to the account by its email address. The
-    provider's word alone put it there, so its MFA does not also stand in for the account's own second factor this
-    once: an account with a factor in effect is asked for it, which is what stops an address taken over at the
-    provider. From the next sign-in the identity is a known one and the policy applies as written."""
+    provider's policy trusts the values the token carried. (No identity is on an account that holds a second
+    factor of its own unless that account put it there itself: see :func:`_email_match`.)"""
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
     return SignInResult(user, [], client_ip, provider_id=provider_id,
-                        provider_mfa_trusted=mfa_trusted(row, answer) and not linked_by_email_now,
+                        provider_mfa_trusted=mfa_trusted(row, answer),
                         provider_auth_time=answer.auth_time,
                         provider_sid=answer.sid, provider_sub=answer.subject,
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)

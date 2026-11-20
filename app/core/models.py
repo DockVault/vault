@@ -3912,7 +3912,7 @@ class ExternalIdentity(Base):
     email_at_link = Column(String(320), nullable=True)
     display_name = Column(String(255), nullable=True)
     linked_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    linked_by = Column(String(16), nullable=False)                   # self | invitation | jit | admin
+    linked_by = Column(String(16), nullable=False)                   # self | email | invitation | jit | admin
     last_sign_in_at = Column(DateTime, nullable=True)
     refused_at = Column(DateTime, nullable=True)
     # The freshness deadline the person was last warned about, and the one they were last told had paused their keys:

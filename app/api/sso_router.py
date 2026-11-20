@@ -425,8 +425,7 @@ async def sign_in_callback(
                 _record_resolution(db, row, found, client_ip=client_ip, details=details)
         sso_groups.tell(db, row, user, applied, client_ip=client_ip)
         from app.core import sign_in_codes
-        result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip,
-                                     linked_by_email_now=bool(found.linked_now and found.linked_by == "self"))
+        result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip)
         try:
             handover_code = sign_in_codes.store(sign_in_codes.from_result(
                 result, verifier_hash=login.verifier_hash, code_challenge=login.code_challenge,
@@ -767,7 +766,7 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
             log.info("sso account-created notices skipped: %s", type(exc).__name__)
     _audit(db, "sso_identity_linked", user=user, ip=client_ip,
            details={"provider_id": details.get("provider_id"), "linked_by": found.linked_by})
-    if found.linked_by == "self":
+    if found.linked_by == sso.LINKED_BY_EMAIL:
         _tell_owner(db, user, row, "A sign-in method was added",
                     f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address."
                     + (PASSWORD_STOPPED.format(label=label) if found.password_stopped else ""))
