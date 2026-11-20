@@ -813,7 +813,11 @@ def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:
     if identity is None or str(identity.user_id) != str(user.id):
         raise Refusal(NOT_THIS_ACCOUNT)
     now = now or datetime.now(timezone.utc)
-    if answer.auth_time is None or not (0 <= (now - answer.auth_time).total_seconds() <= REAUTH_MAX_AGE_SECONDS):
+    # A sign-in a little ahead of this clock is a fresh one seen from a clock that runs behind, by no more than the
+    # skew every token check allows (beyond it the answer was refused earlier, as the provider's clock being ahead).
+    # The upper bound stays where it is: a minute old at most.
+    if answer.auth_time is None or not (
+            -oc.SKEW_SECONDS <= (now - answer.auth_time).total_seconds() <= REAUTH_MAX_AGE_SECONDS):
         raise Refusal(REAUTH_STALE)
     if policy_of(row)["sso_trust_idp_mfa"] and not mfa_trusted(row, answer):
         raise Refusal(REAUTH_NO_MFA)
@@ -830,6 +834,38 @@ def reauth_available(db, user) -> bool:
     account has an identity on, whose last test sign-in carried ``auth_time`` (without it no freshness can be
     judged). False where the database holds no identities at all."""
     return bool(reauth_providers(db, user))
+
+
+REAUTH_NOT_FOR_THIS = ("This step asks for your account's own password: a sign-in at your organisation does not stand "
+                       "in for it.")
+
+
+def reauth_permitted(db, user, action: Optional[str] = None) -> bool:
+    """Whether a fresh sign-in at a provider may stand in for ``user``'s password in a step-up for ``action``, by the
+    account and the action alone (whether a provider can confirm the account is :func:`reauth_available`).
+
+    Only for an account that signs in only through its provider (or holds no password at all): it has no password
+    it could type, so the provider is the one thing that can confirm it. Never for an account that has a password (the step-up means
+    that password: a stolen session and the person's provider account together must not pass it). Never for an
+    account that reaches other people's vaults by its standing (an administrator, an auditor right): those keep a
+    local password for exactly these step-ups, whatever else the row says. And never for a compliance action,
+    which asks for the account's own second factor and its own password. With no ``action`` the question is
+    about the account alone. Asked where the method is offered, where a re-authentication starts, where its
+    answer is staged and where the step-up takes it: none of them trusts another."""
+    from app.core import privileged_accounts, second_factor_actions as acts, second_factor_policy as pol
+    if user is None or not (getattr(user, "sso_only", False) or not getattr(user, "password_hash", None)):
+        return False            # the account has a password it can type: the step-up means that password
+    if privileged_accounts.kind(db, user) is not None:
+        return False
+    if action is not None and acts.fixed_policy(action) == pol.POLICY_COMPLIANCE:
+        return False
+    return True
+
+
+def reauth_allowed(db, user, action: Optional[str] = None) -> bool:
+    """Whether a provider sign-in may be offered to and taken from ``user`` for ``action`` now: the account and the
+    action permit it (:func:`reauth_permitted`), and a provider the account is linked to can confirm it afresh."""
+    return reauth_permitted(db, user, action) and reauth_available(db, user)
 
 
 def reauth_providers(db, user) -> list:

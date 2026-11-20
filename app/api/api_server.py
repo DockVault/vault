@@ -4647,10 +4647,11 @@ def _sf_requirement_for(db, user, action):
     return req, has_active
 
 
-def _sf_step_up_methods(db, user, req, has_active) -> list:
+def _sf_step_up_methods(db, user, req, has_active, action=None) -> list:
     """The methods to offer for a step-up requirement, from the table (app/core/step_up_methods.py) and
     what the account holds (app/core/active_factors.py). ``has_active`` is what the caller already
-    resolved; the table reads the factors itself."""
+    resolved; the table reads the factors itself. ``action`` is the step-up asked for: a provider sign-in in
+    place of the password is offered for some accounts and never for a compliance action."""
     from app.core import step_up_methods
     from app.core.active_factors import active_factors
     from app.services import sso_sign_in
@@ -4658,7 +4659,7 @@ def _sf_step_up_methods(db, user, req, has_active) -> list:
     # A passkey may meet the factor part when the account holds one (the passkey settings item adds the
     # administrator's switch to this context); a fresh sign-in at a linked provider may meet the password part.
     context = step_up_methods.Context(passkey_step_up=factors.passkeys > 0,
-                                      idp_reauth=sso_sign_in.reauth_available(db, user))
+                                      idp_reauth=sso_sign_in.reauth_allowed(db, user, action))
     return step_up_methods.offered(req, factors, context)
 
 
@@ -4693,7 +4694,7 @@ def _enforce_step_up(db, user, request, action):
                                                    receipt=receipt, session_hash=session_hash)):
         raise HTTPException(status_code=403, detail={
             "second_factor_required": True, "action": action, "reason": "step_up_required",
-            "methods": _sf_step_up_methods(db, user, req, has_active)})
+            "methods": _sf_step_up_methods(db, user, req, has_active, action)})
 
 
 def require_step_up(action: str):
@@ -8843,7 +8844,7 @@ async def second_factor_challenge(
     req, has_active = _sf_requirement_for(db, current_user, body.action)
     if req["must_enroll"]:
         return {"second_factor_required": True, "reason": "enroll_required", "methods": []}
-    methods = _sf_step_up_methods(db, current_user, req, has_active)
+    methods = _sf_step_up_methods(db, current_user, req, has_active, body.action)
     return {"second_factor_required": bool(methods), "methods": methods}
 
 
@@ -8887,7 +8888,7 @@ async def second_factor_step_up(
         # password, which is the first factor. The separate `require_password` re-auth below is what
         # reads body.password.
         from app.core import step_up_methods as _sum
-        otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has) if _sum.meets_factor(m)}
+        otp_methods = {m for m in _sf_step_up_methods(db, current_user, req, _has, body.action) if _sum.meets_factor(m)}
         method = (body.method or "").lower()
         if method == "passkey" and method in otp_methods:
             # The assertion is the factor part; the compliance policy adds its own rules on the key.
@@ -8910,10 +8911,12 @@ async def second_factor_step_up(
         if by_provider:
             # A fresh sign-in at the linked provider, staged by this tab for this action: spent here, once, and only
             # while a provider still offers it (a provider disabled meanwhile confirms nobody, and the proof keeps).
+            # Judged here again, whatever was offered or staged: only an account with no password of its own, never
+            # one with an administrator's or an auditor's standing, never for a compliance action.
             from app.core import sso_state
             from app.services import sso_sign_in
             staged = False
-            if sso_sign_in.reauth_available(db, current_user):
+            if sso_sign_in.reauth_allowed(db, current_user, body.action):
                 try:
                     staged = sso_state.take_reauth(session_hash, body.action)
                 except sso_state.Unavailable:
@@ -11932,7 +11935,8 @@ def _passkey_first_proof_kind(db, user) -> tuple:
     from app.core import password_origin
     if user.password_hash and not getattr(user, "sso_only", False) and not password_origin.nobody_knows(user):
         return "password", []
-    providers = sso_sign_in.reauth_providers(db, user)
+    providers = (sso_sign_in.reauth_providers(db, user)
+                 if sso_sign_in.reauth_allowed(db, user, PASSKEY_FIRST_PROOF_ACTION) else [])
     return ("provider", providers) if providers else ("none", [])
 
 
@@ -12329,7 +12333,7 @@ async def confirm_my_passkey(
     if marker is None:
         raise HTTPException(status_code=403, detail={
             "second_factor_required": True, "action": "account.second_factor", "reason": "step_up_required",
-            "methods": _sf_step_up_methods(db, current_user, req, has_active)})
+            "methods": _sf_step_up_methods(db, current_user, req, has_active, "account.second_factor")})
     older = [k for k in _passkeys_of(db, current_user.id)
              if k.id != row.id and k.created_at and k.created_at < row.created_at
              and not (k.provisional_until and k.provisional_until > now)]

@@ -59,7 +59,7 @@ def _stepped_up_url(h, p, **claims):
 
 
 def test_a_fresh_provider_sign_in_meets_the_password_part_once(monkeypatch):
-    alice, p = _user(), _provider(last_test=TESTED)
+    alice, p = _user(sso_only=True), _provider(last_test=TESTED)
     h = Reauth(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
     # Offered: the challenge lists the method beside the password.
     status, body = _call(h.S, "POST", "/auth/second-factor/challenge", {"action": "admin.retention.write"})[:2]
@@ -97,7 +97,7 @@ def test_a_fresh_provider_sign_in_meets_the_password_part_once(monkeypatch):
 
 
 def test_the_provider_must_be_linked_and_tested_with_auth_time(monkeypatch):
-    alice, p, q = _user(), _provider(last_test=TESTED), _provider(name="untested", last_test={"outcome": "ok", "auth_time_present": False})
+    alice, p, q = _user(sso_only=True), _provider(last_test=TESTED), _provider(name="untested", last_test={"outcome": "ok", "auth_time_present": False})
     h = Reauth(monkeypatch, [alice], [p, q], identities=[_identity(alice, q, subject="s-q")])
     # Linked to q, whose test carried no auth_time; p untested-for-alice (no identity): neither is offered.
     status, body = _call(h.S, "POST", "/auth/second-factor/challenge", {"action": "admin.retention.write"})[:2]
@@ -121,7 +121,7 @@ def test_the_provider_must_be_linked_and_tested_with_auth_time(monkeypatch):
 @pytest.mark.parametrize("arrange, reason", [
     ("stale", "reauth_stale"),
     ("no_auth_time", "reauth_stale"),
-    ("ahead_within_the_skew", "reauth_stale"),
+    ("just_over_a_minute_old", "reauth_stale"),
     ("future", "provider_clock_ahead"),
     ("other_identity", "not_this_account"),
     ("other_tenant", "not_this_account"),
@@ -129,7 +129,7 @@ def test_the_provider_must_be_linked_and_tested_with_auth_time(monkeypatch):
 ])
 def test_the_callback_accepts_only_a_fresh_sign_in_of_the_accounts_own_identity(monkeypatch, arrange, reason):
     policy = {"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]} if arrange == "no_mfa_when_trusted" else None
-    alice, p = _user(), _provider(last_test=TESTED, policy=policy)
+    alice, p = _user(sso_only=True), _provider(last_test=TESTED, policy=policy)
     identity = _identity(alice, p, tenant_id="t1" if arrange == "other_tenant" else None)
     h = Reauth(monkeypatch, [alice], [p], identities=[identity])
     now = int(time.time())
@@ -138,8 +138,8 @@ def test_the_callback_accepts_only_a_fresh_sign_in_of_the_accounts_own_identity(
         claims["auth_time"] = now - 120
     elif arrange == "no_auth_time":
         claims["auth_time"] = ...
-    elif arrange == "ahead_within_the_skew":
-        claims["auth_time"] = now + 30
+    elif arrange == "just_over_a_minute_old":
+        claims["auth_time"] = now - 70
     elif arrange == "future":
         claims["auth_time"] = now + 300
     elif arrange == "other_identity":
@@ -164,8 +164,77 @@ def test_the_callback_accepts_only_a_fresh_sign_in_of_the_accounts_own_identity(
         assert location.startswith("/#sso-stepup="), location
 
 
+def test_a_sign_in_a_little_ahead_of_the_clock_here_is_a_fresh_one(monkeypatch):
+    """The clock here runs behind the provider by less than the skew every token check allows: the sign-in the
+    provider just made reads as a few seconds in the future. It is fresh, not stale; a sign-in further ahead than
+    the skew was refused before this rule, as the provider clock being ahead."""
+    alice, p = _user(sso_only=True), _provider(last_test=TESTED)
+    h = Reauth(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    for ahead in (1, 30, 55):
+        status, location, _ = _stepped_up_url(h, p, auth_time=int(time.time()) + ahead)
+        assert location.startswith("/#sso-stepup="), (ahead, location)
+
+
+def test_a_provider_never_stands_in_for_a_password_the_account_has_or_for_a_compliance_step(monkeypatch):
+    """A fresh sign-in at the provider is the password part only for an account that has no password of its own.
+    For an account with a password, for one with the standing of an administrator or an auditor (whatever else
+    its row says), and for a compliance action, it is not offered, cannot be started, and a proof staged for it
+    all the same is not taken: the step-up asks for the password of the account itself."""
+    alice = _user()                                            # linked, with a password it can type
+    root = _user("root", role="admin", sso_only=True)          # the standing decides, not the flag
+    auditor = _user("auditor", sso_only=True)
+    carol = _user("carol", sso_only=True)                      # provider-only: the one account it is for
+    p = _provider(last_test=TESTED)
+    h = Reauth(monkeypatch, [alice, root, auditor, carol], [p],
+               identities=[_identity(u, p, subject=f"s-{u.username}") for u in (alice, root, auditor, carol)])
+    from app.core import sso_state
+    from app.core.models import AuditorGrant
+    h.db.rows_of(AuditorGrant).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=auditor.id, status="active"))
+
+    def refused_everywhere(user, action):
+        h.current_user = user
+        status, body = _call(h.S, "POST", "/auth/second-factor/challenge", {"action": action})[:2]
+        assert status == 200 and "idp_reauth" not in body["methods"] and "password" in body["methods"], (user.username, body)
+        status, body = h.start_reauth(p, action=action)
+        assert status == 403 and body["detail"]["reason"] == "password_required", (user.username, status, body)
+        assert "own password" in body["detail"]["message"]
+        assert not [k for k in h.redis.rows if k.startswith("sso:state:")], user.username     # nothing was started
+        sso_state.stage_reauth(h.session_hash, action)         # a proof staged all the same (an older build, a bug)
+        status, body = h.step_up(action=action, method="idp_reauth")
+        assert status == 403 and "Confirm with your organisation" in body["detail"], (user.username, body)
+        assert sso_state.take_reauth(h.session_hash, action) is True   # and it was not spent: nothing looked at it
+        assert h.step_up(action=action, method="password", password="pw")[0] == 200
+
+    for user in (alice, root, auditor):
+        refused_everywhere(user, "admin.retention.write")
+        refused_everywhere(user, "admin.auth_policy.write")
+    for action in ("compliance.case.request", "compliance.case.approve"):
+        refused_everywhere(carol, action)
+        refused_everywhere(root, action)
+    # What the page reads for Your account: a provider confirms only the account it is for.
+    for user, may in ((alice, False), (root, False), (auditor, False), (carol, True)):
+        h.current_user = user
+        status, body = _call(h.S, "GET", "/users/me/identities")[:2]
+        assert status == 200 and [x["reauth"] for x in body["providers"]] == [may], (user.username, body)
+    # The account it is for, at an action that is not a compliance one: offered, started, staged and taken.
+    h.current_user = carol
+    h.receipts.clear()
+    status, body = _call(h.S, "POST", "/auth/second-factor/challenge", {"action": "admin.retention.write"})[:2]
+    assert body["methods"] == ["idp_reauth", "password"], body
+    status, location, _ = _stepped_up_url(h, p, sub="s-carol", auth_time=int(time.time()) - 5)
+    assert location.startswith("/#sso-stepup="), location
+    assert h.finish_reauth(location)[0] == 200
+    assert h.step_up(method="idp_reauth")[0] == 200 and h.receipts == [(str(carol.id), "admin.retention.write", h.session_hash)]
+    # A proof made before the account gained a standing is not staged for it afterwards.
+    status, location, _ = _stepped_up_url(h, p, sub="s-carol", auth_time=int(time.time()) - 5)
+    h.db.rows_of(AuditorGrant).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=carol.id, status="proposed"))
+    status, body = h.finish_reauth(location)
+    assert status == 403 and body["detail"]["reason"] == "password_required", body
+    assert not [k for k in h.redis.rows if k.startswith("sso:reauth:")]
+
+
 def test_the_staged_proof_never_meets_the_factor_part(monkeypatch):
-    alice, p = _user(), _provider(last_test=TESTED)
+    alice, p = _user(sso_only=True), _provider(last_test=TESTED)
     h = Reauth(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
     S = h.S
     # An action that asks for the factor and the password: the provider meets the password part only.
@@ -175,7 +244,7 @@ def test_the_staged_proof_never_meets_the_factor_part(monkeypatch):
     from app.core.active_factors import ActiveFactors
     from app.core import active_factors as af
     monkeypatch.setattr(af, "active_factors", lambda db, user_id: ActiveFactors(code_method="totp", passkeys=0))
-    status, body = _call(S, "POST", "/auth/second-factor/challenge", {"action": "compliance.case.request"})[:2]
+    status, body = _call(S, "POST", "/auth/second-factor/challenge", {"action": "admin.retention.write"})[:2]
     assert body["methods"] == ["totp", "recovery", "idp_reauth", "password"], body
     status, location, _ = _stepped_up_url(h, p, auth_time=int(time.time()) - 5)
     h.finish_reauth(location)

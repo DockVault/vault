@@ -673,6 +673,9 @@ async def start_reauth(
         raise HTTPException(status_code=404, detail="Unknown action.")
     client_ip = api.get_client_ip(request)
     _limit_start(client_ip)
+    if not sso.reauth_permitted(db, current_user, body.action):
+        # Nothing is started and no state is made for a step this account answers with its own password.
+        raise HTTPException(status_code=403, detail={"reason": "password_required", "message": sso.REAUTH_NOT_FOR_THIS})
     row = _provider(db, provider_id)
     if row is None or not sso.reauth_offered(row):
         raise HTTPException(status_code=404, detail={"reason": sso.PROVIDER_DISABLED,
@@ -710,6 +713,8 @@ async def finish_reauth(
     action = record.get("step_up_action")
     if not isinstance(action, str) or not action:
         raise HTTPException(status_code=401, detail="This code is not valid for this tab; start again.")
+    if not sso.reauth_permitted(db, current_user, action):
+        raise HTTPException(status_code=403, detail={"reason": "password_required", "message": sso.REAUTH_NOT_FOR_THIS})
     try:
         sso_state.stage_reauth(record["session_hash"], action)
     except sso_state.Unavailable:
@@ -948,9 +953,11 @@ async def list_my_identities(
     offered = [p for key, p in providers.items()
                if sso.usable_for(p, sso_state.LINK) is None and (p.show_on_sign_in or key in linked)]
     offered.sort(key=lambda p: (p.sort_order or 0, (p.label or p.name or "").lower(), str(p.id)))
+    may_confirm = sso.reauth_allowed(db, current_user)        # a provider confirms only an account with no password
     return {"identities": [_identity_public(i, providers.get(str(i.provider_id))) for i in rows],
             "providers": [{"id": str(p.id), "label": p.label or p.name, "icon": p.icon or "generic",
-                           "linked": str(p.id) in linked, "reauth": sso.reauth_offered(p)} for p in offered]}
+                           "linked": str(p.id) in linked,
+                           "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)} for p in offered]}
 
 
 @router.post("/users/me/identities/{provider_id}/start")
