@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import io
 import ipaddress
 import json
 import logging
@@ -285,15 +286,117 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirects are not followed", headers, fp)
 
 
+def _time_left(deadline: float) -> float:
+    """The seconds a call has left, or TimeoutError once it has none."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("the call's deadline passed")
+    return left
+
+
+class _DeadlinedReader(io.RawIOBase):
+    """The bytes of a connection, each read waiting no longer than the call has left."""
+
+    def __init__(self, raw, sock, deadline: float):
+        self._raw, self._sock, self._deadline = raw, sock, deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        self._sock.settimeout(_time_left(self._deadline))
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        finally:
+            super().close()
+
+
+class _Deadlined:
+    """A connected socket whose every read and write waits no longer than the call has left. The socket's own
+    timeout bounds one read; a provider that sent a byte of its status line or of a header just inside that timeout,
+    again and again, would hold the call for as long as it liked."""
+
+    def __init__(self, sock, deadline: float):
+        self._sock, self._deadline = sock, deadline
+
+    @property
+    def plain(self):
+        """The socket itself, for the one step that needs it: wrapping it in TLS."""
+        return self._sock
+
+    def sendall(self, data, *args):
+        self._sock.settimeout(_time_left(self._deadline))
+        return self._sock.sendall(data, *args)
+
+    def makefile(self, mode="rb", *args, **kwargs):
+        # The reader the standard library would make, with the deadline in front of every read. It is made by the
+        # socket itself, so the socket stays open for as long as the answer is being read.
+        return io.BufferedReader(_DeadlinedReader(self._sock.makefile("rb", buffering=0), self._sock, self._deadline))
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+class _DeadlineConnection(http.client.HTTPSConnection):
+    """One call to a provider under one deadline: every address tried, the TLS handshake, the request, the status
+    line, the headers and the body together take no longer than the call's timeout."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        whole = self.timeout if isinstance(self.timeout, (int, float)) and self.timeout > 0 else HTTP_TIMEOUT_SECONDS
+        self._deadline = time.monotonic() + whole          # the connection is made as the call starts
+        self._create_connection = self._connect_by_the_deadline
+
+    def _connect_by_the_deadline(self, address, timeout=None, source_address=None):
+        host, port = address
+        addresses = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        failure: Optional[OSError] = None
+        for tried, (family, kind, proto, _name, where) in enumerate(addresses):
+            # Each address gets an even share of what is left. One that never answers (a route that drops IPv6,
+            # say) then leaves time for the next, and the first to answer is taken, as the standard connection
+            # does; all of them together still take no longer than the call has.
+            share = _time_left(self._deadline) / (len(addresses) - tried)
+            sock = socket.socket(family, kind, proto)
+            try:
+                sock.settimeout(share)
+                sock.connect(where)
+                # Held to the deadline from here on: what follows on the bare connection (a proxy's CONNECT
+                # exchange, where the deployment reaches the provider through one) waits no longer either.
+                return _Deadlined(sock, self._deadline)
+            except OSError as exc:
+                failure = exc
+                sock.close()
+        raise failure or OSError("the name has no address")
+
+    def connect(self):
+        http.client.HTTPConnection.connect(self)
+        plain = self.sock.plain
+        plain.settimeout(_time_left(self._deadline))
+        secured = self._context.wrap_socket(plain, server_hostname=self._tunnel_host or self.host)
+        self.sock = _Deadlined(secured, self._deadline)
+
+
+class _Https(urllib.request.HTTPSHandler):
+    """The https handler, with every connection held to one deadline: the timeout of the request it serves."""
+
+    def do_open(self, http_class, req, **http_conn_args):
+        return super().do_open(_DeadlineConnection, req, **http_conn_args)
+
+
 # https only: no file, ftp, data or plain-http handler can ever answer, whatever the address.
-_opener = urllib.request.build_opener(urllib.request.HTTPSHandler(), _NoRedirects())
+_opener = urllib.request.build_opener(_Https(), _NoRedirects())
 
 
 def fetch_json(url: str, *, method: str = "GET", data: Optional[bytes] = None, headers: Optional[dict] = None,
                timeout: int = HTTP_TIMEOUT_SECONDS, opener=None) -> dict:
     """GET or POST ``url`` and return its JSON object: TLS verified against the image's trust store, a short
-    timeout, a body cap, no redirects, a fixed user agent. Any failure is ``temporarily_unavailable`` (the
-    provider's answer is logged, never shown) except a non-JSON or non-object body, which is ``provider_error``."""
+    timeout, a body cap, no redirects, a fixed user agent. ``timeout`` is the whole call's: connecting, the TLS
+    handshake, the request, the status line, the headers and the body together, however slowly a provider sends
+    any of them. Any failure is ``temporarily_unavailable`` (the provider's answer is logged, never shown) except
+    a non-JSON or non-object body, which is ``provider_error``."""
     if urllib.parse.urlsplit(url).scheme.lower() != "https":
         raise OidcError(ENDPOINT_REFUSED, "the endpoint must use https")
     request = urllib.request.Request(url, data=data, method=method)
