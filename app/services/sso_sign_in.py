@@ -48,6 +48,7 @@ REAUTH_MAX_AGE_SECONDS = 60
 RESTRICTED = sso_policy.RESTRICTED
 RESTRICTION_CLAIM_MISSING = sso_policy.RESTRICTION_CLAIM_MISSING
 INVITATION_UNUSABLE = "invitation_unusable"
+ADMINISTRATOR_INVITATION = "administrator_invitation"
 EMAIL_REQUIRED = "email_required"
 ACCOUNT_LIMIT = "account_limit"
 USERNAME_UNAVAILABLE = "username_unavailable"
@@ -85,6 +86,9 @@ REASON_TEXTS = {
     RESTRICTION_CLAIM_MISSING: ("Your organisation's sign-in did not say which tenant, domain or groups you belong to, "
                                 "so the vault could not check who it admits. Ask your administrator."),
     INVITATION_UNUSABLE: "This invitation can no longer be used. Ask your administrator for a new one.",
+    ADMINISTRATOR_INVITATION: ("An administrator's invitation is accepted with a password: an administrator types it at "
+                               "every sign-in. Open the invitation again and choose a password there; you can link "
+                               "your organisation's sign-in from Your account afterwards."),
     EMAIL_REQUIRED: ("Your organisation's sign-in did not provide a verified email address, and this vault requires "
                      "one for a new account. Ask your administrator."),
     ACCOUNT_LIMIT: "This vault cannot take another account right now. Ask your administrator.",
@@ -479,6 +483,7 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     user = User(id=_uuid.uuid4(), username=username, email=email, password_hash=hash_password(secrets.token_urlsafe(32)),
                 role=role, created_by=None, created_at=now, updated_at=now, is_active=True, is_locked=False,
                 failed_login_attempts=0, sftp_enabled=True, sso_only=sso_only, sftp_password_auth=not sso_only)
+    _password_is_nobodys(user, now)
     db.add(user)
     try:
         db.flush()
@@ -488,6 +493,16 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     grant_default_permissions_for_role(str(user.id), user.role, db, commit=False)
     identity = link_identity(db, row, user, answer, linked_by="jit")
     return Resolution(user, identity, created=True, linked_now=True, linked_by="jit")
+
+
+def _password_is_nobodys(user, now) -> None:
+    """An account made through a provider holds a hash of random bytes: a password that is not its owner's. It is
+    marked as one somebody else set (app/core/password_origin.py), so that the rules for such a password apply:
+    made an administrator later, the account's password is taken back and the person is sent a link to choose
+    one, where an administrator must type it at every sign-in; and until the person has chosen one, the account
+    approves no held change. The mark goes when the person sets a password of their own."""
+    from app.core import password_origin
+    password_origin.set_by_other(user, None, now)
 
 
 def _admitted_address(db, answer: ProviderAnswer, policy: dict, account_policy: dict) -> Optional[str]:
@@ -656,15 +671,18 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
         role = RoleEnum(inv.role)
     except ValueError:
         raise Refusal(INVITATION_UNUSABLE, "bad_role")
-    if role == RoleEnum.ADMIN and policy["sso_password_login"] == "disabled":
-        # No administrator is ever linked to a provider whose people hold no password (the save of that setting
-        # refuses while one is linked); an administrator's invitation goes through another provider or the form.
-        raise Refusal(INVITATION_UNUSABLE, "administrator_on_password_less_provider")
+    if role == RoleEnum.ADMIN:
+        # An administrator types the account's password at every sign-in, after any provider. An account made here
+        # holds a password nobody knows, so the new administrator could never finish one. The invitation is
+        # accepted with the form, where the person chooses the password; the provider is linked afterwards. (This
+        # also keeps every administrator off a provider whose people hold no password.)
+        raise Refusal(ADMINISTRATOR_INVITATION, "administrator_invitation")
     sso_only = policy["sso_password_login"] == "disabled"
     user = User(id=_uuid.uuid4(), username=inv.username, email=email,
                 password_hash=hash_password(secrets.token_urlsafe(32)),
                 role=role, created_by=inv.created_by, created_at=now, updated_at=now, is_active=True, is_locked=False,
                 failed_login_attempts=0, sftp_enabled=True, sso_only=sso_only, sftp_password_auth=not sso_only)
+    _password_is_nobodys(user, now)
     if inv.email:
         # The administrator wrote this address into the invitation. An address taken from the provider instead is
         # the provider's word, not the vault's, and stays unconfirmed.

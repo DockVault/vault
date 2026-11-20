@@ -160,14 +160,14 @@ def test_an_invitation_start_is_refused_for_a_token_that_cannot_be_accepted(monk
     ("reserved_name", "invitation_unusable", "username_reserved"),
     ("invitation_address_in_use", "invitation_unusable", "email_in_use"),
     ("username_is_an_address", "invitation_unusable", "username_email_conflict"),
-    ("administrator_without_password", "invitation_unusable", "administrator_on_password_less_provider"),
+    ("administrator", "administrator_invitation", "administrator_invitation"),
     ("subject_pinned_elsewhere", "already_linked", "subject_linked_elsewhere"),
     ("claim_lost", "invitation_unusable", "claim_lost"),
     ("resent", "invitation_unusable", "not_pending"),
 ])
 def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account(monkeypatch, arrange, reason, detail):
     root = _user("root", role="admin")
-    p = _provider(policy={"sso_password_login": "disabled"} if arrange == "administrator_without_password" else None)
+    p = _provider()
     users = [root]
     if arrange == "invitation_address_in_use":
         users.append(_user("holder", email="taken@example.test"))
@@ -175,11 +175,20 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
         users.append(_user("holder", email="newbie"))
     identities = [_identity(_user("other"), p, tenant_id="t1")] if arrange == "subject_pinned_elsewhere" else []
     h = Resolving(monkeypatch, users, [p], identities=identities)
-    admin_role = arrange in ("inviter_demoted", "administrator_without_password", "claim_lost")
+    admin_role = arrange in ("inviter_demoted", "administrator")
     token, inv = h.invite(created_by=root.id, role="admin" if admin_role else "user",
                           email="taken@example.test" if arrange == "invitation_address_in_use" else None)
-    status, out = h.start(p, invitation=token)
-    state, _ = h.state_of(out["authorization_url"])
+    if admin_role:
+        # The start refuses an administrator's invitation outright; the callback is held to the same, for a state
+        # that names one all the same.
+        from app.core import sso_state
+        from app.services import sso_sign_in as sso
+        url = sso.start(p, purpose=sso_state.SIGN_IN, source="s", client_ip="203.0.113.9", verifier_hash=_h("tab-verifier"),
+                        extras={"invitation_id": str(inv.id)})
+    else:
+        status, out = h.start(p, invitation=token)
+        url = out["authorization_url"]
+    state, _ = h.state_of(url)
     now = datetime.utcnow()
     from app.core.models import RoleEnum, SystemSetting
     resent = None
@@ -207,8 +216,9 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
     elif arrange == "subject_pinned_elsewhere":
         h.claims_override = {"tid": "t2"}
     elif arrange == "claim_lost":
-        # Revoked between the inviter's locked read and the atomic claim: the claim finds no pending row.
-        h.db.on_lock.append(lambda: setattr(inv, "revoked_at", datetime.utcnow()))
+        # Revoked after the invitation was read as pending and before the atomic claim: the claim finds no
+        # pending row. (Staged at a check that sits between the two.)
+        monkeypatch.setattr(h.S, "_username_kept", lambda name: setattr(inv, "revoked_at", datetime.utcnow()) or False)
     status, location, _ = h.callback(p, state)
     assert location == f"/#sso-error={reason}", location
     assert h.users_named("newbie") == [] and len(h.identities()) == len(identities) and h.codes() == []
@@ -264,17 +274,50 @@ def test_the_new_accounts_address_is_the_invitations_else_the_providers_verified
     assert user.email == expected
 
 
-def test_an_administrators_invitation_records_the_grant_keeps_a_password_and_is_announced(monkeypatch):
+def test_an_administrators_invitation_is_accepted_with_the_form_never_through_a_provider(monkeypatch):
+    """An administrator types the account's password at every sign-in, and an account made through a provider holds
+    one nobody knows: the new administrator could never finish a sign-in. So the start says, before anyone is sent
+    to the provider, that such an invitation is accepted with a password; and a callback that carries one all the
+    same makes no account and leaves the invitation to be used with the form."""
     root, p = _user("root", role="admin"), _provider()
     h = Resolving(monkeypatch, [root], [p])
     token, inv = h.invite(created_by=root.id, role="admin", inviter_lineage=[str(uuid.uuid4())])
-    location, _ = _sign_in(h, p, token)
-    assert location.startswith("/#sso="), location
-    (user,) = h.users_named("newbie")
-    from app.core.models import RoleEnum
-    assert user.role == RoleEnum.ADMIN
-    assert user.sso_only is False and user.sftp_password_auth is True       # an administrator always keeps a password
-    assert h.admin_grants == [("newbie", "root", inv.inviter_lineage)] and h.announcements == [("newbie", "root", "invited")]
+    status, out = h.start(p, invitation=token)
+    assert status == 409 and out["detail"]["reason"] == "administrator_invitation", out
+    assert "accepted with a password" in out["detail"]["message"]
+    assert not [k for k in h.redis.rows if k.startswith("sso:state:")]            # nobody was sent to the provider
+    # A state that names the invitation all the same (made before, or by hand).
+    from app.core import sso_state
+    from app.services import sso_sign_in as sso
+    url = sso.start(p, purpose=sso_state.SIGN_IN, source="s", client_ip="203.0.113.9", verifier_hash=_h("tab-verifier"),
+                    extras={"invitation_id": str(inv.id)})
+    state, _ = h.state_of(url)
+    status, location, _ = h.callback(p, state)
+    assert location == "/#sso-error=administrator_invitation", location
+    assert h.users_named("newbie") == [] and h.identities() == [] and inv.accepted_at is None
+    assert h.admin_grants == [] and h.announcements == []
+    assert "administrator_invitation" in sso.REASON_TEXTS
+
+
+def test_an_account_made_through_a_provider_holds_a_password_that_is_not_its_owners(monkeypatch):
+    """Made at a first sign-in or from an invitation accepted through the provider, an account holds a hash of
+    random bytes. It is marked as a password someone else set, so that the rules for one apply: a later promotion
+    takes it back and sends the person a link to choose their own, and until then the account approves no held
+    change. An account that existed and was linked keeps what it had."""
+    from app.core import password_origin
+    root, bob = _user("root", role="admin"), _user("bob", password_set_by=None, password_set_by_other_at=None)
+    p = _provider(policy={"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]})
+    q = _provider(name="links", policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [root, bob], [p, q])
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    token, _inv = h.invite(username="invited", created_by=root.id)
+    assert _sign_in(h, p, token, sub="s-invited", email="invited@example.test")[0].startswith("/#sso=")
+    assert _sign_in(h, p, sub="s-first", email="first@example.test", preferred_username="first")[0].startswith("/#sso=")
+    assert _sign_in(h, q, sub="s-bob", email="bob@example.test")[0].startswith("/#sso=")
+    (invited,), (first,) = h.users_named("invited"), h.users_named("first")
+    for made in (invited, first):
+        assert password_origin.is_set_by_other(made) and made.password_set_by is None, made.username
+    assert not password_origin.is_set_by_other(bob) and bob.password_hash == "x"
 
 
 def test_every_new_account_gets_a_password_hash_of_its_own_that_nobody_knows(monkeypatch):
