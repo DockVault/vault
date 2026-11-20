@@ -7,14 +7,16 @@ project — and of everyone who self-hosts it — seriously.
 
 | Release line | Security fixes |
 |---|---|
-| 0.33.x, the latest line | Yes |
+| 0.35.x, the latest line | Yes |
+| 0.34.x | Yes, until 2027-05-17 |
+| 0.33.x | Yes, until 2027-05-09 |
 | 0.32.x and earlier | No. Upgrade to the latest release. |
 
 Each minor release line from 0.33 on (0.33.x, 0.34.x, ...) receives security fixes until six
-months after the next minor release ships. When 0.34.0 ships, 0.33.x gets its own row here with
-that date, so for a while two lines are supported: the latest and the one before it. 0.32.x and
-earlier receive no more security fixes. (The README's "minimum supported version" is a different
-thing: the oldest release `dockvault.py update` can upgrade from.)
+months after the next minor release ships. The table gives that day for each line before the
+latest, so more than one line is supported at a time: until 2027-05-09, three lines are. 0.32.x
+and earlier receive no more security fixes and are end-of-life: from a 0.35.0 checkout,
+`dockvault.py update` no longer moves to them; an install on one upgrades to a supported release.
 
 Security fixes ship as patch releases. Once a newer line exists, a fix for an older line that is
 still supported is released from that line's `release/X.Y` branch, in the same release window as
@@ -59,7 +61,7 @@ What to expect:
 - a first assessment within 10 business days: whether we can reproduce it, and its severity
   (CVSS v4);
 - a fix within 30 days for Critical and High severity and within 90 days for Medium. Low
-  findings are fixed in the next regular release, and in the supported previous line in the same
+  findings are fixed in the next regular release, and in the supported previous lines in the same
   release window.
 
 We will keep you informed, coordinate disclosure with you, and credit you in the release notes

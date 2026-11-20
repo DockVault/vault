@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "about": "Declares what it takes to move between released versions of DockVault, and each version's support lifecycle. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between adjacent releases -- the next release of a line, or the first release of the next line -- and a longer upgrade is composed by walking them. An edge may skip releases only where a release of an older line needs its own way up (for example into the release that carries the same fix on the newer line); it is then at least as cautious as the route it replaces: it requires a backup and is irreversible if any step of that route is, carries every step's conditions, and never passes a release marked `must_land_here`. Every release that is not end-of-life reaches the newest by edges that are not blocked, and no edge leads into a release affected by a vulnerability the release it leaves had fixed. Each version also carries a `support` block: `eol` (end-of-life) and `secure` (free of known unpatched vulnerabilities) are always stated, and an EOL version may carry `code_support` / `security_support` end dates for extended support. The optional top-level `lines` map gives each release line from 0.33 on the day its security fixes end (`security_fixes_until`), null for the newest line, whose end is set when the next minor release ships; it is at least six months after that release. `eol` is the upgrade floor, not the end of security support. The host tool hides EOL releases and refuses to upgrade into or downgrade out of them; a downgrade is refused across any edge marked irreversible. Each known vulnerability is recorded once, in the top-level `advisories`: title, description, impact, remediation, an optional mitigation, a CVSS v4.0 base vector (`cvss`) with the severity band it scores to, an optional id, the `fixed_in` release and the `published` date; `cvss` and `severity` are both null for an unrated advisory. Each affected version lists references to its advisories under `vulnerabilities` (`advisory`, with the advisory's `title` and `fixed_in` repeated for readers that predate advisories; below 0.27.0 a reference carries the advisory id alone). A version affected by any advisory, of any severity, is not secure. An advisory is normally listed only once a release fixes it; one with no fix yet (`fixed_in` null) is published only together with a mitigation.",
+  "about": "Declares what it takes to move between released versions of DockVault, and each version's support lifecycle. Every release must appear here before it can be cut; the release workflow refuses otherwise. Edges are declared between adjacent releases -- the next release of a line, or the first release of the next line -- and a longer upgrade is composed by walking them. An edge may skip releases only where a release of an older line needs its own way up (for example into the release that carries the same fix on the newer line); it is then at least as cautious as the route it replaces: it requires a backup and is irreversible if any step of that route is, carries every step's conditions, and never passes a release marked `must_land_here`. Every release that is not end-of-life reaches the newest by edges that are not blocked, and no edge leads into a release affected by a vulnerability the release it leaves had fixed. Each version also carries a `support` block: `eol` (end-of-life) and `secure` (free of known unpatched vulnerabilities) are always stated, and an EOL version may carry `code_support` / `security_support` end dates for extended support. The optional top-level `lines` map gives each release line from 0.33 on the day its security fixes end (`security_fixes_until`), null for the newest line, whose end is set when the next minor release ships; it is at least six months after that release. `eol` is the upgrade floor, not the end of security support. The host tool hides EOL releases and refuses to upgrade into or downgrade out of them; a downgrade is refused across any edge marked irreversible. Each known vulnerability is recorded once, in the top-level `advisories`: title, description, impact, remediation, an optional mitigation, a CVSS v4.0 base vector (`cvss`) with the severity band it scores to, an optional id, the `fixed_in` release and the `published` date; `cvss` and `severity` are both null for an unrated advisory. Each affected version lists references to its advisories under `vulnerabilities` (`advisory`, with the advisory's `title` and `fixed_in` repeated for readers that predate advisories; on releases below a boundary kept in .github/scripts/upgrade_matrix.py a reference may carry the advisory id alone). A version affected by any advisory, of any severity, is not secure. An advisory is normally listed only once a release fixes it; one with no fix yet (`fixed_in` null) is published only together with a mitigation.",
   "kinds": {
     "direct": "The upgrade can be taken in one step. Any caveats are listed in the edge's conditions.",
     "blocked": "The upgrade must not be taken. The edge says why, and what to do instead."
@@ -10,6 +10,9 @@
       "security_fixes_until": "2027-05-09"
     },
     "0.34": {
+      "security_fixes_until": "2027-05-17"
+    },
+    "0.35": {
       "security_fixes_until": null
     }
   },
@@ -405,6 +408,22 @@
         "0.34.3"
       ],
       "published": "2026-11-16"
+    },
+    "live-updates-used-up-the-cache-connections": {
+      "title": "Open live-update connections could use up the server's cache connections",
+      "description": "Each browser tab of the web app keeps a live-update connection to the server (/ws/monitor). Up to 0.33.8 and 0.34.3, each of these held one connection from the pool the server uses for every request to its cache (Redis), for as long as it stayed open, and that pool allows at most 100 connections. With 100 live-update connections open, which one signed-in account could open in under a minute and a busy deployment reaches with about 100 open tabs, every other use of the cache failed until some of them closed. Separately, when a live-update connection closed, its cache connection could be handed back to the pool while a read on it was still running, so the next request to use it could fail or be refused once. 0.33.9 and 0.34.4 give the live-update connections a pool of their own, use each from one thread at a time, and let one account keep at most 10 open.",
+      "impact": "While the cache's connections were used up, password reset, invitations, self-signup, the user search of the share dialog, and public, note and upload links answered 503 (temporarily unavailable); an account with a second factor could not finish signing in, and actions that ask for the second factor again failed with an error; the general request rate limits did not apply; and live updates stopped. Signing in with a password alone, open sessions, files and signing out kept working, and no data could be read or changed by anyone who could not before. Service came back within about ten seconds of enough live-update connections closing.",
+      "remediation": "Upgrade to 0.34.4 or later, or to 0.33.9 on the 0.33 line. Nothing needs doing after the upgrade.",
+      "mitigation": "Until you upgrade: restarting the web container ends the effect until the connections are opened again, and a reverse proxy in front of the vault can limit how many connections one client keeps open to /ws/monitor.",
+      "severity": "medium",
+      "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N",
+      "id": null,
+      "fixed_in": "0.33.9",
+      "fixed_in_lines": [
+        "0.33.9",
+        "0.34.4"
+      ],
+      "published": "2026-11-17"
     }
   },
   "versions": {
@@ -484,6 +503,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -563,6 +585,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -642,6 +667,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -721,6 +749,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -800,6 +831,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -879,6 +913,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -958,6 +995,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1037,6 +1077,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1116,6 +1159,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1195,6 +1241,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1274,6 +1323,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1356,6 +1408,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1438,6 +1493,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1529,6 +1587,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1623,6 +1684,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1717,14 +1781,17 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
     "0.17.0": {
       "released": "2026-08-27",
-      "notes": "Minimum supported release. First version to seal names, descriptions and content checksums at rest. Schema: adds vaults.name_key_version and files.enc_checksum, and makes files.checksum_sha256 nullable (the content checksum is sealed into enc_checksum and decrypted on load), all applied by the boot DDL. An image older than 0.17.0 cannot read a deployment written by it: a vault name/description reads back NULL, a note title reads as an opaque sealed token, and a file download fails closed mid-stream because the integrity verifier finds checksum_sha256 NULL. There is therefore no in-place downgrade off it, and no in-place upgrade into it from 0.16.1 -- reach it by deploying fresh and restoring from a backup (see the blocked edge and the waiver). Every release below it is end-of-life.",
+      "notes": "First version to seal names, descriptions and content checksums at rest. Schema: adds vaults.name_key_version and files.enc_checksum, and makes files.checksum_sha256 nullable (the content checksum is sealed into enc_checksum and decrypted on load), all applied by the boot DDL. An image older than 0.17.0 cannot read a deployment written by it: a vault name/description reads back NULL, a note title reads as an opaque sealed token, and a file download fails closed mid-stream because the integrity verifier finds checksum_sha256 NULL. There is therefore no in-place downgrade off it, and no in-place upgrade into it from 0.16.1 -- reach it by deploying fresh and restoring from a backup (see the blocked edge and the waiver). End-of-life from 0.35.0, like every release before 0.33.0.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -1811,6 +1878,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1818,7 +1888,7 @@
       "released": "2026-08-28",
       "notes": "No schema change; same physical schema as 0.17.0. Follow-up hardening and fixes on the 0.17.0 at-rest sealing round. At rest: seals a Standard vault's ACTIVE resumable-upload filename and MIME (they were plaintext in chunked_upload_sessions for the life of the upload; the enc_name/enc_mime/name_bi columns already existed and are simply now used for Standard uploads too, decrypted transparently on read), and stops copying already-sealed item/vault names and note titles into the plaintext notification body (the recipient reaches the live item via the deep link). Host tool (dockvault.py): drops the spent ADMIN_PASSWORD from .env after the admin is bootstrapped (only when the DB bootstrap marker confirms an admin exists; fail-closed otherwise); no longer archives a never-used fresh .env when 'deploy a new set' is chosen on a fresh install, and warns in red when a real .env is archived; and lock/status now surface unsealed plaintext .env.* archives. SFTP: the effective per-file upload limit is min(MAX_FILE_SIZE_MB, the RAM staging tmpfs) -- the shipped .env.example defaults are reconciled to agree, the effective SFTP limit is surfaced in the admin settings, and an over-limit or staging-full upload returns a named error instead of a bare 'Failure'. A rollback to 0.17.0 is clean and needs no backup: no persistent schema or data changed, and only an upload in flight at the moment of a downgrade would be affected.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -1905,6 +1975,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -1912,7 +1985,7 @@
       "released": "2026-08-28",
       "notes": "No schema change; same physical schema as 0.17.0/0.18.0. Follow-up fixes from an external audit of 0.18.0, none a confidentiality break: two vault handlers (update-info, change-password) that answered an authorization failure with 500 now return 403; the ECC key-topology endpoint (/ecc/vaults/{id}/keys) returns 403 for a vault the caller cannot reach instead of leaking mode/dek_version to a non-member or 404-vs-403 confirming existence; the public note-link redeem endpoint adds the missing per-IP rate-limit bucket (token enumeration was unthrottled); chunked-upload completion returns a named 409 (not a 500) for a session it cannot read, and the 0.17.0->0.18.0 downgrade edge now documents that in-flight uploads do not survive a downgrade; the download Content-Disposition header strips forward slashes as well as backslashes; a NUL byte in an uploaded filename is rejected with 400 instead of surfacing as a 500; and the base-image apk-upgrade reproducibility exception is documented and contract-tested. A rollback to 0.18.0 is clean and needs no backup.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -1999,6 +2072,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2006,7 +2082,7 @@
       "released": "2026-08-28",
       "notes": "Additive schema fix, no data migration. Adds the foreign key for temporary_credentials.created_by_temp_credential_id (self-referential, ON DELETE SET NULL) that create_all already declares but the boot DDL omitted, so a fresh install and an upgraded one converge to the same physical schema. Deleting a temp credential that had minted others now nulls their created_by_temp_credential_id provenance pointer instead of leaving a dangling id (any pre-existing dangling ids are nulled first, so the constraint add cannot fail on an install that ran the earlier column-only DDL). A rollback to 0.18.1 is clean and needs no backup: the older image simply does not re-add the foreign key and the column is unchanged.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2093,6 +2169,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2100,7 +2179,7 @@
       "released": "2026-08-28",
       "notes": "In-vault file operations & previews. Additive schema: files.modified_by (nullable UUID, FK users.id ON DELETE SET NULL) records who last renamed a file in place; the column AND its foreign key are both added by the boot DDL so a fresh create_all install and an upgraded one match. Adds a safe Markdown/HTML/source preview renderer (server-side nh3 allowlist, CSP-locked empty-sandbox srcdoc iframe), a copyable plaintext SHA-256 (Standard vaults, download-gated), a Move/Copy staging panel, upload fixes, live download progress, and bounded-memory preview (large media refused inline, big text windowed via Range). Depends on Markdown 3.10.3 + Pygments 2.20.0 (hash-pinned, pure-Python). A rollback to 0.18.2 is clean and needs no backup: the modified_by column is left in place and simply ignored by the older image.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2187,6 +2266,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2194,7 +2276,7 @@
       "released": "2026-08-29",
       "notes": "No schema change. Security & authorization hardening from the v0.19.0 review: an SFTP pre-auth connection admission (a total + per-source-IP connection ceiling and an auth grace timeout, the SSH MaxStartups equivalent) so a no-credential connection flood can't exhaust threads and Transports; a password change now durably revokes the account's sessions on the self-service and admin paths, matching the reset path; regular web sessions get an absolute server-side expiry so abandoned rows age out, and session_timeout is clamped to a 30-day maximum; new password key-encryption-key wraps derive at 600,000 PBKDF2 iterations (existing wraps still open at their stored count); and denial tests plus a coverage guard for the four destructive vault capabilities. Adds SFTP_MAX_CONNECTIONS / SFTP_MAX_CONNECTIONS_PER_IP / SFTP_AUTH_GRACE_SECONDS settings (defaults suit a single tenant). A rollback to 0.19.0 is clean and needs no backup: no persistent schema or data changed.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2281,6 +2363,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2288,7 +2373,7 @@
       "released": "2026-08-29",
       "notes": "No schema change. Follow-up security cleanup from the v0.19.0 security review: the ECC name-index-key GET and the member-keys GET now refuse a non-member with 403 whether or not the vault exists, so neither confirms a vault id to a stranger (parity with the DEK keys endpoint); POST /ecc/keys/register refuses a temporary session before charging the account's ECC register rate budget, so a refused temp request can no longer spend the owner's once-per-account budget; plus regression tests pinning cross-tenant file-plane access at 403-not-500 and the temp-credential scope contract. A rollback to 0.19.1 is clean and needs no backup: no persistent schema or data changed.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2375,6 +2460,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2382,7 +2470,7 @@
       "released": "2026-08-29",
       "notes": "No schema change. Collaboration features now default ON for a fresh self-hosted install: internal file sharing, public note links, and admin invite-by-link. These are admin master switches that previously shipped off-by-default; an explicit stored 'off' is still honored, and nothing is exposed until a user actively creates a share or link (invite-by-link is admin-only). Self-signup stays off by default. A rollback to 0.19.2 is clean and needs no backup: no persistent schema or data changed.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2469,6 +2557,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2476,7 +2567,7 @@
       "released": "2026-08-30",
       "notes": "Adds optional two-factor authentication. A user can enroll an authenticator app (TOTP) with mandatory recovery codes; login becomes two-step for an enrolled or required account. An admin can require two-factor (forced enrollment at next sign-in), scope step-up per high-risk action (require the authenticator and/or a password re-authentication), and require a temporary credential for SFTP when an account's second factor is in effect. New two-factor tables are created automatically by the app on first start -- no migration step. A rollback to 0.19.3 leaves those tables and their data intact but DISABLES two-factor enforcement (accounts then sign in with their password only) until you upgrade again.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2563,6 +2654,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2570,7 +2664,7 @@
       "released": "2026-08-30",
       "notes": "Adds public links for files and folders (\"secure send\"): an admin can enable anonymous, tokenized links that let anyone with the URL download one file or one folder of a Standard vault, governed by the existing public-link tags (token-length floor, optional PIN/password, expiry, use cap) and revocable at any time. The link token is stored hashed and shown once at creation; the anonymous read path re-checks the owner's access on every request. New public_links table and a note_link_tags.allowed_targets column are created automatically at boot -- no migration step, and no existing data is changed. A rollback to 0.20.0 leaves the table and column intact but stops serving public file links until you upgrade again.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2657,6 +2751,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2664,7 +2761,7 @@
       "released": "2026-08-30",
       "notes": "Adds upload links (\"receivers\"): an admin can enable anonymous, tokenized links that let anyone with the URL upload files into a dedicated, owner-paid Standard vault, governed by receiver tags (token-length floor, optional PIN/password, expiry, per-file and total size caps, retention) and revocable or pausable at any time. The link token is stored hashed and shown once. Anonymous uploads reserve their declared size against the receiver's cap before any bytes move, are admitted on a separate transfer budget so they cannot starve signed-in transfers, and can only ever land in the receiver's own vault. New receivers, receiver_tags and receiver_upload_sessions tables plus a receivers.reserved_bytes column are created automatically at boot -- no migration step, and no existing data is changed. A rollback to 0.21.0 leaves the tables intact but stops serving upload links until you upgrade again.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2751,6 +2848,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2758,7 +2858,7 @@
       "released": "2026-08-30",
       "notes": "Adds the owner and admin UI for the public file/folder links (\"secure send\", backend added in 0.21.0) and upload links (\"receivers\", 0.22.0), which previously shipped with no interface: create, manage and revoke links, and govern them with tags and per-feature settings. Also a round of two-factor and settings usability fixes -- a full-size enrollment QR code, an MFA column in the accounts list, a single-step-up save for the whole step-up action matrix, an admin \"copy reset link\" action for accounts with no email, and a reworked rate-limit settings surface that shows each limit's read-only deployment value beside an optional, bounded custom override (now extended to the login, vault-unlock and SFTP throttles). No schema change and no existing data is altered; a rollback to 0.22.0 simply hides the new UI.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2845,6 +2945,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2852,7 +2955,7 @@
       "released": "2026-08-31",
       "notes": "Security-hardening release. Adds admin-configurable per-user resource limits (a vault-count cap, a per-account storage budget defaulting to 50 GB, and a cap on active temporary credentials; 0 means unlimited and administrators are exempt), tightens authorization on the file plane (opening an SFTP/chunked upload session now requires write permission, and a nonexistent vault answers 404 instead of 500), hardens a zero-knowledge vault-name re-seal against a future key epoch that would make the name undecryptable, sandboxes the in-browser PDF/media preview, clears the vault list and upload state on logout, keeps the account second-factor requirement from being switched off, bounds the admin login-attempt override, and removes the Server header. No schema change and no existing data is altered; a rollback to 0.23.0 simply restores the prior limits and header behaviour.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -2939,6 +3042,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -2946,7 +3052,7 @@
       "released": "2026-08-31",
       "notes": "Adds a memory-bounded streaming SFTP upload behind a default-OFF flag (SFTP_STREAMING_UPLOAD). When enabled, an SFTP upload encrypts and persists 1 MiB records as they arrive instead of buffering the whole plaintext to the .sftp_tmp staging tmpfs, so RAM/tmpfs use is bounded to one record plus a small reorder window regardless of file size, and the per-file limit is no longer tied to the tmpfs size. The at-rest format is byte-identical to the buffered/web upload path (same codec, 1 MiB records, monotonic AEAD index), so streamed and web-uploaded files are mutually decryptable. All the close-time authorization gates (membership, folder scope, vault password, vault size limit, plan ceiling, and a write-permission re-check) run before the file record commits, and any failure leaves no orphan blob and never destroys an existing same-name file. Adds SFTP_STREAMING_UPLOAD and SFTP_STREAMING_REORDER_MB settings. No schema change; ships OFF, so a rollback to 0.24.0 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3033,6 +3139,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3040,7 +3149,7 @@
       "released": "2026-08-31",
       "notes": "UI polish across the app — no schema change and no new required configuration. Vault cards show a Standard/Zero-knowledge badge; the department access list in a vault's Permissions tab is now the same table as the per-user list with inline level editing, a members modal, and member/granted columns; the audit log paginates and each row opens an 80vw event modal with a table-of-contents of the page's events; the live monitor paginates and a failed login second factor is now recorded and broadcast; the Upload Links page has Links and Drop-vaults tabs (the throwaway drop vaults are also hidden from the main Vaults page); a public file link now counts a use on the actual download rather than on the landing-page visit (a peek returns metadata without consuming a use); native confirm()/alert() dialogs are replaced by the app's themed ones; several tables and the settings tab strip are tightened; and the anonymous share pages get calmer styling. Adds no new environment settings; a rollback to 0.25.0 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3130,6 +3239,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3137,7 +3249,7 @@
       "released": "2026-09-02",
       "notes": "Adds the full SFTP host public key to the host-key endpoint (GET /sftp/host-key) so a client can pin the server's SFTP identity, alongside the existing fingerprint. No schema change, no new required configuration, and no new environment settings; a rollback to 0.26.0 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3227,6 +3339,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3234,7 +3349,7 @@
       "released": "2026-09-04",
       "notes": "Device-scoped SFTP sync credentials. Lets a registered device sync a Standard vault over SFTP without ever holding the vault password: the account proves the vault password once, at grant time, which binds the proof to that device, and the device thereafter holds only a per-device, server-scoped, revocable secret (an opaque token, stored only as its hash) from which the server mints single-use, short-lived SFTP credentials. Additive schema, applied so a fresh install and an upgrade converge: two new tables (devices, device_grants) created by create_all, plus a nullable temporary_credentials.device_id column (FK devices.id ON DELETE SET NULL, tagging a minted credential with the device that minted it) added by the boot DDL ADD COLUMN IF NOT EXISTS. All additions are unused by 0.27.0, so a rollback to 0.27.0 is clean -- it leaves the two tables and the column in place and simply stops serving device credentials until you upgrade again. Adds device-sync settings: a per-account device cap (MAX_DEVICES_PER_USER), a per-device credential cap (MAX_DEVICE_SYNC_CREDS_PER_DEVICE), a previous-secret rotation grace window (DEVICE_SECRET_ROTATION_GRACE_MINUTES), the retired-secret reuse-response posture (DEVICE_SECRET_REUSE_HARD_REVOKE), and an advertised SFTP hostname; the defaults suit a single tenant.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3333,6 +3448,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3340,7 +3458,7 @@
       "released": "2026-09-15",
       "notes": "Eleven product improvements and their fixes. Bugs: the file list is no longer empty after an idle-lock re-login; a vault's hover bar and its menu are now mutually exclusive; opening a vault from Upload links stays on that page and Back returns there. Defaults for NEW vaults and links only: a new vault defaults to 5 GiB (bounded by the account's remaining headroom, and refused below a usable floor exactly as an explicit request would be); a new upload link defaults to a 1 GiB budget. Audit Log: live updates, a compact table view, filters by user and by date-and-time (sent as explicit instants, so they mean the same thing in every time zone), and audit rows for access-control actions that previously wrote none -- group membership and group vault access now record who gained or lost what, and only when something changed. Upload links: the created-link dialog shows the link once with a Done button; the drop-vault card reports its usage and offers Copy link; replacing a link is gated exactly as creating one (step-up, the feature switch and the tag allowlist); 'drop box' is now 'drop vault'. First bootstrap only: temporary vault passcodes, public file and folder links, and upload links start switched on. Starter tags for sharing, public links and upload links are added to any deployment that has none of that kind and has not switched the feature on itself, and the public-link starter tags now say exactly what they permit (the short no-expiry tag publishes notes only; the long-token tags publish notes, files and folders). The 50 GiB account quota (now shown live in Settings), sharing, public note links and invite-by-link were already on by default for every deployment and are unchanged. An existing deployment upgraded to this version keeps every setting and every tag it had. Groups: 'Load from template' presets with an editable tree. Signing out clears every link shown during the session. No schema change: the only model edit is the Python-side default for a new vault's size, so an upgrade alters no existing row and a rollback to 0.28.0 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3439,6 +3557,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3446,7 +3567,7 @@
       "released": "2026-09-16",
       "notes": "Security fix; every deployment on 0.28.0 or 0.29.0 should upgrade. A temporary credential's web session could manage the owner's devices -- enroll a device that never expires, grant it vaults the credential itself was not scoped to, and so obtain lasting sync access that outlived the credential; the device routes now refuse temporary sessions. Signing in and minting a credential no longer fail, leave an orphaned credential counting against the caps, or spend a valid single-use credential when the session cache is unavailable. A device's sync credential is refused at the web sign-in, where it has no legitimate use. No schema change; a rollback to 0.29.0 is clean but reopens the fixed behaviour.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3539,6 +3660,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3546,7 +3670,7 @@
       "released": "2026-09-18",
       "notes": "Device sync is throttled per device in its own bucket, so a looping sync client can no longer lock the owner out of the web sign-in from the same address; a device can ask the server whether it may sync before it tries; a sync credential frees its slot when its connection closes; an in-progress SFTP upload shows in the web listing, and while it runs a second upload of its name is refused, from the web page as well as over SFTP (from 0.32.0 every upload holds its name the same way -- web page, API and SFTP alike -- in Standard vaults); note-link URL tokens are stored hashed with an in-place migration and links can be shown again only by their owner through an encrypted copy; SFTP uploads stream to storage by default within a documented memory ceiling, browser downloads stream to disk by default, and a file too large to hold in memory is refused up front instead of buffered when streaming is unavailable; the version lifecycle shown by the app and the host tool comes from the current matrix, not the release's frozen copy; database waits are bounded; the host tool's update no longer changes the deployment's image reference until the new image has actually been pulled. A rollback to 0.29.1 is not clean: note-link tokens are stored hashed and an older release cannot read them back.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3630,6 +3754,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3637,7 +3764,7 @@
       "released": "2026-09-23",
       "notes": "An SFTP upload that stops making progress is failed instead of holding its thread, its connection slot and the lock on its filename until the client chooses to leave, and an upload the client never closed is discarded rather than committed as a complete file; in the split profile, the SFTP container's healthcheck reports whether the SFTP server is still working rather than whether its port is bound (the combined profile's health check still only tests that the port accepts connections); an abandoned upload's name is freed in five minutes instead of fifteen. A web upload is aborted at sign-out, so an upload in flight cannot outlive the session that started it; a re-picked file is checked against what the server already holds before an interrupted upload continues with it, so an edited file is never spliced onto the previous attempt's chunks; and every upload is told about an earlier upload of its name that is still in progress. No database connection is held while a client sends an upload chunk, and a chunk's whole authorisation is re-established after its body rather than only before it. Every Retry-After is computed in one place -- never below a second, never above its window, and never negative. Where an upload refusal names the member holding the name, it does so only to a viewer shown to be a member. The SFTP per-address limit is split so a device fleet behind one address is not turned away by the flood guard, while the guard against unauthenticated floods is unchanged. A hung Redis breaker probe is replaced instead of a request probing in the foreground. Plain HTTP to a loopback host is treated as a secure context by the browsers' own rule, so a vault served at a .localhost name streams downloads instead of buffering them. Zero-knowledge vaults now write the version-2 key-wrap and content formats, which 0.30.0 already reads, so a rollback to 0.30.0 still opens everything written after the switch; because this is the first release to write them, the upgrade asks for a backup first. The upgrade matrix records each known vulnerability once, with its impact, what to do about it and a CVSS v4.0 rating, and `dockvault.py update` shows each release's known vulnerabilities by severity, says what a change fixes or brings back, and names a release with fewer when there is one. A rollback to 0.30.0 is clean: this release changes no database table, and the one column it writes is read by nothing.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3715,6 +3842,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3722,7 +3852,7 @@
       "released": "2026-09-23",
       "notes": "Device sync and the command shown with a temporary credential now name the SFTP port clients can reach -- the port the host publishes (2322 by default) -- instead of the port the server binds inside its container, which on any standard install sent the desktop sync client to a port nothing answered on; the command also names this server rather than localhost. SFTP_PUBLIC_PORT and SFTP_PUBLIC_HOST say where clients connect when they arrive through NAT or port forwarding, and setup asks for both when SFTP is enabled. A deployment updated by pulling the image, whose compose files stay as they were, gets the right port too. A release candidate's image is now scanned with the release gate's policy before it reaches main. No schema change; a rollback to 0.31.0 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3800,6 +3930,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3807,7 +3940,7 @@
       "released": "2026-09-24",
       "notes": "An upload now holds its file name while it runs, whichever way it arrives -- from the web page, through the API or over SFTP -- so a second upload of that name by another route or another member is refused instead of replacing the first when it lands, and another member's web upload shows in the listing as an upload in progress (Standard vaults; a zero-knowledge vault's names never reach the server). In the combined profile /health reads the SFTP server's heartbeat -- \"unresponsive\" once it stops, \"unreachable\" if it never started, both reported as degraded -- and the container's healthcheck fails when its SFTP half is down, so a hung SFTP server marks the container unhealthy five to six minutes after the stall at the defaults. The web healthcheck is now the image's own in every compose file, so it always matches the image that runs; a deployment updated by pulling the image, whose secure compose file still names the older check, keeps that check, which does not cover SFTP, until the file is updated. BRAND_ENABLE_SIGNUP=false now rules self-signup out for the whole deployment whatever the admin's switch says; the default, true, leaves the admin's switch in charge. A vault created without a size holds 10 GB instead of 5, the same as the largest single file a fresh install accepts, though the web page's Create vault dialog still filled in 5 GB, so a vault made there held 5 GB unless the number was changed (fixed in 0.32.1); existing vaults keep their size, and under the default 50 GB account budget a regular user fits five default-size vaults instead of ten. Settings accepts a session length of up to 30 days, as the server already did. `dockvault.py update` says a backup is required, and why, whenever it will ask for one. .env.example no longer sets MAX_FILE_SIZE_MB=512, which capped any install that copied it at 512 MB: if your .env still has that line, remove it to get the 10 GB default. LOG_FILE_PATH is retired; nothing wrote it, and an .env that still sets it keeps working. Help text, setting descriptions and the 0.29.0 and 0.30.0 notes now say what the code does. A release candidate's tests now include the Windows and Ubuntu fast lanes, and the setup test requires the previous release's image to turn healthy under the new compose files. No schema change; a rollback to 0.31.1 is clean, except that self-signup goes back to the admin's switch alone, and a name being uploaded from the web page at that moment stays locked for up to five minutes.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3885,6 +4018,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3892,7 +4028,7 @@
       "released": "2026-09-25",
       "notes": "The web page's Create vault dialog now fills in 10 GB, the default its hint and the server already used. In 0.32.0 it still filled in 5 GB, so a vault made there held 5 GB unless the number was changed; such a vault keeps its size, and can be made larger in the vault's policies. A vault created through the API without a size was already 10 GB. No schema change; a rollback to 0.32.0 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -3970,6 +4106,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -3977,7 +4116,7 @@
       "released": "2026-09-25",
       "notes": "Each vault card now shows how many members the vault has -- its owner and the people added to it directly -- and how many departments have access, instead of always \"1 members\". The counts show only to someone who may see the vault's member list (its owner, a manager or an admin); the vault list carries them as member_count and department_count, null for anyone else. A department counts as one: who is in it, and how many, stays visible to admins only. The note-link, file-link and upload-link forms now name a value over the link type's limit in their own words and units before sending anything, and the server's refusals read the same way, for example \"The size per file can be at most 100 MB for this link type.\" instead of the raw field name and byte count. Deleting a zero-knowledge vault with no label answers \"Vault deleted successfully\" instead of \"Vault None deleted successfully\". In the audit log only failures and refusals are red; an \"authorized\" row, which records that a download or a rendered preview was allowed, is blue, and a download's outcome is logged in a row of its own. No schema change; a rollback to 0.32.1 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -4055,6 +4194,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -4062,7 +4204,7 @@
       "released": "2026-09-26",
       "notes": "Security fix: the token in a note link, public file link or upload link address was written in full to the web access log, so anyone who could read that log (docker logs, or the web log pull when an administrator has enabled it) could open or use those links. Every such token is now masked in every log the vault writes, as is any password, passcode, secret or token in a query string, and the web log pull also masks lines written before this release. Rate-limit keys in Redis now hold a hash of the link token instead of the token. A link type that allows exactly one view or download now says \"1 view or download\" when it refuses more. No schema change; a rollback to 0.32.2 is clean, but new log lines would hold the tokens again.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -4137,6 +4279,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -4144,7 +4289,7 @@
       "released": "2026-09-26",
       "notes": "The web app fits a phone screen. The sidebar opens from a menu button in the top bar and closes when you choose a section or tap outside it; before, a phone could not reach most sections. Section headers, the file table, an opened user row, long dialogs, the notifications panel and the dashboard now fit the screen. A PDF preview in a browser with no inline PDF viewer, such as Chrome on Android, says to use Download instead of showing an empty frame. On every screen size, toasts have their spacing back, and a wrong password on a public link page says \"password\" or \"PIN\" instead of \"code\". No schema change; a rollback to 0.32.3 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -4219,6 +4364,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -4226,7 +4374,7 @@
       "released": "2026-09-26",
       "notes": "Security fixes, three advisories. Sign-in attempts typed with a client's address as the username no longer count against that address. The client address is read from the whole forwarding chain, and only proxies listed in TRUSTED_PROXIES are believed. Another account's activity reaches an administrator watching the Live Monitor without file, folder or vault names. Before upgrading behind a proxy: a proxy that connects from 127.0.0.1 must be listed (TRUSTED_PROXIES=127.0.0.1), or every client appears as 127.0.0.1 and shares one sign-in limit; with TRUST_ALL_PROXIES=true the vault takes the address the nearest proxy saw, so list each proxy of a chain in TRUSTED_PROXIES instead; uvicorn's FORWARDED_ALLOW_IPS is no longer used. No schema change; a rollback to 0.32.4 is clean.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -4292,6 +4440,9 @@
         },
         {
           "advisory": "page-kept-data-after-session-end"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections"
         }
       ]
     },
@@ -4299,7 +4450,7 @@
       "released": "2026-09-27",
       "notes": "Security fixes, five advisories. Files past their expiry are hidden at once and deleted within about a minute, with an audit record per file; turning a vault's expiry off removes its files' deadlines, and an expiry longer than 100 years is refused. Links stop while their owner is deactivated or locked by an administrator; a lock armed by wrong passwords no longer pauses them. Ending a user's sessions, changing or resetting a password, and signing out other sessions after setting up a second factor now also reach web sessions that went idle, and every way of deactivating a user now ends their sessions. Only an account that holds a zero-knowledge vault's current key can rotate it, share it or create its name-index key; a member removed by someone without the key stays removed, and the vault asks its key holders to rotate. A vault's owner can no longer be removed through the vault's permissions, which could switch off the owner's zero-knowledge keys. Administrators can no longer give themselves access to another person's vault or to a file shared with a department, cannot demote, deactivate or lock their own account, and the last active administrator cannot be removed. An SFTP sign-in is refused when its policy check fails. Automatic account locks and unlocks are audited, and finished session and sign-in rows are deleted after 30 days. Before upgrading: files already past their deadline are deleted soon after 0.32.6 first starts, so set ENFORCE_FILE_EXPIRY=false to review them first (a vault whose expiry is off keeps its files). With a single administrator, only a vault's owner can now give that administrator access to the vault. No schema change; a rollback to 0.32.5 is clean, but files deleted by expiry stay deleted.",
       "support": {
-        "eol": false,
+        "eol": true,
         "secure": false
       },
       "vulnerabilities": [
@@ -4382,12 +4533,17 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
     "0.33.0": {
       "released": "2026-09-29",
-      "notes": "Security fixes, eight advisories, and the Activity page. A change of role now resets the account's permissions to the new role's defaults, keeping those another administrator granted it, so a demoted administrator no longer keeps the permissions to view and manage users; accounts demoted before 0.33.0 keep them until reviewed (the upgrade condition review-former-administrators; python dockvault.py accounts --action user-managers lists every account that may view or manage users without being an administrator). A user given the permission to manage users can no longer make a reset link for an administrator or for anyone whose role is above theirs (403), and a second change of theirs to someone's sign-in details within 14 days is refused (409). A reset link someone else made is judged again when it is used, and refused as an unknown link once its maker could no longer make it; making an account an administrator revokes the open links a non-administrator made for it. Demoting, deactivating, locking or deleting an administrator revokes the invitations they made to be an administrator, and such an invitation is accepted only while its maker is still an active administrator. Wrong passwords lock new sign-ins only from the address they came from, with a count per account over about 24 hours from all addresses, and an automatic lock no longer signs anyone out or stops their devices, temporary credentials, SFTP connections or links. Request bodies are counted as they arrive and refused with 413 past their route's limit (64 KiB before sign-in, 1 MiB for most routes when signed in), the live socket bounds its messages and its connections per address (RATE_LIMIT_WS_CONNECT), and a 422 no longer repeats the rejected input. A failed second-factor sign-in records its method only by a known name. A temporary credential no longer hears the account's other temporary credentials sign in, and the live signal stops within seconds for an account that loses the administrator role. The Activity page replaces the Live Monitor and Settings, Audit Log: a summary band whose charts filter, a live list of every audited event with its detail beside it, numbered pages or loading as you scroll, saved searches and an export. Every change is now audited, with the way it came in, its route and its user agent. A second change to another person's sign-in details within 14 days needs the approval of another administrator independent of it, the server's operator can reset an account or approve a held change from the host with python dockvault.py accounts, users are told of every administrator's change to their account, and every other administrator is told when an account becomes an administrator. An upload link's owner can change how long it keeps uploads. A folder delete that cannot delete all its files keeps the folder; before, a file moved in during the delete could be lost with its bytes left on disk and the vault counted fuller than it was. Hide note text is kept on the account. For scripts: GET /monitor/stats and GET /audit/export are gone; export the audit log with GET /activity/export (CSV or NDJSON, up to 100,000 rows per export, each export audited), and GET /audit/log is unchanged. Files sent in one multipart request to POST /vaults/{id}/files are capped at 64 MiB (MAX_SINGLE_REQUEST_UPLOAD_MB, never more than the largest file allowed; 0 turns the cap off) and a larger request is answered 413: send large files through the resumable upload, as the web app, the desktop app and the upload-link page already do. A JSON body over 1 MiB is refused with 413 (8 MiB for a note or an email template). Personal data this release stores (docs/data-inventory.md lists every store): audit rows now also carry the browser's user agent (up to 512 characters), the HTTP method, the route and the channel, also for people with no account who open a public link or send through an upload link, and a temporary credential's name after the credential is deleted, to say who did what and how, kept as long as the audit log (for ever with the default AUDIT_LOG_RETENTION_DAYS=0). Names typed at failed sign-ins, which can be a password typed as a username, were already audited; the Activity page lists them and its export includes them. sign_in_lockouts holds failed sign-ins per account and source address and per account over about 24 hours, for the automatic locks: a count goes about a day after its last failure, a lock when it ends. credential_changes holds the requesting and deciding administrators, a summary that can hold a new email address or an SSH key's name and fingerprint, and for an email change the address before and after, for the approval rule and for the 14 days a reset the person asks for goes to the address before; while a request waits it also holds what the change would set (a password hash, an address or a key) and the ids of the administrators the approval rule weighs, cleared when the request is decided or expires (at most 7 days); each record goes 14 days after the change or decision. users.second_factor_reset_at records when an administrator reset the person's second factor, so that their next sign-in sets it up again, and is cleared once they have. admin_grants holds who made each administrator one and when, for the approval rule, while the account is an administrator; an administrator's invitation keeps the administrators its maker descends from, with the invitation. activity_saved_searches holds up to 50 saved filters per administrator, which can hold usernames and addresses, until deleted. The notices and the emails Account changed by an administrator and New administrator name the administrator and, for an email change, both addresses (the email masks the new one); a notice stays until the person deletes it. An Activity export holds usernames, addresses and user agents wherever it is saved. Hide note text and the Activity page's choices are kept on the account. The cache keys and the fallback table that count failed sign-ins by name now hold a keyed stand-in, not the name as typed. The Live Monitor's feed to every administrator's open page is gone. Schema: new tables activity_saved_searches, admin_grants, credential_changes and sign_in_lockouts, and nullable columns audit_logs.channel, audit_logs.temp_credential_name, users.second_factor_reset_at, account_invitations.inviter_lineage and password_reset_tokens.made_by_other, created at the first start. A rollback to 0.32.6 works, since it ignores all of them, but brings back 0.32.6's flaws: among them, an account made an administrator on 0.33.0 holds the administrator's permissions as stored rows, and a demotion on 0.32.6 leaves them in place, so after rolling forward again review the accounts the review-former-administrators check lists. Requests waiting for approval are not applied, automatic locks made by 0.33.0 are forgotten while an account with five or more failed sign-ins since its last successful one is locked at its next wrong password, a second-factor reset no longer asks the user to set the factor up again, and Hide note text is off until chosen again. 0.33.x receives security fixes until six months after 0.34.0 ships (.github/SECURITY.md).",
+      "notes": "Security fixes, eight advisories, and the Activity page. A change of role now resets the account's permissions to the new role's defaults; accounts demoted before 0.33.0 keep theirs until reviewed (the upgrade condition review-former-administrators; python dockvault.py accounts --action user-managers lists them). Reset links, administrator invitations and automatic locks are tightened, request bodies are limited (413), and a second change to another person's sign-in details within 14 days needs the approval of another administrator. The Activity page replaces the Live Monitor and Settings, Audit Log, and every change is audited with its channel, route and user agent. For scripts: GET /monitor/stats and GET /audit/export are gone (use GET /activity/export), files sent in one multipart request to POST /vaults/{id}/files are capped at 64 MiB (MAX_SINGLE_REQUEST_UPLOAD_MB; send large files through the resumable upload), and a JSON body over 1 MiB is refused. Personal data it stores is listed in docs/data-inventory.md. Schema: new tables and nullable columns, created at the first start. A rollback to 0.32.6 works but brings back 0.32.6's flaws; after rolling forward again, review the accounts review-former-administrators lists. The release page on GitHub has the full notes.",
       "support": {
         "eol": false,
         "secure": false
@@ -4432,12 +4588,17 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
     "0.33.1": {
       "released": "2026-10-03",
-      "notes": "Security fixes, three advisories, and the release tooling for supporting two release lines. python dockvault.py update runs the host tool already installed, and the checks and host actions named below are in the tool of 0.33.1, so update the checkout first (git pull, or git fetch --tags and git checkout v0.33.1): an older tool checks none of them and offers neither action. A range in TRUSTED_PROXIES no longer trusts the Docker network's gateway, which every connection Docker relays to a published port comes from (IPv6 clients, clients on the Docker host, on Docker Desktop every client), so those clients can no longer set their own address; only the token gateway or the gateway's exact address trusts it. A reverse proxy on the Docker host arrives from the gateway too: for one, set TRUSTED_PROXIES=gateway and publish the web port on loopback only (WEB_BIND=127.0.0.1 with the secure compose file of 0.33.1; an install that updates by pulling images keeps its compose files and edits its port mapping to 127.0.0.1:<port>:8000 by hand). Until then all of such a proxy's clients are recorded as the gateway and share one set of sign-in limits; the web process says so at start, and the update of 0.33.1's host tool says so before the upgrade (the upgrade condition gateway-no-longer-covered-by-ranges, which says how to check by hand). A permission an administrator revoked from an account now stays revoked when the vault restarts: a start gives an account only the role defaults added in a later release, once, each audited as permission_default_granted. Permissions an earlier restart gave back are still held: after the upgrade, 0.33.1's python dockvault.py accounts --action regranted-defaults lists them (the upgrade condition role-defaults-granted-once). With ACCOUNT_LOCKOUT_MINUTES=0 an administrator's automatic lock now has an end (15 minutes; a pause from every address once its count has lost a failure, 72 minutes by default), one that 0.33.0 armed and is already in place included, while other accounts' automatic locks still last until cleared, and so does a lock with no end from a release before 0.33.0, which is recorded like one an administrator set; with that setting, locking a name shows whether it is an administrator's, because its lock ends. 0.33.1's python dockvault.py accounts --action unlock clears an account's locks from the host, audited as the host operator. A right password no longer counts against the sign-in throttle, so one person signing in again and again, or many accounts behind one address, are no longer refused; wrong passwords count as before, and more right-password sign-ins at the same moment from one address than the login limit (5 by default) still have their extras refused. A password sign-in over SFTP no longer ends the account's other SFTP connections, and a web sign-in no longer ends SFTP connections, which also dropped an SSH-key upload in flight; ending an account's sessions, locking or deactivating it still ends all of them. The database session now runs in UTC whatever the database server's time zone, so times the database stamps are no longer off by that zone's offset. From this release on, the web and SFTP processes read data_requirements before they touch the database and refuse to start when a newer release has marked the data as needing a newer version, naming what changed and how to undo it with that release; ALLOW_START_ON_NEWER_DATA=true starts them anyway. No release writes such a mark yet, and 0.33.0 and earlier do not read it, so a rollback to them is not protected by it. Release lines: each release is published as :vX.Y.Z, the newest release of each line also as :vX.Y (for example :v0.33), and :latest and GitHub's latest release name only the highest version, so a patch release of an older line never moves them; a release tag must be an annotated tag. The upgrade matrix states until when each release line gets security fixes, and lists an advisory by its id alone on versions below 0.27.0. python dockvault.py update and the in-app update check show the newest release of the install's line and until when the line gets security fixes, and an install on an older line is shown a banner when a newer release of its line exists or its line's security fixes have ended; to know about older lines without telling GitHub which one the install runs, the update check, when it is on, also fetches the published matrix of the newest release of each older line the matrix lists (at most five). The image scan fails when a reviewed VEX statement names a package version the image no longer contains; the stale OpenSSL statement was removed. The image sets FORWARDED_ALLOW_IPS empty. The JWT library PyJWT is updated from 2.13.0 to 2.15.1, which fixes eleven advisories in it. One of them reached the vault: a bearer token whose header was nested deeper than the stack made a signed-in route answer 500 instead of 401 (GHSA-8wjv-2p76-3863). That exposed nothing and skipped no check, so the vault has no advisory for it; such a token is now refused with 401 like any other invalid one. A bearer token longer than 8,192 characters, far longer than any the vault signs, is now refused the same way without being decoded, so a very long token no longer costs the server time to reject. Accepted residual, published in .github/SECURITY.md: an administrator whose current password someone else set can still approve another administrator's credential change, so whoever set that password can approve through that account; 0.34.0 refuses such approvals. Personal data this release stores (docs/data-inventory.md lists every store): active_sessions.channel records whether a session was signed in over the web or SFTP, and users.permission_defaults_revision the revision of its role's defaults an account has been given; the audit log records each permission a start grants (permission_default_granted) and each unlock from the host. The host tool can list the permissions an administrator revoked that a restart before 0.33.1 granted again, with usernames, roles and times read from the audit log, on the host's terminal and not audited. data_requirements holds no personal data. Schema: new table data_requirements and nullable columns users.permission_defaults_revision and active_sessions.channel, created at the first start. A rollback to 0.33.0 works, since it ignores all of them, but brings back 0.33.0's flaws: its first start grants revoked defaults again, an administrator's lock can last for good again, a range trusts the gateway again, sign-ins end other channels' sessions again, and it does not read data_requirements. 0.33.x receives security fixes until six months after 0.34.0 ships (.github/SECURITY.md).",
+      "notes": "Security fixes, three advisories, and the release tooling for two release lines. Update the checkout first (git pull, or git fetch --tags and git checkout v0.33.1): the checks and host actions below are in 0.33.1's host tool. A range in TRUSTED_PROXIES no longer trusts the Docker network's gateway; a reverse proxy on the Docker host needs TRUSTED_PROXIES=gateway and the web port published on loopback only (WEB_BIND=127.0.0.1; the upgrade condition gateway-no-longer-covered-by-ranges). A permission an administrator revoked stays revoked when the vault restarts; python dockvault.py accounts --action regranted-defaults lists those an earlier restart gave back (the condition role-defaults-granted-once). With ACCOUNT_LOCKOUT_MINUTES=0 an administrator's automatic lock now ends, and python dockvault.py accounts --action unlock clears an account's locks from the host. The web and SFTP processes refuse to start on data a newer release marked as needing a newer version (ALLOW_START_ON_NEWER_DATA=true starts them anyway). Images: :vX.Y.Z, :vX.Y for the newest release of each line, and :latest for the highest version only. PyJWT is updated to 2.15.1. Personal data it stores is listed in docs/data-inventory.md. Schema: a new table and nullable columns, created at the first start; a rollback to 0.33.0 works but brings back 0.33.0's flaws. The release page on GitHub has the full notes.",
       "support": {
         "eol": false,
         "secure": false
@@ -4467,6 +4628,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
@@ -4492,6 +4658,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
@@ -4517,6 +4688,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
@@ -4542,6 +4718,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
@@ -4567,6 +4748,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
@@ -4587,6 +4773,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
@@ -4602,6 +4793,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.33.8"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
         }
       ]
     },
@@ -4610,8 +4806,15 @@
       "notes": "Security release for the 0.33 line: it fixes one security issue in the web app, rated low; the advisory is published with 0.34.3. When a session ends, the page now drops everything it showed and loads anew, and the sign-in screen says why the session ended. Upgrade, then reload browser tabs that were open before the upgrade. dnspython moves to 2.9.2 (CVE-2026-128089 in 2.9.1 reads DNS zone files, which the vault never does). The release attaches a VEX document for the scanners' CVE-2026-119170 in Python 3.14.10. No stored data changes, so going back to 0.33.7 needs no restore.",
       "support": {
         "eol": false,
-        "secure": true
-      }
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.33.9"
+        }
+      ]
     },
     "0.33.9": {
       "released": "2026-11-17",
@@ -4623,7 +4826,7 @@
     },
     "0.34.0": {
       "released": "2026-11-09",
-      "notes": "The first release of the 0.34 line. It publishes no advisory: 0.33.6 stays secure, and 0.33.x receives security fixes until 2027-05-09 (.github/SECURITY.md). Administrators decide what the audit log keeps and for how long, and can check that it was not changed; an auditor can open other people's vaults only in a case a second administrator approved, and their owners are told at once; and the remaining ways to obtain a zero-knowledge key through an account someone else took over are closed. Upgrade from 0.33.6 (an older release moves to 0.33.6 first), and take a backup first. Update the checkout before running python dockvault.py update (git pull, or git fetch --tags and git checkout v0.34.0): the checks it makes before the upgrade are in this release's tool, and the rotation of container output is in its compose files. Reload browser tabs opened before the upgrade, and with SFTP in its own container update it together with the web container. The upgrade conditions say what changes at the first start and what going back needs. Records: the pruner deletes on a timer, in the web container, never when a page is opened. The audit log is still kept for ever by default: a positive AUDIT_LOG_RETENTION_DAYS set before the upgrade first waits RETENTION_REDUCTION_DELAY_DAYS (7) as a change that deletes sooner, as every such change made in Settings, Activity and records does, with every administrator told and any of them able to cancel it. The audit log takes a minimum age, a maximum and a size cap; administration and security rows are kept at least AUDIT_PROTECTED_MIN_DAYS (365), and the size cap never deletes them. RETENTION_HOLD stops every deletion of logs. Each failed sign-in is kept in full in a security record for SECURITY_RECORD_DAYS (30), after which security alerts lose the name and the address that raised them. Ended invitations, and used or expired reset links and codes, are deleted 30 days after they end. Every closed hour of the audit log is sealed into a chain under a key the database never holds (AUDIT_CHAIN_KEY, else one derived from ENCRYPTION_KEY): python dockvault.py audit verify checks it and prints its head to keep elsewhere, and the Activity page and every export show the head. The chain shows a change made in the database without the server's key, not one made by the server's operator. From 14 days after the upgrade, audit days older than AUDIT_HOT_DAYS (90) are compressed into daily blocks, each checked against the chain before its rows are removed; the Activity page and its exports still read them, and python dockvault.py audit unarchive puts them back as rows. An administrator can erase a deleted account's username, or a name typed at a failed sign-in, from the audit log and the other records; the erase waits RETENTION_REDUCTION_DELAY_DAYS first. Recording levels set how much the audit log keeps of the names of vaults, files and folders, names typed at sign-in, email addresses, IP addresses and browser descriptions: in full, as a keyed fingerprint, shortened (addresses) or not at all, within the AUDIT_MAX_* limits of .env. The default records what earlier releases did, setup offers the presets full, standard and minimal, and the page /recording tells everyone what is recorded, for how long and who can see it. Compliance access: two administrators give a person the auditor right, for at most a year (COMPLIANCE_AUDITOR_GRANT_DAYS). An auditor opens other people's vaults only in a case a second, independent administrator approved, for at most COMPLIANCE_MAX_ACCESS_DAYS (30) days, extended to at most COMPLIANCE_MAX_TOTAL_DAYS (90), and every compliance step asks for the password and an authenticator or recovery code. Each owner of a vault a case covers is told when it is approved, in the app and by email when the server sends mail, and the page Access to my vaults lists every file opened. A case can export copies of files, fetched once (COMPLIANCE_EXPORT=disabled turns exports off), and place a legal hold, which a second administrator confirms within COMPLIANCE_HOLD_CONFIRM_DAYS (7) or it lapses: while it stands, the files and folders deleted from its vaults and the old names of renamed ones are kept, and they are purged COMPLIANCE_HOLD_PURGE_DELAY_DAYS (7) after its release. COMPLIANCE_ACCESS=disabled turns compliance access off; holds already placed stay. docs/guides/hardening.md says what it cannot prevent, and docs/guides/dpia-compliance-access.md is a template for the impact assessment. Accounts and keys: each account records whether its current password is its own or one someone else set; making such an account an administrator ends that password and its sessions and sends a reset link, and until it has a password of its own it cannot approve a held change to someone's sign-in details. SSH keys record who added them. For ZK_ENVELOPE_HOLD_DAYS (14) after an administrator or the server's operator changed an account's sign-in details, its zero-knowledge key is given to a browser only after a code sent by email; python dockvault.py accounts --action release-key-hold releases it. A new zero-knowledge passphrase must be at least 12 characters and not a common one. Members' browsers check the vault keys they hold, a person is told when an encryption key is set up for their account, and the share dialog shows the recipient's key fingerprint. Other changes: signing out of the web app ends the session on the server; a password reset ends the account's sessions in the transaction that writes the password; logs carry an error id where they carried an error's text, and no part of a session token. Uploads finish off the event loop, so other requests are answered meanwhile. Copies, moves to another vault and folder copies wait for a transfer slot as uploads do, one account's copies taking at most a quarter of the slots, and downloads and previews wait for theirs without holding a database connection. The storage volume keeps free space (MIN_FREE_SPACE_GB): an upload, an SFTP write or a copy that would leave less is refused with 507, and what legal holds keep counts toward the deployment's storage limit. Clients of one IPv6 /64 share one set of per-address limits, and the container's access log keeps the names of query parameters, not their values. The image no longer contains SQLite, which the vault never used. The host tool: a backup pauses the deployment for its whole run and records each archive's SHA-256, and a sealed backup an HMAC of its manifest; a restore checks every archive before it stops anything and keeps the current .env first, and a restore that stops part way keeps that set from starting; setup without a terminal writes a generated password to a mode-600 file and prints only its path, and takes the first administrator's password from a file or standard input; and the tool refuses to write a plain .env beside a sealed one. Personal data this release stores (docs/data-inventory.md lists every store): each failed sign-in with the name typed and the address (security_records, SECURITY_RECORD_DAYS); the chain's seals, and its head in a file on the keys volume; archived audit days, the same data as the rows they replace; erase requests, their name sealed; the values set in Settings, Activity and records and the changes waiting, with who set them; the compliance tables (auditor rights, cases, exports, revealed names, notices to owners, legal holds and what they keep), their free text sealed at rest; who set an account's password and who added an SSH key; and the key hold's codes and releases. Schema: new tables, nullable columns and triggers (among them those on files, folders and vaults that keep what a legal hold keeps), created at the first start; an index of audit_logs that another one duplicates is dropped in the background. Going back: 0.33.1 and later refuse to start, and python dockvault.py update refuses to go back unless --force-downgrade is given, while audit days are archived, a legal hold stands or what it kept waits for its purge, a recording level is below Full, or a compliance case is open or the records of compliance access are younger than COMPLIANCE_RECORD_MIN_DAYS (six years by default); the conditions say what to undo first. Set AUDIT_LOG_RETENTION_DAYS=0 before going back. 0.33.0 and earlier do not read these records.",
+      "notes": "The first release of the 0.34 line, with no advisory. Upgrade from 0.33.6 (an older release moves to 0.33.6 first) and take a backup first; update the checkout before running python dockvault.py update (git pull, or git fetch --tags and git checkout v0.34.0), reload browser tabs opened before the upgrade, and with SFTP in its own container update both together. Records: administrators set what the audit log keeps and for how long, and a change that deletes sooner waits RETENTION_REDUCTION_DELAY_DAYS (7) and can be cancelled; every closed hour is sealed into a chain (python dockvault.py audit verify); from 14 days after the upgrade, audit days older than AUDIT_HOT_DAYS (90) are compressed; recording levels set what the log keeps of names and addresses. Compliance access: an auditor opens other people's vaults only in a case a second administrator approved, and their owners are told. A zero-knowledge key is held back for ZK_ENVELOPE_HOLD_DAYS (14) after someone else changed the account's sign-in details. Signing out of the web app ends the session on the server. Personal data it stores is listed in docs/data-inventory.md. Schema: new tables, nullable columns and triggers, created at the first start. Going back: 0.33.1 and later refuse to start while audit days are archived, a legal hold stands, a recording level is below Full or a compliance case is open; the upgrade conditions say what to undo first. The release page on GitHub has the full notes.",
       "support": {
         "eol": false,
         "secure": false
@@ -4638,6 +4841,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.34.3"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.34.4"
         }
       ]
     },
@@ -4653,6 +4861,11 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.34.3"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.34.4"
         }
       ]
     },
@@ -4668,12 +4881,48 @@
           "advisory": "page-kept-data-after-session-end",
           "title": "The page kept a person's data after their session ended",
           "fixed_in": "0.34.3"
+        },
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.34.4"
         }
       ]
     },
     "0.34.3": {
       "released": "2026-11-16",
       "notes": "Security release, one advisory (page-kept-data-after-session-end, low); the 0.33 line has the fix in 0.33.8. When a session ends, the page now drops everything it showed and loads anew, and the sign-in screen says why the session ended. Upgrade, then reload browser tabs that were open before the upgrade. The release attaches a VEX document for the scanners' CVE-2026-119170 in Python 3.14.10. No stored data changes, so going back to 0.34.2 needs no restore. Upgrade from 0.34.2 or 0.34.0, or from 0.33.8 under the conditions of the step from 0.33.x into the 0.34 line (take a backup first).",
+      "support": {
+        "eol": false,
+        "secure": false
+      },
+      "vulnerabilities": [
+        {
+          "advisory": "live-updates-used-up-the-cache-connections",
+          "title": "Open live-update connections could use up the server's cache connections",
+          "fixed_in": "0.34.4"
+        }
+      ]
+    },
+    "0.34.4": {
+      "released": "2026-11-17",
+      "notes": "Security release, one advisory (live-updates-used-up-the-cache-connections, medium); the 0.33 line has the fix in 0.33.9. The web app's live-update connections now use a cache connection pool of their own, each used from one thread at a time. One account may keep at most 10 open, and each of its temporary credentials 10 of its own: an eleventh is refused with \"Too many live connections for this account; close another tab.\" A web process serves at most 100 live-update connections that receive updates. A live-update connection checks every 5 seconds by the clock that its session still stands, and closes when its token ends. The release attaches a VEX document for the scanners' CVE-2026-119170 in Python 3.14.10. No stored data changes, so going back to 0.34.3 needs no restore. Upgrade from 0.34.3, or from 0.33.9 under the conditions of the step from 0.33.x into the 0.34 line (take a backup first). The notes of 0.33.0, 0.33.1 and 0.34.0 in this file are shortened; their release pages on GitHub keep the full text.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
+    "0.35.0": {
+      "released": "2026-11-17",
+      "notes": "The first release of the 0.35 line: the web app made ready for everyday work in an organisation. It publishes no new advisory and carries the fix of the one published with 0.34.4. Releases before 0.33 are end-of-life from this release; 0.34.x receives security fixes until 2027-05-17 and 0.33.x until 2027-05-09 (.github/SECURITY.md). Upgrade from 0.34.4 (an older release goes through it on the way): update the checkout before python dockvault.py update, reload browser tabs opened before the upgrade, and with SFTP in its own container update both together. dockvault.py no longer names an end-of-life release as the newest of your line. New: one chip per person and sortable, searchable tables with a density switch; a More menu on each file, folder selection with Copy and Cut, and Find in this folder; a dashboard with quick actions, a Needs-attention lane and, for administrators, a Get-started list; Settings pages listed at the left; dialogs and toasts named for assistive technology, and contrast fixes. Previews are served inline under a sandboxing Content-Security-Policy, and a share recipient's previews are counted apart from downloads (recorded as share_previewed). A share tag has a new switch that lets view-only recipients view files in the browser, with no Download button (the browser receives the file, so they can keep a copy): on for tags made from this release on and for a new install's tags, off for every tag and share that existed before the upgrade, whose view-only recipients keep seeing names and sizes only. A share the dialog showed as view-only is never made downloadable when an administrator changes its tag while the dialog is open: it is made view-only, or refused with the reason if the tag no longer allows view-only (before, it could be made downloadable). Makers can extend shares and links (administrators, someone else's, through the API), and makers are reminded two days before something expires. Upload links take several files, give the uploader a receipt and tell the owner; an owner can add a message to an upload, file or note link. The two new emails are off until an administrator turns them on. Stay signed in: a minute before a session ends the web app offers to renew it, up to 24 hours after the sign-in by default (Settings, Security, Show advanced settings). Personal data it stores is listed in docs/data-inventory.md. A live-update connection refused because its account (or temporary credential) already holds ten closes with code 4429, and the tab tries again a minute later. Schema: a new table and new columns, added at the first start; going back to 0.34.4 needs no restore. The release page on GitHub has the full notes.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
+    "0.35.1": {
+      "released": "2026-11-18",
+      "notes": "A maintenance release of the 0.35 line with hardening; it publishes no advisory. Every emailed link (password reset, invitations, notices) is now built only on the server's configured public address, the first entry of ALLOWED_HOSTS, never on a request's Host header: an install without ALLOWED_HOSTS sends no reset or invitation email, and Settings says so. ALLOWED_HOSTS entries may be full addresses (https://name:port); the Host check uses their names, a wildcard is never the link base, and an entry with no readable host stops the start with its name. dockvault.py setup sets ALLOWED_HOSTS and now asks whether people reach the web UI through a reverse proxy or another port. If you installed with dockvault.py setup on a web port other than 443 and people open the vault on that port, change ALLOWED_HOSTS to the address they open (for example https://vault.example.com:8443) and restart the vault (python dockvault.py restart). File passwords have the vault password's attempt limit, and routes that answered 500 or 404 when a password was locked out answer 429. While the cache is down, sign-ins for unknown names are counted in the database (a new table, sign_in_phantoms) so they look like known ones, and the second-factor steps answer 503. A live socket whose temporary session ran out closes; an account's temporary credentials hold at most twenty live sockets together. The share dialog keeps an earlier dialog's answers out of one opened again. Going back to 0.35.0 needs no restore, but 0.35.0 reads ALLOWED_HOSTS entries as host names only: first add the bare name of each full address as another entry (https://vault.example.com:8443,vault.example.com), or 0.35.0 refuses every request made by that name.",
       "support": {
         "eol": false,
         "secure": true
@@ -5226,7 +5475,7 @@
     },
     {
       "from": "0.33.9",
-      "to": "0.34.3",
+      "to": "0.34.4",
       "kind": "direct",
       "reversible": true,
       "requires_backup": true,
@@ -5336,12 +5585,47 @@
       "kind": "direct",
       "reversible": true,
       "requires_backup": false
+    },
+    {
+      "from": "0.34.3",
+      "to": "0.34.4",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.4",
+      "to": "0.35.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "stay-signed-in",
+          "summary": "From 0.35.0 the web app offers, a minute before a session ends, to keep it going. Each renewal lasts the session timeout, up to 24 hours after the sign-in by default (Settings, Security, under Show advanced settings: Stay signed in for at most, from the session timeout up to 720 hours). In 0.34 a sign-in ended at the session timeout. To keep sign-ins about as short as before, set that limit to the session timeout rounded up to whole hours.",
+          "detect": "SELECT (SELECT value->>'session_timeout' FROM system_settings WHERE key = 'global') AS session_timeout_minutes, (SELECT value->>'session_renewal_max_hours' FROM system_settings WHERE key = 'global') AS stay_signed_in_hours"
+        }
+      ]
+    },
+    {
+      "from": "0.35.0",
+      "to": "0.35.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "emailed-links-need-allowed-hosts",
+          "summary": "From 0.35.1 every emailed link (password reset, invitations, notices) is built on the first entry of ALLOWED_HOSTS in .env, never on a request's Host header. With ALLOWED_HOSTS empty, no reset or invitation email is sent until it is set. Set it to the address people open the vault by: a bare name means https://name; write another port or plain http as the full address (https://vault.example.com:8443). An entry with no readable host now stops the start and names the entry. dockvault.py setup writes it; an install made by setup on a web port other than 443 should check it. 0.35.0 reads entries as host names only: before going back to it, add the bare name of each full address as another entry.",
+          "detect": "SELECT value->>'password_reset_enabled' AS self_service_reset_enabled FROM system_settings WHERE key = 'global'"
+        }
+      ]
     }
   ],
   "waivers": [
     {
       "version": "0.17.0",
-      "reason": "Floor release. Reachable only by a fresh deploy and restore-from-backup, not by an in-place upgrade from 0.16.1 (see the blocked 0.16.1 -> 0.17.0 edge). This is the minimum supported version; every release below it is end-of-life and insecure."
+      "reason": "Floor release. Reachable only by a fresh deploy and restore-from-backup, not by an in-place upgrade from 0.16.1 (see the blocked 0.16.1 -> 0.17.0 edge). It is end-of-life from 0.35.0, like every release before 0.33.0."
     }
   ]
 }
