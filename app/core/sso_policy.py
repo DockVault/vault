@@ -99,7 +99,8 @@ def mfa_trusted(policy: dict, amr, acr) -> bool:
     if not policy["sso_trust_idp_mfa"]:
         return False
     values = {str(v) for v in amr} if isinstance(amr, (list, tuple, set)) else set()
-    if values & (set(policy["sso_accepted_amr"]) - SINGLE_FACTOR_AMR):
+    accepted = {a for a in policy["sso_accepted_amr"] if str(a).strip().lower() not in SINGLE_FACTOR_AMR}
+    if values & accepted:
         return True
     return isinstance(acr, str) and acr in set(policy["sso_accepted_acr"])
 
@@ -156,7 +157,16 @@ def restriction(policy: dict, *, tenant_id, email, email_verified: bool, hosted_
         mode, listed = signup_domain_gate(account_policy)
         if mode != "off":
             from app.core.account_policy import email_allowed_by_domain_gate
-            if not (email_verified and isinstance(email, str) and email.count("@") == 1):
+            if hosted_domain_only:
+                # Where the provider has a hosted-domain claim, the list is asked about that claim, as the
+                # provider's own list is: a consumer account's verified address proves nothing, whichever list
+                # the address is on.
+                domain = _domain_of(hosted_domain, email, email_verified, claim_only=True)
+                if domain is None:
+                    missing = True
+                elif not email_allowed_by_domain_gate("someone@" + domain, mode, listed):
+                    return RESTRICTED
+            elif not (email_verified and isinstance(email, str) and email.count("@") == 1):
                 missing = True
             elif not email_allowed_by_domain_gate(email, mode, listed):
                 return RESTRICTED

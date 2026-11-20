@@ -107,6 +107,24 @@ def test_where_the_provider_has_a_hosted_domain_claim_the_address_proves_nothing
     assert _judge({"sso_allowed_domains": ["example.test"]}, hosted_domain_only=True, **answer) == verdict
 
 
+@pytest.mark.parametrize("answer, verdict", [
+    ({"hosted_domain": "example.test", "email": "a@gmail.com", "email_verified": True}, None),
+    ({"hosted_domain": "other.test", "email": "a@example.test", "email_verified": True}, P.RESTRICTED),
+    # The consumer account with the work address again: the sign-up list is asked about the claim, not the address.
+    ({"email": "a@example.test", "email_verified": True}, P.RESTRICTION_CLAIM_MISSING),
+    ({}, P.RESTRICTION_CLAIM_MISSING),
+])
+def test_the_sign_up_domain_list_is_asked_about_the_hosted_domain_claim_too(answer, verdict):
+    """A provider with a hosted-domain claim, restricted only by the vault's sign-up domain list (no list of its
+    own): the same rule as for its own list. Without it the tick box alone let any consumer account in that
+    carried an address of the organisation's domain."""
+    account_policy = {"signup_email_domain_mode": "allowlist", "signup_email_domains": ["example.test"]}
+    assert _judge({"sso_use_signup_domains": True}, hosted_domain_only=True, account_policy=account_policy, **answer) == verdict
+    # The control: a provider without such a claim is judged on the verified address, as before.
+    plain = _judge({"sso_use_signup_domains": True}, account_policy=account_policy, **answer)
+    assert plain == (None if answer.get("email") == "a@example.test" else P.RESTRICTED if answer.get("email") else P.RESTRICTION_CLAIM_MISSING)
+
+
 def test_a_single_knowledge_factor_is_never_a_second_factor():
     """A password, a PIN or a question is one factor. Such a value is refused at save, with the reason, and counts
     for nothing when a stored list holds it all the same: a sign-in with a password alone is not two factors."""
@@ -121,6 +139,10 @@ def test_a_single_knowledge_factor_is_never_a_second_factor():
     assert P.mfa_trusted(stored, ["pwd"], None) is False
     assert P.mfa_trusted(stored, ["pwd", "pin", "kba"], None) is False
     assert P.mfa_trusted(stored, ["pwd", "mfa"], None) is True
+    # In whatever letters a stored list holds it (a list written by hand, past the save's check).
+    shouted = dict(stored, sso_accepted_amr=["PWD", "Pin", " kba ", "mfa"])
+    assert P.mfa_trusted(shouted, ["PWD"], None) is False and P.mfa_trusted(shouted, ["Pin", " kba "], None) is False
+    assert P.mfa_trusted(shouted, ["PWD", "mfa"], None) is True
 
 
 @pytest.mark.parametrize("answer, verdict", [
