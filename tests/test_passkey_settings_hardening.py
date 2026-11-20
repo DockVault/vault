@@ -156,10 +156,12 @@ def test_a_requirement_waits_while_no_passkey_can_be_made_at_the_address(monkeyp
     assert alice.passkey_required_since is not None and datetime.utcnow() - alice.passkey_required_since < timedelta(minutes=1)
 
 
-def test_the_grace_starts_over_when_the_last_passkey_leaves_the_account(monkeypatch):
-    """A role must hold a passkey, and the account set one up long ago. Removing it (a lost device) is not refused,
-    and the next sign-in is not stopped at once on a grace that ran out before the key existed: registering a
-    passkey ends the grace, so the time to set one up starts again at the sign-in after the last one left."""
+def test_a_roles_last_passkey_is_not_removed_by_its_holder_and_the_grace_starts_over_when_it_leaves(monkeypatch):
+    """A role must hold a passkey, and the account set one up long ago. Its holder does not remove the last one:
+    adding a passkey at the deadline and removing it at once would otherwise put the requirement off for ever. With
+    another passkey added, the first goes. When the last one does leave (an administrator removed it: a lost
+    device), the next sign-in is not stopped at once on a grace that ran out before the key existed: registering a
+    passkey ended the grace, so the time to set one up starts again at the sign-in after the last one left."""
     registry, wss = _mod()
     long_ago = datetime.utcnow() - timedelta(days=200)
     alice = _user(passkey_required_since=long_ago, passkey_requirement_cleared_at=None)
@@ -170,7 +172,26 @@ def test_the_grace_starts_over_when_the_last_passkey_leaves_the_account(monkeypa
     assert status == 201, shown
     assert alice.passkey_required_since is None and wss.requirement(h.db, alice) == wss.Requirement(False)
     status, body = _rcall(h.S, "DELETE", f"/users/me/passkeys/{shown['id']}", None, {"X-Second-Factor": "ok"})
+    assert status == 409 and "Your role must hold a passkey, and this is your last one" in body["detail"], body
+    assert len(h.rows()) == 1 and alice.passkey_required_since is None
+    # The rule waits with the requirement: where no passkey can be made at the address, or the operator cleared
+    # the requirement for this account, or the role is not named, the last one may go.
+    assert wss.must_hold(alice) is True
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: False)
+    assert wss.must_hold(alice) is False
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: True)
+    alice.passkey_requirement_cleared_at = datetime.utcnow()
+    assert wss.must_hold(alice) is False
+    alice.passkey_requirement_cleared_at = None
+    assert wss.must_hold(_user("eve", role="external")) is False
+    # With another passkey on the account, the first one is the holder's to remove.
+    status, second, _auth = h.register(label="phone", receipt="ok")
+    assert status == 201, second
+    status, body = _rcall(h.S, "DELETE", f"/users/me/passkeys/{shown['id']}", None, {"X-Second-Factor": "ok"})
     assert status == 200 and body == {"removed": True}, body
+    status, body = _rcall(h.S, "DELETE", f"/users/me/passkeys/{second['id']}", None, {"X-Second-Factor": "ok"})
+    assert status == 409, body
+    h.rows().clear()                                    # an administrator removed it (a lost device)
     after = wss.requirement(h.db, alice)
     assert after.required is True and after.overdue is False and after.since is None
     assert wss.mark_required(alice) is True and wss.requirement(h.db, alice).overdue is False

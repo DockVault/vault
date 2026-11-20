@@ -258,6 +258,16 @@ def requirement(db, user, *, now: Optional[datetime] = None) -> Requirement:
     return Requirement(True, since=since, due=due, overdue=bool(due is not None and now > due))
 
 
+def must_hold(user) -> bool:
+    """Whether ``user``'s role must hold a passkey now, whatever the account holds: the requirement names its role,
+    was not cleared for this account, and does not wait (a passkey can be made at the vault's address)."""
+    if getattr(user, "passkey_requirement_cleared_at", None) is not None:
+        return False
+    if mode() != REQUIRED_FOR_ROLES or role_name(user) not in required_roles():
+        return False
+    return passkeys_can_be_made()
+
+
 def passkeys_can_be_made() -> bool:
     """Whether a browser can make a passkey at the vault's address as it is configured now."""
     from app.core.public_url import readiness

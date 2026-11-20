@@ -11610,11 +11610,20 @@ def _passkey_notice(db, user, title: str, change: str) -> None:
 
 
 def _passkey_last_factor_refusal(db, user, row) -> Optional[str]:
-    """Why ``row`` may not be removed now, or None: it would leave an account whose policy requires a second
-    factor with none, or the last factor of an account that signs in only through a provider."""
+    """Why the account's owner may not remove ``row`` now, or None: it is the last passkey of an account whose
+    role must hold one; or it would leave an account whose policy requires a second factor with none, or the last
+    factor of an account that signs in only through a provider."""
+    from app.core import webauthn_settings
     from app.core.active_factors import active_factors
     factors = active_factors(db, user.id)
     others = factors.passkeys - 1 if row.retired_at is None else factors.passkeys
+    if others <= 0 and webauthn_settings.must_hold(user):
+        # A role's passkey is not dropped by its holder: registering one ends the time given to set it up, and
+        # that time starts again when the account has none, so adding one at the deadline and removing it at
+        # once would put the requirement off for ever. A lost device is an administrator's to remove (the
+        # time to set a new one up starts then), or is removed after another passkey was added.
+        return ("Your role must hold a passkey, and this is your last one. Add another passkey first, or ask an "
+                "administrator to remove this one.")
     if factors.code or others > 0:
         return None
     if _second_factor_effective(db, user)["required"]:
@@ -11771,7 +11780,8 @@ async def passkey_register_verify(
         user.second_factor_reset_at = None
         db.commit()
     # The passkey a role must hold is held now: its grace is over. Should the account's last passkey leave it
-    # later (removed, or retired by a reset), the time to set one up starts again, as for a new requirement.
+    # later (an administrator removed it, or a reset retired it; its holder cannot remove it), the time to set
+    # one up starts again, as for a new requirement.
     if getattr(user, "passkey_required_since", None) is not None:
         user.passkey_required_since = None
         db.commit()
@@ -11836,8 +11846,8 @@ async def remove_my_passkey(
     db: Session = Depends(get_db),
 ):
     """Remove one of the caller's passkeys, under the account.second_factor step-up. Refused (409) when it is the
-    last factor of an account whose policy requires one, or of an account that signs in only through a provider.
-    Sessions stay: a passkey is a way in, not a session."""
+    last passkey of an account whose role must hold one, or the last factor of an account whose policy requires
+    one or that signs in only through a provider. Sessions stay: a passkey is a way in, not a session."""
     _passkey_refuse_temp(current_user)
     row = _passkey_of(db, current_user.id, passkey_id)
     refusal = _passkey_last_factor_refusal(db, current_user, row)
