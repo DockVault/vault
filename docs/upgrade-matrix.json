@@ -4149,124 +4149,76 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "sign-in-throttle-address-and-name-share-buckets",
-          "title": "A username could use up an address's sign-in attempts",
-          "fixed_in": "0.32.5"
+          "advisory": "sign-in-throttle-address-and-name-share-buckets"
         },
         {
-          "advisory": "client-address-forgeable-behind-proxy",
-          "title": "The client address could be forged behind some proxies",
-          "fixed_in": "0.32.5"
+          "advisory": "client-address-forgeable-behind-proxy"
         },
         {
-          "advisory": "live-monitor-sent-names-to-every-admin",
-          "title": "The live activity feed sent file and vault names to every administrator",
-          "fixed_in": "0.32.5"
+          "advisory": "live-monitor-sent-names-to-every-admin"
         },
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         },
         {
-          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
-          "title": "A file opened from its preview could run as a page with the vault's origin",
-          "fixed_in": "0.33.7"
+          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
         },
         {
-          "advisory": "page-kept-data-after-session-end",
-          "title": "The page kept a person's data after their session ended",
-          "fixed_in": "0.33.8"
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
@@ -4279,109 +4231,67 @@
       },
       "vulnerabilities": [
         {
-          "advisory": "file-expiry-not-enforced",
-          "title": "Files past their expiry were not deleted",
-          "fixed_in": "0.32.6"
+          "advisory": "file-expiry-not-enforced"
         },
         {
-          "advisory": "links-kept-working-after-owner-locked",
-          "title": "Links kept working after their owner was locked or deactivated",
-          "fixed_in": "0.32.6"
+          "advisory": "links-kept-working-after-owner-locked"
         },
         {
-          "advisory": "ending-sessions-missed-older-web-sessions",
-          "title": "Ending a user's sessions missed some of them",
-          "fixed_in": "0.32.6"
+          "advisory": "ending-sessions-missed-older-web-sessions"
         },
         {
-          "advisory": "zero-knowledge-key-rotated-by-non-holder",
-          "title": "An administrator without a zero-knowledge vault's key could rotate it and learn the new key",
-          "fixed_in": "0.32.6"
+          "advisory": "zero-knowledge-key-rotated-by-non-holder"
         },
         {
-          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault",
-          "title": "A vault manager could lock the owner out of their own zero-knowledge vault",
-          "fixed_in": "0.32.6"
+          "advisory": "manager-could-lock-owner-out-of-zero-knowledge-vault"
         },
         {
-          "advisory": "delegated-user-manager-could-take-an-administrator-account",
-          "title": "A user given the permission to manage users could take an administrator's account",
-          "fixed_in": "0.33.0"
+          "advisory": "delegated-user-manager-could-take-an-administrator-account"
         },
         {
-          "advisory": "demoted-administrator-kept-the-permission-to-manage-users",
-          "title": "A demoted administrator kept the permission to manage users",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-permission-to-manage-users"
         },
         {
-          "advisory": "administrator-invitation-outlived-its-maker",
-          "title": "A removed administrator could become an administrator again through an invitation they had made",
-          "fixed_in": "0.33.0"
+          "advisory": "administrator-invitation-outlived-its-maker"
         },
         {
-          "advisory": "unbounded-request-bodies-before-sign-in",
-          "title": "Anyone could stall or crash the web app with large request bodies",
-          "fixed_in": "0.33.0"
+          "advisory": "unbounded-request-bodies-before-sign-in"
         },
         {
-          "advisory": "second-factor-failure-wrote-unbounded-audit-rows",
-          "title": "A failed second-factor sign-in could write audit rows of any size",
-          "fixed_in": "0.33.0"
+          "advisory": "second-factor-failure-wrote-unbounded-audit-rows"
         },
         {
-          "advisory": "failed-sign-ins-locked-out-the-account-owner",
-          "title": "Wrong passwords from anyone signed a user out and kept them out",
-          "fixed_in": "0.33.0"
+          "advisory": "failed-sign-ins-locked-out-the-account-owner"
         },
         {
-          "advisory": "temp-credential-heard-other-credentials-sign-in",
-          "title": "A temporary credential learned when the account's other temporary credentials signed in",
-          "fixed_in": "0.33.0"
+          "advisory": "temp-credential-heard-other-credentials-sign-in"
         },
         {
-          "advisory": "demoted-administrator-kept-the-live-feed",
-          "title": "An administrator whose role was taken away kept receiving the live activity feed",
-          "fixed_in": "0.33.0"
+          "advisory": "demoted-administrator-kept-the-live-feed"
         },
         {
-          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0",
-          "title": "With a lockout duration of 0, failed sign-ins could lock every administrator out for good",
-          "fixed_in": "0.33.1"
+          "advisory": "administrators-locked-out-for-good-with-lockout-duration-0"
         },
         {
-          "advisory": "client-address-forgeable-through-docker-gateway",
-          "title": "The client address could be forged through the Docker gateway when TRUSTED_PROXIES was a range",
-          "fixed_in": "0.33.1"
+          "advisory": "client-address-forgeable-through-docker-gateway"
         },
         {
-          "advisory": "revoked-permission-came-back-after-a-restart",
-          "title": "A permission an administrator revoked came back when the vault restarted",
-          "fixed_in": "0.33.1"
+          "advisory": "revoked-permission-came-back-after-a-restart"
         },
         {
-          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account",
-          "title": "Someone signed in as a zero-knowledge key holder could replace the vault's key",
-          "fixed_in": "0.33.2"
+          "advisory": "zero-knowledge-key-changed-through-a-taken-over-account"
         },
         {
-          "advisory": "sign-in-form-sent-credentials-in-the-url",
-          "title": "A sign-in sent before the page had loaded put the password in the address",
-          "fixed_in": "0.33.2"
+          "advisory": "sign-in-form-sent-credentials-in-the-url"
         },
         {
-          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted",
-          "title": "A certificate authority the image trusted let anyone pose as the vault's mail server",
-          "fixed_in": "0.33.6"
+          "advisory": "mail-server-certificate-from-a-compromised-authority-accepted"
         },
         {
-          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page",
-          "title": "A file opened from its preview could run as a page with the vault's origin",
-          "fixed_in": "0.33.7"
+          "advisory": "stored-file-opened-from-a-preview-runs-as-a-page"
         },
         {
-          "advisory": "page-kept-data-after-session-end",
-          "title": "The page kept a person's data after their session ended",
-          "fixed_in": "0.33.8"
+          "advisory": "page-kept-data-after-session-end"
         }
       ]
     },
