@@ -22,7 +22,7 @@ pytestmark = pytest.mark.integration
 
 LEVELS = {"essential", "advanced"}
 PAGES = {"general", "branding", "security", "storage", "email", "sftp", "sharing", "notelinks", "uploadlinks",
-         "accounts", "logs", "records"}
+         "accounts", "logs", "records", "signin"}
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 
 
