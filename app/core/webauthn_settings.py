@@ -247,7 +247,7 @@ def requirement(db, user, *, now: Optional[datetime] = None) -> Requirement:
         return Requirement(False, cleared=True)
     if mode() != REQUIRED_FOR_ROLES or role_name(user) not in required_roles():
         return Requirement(False)
-    if active_factors(db, user.id).passkeys > 0:
+    if usable_passkeys(db, user.id, now=now) > 0:
         return Requirement(False)
     if not passkeys_can_be_made():
         # The address changed under the requirement (emptied, plain http, an IP put first): it waits. An account is
@@ -256,6 +256,34 @@ def requirement(db, user, *, now: Optional[datetime] = None) -> Requirement:
     since = getattr(user, "passkey_required_since", None)
     due = since + timedelta(days=grace_days()) if since is not None else None
     return Requirement(True, since=since, due=due, overdue=bool(due is not None and now > due))
+
+
+def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None) -> int:
+    """How many passkeys of the account can still be used: not retired, and of an algorithm that is allowed now or
+    was removed less than 30 days ago (:func:`algorithm_usable`). A key of an algorithm an administrator removed
+    is refused at every use once its 30 days are over; it is on the account in name only, and a role's requirement
+    is not met by it. ``without`` leaves one key out (the one about to be removed)."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
+        return 0
+    now = now or datetime.utcnow()
+    keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == user_id,
+                                               WebAuthnCredential.retired_at.is_(None)).all()
+    return sum(1 for key in keys
+               if getattr(key, "id", None) != without and algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0])
+
+
+# Run at every start. A reset of an account's second factor retires its passkeys; one made by a release that knew
+# no passkeys (run for a while after going back to it) left them as they were, though the account's second factor
+# was taken from it for a reason (a lost device, an account taken over). A passkey made before the reset the
+# account has not answered yet is retired as of that reset; one made after it (its answer) is left.
+RETIRE_PASSKEYS_FROM_BEFORE_A_RESET = (
+    "UPDATE webauthn_credentials SET retired_at = "
+    "(SELECT u.second_factor_reset_at FROM users u WHERE u.id = webauthn_credentials.user_id) "
+    "WHERE retired_at IS NULL AND EXISTS (SELECT 1 FROM users u WHERE u.id = webauthn_credentials.user_id "
+    "AND u.second_factor_reset_at IS NOT NULL AND webauthn_credentials.created_at < u.second_factor_reset_at)"
+)
 
 
 def must_hold(user) -> bool:

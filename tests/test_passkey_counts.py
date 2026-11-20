@@ -64,6 +64,34 @@ def test_each_account_is_counted_on_its_own_and_a_retired_passkey_is_not_counted
     assert all(type(n) is int for n in counts.values())
 
 
+def test_passkeys_from_before_a_reset_the_account_has_not_answered_are_retired_at_start(S, db):
+    """A reset of an account's second factor retires its passkeys. A release that knew no passkeys, run for a while
+    after going back to it, resets the factor and leaves them. At every start the passkeys made before a reset the
+    account has not answered yet are retired, as of that reset; one made after it (the account's answer, or a key
+    made while the reset is still open), the keys of an account with no reset, and a key already retired are left."""
+    import inspect
+    from app.core import webauthn_settings as wss
+    reset_at, earlier, later = datetime(2026, 11, 10), datetime(2026, 11, 1), datetime(2026, 11, 12)
+    lost, fine = _user(db, "lost-device"), _user(db, "fine")
+    lost.second_factor_reset_at = reset_at
+    before, after, others = _passkey(db, lost), _passkey(db, lost), _passkey(db, fine)
+    already = _passkey(db, lost, retired=True)
+    before.created_at, after.created_at, others.created_at, already.created_at = earlier, later, earlier, earlier
+    db.commit()
+    for _ in range(2):                                   # run at every start: a second run changes nothing
+        db.execute(sa.text(wss.RETIRE_PASSKEYS_FROM_BEFORE_A_RESET))
+        db.commit()
+        for row in (before, after, others, already):
+            db.refresh(row)
+        assert before.retired_at == reset_at
+        assert after.retired_at is None and others.retired_at is None and already.retired_at == datetime(2026, 11, 1)
+    assert S._passkey_counts(db, [lost.id, fine.id]) == {lost.id: 1, fine.id: 1}
+    # It is among the statements the server runs at start, after the table has its columns.
+    source = inspect.getsource(S)
+    assert source.count("_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,") == 1
+    assert source.index("ADD COLUMN IF NOT EXISTS attested") < source.index("_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,")
+
+
 def test_only_the_accounts_asked_about_are_counted(S, db):
     asked, other = _user(db, "asked"), _user(db, "other")
     _passkey(db, asked)

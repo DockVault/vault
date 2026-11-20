@@ -390,6 +390,7 @@ def _passkey_rule(monkeypatch, *, roles=("user",), grace=7, held=0):
     monkeypatch.setattr(webauthn_settings, "grace_days", lambda: grace)
     monkeypatch.setattr(webauthn_settings, "passkeys_can_be_made", lambda: True)    # the vault has an address for them
     monkeypatch.setattr(active_factors, "_passkey_count", lambda db, user_id: held)
+    monkeypatch.setattr(webauthn_settings, "usable_passkeys", lambda db, user_id, **kw: held)
 
 
 def test_a_role_past_its_passkey_grace_is_not_renewed_and_is_told_how_to_sign_in_again(db, monkeypatch):

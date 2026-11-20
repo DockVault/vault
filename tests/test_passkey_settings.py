@@ -115,8 +115,21 @@ def test_the_requirement_follows_the_role_the_keys_and_the_clearance(monkeypatch
     assert wss.requirement(db, alice, now=now + timedelta(days=14, seconds=1)).overdue is True
     assert wss.requirement_public(req)["due"].startswith("2026-11-23")
     # A passkey ends it; a retired one does not count; another role is not asked; the clearance ends it.
-    db.rows_of(WebAuthnCredential).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None))
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, cose_alg=-7)
+    db.rows_of(WebAuthnCredential).append(key)
     assert wss.requirement(db, alice, now=now).required is False
+    assert wss.usable_passkeys(db, alice.id) == 1 and wss.usable_passkeys(db, alice.id, without=key.id) == 0
+    # A key of an algorithm an administrator removed (its 30 days over) is refused at every use: the account
+    # holds it in name only, and the requirement is not met by it.
+    usable = wss.algorithm_usable
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db_, alg, now=None: (alg != -7, False))
+    assert wss.usable_passkeys(db, alice.id) == 0 and wss.requirement(db, alice, now=now).required is True
+    monkeypatch.setattr(wss, "algorithm_usable", usable)
+    assert wss.requirement(db, alice, now=now).required is False
+    monkeypatch.setattr(wss, "enabled", lambda: False)             # passkeys switched off: none is usable
+    assert wss.usable_passkeys(db, alice.id) == 0
+    monkeypatch.undo()
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["user"], wss.GRACE_DAYS: 14})
     db.rows_of(WebAuthnCredential)[0].retired_at = now
     assert wss.requirement(db, alice, now=now + timedelta(days=30)).overdue is True
     bob = _user("bob", role="external", passkey_required_since=None, passkey_requirement_cleared_at=None)

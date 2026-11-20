@@ -11617,7 +11617,8 @@ def _passkey_last_factor_refusal(db, user, row) -> Optional[str]:
     from app.core.active_factors import active_factors
     factors = active_factors(db, user.id)
     others = factors.passkeys - 1 if row.retired_at is None else factors.passkeys
-    if others <= 0 and webauthn_settings.must_hold(user):
+    usable = webauthn_settings.usable_passkeys
+    if webauthn_settings.must_hold(user) and usable(db, user.id) > 0 and usable(db, user.id, without=row.id) <= 0:
         # A role's passkey is not dropped by its holder: registering one ends the time given to set it up, and
         # that time starts again when the account has none, so adding one at the deadline and removing it at
         # once would put the requirement off for ever. A lost device is an administrator's to remove (the
@@ -13248,8 +13249,7 @@ async def admin_reset_second_factor(
                     "You can't reset your own second factor while MFA is required and you are the only "
                     "enrolled administrator. Have another admin enroll first, or reset it from the host."))
         from app.core import webauthn_settings
-        from app.core.active_factors import active_factors
-        if webauthn_settings.must_hold(target) and active_factors(db, target.id).passkeys > 0:
+        if webauthn_settings.must_hold(target) and webauthn_settings.usable_passkeys(db, target.id) > 0:
             # A reset retires every passkey, and the time to set one up starts again when the account has none:
             # by resetting their own factor at each deadline an administrator would put the requirement off for
             # ever. Their own last passkey is not theirs to drop here either, as it is not in Your account.
@@ -28283,6 +28283,8 @@ def _run_lightweight_migrations():
             _retire_ddl.append(
                 f"ALTER TABLE {_tbl} ENABLE ALWAYS TRIGGER trg_{_tbl}_retire")
 
+        from app.core.webauthn_settings import (
+            RETIRE_PASSKEYS_FROM_BEFORE_A_RESET as _RETIRE_PASSKEYS_FROM_BEFORE_A_RESET)
         statements = _retire_ddl + [
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS unlock_remember_minutes INTEGER",
             # Per-vault confidentiality tier; 'standard' = today's server-encrypted,
@@ -28311,6 +28313,8 @@ def _run_lightweight_migrations():
             "ALTER TABLE auditor_grants ADD COLUMN IF NOT EXISTS approved_credential_ids JSON",
             # Whether a passkey was registered under direct attestation (see WebAuthnCredential in models.py).
             "ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS attested BOOLEAN NOT NULL DEFAULT FALSE",
+            # Passkeys from before a second-factor reset the account has not answered (app/core/webauthn_settings.py).
+            _RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,
             # When a role's passkey requirement first applied to the account, and the host operator's clearance.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_required_since TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_requirement_cleared_at TIMESTAMP",
