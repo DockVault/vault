@@ -213,6 +213,11 @@ class User(Base):
     # Nullable and added by the boot DDL, so an earlier release reads the table without them.
     passkey_required_since = Column(DateTime, nullable=True)
     passkey_requirement_cleared_at = Column(DateTime, nullable=True)
+    # When the vault itself confirmed that the address in ``email`` belongs to this account: an administrator or an
+    # invitation set it, or the person typed the code sent there (app/core/email_confirmation.py). Cleared by every
+    # change of the address (the listener below the models). NULL = never confirmed. Nullable and added by the
+    # boot DDL, so an earlier release reads the table without it.
+    email_confirmed_at = Column(DateTime, nullable=True)
     # The account signs in only through its linked identity provider: it has no usable password (the
     # stored hash is of random bytes, never given out) and the password form, SFTP password sign-in and
     # self-service reset refuse it. Set for an account created at its first provider sign-in, or when
@@ -2234,6 +2239,9 @@ def _seal_note_content_before_flush(session, _flush_context, _instances):
 from sqlalchemy.orm import Session as _SaSessionForNoteSeal
 _sa_event.listen(Note, 'load', _decrypt_note_fields)
 _sa_event.listen(Note, 'refresh', _decrypt_note_fields)
+# An account's address that changes is no longer confirmed, whatever path changed it (app/core/email_confirmation.py).
+from app.core.email_confirmation import address_changed as _address_changed  # noqa: E402
+_sa_event.listen(User.email, 'set', _address_changed, active_history=True)
 _sa_event.listen(NoteLink, 'load', _decrypt_notelink_snapshot)
 _sa_event.listen(NoteLink, 'refresh', _decrypt_notelink_snapshot)
 _sa_event.listen(_SaSessionForNoteSeal, 'before_flush', _seal_note_content_before_flush)

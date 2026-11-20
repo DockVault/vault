@@ -130,7 +130,8 @@ def _user(username="alice", role="user", **extra):
     fields = dict(id=uuid.uuid4(), username=username, email=f"{username}@example.test", role=RoleEnum(role), is_active=True,
                   is_locked=False, locked_until=None, password_hash="x", second_factor_reset_at=None, created_at=now,
                   last_login=None, sftp_enabled=True, sftp_password_auth=True, storage_quota_bytes=None, groups=[],
-                  failed_login_attempts=0, sso_only=False, _is_temp_session=False)
+                  failed_login_attempts=0, sso_only=False, _is_temp_session=False,
+                  email_confirmed_at=now)          # an address an administrator set, unless the test says otherwise
     fields.update(extra)
     return types.SimpleNamespace(**fields)
 

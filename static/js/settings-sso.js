@@ -336,8 +336,11 @@
         const creation = choice('sso-creation', [['invite_only', 'Only invited or linked people sign in'],
             ['jit', 'Make an account at a person\'s first sign-in']], policy.sso_account_creation);
         const role = choice('sso-role', [['user', 'User'], ['external', 'External']], policy.sso_default_role);
-        const byEmail = tick('sso-link-email', 'Link an existing account by its verified email address', policy.sso_link_by_email,
-            'Only for a provider that says who may sign in, and never for an administrator or an auditor.');
+        const byEmail = tick('sso-link-email', 'Link an existing account by its email address', policy.sso_link_by_email,
+            'The provider must have verified the address, and the vault must have confirmed it for the account: an '
+            + 'administrator or an invitation set it, or its owner confirmed it with an emailed code. An address a person '
+            + 'wrote on their own account links nothing; a test sign-in says what would happen. Only for a provider that '
+            + 'says who may sign in, and never for an administrator or an auditor.');
         const password = choice('sso-password', [['allowed', 'Linked accounts keep their password'],
             ['disabled', 'Linked accounts sign in only through this provider']], policy.sso_password_login);
         box.appendChild(_el('p', 'text-secondary text-sm mb-sm', 'Who may sign in through this provider. With none of the '

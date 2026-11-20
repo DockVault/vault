@@ -43,6 +43,8 @@ from app.core import vault_attempt_throttle
 from app.core.sign_in_lockout import source_of
 from app.core import zero_knowledge_rules as zk_rules
 from app.core import redis_guard
+from app.core import email_confirmation
+from app.core.email_confirmation import BACKFILL as _EMAIL_CONFIRMATION_BACKFILL
 from app.core.rate_limiter import redis_circuit_open, retry_after_seconds
 from app.core.auth_offload import (
     auth_offload_slot, run_offloaded, FIRE_OFFLOOP_LIMIT, _offload_executor)
@@ -1120,6 +1122,9 @@ class UserResponse(BaseModel):
     passkey_unusable_count: int = 0
     # When the server's operator lifted the role's passkey requirement for this account (None: it applies).
     passkey_requirement_cleared_at: Optional[datetime] = None
+    # Whether the vault itself confirmed the account's address (app/core/email_confirmation.py): only such an
+    # account is linked to a provider by its email address. Filled in by the admin users list.
+    email_confirmed: bool = False
     # New sign-ins to this account are paused by failed ones ({scope: "address" | "account",
     # addresses, until}), or None. Sessions carry on; an administrator's unlock clears it. Filled in
     # by the admin users list.
@@ -5948,6 +5953,10 @@ async def accept_invite(token: str, payload: InviteAccept, request: Request,
     user = User(username=inv.username, email=acct_email,
                 password_hash=hash_password(payload.password),
                 role=role, created_by=inv.created_by)
+    if inv.email:
+        # The administrator wrote this address into the invitation: the vault's own word that it is the person's.
+        # An address the person typed here is their claim, and stays unconfirmed.
+        email_confirmation.confirm(user)
     db.add(user)
     try:
         db.flush()  # surfaces users.username/email UNIQUE conflicts before we claim the invite
@@ -6561,6 +6570,7 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             raise HTTPException(status_code=400, detail="That email address is already in use.")
         old_email = target.email
         target.email = new_email
+        email_confirmation.confirm(target)      # an administrator (or the host operator) set it
         target.updated_at = datetime.now(timezone.utc)
         return {"old_email": old_email, "new_email": new_email}
     if kind == cc.SSH_KEY:
@@ -10938,6 +10948,7 @@ async def list_users(
         item.second_factor_enabled = user.id in mfa_user_ids
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
         item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))
+        item.email_confirmed = email_confirmation.confirmed(user)
         item.sso_providers = provider_names.get(user.id, [])
         block = blocks.get(user.id)
         if block is not None:
@@ -11196,6 +11207,7 @@ async def confirm_email_change(
         raise HTTPException(status_code=400, detail="That email address is now in use.")
     old_email = user.email
     user.email = new_email
+    email_confirmation.confirm(user)            # the person typed the code the vault sent to this address
     db.commit()
     db.refresh(user)
     try:
@@ -28785,6 +28797,10 @@ def _run_lightweight_migrations():
             # The account signs in only through its identity provider (see User.sso_only). Nullable, so an
             # older release reads the table without it and every existing account reads as false.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sso_only BOOLEAN",
+            # When the vault confirmed the account's address (see User.email_confirmed_at), and the one case an
+            # existing account's address is proved by what is stored (app/core/email_confirmation.py).
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP",
+            _EMAIL_CONFIRMATION_BACKFILL,
             # Per-vault confidentiality tier; 'standard' = today's server-encrypted,
             # SFTP-capable vault (zero-knowledge slots in later, web-only).
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS type VARCHAR(20) NOT NULL DEFAULT 'standard'",

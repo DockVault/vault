@@ -420,7 +420,8 @@ async def sign_in_callback(
                 _record_resolution(db, row, found, client_ip=client_ip, details=details)
         sso_groups.tell(db, row, user, applied, client_ip=client_ip)
         from app.core import sign_in_codes
-        result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip)
+        result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip,
+                                     linked_by_email_now=bool(found.linked_now and found.linked_by == "self"))
         try:
             handover_code = sign_in_codes.store(sign_in_codes.from_result(
                 result, verifier_hash=login.verifier_hash, code_challenge=login.code_challenge,
@@ -755,6 +756,17 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
     if found.linked_by == "self":
         _tell_owner(db, user, row, "A sign-in method was added",
                     f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address.")
+        # A link nobody at the vault asked for: the administrators are told of each, as of an account made at a
+        # first sign-in.
+        try:
+            admins = [str(a.id) for a in api._active_admins(db)]
+            api._notify_users(admins, "account_changed", title="An account was linked to single sign-on by its email address",
+                              body=(f"{user.username} was linked to {label} by a sign-in there with the account's email "
+                                    "address. From now on that identity signs in to the account. Check the Users page if "
+                                    "you did not expect this."),
+                              target="#users")
+        except Exception as exc:  # noqa: BLE001
+            log.info("sso link-by-email notices skipped: %s", type(exc).__name__)
 
 
 def _claim_handover(db, request, current_user, body: SsoHandoverFinishRequest, *, purpose: str):

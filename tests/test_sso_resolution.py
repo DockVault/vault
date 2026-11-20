@@ -332,11 +332,38 @@ def test_a_known_identity_signs_in_and_leaves_the_invitation_it_carried_untouche
 
 # --------------------------------------------------------------------------- an account linked by its verified email
 
+def test_an_address_the_vault_never_confirmed_links_nothing(monkeypatch):
+    """Mallory writes a colleague's address on her own account (her own password is all that change asks for), and
+    the colleague signs in through the provider for the first time, with their own subject and that verified
+    address. Nothing is linked: the colleague is told there is no account for them, no code is handed out, nobody
+    is told that a sign-in method was added, and the record says why. The same holds for an address typed at self
+    sign-up. Once the vault confirmed the address for the account, the same sign-in links it."""
+    mallory = _user("mallory", email="victim@example.test", email_confirmed_at=None)
+    root = _user("root", role="admin")
+    p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [mallory, root], [p])
+    for _ in range(2):                       # the second try finds nothing left behind by the first
+        location, _state = _sign_in(h, p, sub="victim-subject", email="victim@example.test")
+        assert location == "/#sso-error=no_account", location
+        assert h.identities() == [] and h.codes() == [] and h.notices == [] and h.emails == []
+    refused = [a[2] for a in h.audits if a[0] == "sso_sign_in_refused"]
+    assert len(refused) == 2 and all(r.get("reason") == "no_account" and r.get("refused_because") == "address_not_confirmed"
+                                     for r in refused), h.audits
+    assert not any(a[0] == "sso_identity_linked" for a in h.audits)
+    mallory.email_confirmed_at = datetime.utcnow()
+    location, _state = _sign_in(h, p, sub="victim-subject", email="victim@example.test")
+    assert location.startswith("/#sso=") and len(h.identities()) == 1
+
+
 def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_and_is_restricted(monkeypatch):
     bob, p = _user("bob"), _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
-    h = Resolving(monkeypatch, [bob], [p])
+    root, other = _user("root", role="admin"), _user("second", role="admin")
+    h = Resolving(monkeypatch, [bob, root, other], [p])
     location, _ = _sign_in(h, p, email="bob@example.test")
     assert location.startswith("/#sso="), location
+    # A link nobody at the vault asked for: every administrator is told of it, as of an account made at a first sign-in.
+    told = [ids for ids, title in h.notices if title == "An account was linked to single sign-on by its email address"]
+    assert told == [[str(root.id), str(other.id)]], h.notices
     (identity,) = h.identities()
     assert identity.user_id == bob.id and identity.linked_by == "self" and identity.email_at_link == "bob@example.test"
     assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "self"}) in h.audits
@@ -542,6 +569,39 @@ def test_the_providers_mfa_is_the_second_factor_only_when_the_policy_trusts_the_
     assert ("mfa_at" in token) is trusted and token["amr"] == []
 
 
+def test_a_link_made_by_email_does_not_count_the_providers_mfa_at_that_sign_in(monkeypatch):
+    """The provider's word alone put the identity on the account at this sign-in, so its MFA does not also stand in
+    for the factor the account set up: the account's own factor is asked for, which is what stops an address taken
+    over at the provider. The next sign-in is a known identity's, and the provider's MFA counts as the policy says."""
+    bob = _user("bob")
+    p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"], "sso_trust_idp_mfa": True,
+                          "sso_accepted_amr": ["mfa"]})
+    h = Resolving(monkeypatch, [bob], [p])
+    monkeypatch.setattr(h.S, "_login_second_factor_in_effect", lambda db, user: True)
+    monkeypatch.setattr(h.S, "_second_factor_effective", lambda db, user: {"state": "active", "in_effect": True,
+                                                                          "required": False})
+    monkeypatch.setattr(h.S, "_sf_login_methods", lambda db, user: ["totp", "recovery"])
+    location, _ = _sign_in(h, p, email="bob@example.test", amr=["pwd", "mfa"])
+    assert location.startswith("/#sso=") and len(h.identities()) == 1
+    status, body = h.finish(location)
+    assert status == 200 and body["access_token"] is None, body
+    assert body["stage"] == "second_factor" and body["methods"] == ["totp", "recovery"] and not body["enrollment_required"]
+    location, _ = _sign_in(h, p, email="bob@example.test", amr=["pwd", "mfa"])
+    status, body = h.finish(location)
+    assert status == 200 and "mfa_at" in _claims(body["access_token"]), body
+    # Only a link by email is treated so. An account made at its first sign-in has no factor of its own to ask
+    # for: there the provider's trusted MFA counts from the start.
+    from app.core.models import SsoProvider
+    q = _provider(name="makes", policy={"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"],
+                                        "sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]})
+    h.db.rows_of(SsoProvider).append(q)
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    location, _ = _sign_in(h, q, sub="new-subject", email="new@example.test", preferred_username="newcomer", amr=["pwd", "mfa"])
+    assert location.startswith("/#sso="), location
+    status, body = h.finish(location)
+    assert status == 200 and "mfa_at" in _claims(body["access_token"]), body
+
+
 def test_the_requested_acr_rides_in_the_authorization_request_and_the_test_reports_the_trust(monkeypatch):
     root = _user("root", role="admin")
     p = _provider(policy={"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"], "sso_requested_acr": "urn:example:mfa"})
@@ -670,6 +730,12 @@ def test_a_test_sign_in_reports_the_restriction_and_what_the_vault_would_do(monk
     summary = run(email="bob@example.test")
     assert summary["restriction"] == "passes" and summary["would"] == "link the account bob by its verified email address and sign it in"
     assert h.identities() == []                                   # a test links nothing
+    # An address the vault never confirmed for the account: the administrator reads why nothing would be linked.
+    bob.email_confirmed_at = None
+    summary = run(email="bob@example.test")
+    assert summary["restriction"] == "passes" and summary["would"].startswith("refuse: an account holds this address, but "
+                                                                             "the vault never confirmed"), summary
+    bob.email_confirmed_at = datetime.utcnow()
     summary = run(email="nobody@example.test")
     assert summary["would"].startswith("refuse: no account is linked")
     h.db.rows_of(type(h.identities()[0]) if h.identities() else __import__("app.core.models", fromlist=["ExternalIdentity"]).ExternalIdentity).append(_identity(root, p))
@@ -692,3 +758,53 @@ def test_every_reason_has_words_the_sign_in_page_can_fetch(monkeypatch):
                  oc.TOKEN_INVALID, oc.NONCE_MISMATCH, oc.ENDPOINT_REFUSED, oc.TEMPORARILY_UNAVAILABLE, oc.DISCOVERY_INVALID):
         assert isinstance(reasons.get(code), str) and reasons[code].strip(), code
     assert sso.reason_text("something-new") == reasons[oc.PROVIDER_ERROR]
+
+
+# --------------------------------------------------------------------------- whose word an address is
+
+def test_an_address_is_confirmed_only_until_it_changes():
+    """The mark belongs to the address, not to the account: any change of the address clears it, whoever makes the
+    change and by whatever path (the column's own listener), and only the paths that confirm set it again."""
+    from app.core import email_confirmation as ec
+    from app.core.models import User
+    bob = User(username="bob", email="bob@example.test")
+    assert not ec.confirmed(bob)
+    ec.confirm(bob)
+    assert ec.confirmed(bob)
+    bob.email = "Bob@Example.test"                      # the same address in other letters
+    assert ec.confirmed(bob)
+    bob.email = "victim@example.test"
+    assert not ec.confirmed(bob) and bob.email_confirmed_at is None
+    ec.confirm(bob)
+    bob.email = None
+    assert bob.email_confirmed_at is None
+    ec.confirm(bob)
+    assert bob.email_confirmed_at is None and not ec.confirmed(bob)     # no address: nothing to confirm
+    # A mark given before the address is not a mark for it.
+    eve = User(email_confirmed_at=datetime.utcnow(), username="eve", email="eve@example.test")
+    assert not ec.confirmed(eve)
+    # What is not an account object at all is unconfirmed.
+    assert not ec.confirmed(types.SimpleNamespace(email="x@example.test"))
+
+
+def test_an_invitation_confirms_the_address_it_carried_and_a_providers_word_confirms_none(monkeypatch):
+    """Accepted through a provider: an address the administrator wrote into the invitation is the vault's own word;
+    an address taken from the provider's token, at an invitation without one or at a first sign-in, is the
+    provider's word and stays unconfirmed, so another provider never links to the account by it."""
+    p = _provider(policy={"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [], [p], account_policy={"invite_enabled": True})
+    monkeypatch.setattr(h.S, "_invitation_inviter_can_act", lambda db, inv, lock=False: True)
+    monkeypatch.setattr(h.S, "_username_kept", lambda name: False)
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    token, inv = h.invite(username="invited", email="invited@example.test")
+    location, _ = _sign_in(h, p, token, sub="s1", email="invited@example.test")
+    assert location.startswith("/#sso="), location
+    token, inv = h.invite(username="typed")
+    location, _ = _sign_in(h, p, token, sub="s2", email="typed@example.test")
+    assert location.startswith("/#sso="), location
+    location, _ = _sign_in(h, p, sub="s3", email="first@example.test", preferred_username="first")
+    assert location.startswith("/#sso="), location
+    confirmed = {u.username: u.email_confirmed_at is not None for u in h.db.rows_of(type(h.users_named("invited")[0]))}
+    assert confirmed == {"invited": True, "typed": False, "first": False}, confirmed
+    assert {u.username: u.email for u in h.db.rows_of(type(h.users_named("invited")[0]))} == {
+        "invited": "invited@example.test", "typed": "typed@example.test", "first": "first@example.test"}

@@ -541,9 +541,15 @@ def _username_taken(db, name: str) -> bool:
 def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     """The one account a verified email may link to (the design's step 4), or None: the provider must be
     restricted (the save-time rule's condition, held here too so a hand-edited row never widens the door), the
-    address verified, owned by exactly one active account that is not an administrator and has no identity on
-    this provider yet."""
-    from app.core import privileged_accounts
+    address verified by the provider, owned by exactly one active account that is not an administrator and has no
+    identity on this provider yet, and confirmed for that account by the vault itself (an administrator or an
+    invitation set it, or the person typed the code sent there: app/core/email_confirmation.py).
+
+    The last condition is the vault's side of "verified". Without it, anyone with an account could write a
+    colleague's address on their own account (a change of one's own address asks for the current password, not
+    for a code, unless the administrator turned that on) and wait: the colleague's first sign-in through the
+    provider would be linked to that account, and every later one would land there."""
+    from app.core import email_confirmation, privileged_accounts
     from app.core.email_identity import find_user_by_email
     from app.core.models import ExternalIdentity
     api = _api()
@@ -561,10 +567,16 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         # An administrator, or an account with the auditor right (open), reaches other people's vaults: a takeover of
         # its address at the provider must not reach it silently. It links only from its own profile, under step-up.
         raise Refusal(RESTRICTED, f"privileged_account:{kind}")
+    if not email_confirmation.confirmed(user):
+        raise Refusal(NO_ACCOUNT, ADDRESS_NOT_CONFIRMED)
     if db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
                                             ExternalIdentity.user_id == user.id).first() is not None:
         return None          # the account's identity on this provider is another one: an administrator sorts it out
     return user
+
+
+# The audit's word for a link by email refused because the vault never confirmed the account's address.
+ADDRESS_NOT_CONFIRMED = "address_not_confirmed"
 
 
 def _link_by_email(db, row, answer: ProviderAnswer, policy: dict):
@@ -635,6 +647,11 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
                 password_hash=hash_password(secrets.token_urlsafe(32)),
                 role=role, created_by=inv.created_by, created_at=now, updated_at=now, is_active=True, is_locked=False,
                 failed_login_attempts=0, sftp_enabled=True, sso_only=sso_only, sftp_password_auth=not sso_only)
+    if inv.email:
+        # The administrator wrote this address into the invitation. An address taken from the provider instead is
+        # the provider's word, not the vault's, and stays unconfirmed.
+        from app.core import email_confirmation
+        email_confirmation.confirm(user, now=now)
     db.add(user)
     try:
         db.flush()             # surfaces a username or address taken meanwhile before the invitation is claimed
@@ -687,6 +704,10 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
     try:
         match = _email_match(db, row, answer, policy)
     except Refusal as refused:
+        if refused.detail == ADDRESS_NOT_CONFIRMED:
+            return {"restriction": "passes", "would": (
+                "refuse: an account holds this address, but the vault never confirmed it is that account's (an "
+                "administrator or an invitation sets an address, or its owner confirms it with an emailed code)")}
         return {"restriction": "passes", "would": "refuse: the account that owns this address is " + (
             "an administrator" if refused.detail.endswith("administrator") else "holding the auditor right") +
             "; it links only from its own signed-in profile"}
@@ -764,13 +785,20 @@ def _group_names(row, answer: ProviderAnswer) -> list:
     return sorted(answer.groups or [])[:200]
 
 
-def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str]):
+def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str],
+                    linked_by_email_now: bool = False):
     """The pipeline's result for a provider sign-in: the provider is the first proof (``amr`` carries what the
     vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
-    provider's policy trusts the values the token carried."""
+    provider's policy trusts the values the token carried.
+
+    ``linked_by_email_now``: this very sign-in linked the identity to the account by its email address. The
+    provider's word alone put it there, so its MFA does not also stand in for the account's own second factor this
+    once: an account with a factor in effect is asked for it, which is what stops an address taken over at the
+    provider. From the next sign-in the identity is a known one and the policy applies as written."""
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
-    return SignInResult(user, [], client_ip, provider_id=provider_id, provider_mfa_trusted=mfa_trusted(row, answer),
+    return SignInResult(user, [], client_ip, provider_id=provider_id,
+                        provider_mfa_trusted=mfa_trusted(row, answer) and not linked_by_email_now,
                         provider_auth_time=answer.auth_time,
                         provider_sid=answer.sid, provider_sub=answer.subject,
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)

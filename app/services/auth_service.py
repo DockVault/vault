@@ -499,6 +499,10 @@ class AuthService:
             role=role,
             created_by=created_by
         )
+        if created_by is not None:
+            # An administrator made the account and wrote its address: confirmed by the vault's own word.
+            from app.core import email_confirmation
+            email_confirmation.confirm(user)
         
         self.db.add(user)
         if before_commit is not None:
