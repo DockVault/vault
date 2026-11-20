@@ -874,6 +874,58 @@ def test_an_address_is_confirmed_only_until_it_changes():
     assert ec.confirmed(carol)
     carol.email = "other@example.test"
     assert carol.email_confirmed_at is None and carol.email_confirmed_for is None
+    # The mark folds an address as the vault compares addresses: ASCII letters only. Another case of a letter
+    # outside ASCII is another address to the vault, and to the mark.
+    dora = User(username="dora", email="d\u00c9sir\u00e9e@example.test")
+    ec.confirm(dora)
+    assert ec.confirmed(dora) and ec.mark_for("D\u00c9SIR\u00e9E@EXAMPLE.test") == dora.email_confirmed_for
+    assert ec.mark_for("d\u00e9sir\u00e9e@example.test") != dora.email_confirmed_for
+    dora.email = "d\u00e9sir\u00e9e@example.test"
+    assert dora.email_confirmed_at is None and not ec.confirmed(dora)
+
+
+def test_the_addresses_an_invitation_carried_are_confirmed_once_not_at_every_start():
+    """At the first start with the mark, an account made from an invitation that carried the address it still holds
+    is confirmed. Once: at every start the statement would confirm again an address the account lost and its
+    owner then typed back with the password alone, which is the vault's word for nothing."""
+    from app.core import email_confirmation as ec
+    from app.core.models import SystemSetting
+
+    class _Once:
+        def __init__(self):
+            self.settings, self.ran, self.commits = [], [], 0
+
+        def query(self, model):
+            assert model is SystemSetting
+            return self
+
+        def filter(self, *a):
+            return self
+
+        def first(self):
+            return next((row for row in self.settings if row.key == ec.BACKFILL_MARKER), None)
+
+        def execute(self, statement):
+            self.ran.append(str(statement))
+            return types.SimpleNamespace(rowcount=3)
+
+        def add(self, row):
+            self.settings.append(row)
+
+        def commit(self):
+            self.commits += 1
+    db = _Once()
+    assert ec.backfill_once(db) == 3 and db.ran == [ec.BACKFILL] and db.commits == 1
+    assert [(row.key, row.value) for row in db.settings] == [(ec.BACKFILL_MARKER, {"rows": 3})]
+    assert ec.backfill_once(db) == 0 and ec.backfill_once(db) == 0
+    assert db.ran == [ec.BACKFILL] and len(db.settings) == 1                  # never again
+    # At start it is this that runs, not the statement itself among those run at every start.
+    import inspect
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    from app.api import api_server as api
+    source = inspect.getsource(api)
+    assert "email_confirmation.backfill_once(db)" in source and "_EMAIL_CONFIRMATION_BACKFILL" not in source
     # What is not an account object at all is unconfirmed.
     assert not ec.confirmed(types.SimpleNamespace(email="x@example.test"))
 

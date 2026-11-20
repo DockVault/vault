@@ -60,7 +60,7 @@ def enforce(db, user, request, action) -> None:
                                                    session_hash=_current_session_hash(request))):
         raise HTTPException(status_code=403, detail={
             "second_factor_required": True, "action": action, "reason": "step_up_required",
-            "methods": _sf_step_up_methods(db, user, req, has_active)})
+            "methods": _sf_step_up_methods(db, user, req, has_active, action=action)})
 
 
 def guard(action):

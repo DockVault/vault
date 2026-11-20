@@ -131,6 +131,22 @@ def _guarded(db, user, action, receipt=None, session="session-1"):
     return fixed_step_up.enforce(db, user, _request(session, receipt), action)
 
 
+def test_the_refusal_offers_the_methods_of_the_action_it_was_asked_for(db, monkeypatch):
+    """The 403 lists the ways to confirm. Which ways there are depends on the action (a provider's sign-in never
+    stands in for a compliance step): the list is asked for with the action, not for any action."""
+    asked = []
+    real = api._sf_step_up_methods
+
+    def listing(db_, user, req, has_active, action=None):
+        asked.append(action)
+        return real(db_, user, req, has_active, action=action)
+    monkeypatch.setattr(api, "_sf_step_up_methods", listing)
+    ada = _admin(db)
+    refusal = _refusal(_guarded, db, ada, RETENTION)
+    assert refusal.status_code == 403 and refusal.detail["reason"] == "step_up_required"
+    assert asked == [RETENTION]
+
+
 # --------------------------------------------------------------------------- the policies, pure
 
 @pytest.mark.parametrize("policy,method,expected", [

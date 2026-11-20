@@ -44,7 +44,6 @@ from app.core.sign_in_lockout import source_of
 from app.core import zero_knowledge_rules as zk_rules
 from app.core import redis_guard
 from app.core import email_confirmation
-from app.core.email_confirmation import BACKFILL as _EMAIL_CONFIRMATION_BACKFILL
 from app.core.rate_limiter import redis_circuit_open, retry_after_seconds
 from app.core.auth_offload import (
     auth_offload_slot, run_offloaded, FIRE_OFFLOOP_LIMIT, _offload_executor)
@@ -28825,7 +28824,6 @@ def _run_lightweight_migrations():
             # existing account's address is proved by what is stored (app/core/email_confirmation.py).
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_confirmed_for VARCHAR(64)",
-            _EMAIL_CONFIRMATION_BACKFILL,
             # Per-vault confidentiality tier; 'standard' = today's server-encrypted,
             # SFTP-capable vault (zero-knowledge slots in later, web-only).
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS type VARCHAR(20) NOT NULL DEFAULT 'standard'",
@@ -29553,6 +29551,22 @@ def _release_finished_cred_slots():
         print(f"⚠ credential-slot release backfill skipped: {e}")
 
 
+def _confirm_invited_addresses():
+    """Once, at the first start with the confirmation mark: the accounts whose address is proved by what is stored
+    (made from an invitation that carried the address they still hold) are marked confirmed. Marker-guarded, in
+    app/core/email_confirmation.py; best-effort, never blocks boot (an account left unconfirmed links nothing by
+    email, which is the safe side)."""
+    try:
+        from app.core import email_confirmation
+        from app.core.database import get_db_context
+        with get_db_context() as db:
+            confirmed = email_confirmation.backfill_once(db)
+        if confirmed:
+            print(f"[OK] Confirmed the address of {confirmed} account(s) from their invitations")
+    except Exception as e:  # noqa: BLE001 -- best-effort, never block boot
+        print(f"⚠ address confirmation backfill skipped: {e}")
+
+
 def _purge_audit_log_names():
     """Strip residual plaintext names (file/folder/old/new/vault_name) from legacy audit-log rows
     written before the AuditLogger began redacting them (idempotent; a marker makes it a no-op after
@@ -29847,6 +29861,7 @@ async def lifespan(app: FastAPI):
     _backfill_notelink_tokens()         # hash legacy plaintext note-link tokens at rest
     _relabel_name_index_keys()          # name-index-key rows: the label that names their bytes
     _release_finished_cred_slots()      # free cap slots of credentials finished before this upgrade
+    _confirm_invited_addresses()        # once: addresses an invitation carried are confirmed for their accounts
     _add_name_uniqueness()  # after backfill so freshly-sealed name_bi values are indexed
     _admin_bootstrap_status = _seed_admin_user()
     # Once the admin is bootstrapped, ADMIN_PASSWORD is spent: drop it (remove a writable mounted

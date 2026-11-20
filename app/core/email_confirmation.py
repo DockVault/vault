@@ -27,8 +27,10 @@ import hashlib
 from datetime import datetime
 from typing import Optional
 
-# Run at start, after the column exists; harmless to run again. An administrator wrote the address into the
-# invitation this account was made from, and the account holds that address now: confirmed, as of the acceptance.
+# Run once, at the first start after the columns exist (:func:`backfill_once`). An administrator wrote the address
+# into the invitation this account was made from, and the account holds that address now: confirmed, as of the
+# acceptance. Once only: run at every start, it would confirm again an address the account lost and its owner then
+# typed back with the password alone.
 # The digest is the one :func:`mark_for` makes; where the database and Python would lower-case an address
 # differently the two do not match, and the address reads as unconfirmed.
 BACKFILL = (
@@ -41,9 +43,30 @@ BACKFILL = (
 )
 
 
+BACKFILL_MARKER = "email_confirmation_backfill_v1"
+
+
+def backfill_once(db) -> int:
+    """Run :data:`BACKFILL` if it never ran on this database, and note that it did. Returns the accounts confirmed."""
+    from sqlalchemy import text
+    from app.core.models import SystemSetting
+    if db.query(SystemSetting).filter(SystemSetting.key == BACKFILL_MARKER).first() is not None:
+        return 0
+    confirmed = db.execute(text(BACKFILL)).rowcount or 0
+    db.add(SystemSetting(key=BACKFILL_MARKER, value={"rows": confirmed}))
+    db.commit()
+    return confirmed
+
+
+def _folded(address) -> str:
+    """The address as the vault compares addresses (app/core/email_identity.py): trimmed, ASCII letters lowered."""
+    from app.core.email_identity import normalize_email
+    return normalize_email(address) or ""
+
+
 def mark_for(address: str) -> str:
-    """What a mark is given for: the address in lower case, as a digest."""
-    return hashlib.sha256(address.strip().lower().encode("utf-8")).hexdigest()
+    """What a mark is given for: the address as the vault compares addresses, as a digest."""
+    return hashlib.sha256(_folded(address).encode("utf-8")).hexdigest()
 
 
 def confirm(user, *, now: Optional[datetime] = None) -> None:
@@ -67,6 +90,6 @@ def address_changed(target, value, oldvalue, initiator) -> None:
     letter case alone is the same address. The paths that confirm call :func:`confirm` afterwards."""
     old = oldvalue if isinstance(oldvalue, str) else ""
     new = value if isinstance(value, str) else ""
-    if new.strip().lower() != old.strip().lower():
+    if _folded(new) != _folded(old):
         target.email_confirmed_at = None
         target.email_confirmed_for = None
