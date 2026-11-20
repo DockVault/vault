@@ -2017,8 +2017,11 @@ async function _ssoResume(back) {
         return;
     }
     if (out.kind === 'confirmed' && out.then === 'add-passkey') {
+        // The passkey is made from a click, not as the page loads: a browser refuses to make one for a page that
+        // asks on its own (Safari, and every browser on an iPhone, without a word), and the confirmation would be
+        // spent for nothing. Your account opens with the button that goes on.
+        _passkeyAddConfirmed = true;
         openUserSettingsModal();
-        _addPasskey({ confirmed: true });
         return;
     }
     if (out.kind === 'confirmed') showSuccess('Confirmed with your organisation\'s sign-in. Continue within two minutes.');
@@ -7764,17 +7767,31 @@ async function renderAccountPasskeys() {
         body.appendChild(_el('p', 'text-secondary text-sm', 'You hold as many passkeys as an account may. Remove one to add another.'));
         return;
     }
-    const add = _el('button', 'btn btn-primary btn-sm', 'Add a passkey');
+    // Back from the fresh sign-in at the provider: the same button goes straight on, and says so.
+    const confirmed = _passkeyAddConfirmed;
+    if (confirmed) {
+        const note = _el('p', 'text-sm', 'You confirmed it is you. Add your passkey now: the confirmation lasts two minutes.');
+        note.id = 'us-passkey-confirmed';
+        note.setAttribute('role', 'status');
+        body.appendChild(note);
+    }
+    const add = _el('button', 'btn btn-primary btn-sm', confirmed ? 'Add your passkey now' : 'Add a passkey');
     add.id = 'us-passkey-add';
     add.addEventListener('click', async () => {
         add.disabled = true;
-        try { await _addPasskey(); } finally { add.disabled = false; }
+        const goOn = _passkeyAddConfirmed;
+        _passkeyAddConfirmed = false;                      // one try: the next one confirms again
+        try { await _addPasskey({ confirmed: goOn }); } finally { add.disabled = false; }
         renderAccountPasskeys();
     });
     body.appendChild(add);
+    if (confirmed) {
+        try { add.scrollIntoView({ block: 'center' }); add.focus(); } catch (_) {}
+    }
 }
 
 let _passkeyFirstProof = null;     // how this account proves adding a passkey, from the last list read
+let _passkeyAddConfirmed = false;  // the page came back from the provider's fresh sign-in to add a passkey
 
 // `confirmed`: the page has just come back from the provider's fresh sign-in for this.
 async function _addPasskey({ confirmed = false } = {}) {

@@ -290,7 +290,8 @@ def test_a_provider_only_account_is_told_what_a_passkey_is_for_and_confirms_at_i
             "passkeys": [], "limit": 20, "enabled": True, "requirement": {}, "provider_only": sentence,
             "first_proof": {"kind": "provider", "action": "account.second_factor",
                             "providers": [{"id": PROVIDER, "label": "Company sign-in"}]}})
-    page.route("**/users/me/passkeys", passkeys)
+    lists = []
+    page.route("**/users/me/passkeys", lambda route: (lists.append(1), passkeys(route)))
 
     def options(route):
         asked.append(route.request.post_data_json or {})
@@ -305,13 +306,26 @@ def test_a_provider_only_account_is_told_what_a_passkey_is_for_and_confirms_at_i
     expect(page.locator("#confirm-modal-message")).to_contain_text("fresh sign-in at Company sign-in", timeout=8000)
     assert asked == []                                   # nothing is asked of the server before the confirmation
     page.click("#confirm-modal-confirm-btn")
-    # Back from the provider: the confirmation is staged with this tab's proof, and the registration goes on.
+    # Back from the provider: the confirmation is staged with this tab's proof, and Your account says to go on.
+    # Nothing is started as the page loads: a browser makes a passkey only for a click (Safari refuses without a
+    # word), so the registration waits for one.
     expect(page.locator("#user-settings-modal")).to_be_visible(timeout=20000)
+    expect(page.locator("#us-passkey-confirmed")).to_contain_text("You confirmed it is you", timeout=10000)
+    expect(page.locator("#us-passkey-add")).to_have_text("Add your passkey now")
+    page.wait_for_timeout(1500)
+    assert asked == []
+    drawn = len(lists)
+    page.click("#us-passkey-add")
     for _ in range(75):
-        if asked:
+        if asked and len(lists) > drawn:
             break
         page.wait_for_timeout(200)
     assert len(asked) == 1 and asked[0] == {}            # no password is sent: nobody knows one
+    assert len(stand.starts) == 1                        # and the click did not send the person to the provider again
+    # The list is read again when the try ends, and the next try confirms afresh.
+    assert len(lists) > drawn
+    expect(page.locator("#us-passkey-add")).to_have_text("Add a passkey", timeout=10000)
+    expect(page.locator("#us-passkey-confirmed")).to_have_count(0)
     start_url, start_body = stand.starts[-1]
     assert start_url.endswith(f"/users/me/identities/{PROVIDER}/reauth")
     assert start_body["action"] == "account.second_factor" and len(start_body["verifier_hash"]) == 64
