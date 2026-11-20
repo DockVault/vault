@@ -536,3 +536,38 @@ def test_the_sessions_of_a_provider_are_ended_under_each_owners_turn(monkeypatch
         raise RuntimeError("down")
     monkeypatch.setattr(h.S, "_revoke_sessions", broken)
     assert h.R._end_sessions_of(h.db, row.id) == 0
+
+
+def test_a_test_sign_in_speaks_for_the_connection_it_was_made_with(monkeypatch):
+    """A connection saved while the provider is answering a test sign-in was not tested by it. The summary carries
+    the fingerprint of the provider as the sign-in was made with it, so the provider with the newer connection does
+    not read as tested and cannot be turned on with it."""
+    from app.core import sso_state
+    from app.services import oidc_client as oc
+    from app.services import sso_providers
+    from app.services import sso_sign_in as sso
+    row = _provider(state="draft", created_at=None, updated_at=None)
+    h = Admin(monkeypatch, [row])
+    before = sso_providers.fingerprint(row)
+    url = sso.start(row, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
+                    user_id=h.root.id, session_hash="sess-hash")
+    state, _ = h.state_of(url)
+    answered = oc.fetch_json
+
+    def while_the_provider_answers(*a, **kw):
+        row.scopes = "openid email"                    # another administrator's save lands meanwhile
+        return answered(*a, **kw)
+    monkeypatch.setattr(oc, "fetch_json", while_the_provider_answers)
+    status, location, _ = h.callback(row, state)
+    assert location.startswith("/#sso-test="), location
+    status, body = h.finish_test(row, location)
+    assert status == 200, body
+    assert row.last_test["config"] == before != sso_providers.fingerprint(row)
+    assert sso_providers.tested(row) is False
+
+
+def test_the_client_secret_is_in_no_text_made_of_the_provider():
+    from app.services import oidc_client as oc
+    provider = oc.ProviderConfig(id="p", issuer="https://login.example.org", client_id="client-1", client_secret="s3cret-value")
+    assert "s3cret-value" not in repr(provider) and "s3cret-value" not in str(provider) and "s3cret-value" not in f"{provider}"
+    assert provider.client_secret == "s3cret-value" and "client-1" in repr(provider)

@@ -469,7 +469,7 @@ async def sign_in_callback(
     record = {"purpose": login.purpose, "provider_id": login.provider_id, "user_id": login.user_id,
               "session_hash": login.session_hash, "verifier_hash": login.verifier_hash, **sso.answer_record(answer)}
     if login.purpose == sso_state.TEST:
-        record["summary"] = sso.test_summary(db, row, answer, user)
+        record["summary"] = sso.test_summary(db, row, answer, user, tested=view)
     if login.purpose == sso_state.STEP_UP:
         record["step_up_action"] = login.step_up_action
     try:

@@ -787,9 +787,11 @@ def _password_less_refusal(db, row, user) -> None:
         raise Refusal(PRIVILEGED_ON_PASSWORD_LESS, kind)
 
 
-def test_summary(db, row, answer: ProviderAnswer, tester) -> dict:
+def test_summary(db, row, answer: ProviderAnswer, tester, tested=None) -> dict:
     """What an administrator reads after a test sign-in: the claim names (never the values but the tester's own
-    identifiers), the proofs the token carried, and what the vault would do with this identity."""
+    identifiers), the proofs the token carried, and what the vault would do with this identity. ``tested`` is the
+    provider as the sign-in was made with it (the values read before the provider was called): the summary speaks
+    for that connection, not for one saved while the provider was answering."""
     from app.services import sso_providers
     return {
         "outcome": "ok", "at": datetime.utcnow().isoformat() + "Z", "tester": tester.username,
@@ -799,7 +801,7 @@ def test_summary(db, row, answer: ProviderAnswer, tester) -> dict:
         "groups": _group_names(row, answer), "subject_length": len(answer.subject),
         "mfa_trusted": mfa_trusted(row, answer), **would_do(db, row, answer, tester),
         # The connection settings this sign-in passed with: a provider is turned on only while they still stand.
-        "config": sso_providers.fingerprint(row),
+        "config": sso_providers.fingerprint(tested if tested is not None else row),
     }
 
 

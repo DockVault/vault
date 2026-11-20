@@ -87,7 +87,7 @@ class ProviderConfig:
     id: str
     issuer: str
     client_id: str
-    client_secret: str
+    client_secret: str = field(repr=False)      # never in a log line, an error's text or a test's diff
     token_auth: str = TOKEN_AUTH_BASIC
     scopes: str = "openid profile email"
     discovery_url: Optional[str] = None

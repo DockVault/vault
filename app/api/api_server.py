@@ -7594,7 +7594,7 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     if getattr(user, "sso_only", False):
         raise HTTPException(status_code=409, detail=(
             "This account signs in only through its organisation's provider and holds no password. Allow password "
-            "sign-in on the provider, or unlink the account, before sending a reset link."))
+            "sign-in on the provider before sending a reset link."))
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not (user.email or "").strip():
         raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
@@ -7648,7 +7648,7 @@ async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
     if getattr(user, "sso_only", False):
         raise HTTPException(status_code=409, detail=(
             "This account signs in only through its organisation's provider and holds no password. Allow password "
-            "sign-in on the provider, or unlink the account, before sending a reset link."))
+            "sign-in on the provider before sending a reset link."))
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not getattr(user, "is_active", True):
         raise HTTPException(status_code=400,
