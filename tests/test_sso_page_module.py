@@ -303,3 +303,18 @@ out({ said, went, assigned: left });
     assert got["went"] == ["https://idp.example.org/logout?id_token_hint=x", "http://localhost:8080/logout",
                            "http://127.0.0.1/o"]
     assert got["assigned"] == []            # replaced, never added to the history
+
+
+def test_no_text_of_the_pages_or_the_server_is_garbled():
+    """Text saved once in another encoding and again as UTF-8 shows as two wrong characters where one was meant (a
+    multiplication sign as a close button, a warning sign in a log line). None of those pairs is in any page, script,
+    style sheet or server module."""
+    marks = ("Ã—", "Ã\u0097", "â€", "âš", "Â ")
+    found = []
+    for base, patterns in (("static", ("*.html", "*.js", "*.css")), ("app", ("*.py",))):
+        for pattern in patterns:
+            for path in sorted((ROOT / base).rglob(pattern)):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                found += [(path.relative_to(ROOT).as_posix(), mark.encode("unicode_escape").decode()) for mark in marks
+                          if mark in text]
+    assert found == [], found

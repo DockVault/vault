@@ -275,6 +275,7 @@
             row.appendChild(text);
             const unlink = _el('button', 'btn btn-danger btn-sm', 'Unlink');
             unlink.type = 'button';
+            unlink.setAttribute('aria-label', 'Unlink ' + (identity.provider || 'this provider'));
             unlink.addEventListener('click', async () => {
                 const ok = await showConfirm('Unlink ' + (identity.provider || 'this provider') + '? You will no longer '
                     + 'sign in through it.', 'Unlink single sign-on', null, 'Unlink');

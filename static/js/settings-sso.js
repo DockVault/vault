@@ -42,7 +42,12 @@
         if (!line) return;
         const address = (data && data.address) || {};
         line.hidden = false;
-        if (address.usable) {
+        if (address.usable && address.base && address.base !== location.origin) {
+            line.className = 'alert alert-warning mb-md';
+            line.textContent = `Providers send people back to ${address.base}, which is not the address this page was `
+                + `opened at (${location.origin}). A sign-in, a link or a test started here does not come back here: `
+                + 'open the vault there.';
+        } else if (address.usable) {
             line.className = 'alert alert-info mb-md';
             line.textContent = `Providers send people back to ${address.base}. Changing the vault's address later means `
                 + 'giving every provider its new redirect address.';
@@ -282,7 +287,7 @@
             'Lets the vault call a provider on a private address or name. Leave it off for a provider on the internet.');
         box.appendChild(field('Name', name, 'For administrators: in this list, in notices and in the records.'));
         box.appendChild(field('Button text', label, 'What the sign-in page\'s button says. Empty: the name.'));
-        box.appendChild(field('Icon', icon));
+        box.appendChild(field('Provider type', icon, 'Which provider this is: it chooses the instructions shown above for its console.'));
         box.appendChild(field('Order', order, 'Lower comes first on the sign-in page.'));
         box.appendChild(shown.group);
         box.appendChild(field('Issuer', issuer, preset.issuer_help || ''));

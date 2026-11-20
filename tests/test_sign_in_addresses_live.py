@@ -84,6 +84,16 @@ def test_with_an_address_everything_is_built_on_it_whatever_host_a_request_names
         assert r.status_code == 200, r.text
         assert r.json()["provider"]["addresses"]["redirect_uri"] == f"{base}/auth/sso/{pid}/callback"
         assert boss.get("/settings/sign-in", headers={"Host": host}).json()["readiness"]["origin"] == base
+    # Nor do the other headers a caller writes an address in change anything that is given out.
+    for forged in ({"Origin": "https://evil.example.org"}, {"Referer": "https://evil.example.org/x"},
+                   {"X-Forwarded-Host": "evil.example.org"}, {"X-Forwarded-Proto": "http"},
+                   {"X-Forwarded-Port": "1"}, {"Forwarded": "host=evil.example.org;proto=http"}):
+        r = boss.get(f"/admin/sso/providers/{pid}", headers=forged)
+        assert r.status_code == 200, (forged, r.text)
+        assert r.json()["provider"]["addresses"]["redirect_uri"] == f"{base}/auth/sso/{pid}/callback", forged
+        assert "evil.example.org" not in r.text, forged
+        assert boss.get("/settings/sign-in", headers=forged).json()["readiness"]["origin"] == base, forged
+        assert boss.get("/auth/policy", headers=forged).json()["methods"]["origin"] == base, forged
     # A host the vault does not answer to is refused outright, before any route.
     forged = boss.get(f"/admin/sso/providers/{pid}", headers={"Host": "evil.example.org"})
     assert forged.status_code == 400 and "evil.example.org" not in forged.text

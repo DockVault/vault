@@ -912,25 +912,27 @@ def passkeys_elsewhere_note(answer, host):
 
 def sign_in_address_note(allowed_hosts):
     """What setup and status say when no passkey can be made at the address the vault gives out, or None: what is
-    in the way, what to change, and that a passkey requirement set for a role waits meanwhile."""
+    in the way, what it turns off (passkeys alone at an address reached by IP; passkeys and single sign-on where
+    sign-in cannot be built on the address at all), what to change, and that a passkey requirement set for a role
+    waits meanwhile."""
     reason = sign_in_address_reason(allowed_hosts)
     if reason is None:
         return None
     if reason == "ip":
         said = passkey_address_note(_allowed_hosts_first(allowed_hosts)[1])
     elif reason == "http":
-        said = ("passkeys stay hidden at this address: browsers make a passkey only over https (plain http carries "
-                "one on this computer alone, at localhost). Put an https address first in ALLOWED_HOSTS when you "
-                "want them; the emailed links work either way.")
+        said = ("passkeys and single sign-on stay off at this address: both need https (plain http carries them on "
+                "this computer alone, at localhost). Put an https address first in ALLOWED_HOSTS when you want "
+                "them; the emailed links work either way.")
     elif reason == "script":
-        said = ("passkeys stay hidden at this address: its host name is written in another script. Write it first "
+        said = ("passkeys and single sign-on stay off at this address: its host name is written in another script. Write it first "
                 "in ALLOWED_HOSTS in its xn-- form, as the browser's address bar shows it.")
     elif reason == "dot":
         said = ("passkeys and single sign-on stay off at this address: its host name is written with a dot at its "
                 "end. Write it first in ALLOWED_HOSTS without that dot; passkeys made at the name without the dot "
                 "work again then.")
     else:
-        said = ("passkeys stay hidden: the vault has no address (ALLOWED_HOSTS has no entry that names one). Set "
+        said = ("passkeys and single sign-on stay off: the vault has no address (ALLOWED_HOSTS has no entry that names one). Set "
                 "it to the address people open the vault at; until then no reset or invitation link is sent either.")
     return said + " A passkey requirement set for a role in Settings waits meanwhile, and locks nobody out."
 

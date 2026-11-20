@@ -90,6 +90,7 @@ def _with_the_password(page: Page, boss):
 def _add(page: Page, boss, name, preset="keycloak"):
     page.click("#signin-sso-add")
     expect(page.locator("#sso-provider-modal.active")).to_be_visible(timeout=8000)
+    expect(page.locator("#sso-provider-modal .modal-close")).to_have_text("×")      # the close sign, not two wrong characters
     page.select_option("#sso-new-preset", preset)
     page.fill("#sso-new-name", name)
     page.click("#sso-new-add")

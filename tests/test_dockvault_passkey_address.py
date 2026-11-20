@@ -76,7 +76,12 @@ def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypa
     if reason == "dot":
         assert "written with a dot at its end" in note and "ALLOWED_HOSTS" in note     # its own words, held below
     elif note:
-        assert note.startswith("passkeys stay hidden") and "waits meanwhile, and locks nobody out" in note
+        assert note.startswith("passkeys") and "waits meanwhile, and locks nobody out" in note
+        # What it turns off: passkeys alone at an address reached by IP, single sign-on too everywhere else.
+        if reason == "ip":
+            assert "single sign-on and the emailed links work either way" in note
+        else:
+            assert note.startswith("passkeys and single sign-on stay off"), note
         assert "ALLOWED_HOSTS" in note
     # Where the vault refuses the address in words, they are the words for the tool's reason and no other: the
     # operator who mends what one of the two says does not meet the other's different answer next.
@@ -88,7 +93,8 @@ def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypa
 
 
 def test_each_reason_says_what_to_change():
-    assert "only over https" in dv.sign_in_address_note("http://vault.lan:8080")
+    assert "both need https" in dv.sign_in_address_note("http://vault.lan:8080")
+    assert "single sign-on and the emailed links work either way" not in dv.sign_in_address_note("http://10.0.0.5:8080")
     assert "xn-- form" in dv.sign_in_address_note("https://b\u00fccher.example")
     assert "has no address" in dv.sign_in_address_note("")
     assert "reached by IP" in dv.sign_in_address_note("https://203.0.113.9:8443")
@@ -117,7 +123,7 @@ def test_status_says_passkeys_are_hidden_at_an_ip(monkeypatch, tmp_path):
     monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
     tool._print_status("combined")
     assert any("Passkeys: hidden" in line and "reached by IP" in line for line in printed), printed
-    for written, said in (("http://vault.lan:8080", "only over https"), ("", "has no address")):
+    for written, said in (("http://vault.lan:8080", "both need https"), ("", "has no address")):
         printed.clear()
         monkeypatch.setattr(tool, "_load_env", lambda env={"ALLOWED_HOSTS": written, "SERVER_NAME": "vault"}: env)
         tool._print_status("combined")

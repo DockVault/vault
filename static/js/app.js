@@ -1246,6 +1246,7 @@ async function applyLoginPolicyLabel() {
         _initSignupAffordance(policy);
         _initForgotAffordance(policy);
         _initPasskeySignIn(policy);
+        _applyLocalSignIn(policy);
         _initSsoSignIn(policy);
     } catch (_) { /* keep the static fallback */ }
 }
@@ -1927,14 +1928,32 @@ function _noteSignInOrigin(policy, kinds) {
 function _initSsoSignIn(policy) {
     if (!window.Sso) return;
     const providers = (policy && policy.methods && Array.isArray(policy.methods.providers)) ? policy.methods.providers : [];
-    Sso.renderButtons(providers, (message) => { _showLoginError(message); });
+    // A page opened at another address than the configured one offers no button: the provider sends the browser
+    // back to the configured address, to a page that did not start the sign-in. The note says where to go.
+    const elsewhere = _signInOriginElsewhere(policy);
+    Sso.renderButtons(elsewhere ? [] : providers, (message) => { _showLoginError(message); });
+    const kinds = [];
+    if (policy && policy.methods && policy.methods.passkeys) kinds.push('a passkey');
+    if (providers.length) kinds.push("your organisation's sign-in");
+    _noteSignInOrigin(policy, kinds);
 }
 
 // A link an organisation hands out (/?sso=<provider>) starts that provider at once from the sign-in screen: the
 // server says whether the provider can serve a sign-in, and its refusal is shown like any other.
 function _ssoStartHandOut(providerId) {
     if (!window.Sso) return;
-    Sso.startSignIn(providerId).catch((e) => { _showLoginError((e && e.message) || 'This sign-in could not be started.'); });
+    const start = () => Sso.startSignIn(providerId).catch((e) => {
+        _showLoginError((e && e.message) || 'This sign-in could not be started.');
+    });
+    // Opened at another address than the configured one, the link is followed there first: a sign-in started here
+    // would come back to a page that did not start it. The provider's id is one the page already checked.
+    fetch(`${API_BASE}/auth/policy`, { headers: { Accept: 'application/json' } })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((policy) => {
+            const elsewhere = _signInOriginElsewhere(policy);
+            if (elsewhere) location.replace(`${elsewhere}/?sso=${encodeURIComponent(providerId)}`);
+            else start();
+        }, start);
 }
 
 // The page came back from a provider to the sign-in screen: a refusal is said in the server's words for its
@@ -1965,7 +1984,7 @@ async function _ssoOnSignInScreen(back) {
         }
         if (back.returnTo) _hashForSignIn = '#' + back.returnTo;
         wentOn = true;
-        await _passkeySignInAnswer(data);
+        await _passkeySignInAnswer(data, 'provider');
     } catch (_) {
         wentOn = false;
         said = 'This sign-in could not be finished. Start again.';
@@ -2008,7 +2027,7 @@ async function _ssoResume(back) {
 async function _initPasskeySignIn(policy) {
     const button = document.getElementById('passkey-sign-in-btn');
     const offered = !!(policy && policy.methods && policy.methods.passkeys);
-    _noteSignInOrigin(policy, offered ? ['a passkey'] : []);
+    if (!window.Sso) _noteSignInOrigin(policy, offered ? ['a passkey'] : []);     // else written with the providers
     const on = offered && !_signInOriginElsewhere(policy) && !!window.Passkeys && Passkeys.supported();
     if (button) button.style.display = on ? '' : 'none';
     if (!on) return;
@@ -2064,6 +2083,7 @@ function _showLoginError(message) {
     const errorDiv = document.getElementById('login-error');
     if (!errorDiv) return;
     errorDiv.className = 'alert alert-error mt-md';
+    errorDiv.setAttribute('role', 'alert');      // said aloud by a screen reader when it appears
     errorDiv.textContent = message;
     errorDiv.style.display = 'block';
 }
@@ -2142,12 +2162,60 @@ async function _passkeySignIn({ conditional = false } = {}) {
     }
 }
 
-async function _passkeySignInAnswer(data) {
-    if (data.second_factor_required && data.stage === 'password') { _beginPasswordStage(data); return; }
+// `how`: what proved the person so far ('provider' for a sign-in that came back from one; a passkey otherwise).
+async function _passkeySignInAnswer(data, how) {
+    if (data.second_factor_required && data.stage === 'password') { _beginPasswordStage(data, how); return; }
     if (data.second_factor_required) { beginSecondFactor(data); return; }
     const form = document.getElementById('login-form');
     if (form) form.reset();
     await finishSecondFactorLogin(data.access_token);
+}
+
+// The password form behind a link, when every provider of this vault holds its people to no password (the sign-in
+// policy says methods.password 'link'): the page leads with the provider buttons, and the form is one click away,
+// for an administrator and for the day a provider is down. A step that needs the form shows it (the password step).
+function _localSignInParts() {
+    const parts = ['login-submit', 'login-loading-note', 'forgot-toggle'].map((id) => document.getElementById(id)).filter(Boolean);
+    ['username', 'password'].forEach((id) => {
+        const input = document.getElementById(id);
+        const group = input && input.closest ? input.closest('.form-group') : null;
+        if (group) parts.push(group);
+    });
+    return parts;
+}
+
+function _showLocalSignIn(shown) {
+    _localSignInParts().forEach((part) => {
+        if (shown) {
+            if ('localWas' in part.dataset) { part.style.display = part.dataset.localWas; delete part.dataset.localWas; }
+        } else if (!('localWas' in part.dataset)) {
+            part.dataset.localWas = part.style.display;
+            part.style.display = 'none';
+        }
+    });
+}
+
+function _applyLocalSignIn(policy) {
+    const behindLink = !!(policy && policy.methods && policy.methods.password === 'link') && !_passwordStage;
+    let toggle = document.getElementById('local-sign-in-toggle');
+    if (!behindLink) {
+        if (toggle) toggle.remove();
+        _showLocalSignIn(true);
+        return;
+    }
+    if (toggle) return;              // already behind its link, or opened by the person: left as it is
+    _showLocalSignIn(false);
+    toggle = _el('button', 'btn btn-link btn-sm btn-block mt-sm', 'Sign in with a local account');
+    toggle.type = 'button';
+    toggle.id = 'local-sign-in-toggle';
+    toggle.addEventListener('click', () => {
+        _showLocalSignIn(true);
+        toggle.style.display = 'none';
+        const username = document.getElementById('username');
+        if (username) username.focus();
+    });
+    const form = document.getElementById('login-form');
+    if (form) form.appendChild(toggle);
 }
 
 // What a step of a sign-in answered: the session, or a hold for one more step (the password, the second factor, an
@@ -2166,13 +2234,21 @@ async function _signInStepAnswer(data) {
     await finishSecondFactorLogin(data && data.access_token);
 }
 
-function _beginPasswordStage(data) {
+function _beginPasswordStage(data, how) {
     _passwordStage = { token: data.pre_auth_token, username: data.username || '' };
+    _showLocalSignIn(true);         // the password is typed in the form, wherever it was
+    const local = document.getElementById('local-sign-in-toggle');
+    if (local) local.style.display = 'none';
+    // The provider's buttons are another first step: not offered while this sign-in waits for its password.
+    const providers = document.getElementById('sso-sign-in');
+    if (providers) { providers.dataset.wasShown = providers.style.display === 'none' ? '' : '1'; providers.style.display = 'none'; }
     const input = document.getElementById('username');
     if (input) { input.value = _passwordStage.username; input.readOnly = true; }
     const button = document.getElementById('passkey-sign-in-btn');
     if (button) { button.dataset.wasShown = button.style.display === 'none' ? '' : '1'; button.style.display = 'none'; }
-    _loginNote('Your passkey was accepted. Enter your password to finish signing in.');
+    _loginNote(how === 'provider'
+        ? 'You are signed in through your organisation. Enter your password to finish signing in.'
+        : 'Your passkey was accepted. Enter your password to finish signing in.');
     const note = document.getElementById('login-stage-note');
     if (note) {
         const other = _el('button', 'btn btn-link btn-sm', 'Use another account');
@@ -2189,6 +2265,8 @@ function _beginPasswordStage(data) {
 function _endPasswordStage() {
     if (!_passwordStage) return;
     _passwordStage = null;
+    const providers = document.getElementById('sso-sign-in');
+    if (providers && providers.dataset.wasShown) { providers.style.display = ''; providers.dataset.wasShown = ''; }
     const input = document.getElementById('username');
     if (input) input.readOnly = false;
     _loginNote('');

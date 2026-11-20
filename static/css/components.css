@@ -2291,3 +2291,9 @@ details summary:hover {
     100% { box-shadow: 0 0 0 0 transparent; }
 }
 @media (prefers-reduced-motion: reduce) { .is-flashed { animation: none; outline: 3px solid var(--primary, var(--brand-secondary, #2563eb)); } }
+
+/* Single sign-on: the provider buttons on the sign-in page (a long name wraps instead of being cut on a phone),
+   the status beside a provider and what a save said in Settings, the Link buttons in Your account. */
+.sso-sign-in-btn { white-space: normal; overflow-wrap: anywhere; }
+.sso-provider-status, .sso-said { margin-left: var(--space-sm); }
+.identity-link { margin-right: var(--space-sm); }

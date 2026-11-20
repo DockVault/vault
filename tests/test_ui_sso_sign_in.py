@@ -388,3 +388,94 @@ def test_a_sign_out_stays_here_when_the_server_names_no_logout_this_page_will_op
     expect(page.locator("#login-submit")).to_be_enabled(timeout=25000)
     page.wait_for_timeout(500)
     assert page.url.startswith(base_url) and elsewhere == [], elsewhere
+
+
+def test_an_administrator_back_from_the_provider_is_asked_for_the_password_in_words_that_fit(page: Page, base_url):
+    """An administrator types the password after any provider. The step says they are signed in through their
+    organisation (not that a passkey was accepted: none was used), and the provider buttons, which would start
+    another sign-in, are not offered while this one waits for its password; leaving the step brings them back."""
+    stand = Stand(page, base_url)
+    stand.finish_answer = (200, {"access_token": None, "second_factor_required": True, "stage": "password",
+                                 "enrollment_required": False, "methods": ["password"], "enrollment_methods": [],
+                                 "pre_auth_token": "held-password", "username": "an-administrator"})
+    _sign_in_screen(page)
+    buttons = page.locator("#sso-sign-in .sso-sign-in-btn")
+    expect(buttons.first).to_be_visible(timeout=15000)
+    buttons.first.click()
+    note = page.locator("#login-stage-note")
+    expect(note).to_contain_text("You are signed in through your organisation. Enter your password to finish signing in.",
+                                 timeout=20000)
+    expect(note).not_to_contain_text("passkey")
+    expect(page.locator("#username")).to_have_value("an-administrator")
+    expect(page.locator("#sso-sign-in")).to_be_hidden()
+    page.click("#login-stage-cancel")
+    expect(page.locator("#sso-sign-in")).to_be_visible(timeout=8000)
+    expect(page.locator("#login-stage-note")).not_to_contain_text("signed in through your organisation")
+
+
+def test_the_password_form_waits_behind_a_link_when_every_provider_holds_its_people_to_no_password(page: Page, base_url,
+                                                                                                fresh_user):
+    """The administrator's providers all sign their people in without a vault password, and the sign-in page says
+    so by what it leads with: the provider buttons, with the password form one click away for an administrator or
+    for the day a provider is down. Opened, the form signs a local account in as always."""
+    def policy(route):
+        response = route.fetch()
+        body = response.json()
+        body["methods"]["providers"] = [{"id": PROVIDER, "label": "Company sign-in", "kind": "oidc", "icon": "generic",
+                                         "order": 0}]
+        body["methods"]["password"] = "link"
+        route.fulfill(response=response, json=body)
+    page.route("**/auth/policy", policy)
+    page.goto("/")
+    expect(page.locator("#sso-sign-in .sso-sign-in-btn")).to_have_text(["Company sign-in"], timeout=15000)
+    toggle = page.locator("#local-sign-in-toggle")
+    expect(toggle).to_be_visible(timeout=8000)
+    expect(toggle).to_have_text("Sign in with a local account")
+    for part in ("#username", "#password", "#login-submit"):
+        expect(page.locator(part)).to_be_hidden()
+    toggle.click()
+    expect(toggle).to_be_hidden()
+    expect(page.locator("#username")).to_be_focused()
+    page.fill("#username", fresh_user["_username"])
+    page.fill("#password", fresh_user["_password"])
+    page.click("#login-submit")
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+
+
+def test_a_page_opened_at_another_address_offers_no_provider_and_follows_a_hand_out_link_there(page: Page, base_url):
+    """The vault answers to more than one name, and a provider sends people back to one: the configured address. A
+    page opened at another shows no provider button (a sign-in started there would come back to a page that did
+    not start it) and says where to go; a link an organisation handed out is followed at the configured address
+    before anything is started."""
+    elsewhere = "https://vault.example.test"
+
+    def policy(route):
+        response = route.fetch()
+        body = response.json()
+        body["methods"]["providers"] = [{"id": PROVIDER, "label": "Company sign-in", "kind": "oidc", "icon": "generic",
+                                         "order": 0}]
+        body["methods"]["passkeys"] = False
+        body["methods"]["origin"] = elsewhere
+        route.fulfill(response=response, json=body)
+    page.route("**/auth/policy", policy)
+    went, starts = [], []
+
+    def there(route):
+        went.append(route.request.url)
+        route.fulfill(status=200, content_type="text/html", body="<html><body>the configured address</body></html>")
+
+    def start(route):
+        starts.append(route.request.url)
+        route.fulfill(status=409, json={"detail": "Stopped here by the test."})
+    page.route("https://vault.example.test/**", there)
+    page.route(re.compile(r".*/auth/sso/[0-9a-f-]{36}/start$"), start)
+    page.goto("/")
+    expect(page.locator("#login-origin-note")).to_have_text(
+        f"Signing in with your organisation's sign-in works at {elsewhere}. Open the vault there to use it.", timeout=15000)
+    expect(page.locator("#sso-sign-in .sso-sign-in-btn")).to_have_count(0)
+    page.goto(f"/?sso={PROVIDER}")
+    for _ in range(100):
+        if went:
+            break
+        page.wait_for_timeout(200)
+    assert went == [f"{elsewhere}/?sso={PROVIDER}"] and starts == [], (went, starts)

@@ -345,6 +345,16 @@ def test_the_sign_in_page_gets_a_button_for_each_provider_that_is_on_and_shown(m
         {"id": str(on.id), "label": "Company sign-in", "kind": "oidc", "icon": "microsoft", "order": 2}]
     methods = h.S._sign_in_methods(h.db)
     assert methods["providers"] == h.S._sign_in_providers(h.db) and set(methods) == {"password", "passkeys", "providers", "origin"}
+    # The form stays in view while a provider lets its people keep a password; it goes behind a link once every
+    # provider that is on holds its people to none (one that is off, or hidden, does not count).
+    assert methods["password"] == "visible"
+    for row in (on, first, hidden):
+        row.policy = {"sso_password_login": "disabled"}
+    assert h.S._sign_in_methods(h.db)["password"] == "link"
+    first.policy = None
+    assert h.S._sign_in_methods(h.db)["password"] == "visible"
+    for row in (on, first, hidden):
+        row.policy = None
     # Never an issuer, a client id or anything of the connection.
     assert not {"issuer", "client_id", "name", "state"} & set(methods["providers"][0])
     # No address a provider can send the browser back to: no button, since no sign-in could start.

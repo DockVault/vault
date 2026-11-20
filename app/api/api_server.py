@@ -6051,8 +6051,28 @@ def _sign_in_methods(db) -> dict:
     (public already: every emailed link carries it), or none when sign-in cannot be built on it. A page
     opened at any other address says so and offers neither."""
     from app.core import public_url
-    return {"password": "visible", "passkeys": _passkey_sign_in_ready(db), "providers": _sign_in_providers(db),
-            "origin": public_url.public_base_url() or None}
+    providers = _sign_in_providers(db)
+    return {"password": _sign_in_password(db, providers), "passkeys": _passkey_sign_in_ready(db),
+            "providers": providers, "origin": public_url.public_base_url() or None}
+
+
+def _sign_in_password(db, providers) -> str:
+    """How the sign-in page shows the password form: ``visible``, or ``link`` (behind "Sign in with a local
+    account") when the page has provider buttons and every provider that is on holds its people to no password.
+    The people of such a vault sign in through a provider; the form is for administrators, and for the day a
+    provider is down, so it is never ``hidden``. Anything that cannot be read leaves the form in view."""
+    if not providers:
+        return "visible"
+    from app.core import sso_only
+    from app.core.models import SsoProvider
+    from app.services import sso_sign_in
+    try:
+        # Every provider a person can sign in through, with or without a button of its own.
+        rows = [row for row in db.query(SsoProvider).filter(SsoProvider.state == "enabled").all()
+                if sso_sign_in.usable_for(row, "sign_in") is None]
+    except Exception:      # noqa: BLE001 -- the sign-in page still shows its form
+        return "visible"
+    return "link" if rows and all(sso_only.password_less(row) for row in rows) else "visible"
 
 
 def _sign_in_providers(db) -> list:
