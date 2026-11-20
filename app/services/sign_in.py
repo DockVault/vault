@@ -504,25 +504,31 @@ def finish(db, result: SignInResult):
         # sign-in stops at the enrollment (a user-verified passkey meets a pending authenticator enrollment too).
         passkey = api._passkey_requirement(db, user)
         enrollment_methods = list(ENROLLMENT_METHODS) if enrollment_pending else []
+        own_factor_first = password_first = False
         if passkey.paused:
             api._passkey_pause_grace(user)
         if passkey.required:
             api._passkey_mark_required(user)
             enrollment_methods.append("passkey")
             if passkey.overdue:
-                # An account that holds a factor of its own gives it before it enrolls the passkey, whatever the
-                # login switch says: an enrollment straight after the first proof would let whoever knows the
-                # password add a passkey of their own, past the factor the account set up. Only an account with no
-                # factor at all enrolls after its first proof, as a required authenticator is enrolled.
+                # A passkey outlives whatever proved the sign-in it was set up at (it signs in after a provider
+                # was turned off, an identity unlinked), so it is added on no less than Your account asks for the
+                # same act. An account that holds a factor of its own gives that factor first, whatever the login
+                # switch says, and a provider's trusted MFA does not stand in for it here. An account with none
+                # enrolls after its first proof, as a required authenticator is enrolled; where that proof was a
+                # provider and the account has a password it can type, the password comes first.
                 in_effect = True
-                if not holds_a_factor(db, user):
+                if holds_a_factor(db, user):
+                    own_factor_first = True
+                else:
                     enrollment_pending = True
+                    password_first = password_owed_before_an_enrollment(user, result.methods, result.provider_id)
         try:
             stage = second_factor_due(user, result.methods, factor_in_effect=bool(in_effect),
                                       enrollment_pending=enrollment_pending,
                                       passwordless_allowed=result.passwordless_allowed,
                                       user_verified=result.user_verified,
-                                      provider_mfa_trusted=result.provider_mfa_trusted,
+                                      provider_mfa_trusted=result.provider_mfa_trusted and not own_factor_first,
                                       provider_id=result.provider_id)
         except NoFirstProof:
             raise HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")
@@ -532,6 +538,8 @@ def finish(db, result: SignInResult):
             # whatever else was proved. A step the table still asks for (an administrator's password, the
             # account's own second factor) comes first.
             stage = ENROLL
+        if password_first and stage == ENROLL:
+            stage = STAGE_PASSWORD
     if stage == DONE:
         return complete_sign_in(db, result)
     if result.session_token:
@@ -555,16 +563,30 @@ def holds_a_factor(db, user) -> bool:
     return active_factors(db, user.id).any
 
 
+def password_owed_before_an_enrollment(user, methods, provider_id) -> bool:
+    """Whether a sign-in that came through a provider owes the account's password before it sets a passkey up: the
+    password is not among its proofs, and the account has one it can type. An account that signs in only through
+    its provider has none; its passkey signs nobody in without the provider, so the provider is proof enough."""
+    if not provider_id or PASSWORD in set(methods or ()):
+        return False
+    return bool(getattr(user, "password_hash", None)) and not getattr(user, "sso_only", False)
+
+
 def refuse_enrollment_before_the_accounts_factor(db, user, pending) -> None:
-    """A held sign-in sets a passkey up only when nothing of the account's own is still owed: an account that holds
-    a second factor gives it (or comes with a trusted provider's MFA) before it enrolls another. The pipeline
-    makes no enrollment hold that skips the factor; this refuses one at the registration routes all the same,
-    whatever made the token."""
-    if pending is None or not holds_a_factor(db, user):
+    """A held sign-in sets a passkey up only on what Your account asks for the same act: an account that holds a
+    second factor gives that factor first (a provider's trusted MFA does not stand in for it: the passkey would
+    outlive the provider), and an account with none, signed in through a provider, gives its password first when
+    it has one it can type. The pipeline makes no enrollment hold that skips either; this refuses one at the
+    registration routes all the same, whatever made the token."""
+    if pending is None:
         return
-    if (set(methods_so_far(pending)) & SECOND_KINDS) or provider_mfa_of(pending):
-        return
-    raise HTTPException(status_code=401, detail="Confirm your second factor first; start the sign-in again.")
+    methods = set(methods_so_far(pending))
+    if holds_a_factor(db, user):
+        if methods & SECOND_KINDS:
+            return
+        raise HTTPException(status_code=401, detail="Confirm your second factor first; start the sign-in again.")
+    if password_owed_before_an_enrollment(user, methods, provider_of(pending)):
+        raise HTTPException(status_code=401, detail="Enter your password first; start the sign-in again.")
 
 
 def refuse_unless_the_account_may_sign_in(db, user, client_ip: Optional[str]) -> None:

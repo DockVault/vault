@@ -213,6 +213,28 @@ def test_a_second_factor_stage_token_here_is_ignored_and_the_form_sign_in_procee
     assert body["user"]["username"] == "bob" and pending.consumed_at is None and pending.attempts == 0
 
 
+def test_an_ordinary_account_held_for_its_password_after_a_provider_goes_on_to_set_its_passkey_up(stage, monkeypatch):
+    """A role must hold a passkey, the grace is over, and the account (no administrator, no factor of its own) came
+    in through a provider: the sign-in was held for the account's password, since a passkey is set up on no less
+    than Your account asks. The password given, the sign-in stops at the passkey's enrollment, with both proofs
+    carried; the wrong password gets nowhere."""
+    from app.core import webauthn_settings as wss
+    overdue = wss.Requirement(True, overdue=True)
+    monkeypatch.setattr(stage.S, "_passkey_requirement", lambda db, user: overdue)
+    monkeypatch.setattr(stage.S, "_passkey_mark_required", lambda user: False)
+    pending = _pending(stage.alice)
+    stage.db.tables[stage.PendingLogin].append(pending)
+    token = _stage_token(stage.S, stage.alice, pending, methods=(), idp="p1")
+    status, body = _post_login(stage.S, {"username": "alice", "password": "wrong"}, token)
+    assert status == 401 and pending.consumed_at is None, body
+    status, body = _post_login(stage.S, {"username": "alice", "password": "right"}, token)
+    assert status == 200 and body.get("access_token") is None, body
+    assert body["stage"] == "second_factor" and body["enrollment_required"] is True, body
+    assert body["enrollment_methods"] == ["passkey"] and body["pre_auth_token"]
+    held = _claims(body["pre_auth_token"])
+    assert held["methods_so_far"] == ["pwd"] and held["idp"] == "p1" and held["stage"] == "second_factor"
+
+
 def test_a_trusted_provider_mfa_carried_by_the_stage_finishes_an_administrator_without_a_code(stage, monkeypatch):
     admin = _user(role="admin", username="root")
     from app.core.models import User

@@ -38,16 +38,39 @@ def test_a_requirement_past_its_grace_is_met_by_a_passkey_and_nothing_else(monke
     def finish(user, methods, **kw):
         return sign_in.finish(h.db, sign_in.SignInResult(user, methods, "203.0.113.9", **kw))
 
-    # Every way the table is done without a passkey: the password with a code, a provider's trusted MFA, a provider
-    # with the vault's code, a provider alone. Each stops at the passkey enrollment.
+    # Every way the table is done without a passkey, with the password among the proofs: the password with a code,
+    # and the password after a provider (its MFA trusted or not). Each stops at the passkey enrollment.
     for methods, kw in (
             (["pwd", "totp"], {}), (["pwd", "recovery"], {}),
-            ([], {"provider_id": "p", "provider_mfa_trusted": True}),
-            (["totp"], {"provider_id": "p"}), ([], {"provider_id": "p"})):
+            (["pwd"], {"provider_id": "p", "provider_mfa_trusted": True}), (["pwd"], {"provider_id": "p"})):
         outcome = finish(alice, methods, **kw)
         assert isinstance(outcome, sign_in.PendingStep), (methods, kw)
         assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["passkey"], (methods, kw)
         assert outcome.body["stage"] == "second_factor" and outcome.body["access_token"] is None
+    # A provider alone, for an account that has a password it can type: the password first. A passkey outlives the
+    # provider (it signs in after the provider was turned off or the identity unlinked), so it is set up on no less
+    # than Your account asks of an account with no factor: its password.
+    for kw in ({"provider_id": "p", "provider_mfa_trusted": True}, {"provider_id": "p"}):
+        outcome = finish(alice, [], **kw)
+        assert isinstance(outcome, sign_in.PendingStep) and outcome.body["stage"] == "password", kw
+        assert outcome.body["enrollment_required"] is False and outcome.body["access_token"] is None, kw
+    # An account that signs in only through its provider has no password to type, and its passkey signs nobody in
+    # without the provider: the provider is proof enough.
+    alice.sso_only = True
+    for kw in ({"provider_id": "p", "provider_mfa_trusted": True}, {"provider_id": "p"}):
+        outcome = finish(alice, [], **kw)
+        assert isinstance(outcome, sign_in.PendingStep) and outcome.body["stage"] == "second_factor", kw
+        assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["passkey"], kw
+    alice.sso_only = False
+    # The rule itself: only after a provider, only without the password among the proofs, only for an account that
+    # has a password it can type.
+    owed = sign_in.password_owed_before_an_enrollment
+    assert owed(alice, [], "p") is True and owed(alice, ["totp"], "p") is True
+    assert owed(alice, ["pwd"], "p") is False and owed(alice, [], None) is False and owed(alice, ["hwk"], None) is False
+    alice.password_hash, kept = None, alice.password_hash            # and so has an account with no password at all
+    outcome = finish(alice, [], provider_id="p")
+    assert outcome.body["enrollment_required"] is True and outcome.body["stage"] == "second_factor"
+    alice.password_hash = kept
     assert all(a[0] != "success" for a in h.audits)
     # A passkey among the proofs meets it, whatever else was proved.
     assert isinstance(finish(alice, ["pwd", "hwk"]), sign_in.SignedIn)
@@ -94,9 +117,16 @@ def test_an_overdue_requirement_asks_the_accounts_own_factor_before_the_enrollme
         assert outcome.body["stage"] == "second_factor" and outcome.body["enrollment_required"] is False, (methods, kw)
         assert outcome.body["methods"] == ["totp", "recovery"] and outcome.body["enrollment_methods"] == [], (methods, kw)
         assert outcome.body["access_token"] is None
-    # The code given, or a trusted provider's MFA in its place: now the passkey is asked for.
+    # A provider whose MFA is trusted does not stand in for the account's code here, with or without the password:
+    # Your account asks a holder of a factor for that factor before it adds a passkey, and so does the sign-in.
+    for methods in ([], ["pwd"]):
+        outcome = finish(alice, methods, provider_id="p", provider_mfa_trusted=True)
+        assert isinstance(outcome, sign_in.PendingStep), methods
+        assert outcome.body["stage"] == "second_factor" and outcome.body["enrollment_required"] is False, methods
+        assert outcome.body["methods"] == ["totp", "recovery"] and outcome.body["enrollment_methods"] == [], methods
+    # The code given: now the passkey is asked for.
     for methods, kw in ((["pwd", "totp"], {}), (["pwd", "recovery"], {}), (["totp"], {"provider_id": "p"}),
-                        ([], {"provider_id": "p", "provider_mfa_trusted": True})):
+                        (["totp"], {"provider_id": "p", "provider_mfa_trusted": True})):
         outcome = finish(alice, methods, **kw)
         assert isinstance(outcome, sign_in.PendingStep), (methods, kw)
         assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["passkey"], (methods, kw)
@@ -212,8 +242,9 @@ def test_whether_a_passkey_can_be_made_is_what_the_address_says(monkeypatch):
 
 def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monkeypatch):
     """The registration routes refuse a held sign-in that would enroll a passkey before the account's own factor
-    was given, whatever made the token; with the code among its proofs, or a trusted provider's MFA, it registers,
-    and the sign-in then finishes with the new key."""
+    was given, whatever made the token, a trusted provider's MFA included; with the code among its proofs it
+    registers, and the sign-in then finishes with the new key. An account with no factor, held after a provider's
+    sign-in, registers nothing before its password was given, unless it has none it can type."""
     registry, wss = _mod()
     overdue = datetime.utcnow() - timedelta(days=20)
     alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
@@ -232,10 +263,37 @@ def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monke
     pending.enrollment_required = True
     assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 401
     assert h.db.rows_of(WebAuthnCredential) == [] and pending.consumed_at is None
-    # A provider whose MFA is trusted stands in for the code.
+    # A provider whose MFA is trusted does not stand in for the code: the passkey would outlive the provider.
     pending, headers = h.pending_for(alice, methods=(), provider="p", provider_mfa=True)
     pending.enrollment_required = True
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == 401 and body["detail"] == "Confirm your second factor first; start the sign-in again.", body
+    status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)
+    assert status == 401, body
+    assert h.db.rows_of(WebAuthnCredential) == []
+    # An account with no factor, after a provider: its password first, where it has one it can type.
+    from app.core.models import SecondFactorEnrollment
+    factor = h.db.rows_of(SecondFactorEnrollment).pop()
+    for provider_mfa in (False, True):
+        pending, headers = h.pending_for(alice, methods=(), provider="p", provider_mfa=provider_mfa)
+        pending.enrollment_required = True
+        status, body = _call_h(h.S, "POST", options_path, {}, headers)
+        assert status == 401 and body["detail"] == "Enter your password first; start the sign-in again.", body
+        status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)
+        assert status == 401 and body["detail"] == "Enter your password first; start the sign-in again.", body
+    assert h.db.rows_of(WebAuthnCredential) == []
+    pending, headers = h.pending_for(alice, methods=("pwd",), provider="p")         # the password given
+    pending.enrollment_required = True
     assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 200
+    alice.sso_only = True                                                           # none it can type
+    pending, headers = h.pending_for(alice, methods=(), provider="p")
+    pending.enrollment_required = True
+    assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 200
+    alice.sso_only = False
+    pending, headers = h.pending_for(alice)                                         # the password alone, no provider
+    pending.enrollment_required = True
+    assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 200
+    h.db.rows_of(SecondFactorEnrollment).append(factor)
     # The code among the proofs: the registration goes through and finishes the sign-in.
     pending, headers = h.pending_for(alice, methods=("pwd", "totp"))
     pending.enrollment_required = True
