@@ -67,7 +67,10 @@ def test_an_account_is_fresh_while_its_last_provider_sign_in_is_younger_than_the
     assert F.deadlines(db, alice.id)[0].due == i.linked_at + 30 * DAY
 
 
-def test_a_provider_that_is_off_or_not_enabled_asks_nothing_and_others_are_untouched():
+def test_the_days_go_on_counting_while_a_provider_is_off_and_others_are_untouched():
+    """A provider with no days set asks nothing. One that is turned off goes on counting: nobody can sign in through
+    it then, so a person's keys pause on the day they would have. Otherwise someone who stopped signing in (a
+    leaver whose days end tomorrow) would keep their keys for as long as the provider stayed off."""
     alice, bob, p = _user(), _user("bob"), _provider(30)
     i = _identity(alice, p, signed_in=NOW - 90 * DAY)
     db = _db([alice, bob], [p], [i])
@@ -78,7 +81,16 @@ def test_a_provider_that_is_off_or_not_enabled_asks_nothing_and_others_are_untou
     p.policy = {"sso_freshness_days": 30}
     for state in ("disabled", "draft"):
         p.state = state
+        assert F.lapsed(db, alice.id, now=NOW) is not None, state
+        # Still inside the days when the provider went off: nothing yet, and the pause comes on its day.
+        i.last_sign_in_at = NOW - 29 * DAY
         assert F.lapsed(db, alice.id, now=NOW) is None, state
+        assert F.due_date(db, alice.id) == NOW + DAY, state
+        assert F.lapsed(db, alice.id, now=NOW + 2 * DAY) is not None, state
+        i.last_sign_in_at = NOW - 90 * DAY
+        p.policy = {"sso_freshness_days": 0}                 # the rule is ended by its days, on or off
+        assert F.lapsed(db, alice.id, now=NOW) is None, state
+        p.policy = {"sso_freshness_days": 30}
     assert F.lapsed(_db(), alice.id, now=NOW) is None and F.lapsed(db, None, now=NOW) is None
 
 

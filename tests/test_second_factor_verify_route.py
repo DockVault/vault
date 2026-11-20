@@ -16,6 +16,16 @@ from _memory_db import MemoryDB
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _the_provider_stands(monkeypatch):
+    """These tests name a provider by a made-up id. Whether a provider is still on, and the account still linked to
+    it, when a sign-in finishes is pinned in tests/test_sso_only.py; here that check is out of the way."""
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    from app.services import sign_in
+    monkeypatch.setattr(sign_in, "refuse_unless_the_provider_stands", lambda db, result: None)
+
+
 def _api():
     set_bare_api_env()
     import app.api.api_server as S

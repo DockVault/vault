@@ -219,12 +219,13 @@ WHERE_IT_IS = ("issuer", "discovery_url", "private_network")
 
 
 def hold_lapsed(db, row, *, now=None) -> int:
-    """Before ``row`` is turned off, in the caller's transaction: every identity of it whose freshness window has
-    already run out is recorded as held (``refused_at``). A provider that is off asks nothing, so without this
+    """Before ``row`` is turned off, and again before it is removed, in the caller's transaction: every identity
+    of it whose freshness window has already run out is recorded as held (``refused_at``). The window goes on
+    counting while a provider is off, but a removed provider has no identities left to count for: without this
     the people who stopped signing in there (the ones the window is for) would get their SSH keys, temporary
-    credentials and devices back the moment it is turned off, and for good once it is removed. A held identity is
-    lifted as a refusal is: by a later sign-in the provider admits, or by another administrator; and a provider
-    is not removed while it holds one. Returns how many were held."""
+    credentials and devices back for good once it is removed. A held identity is lifted as a refusal is: by a
+    later sign-in the provider admits, or by another administrator; and a provider is not removed while it holds
+    one. Returns how many were held."""
     from datetime import datetime
     from app.core.models import ExternalIdentity
     from app.services import sso_freshness

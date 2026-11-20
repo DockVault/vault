@@ -473,6 +473,60 @@ def test_the_password_door_and_the_pipeline_record_the_same_reason():
     assert sign_in.PROVIDER_ONLY_REASON == "Account signs in only through its identity provider"
 
 
+def test_a_provider_sign_in_is_finished_only_while_its_provider_is_on_and_the_account_linked(monkeypatch):
+    """The provider answered at the callback; the code handed to the page lives a minute after it, and a held step
+    (the account's factor, an administrator's password, an enrollment) five. A provider turned off in that time,
+    by an administrator or by a change to its connection, ends the sign-ins under way with it, and so does an
+    unlink: none becomes a session, and none stamps its identity as freshly signed in."""
+    from fastapi import HTTPException
+    from app.core.models import ExternalIdentity
+    from app.services import sign_in as s
+    alice, p = _user(), _provider()
+    identity = _identity(alice, p)
+    h = Resolving(monkeypatch, [alice], [p], identities=[identity])
+    monkeypatch.setattr(h.S, "_login_second_factor_in_effect", lambda db, user: False)
+    stamped = []
+    monkeypatch.setattr(s, "_stamp_identity", lambda db, result: stamped.append(result.provider_id))
+
+    def result(**extra):
+        return s.SignInResult(alice, [], "203.0.113.9", provider_id=str(p.id), **extra)
+    s.refuse_unless_the_provider_stands(h.db, result())                                   # on, and linked
+    s.refuse_unless_the_provider_stands(h.db, s.SignInResult(alice, [s.PASSWORD], "203.0.113.9"))            # no provider
+    s.refuse_unless_the_provider_stands(h.db, result(is_temporary=True))
+    for change in ("off", "draft", "unlinked", "gone", "not an id"):
+        p.state, rows, named = "enabled", h.db.rows_of(ExternalIdentity), str(p.id)
+        if identity not in rows:
+            rows.append(identity)
+        if change in ("off", "draft"):
+            p.state = "disabled" if change == "off" else "draft"
+        elif change == "unlinked":
+            rows.remove(identity)
+        elif change == "gone":
+            named = str(__import__("uuid").uuid4())
+        else:
+            named = "p1"
+        before = len([a for a in h.audits if a[0] == "login_failure"])
+        with pytest.raises(HTTPException) as refused:
+            s.refuse_unless_the_provider_stands(h.db, s.SignInResult(alice, [], "203.0.113.9", provider_id=named))
+        assert refused.value.status_code == 401 and "start again" in refused.value.detail, change
+        assert len([a for a in h.audits if a[0] == "login_failure"]) == before + 1, change
+    p.state = "enabled"
+    if identity not in h.db.rows_of(ExternalIdentity):
+        h.db.rows_of(ExternalIdentity).append(identity)
+    # Through the routes: the provider answers, it is turned off, and the code the page holds finishes nothing.
+    location, _ = _sign_in(h, p)
+    assert location.startswith("/#sso="), location
+    p.state = "disabled"
+    status, body = h.finish(location)
+    assert status == 401 and not (body or {}).get("access_token"), (status, body)
+    assert stamped == []
+    # The control: left on, the same sign-in is a session and stamps its identity.
+    p.state = "enabled"
+    location, _ = _sign_in(h, p)
+    status, body = h.finish(location)
+    assert status == 200 and body.get("access_token") and stamped == [str(p.id)], (status, body, stamped)
+
+
 def test_the_rule_is_asked_in_the_one_place_every_sign_in_finishes():
     """Every way in finishes in the pipeline's ``finish``; the rule sits there once, after the account-state checks
     and before the second-factor table, so no route can skip it."""
@@ -481,5 +535,8 @@ def test_the_rule_is_asked_in_the_one_place_every_sign_in_finishes():
     from app.services import sign_in
     source = inspect.getsource(sign_in.finish)
     assert source.count("refuse_without_the_provider(db, result)") == 1
+    assert source.count("refuse_unless_the_provider_stands(db, result)") == 1
+    assert (source.index("refuse_without_the_provider(") < source.index("refuse_unless_the_provider_stands(")
+            < source.index("second_factor_due("))
     assert (source.index("refuse_unless_the_account_may_sign_in(") < source.index("refuse_without_the_provider(")
             < source.index("second_factor_due("))

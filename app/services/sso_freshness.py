@@ -55,13 +55,15 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
     made since the person's last sign-in through it pauses the keys whatever the window and whatever has become of
     the provider since: disabling a provider (during an incident, say) must not hand keys back to people it excluded.
     Only a later sign-in it admits, or an administrator clearing the refusal, lifts it. Otherwise a provider asks
-    only while it is enabled and its freshness is on."""
+    while its freshness is on, whether it is on or off itself: the days go on counting while a provider is turned
+    off (nobody can sign in through it then, so the keys pause on the day they would have), or a person who
+    stopped signing in would keep their keys for as long as the provider stayed off. Turning the days to 0 ends
+    the rule."""
     last = identity.last_sign_in_at
     refused_at = getattr(identity, "refused_at", None)
     refused = refused_at is not None and (last is None or refused_at >= last)
-    enabled = provider is not None and getattr(provider, "state", None) == "enabled"
-    days = sso_policy.effective(getattr(provider, "policy", None))["sso_freshness_days"] if enabled else 0
-    if not refused and (not enabled or days <= 0):
+    days = sso_policy.effective(getattr(provider, "policy", None))["sso_freshness_days"] if provider is not None else 0
+    if not refused and days <= 0:
         return None
     since = last or identity.linked_at or datetime.utcnow()
     due = since + timedelta(days=days) if days > 0 else refused_at

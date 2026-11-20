@@ -335,10 +335,10 @@ def test_pointing_a_provider_somewhere_else_drops_the_stored_secret(P, db):
 
 
 def test_turning_a_provider_off_holds_the_accounts_whose_sign_in_there_had_lapsed(P, db):
-    """A provider that is off asks nothing of anyone, so the people who stopped signing in there would get their
-    keys back the moment it is turned off. Before it is, each identity whose window has already run out is recorded
-    as held: it stays paused while the provider is off, the provider is not removed while it holds one, and it is
-    lifted as a refusal is. An identity still inside its window, and one already refused, are left as they are."""
+    """Before a provider is turned off, each identity whose window has already run out is recorded as held: the
+    provider is not removed while it holds one (a removal would lift the pause unseen), and it is lifted as a refusal
+    is. An identity still inside its window, and one already refused, are left as they are; the days of the first go
+    on counting while the provider is off, and it is held in its turn when they have run out."""
     from datetime import timedelta
     from app.services import sso_freshness as F
     now = datetime.utcnow()
@@ -356,9 +356,13 @@ def test_turning_a_provider_off_holds_the_accounts_whose_sign_in_there_had_lapse
     row.state = "disabled"
     held = F.deadline_of(gone, row)
     assert held is not None and held.refused                    # paused though the provider is off
-    assert F.deadline_of(here, row) is None                      # inside its window when the provider went off
+    inside = F.deadline_of(here, row)                            # inside its window when the provider went off
+    assert inside is not None and not inside.refused and now < inside.due <= now + timedelta(days=7)
     assert P.remove_refusal(db, row).reason == P.REFUSALS_IN_FORCE
-    assert P.hold_lapsed(db, row, now=now) == 0                  # nothing more to hold
+    assert P.hold_lapsed(db, row, now=now) == 0                  # nothing more to hold today
+    later = now + timedelta(days=8)                              # its days ran out while the provider was off
+    assert P.hold_lapsed(db, row, now=later) == 1 and here.refused_at == later
+    here.refused_at = None
     # A provider that asks for no window holds nobody.
     other = _ready(P, db, name="no-window")
     other.state = "enabled"

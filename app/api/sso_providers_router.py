@@ -330,6 +330,11 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
+    if row.state != providers.ENABLED and providers.hold_lapsed(db, row):
+        # People whose days ran out while the provider was off: held now, so the removal does not lift the pause
+        # unseen. The holds stand whatever becomes of this request.
+        db.commit()
+        row = _row_or_404(db, provider_id)
     refusal = providers.remove_refusal(db, row)
     if refusal is not None:
         raise _refused(refusal)

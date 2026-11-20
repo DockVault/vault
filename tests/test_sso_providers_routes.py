@@ -242,6 +242,29 @@ def test_a_provider_is_removed_with_its_links_only_when_nothing_depends_on_it(mo
     assert h.call("DELETE", path)[0] == 404
 
 
+def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_was_off(monkeypatch):
+    """A removed provider has no identities left to count days for. A person whose days ran out while it was off
+    would get their keys back for good, unseen: the removal holds them first, the hold is kept whatever becomes of
+    the request, and the removal is refused until an administrator has cleared it."""
+    from datetime import datetime, timedelta
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7}
+    alice, bob = _user("alice"), _user("bob")
+    now = datetime.utcnow()
+    lapsed = _identity(alice, row, last_sign_in_at=now - timedelta(days=30), linked_at=now - timedelta(days=60),
+                       refused_at=None)
+    inside = _identity(bob, row, last_sign_in_at=now - timedelta(days=1), linked_at=now - timedelta(days=60),
+                       refused_at=None)
+    h = Admin(monkeypatch, [row], users=[alice, bob], identities=[lapsed, inside])
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["reason"] == "refusals_in_force", out
+    assert lapsed.refused_at is not None and inside.refused_at is None and h.rows() == [row] and h.order == []
+    lapsed.refused_at = None                                    # cleared, and signed in since
+    lapsed.last_sign_in_at = now
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 200 and out == {"removed": True}, out
+
+
 def test_a_locked_deployment_changes_nothing_and_asks_nothing(monkeypatch):
     row = _tested(_provider(state="draft", created_at=None, updated_at=None))
     h = Admin(monkeypatch, [row])

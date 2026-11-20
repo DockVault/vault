@@ -610,6 +610,9 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
 # The reason an account that signs in only through its identity provider is refused at a door that is not the
 # provider: the password door (app/services/auth_service.py) and every other first proof here record the same text.
 PROVIDER_ONLY_REASON = "Account signs in only through its identity provider"
+# The audit's reason for a provider sign-in that was not finished because its provider was turned off, or the
+# account unlinked from it, after the provider answered.
+PROVIDER_GONE_REASON = "The identity provider was turned off or unlinked before the sign-in finished"
 
 
 def refuse_without_the_provider(db, result: SignInResult) -> None:
@@ -630,6 +633,36 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
     except Exception:  # noqa: BLE001 -- the refusal stands without its row
         db.rollback()
     raise ProviderOnly(message)
+
+
+def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
+    """A sign-in that came through a provider is finished only while that provider is on and the account is still
+    linked to it. The provider's answer was taken at the callback; the handover code lives a minute after it and
+    a held step (the account's second factor, an administrator's password, an enrollment) five. An administrator
+    who turns the provider off in that time, or a change to its connection that does, ends the sign-ins under way
+    with it: without this each would still become a session, and would stamp its identity as freshly signed in."""
+    if result.is_temporary or not result.provider_id:
+        return
+    stands = False
+    try:
+        import uuid
+        from app.core.models import ExternalIdentity, SsoProvider
+        provider_id = uuid.UUID(str(result.provider_id))
+        row = db.query(SsoProvider).filter(SsoProvider.id == provider_id).first()
+        if row is not None and getattr(row, "state", None) == "enabled":
+            stands = db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == provider_id,
+                                                         ExternalIdentity.user_id == result.user.id).first() is not None
+    except ValueError:
+        stands = False                  # not a provider's id at all
+    if stands:
+        return
+    from app.api import api_server as api
+    try:
+        api.AuditLogger(db).log_login_failure(result.user.username, result.client_ip, PROVIDER_GONE_REASON,
+                                              account=result.user, login_identifier="sso")
+    except Exception:  # noqa: BLE001 -- the refusal stands without its row
+        db.rollback()
+    raise HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")
 
 
 def carry_provider_session(result: SignInResult) -> None:
@@ -660,6 +693,7 @@ def finish(db, result: SignInResult):
     else:
         refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
         refuse_without_the_provider(db, result)
+        refuse_unless_the_provider_stands(db, result)
         in_effect = api._login_second_factor_in_effect(db, user)
         enrollment_pending = bool(in_effect) and api._second_factor_effective(db, user)["state"] == "pending"
         # A role that must hold a passkey: the grace runs from the first sign-in under the requirement; past it the

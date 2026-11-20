@@ -425,7 +425,8 @@
         box.appendChild(back.group);
         box.appendChild(out.group);
         box.appendChild(field('Days a person may go without signing in through the provider', fresh,
-            'After that their SSH keys, temporary credentials and devices pause until they sign in again. 0: no limit.'));
+            'After that their SSH keys, temporary credentials and devices pause until they sign in again. The days go '
+            + 'on counting while the provider is turned off. 0: no limit.'));
         box.appendChild(ends.group);
         const said = _el('span', 'text-sm ml-sm sso-said');
         box.appendChild(saveBar(() => {
