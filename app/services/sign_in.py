@@ -374,6 +374,16 @@ def refuse_unless_the_account_may_sign_in(db, user, client_ip: Optional[str]) ->
             "Account is locked", locked_until=lock.locked_until, scope=lock.scope))
 
 
+def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: Optional[str]) -> None:
+    """On a held sign-in, before a factor is stored or made active for the account: refuse what :func:`finish`
+    refuses. It is asked there only after the factor stands, and a factor outlives the sign-in it was set up at:
+    one stored for an account that was locked or turned off while its enrollment was open would stay after the
+    refusal. With a session there is nothing to ask here: the session is the account's own."""
+    if pending is None:
+        return
+    refuse_unless_the_account_may_sign_in(db, user, client_ip)
+
+
 def complete_sign_in(db, result: SignInResult) -> SignedIn:
     """Make the session and the token, and the records every sign-in makes.
 

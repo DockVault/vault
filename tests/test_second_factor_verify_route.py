@@ -65,6 +65,55 @@ def _user(role="user"):
                                  groups=[], password_hash="x")
 
 
+@pytest.mark.parametrize("state", ["locked", "turned off", "locked out here", "in order"])
+def test_a_held_sign_in_makes_no_factor_active_for_an_account_that_may_not_sign_in(monkeypatch, state):
+    """A sign-in held for a required enrollment stays open five minutes. An account locked or turned off in that
+    time (an incident) is refused by the pipeline, but only after the enrollment was made active: the factor would
+    stand on the account after the refusal. The refusal comes first: nothing is made active, nothing is written,
+    and the pipeline is not asked. With a session, and for an account in order, the enrollment goes on as before."""
+    from fastapi import HTTPException
+    S = _api()
+    from app.core import sign_in_lockout
+    from app.core.models import SecondFactorEnrollment, User
+    from app.services import sign_in
+    user = _user()
+    user.second_factor_reset_at = None
+    enrollment = types.SimpleNamespace(user_id=user.id, status="unconfirmed", method="totp",
+                                       confirmed_at=datetime.utcnow())
+    db = MemoryDB({User: [user], SecondFactorEnrollment: [enrollment]})
+    pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, _methods_so_far=("password",))
+    asked = []
+    monkeypatch.setattr(S, "_sf_recovery_remaining", lambda db, user_id: 10)
+    monkeypatch.setattr(S, "get_client_ip", lambda request: "203.0.113.9")
+    monkeypatch.setattr(sign_in, "finish", lambda db, result: asked.append(result.methods) or sign_in.SignedIn("token", user))
+    lock = types.SimpleNamespace(locked_until=datetime.utcnow() + timedelta(minutes=5), scope="address")
+    monkeypatch.setattr(sign_in_lockout, "lock_in_force",
+                        lambda db, user_id, ip: lock if state == "locked out here" and ip == "203.0.113.9" else None)
+    if state == "locked":
+        user.is_locked = True
+    elif state == "turned off":
+        user.is_active = False
+
+    def acknowledge(principal):
+        return run_coroutine(S.acknowledge_recovery_codes(request=None, principal=principal, db=db), timeout=30)
+
+    if state == "in order":
+        out = acknowledge((user, pending))
+        assert out["enrolled"] is True and out["access_token"] == "token" and enrollment.status == "active"
+        assert asked == [["password", "totp"]]
+        return
+    with pytest.raises(HTTPException) as refused:
+        acknowledge((user, pending))
+    assert refused.value.status_code == (401 if state == "turned off" else 403)
+    assert enrollment.status == "unconfirmed" and asked == [] and ("commit",) not in db.log
+    # With a session of its own, the account is not held to this: the session is the proof, and it is checked
+    # where sessions are (an account locked or turned off has none).
+    monkeypatch.setattr(S, "_revoke_sessions", lambda *a, **kw: 0)
+    monkeypatch.setattr(S, "_current_session_token", lambda request: "the-session")
+    out = acknowledge((user, None))
+    assert out["enrolled"] is True and enrollment.status == "active" and asked == []
+
+
 @pytest.fixture
 def verify(monkeypatch):
     S = _api()

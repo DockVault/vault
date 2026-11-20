@@ -11163,6 +11163,8 @@ async def acknowledge_recovery_codes(
         raise HTTPException(status_code=400, detail="Confirm a code and generate recovery codes first.")
     if _sf_recovery_remaining(db, current_user.id) == 0:
         raise HTTPException(status_code=400, detail="Generate recovery codes before activating.")
+    # A sign-in held for this enrollment: the factor is made active only where the sign-in could still finish.
+    sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, current_user, pending, get_client_ip(request))
     enr.status = "active"
     # Set up again after an administrator's reset: the requirement that asked for it is met.
     current_user.second_factor_reset_at = None
