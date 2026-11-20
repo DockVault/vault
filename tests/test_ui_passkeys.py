@@ -338,3 +338,26 @@ def test_a_refused_passkey_sign_in_lets_the_page_be_replaced_and_the_new_page_sa
     expect(page.locator("#login-screen")).to_be_visible(timeout=10000)
     expect(page.locator("#dashboard-screen")).to_be_hidden()
     expect_reason(page, "That passkey was not accepted here.")
+
+
+def test_the_users_page_lists_how_each_account_signs_in(page: Page, no_offer, authenticator, fresh_user, admin_creds):
+    """An administrator sees, for every account, the ways it signs in: the password, and its passkeys once it has
+    any. The column sits between the role and the departments, and an opened row still spans the whole table."""
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    _add_first_passkey(page, fresh_user["_password"], "Laptop")
+    _sign_out(page)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"users\"]').click()")
+    table = page.locator("#users-list table")
+    expect(table).to_be_visible(timeout=10000)
+    titles = [t.strip() for t in table.locator("thead th").all_text_contents()]
+    assert titles[titles.index("Role") + 1] == "Sign-in methods" and titles[titles.index("Role") + 2] == "Departments"
+    page.fill("#users-search", fresh_user["_username"])
+    row = table.locator("tbody tr", has_text=fresh_user["_username"]).first
+    methods = row.locator("td.col-methods .badge")
+    expect(methods).to_have_text(["Password", "Passkey"])
+    # The account's details, opened, take the table's full width with the new column in it.
+    row.locator(".exp-toggle").click()
+    detail = table.locator("tbody td[colspan]").first
+    expect(detail).to_be_visible()
+    assert detail.get_attribute("colspan") == str(len(titles))

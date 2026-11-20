@@ -277,3 +277,19 @@ def test_a_passkey_is_the_second_step_after_the_password_and_proves_a_step_up(pe
     # The receipt was spent with that call.
     r = me.delete(f"/users/me/passkeys/{key_id}", headers={"X-Second-Factor": receipt})
     assert r.status_code in (403, 404)
+
+
+def test_the_user_list_counts_the_passkeys_each_account_holds(person, admin):
+    """The Users page's sign-in methods column reads it: an account's passkeys, retired ones not counted."""
+    client, uid = person
+
+    def counted():
+        rows = admin.get("/users").json()
+        return next(row["passkey_count"] for row in rows if row["id"] == uid)
+
+    assert counted() == 0
+    r, _ = _register(client, "Laptop")
+    assert r.status_code == 201, r.text
+    assert counted() == 1
+    assert admin.delete(f"/users/{uid}/passkeys/{r.json()['id']}").status_code == 200
+    assert counted() == 0

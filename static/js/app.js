@@ -6901,6 +6901,21 @@ function groupChip(g, removable, userId) {
 }
 
 // Render the filtered users table (re-runs on each search/filter change)
+// The ways an account signs in, for the Users table: the password, an authenticator app, its passkeys. Every word
+// here is the page's own and the count is a number, so the result is safe to place as markup.
+function signInMethods(u) {
+    const methods = ['Password'];
+    if (u.second_factor_enabled) methods.push('Authenticator');
+    const passkeys = Number(u.passkey_count) || 0;
+    if (passkeys === 1) methods.push('Passkey');
+    else if (passkeys > 1) methods.push(`${passkeys} passkeys`);
+    return methods;
+}
+
+function signInMethodBadges(u) {
+    return signInMethods(u).map((m) => `<span class="badge badge-secondary">${escapeHtml(m)}</span>`).join('');
+}
+
 function renderUsersTable() {
     const container = document.getElementById('users-list');
     if (!container) return;
@@ -6940,6 +6955,7 @@ function renderUsersTable() {
                         <th class="col-toggle"></th>
                         <th data-col="user">User</th>
                         <th data-col="role">Role</th>
+                        <th data-col="signin-methods">Sign-in methods</th>
                         <th class="col-depts" data-col="departments">Departments</th>
                         <th data-col="status">Status</th>
                         <th data-col="mfa">MFA</th>
@@ -7030,6 +7046,7 @@ function renderUserRow(u) {
                 </div>
             </td>
             <td><span class="badge badge-${u.role}">${u.role}</span></td>
+            <td class="col-methods"><div class="badge-row">${signInMethodBadges(u)}</div></td>
             <td class="col-depts"><div class="chip-row">${groupChips}</div></td>
             <td><div class="badge-row">
                 <span class="badge badge-${u.is_active ? 'success' : 'secondary'}">${u.is_active ? 'Active' : 'Inactive'}</span>
@@ -7043,7 +7060,7 @@ function renderUserRow(u) {
             <td class="col-time">${People.whenPlaceholder(u.created_at)}</td>
         </tr>
         <tr class="exp-detail${open ? ' is-open' : ''}" data-id="${u.id}">
-            <td colspan="8">${renderUserDetail(u)}</td>
+            <td colspan="9">${renderUserDetail(u)}</td>
         </tr>`;
 }
 

@@ -40,9 +40,12 @@ def test_the_users_table_has_its_two_new_columns_and_the_detail_row_spans_them()
     app = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     head = app[app.index("function renderUsersTable() {"):]
     head = head[:head.index("\nfunction ")]
-    assert len(re.findall(r"<th[ >]", head)) == 8, re.findall(r"<th[ >]", head)
+    assert len(re.findall(r"<th[ >]", head)) == 9, re.findall(r"<th[ >]", head)
     assert '<th data-col="last-signin">Last sign-in</th>' in head and '<th data-col="created">Created</th>' in head
-    assert 'colspan="8"' in app[app.index("function renderUserRow(u) {"):app.index("function renderUserDetail(u) {")]
+    # How each account signs in sits between its role and its departments.
+    assert ('<th data-col="role">Role</th>\n                        <th data-col="signin-methods">Sign-in methods</th>\n'
+            '                        <th class="col-depts" data-col="departments">Departments</th>') in head
+    assert 'colspan="9"' in app[app.index("function renderUserRow(u) {"):app.index("function renderUserDetail(u) {")]
 
 
 def test_the_stylesheets_keep_their_order():
