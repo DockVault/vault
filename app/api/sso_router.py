@@ -524,7 +524,11 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
     vault sessions it names (by the provider's session id, else by the subject) are ended, those and no others.
     200 on success; 400 with ``{"error": "invalid_request"}`` for a token that is not valid, never a body that says
     why; 501 with ``{"error": "logout_failed"}`` when the vault could not act on a token (the limiter, the store, the
-    provider's keys unreachable), the code the specification gives a failed logout, so the provider may try again."""
+    provider's keys unreachable). The specification (Back-Channel Logout 1.0, 2.8) gives 400 for a failed logout as
+    well; the vault answers a server error on purpose, so that a provider which sends again after one does, and the
+    token, which was not spent, ends the sessions then. A provider that follows the text to the letter reads either
+    as a logout that failed. Every answer carries ``Cache-Control: no-store``, as the specification asks: the server
+    sets it on every answer of the API, and the route's tests hold each of its answers to it."""
     api = _api()
     client_ip = api.get_client_ip(request)
     from app.core import sign_in_lockout

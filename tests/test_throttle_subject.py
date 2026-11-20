@@ -549,6 +549,67 @@ def test_every_public_route_budget_answers_503_while_the_limiter_cannot_count(mo
         assert refused.value.status_code == 503, (fn.__name__, refused.value.status_code, refused.value.detail)
 
 
+# The budgets that fail closed outside the server's main module, by the function that keeps each, and what it does
+# while the limiter cannot count: 503 for a route of the web app; the provider's logout answers the provider its own
+# code for a logout that failed; the count of refused logouts writes nothing.
+OTHER_MODULES = {
+    "email_studio_router.py": {"_rate_limit": 503},
+    "sso_router.py": {"_limit_start": 503, "_invitation_for_start": 503, "_claim_handover": 503,
+                      "backchannel_logout": "its own answer", "_note_refused_logout": "writes nothing"},
+}
+
+
+def _fail_closed_functions(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return {fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(isinstance(k, ast.keyword) and k.arg == "fail_open" and getattr(k.value, "value", None) is False
+                    for k in ast.walk(fn))}
+
+
+def test_every_budget_outside_the_main_module_that_fails_closed_answers_503_too(monkeypatch):
+    """The same rule for every other module of routes: a budget that fails closed refuses with 503 while the limiter
+    cannot count, never with 500. The table is every such function under app/api but the main module's, read from
+    the source, so a new one fails here until it is listed and answers so."""
+    from fastapi import HTTPException
+    from app.core import rate_limiter as RL
+    found = {}
+    for path in sorted((ROOT / "app" / "api").glob("*.py")):
+        if path.name != "api_server.py":
+            names = _fail_closed_functions(path)
+            if names:
+                found[path.name] = names
+    assert found == {name: set(table) for name, table in OTHER_MODULES.items()}, found
+
+    def _cannot_count(*a, **kw):
+        if kw.get("fail_open", True):
+            return True, 0, 0
+        raise RL.RateLimiterUnavailable("down")
+    monkeypatch.setattr(RL.rate_limiter, "check_rate_limit", _cannot_count)
+    from app.api import email_studio_router as E
+    from app.api import sso_router as S
+    monkeypatch.setattr(E._rate_limiter, "check_rate_limit", _cannot_count)
+    monkeypatch.setattr(S, "_api", lambda: SimpleNamespace(
+        get_client_ip=lambda request: PLAIN, _invite_pepper=lambda: "pepper"))
+    body = SimpleNamespace(code="c" * 43, verifier="v" * 43)
+    calls = {
+        "_rate_limit": lambda: E._rate_limit("admin-1", limit=1, window=60, prefix="x", detail="too many"),
+        "_limit_start": lambda: S._limit_start(PLAIN),
+        "_invitation_for_start": lambda: S._invitation_for_start(None, "t" * 43, PLAIN),
+        "_claim_handover": lambda: S._claim_handover(None, _request(PLAIN), SimpleNamespace(id="u-1"), body, purpose="link"),
+    }
+    for table in OTHER_MODULES.values():
+        for name, answer in table.items():
+            if answer != 503:
+                continue
+            with pytest.raises(HTTPException) as refused:
+                calls[name]()
+            assert refused.value.status_code == 503, (name, refused.value.status_code, refused.value.detail)
+    # The count of refused logouts: nothing is written, and nothing is raised.
+    written = []
+    monkeypatch.setattr(S, "_audit", lambda *a, **k: written.append(a))
+    assert S._note_refused_logout(None, "provider-1", "source", PLAIN, reason="busy") is None and written == []
+
+
 def test_every_compliance_step_up_counts_one_subject_per_client(monkeypatch):
     """The steps of compliance access are earned at the same step-up route as any other action, on the same
     budget: two addresses in one /64 share it and another /64 has its own, for each of the steps."""

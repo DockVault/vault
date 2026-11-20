@@ -98,6 +98,7 @@ def _form(S, path, fields):
         async def send(msg):
             if msg["type"] == "http.response.start":
                 out["status"] = msg["status"]
+                out["headers"] = dict(msg.get("headers") or [])
             elif msg["type"] == "http.response.body":
                 chunks.append(msg.get("body", b""))
         await S.app(scope, receive, send)
@@ -107,6 +108,10 @@ def _form(S, path, fields):
         except ValueError:
             out["body"] = raw.decode("utf-8", "replace")
     run_coroutine(_drive(), timeout=30)
+    # Whatever the answer to a provider's logout says, nothing between the provider and the vault keeps it: the
+    # server marks every answer of the API so, and this route's answers are held to it one by one.
+    kept = [part.strip() for part in out["headers"].get(b"cache-control", b"").decode().split(",")]
+    assert "no-store" in kept, (path, out["status"], out["headers"])
     return out["status"], out["body"]
 
 
