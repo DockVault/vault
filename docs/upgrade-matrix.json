@@ -4927,6 +4927,14 @@
         "eol": false,
         "secure": true
       }
+    },
+    "0.33.10": {
+      "released": "2026-11-20",
+      "notes": "A maintenance release of the 0.33 line, rebuilt on Alpine's patched OpenSSL (libssl3 and libcrypto3 3.5.9-r1), which fixes the five findings of OpenSSL's advisory of 10 November 2026 (CVE-2026-88822, CVE-2026-88823, CVE-2026-95691, CVE-2026-95692 and CVE-2026-107496, all rated Low by OpenSSL); the vault reaches none of them. It publishes no advisory. The application is the one of 0.33.9, and going back to 0.33.9 needs no restore.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
     }
   },
   "edges": [
@@ -5474,7 +5482,77 @@
       "requires_backup": false
     },
     {
+      "from": "0.34.0",
+      "to": "0.34.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.1",
+      "to": "0.34.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.0",
+      "to": "0.34.2",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.2",
+      "to": "0.34.3",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.3",
+      "to": "0.34.4",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.34.4",
+      "to": "0.35.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "stay-signed-in",
+          "summary": "From 0.35.0 the web app offers, a minute before a session ends, to keep it going. Each renewal lasts the session timeout, up to 24 hours after the sign-in by default (Settings, Security, under Show advanced settings: Stay signed in for at most, from the session timeout up to 720 hours). In 0.34 a sign-in ended at the session timeout. To keep sign-ins about as short as before, set that limit to the session timeout rounded up to whole hours.",
+          "detect": "SELECT (SELECT value->>'session_timeout' FROM system_settings WHERE key = 'global') AS session_timeout_minutes, (SELECT value->>'session_renewal_max_hours' FROM system_settings WHERE key = 'global') AS stay_signed_in_hours"
+        }
+      ]
+    },
+    {
+      "from": "0.35.0",
+      "to": "0.35.1",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "emailed-links-need-allowed-hosts",
+          "summary": "From 0.35.1 every emailed link (password reset, invitations, notices) is built on the first entry of ALLOWED_HOSTS in .env, never on a request's Host header. With ALLOWED_HOSTS empty, no reset or invitation email is sent until it is set. Set it to the address people open the vault by: a bare name means https://name; write another port or plain http as the full address (https://vault.example.com:8443). An entry with no readable host now stops the start and names the entry. dockvault.py setup writes it; an install made by setup on a web port other than 443 should check it. 0.35.0 reads entries as host names only: before going back to it, add the bare name of each full address as another entry.",
+          "detect": "SELECT value->>'password_reset_enabled' AS self_service_reset_enabled FROM system_settings WHERE key = 'global'"
+        }
+      ]
+    },
+    {
       "from": "0.33.9",
+      "to": "0.33.10",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false
+    },
+    {
+      "from": "0.33.10",
       "to": "0.34.4",
       "kind": "direct",
       "reversible": true,
@@ -5555,69 +5633,6 @@
           "id": "zk-envelope-held-after-admin-reset",
           "summary": "From 0.34.0, for ZK_ENVELOPE_HOLD_DAYS days (14 by default) after an administrator or the server's operator changed an account's sign-in details, the account's zero-knowledge encryption key is given to a browser only after it enters a code sent by email to the address the account had before the first of those changes. Changes made before the upgrade count: an account with an encryption key whose sign-in details were changed in the 14 days before the upgrade is held from the first start (opening the key answers 403 zk-envelope-hold), and an account changed then that has no key yet is held as soon as it sets one up, until the hold ends. Only an email change recorded before 0.34.0 kept the address it replaced, so for an account whose first such change was of another kind or an email change of an account that had no address, or on a deployment without mail, no code can be sent (409 zk-envelope-hold-no-mail): the server's operator releases it with python dockvault.py accounts --action release-key-hold, or the hold ends ZK_ENVELOPE_HOLD_DAYS days after the last change. The check below counts the accounts held at the first start and those only the server's operator can release; it cannot count an account that sets up a key later, so a check that finds none does not mean no account will be held. ZK_ENVELOPE_HOLD_DAYS=0 in .env before the upgrade turns the hold off. Going back to an earlier release lifts the hold.",
           "detect": "SELECT count(*) AS held_accounts, count(*) FILTER (WHERE kind <> 'email' OR coalesce(btrim(previous_email), '') = '') AS released_only_by_the_host FROM (SELECT DISTINCT ON (c.target_user_id) c.target_user_id, c.kind, c.payload->>'previous_email' AS previous_email FROM credential_changes c JOIN user_keypairs k ON k.user_id = c.target_user_id WHERE c.status IN ('made', 'approved') AND c.applied_at > (now() AT TIME ZONE 'utc') - interval '14 days' ORDER BY c.target_user_id, c.applied_at) t HAVING count(*) > 0"
-        }
-      ]
-    },
-    {
-      "from": "0.34.0",
-      "to": "0.34.1",
-      "kind": "direct",
-      "reversible": true,
-      "requires_backup": false
-    },
-    {
-      "from": "0.34.1",
-      "to": "0.34.2",
-      "kind": "direct",
-      "reversible": true,
-      "requires_backup": false
-    },
-    {
-      "from": "0.34.0",
-      "to": "0.34.2",
-      "kind": "direct",
-      "reversible": true,
-      "requires_backup": false
-    },
-    {
-      "from": "0.34.2",
-      "to": "0.34.3",
-      "kind": "direct",
-      "reversible": true,
-      "requires_backup": false
-    },
-    {
-      "from": "0.34.3",
-      "to": "0.34.4",
-      "kind": "direct",
-      "reversible": true,
-      "requires_backup": false
-    },
-    {
-      "from": "0.34.4",
-      "to": "0.35.0",
-      "kind": "direct",
-      "reversible": true,
-      "requires_backup": false,
-      "conditions": [
-        {
-          "id": "stay-signed-in",
-          "summary": "From 0.35.0 the web app offers, a minute before a session ends, to keep it going. Each renewal lasts the session timeout, up to 24 hours after the sign-in by default (Settings, Security, under Show advanced settings: Stay signed in for at most, from the session timeout up to 720 hours). In 0.34 a sign-in ended at the session timeout. To keep sign-ins about as short as before, set that limit to the session timeout rounded up to whole hours.",
-          "detect": "SELECT (SELECT value->>'session_timeout' FROM system_settings WHERE key = 'global') AS session_timeout_minutes, (SELECT value->>'session_renewal_max_hours' FROM system_settings WHERE key = 'global') AS stay_signed_in_hours"
-        }
-      ]
-    },
-    {
-      "from": "0.35.0",
-      "to": "0.35.1",
-      "kind": "direct",
-      "reversible": true,
-      "requires_backup": false,
-      "conditions": [
-        {
-          "id": "emailed-links-need-allowed-hosts",
-          "summary": "From 0.35.1 every emailed link (password reset, invitations, notices) is built on the first entry of ALLOWED_HOSTS in .env, never on a request's Host header. With ALLOWED_HOSTS empty, no reset or invitation email is sent until it is set. Set it to the address people open the vault by: a bare name means https://name; write another port or plain http as the full address (https://vault.example.com:8443). An entry with no readable host now stops the start and names the entry. dockvault.py setup writes it; an install made by setup on a web port other than 443 should check it. 0.35.0 reads entries as host names only: before going back to it, add the bare name of each full address as another entry.",
-          "detect": "SELECT value->>'password_reset_enabled' AS self_service_reset_enabled FROM system_settings WHERE key = 'global'"
         }
       ]
     }
