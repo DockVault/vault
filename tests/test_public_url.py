@@ -69,10 +69,19 @@ def test_a_host_no_browser_has_cannot(value):
     assert "example" not in why and "foo" not in why
 
 
-def test_a_name_in_another_script_is_written_as_the_browser_writes_it():
+def test_a_name_in_another_script_is_taken_only_as_the_browser_writes_it():
+    """The browser writes such a name in its xn-- form and signs passkeys and follows redirects at that name. The
+    conversion at hand is the older one: it turns a sharp s into ss and a final sigma into a plain one, which are
+    other names, owned by whoever registered them. So the other spelling is refused in words, never converted."""
     pu = _pu()
-    assert pu.problem("https://bücher.example") is None
-    assert pu.normalize("https://Bücher.example:8443") == "https://xn--bcher-kva.example:8443"
+    for written in ("https://bücher.example", "https://Bücher.example:8443", "https://straße.example",
+                    "https://ὀδός.example", "https://a\u200db.example"):
+        why = pu.problem(written)
+        assert why and "xn-- form" in why and "example" not in why, (written, why)
+        assert pu.normalize(written) == "", written
+    assert pu.problem("https://xn--bcher-kva.example") is None
+    assert pu.normalize("https://XN--Bcher-KVA.example:8443") == "https://xn--bcher-kva.example:8443"
+    assert pu.normalize("https://xn--strae-oqa.example") == "https://xn--strae-oqa.example"      # never strasse
     assert pu.normalize("https://vault.example.com.") == "https://vault.example.com"
 
 

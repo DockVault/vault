@@ -44,7 +44,9 @@ def problem(value: Optional[str]) -> Optional[str]:
     Usable: ``https://host``, ``https://host:port``, and ``http://`` for localhost, 127.0.0.1 and ::1 only.
     Not usable, with a plain reason that never repeats the value: another scheme, a missing host, a user name or
     password in the address, a path, a query or a fragment (the address is where the vault is, not a page in it),
-    a port outside 1-65535, plain http for any other host.
+    a port outside 1-65535, plain http for any other host, and a host name written in another script: the browser
+    writes such a name in its ``xn--`` form, and the conversions differ (the one at hand turns a sharp s into
+    ``ss``, a different name from the one the browser asks for), so the name is taken only as the browser writes it.
     """
     raw = (value or "").strip()
     if not raw:
@@ -65,6 +67,9 @@ def problem(value: Optional[str]) -> Optional[str]:
         return f"{_NAME} has a port that is not a number between 1 and 65535"
     if not host:
         return f"{_NAME} has no host name"
+    if not host.isascii():
+        return (f"{_NAME} has a host name written in another script: write it in its xn-- form, as the browser's "
+                "address bar shows it")
     if _host_problem(host):
         return f"{_NAME} has a host name no browser accepts (letters, digits, hyphens and dots, or an IP address)"
     if port is not None and not (1 <= port <= 65535):
@@ -79,7 +84,7 @@ def problem(value: Optional[str]) -> Optional[str]:
 def _host_problem(host: str) -> bool:
     """Whether ``host`` is not one a browser would put in an origin: an IP address (no zone id), or a name of
     letters, digits, hyphens and dots whose labels start and end with a letter or digit (a name in another
-    script is taken in its punycode form, as the browser writes it)."""
+    script only in its ``xn--`` form, which is such a name; ``problem`` refuses the other spelling in words)."""
     if not host or "%" in host:          # no zone id, no escaped character: an origin carries neither
         return True
     try:
