@@ -169,7 +169,9 @@ def test_auth_policy_minimal_keys_and_no_leak(admin, restore_settings):
     # What the sign-in page may offer: the form, the passkey button, the provider buttons; nothing else, and
     # each provider entry (when there are any) only its id, label, kind, icon and order.
     methods = body["methods"]
-    assert set(methods) == {"password", "passkeys", "providers"}
+    assert set(methods) == {"password", "passkeys", "providers", "origin"}
+    # The address the passkey and provider buttons work at: the configured one (in every emailed link), or none.
+    assert methods["origin"] is None or methods["origin"] == admin.base_url.rstrip("/")
     assert methods["password"] in ("visible", "link", "hidden") and isinstance(methods["passkeys"], bool)
     assert isinstance(methods["providers"], list)
     for provider in methods["providers"]:

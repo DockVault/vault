@@ -159,7 +159,11 @@
         if (!line) return;
         const ready = data.readiness || {};
         line.hidden = false;
-        if (ready.usable) {
+        if (ready.usable && ready.origin && ready.origin !== location.origin) {
+            line.className = 'alert alert-warning mb-md';
+            line.textContent = `Passkeys can be made at ${ready.origin}, which is not the address this page was opened at `
+                + `(${location.origin}). Open the vault there to add or use one: here the browser refuses.`;
+        } else if (ready.usable) {
             line.className = 'alert alert-info mb-md';
             line.textContent = `Passkeys can be made at ${ready.origin}. A passkey works only at the address it was `
                 + 'made at, so changing the vault\'s address later leaves every passkey unusable.';

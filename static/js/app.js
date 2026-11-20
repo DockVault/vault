@@ -1897,9 +1897,34 @@ function _stopPasskeyOffer() {
     _passkeyOffer = null;
 }
 
+// The address passkeys and single sign-on work at, when it is not the one this page was opened at (another name
+// the vault answers to, an IP address): a passkey made there is unknown to the browser here, and a provider sends
+// people back there, to a page that did not start the sign-in. '' when this page is at that address, or none is set.
+function _signInOriginElsewhere(policy) {
+    const origin = policy && policy.methods && typeof policy.methods.origin === 'string' ? policy.methods.origin : '';
+    return origin && /^https?:\/\//.test(origin) && origin !== location.origin ? origin : '';
+}
+
+// Says where the ways to sign in named in ``kinds`` work, with a link there, when that is not this page's address.
+function _noteSignInOrigin(policy, kinds) {
+    const note = document.getElementById('login-origin-note');
+    if (!note) return;
+    const elsewhere = kinds.length ? _signInOriginElsewhere(policy) : '';
+    note.replaceChildren();
+    note.hidden = !elsewhere;
+    if (!elsewhere) return;
+    const link = _el('a', null, elsewhere);
+    link.href = elsewhere + '/';
+    note.appendChild(document.createTextNode(`Signing in with ${kinds.join(' or ')} works at `));
+    note.appendChild(link);
+    note.appendChild(document.createTextNode('. Open the vault there to use it.'));
+}
+
 async function _initPasskeySignIn(policy) {
     const button = document.getElementById('passkey-sign-in-btn');
-    const on = !!(policy && policy.methods && policy.methods.passkeys) && !!window.Passkeys && Passkeys.supported();
+    const offered = !!(policy && policy.methods && policy.methods.passkeys);
+    _noteSignInOrigin(policy, offered ? ['a passkey'] : []);
+    const on = offered && !_signInOriginElsewhere(policy) && !!window.Passkeys && Passkeys.supported();
     if (button) button.style.display = on ? '' : 'none';
     if (!on) return;
     if (button && !button.dataset.wired) {
@@ -7496,6 +7521,12 @@ async function renderAccountPasskeys() {
         list.appendChild(row);
     }
     body.appendChild(list);
+    if (typeof data.origin === 'string' && data.origin && data.origin !== location.origin) {
+        // A passkey is made for one address: here the browser would refuse, with words that say nothing of why.
+        body.appendChild(_el('p', 'text-secondary text-sm', 'Passkeys are added and used at ' + data.origin
+            + '. Open the vault there to add one.'));
+        return;
+    }
     if (!(window.Passkeys && Passkeys.supported())) {
         body.appendChild(_el('p', 'text-secondary text-sm', 'This browser cannot make a passkey here.'));
         return;

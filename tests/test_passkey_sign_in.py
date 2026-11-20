@@ -464,6 +464,15 @@ def test_without_a_public_address_the_routes_say_so_and_the_policy_hides_the_but
     assert h.S._sign_in_methods(h.db)["passkeys"] is False
     monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(rp_id=RP_ID, origin=ORIGIN, name="x"))
     assert h.S._sign_in_methods(h.db)["passkeys"] is True
+    # Where they work: the configured address as a browser writes an origin, or none; never a request's own.
+    import app.core.public_url as public_url
+    monkeypatch.setattr(public_url, "link_base", lambda: "https://Vault.Example.test:443")
+    assert h.S._sign_in_methods(h.db)["origin"] == "https://vault.example.test"
+    monkeypatch.setattr(public_url, "link_base", lambda: "http://vault.lan:8080")       # plain http: not for sign-in
+    assert h.S._sign_in_methods(h.db)["origin"] is None
+    monkeypatch.setattr(public_url, "link_base", lambda: "")
+    assert h.S._sign_in_methods(h.db)["origin"] is None
+    assert set(h.S._sign_in_methods(h.db)) == {"password", "passkeys", "providers", "origin"}
 
 
 def test_the_challenge_limiter_and_the_store_fail_closed(monkeypatch):

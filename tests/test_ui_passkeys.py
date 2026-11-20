@@ -553,3 +553,57 @@ def test_a_required_passkey_in_a_browser_that_cannot_make_one_says_so(page: Page
     expect(page.locator("#login-second-factor")).to_contain_text("this browser cannot make one here", timeout=8000)
     expect(page.locator("#sf-passkey-enroll")).to_have_count(0)
     expect(page.locator("#login-second-factor")).to_contain_text("Back to sign in")
+
+
+# --------------------------------------------------------------------------- a page opened at another address
+
+ELSEWHERE = "https://vault.example.test"
+
+
+def test_a_page_opened_at_another_address_says_where_passkeys_work_and_offers_none(page: Page, no_offer, fresh_user):
+    """The vault answers to more than one name, and a passkey works at one: the configured address. A page opened at
+    another offers no passkey button (the browser would refuse, in words that say nothing) and says where to go;
+    the password form stays. Your account says the same in place of the Add button. The address the server names
+    is stood in for: this stack is opened at its configured address, where every other test here finds the button."""
+    def policy(route):
+        response = route.fetch()
+        body = response.json()
+        body["methods"]["passkeys"] = True
+        body["methods"]["origin"] = ELSEWHERE
+        route.fulfill(response=response, json=body)
+
+    def passkeys(route):
+        if route.request.method != "GET":
+            return route.fallback()
+        response = route.fetch()
+        body = response.json()
+        body["origin"] = ELSEWHERE
+        route.fulfill(response=response, json=body)
+    page.route("**/auth/policy", policy)
+    page.route("**/users/me/passkeys", passkeys)
+    page.goto("/")
+    note = page.locator("#login-origin-note")
+    expect(note).to_be_visible(timeout=8000)
+    expect(note).to_have_text(f"Signing in with a passkey works at {ELSEWHERE}. Open the vault there to use it.")
+    assert note.locator("a").get_attribute("href") == ELSEWHERE + "/"
+    expect(page.locator("#passkey-sign-in-btn")).to_be_hidden()
+    expect(page.locator("#login-form")).to_be_visible()
+    page.fill("#username", fresh_user["_username"])
+    page.fill("#password", fresh_user["_password"])
+    page.click("#login-form button[type=submit]")
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    _open_account(page)
+    expect(page.locator("#us-passkeys-body")).to_contain_text(
+        f"Passkeys are added and used at {ELSEWHERE}. Open the vault there to add one.", timeout=8000)
+    expect(page.locator("#us-passkey-add")).to_have_count(0)
+
+
+def test_at_the_configured_address_nothing_is_said_of_another(page: Page, no_offer, fresh_user):
+    page.goto("/")
+    expect(page.locator("#passkey-sign-in-btn")).to_be_visible(timeout=8000)
+    expect(page.locator("#login-origin-note")).to_be_hidden()
+    assert page.locator("#login-origin-note").text_content() == ""
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    _open_account(page)
+    expect(page.locator("#us-passkey-add")).to_be_visible(timeout=8000)
+    expect(page.locator("#us-passkeys-body")).not_to_contain_text("Passkeys are added and used at")

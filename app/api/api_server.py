@@ -6012,8 +6012,12 @@ def _sign_in_methods(db) -> dict:
     ``{id, label, kind, icon, order}``: never a secret, never an issuer). Nothing else rides along: the page
     renders from this object and from nothing in the settings blob. The passkey and provider settings fill it
     in as they land; the passkey button shows when the deployment can take a passkey sign-in (a usable
-    public address), the provider buttons when their items land."""
-    return {"password": "visible", "passkeys": _passkey_sign_in_ready(db), "providers": []}
+    public address), the provider buttons when their items land. ``origin`` is the address those work at: the
+    vault's configured address as a browser writes an origin (public already: every emailed link carries it), or
+    none when sign-in cannot be built on it. A page opened at any other address says so and offers neither."""
+    from app.core import public_url
+    return {"password": "visible", "passkeys": _passkey_sign_in_ready(db), "providers": [],
+            "origin": public_url.public_base_url() or None}
 
 
 def _email_has_pending_invite(db: Session, email: str) -> bool:
@@ -11796,8 +11800,9 @@ async def list_my_passkeys(
     from app.core import webauthn_settings
     _passkey_refuse_temp(current_user)
     now = datetime.utcnow()
+    from app.core import public_url
     return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
-            "attestation": webauthn_settings.attestation(),
+            "attestation": webauthn_settings.attestation(), "origin": public_url.expected_origin() or None,
             "enabled": _passkeys_enabled(db),
             "requirement": webauthn_settings.requirement_public(webauthn_settings.requirement(db, current_user))}
 

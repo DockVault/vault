@@ -103,3 +103,55 @@ def test_a_change_the_server_refuses_is_said_in_its_words_and_asks_for_no_passwo
     # Nothing changed: the page read again shows the value in force.
     page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
     expect(page.locator(ATTESTATION + " select")).to_have_value("none", timeout=10000)
+
+
+def _with_the_answer_changed(page: Page, change):
+    """The page's read of the Sign-in settings, with ``change`` applied to the server's own answer."""
+    def answer(route):
+        if route.request.method != "GET":
+            return route.fallback()
+        response = route.fetch()
+        body = response.json()
+        change(body)
+        route.fulfill(response=response, json=body)
+    page.route("**/settings/sign-in", answer)
+
+
+def test_the_page_says_when_it_was_opened_at_another_address_than_passkeys_are_made_at(page: Page, admin_creds):
+    def elsewhere(body):
+        body["readiness"] = {"usable": True, "rp_id": "vault.example.test", "origin": "https://vault.example.test",
+                             "reason": "ok"}
+        body["why_not"] = ""
+    _with_the_answer_changed(page, elsewhere)
+    _open(page, admin_creds)
+    line = page.locator("#signin-passkey-readiness")
+    here = page.evaluate("() => location.origin")
+    expect(line).to_have_text(f"Passkeys can be made at https://vault.example.test, which is not the address this "
+                              f"page was opened at ({here}). Open the vault there to add or use one: here the "
+                              "browser refuses.")
+    assert "alert-warning" in (line.get_attribute("class") or "")
+    page.unroute_all(behavior="ignoreErrors")
+
+
+def test_the_page_says_that_a_requirement_waits_and_how_many_older_passkeys_there_are(page: Page, admin_creds):
+    def waiting(body):
+        body["readiness"] = {"usable": False, "rp_id": "", "origin": "", "reason": "no_public_host"}
+        body["why_not"] = "The vault has no public address."
+        body["requirement_paused"] = True
+        body["unattested_passkeys"] = 3
+    _with_the_answer_changed(page, waiting)
+    _open(page, admin_creds)
+    line = page.locator("#signin-passkey-readiness")
+    expect(line).to_contain_text("No passkey can be made at this vault yet")
+    expect(line).to_contain_text("The passkey requirement below is paused until then")
+    older = page.locator("#signin-passkey-older")
+    expect(older).to_have_text("3 passkeys in use were added before this vault checked authenticator makes. They keep "
+                               "signing in and serving as a second factor, and do not prove a compliance step-up until "
+                               "their owners add them again.")
+    page.unroute_all(behavior="ignoreErrors")
+    # The server's own answer: nothing waits, and no older passkey is counted where attestation is not asked.
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    _open_page(page)
+    expect(page.locator("#signin-passkey-readiness")).not_to_contain_text("paused")
+    expect(page.locator("#signin-passkey-older")).to_be_hidden()
