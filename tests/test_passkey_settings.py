@@ -229,6 +229,7 @@ def test_the_settings_route_lists_and_writes_under_the_step_up(monkeypatch):
     status, body = _call(S, "GET", "/settings/sign-in")
     assert status == 200 and {s["key"] for s in body["settings"]} == set(wss.KEYS) and body["readiness"]["usable"] is True
     assert body["step_up"] == "admin.auth_policy.write" and body["trust_anchors"] == 0
+    assert body["why_not"] == ""                          # a passkey can be made here: nothing to change
     # A refusal from the registry, one from the guards, an unknown key: nothing written, no step-up asked.
     assert _call(S, "PUT", "/settings/sign-in/webauthn_sign_in", {"value": ["admin"]})[0] == 400
     assert _call(S, "PUT", "/settings/sign-in/webauthn_attestation", {"value": "direct"})[0] == 400

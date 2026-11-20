@@ -3054,6 +3054,10 @@ function logout(how, reason) {
     if (window.EraseSettings && typeof window.EraseSettings.reset === 'function') {
         try { window.EraseSettings.reset(); } catch (_) {}
     }
+    // The sign-in settings (Settings): what one administrator read is not left for the next person.
+    if (window.SignInSettings && typeof window.SignInSettings.reset === 'function') {
+        try { window.SignInSettings.reset(); } catch (_) {}
+    }
     // Then the session is ended on the server (see above), after that save.
     if (mode === 'end') signOutOver = _endServerSession(endingToken);
     if (window.SessionWatch) SessionWatch.disarm();

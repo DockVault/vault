@@ -325,8 +325,7 @@ def markup():
 def test_the_pages_are_the_tabs_of_the_settings_section(markup):
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     tabs = re.findall(r'<button class="tab-btn(?: active)?" data-tab="([a-z]+)"(?: aria-current="page")?>', html)
-    # The sign-in page's tab lands with its pages (the passkey and single sign-on settings).
-    assert tuple(tabs) == tuple(page for page in reg.PAGES if page != "signin")
+    assert tuple(tabs) == tuple(reg.PAGES)
     assert {page for _, page in markup.settings} <= set(reg.PAGES)
 
 

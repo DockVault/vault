@@ -1748,9 +1748,9 @@
                         <button type="button" id="settings-load-retry" class="btn btn-secondary btn-sm">Retry</button>
                     </div>
 
-                    <!-- The Settings pages: on a wide screen a list at the left, grouped under five headings
-                         (and a sixth, Sign-in, kept hidden until it has a page); on a phone the same buttons as a
-                         strip, the headings hidden. The groups are CSS only, so every page keeps its data-tab. -->
+                    <!-- The Settings pages: on a wide screen a list at the left, grouped under six headings; on a
+                         phone the same buttons as a strip, the headings hidden. The groups are CSS only, so every
+                         page keeps its data-tab. -->
                     <div class="tabs mb-lg settings-nav" role="group" aria-label="Settings pages">
                         <div class="settings-nav-group" data-settings-group="organisation">
                             <span class="settings-nav-title">Organisation</span>
@@ -1779,9 +1779,26 @@
                             <button class="tab-btn" data-tab="records">Activity and records</button>
                             <button class="tab-btn" data-tab="logs">Log access</button>
                         </div>
-                        <!-- A group of Settings pages kept hidden while it holds none. -->
-                        <div class="settings-nav-group" data-settings-group="signin" hidden>
+                        <div class="settings-nav-group" data-settings-group="signin">
                             <span class="settings-nav-title">Sign-in</span>
+                            <button class="tab-btn" data-tab="signin">Sign-in methods</button>
+                        </div>
+                    </div>
+
+                    <!-- Sign-in Settings Tab (static/js/settings-signin.js): each change is saved on its own, with
+                         the password, never by "Save All Changes". -->
+                    <div id="settings-tab-signin" class="settings-tab-content">
+                        <div class="card mb-lg" id="signin-passkeys-card">
+                            <div class="card-header"><h3>Passkeys</h3></div>
+                            <div class="p-lg">
+                                <p class="text-secondary mb-md">
+                                    A passkey is a key kept by a person's phone, computer, security key or password
+                                    manager, unlocked with a fingerprint, a face or a PIN. It cannot be phished: it
+                                    works only at this vault's address. Each change here asks for your password.
+                                </p>
+                                <div class="alert alert-info mb-md" id="signin-passkey-readiness" role="status" hidden></div>
+                                <div id="signin-passkey-settings"></div>
+                            </div>
                         </div>
                     </div>
 
@@ -4402,6 +4419,7 @@
     <script src="/static/js/activity-archive.js?v=20261108a"></script>
     <script src="/static/js/settings-records.js?v=20261108a"></script>
     <script src="/static/js/settings-retention.js?v=20261113a"></script>
+    <script src="/static/js/settings-signin.js?v=20261117a"></script>
     <script src="/static/js/settings-erase.js?v=20261108a"></script>
     <script src="/static/js/settings-removal.js?v=20261108a"></script>
     <script src="/static/js/settings-integrity.js?v=20261108a"></script>

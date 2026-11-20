@@ -6,7 +6,7 @@ from playwright.sync_api import Page, expect
 
 pytestmark = pytest.mark.ui
 
-GROUPS = ["Organisation", "Security and access", "Sharing and links", "Email", "Records"]
+GROUPS = ["Organisation", "Security and access", "Sharing and links", "Email", "Records", "Sign-in"]
 
 
 def _login(page: Page, admin_creds):
@@ -21,7 +21,7 @@ def _login(page: Page, admin_creds):
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
-def test_wide_screens_list_the_pages_at_the_left_under_five_headings(page: Page, admin_creds, skin):
+def test_wide_screens_list_the_pages_at_the_left_under_six_headings(page: Page, admin_creds, skin):
     page.set_viewport_size({"width": 1280, "height": 900})
     page.goto("/")
     page.evaluate("ui => localStorage.setItem('ui', ui)", skin)
@@ -29,8 +29,8 @@ def test_wide_screens_list_the_pages_at_the_left_under_five_headings(page: Page,
     nav = page.locator("#settings-section .settings-nav")
     titles = [t.strip() for t in nav.locator(".settings-nav-group:not([hidden]) .settings-nav-title").all_text_contents()]  # drawn in capitals
     assert titles == GROUPS, titles
-    expect(nav.locator('.settings-nav-group[data-settings-group="signin"]')).to_be_hidden()
-    assert nav.locator(".tab-btn").count() == 12
+    expect(nav.locator('.settings-nav-group[data-settings-group="signin"] .tab-btn')).to_have_text("Sign-in methods")
+    assert nav.locator(".tab-btn").count() == 13
     # The list is at the left of the open page, both starting at the same height.
     nav_box = nav.bounding_box()
     page_box = page.locator("#settings-tab-general").bounding_box()
