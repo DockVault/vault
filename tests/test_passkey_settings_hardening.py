@@ -227,6 +227,45 @@ def test_a_roles_last_passkey_is_not_removed_by_its_holder_and_the_grace_starts_
     assert wss.mark_required(alice) is True and wss.requirement(h.db, alice).overdue is False
 
 
+def test_an_administrator_does_not_reset_away_the_last_passkey_their_own_role_must_hold(monkeypatch):
+    """A reset of the second factor retires every passkey, and the time to set one up starts again when the account
+    has none. An administrator whose role must hold a passkey could so reset their own factor at each deadline and
+    never hold one. Their own reset is refused while it would retire the passkey their role must hold, as removing
+    it is in Your account; another administrator's reset of the same account goes on, and so does their own
+    where nothing is to be kept or the requirement waits."""
+    from fastapi import HTTPException
+    from app.core.models import User, WebAuthnCredential
+    registry, wss = _mod()
+    root = _user("root", role="admin", passkey_required_since=None, passkey_requirement_cleared_at=None)
+    sam = _user("sam", role="admin", passkey_required_since=None, passkey_requirement_cleared_at=None)
+    h = RouteHarness(monkeypatch, root)
+    h.db.rows_of(User).append(sam)
+    _required(monkeypatch, registry, wss, ["admin"])
+
+    def the_reset_itself(*a, **k):
+        raise HTTPException(status_code=418, detail="reached the reset")
+    monkeypatch.setattr(h.S, "_credential_change", the_reset_itself)
+    own, others = f"/users/{root.id}/second-factor/reset", f"/users/{sam.id}/second-factor/reset"
+    receipt = {"X-Second-Factor": "ok"}
+    assert _rcall(h.S, "POST", own, None, receipt)[0] == 418                # no passkey yet: nothing to keep
+    status, shown, _auth = h.register()
+    assert status == 201, shown
+    status, body = _rcall(h.S, "POST", own, None, receipt)
+    assert status == 409 and "Your role must hold a passkey, and a reset would retire yours" in body["detail"], body
+    assert len(h.rows()) == 1 and h.rows()[0].retired_at is None
+    # Another administrator's account is theirs to reset, passkey or not.
+    h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=sam.id, retired_at=None))
+    assert _rcall(h.S, "POST", others, None, receipt)[0] == 418
+    # The rule waits with the requirement.
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: False)
+    assert _rcall(h.S, "POST", own, None, receipt)[0] == 418
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: True)
+    root.passkey_requirement_cleared_at = datetime.utcnow()
+    assert _rcall(h.S, "POST", own, None, receipt)[0] == 418
+    root.passkey_requirement_cleared_at = None
+    assert _rcall(h.S, "POST", own, None, receipt)[0] == 409
+
+
 def test_whether_a_passkey_can_be_made_is_what_the_address_says(monkeypatch):
     registry, wss = _mod()
     import app.core.public_url as public_url

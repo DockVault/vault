@@ -13247,6 +13247,15 @@ async def admin_reset_second_factor(
                 raise HTTPException(status_code=400, detail=(
                     "You can't reset your own second factor while MFA is required and you are the only "
                     "enrolled administrator. Have another admin enroll first, or reset it from the host."))
+        from app.core import webauthn_settings
+        from app.core.active_factors import active_factors
+        if webauthn_settings.must_hold(target) and active_factors(db, target.id).passkeys > 0:
+            # A reset retires every passkey, and the time to set one up starts again when the account has none:
+            # by resetting their own factor at each deadline an administrator would put the requirement off for
+            # ever. Their own last passkey is not theirs to drop here either, as it is not in Your account.
+            raise HTTPException(status_code=409, detail=(
+                "Your role must hold a passkey, and a reset would retire yours. Ask another administrator to "
+                "reset your second factor, or add another passkey and remove this one."))
     # Someone else's second factor: a credential change, so the second one within 14 days waits for
     # another administrator (app/core/credential_changes.py). The reset itself (enrollment and
     # recovery codes removed, sessions ended, set-up asked for at the next sign-in) is
