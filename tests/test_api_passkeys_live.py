@@ -191,7 +191,8 @@ def test_an_administrators_passkey_leads_to_the_password_step(admin):
     try:
         client = ApiClient()
         client.login(other["_username"], other["_password"])
-        r = client.post("/users/me/passkeys/register/options", json={"current_password": other["_password"]})
+        client.password = other["_password"]
+        r = _skip_unless_ready(client)
         assert r.status_code == 200, r.text
         body = r.json()
         auth = SoftAuthenticator()

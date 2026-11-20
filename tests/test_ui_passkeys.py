@@ -6,11 +6,21 @@ the passkey itself; an administrator's passkey leads to the password step and th
 Needs the vault at a localhost address (a secure context) that is its configured address (the first ALLOWED_HOSTS
 entry): its host is the relying-party id."""
 import pytest
+import requests
 from playwright.sync_api import Page, expect
 
 from _ui_hand_over import expect_reason, mark_old, replaced, still_old, wait_new_page
 
 pytestmark = pytest.mark.ui
+
+
+@pytest.fixture(autouse=True)
+def _a_stack_where_a_passkey_can_be_made(base_url):
+    """Every test here makes or uses a passkey. A vault with no configured address refuses them all (and has its own
+    tests for that), so on such a stack these are skipped, with the reason, instead of failing one by one."""
+    methods = requests.get(f"{base_url}/auth/policy", timeout=15).json().get("methods") or {}
+    if not methods.get("passkeys"):
+        pytest.skip("this stack offers no passkey sign-in: no address a passkey can be made at (ALLOWED_HOSTS)")
 
 
 @pytest.fixture
