@@ -703,6 +703,62 @@ def test_what_is_no_factor_of_the_accounts_own_does_not_keep_a_link_by_email_out
     assert location.startswith("/#sso=") and len(h.identities()) == 1, location
 
 
+@pytest.mark.parametrize("row", ["names a hosted-domain claim", "is Google"])
+@pytest.mark.parametrize("way", ["an account made at the first sign-in", "a link by email", "the sign-up list"])
+def test_a_provider_with_a_hosted_domain_claim_is_judged_on_that_claim_and_not_on_the_address(monkeypatch, row, way):
+    """Google signs consumer accounts and its organisations' accounts as one issuer, and tells them apart only by
+    the hosted-domain claim. A consumer account can carry any verified address, a work address included. So a
+    provider row that names such a claim, and Google's own issuer whatever the row says of its claims, is judged
+    on that claim alone: a token without it admits nobody on the strength of its address, whichever list restricts
+    the provider (its own domains or the vault's sign-up domains), and nobody is made or linked; the same person
+    with the claim is admitted. A row with neither has only the verified address to go by, and is judged on it."""
+    from app.services import sso_sign_in as sso
+    bob, root = _user("bob"), _user("root", role="admin")
+    policy = {"sso_allowed_domains": ["example.test"]}
+    account_policy = None
+    if way == "an account made at the first sign-in":
+        policy["sso_account_creation"] = "jit"
+        claims = {"sub": "new-subject", "email": "newcomer@example.test", "preferred_username": "newcomer"}
+    elif way == "a link by email":
+        policy["sso_link_by_email"] = True
+        claims = {"sub": "bob-subject", "email": "bob@example.test"}
+    else:
+        policy = {"sso_use_signup_domains": True, "sso_account_creation": "jit"}
+        account_policy = {"signup_email_domain_mode": "allowlist", "signup_email_domains": ["example.test"]}
+        claims = {"sub": "new-subject", "email": "newcomer@example.test", "preferred_username": "newcomer"}
+    shape = {"claims": {"domain": "hd"}} if row == "names a hosted-domain claim" else {"issuer": sso.GOOGLE_ISSUER + "/"}
+    p = _provider(policy=policy, **shape)
+    plain = _provider(name="plain", label="Plain", policy=policy)
+    assert sso.hosted_domain_only(p) is True and sso.hosted_domain_only(plain) is False
+    assert sso.hosted_domain_only(_provider(issuer="https://ACCOUNTS.google.com")) is True       # the issuer, folded
+    assert sso.hosted_domain_only(_provider(issuer="https://accounts.google.com.example.test")) is False
+    assert sso.hosted_domain_only(_provider(claims={"domain": "  "})) is False                   # names no claim
+    if row == "is Google":
+        # The token's issuer is the test provider's; the row's rule is what is under test, so it is judged here.
+        answer = types.SimpleNamespace(tenant_id=None, email=claims["email"], email_verified=True, hosted_domain=None,
+                                       groups=None, groups_overage=False)
+        h = Resolving(monkeypatch, [bob, root], [p, plain], account_policy=account_policy)
+        assert sso.restriction_of(h.db, p, answer) == "restriction_claim_missing"
+        answer.hosted_domain = "example.test"
+        assert sso.restriction_of(h.db, p, answer) is None
+        answer.hosted_domain = None
+        assert sso.restriction_of(h.db, plain, answer) is None
+        return
+    h = Resolving(monkeypatch, [bob, root], [p, plain], account_policy=account_policy)
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    before = (bob.password_hash, bob.sso_only)
+    location, _state = _sign_in(h, p, **claims)                                  # a consumer account: no such claim
+    assert location == "/#sso-error=restriction_claim_missing", location
+    assert h.identities() == [] and h.codes() == [] and h.users_named("newcomer") == []
+    assert (bob.password_hash, bob.sso_only) == before
+    location, _state = _sign_in(h, p, hd="other.test", **claims)                 # another organisation's account
+    assert location == "/#sso-error=restricted", location
+    assert h.identities() == [] and h.users_named("newcomer") == []
+    location, _state = _sign_in(h, p, hd="example.test", **claims)               # the organisation's own
+    assert location.startswith("/#sso="), location
+    assert len(h.identities()) == 1
+
+
 def _provider_locks(h):
     from app.core.models import SsoProvider
     return [entry[2] for entry in h.db.log if entry[0] == "lock" and entry[1] is SsoProvider]
