@@ -213,6 +213,31 @@ def clean(body: dict, *, row=None) -> dict:
 
 # --------------------------------------------------------------------------- what the pages are shown
 
+# The fields that say where the provider is. The client secret was entered for the place they named then, and is
+# kept only for it: pointing the provider somewhere else drops the secret, to be entered again by whoever knows it.
+WHERE_IT_IS = ("issuer", "discovery_url", "private_network")
+
+
+def hold_lapsed(db, row, *, now=None) -> int:
+    """Before ``row`` is turned off, in the caller's transaction: every identity of it whose freshness window has
+    already run out is recorded as held (``refused_at``). A provider that is off asks nothing, so without this
+    the people who stopped signing in there (the ones the window is for) would get their SSH keys, temporary
+    credentials and devices back the moment it is turned off, and for good once it is removed. A held identity is
+    lifted as a refusal is: by a later sign-in the provider admits, or by another administrator; and a provider
+    is not removed while it holds one. Returns how many were held."""
+    from datetime import datetime
+    from app.core.models import ExternalIdentity
+    from app.services import sso_freshness
+    now = now or datetime.utcnow()
+    held = 0
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
+        standing = sso_freshness.deadline_of(identity, row)
+        if standing is not None and not standing.refused and standing.due <= now:
+            identity.refused_at = now
+            held += 1
+    return held
+
+
 def fingerprint(row) -> str:
     """The connection settings of ``row`` as one short value: equal while a test sign-in still speaks for them.
     The secret enters as a digest of its stored form, never as itself."""
@@ -238,14 +263,18 @@ def tested(row) -> bool:
 
 
 def addresses(row) -> Optional[dict]:
-    """The two addresses the provider's own console asks for, on the vault's configured address; None when the
-    vault has none to give (see :func:`app.services.sso_sign_in.address_refusal`)."""
+    """The addresses the provider's own console asks for, on the vault's configured address: where it sends the
+    browser back after a sign-in, where it reports a logout, where it sends the browser back after its own logout
+    (asked for only when signing out here also signs out there; a provider refuses an address it was not given),
+    and the link an organisation hands out. None when the vault has none to give (see
+    :func:`app.services.sso_sign_in.address_refusal`)."""
     from app.core.public_url import public_base_url
     base = public_base_url()
     if not base:
         return None
     return {"redirect_uri": f"{base}/auth/sso/{row.id}/callback",
             "backchannel_logout_uri": f"{base}/auth/sso/{row.id}/backchannel-logout",
+            "post_logout_redirect_uri": f"{base}/",
             "sign_in_link": f"{base}/?sso={row.id}"}
 
 
@@ -357,8 +386,9 @@ def check(db, row, changes: dict, *, account_policy=None) -> dict:
 
 def apply(db, row, changes: dict, stored_policy) -> dict:
     """Write ``changes`` to ``row`` (already judged by :func:`check`). Returns what happened beside the row itself:
-    the fields that changed, whether the connection did (the last test no longer speaks for it), and the accounts
-    whose password sign-in was turned off or allowed again."""
+    the fields that changed, whether the connection did (the last test no longer speaks for it), whether the stored
+    secret was dropped because the provider was pointed somewhere else without a new one, and the accounts whose
+    password sign-in was turned off or allowed again."""
     from app.core import sso_only
     from app.core.security import encrypt_secret
     changed = []
@@ -372,6 +402,11 @@ def apply(db, row, changes: dict, stored_policy) -> dict:
         elif getattr(row, field) != value:
             setattr(row, field, value)
             changed.append(field)
+    secret_cleared = False
+    if any(field in changed for field in WHERE_IT_IS) and "client_secret" not in changed and row.client_secret_enc:
+        # Never sent to an address it was not entered for: a test sign-in posts it to the provider's token endpoint.
+        row.client_secret_enc = None
+        secret_cleared = True
     accounts = {"made_sso_only": [], "restored": []}
     if stored_policy is not None:
         was = sso_policy.effective(row.policy)
@@ -382,7 +417,8 @@ def apply(db, row, changes: dict, stored_policy) -> dict:
             changed.extend("policy." + key for key in keys)
         if now["sso_password_login"] != was["sso_password_login"]:
             accounts = sso_only.apply_password_login(db, row)       # the row holds the new setting
-    return {"changed": changed, "connection_changed": fingerprint(row) != before, **accounts}
+    return {"changed": changed, "connection_changed": fingerprint(row) != before, "secret_cleared": secret_cleared,
+            **accounts}
 
 
 def enable_refusal(db, row) -> Optional[Conflict]:

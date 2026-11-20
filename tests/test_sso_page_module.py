@@ -285,3 +285,21 @@ try { await window.Sso.startSignIn('p-1'); } catch (e) { said = e.message; }
 out({ before, said, asked: asked.length, flow: flow() });
 """)
     assert got == {"before": False, "said": "Single sign-on needs a secure page (https).", "asked": 0, "flow": None}
+
+
+def test_after_a_sign_out_only_an_address_the_page_would_open_is_followed():
+    """The provider logout a sign-out answer names: https anywhere, http on this computer, and nothing else. The page
+    is replaced (Back does not return to the page that showed the app); for any other address the caller stays."""
+    got = _node(r"""
+const went = [];
+global.location.replace = (u) => { went.push(u); };
+const tried = ['https://idp.example.org/logout?id_token_hint=x', 'http://localhost:8080/logout', 'http://127.0.0.1/o',
+               'http://idp.example.org/logout', 'javascript:alert(1)', 'data:text/html,x', 'not an address', '', null,
+               'ftp://idp.example.org/x', '//idp.example.org/logout'];
+const said = tried.map((address) => window.Sso.leaveToSignOut(address));
+out({ said, went, assigned: left });
+""")
+    assert got["said"] == [True, True, True, False, False, False, False, False, False, False, False]
+    assert got["went"] == ["https://idp.example.org/logout?id_token_hint=x", "http://localhost:8080/logout",
+                           "http://127.0.0.1/o"]
+    assert got["assigned"] == []            # replaced, never added to the history

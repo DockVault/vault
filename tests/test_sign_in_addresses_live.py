@@ -74,6 +74,7 @@ def test_with_an_address_everything_is_built_on_it_whatever_host_a_request_names
     pid = provider["id"]
     assert provider["addresses"] == {"redirect_uri": f"{base}/auth/sso/{pid}/callback",
                                      "backchannel_logout_uri": f"{base}/auth/sso/{pid}/backchannel-logout",
+                                     "post_logout_redirect_uri": f"{base}/",
                                      "sign_in_link": f"{base}/?sso={pid}"}
     # Another host the vault answers to (the name the containers reach it by) changes nothing that is given out.
     for host in ("vault-api", "vault-api:8000"):

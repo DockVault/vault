@@ -243,7 +243,7 @@ def test_a_save_writes_the_fields_and_keeps_the_secret_encrypted(P, db):
                                     "label": "Company sign-in"}), None)
     db.commit()
     assert out == {"changed": ["label", "issuer", "client_id", "client_secret"], "connection_changed": True,
-                   "made_sso_only": [], "restored": []}
+                   "secret_cleared": False, "made_sso_only": [], "restored": []}
     assert row.client_secret_enc and "s3cret" not in row.client_secret_enc
     assert decrypt_secret(row.client_secret_enc) == "s3cret"
     assert P.configured(row)
@@ -267,7 +267,7 @@ def test_the_page_is_never_shown_the_secret(P, db):
     assert shown["last_test"] == {"outcome": "ok", "auth_time_present": True}      # the fingerprint stays inside
     assert shown["addresses"] == {"redirect_uri": f"{BASE}/auth/sso/{row.id}/callback",
                                   "backchannel_logout_uri": f"{BASE}/auth/sso/{row.id}/backchannel-logout",
-                                  "sign_in_link": f"{BASE}/?sso={row.id}"}
+                                  "post_logout_redirect_uri": f"{BASE}/", "sign_in_link": f"{BASE}/?sso={row.id}"}
     assert (shown["identities"], shown["sso_only_accounts"], shown["refusals"]) == (2, 1, 1)
     assert shown["policy"]["sso_password_login"] == "allowed" and shown["policy"]["sso_freshness_days"] == 30
     assert shown["token_auth"] == "client_secret_basic" and shown["claims"] == {} and shown["created_by"] is None
@@ -293,9 +293,9 @@ def test_the_fingerprint_follows_the_connection_and_nothing_else(P, db):
     assert P.fingerprint(row) == first and P.tested(row)
     seen = {first}
     for change in ({"issuer": ISSUER + "/"}, {"discovery_url": "https://login.example.org/doc"},
+                   {"private_network": True},
                    {"client_id": "client-2"}, {"client_secret": "another"}, {"token_auth": "client_secret_post"},
-                   {"scopes": "openid email"}, {"claims": {"groups": "roles"}},
-                   {"private_network": True}):
+                   {"scopes": "openid email"}, {"claims": {"groups": "roles"}}):
         out = P.apply(db, row, P.clean(change, row=row), None)
         assert out["connection_changed"] is True, change
         now = P.fingerprint(row)
@@ -304,6 +304,67 @@ def test_the_fingerprint_follows_the_connection_and_nothing_else(P, db):
         assert not P.tested(row)             # the last test spoke for the connection as it was
     # The secret enters only as a digest of its stored form.
     assert "another" not in "".join(seen) and row.client_secret_enc not in "".join(seen)
+
+
+def test_pointing_a_provider_somewhere_else_drops_the_stored_secret(P, db):
+    """The secret was entered for the place the provider was then, and a test sign-in posts it to the token endpoint
+    of wherever the provider points now. So a change of the issuer, the discovery address or the private-network
+    switch without a new secret drops the stored one: whoever points the provider elsewhere enters it themselves,
+    and nobody learns a secret they never entered."""
+    from app.core.security import decrypt_secret
+    moves = ({"issuer": ISSUER + "/other"},
+             {"discovery_url": "https://elsewhere.example.org/.well-known/openid-configuration"},
+             {"private_network": True})
+    for n, change in enumerate(moves):
+        row = _ready(P, db, name=f"moved-{n}")
+        out = P.apply(db, row, P.clean(change, row=row), None)
+        assert out["secret_cleared"] is True and row.client_secret_enc is None, change
+        assert not P.configured(row) and not P.tested(row), change
+        assert P.enable_refusal(db, row).reason == P.NOT_CONFIGURED
+    # A new secret in the same change is the one kept.
+    row = _ready(P, db, name="moved-with-secret")
+    out = P.apply(db, row, P.clean({"issuer": ISSUER + "/other", "client_secret": "the-new-one"}, row=row), None)
+    assert out["secret_cleared"] is False and decrypt_secret(row.client_secret_enc) == "the-new-one"
+    # What does not say where the provider is leaves the secret alone.
+    stays = ({"client_id": "client-2"}, {"token_auth": "client_secret_post"}, {"scopes": "openid email"},
+             {"claims": {"groups": "roles"}}, {"label": "Staff"}, {"issuer": ISSUER})
+    for n, change in enumerate(stays):
+        row = _ready(P, db, name=f"stays-{n}")
+        out = P.apply(db, row, P.clean(change, row=row), None)
+        assert out["secret_cleared"] is False and decrypt_secret(row.client_secret_enc) == "s3cret", change
+
+
+def test_turning_a_provider_off_holds_the_accounts_whose_sign_in_there_had_lapsed(P, db):
+    """A provider that is off asks nothing of anyone, so the people who stopped signing in there would get their
+    keys back the moment it is turned off. Before it is, each identity whose window has already run out is recorded
+    as held: it stays paused while the provider is off, the provider is not removed while it holds one, and it is
+    lifted as a refusal is. An identity still inside its window, and one already refused, are left as they are."""
+    from datetime import timedelta
+    from app.services import sso_freshness as F
+    now = datetime.utcnow()
+    row = _ready(P, db)
+    row.state = "enabled"
+    row.policy = {"sso_freshness_days": 7}
+    gone = _link(db, _user(db, "gone"), row, last_sign_in_at=now - timedelta(days=30), linked_at=now - timedelta(days=60))
+    here = _link(db, _user(db, "here"), row, last_sign_in_at=now - timedelta(days=1), linked_at=now - timedelta(days=60))
+    refused_at = now - timedelta(days=2)
+    out = _link(db, _user(db, "out"), row, last_sign_in_at=now - timedelta(days=3), linked_at=now - timedelta(days=60),
+                refused_at=refused_at)
+    assert F.deadline_of(gone, row).due <= now and not F.deadline_of(gone, row).refused
+    assert P.hold_lapsed(db, row, now=now) == 1
+    assert gone.refused_at == now and here.refused_at is None and out.refused_at == refused_at
+    row.state = "disabled"
+    held = F.deadline_of(gone, row)
+    assert held is not None and held.refused                    # paused though the provider is off
+    assert F.deadline_of(here, row) is None                      # inside its window when the provider went off
+    assert P.remove_refusal(db, row).reason == P.REFUSALS_IN_FORCE
+    assert P.hold_lapsed(db, row, now=now) == 0                  # nothing more to hold
+    # A provider that asks for no window holds nobody.
+    other = _ready(P, db, name="no-window")
+    other.state = "enabled"
+    other.policy = {"sso_freshness_days": 0}
+    _link(db, _user(db, "anyone"), other, last_sign_in_at=now - timedelta(days=400), linked_at=now - timedelta(days=500))
+    assert P.hold_lapsed(db, other, now=now) == 0
 
 
 def test_tested_means_a_passed_test_of_the_connection_as_it_is(P, db):

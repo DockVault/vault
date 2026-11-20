@@ -150,14 +150,19 @@
         return { group, box };
     }
 
-    function copyLine(labelText, value, id) {
+    // An address to give the provider: read-only, named by its label for a screen reader, with a Copy button that
+    // says what it copies, and a line of help when the address is only sometimes needed.
+    function copyLine(labelText, value, id, help) {
         const group = _el('div', 'form-group');
-        group.appendChild(_el('label', null, labelText));
+        const label = _el('label', null, labelText);
+        label.htmlFor = id;
+        group.appendChild(label);
         const row = _el('div', 'flex items-center gap-sm');
         const shown = _el('input', 'form-control');
         shown.id = id; shown.readOnly = true; shown.value = value;
         const copy = _el('button', 'btn btn-secondary btn-sm', 'Copy');
         copy.type = 'button';
+        copy.setAttribute('aria-label', 'Copy ' + labelText.charAt(0).toLowerCase() + labelText.slice(1));
         copy.addEventListener('click', async () => {
             try { await navigator.clipboard.writeText(value); showToast('Copied.', 'success'); }
             catch (_) { shown.select(); showToast('Select the address and copy it.', 'info'); }
@@ -165,6 +170,7 @@
         row.appendChild(shown);
         row.appendChild(copy);
         group.appendChild(row);
+        if (help) group.appendChild(_el('p', 'text-secondary text-sm mt-xs', help));
         return group;
     }
 
@@ -190,7 +196,8 @@
                 open = out.provider;
                 let told = 'Saved.';
                 if (out.connection_changed && open.state !== 'enabled') told = 'Saved. Run a test sign-in before turning it on.';
-                if (out.connection_changed && open.state === 'enabled') told = 'Saved. The connection changed: run a test sign-in to check it.';
+                if (out.turned_off) told = 'Saved. The connection changed, so the provider was turned off: run a test sign-in, then turn it on again.';
+                if (out.secret_cleared) told += ' Enter the client secret again: it is kept only for the address it was entered for.';
                 if ((out.made_sso_only || []).length) told += ` ${out.made_sso_only.length} linked account(s) now sign in only through it.`;
                 if ((out.restored || []).length) {
                     told += ` ${out.restored.length} linked account(s) may hold a password again: each asks for a reset `
@@ -250,6 +257,9 @@
             box.appendChild(_el('p', 'text-secondary text-sm mb-sm', 'Give these to the provider. ' + (preset.console || '')));
             box.appendChild(copyLine('Redirect address', provider.addresses.redirect_uri, 'sso-redirect-uri'));
             box.appendChild(copyLine('Back-channel logout address', provider.addresses.backchannel_logout_uri, 'sso-logout-uri'));
+            box.appendChild(copyLine('Sign-out return address', provider.addresses.post_logout_redirect_uri, 'sso-post-logout-uri',
+                'Only when signing out here also signs the person out at the provider (Sessions): the provider sends '
+                + 'the browser back here after its own logout, and refuses an address it was not given.'));
             box.appendChild(copyLine('Sign-in link to hand out', provider.addresses.sign_in_link, 'sso-sign-in-link'));
         }
         const name = input('sso-name', provider.name);
@@ -396,7 +406,9 @@
         const policy = provider.policy || {};
         const back = tick('sso-backchannel', 'The provider may end a person\'s sessions here (back-channel logout)', policy.sso_backchannel_logout,
             'Give the provider the back-channel logout address on the Connection page.');
-        const out = tick('sso-idp-logout', 'Signing out here also signs the person out at the provider', policy.sso_idp_logout);
+        const out = tick('sso-idp-logout', 'Signing out here also signs the person out at the provider', policy.sso_idp_logout,
+            'After a sign-out here the browser goes to the provider to end its session too, then comes back to the '
+            + 'sign-in page. Give the provider the sign-out return address on the Connection page first.');
         const fresh = input('sso-freshness', policy.sso_freshness_days, 'number');
         fresh.min = 0; fresh.max = 365;
         const ends = tick('sso-refusal', 'When the provider refuses a known person, their access here ends', policy.sso_refusal_ends_access,

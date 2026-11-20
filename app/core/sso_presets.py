@@ -22,8 +22,11 @@ PRESETS = (
         "restriction": "sso_allowed_tenants",
         "restriction_help": "Enter your tenant id under Access, so that only your organisation's accounts sign in.",
         "console": "Entra admin center: App registrations, your app, Authentication. Add the redirect address as "
-                   "a Web redirect URI and the logout address as the front-channel or back-channel logout URL. "
-                   "For groups, add the groups claim under Token configuration.",
+                   "a Web redirect URI, and the sign-out return address as a second one when signing out here "
+                   "also signs out there. Leave the front-channel logout URL empty: Entra has no back-channel "
+                   "logout, and the vault takes none through a frame; the freshness window and the refusal rule "
+                   "under Sessions cover people who leave. For groups, add the groups claim under Token "
+                   "configuration.",
     },
     {
         "id": "google", "name": "Google Workspace", "icon": "google",
@@ -49,7 +52,8 @@ PRESETS = (
         "restriction_help": "Assign the app in Okta to the people who may sign in; a required group under Access "
                             "narrows it further.",
         "console": "Okta admin console: Applications, your OIDC web app. Add the redirect address under Sign-in "
-                   "redirect URIs. For groups, add a groups claim filter to the ID token.",
+                   "redirect URIs, and the sign-out return address under Sign-out redirect URIs when signing out "
+                   "here also signs out there. For groups, add a groups claim filter to the ID token.",
     },
     {
         "id": "keycloak", "name": "Keycloak", "icon": "keycloak",
@@ -60,8 +64,10 @@ PRESETS = (
         "restriction": "sso_required_groups",
         "restriction_help": "A realm usually holds only your people; a required group under Access narrows it.",
         "console": "Keycloak admin console: Clients, your client (client authentication on, standard flow). Add "
-                   "the redirect address under Valid redirect URIs and the logout address under Backchannel "
-                   "logout URL. For groups, add a Group Membership mapper named groups.",
+                   "the redirect address under Valid redirect URIs, the back-channel logout address under "
+                   "Backchannel logout URL, and the sign-out return address under Valid post logout redirect URIs "
+                   "when signing out here also signs out there. For groups, add a Group Membership mapper named "
+                   "groups.",
     },
     {
         "id": "authentik", "name": "Authentik", "icon": "authentik",
@@ -73,7 +79,8 @@ PRESETS = (
         "restriction_help": "Bind the application in Authentik to the people who may use it; a required group "
                             "under Access narrows it further.",
         "console": "Authentik admin interface: Applications, Providers, your OAuth2/OpenID provider "
-                   "(confidential client). Add the redirect address under Redirect URIs.",
+                   "(confidential client). Add the redirect address under Redirect URIs, and the sign-out return "
+                   "address there too when signing out here also signs out there.",
     },
     {
         "id": OTHER, "name": "Another OpenID Connect provider", "icon": "generic",

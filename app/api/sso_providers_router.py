@@ -114,6 +114,31 @@ def _tell_accounts(users, title: str, change: str) -> None:
         log.info("sso account notices skipped: %s", type(exc).__name__)
 
 
+def _end_sessions_of(db, provider_id) -> int:
+    """End every session that came through the provider, once it is off (no new sign-in and no renewal goes through
+    it any more): each account's turn at its sessions first, as a provider's own logout ends them. Returns how
+    many ended; a failure ends none and is logged, and the provider stays off."""
+    from app.api import sso_router
+    from app.core.models import SsoSession
+    api = _api()
+    try:
+        query = db.query(SsoSession).filter(SsoSession.provider_id == provider_id)
+        named = [s.session_id for s in query.all()]
+        if not named:
+            return 0
+        for owner in sso_router._owners_of(db, named):
+            api._sessions_turn(db, owner)
+        session_ids = [s.session_id for s in query.all()]
+        ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider turned off",
+                                     durable=True) if session_ids else 0
+        db.commit()
+        return int(ended or 0)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.warning("sso sessions of a provider turned off were not ended: %s", type(exc).__name__)
+        return 0
+
+
 def _accounts_named(db, usernames) -> list:
     """(id, username, email) of the accounts ``usernames`` names, for a notice sent after the commit."""
     names = list(usernames or [])
@@ -188,7 +213,10 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
                     current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """Change a provider: its name, button and order, its connection (issuer, client id and secret, scopes, claim
     names), its policy. A change to the connection leaves the last test sign-in speaking for something else: a
-    provider that is off must be tested again before it is turned on, and one that is on stays on and says so.
+    provider that is off must be tested again before it is turned on, and one that is on is turned off by the
+    change, with its sessions ended, until a test sign-in passes again (an untested connection signs nobody in).
+    Pointing the provider somewhere else (the issuer, the discovery address, the private-network switch) without
+    a new client secret drops the stored one: it is never sent to an address it was not entered for.
     Turning password sign-in off for the provider makes its linked accounts sign in only through it (refused while
     one of them must keep a password); allowing it again lets each hold a password again, and mints nothing."""
     api = _api()
@@ -209,10 +237,16 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         stored_policy = providers.check(db, row, changes, account_policy=api._account_policy(db))
         outcome = providers.apply(db, row, changes, stored_policy)
         made, restored = _accounts_named(db, outcome["made_sso_only"]), _accounts_named(db, outcome["restored"])
+        turned_off = outcome["connection_changed"] and row.state == providers.ENABLED
+        held = providers.hold_lapsed(db, row) if turned_off else 0
+        if turned_off:
+            row.state = providers.DISABLED
         db.commit()
     except (providers.Invalid, providers.Conflict) as exc:
         db.rollback()
         raise _refused(exc)
+    ended = _end_sessions_of(db, row.id) if turned_off else 0
+    outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "held": held}
     label = row.label or row.name
     # A change another person made to how an account signs in is told to its owner.
     _tell_accounts(made, "Your password no longer works on this vault", (
@@ -230,6 +264,11 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
             said += f" {len(outcome['made_sso_only'])} linked account(s) now sign in only through it."
         if outcome["restored"]:
             said += f" {len(outcome['restored'])} linked account(s) may hold a password again."
+        if outcome["secret_cleared"]:
+            said += " It was pointed somewhere else, so its stored client secret was dropped and must be entered again."
+        if turned_off:
+            said += (" Its connection changed, so it was turned off until a test sign-in passes again"
+                     + (f", and {ended} session(s) that came through it were ended." if ended else "."))
         _tell_administrators(current_user.username, "A single sign-on provider was changed", said)
     return {"provider": providers.public(db, row), **outcome}
 
@@ -238,8 +277,10 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
 def set_provider_state(provider_id: str, body: ProviderState, request: Request,
                        current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """Turn a provider on or off. On: only with an address the provider can send a browser back to, the connection
-    filled in, and a test sign-in passed with it as it is now. Off: never refused; the answer says how many
-    accounts sign in only through a provider and are linked to this one, since they cannot sign in while it is off."""
+    filled in, and a test sign-in passed with it as it is now. Off: never refused (an incident may need it at
+    once); the sessions that came through it are ended, and an account whose sign-in there had already lapsed stays
+    held, so that turning it off hands nobody their keys back. The answer says how many accounts sign in only
+    through a provider and are linked to this one, since they cannot sign in while it is off."""
     api = _api()
     _refuse_locked()
     if body.state not in (providers.ENABLED, providers.DISABLED):
@@ -259,14 +300,26 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
         if refusal is not None:
             db.rollback()
             raise _refused(refusal)
+    off = body.state == providers.DISABLED
+    held = providers.hold_lapsed(db, row) if off else 0        # while the row still reads as on
     row.state = body.state
     db.commit()
+    ended = _end_sessions_of(db, row.id) if off else 0
     _audit(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
-           details={"provider_id": str(row.id), "name": row.name, "changed": ["state"], "state": row.state})
+           details={"provider_id": str(row.id), "name": row.name, "changed": ["state"], "state": row.state,
+                    **({"sessions": ended, "identities": held} if off else {})})
     turned = "on" if row.state == providers.ENABLED else "off"
-    _tell_administrators(current_user.username, f"A single sign-on provider was turned {turned}",
-                         f"{current_user.username} turned the single sign-on provider {row.name} {turned}.")
-    return {"provider": providers.public(db, row), "changed": True}
+    said = f"{current_user.username} turned the single sign-on provider {row.name} {turned}."
+    if off and ended:
+        said += f" {ended} session(s) that came through it were ended."
+    if off and held:
+        said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each under Identities when it "
+                 "should have its keys back.")
+    _tell_administrators(current_user.username, f"A single sign-on provider was turned {turned}", said)
+    answer = {"provider": providers.public(db, row), "changed": True}
+    if off:
+        answer.update(sessions_ended=ended, held=held)
+    return answer
 
 
 @router.delete("/admin/sso/providers/{provider_id}")

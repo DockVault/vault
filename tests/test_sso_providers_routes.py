@@ -430,3 +430,109 @@ def test_your_account_lists_the_providers_it_is_linked_to_or_could_link(monkeypa
     monkeypatch.setattr(public_url, "public_base_url", lambda: "")
     out = h.call("GET", "/users/me/identities")[1]
     assert out["providers"] == [] and len(out["identities"]) == 3
+
+
+# --------------------------------------------------------------------------- a provider that is on, changed or turned off
+
+def _watch_turn_off(monkeypatch, h, ended=3, held=2):
+    """What turning a provider off does beside the state, observed: (the state the row had when the lapsed accounts
+    were held, the provider whose sessions were ended)."""
+    from app.services import sso_providers
+    seen = []
+    monkeypatch.setattr(sso_providers, "hold_lapsed", lambda db, row, now=None: seen.append(("held", row.state)) or held)
+    monkeypatch.setattr(h.R, "_end_sessions_of", lambda db, provider_id: seen.append(("ended", str(provider_id))) or ended)
+    return seen
+
+
+def test_a_change_to_the_connection_of_a_provider_that_is_on_turns_it_off_until_tested_again(monkeypatch):
+    """One administrator points a provider that is on at another discovery address. It does not go on signing people
+    in on a connection nobody tested: the change turns it off, ends the sessions that came through it, holds the
+    lapsed accounts, and drops the stored secret, which was never entered for that address. It comes on again only
+    after the secret is entered and a test sign-in passes."""
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row])
+    seen = _watch_turn_off(monkeypatch, h)
+    path = f"/admin/sso/providers/{row.id}"
+    status, out = h.call("PATCH", path, {"discovery_url": "https://elsewhere.example.net/.well-known/openid-configuration"})
+    assert status == 200, out
+    assert out["turned_off"] is True and out["secret_cleared"] is True and out["sessions_ended"] == 3 and out["held"] == 2
+    assert row.state == "disabled" and row.client_secret_enc is None
+    assert out["provider"]["state"] == "disabled" and out["provider"]["has_client_secret"] is False
+    assert seen == [("held", "enabled"), ("ended", str(row.id))]       # held while it still read as on, then ended
+    said = h.told[-1][2]
+    assert "turned off until a test sign-in passes again" in said and "3 session(s)" in said
+    assert "must be entered again" in said
+    # It does not come back on by itself: no secret, then no test of the connection as it is now.
+    status, out = h.call("POST", f"{path}/state", {"state": "enabled"})
+    assert status == 409 and out["detail"]["reason"] == "not_configured" and row.state == "disabled"
+    status, out = h.call("PATCH", path, {"client_secret": "entered-again"})
+    assert status == 200 and out["turned_off"] is False and row.client_secret_enc
+    status, out = h.call("POST", f"{path}/state", {"state": "enabled"})
+    assert status == 409 and out["detail"]["reason"] == "not_tested" and row.state == "disabled"
+    # A connection field that does not say where the provider is turns it off as well, and keeps the secret.
+    _tested(row)
+    row.state = "enabled"
+    seen.clear()
+    status, out = h.call("PATCH", path, {"client_id": "another-client"})
+    assert status == 200 and out["turned_off"] is True and out["secret_cleared"] is False and row.state == "disabled"
+    assert row.client_secret_enc and seen == [("held", "enabled"), ("ended", str(row.id))]
+    # What is not the connection leaves a provider that is on as it is.
+    _tested(row)
+    row.state = "enabled"
+    seen.clear()
+    status, out = h.call("PATCH", path, {"label": "Staff sign-in", "policy": {"sso_freshness_days": 14}})
+    assert status == 200 and out["turned_off"] is False and row.state == "enabled" and seen == []
+    # And a provider that is off is not turned off again by a change.
+    row.state = "disabled"
+    status, out = h.call("PATCH", path, {"client_id": "a-third-client"})
+    assert status == 200 and out["turned_off"] is False and seen == []
+
+
+def test_turning_a_provider_off_ends_its_sessions_and_holds_the_lapsed_accounts(monkeypatch):
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row])
+    seen = _watch_turn_off(monkeypatch, h, ended=4, held=1)
+    path = f"/admin/sso/providers/{row.id}/state"
+    status, out = h.call("POST", path, {"state": "disabled"})
+    assert status == 200 and out["changed"] is True and out["sessions_ended"] == 4 and out["held"] == 1, out
+    assert row.state == "disabled" and seen == [("held", "enabled"), ("ended", str(row.id))]
+    audit = h.audit("sso_provider_updated")[-1][2]
+    assert audit["state"] == "disabled" and audit["sessions"] == 4 and audit["identities"] == 1
+    said = h.told[-1][2]
+    assert "4 session(s) that came through it were ended" in said and "1 account(s) whose sign-in there had lapsed stay held" in said
+    # Turning it on ends nothing and holds nobody, and its answer says nothing of either.
+    seen.clear()
+    status, out = h.call("POST", path, {"state": "enabled"})
+    assert status == 200 and out["changed"] is True and "sessions_ended" not in out and "held" not in out and seen == []
+    # Off when it is off already: nothing happens.
+    row.state = "disabled"
+    status, out = h.call("POST", path, {"state": "disabled"})
+    assert status == 200 and out["changed"] is False and seen == []
+
+
+def test_the_sessions_of_a_provider_are_ended_under_each_owners_turn(monkeypatch):
+    """Every session recorded for the provider, and none of another provider's: each owner's turn at their sessions
+    is taken first (a renewal moves the provider's session to its new row under the same turn), then they are ended
+    for good. A failure ends none and does not raise: the provider stays off."""
+    from app.api import sso_router
+    from app.core.models import SsoSession
+    row, other = _provider(created_at=None, updated_at=None), _provider(name="other", created_at=None, updated_at=None)
+    h = Admin(monkeypatch, [row, other])
+    mine = [types.SimpleNamespace(session_id=uuid.uuid4(), provider_id=row.id) for _ in range(2)]
+    theirs = types.SimpleNamespace(session_id=uuid.uuid4(), provider_id=other.id)
+    h.db.tables.setdefault(SsoSession, []).extend(mine + [theirs])
+    order = []
+    monkeypatch.setattr(sso_router, "_owners_of", lambda db, ids: order.append(("owners", sorted(map(str, ids)))) or ["u1", "u2"])
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: order.append(("turn", owner)))
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, session_ids=None, actor_username=None, durable=False: (
+        order.append(("revoke", sorted(map(str, session_ids)), actor_username, durable)) or len(session_ids)))
+    wanted = sorted(str(s.session_id) for s in mine)
+    assert h.R._end_sessions_of(h.db, row.id) == 2
+    assert order == [("owners", wanted), ("turn", "u1"), ("turn", "u2"), ("revoke", wanted, "provider turned off", True)]
+    order.clear()
+    assert h.R._end_sessions_of(h.db, uuid.uuid4()) == 0 and order == []        # a provider with none
+
+    def broken(db, session_ids=None, actor_username=None, durable=False):
+        raise RuntimeError("down")
+    monkeypatch.setattr(h.S, "_revoke_sessions", broken)
+    assert h.R._end_sessions_of(h.db, row.id) == 0

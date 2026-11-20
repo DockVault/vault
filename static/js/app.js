@@ -2872,10 +2872,13 @@ const _signOutsOwed = new Map();     // token -> { timer, wait, sending }
 const SIGN_OUT_REPLACE_CAP_MS = 15000;
 const _signOutsOver = new Map();     // token -> resolve
 
-function _signOutOver(token) {
+// `providerLogout`: the address of the provider's own logout, when the server's answer named one (the session came
+// through a provider that asks for it); the page that ended the session goes there instead of straight to the
+// sign-in page (_replacePageAfterSignOut).
+function _signOutOver(token, providerLogout) {
     const over = _signOutsOver.get(token);
     _signOutsOver.delete(token);
-    if (over) over();
+    if (over) over(typeof providerLogout === 'string' ? providerLogout : '');
 }
 
 function _endServerSession(token) {
@@ -2920,7 +2923,9 @@ function _sendSignOut(token) {
             _signOutAgain(token, _retryAfterMs(resp.headers.get('Retry-After')));
         } else {
             _signOutsOwed.delete(token);     // ended, or refused for good: the server will not take that token
-            _signOutOver(token);
+            // The answer may name the provider's own logout; a body that cannot be read names none.
+            const ended = resp.ok ? resp.json().catch(() => null) : Promise.resolve(null);
+            ended.then((body) => _signOutOver(token, body && body.provider_logout_url));
         }
     }, () => _signOutAgain(token, null));
 }
@@ -3190,6 +3195,7 @@ function _replacePageAfterSignOut(signOutOver, reason, told) {
     _writeSignedOutKeys();
     let asking = false;
     let again = null;
+    let providerLogout = '';
     const attempt = async () => {
         if (asking) return;
         if (again) { clearTimeout(again); again = null; }
@@ -3202,13 +3208,20 @@ function _replacePageAfterSignOut(signOutOver, reason, told) {
             // A sign-out still owed (put off by the server at the cap) is sent once more, kept alive, as the page goes.
             _signOutsOwed.forEach((owed, token) => { if (!owed.sending) _sendSignOut(token); });
             _writeSignedOutKeys();
+            // The session came through a provider that is also signed out of: the page goes to the provider's own
+            // logout, which sends the browser back to the sign-in page. Any other answer, or an address this page
+            // will not open, and the page is replaced by the sign-in page as always.
+            if (providerLogout && window.Sso && Sso.leaveToSignOut(providerLogout)) return;
             location.replace(location.pathname);
             return;
         }
         again = setTimeout(attempt, REPLACE_RETRY_MS);
     };
     _replaceAttempt = attempt;
-    Promise.resolve(signOutOver).then(attempt);
+    Promise.resolve(signOutOver).then((address) => {
+        providerLogout = typeof address === 'string' ? address : '';
+        attempt();
+    });
 }
 let _replaceAttempt = null;
 window.addEventListener('online', () => { if (_replaceAttempt) _replaceAttempt(); });

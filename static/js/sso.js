@@ -83,16 +83,32 @@
         return { kind: found[1], value: found[2], returnTo: found[3] || '', flow: recall() };
     }
 
-    // Follow an address the server answered: only https, or http on this computer, and never anything else.
-    function leaveFor(address) {
+    // An address the server answered, when it is one this page will open: only https, or http on this computer, and
+    // never anything else. null otherwise.
+    function followable(address) {
         let url = null;
         try { url = new URL(String(address)); } catch (_) { url = null; }
         const local = url && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]');
-        if (!url || !(url.protocol === 'https:' || (url.protocol === 'http:' && local))) {
+        return (url && (url.protocol === 'https:' || (url.protocol === 'http:' && local))) ? url : null;
+    }
+
+    function leaveFor(address) {
+        const url = followable(address);
+        if (!url) {
             forget();
             throw new Error('The provider\'s address is not one this page will open.');
         }
         window.location.assign(url.href);
+    }
+
+    // After a sign-out here: the provider's own logout, when the session came through a provider that asks for it.
+    // The page is replaced, so Back does not return to the page that showed the app; the provider sends the browser
+    // back to the sign-in page. False when the address is not one this page will open: the caller stays.
+    function leaveToSignOut(address) {
+        const url = followable(address);
+        if (!url) return false;
+        window.location.replace(url.href);
+        return true;
     }
 
     function refusalText(data, fallback) {
@@ -302,6 +318,6 @@
 
     window.Sso = {
         available, takeReturn, reasonText, renderButtons, startSignIn, startLink, startTest, startConfirm, resume,
-        renderAccount, reset,
+        renderAccount, reset, leaveToSignOut,
     };
 })();

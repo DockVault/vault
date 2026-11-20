@@ -317,3 +317,74 @@ def test_a_provider_only_account_is_told_what_a_passkey_is_for_and_confirms_at_i
     assert start_body["action"] == "account.second_factor" and len(start_body["verifier_hash"]) == 64
     assert stand.finishes[-1][0].endswith("/users/me/identities/reauth/finish")
     assert stand.finishes[-1][1]["code"] == "confirm-code" and stand.proof_matches()
+
+
+# --------------------------------------------------------------------------- signing out at the provider too
+
+def _sign_out_naming(page: Page, address):
+    """The real sign-out (the session ends on the server), with the provider logout address the server names for a
+    session that came through a provider which asks for it."""
+    def sign_out(route):
+        response = route.fetch()
+        body = response.json()
+        if address is not None:
+            body["provider_logout_url"] = address
+        route.fulfill(response=response, json=body)
+    page.route("**/auth/sign-out", sign_out)
+
+
+def test_a_sign_out_goes_on_to_the_logout_of_the_provider_and_comes_back_to_the_sign_in_page(page: Page, base_url,
+                                                                                            fresh_user):
+    """The administrator chose that signing out here also signs the person out at the provider: the page that ended
+    the session goes to the address the server names, once, and the provider sends the browser back to the sign-in
+    page. On a shared computer the next person then finds no provider session to ride on."""
+    Stand(page, base_url, providers=[])
+    seen = []
+
+    def provider(route):
+        seen.append(route.request.url)
+        route.fulfill(status=200, content_type="text/html", body=(
+            "<html><body>Signed out.<script>location.replace("
+            "new URL(location.href).searchParams.get('post_logout_redirect_uri'));</script></body></html>"))
+    page.route(re.compile(r".*/__provider/logout\?.*"), provider)
+    from urllib.parse import quote
+    _sign_out_naming(page, f"{base_url}/__provider/logout?id_token_hint=the-hint"
+                           f"&post_logout_redirect_uri={quote(base_url + '/', safe='')}")
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    page.click("#profile-btn")
+    page.click("#dropdown-logout-btn")
+    for _ in range(150):
+        if seen:
+            break
+        page.wait_for_timeout(200)
+    assert len(seen) == 1 and "id_token_hint=the-hint" in seen[0], seen
+    expect(page.locator("#login-screen")).to_be_visible(timeout=20000)
+    expect(page.locator("#dashboard-screen")).to_be_hidden()
+    assert page.url.rstrip("/") == base_url.rstrip("/")
+    page.wait_for_timeout(1500)
+    assert len(seen) == 1                                       # once: the sign-in page does not go there again
+    # Back does not return to the page that showed the app.
+    page.go_back()
+    page.wait_for_timeout(1000)
+    expect(page.locator("#dashboard-screen")).to_be_hidden()
+
+
+@pytest.mark.parametrize("address", [None, "javascript:alert(1)", "http://provider.example.org/logout", "not an address"])
+def test_a_sign_out_stays_here_when_the_server_names_no_logout_this_page_will_open(page: Page, base_url, fresh_user, address):
+    """No address (the usual sign-out), or one that is not https (nor http on this computer): the page is replaced
+    by the sign-in page as always, and nothing else is opened."""
+    Stand(page, base_url, providers=[])
+    elsewhere = []
+    page.on("request", lambda request: elsewhere.append(request.url) if not request.url.startswith(base_url) else None)
+    page.on("dialog", lambda dialog: (elsewhere.append("dialog"), dialog.dismiss()))
+    _sign_out_naming(page, address)
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    page.click("#profile-btn")
+    # The sign-in screen shows at once; the page that ended the session is replaced a moment later, when the
+    # server has answered. That replacement is what is waited for: it is where the page would go elsewhere.
+    with page.expect_navigation(timeout=30000):
+        page.click("#dropdown-logout-btn")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=25000)
+    expect(page.locator("#login-submit")).to_be_enabled(timeout=25000)
+    page.wait_for_timeout(500)
+    assert page.url.startswith(base_url) and elsewhere == [], elsewhere
