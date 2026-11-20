@@ -20,10 +20,17 @@ from test_passkey_sign_in import ORIGIN, Harness as SignInHarness, _call, _claim
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture
+def the_providers_own_check():
+    """Asked for by a test that gives its provider real rows: the check below is left as it is for that test."""
+
+
 @pytest.fixture(autouse=True)
-def _the_provider_stands(monkeypatch):
+def _the_provider_stands(request, monkeypatch):
     """These tests name a provider by a made-up id. Whether a provider is still on, and the account still linked to
     it, when a sign-in finishes is pinned in tests/test_sso_only.py; here that check is out of the way."""
+    if "the_providers_own_check" in request.fixturenames:
+        return
     from _bare_api_env import set_bare_api_env
     set_bare_api_env()
     from app.services import sign_in
@@ -801,6 +808,65 @@ def test_a_change_to_how_an_account_signs_in_takes_its_turn_before_it_reads_anyt
     h.S._apply_credential_change(h.db, kind, alice, payload, actor_id=root.id, actor_name="root")
     assert seen == [(alice.id, (True, 1, True, True))]
     assert untouched() != (True, 1, True, True), "and the change was then made"
+
+
+def _held_through(h, user, provider, subject):
+    """A sign-in held for an enrollment that came through ``provider`` as ``subject``, its password given."""
+    from app.core.security import create_access_token
+    pending, _headers = h.pending_for(user)
+    pending.enrollment_required = True
+    claims = {"sub": str(user.id), "username": user.username, "pre_auth": str(pending.id), "stage": "second_factor",
+              "methods_so_far": ["pwd"]}
+    if provider is not None:
+        claims.update({"idp": str(provider.id), "idp_sub": subject})
+    return pending, {"Authorization": f"Bearer {create_access_token(claims)}"}
+
+
+@pytest.mark.parametrize("what", ["the provider is turned off", "the identity is unlinked",
+                                  "another identity is linked since", "the account came to sign in only through it"])
+def test_a_held_enrollment_registers_no_passkey_once_its_provider_no_longer_stands(monkeypatch, the_providers_own_check,
+                                                                                    what):
+    """A provider's sign-in held for the passkey a role must hold stays open five minutes. In that time an
+    administrator turns the provider off (an incident: it ends the sign-ins under way), or the account is unlinked
+    from it. The pipeline refuses to finish such a sign-in, but it was asked only after the new key was stored,
+    and that key then signed in by itself, without the provider. The registration routes ask first: no challenge,
+    no key, and the held sign-in is not used up. The same holds for a sign-in that did not come through a provider
+    at all, on an account that meanwhile signs in only through one."""
+    registry, wss = _mod()
+    from app.core.models import ExternalIdentity, SsoProvider, WebAuthnCredential
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = StepHarness(monkeypatch, [alice])
+    _required(monkeypatch, registry, wss, ["user"])
+    provider = types.SimpleNamespace(id=uuid.uuid4(), state="enabled", name="Contoso", label="Sign in with Contoso",
+                                     show_on_sign_in=True, policy=None)
+    identity = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, provider_id=provider.id, subject="subject-1")
+    h.db.tables[SsoProvider], h.db.tables[ExternalIdentity] = [provider], [identity]
+    options_path, verify_path = "/users/me/passkeys/register/options", "/users/me/passkeys/register/verify"
+    through = None if what == "the account came to sign in only through it" else provider
+    pending, headers = _held_through(h, alice, through, "subject-1")
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == 200, body                                  # while everything stands, the enrollment starts
+    status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)
+    assert status == 400 and body["detail"]["reason"] == "challenge_unknown", body
+    if what == "the provider is turned off":
+        provider.state = "disabled"
+    elif what == "the identity is unlinked":
+        h.db.tables[ExternalIdentity].clear()
+    elif what == "another identity is linked since":
+        identity.subject = "somebody-else"
+    else:
+        alice.sso_only = True
+    refused_with = 403 if through is None else 401
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == refused_with, body
+    if through is None:
+        assert "through Contoso" in body["detail"], body
+    else:
+        assert body["detail"] == "This sign-in cannot be completed; start again.", body
+    status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)
+    assert status == refused_with, body                         # refused before the challenge is looked at
+    assert h.db.rows_of(WebAuthnCredential) == [] and pending.consumed_at is None
 
 
 def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monkeypatch):

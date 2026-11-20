@@ -828,7 +828,9 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
     """On a held sign-in, before a factor is stored or made active for the account: refuse what :func:`finish`
     refuses. It is asked there only after the factor stands, and a factor outlives the sign-in it was set up at:
     one stored for an account that was locked or turned off while its enrollment was open would stay after the
-    refusal. With a session there is nothing to ask here: the session is the account's own.
+    refusal, and so would one stored after the provider the sign-in came through was turned off, or the account
+    unlinked from it (a passkey signs in by itself afterwards, without the provider). With a session there is
+    nothing to ask here: the session is the account's own.
 
     The account's turn at its sessions is taken first, and the held sign-in is read again in it. What ends the
     account's sessions spends its sign-ins under way in that same turn (:func:`spend_sign_ins_under_way`), and a
@@ -859,6 +861,11 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
     if on_record is None or on_record[0] is not None:
         raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
     refuse_unless_the_account_may_sign_in(db, user, client_ip)
+    held = SignInResult(user, methods_so_far(pending), client_ip, pending=pending, provider_id=provider_of(pending),
+                        provider_mfa_trusted=provider_mfa_of(pending),
+                        provider_sub=getattr(pending, "_provider_sub", None))
+    refuse_without_the_provider(db, held)
+    refuse_unless_the_provider_stands(db, held)
 
 
 def complete_sign_in(db, result: SignInResult) -> SignedIn:
