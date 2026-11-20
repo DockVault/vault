@@ -511,6 +511,28 @@ def _a_session_is_live(db, session_ids) -> bool:
         return True
 
 
+def _end_what_came_through(db, account, identity) -> int:
+    """End the sessions that came through ``identity`` (its provider and its subject) and spend the sign-ins of
+    ``account`` under way, in the caller's transaction. Returns how many sessions ended. Raises when it cannot:
+    the unlink then fails as a whole, and nothing stays signed in through an identity that is gone."""
+    from app.core.models import PendingLogin, SsoSession
+    api = _api()
+    query = db.query(SsoSession).filter(SsoSession.provider_id == identity.provider_id,
+                                        SsoSession.idp_sub == identity.subject)
+    named = [s.session_id for s in query.all()]
+    ended = 0
+    if named:
+        for owner in _owners_of(db, named):
+            api._sessions_turn(db, owner)
+        session_ids = [s.session_id for s in query.all()]
+        if session_ids:
+            ended = int(api._revoke_sessions(db, session_ids=session_ids, actor_username=account.username,
+                                             durable=True) or 0)
+    db.query(PendingLogin).filter(PendingLogin.user_id == account.id, PendingLogin.consumed_at.is_(None)).update(
+        {PendingLogin.consumed_at: datetime.utcnow()}, synchronize_session=False)
+    return ended
+
+
 def _owners_of(db, session_ids) -> list:
     """The accounts the given sessions belong to, in one order always (two logouts that name the same accounts take
     their turns the same way round)."""
@@ -1086,17 +1108,23 @@ async def unlink_my_identity(
     # The flag follows the providers the account is still linked to: unlinking the one that held it to no password
     # lets it hold one again (nothing is minted), in the same transaction as the unlink.
     settled = sso_only.settle(db, account, without=identity)
+    # What came through the identity ends with it, in the same transaction: the sessions made by a sign-in through
+    # it, and the sign-ins of the account under way. An unlink is the owner's answer to a link they did not make;
+    # whoever was signed in through it must not stay signed in, least of all once the owner links their own
+    # identity on the same provider.
+    ended = _end_what_came_through(db, account, identity)
     db.delete(identity)
     db.commit()
     _audit(db, "sso_identity_unlinked", user=current_user, ip=api.get_client_ip(request),
-           details={"provider_id": provider_id, "identity_id": str(identity_id), "linked_by": "self"})
+           details={"provider_id": provider_id, "identity_id": str(identity_id), "linked_by": "self",
+                    "sessions": ended})
     label = (row.label or row.name) if row is not None else "an organisation provider"
     may_set_password = settled == sso_only.RESTORED
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",
                 f"You unlinked your account from {label}: it can no longer sign in through it."
                 + (" Your account may hold a password again and has none yet: set one with \"Forgot password\" on the "
                    "sign-in page, or ask an administrator for a reset link." if may_set_password else ""))
-    answer = {"removed": True}
+    answer = {"removed": True, "sessions_ended": ended}
     if may_set_password:
         answer["may_set_password"] = True
     return answer

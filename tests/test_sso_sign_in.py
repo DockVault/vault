@@ -612,9 +612,31 @@ def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_accoun
     assert _call(h.S, "DELETE", f"/users/me/identities/{uuid.uuid4()}")[0] == 404
     assert _call(h.S, "DELETE", f"/users/me/identities/{bobs.id}")[0] == 404           # someone else's
     assert len(h.identities()) == 2
+    # What came through the identity ends with it: the sessions made by a sign-in through it (and no other: not
+    # one through another identity of the provider, not one of another provider), and the account's sign-ins under
+    # way (and nobody else's).
+    from app.core.models import ActiveSession, PendingLogin, SsoSession
+    q = _provider(name="Fabrikam")
+    through, bobs_own, elsewhere = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    h.db.rows_of(ActiveSession).extend([types.SimpleNamespace(id=through, user_id=alice.id),
+                                         types.SimpleNamespace(id=bobs_own, user_id=bob.id),
+                                         types.SimpleNamespace(id=elsewhere, user_id=alice.id)])
+    h.db.rows_of(SsoSession).extend([
+        types.SimpleNamespace(session_id=through, provider_id=p.id, idp_sub="subject-1"),
+        types.SimpleNamespace(session_id=bobs_own, provider_id=p.id, idp_sub="bob-subject"),
+        types.SimpleNamespace(session_id=elsewhere, provider_id=q.id, idp_sub="subject-1")])
+    mine = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, consumed_at=None)
+    others = types.SimpleNamespace(id=uuid.uuid4(), user_id=bob.id, consumed_at=None)
+    h.db.rows_of(PendingLogin).extend([mine, others])
+    revoked, turns = [], []
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: revoked.append(kw) or len(kw["session_ids"]))
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: turns.append(owner))
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
-    assert status == 200 and out == {"removed": True} and h.identities() == [bobs]
-    assert any(a[0] == "sso_identity_unlinked" for a in h.audits) and h.step_ups.count("account.second_factor") == 4
+    assert status == 200 and out == {"removed": True, "sessions_ended": 1} and h.identities() == [bobs], out
+    assert revoked == [{"session_ids": [through], "actor_username": "alice", "durable": True}] and turns == [str(alice.id)]
+    assert mine.consumed_at is not None and others.consumed_at is None
+    unlinked = [a for a in h.audits if a[0] == "sso_identity_unlinked"]
+    assert len(unlinked) == 1 and unlinked[0][2]["sessions"] == 1 and h.step_ups.count("account.second_factor") == 4
     assert h.notices[-1][1] == "A sign-in method was removed from your account"
 
 

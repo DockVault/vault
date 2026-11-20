@@ -159,12 +159,35 @@ def test_the_providers_session_moves_to_the_new_session_with_its_hint(db):
     assert _live_named_by_the_provider(db, p) == [new_row.id]
 
 
-def test_a_session_with_no_record_of_the_provider_is_renewed_with_none(db):
+def test_a_session_with_no_record_of_the_identity_it_came_through_is_not_renewed(db):
+    """The token names a provider and the session has no record of the provider's sign-in: nothing says which
+    identity it came through, so nothing can be compared with the identity the account is linked by now. It is not
+    renewed, and runs out on its own."""
     p = _provider(db)
     user, identity, old = _through(db, p, record=False)
-    renewed = sign_in.renew(db, user, old, client_ip="127.0.0.1")
-    assert jwt.decode(renewed.access_token, options={"verify_signature": False})["idp"] == str(p.id)
-    assert _records(db) == {} and len(_sessions(db)) == 2
+    assert _refused(db, user, old) == UNLINKED
+    assert _records(db) == {} and len(_sessions(db)) == 1
+    assert sign_in.provider_subject_of_session(db, OLD) is None and sign_in.provider_subject_of_session(db, None) is None
+
+
+def test_an_unlink_followed_by_a_link_on_the_same_provider_keeps_no_session_of_the_first_identity(db):
+    """Somebody was linked to the account at the provider (by its address, or a provider account taken over) and
+    signed in. The owner unlinks that identity, then links their own on the same provider, as their organisation
+    signs in there. The session that came through the first identity is not the new identity's: it is not renewed,
+    whatever the account is linked by now; one that came through the identity the account holds is."""
+    p = _provider(db)
+    user, identity, old = _through(db, p)
+    assert sign_in.provider_subject_of_session(db, OLD) == "subject-1"
+    db.delete(identity)
+    db.commit()
+    assert _refused(db, user, old) == UNLINKED
+    _link(db, user, p, subject="the-owners-own-subject")
+    assert _refused(db, user, old) == UNLINKED                  # the owner's identity does not vouch for it
+    assert sso_sign_in.renewal_refusal(db, user, str(p.id), subject="subject-1") == UNLINKED
+    assert sso_sign_in.renewal_refusal(db, user, str(p.id), subject=None) == UNLINKED
+    assert sso_sign_in.renewal_refusal(db, user, str(p.id), subject="") == UNLINKED
+    assert sso_sign_in.renewal_refusal(db, user, str(p.id), subject="the-owners-own-subject") is None
+    assert len(_sessions(db)) == 1
 
 
 def test_the_providers_session_moves_in_the_renewals_own_transaction(db, monkeypatch):
@@ -277,7 +300,7 @@ def test_a_link_to_another_provider_does_not_stand_in_for_the_one_the_session_ca
     db.commit()
     _link(db, other, p, subject="subject-of-sam")
     assert _refused(db, user, old) == UNLINKED
-    assert sso_sign_in.renewal_refusal(db, other, str(p.id)) is None
+    assert sso_sign_in.renewal_refusal(db, other, str(p.id), subject="subject-of-sam") is None
 
 
 @pytest.mark.parametrize("state", ["disabled", "draft", "tested"])
@@ -326,7 +349,7 @@ def test_the_freshness_window_ends_at_its_moment(db):
     signed_in = datetime(2026, 3, 1, 12, 0, 0)
     user, identity, old = _through(db, p, signed_in=signed_in)
     due = signed_in + timedelta(days=1)
-    asked = lambda now: sso_sign_in.renewal_refusal(db, user, str(p.id), now=now)       # noqa: E731
+    asked = lambda now: sso_sign_in.renewal_refusal(db, user, str(p.id), subject="subject-1", now=now)       # noqa: E731
     assert asked(due - timedelta(seconds=1)) is None
     assert asked(due) == AGAIN and asked(due + timedelta(seconds=1)) == AGAIN
     # Through the renewal, long past it.
@@ -386,7 +409,7 @@ def test_a_provider_sign_in_that_showed_no_second_factor_is_not_renewed_once_one
 
 def test_an_account_that_is_provider_only_now_keeps_no_session_made_another_way(db):
     p = _provider(db)
-    user, identity, old = _through(db, p, sso_only_account=True, record=False)
+    user, identity, old = _through(db, p, sso_only_account=True)
     without = {**{k: v for k, v in old.items() if k != "idp"}, "amr": ["pwd"]}
     said = _refused(db, user, without)
     assert said == sso_only.provider_only_message(db, user) and "Contoso" in said

@@ -637,7 +637,8 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
 
 def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
     """A sign-in that came through a provider is finished only while that provider is on and the account is still
-    linked to it. The provider's answer was taken at the callback; the handover code lives a minute after it and
+    linked to it by the identity the sign-in came through (an identity unlinked meanwhile, and another linked on the
+    same provider since, does not finish it). The provider's answer was taken at the callback; the handover code lives a minute after it and
     a held step (the account's second factor, an administrator's password, an enrollment) five. An administrator
     who turns the provider off in that time, or a change to its connection that does, ends the sign-ins under way
     with it: without this each would still become a session, and would stamp its identity as freshly signed in."""
@@ -650,8 +651,10 @@ def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
         provider_id = uuid.UUID(str(result.provider_id))
         row = db.query(SsoProvider).filter(SsoProvider.id == provider_id).first()
         if row is not None and getattr(row, "state", None) == "enabled":
-            stands = db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == provider_id,
-                                                         ExternalIdentity.user_id == result.user.id).first() is not None
+            from app.services import sso_sign_in
+            identity = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == provider_id,
+                                                         ExternalIdentity.user_id == result.user.id).first()
+            stands = identity is not None and sso_sign_in.same_identity(identity, result.provider_sub)
     except ValueError:
         stands = False                  # not a provider's id at all
     if stands:
@@ -1164,9 +1167,23 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
             raise HTTPException(status_code=403, detail=sso_only.provider_only_message(db, user))
         return
     from app.services import sso_sign_in
-    sentence = sso_sign_in.renewal_refusal(db, user, provider_id, methods=old.get("amr") or ())
+    sentence = sso_sign_in.renewal_refusal(db, user, provider_id, methods=old.get("amr") or (),
+                                           subject=provider_subject_of_session(db, old.get("session_token")))
     if sentence:
         raise HTTPException(status_code=403, detail=sentence)
+
+
+def provider_subject_of_session(db, session_token: Optional[str]) -> Optional[str]:
+    """The identity a session came through at its provider (``sso_sessions.idp_sub``), or None when the session has
+    no such record."""
+    if not session_token or not table_present(db, "sso_sessions"):
+        return None
+    from app.core.models import ActiveSession, SsoSession
+    row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(session_token)).first()
+    if row is None:
+        return None
+    kept = db.query(SsoSession).filter(SsoSession.session_id == row.id).first()
+    return (getattr(kept, "idp_sub", None) or None) if kept is not None else None
 
 
 def carry_renewed_provider_session(db, old_row, new_session: str) -> None:

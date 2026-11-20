@@ -978,12 +978,24 @@ def reauth_offered(row) -> bool:
             and isinstance(last_test, dict) and last_test.get("auth_time_present") is True)
 
 
-def renewal_refusal(db, user, provider_id, *, methods=(), now: Optional[datetime] = None) -> Optional[str]:
+def same_identity(identity, subject) -> bool:
+    """Whether ``subject`` (what a session or a sign-in under way came through at the provider) is the subject of
+    ``identity``, the account's link on that provider now. No subject is no match."""
+    return bool(subject) and str(getattr(identity, "subject", None) or "") == str(subject)
+
+
+def renewal_refusal(db, user, provider_id, *, methods=(), subject: Optional[str] = None,
+                    now: Optional[datetime] = None) -> Optional[str]:
     """Why a session that came through the provider ``provider_id`` (its token's ``idp``) is not renewed, as the
     sentence the sign-in screen shows, or None when it may be. A renewal keeps the provider's sign-in going, so it
     needs what that sign-in would need now: the identity still linked, the provider turned on, no refusal by the
     provider in force and its freshness window not run out (app/services/sso_freshness.py). A record that cannot be
     read (no such provider, a database without the tables) is a refusal: nothing vouches for the session.
+
+    ``subject`` is the identity the session came through at the provider (``sso_sessions.idp_sub``). The account
+    must be linked by that very identity now: a session that came through an identity since unlinked is not kept
+    going by another identity the account has linked on the same provider afterwards, and a session with no record
+    of the identity it came through has nothing to be compared by and is refused.
 
     ``methods`` are the old token's proofs (its ``amr``). A sign-in through a provider is whole without the vault's
     own second factor only while the provider's is trusted; when the account needs a second factor, the token shows
@@ -1001,7 +1013,7 @@ def renewal_refusal(db, user, provider_id, *, methods=(), now: Optional[datetime
         return unlinked
     identity = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row_id,
                                                  ExternalIdentity.user_id == user.id).first()
-    if identity is None:
+    if identity is None or not same_identity(identity, subject):
         return unlinked
     provider = db.query(SsoProvider).filter(SsoProvider.id == row_id).first()
     name = ((getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()

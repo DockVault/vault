@@ -330,7 +330,7 @@ def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatc
     # With it on, the unlink goes through and the account may hold a password again; it is told how to set one.
     b.state = "enabled"
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_a.id}")
-    assert status == 200 and out == {"removed": True, "may_set_password": True}, out
+    assert status == 200 and out == {"removed": True, "sessions_ended": 0, "may_set_password": True}, out
     assert alice.sso_only is False and h.identities() == [on_b]
     said = [body for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
     assert "may hold a password again" in said[-1] and "Forgot password" in said[-1]
@@ -388,10 +388,10 @@ def test_after_the_provider_the_accounts_passkey_is_its_second_factor(monkeypatc
     h = Resolving(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
     monkeypatch.setattr(h.S, "_login_second_factor_in_effect", lambda db, user: True)
     # The provider's sign-in with a factor required: held for the second step, not refused.
-    held = _finish(h, alice, [], provider_id=str(p.id))
+    held = _finish(h, alice, [], provider_id=str(p.id), provider_sub="subject-1")
     assert isinstance(held, s.PendingStep) and held.body["stage"] == s.STAGE_SECOND_FACTOR
     # The second step with the passkey, the provider carried: finished.
-    signed = _finish(h, alice, [s.HARDWARE_KEY], provider_id=str(p.id))
+    signed = _finish(h, alice, [s.HARDWARE_KEY], provider_id=str(p.id), provider_sub="subject-1")
     assert isinstance(signed, s.SignedIn)
     assert not [a for a in h.audits if a[0] == "login_failure"]
     # The whole provider sign-in through the routes, for the account that signs in only that way.
@@ -489,12 +489,12 @@ def test_a_provider_sign_in_is_finished_only_while_its_provider_is_on_and_the_ac
     monkeypatch.setattr(s, "_stamp_identity", lambda db, result: stamped.append(result.provider_id))
 
     def result(**extra):
-        return s.SignInResult(alice, [], "203.0.113.9", provider_id=str(p.id), **extra)
+        return s.SignInResult(alice, [], "203.0.113.9", provider_id=str(p.id), provider_sub="subject-1", **extra)
     s.refuse_unless_the_provider_stands(h.db, result())                                   # on, and linked
     s.refuse_unless_the_provider_stands(h.db, s.SignInResult(alice, [s.PASSWORD], "203.0.113.9"))            # no provider
     s.refuse_unless_the_provider_stands(h.db, result(is_temporary=True))
-    for change in ("off", "draft", "unlinked", "gone", "not an id"):
-        p.state, rows, named = "enabled", h.db.rows_of(ExternalIdentity), str(p.id)
+    for change in ("off", "draft", "unlinked", "gone", "not an id", "another identity", "no identity named"):
+        p.state, rows, named, came_through = "enabled", h.db.rows_of(ExternalIdentity), str(p.id), "subject-1"
         if identity not in rows:
             rows.append(identity)
         if change in ("off", "draft"):
@@ -503,11 +503,16 @@ def test_a_provider_sign_in_is_finished_only_while_its_provider_is_on_and_the_ac
             rows.remove(identity)
         elif change == "gone":
             named = str(__import__("uuid").uuid4())
+        elif change == "another identity":
+            came_through = "the-identity-that-was-unlinked"       # the account links by another one now
+        elif change == "no identity named":
+            came_through = None
         else:
             named = "p1"
         before = len([a for a in h.audits if a[0] == "login_failure"])
         with pytest.raises(HTTPException) as refused:
-            s.refuse_unless_the_provider_stands(h.db, s.SignInResult(alice, [], "203.0.113.9", provider_id=named))
+            s.refuse_unless_the_provider_stands(h.db, s.SignInResult(alice, [], "203.0.113.9", provider_id=named,
+                                                                     provider_sub=came_through))
         assert refused.value.status_code == 401 and "start again" in refused.value.detail, change
         assert len([a for a in h.audits if a[0] == "login_failure"]) == before + 1, change
     p.state = "enabled"
