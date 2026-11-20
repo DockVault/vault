@@ -102,6 +102,8 @@
 
     // Whether anything was typed or chosen in the dialog since it opened.
     function hasEdits(dialog) {
+        // A dialog with pages keeps what was typed on a page that is not on screen, and says so itself.
+        if (dialog && dialog.dataset && dialog.dataset.unsaved === 'true') return true;
         const taken = snapshots.get(dialog);
         if (!taken) return false;
         return fields(dialog).some((el) => {
@@ -275,5 +277,8 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
     else start();
 
-    window.Dialogs = { top, closeTop, closeLifted, backdropClick, backdropRelease, hasEdits, focusables, label };
+    // `retake`: a dialog that builds its fields again while it is open (a page of several, a form drawn again after a
+    // save) calls it once they are built, so that what is typed in the new fields counts as typed.
+    window.Dialogs = { top, closeTop, closeLifted, backdropClick, backdropRelease, hasEdits, focusables, label,
+                       retake: snapshot };
 })();

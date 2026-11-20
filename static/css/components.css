@@ -2296,4 +2296,5 @@ details summary:hover {
    the status beside a provider and what a save said in Settings, the Link buttons in Your account. */
 .sso-sign-in-btn { white-space: normal; overflow-wrap: anywhere; }
 .sso-provider-status, .sso-said { margin-left: var(--space-sm); }
+.sso-unsaved { font-weight: normal; }
 .identity-link { margin-right: var(--space-sm); }

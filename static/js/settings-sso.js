@@ -22,6 +22,8 @@
     let loads = 0;              // only the latest read draws the card
     let open = null;            // the provider the dialog shows, as last read
     let page = 'connection';    // the dialog's page
+    let drafts = {};            // typed and not saved, by page: {field id: value}, kept while another page is shown
+    let fresh = {};             // the values the page on screen was built with
 
     const ICON_NAMES = { generic: 'Plain', microsoft: 'Microsoft', google: 'Google', okta: 'Okta', keycloak: 'Keycloak', authentik: 'Authentik' };
     const PAGES = [['connection', 'Connection'], ['access', 'Access'], ['factor', 'Second factor'], ['sessions', 'Sessions']];
@@ -209,7 +211,8 @@
                         + 'link on the sign-in page, or you make one for them on the Users page.';
                 }
                 showToast(told, 'success');
-                drawDialog();
+                delete drafts[page];                       // this page was saved; the others keep what was typed
+                drawDialog({ keep: false, focus: 'sso-save' });
                 load();
             } catch (e) {
                 said.className = 'text-sm ml-sm sso-said text-error';
@@ -446,7 +449,7 @@
             });
             open = out.provider;
             showToast(state === 'enabled' ? 'The provider is on.' : 'The provider is off.', 'success');
-            drawDialog();
+            drawDialog({ focus: 'sso-toggle' });
             load();
         } catch (e) { showToast(e.message || 'The provider was not changed.', 'error'); }
     }
@@ -464,10 +467,69 @@
         } catch (e) { showToast(e.message || 'The provider was not removed.', 'error'); }
     }
 
-    function drawDialog() {
+    // The values of a page's fields, by field id (an address shown to be copied is no field).
+    function valuesOf(box) {
+        const out = {};
+        box.querySelectorAll('input, select, textarea').forEach((el) => {
+            if (el.id && !el.readOnly) out[el.id] = el.type === 'checkbox' ? el.checked : el.value;
+        });
+        return out;
+    }
+
+    // Before the page on screen is taken down: keep what was typed on it and not saved.
+    function keepDraft(body) {
+        const shown = body.querySelector('[data-sso-shown]');
+        if (!shown) return;
+        const now = valuesOf(shown);
+        const kept = {};
+        Object.keys(now).forEach((id) => { if (id in fresh && now[id] !== fresh[id]) kept[id] = now[id]; });
+        if (Object.keys(kept).length) drafts[shown.dataset.ssoShown] = kept;
+        else delete drafts[shown.dataset.ssoShown];
+    }
+
+    function restoreDraft(shown) {
+        const kept = drafts[shown.dataset.ssoShown] || {};
+        shown.querySelectorAll('input, select, textarea').forEach((el) => {
+            if (!el.id || !(el.id in kept)) return;
+            if (el.type === 'checkbox') el.checked = kept[el.id]; else el.value = kept[el.id];
+        });
+    }
+
+    // The dialog says whether a page that is not on screen holds something typed: a click beside the dialog then
+    // does not close it (static/js/dialogs.js), and the page's tab says so.
+    function markUnsaved() {
+        const modal = byId('sso-provider-modal');
+        const waiting = Object.keys(drafts).filter((key) => key !== page);
+        if (modal) {
+            if (waiting.length) modal.dataset.unsaved = 'true'; else delete modal.dataset.unsaved;
+        }
+        waiting.forEach((key) => {
+            const tab = byId('sso-tab-' + key);
+            if (tab && !tab.querySelector('.sso-unsaved')) tab.appendChild(_el('span', 'sso-unsaved', ' (not saved)'));
+        });
+    }
+
+    function forgetDrafts() {
+        drafts = {};
+        fresh = {};
+        const modal = byId('sso-provider-modal');
+        if (modal) delete modal.dataset.unsaved;
+    }
+
+    // `how.keep === false`: what the page on screen holds is not kept (it was just saved, or another provider is
+    // opened). `how.focus`: where the keyboard goes afterwards, 'tab' for the page's tab or the id of a button (the
+    // one that was used: a confirmation dialog may have held the keyboard in between).
+    function drawDialog(how) {
         const body = byId('sso-provider-body');
         const title = byId('sso-provider-title');
         if (!body || !open) return;
+        const opts = how || {};
+        // Every node of the body is replaced: where the keyboard was is found again afterwards, so a person using
+        // a keyboard or a screen reader stays inside the dialog and in their place.
+        const active = document.activeElement;
+        const held = opts.focus === 'tab' ? 'sso-tab-' + page
+            : (opts.focus || (active && body.contains(active) ? (active.id || 'sso-tab-' + page) : null));
+        if (opts.keep !== false) keepDraft(body);
         if (title) title.textContent = open.label || open.name;
         body.replaceChildren();
         const head = _el('div', 'flex items-center gap-sm mb-md');
@@ -493,17 +555,42 @@
         PAGES.forEach(([key, text]) => {
             const tab = _el('button', 'btn btn-sm ' + (key === page ? 'btn-primary' : 'btn-secondary'), text);
             tab.type = 'button';
+            tab.id = 'sso-tab-' + key;
             tab.dataset.ssoPage = key;
             tab.setAttribute('role', 'tab');
             tab.setAttribute('aria-selected', key === page ? 'true' : 'false');
-            tab.addEventListener('click', () => { page = key; drawDialog(); });
+            tab.setAttribute('aria-controls', 'sso-page-' + key);
+            tab.tabIndex = key === page ? 0 : -1;        // one stop for Tab; the arrow keys move between the pages
+            tab.addEventListener('click', () => { page = key; drawDialog({ focus: 'tab' }); });
+            tab.addEventListener('keydown', (e) => {
+                const at = PAGES.findIndex(([k]) => k === key);
+                const to = { ArrowRight: at + 1, ArrowLeft: at - 1, Home: 0, End: PAGES.length - 1 }[e.key];
+                if (to === undefined) return;
+                e.preventDefault();
+                page = PAGES[(to + PAGES.length) % PAGES.length][0];
+                drawDialog({ focus: 'tab' });
+            });
             tabs.appendChild(tab);
         });
         body.appendChild(tabs);
         const draws = { connection: connectionPage, access: accessPage, factor: factorPage, sessions: sessionsPage };
         const shown = draws[page](open);
         shown.id = 'sso-page-' + page;
+        shown.dataset.ssoShown = page;
+        shown.setAttribute('role', 'tabpanel');
+        shown.setAttribute('aria-labelledby', 'sso-tab-' + page);
         body.appendChild(shown);
+        fresh = valuesOf(shown);
+        // The page as built is what the dialog holds; what was typed on it before, put back now, is an edit.
+        const modal = byId('sso-provider-modal');
+        if (modal && window.Dialogs && typeof Dialogs.retake === 'function') Dialogs.retake(modal);
+        restoreDraft(shown);
+        markUnsaved();
+        if (held) {
+            const back = byId(held);
+            const to = back && !back.disabled ? back : byId('sso-tab-' + page);
+            try { if (to) to.focus(); } catch (_) {}
+        }
     }
 
     async function show(providerId, which) {
@@ -512,7 +599,8 @@
         catch (e) { showToast(e.message || 'The provider could not be read.', 'error'); return; }
         open = read.provider;
         page = which || 'connection';
-        drawDialog();
+        forgetDrafts();
+        drawDialog({ keep: false });
         openModal('sso-provider-modal');
     }
 
@@ -523,6 +611,7 @@
         const title = byId('sso-provider-title');
         if (!body) return;
         open = null;
+        forgetDrafts();
         if (title) title.textContent = 'Add a provider';
         body.replaceChildren();
         const presets = (data && data.presets) || [];
@@ -554,7 +643,8 @@
                 });
                 open = out.provider;
                 page = 'connection';
-                drawDialog();
+                forgetDrafts();
+                drawDialog({ keep: false });
                 load();
             } catch (e) {
                 said.className = 'text-sm ml-sm sso-said text-error';

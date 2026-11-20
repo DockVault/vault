@@ -263,6 +263,69 @@ def test_who_may_sign_in_is_set_on_its_own_page_and_a_rule_the_server_holds_is_s
     assert saved["policy"]["sso_freshness_days"] == 7 and saved["policy"]["sso_required_groups"] == ["Vault Users", "staff"]
 
 
+def _beside_the_dialog(page: Page):
+    page.mouse.click(5, 5)
+    page.wait_for_timeout(400)
+
+
+def test_what_is_typed_on_a_page_of_the_dialog_is_kept_and_the_keyboard_stays_in_its_place(page: Page, boss,
+                                                                                        provider_name):
+    """The dialog draws a page again whenever another is chosen or one is saved. What was typed on a page and not
+    saved is there when the page is shown again, its tab says so meanwhile, a click beside the dialog does not
+    throw it away, and the keyboard is on the tab or the button that was used, not lost outside the dialog."""
+    _open(page, boss)
+    _add(page, boss, provider_name)
+    focused = "() => document.activeElement && document.activeElement.id"
+    page.fill("#sso-client-id", "typed-and-not-saved")
+    # To the next page with the keyboard, as the tabs of a dialog are used.
+    page.locator("#sso-tab-connection").focus()
+    page.keyboard.press("ArrowRight")
+    panel = page.locator("#sso-page-access")
+    expect(panel).to_be_visible()
+    assert page.evaluate(focused) == "sso-tab-access"
+    assert panel.get_attribute("role") == "tabpanel" and panel.get_attribute("aria-labelledby") == "sso-tab-access"
+    tab = page.locator("#sso-tab-access")
+    assert tab.get_attribute("aria-controls") == "sso-page-access" and tab.get_attribute("aria-selected") == "true"
+    assert page.locator("#sso-tab-connection").get_attribute("tabindex") == "-1"
+    expect(page.locator("#sso-tab-connection")).to_contain_text("(not saved)")
+    # A click beside the dialog closes it only when nothing typed would be lost: a page not on screen holds some.
+    _beside_the_dialog(page)
+    expect(page.locator("#sso-provider-modal.active")).to_be_visible()
+    page.fill("#sso-groups", "staff")
+    page.locator('.sso-tabs [data-sso-page="connection"]').click()
+    expect(page.locator("#sso-client-id")).to_have_value("typed-and-not-saved")
+    assert page.evaluate(focused) == "sso-tab-connection"
+    expect(page.locator("#sso-tab-access")).to_contain_text("(not saved)")
+    expect(page.locator("#sso-tab-connection")).not_to_contain_text("(not saved)")
+    # A page that is saved keeps nothing aside; the other still holds what was typed on it, and the keyboard is on
+    # the button that saved.
+    page.locator("#sso-tab-access").click()
+    expect(page.locator("#sso-groups")).to_have_value("staff")
+    page.click("#sso-save")
+    _with_the_password(page, boss)
+    expect(page.locator(".toast", has_text="Saved.").first).to_be_visible(timeout=10000)
+    expect(page.locator("#sso-groups")).to_have_value("staff")
+    page.wait_for_function("() => document.activeElement && document.activeElement.id === 'sso-save'", timeout=8000)
+    expect(page.locator("#sso-tab-connection")).to_contain_text("(not saved)")
+    expect(page.locator("#sso-tab-access")).not_to_contain_text("(not saved)")
+    _beside_the_dialog(page)
+    expect(page.locator("#sso-provider-modal.active")).to_be_visible()
+    # With the first page as it was, nothing is held anywhere. (Seen from the first page, the saved one is not
+    # marked: saving it left nothing aside.)
+    page.locator("#sso-tab-connection").click()
+    expect(page.locator("#sso-tab-access")).not_to_contain_text("(not saved)")
+    page.fill("#sso-client-id", "")
+    page.locator("#sso-tab-access").click()
+    expect(page.locator("#sso-tab-connection")).not_to_contain_text("(not saved)")
+    # What is typed on the page on screen counts as typed, though its fields were built after the dialog opened.
+    page.fill("#sso-groups", "staff\nmore")
+    _beside_the_dialog(page)
+    expect(page.locator("#sso-provider-modal.active")).to_be_visible()
+    page.fill("#sso-groups", "staff")
+    _beside_the_dialog(page)
+    expect(page.locator("#sso-provider-modal.active")).to_have_count(0)
+
+
 def test_a_provider_is_removed_after_a_question_and_the_password(page: Page, boss, provider_name):
     _open(page, boss)
     _add(page, boss, provider_name)
