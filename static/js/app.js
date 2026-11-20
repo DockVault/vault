@@ -1936,6 +1936,10 @@ function _initSsoSignIn(policy) {
     if (policy && policy.methods && policy.methods.passkeys) kinds.push('a passkey');
     if (providers.length) kinds.push("your organisation's sign-in");
     _noteSignInOrigin(policy, kinds);
+    // The policy can land after a password step began (a page that came back from a provider, a tab told to ask
+    // again). That step offers no other first step: what was just drawn stays out of sight until the step ends.
+    const box = document.getElementById('sso-sign-in');
+    if (_passwordStage && box && box.style.display !== 'none') { box.dataset.wasShown = '1'; box.style.display = 'none'; }
 }
 
 // A link an organisation hands out (/?sso=<provider>) starts that provider at once from the sign-in screen: the
@@ -2034,6 +2038,7 @@ async function _initPasskeySignIn(policy) {
     const on = offered && !_signInOriginElsewhere(policy) && !!window.Passkeys && Passkeys.supported();
     if (button) button.style.display = on ? '' : 'none';
     if (!on) return;
+    if (button && _passwordStage) { button.dataset.wasShown = '1'; button.style.display = 'none'; }    // as above
     if (button && !button.dataset.wired) {
         button.dataset.wired = '1';
         button.addEventListener('click', () => { _passkeySignIn({ conditional: false }); });
@@ -2940,6 +2945,11 @@ function _buildStepUpBody(action, methods) {
 // save, sends nothing more: that session ends when its token expires.
 const SIGN_OUT_THIS_TAB = 'this-tab';
 const SIGN_OUT_TOLD = 'told';
+// The person signed out themselves (the Sign out buttons, the button of the session warning). Such a sign-out ends
+// the session as any full one does; it is also the only one after which the page goes on to the provider's logout,
+// where the administrator chose that. A session that ran out or that the server refused ends here alone: an idle
+// tab does not go to the provider on its own and end the person's session there.
+const SIGN_OUT_ASKED = 'asked';
 const SIGN_OUT_WAIT_MS = 3000;
 const SIGN_OUT_RETRY_FIRST_MS = 15000;
 const SIGN_OUT_RETRY_MOST_MS = 300000;
@@ -3268,7 +3278,7 @@ function _writeSignedOutKeys() {
     try { window.name = SIGNED_OUT_NAME + JSON.stringify({ c: _reasonCode(_endedReason), t: _endedTold }); } catch (_) {}
 }
 
-function _replacePageAfterSignOut(signOutOver, reason, told) {
+function _replacePageAfterSignOut(signOutOver, reason, told, asked) {
     if (_replacing) return;
     _replacing = true;
     _endedReason = reason ? String(reason) : '';
@@ -3289,10 +3299,11 @@ function _replacePageAfterSignOut(signOutOver, reason, told) {
             // A sign-out still owed (put off by the server at the cap) is sent once more, kept alive, as the page goes.
             _signOutsOwed.forEach((owed, token) => { if (!owed.sending) _sendSignOut(token); });
             _writeSignedOutKeys();
-            // The session came through a provider that is also signed out of: the page goes to the provider's own
-            // logout, which sends the browser back to the sign-in page. Any other answer, or an address this page
-            // will not open, and the page is replaced by the sign-in page as always.
-            if (providerLogout && window.Sso && Sso.leaveToSignOut(providerLogout)) return;
+            // The person signed out, and the session came through a provider that is also signed out of: the page
+            // goes to the provider's own logout, which sends the browser back to the sign-in page. Any other
+            // answer, a sign-out nobody asked for (SIGN_OUT_ASKED), or an address this page will not open, and
+            // the page is replaced by the sign-in page as always.
+            if (asked && providerLogout && window.Sso && Sso.leaveToSignOut(providerLogout)) return;
             location.replace(location.pathname);
             return;
         }
@@ -3573,7 +3584,7 @@ function logout(how, reason) {
     _pageEnded = true;
     queueMicrotask(_removeSignedInPage);
     const said = typeof reason === 'string' ? reason : '';
-    if (replaceAfter) _replacePageAfterSignOut(signOutOver, said, mode === SIGN_OUT_TOLD);
+    if (replaceAfter) _replacePageAfterSignOut(signOutOver, said, mode === SIGN_OUT_TOLD, how === SIGN_OUT_ASKED);
     _showReasonNote(said);
 }
 
@@ -7715,6 +7726,7 @@ async function renderAccountPasskeys() {
         row.appendChild(text);
         if (key.provisional) {
             const confirm = _el('button', 'btn btn-secondary btn-sm', 'Confirm');
+            confirm.setAttribute('aria-label', 'Confirm ' + (key.label || 'this passkey'));
             confirm.addEventListener('click', async () => {
                 try {
                     await apiRequest('/users/me/passkeys/' + encodeURIComponent(key.id) + '/confirm', { method: 'POST' });
@@ -7725,6 +7737,7 @@ async function renderAccountPasskeys() {
             row.appendChild(confirm);
         }
         const rename = _el('button', 'btn btn-secondary btn-sm', 'Rename');
+        rename.setAttribute('aria-label', 'Rename ' + (key.label || 'this passkey'));
         rename.addEventListener('click', async () => {
             const label = await showPrompt('A name for this passkey, so you can tell it apart.', 'Rename passkey',
                 { defaultValue: key.label || '' });
@@ -7737,6 +7750,7 @@ async function renderAccountPasskeys() {
             renderAccountPasskeys();
         });
         const remove = _el('button', 'btn btn-danger btn-sm', 'Remove');
+        remove.setAttribute('aria-label', 'Remove ' + (key.label || 'this passkey'));
         remove.addEventListener('click', async () => {
             const ok = await showConfirm('Remove the passkey "' + (key.label || 'Passkey') + '"? It will no longer sign you '
                 + 'in or confirm it is you.', 'Remove passkey', null, 'Remove');
@@ -25104,7 +25118,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Logout button (old - can be removed after testing)
     const logoutBtn = document.getElementById('logout-btn');
     if (logoutBtn) {
-        logoutBtn.addEventListener('click', logout);
+        logoutBtn.addEventListener('click', () => logout(SIGN_OUT_ASKED));
     }
     
     // Profile dropdown toggle
@@ -25148,7 +25162,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Dropdown logout button
     const dropdownLogoutBtn = document.getElementById('dropdown-logout-btn');
     if (dropdownLogoutBtn) {
-        dropdownLogoutBtn.addEventListener('click', logout);
+        dropdownLogoutBtn.addEventListener('click', () => logout(SIGN_OUT_ASKED));
     }
 
     // Encryption key (per-user zero-knowledge keypair) — available to all users.

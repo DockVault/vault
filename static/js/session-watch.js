@@ -424,7 +424,8 @@
     function signOut() {
         disarm();
         forgetArrival();
-        if (typeof logout === 'function') logout();
+        // 'asked': the person chose to sign out (app.js, SIGN_OUT_ASKED).
+        if (typeof logout === 'function') logout('asked');
     }
 
     // Whether the session of `token` ends within `ms` (or has ended): by this device's count when it is armed for

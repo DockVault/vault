@@ -324,6 +324,22 @@ def test_what_is_typed_on_a_page_of_the_dialog_is_kept_and_the_keyboard_stays_in
     page.fill("#sso-groups", "staff")
     _beside_the_dialog(page)
     expect(page.locator("#sso-provider-modal.active")).to_have_count(0)
+    # What was typed and not saved, a client secret among it, is kept no longer than the dialog is open: closed
+    # by its button over a page that holds something, it has forgotten at once, and says nothing of it when opened again.
+    held = "() => document.getElementById('sso-provider-modal').dataset.unsaved || ''"
+    page.locator(f'#signin-sso-providers .sso-provider-row:has-text("{provider_name}") button').click()
+    expect(page.locator("#sso-provider-modal.active")).to_be_visible(timeout=8000)
+    page.fill("#sso-client-secret", "typed-and-left")
+    page.locator("#sso-tab-access").click()
+    expect(page.locator("#sso-tab-connection")).to_contain_text("(not saved)")
+    assert page.evaluate(held) == "true"
+    page.locator("#sso-provider-modal .modal-close").click()
+    expect(page.locator("#sso-provider-modal.active")).to_have_count(0)
+    page.wait_for_function("() => !document.getElementById('sso-provider-modal').dataset.unsaved", timeout=5000)
+    page.locator(f'#signin-sso-providers .sso-provider-row:has-text("{provider_name}") button').click()
+    expect(page.locator("#sso-provider-modal.active")).to_be_visible(timeout=8000)
+    expect(page.locator("#sso-client-secret")).to_have_value("")
+    expect(page.locator("#sso-tab-connection")).not_to_contain_text("(not saved)")
 
 
 def test_a_provider_is_removed_after_a_question_and_the_password(page: Page, boss, provider_name):

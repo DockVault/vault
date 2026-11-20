@@ -383,6 +383,28 @@ def test_a_sign_out_goes_on_to_the_logout_of_the_provider_and_comes_back_to_the_
     expect(page.locator("#dashboard-screen")).to_be_hidden()
 
 
+def test_a_session_that_ended_by_itself_leaves_the_providers_session_alone(page: Page, base_url, fresh_user):
+    """The setting is about a person signing out. A session that ran out, or that the server refused, ends here
+    only: an idle tab does not go to the provider on its own and end the person's session there. The same answer
+    of the server, after the same sign-out call, is followed when the person clicked Sign out (the test above)."""
+    Stand(page, base_url, providers=[])
+    seen = []
+
+    def provider(route):
+        seen.append(route.request.url)
+        route.fulfill(status=200, content_type="text/html", body="<html><body>Signed out at the provider.</body></html>")
+    page.route(re.compile(r".*/__provider/logout\?.*"), provider)
+    from urllib.parse import quote
+    _sign_out_naming(page, f"{base_url}/__provider/logout?id_token_hint=the-hint"
+                           f"&post_logout_redirect_uri={quote(base_url + '/', safe='')}")
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    with page.expect_navigation(timeout=30000):
+        page.evaluate("() => { logout(undefined, 'Your session has ended. Sign in again.'); }")
+    expect(page.locator("#login-screen")).to_be_visible(timeout=25000)
+    page.wait_for_timeout(1500)
+    assert seen == [] and page.url.rstrip("/") == base_url.rstrip("/"), (seen, page.url)
+
+
 @pytest.mark.parametrize("address", [None, "javascript:alert(1)", "http://provider.example.org/logout", "not an address"])
 def test_a_sign_out_stays_here_when_the_server_names_no_logout_this_page_will_open(page: Page, base_url, fresh_user, address):
     """No address (the usual sign-out), or one that is not https (nor http on this computer): the page is replaced

@@ -196,10 +196,14 @@
             if (!Object.keys(body).length) { said.textContent = 'Nothing was changed.'; return; }
             save.disabled = true;
             said.textContent = 'Saving...';
+            const saved = open.id;
             try {
-                const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(open.id)}`, {
+                const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(saved)}`, {
                     method: 'PATCH', body: JSON.stringify(body), silent: true,
                 });
+                // An answer that comes after the dialog was closed, or opened on another provider, draws nothing
+                // into it: the list is read again and says what was saved.
+                if (!open || open.id !== saved) { load(); return; }
                 open = out.provider;
                 let told = 'Saved.';
                 if (out.connection_changed && open.state !== 'enabled') told = 'Saved. Run a test sign-in before turning it on.';
@@ -416,8 +420,9 @@
         const back = tick('sso-backchannel', 'The provider may end a person\'s sessions here (back-channel logout)', policy.sso_backchannel_logout,
             'Give the provider the back-channel logout address on the Connection page.');
         const out = tick('sso-idp-logout', 'Signing out here also signs the person out at the provider', policy.sso_idp_logout,
-            'After a sign-out here the browser goes to the provider to end its session too, then comes back to the '
-            + 'sign-in page. Give the provider the sign-out return address on the Connection page first.');
+            'When a person signs out here, the browser goes to the provider to end its session too, then comes back to '
+            + 'the sign-in page. A session that runs out on its own ends here only. Give the provider the sign-out '
+            + 'return address on the Connection page first.');
         const fresh = input('sso-freshness', policy.sso_freshness_days, 'number');
         fresh.min = 0; fresh.max = 365;
         const ends = tick('sso-refusal', 'When the provider refuses a known person, their access here ends', policy.sso_refusal_ends_access,
@@ -445,10 +450,12 @@
                 + 'to this one: they cannot sign in while it is off.', 'Turn the provider off', null, 'Turn off');
             if (!ok) return;
         }
+        const asked = open.id;
         try {
-            const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(open.id)}/state`, {
+            const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(asked)}/state`, {
                 method: 'POST', body: JSON.stringify({ state }), silent: true,
             });
+            if (!open || open.id !== asked) { load(); return; }       // as after a save
             open = out.provider;
             showToast(state === 'enabled' ? 'The provider is on.' : 'The provider is off.', 'success');
             drawDialog({ focus: 'sso-toggle' });
@@ -464,6 +471,7 @@
             await apiRequest(`/admin/sso/providers/${encodeURIComponent(open.id)}`, { method: 'DELETE', silent: true });
             showToast('The provider was removed.', 'success');
             open = null;
+            forgetDrafts();
             closeModal();
             load();
         } catch (e) { showToast(e.message || 'The provider was not removed.', 'error'); }
@@ -518,6 +526,17 @@
         if (modal) delete modal.dataset.unsaved;
     }
 
+    // What was typed and not saved (a client secret among it) is kept no longer than the dialog is open: closed by
+    // its button, by a click beside it or by Escape, it forgets.
+    let watchingClose = false;
+    function forgetWhenClosed() {
+        const modal = byId('sso-provider-modal');
+        if (watchingClose || !modal || typeof MutationObserver !== 'function') return;
+        watchingClose = true;
+        new MutationObserver(() => { if (!modal.classList.contains('active')) forgetDrafts(); })
+            .observe(modal, { attributes: true, attributeFilter: ['class'] });
+    }
+
     // `how.keep === false`: what the page on screen holds is not kept (it was just saved, or another provider is
     // opened). `how.focus`: where the keyboard goes afterwards, 'tab' for the page's tab or the id of a button (the
     // one that was used: a confirmation dialog may have held the keyboard in between).
@@ -526,6 +545,7 @@
         const title = byId('sso-provider-title');
         if (!body || !open) return;
         const opts = how || {};
+        forgetWhenClosed();
         // Every node of the body is replaced: where the keyboard was is found again afterwards, so a person using
         // a keyboard or a screen reader stays inside the dialog and in their place.
         const active = document.activeElement;
@@ -678,6 +698,7 @@
         loads += 1;
         data = null;
         open = null;
+        forgetDrafts();
         const box = byId('signin-sso-providers');
         if (box) box.replaceChildren();
         const line = byId('signin-sso-address');
