@@ -12209,12 +12209,11 @@ def _passkey_assert(db, user, *, purpose: str, challenge_id, credential, policy)
 
 
 def _passkey_challenge_for(db, user, *, purpose: str, request) -> dict:
-    """A challenge for the signed-in (or pending) account's own keys, under the session challenge limiter."""
+    """A challenge for the signed-in (or pending) account's own keys, under the session challenge limiter, which is
+    asked before anything is read and fails closed."""
     from app.core import sign_in_lockout, webauthn_challenges
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     from app.services import webauthn_service as ws
-    if not _passkeys_enabled(db):
-        raise HTTPException(status_code=409, detail="Passkeys are turned off on this deployment.")
     client_ip = get_client_ip(request)
     try:
         allowed, _, reset = _rl.check_rate_limit(identifier=sign_in_lockout.source_of(client_ip),
@@ -12225,6 +12224,8 @@ def _passkey_challenge_for(db, user, *, purpose: str, request) -> dict:
     if not allowed:
         raise HTTPException(status_code=429, detail="Too many requests. Try again later.",
                             headers={"Retry-After": str(retry_after_seconds(reset, PASSKEY_CHALLENGE_WINDOW))})
+    if not _passkeys_enabled(db):
+        raise HTTPException(status_code=409, detail="Passkeys are turned off on this deployment.")
     keys = _passkeys_of(db, user.id)
     if not keys:
         raise HTTPException(status_code=400, detail="This account has no passkey.")
@@ -12321,14 +12322,18 @@ async def passkey_second_factor_verify(
 ):
     """The sign-in's second step met by a passkey: the assertion verified against the pending account's key, then
     the pipeline asks its table with the passkey added (``amr`` ``[pwd, hwk|swk]``, ``mfa_at``). A wrong answer
-    counts against the pending login as a wrong code does."""
+    counts against the pending login as a wrong code does. On the budget of the second step whatever the factor,
+    which fails closed: refused with 503 while it cannot count."""
     from app.core import sign_in_lockout
-    from app.core.rate_limiter import rate_limiter as _rl
+    from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     from app.services import webauthn_service as ws
     user, pending = principal
     client_ip = get_client_ip(request)
-    allowed, _, reset = _rl.check_rate_limit(identifier=f"{sign_in_lockout.source_of(client_ip)}:{user.id}",
-                                             limit=10, window=300, prefix="sf_login_verify", fail_open=False)
+    try:
+        allowed, _, reset = _rl.check_rate_limit(identifier=f"{sign_in_lockout.source_of(client_ip)}:{user.id}",
+                                                 limit=10, window=300, prefix="sf_login_verify", fail_open=False)
+    except RateLimiterUnavailable:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
     if not allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",

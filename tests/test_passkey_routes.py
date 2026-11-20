@@ -485,6 +485,34 @@ def test_a_second_factor_reset_retires_every_passkey_and_a_gone_key_is_reported(
                                       actor_name="root") == {"passkey_gone": True}
 
 
+def test_registration_has_a_budget_per_account_that_fails_closed(monkeypatch):
+    """Asking for registration options is counted per account, on a budget of its own: refused with 429 when it is
+    spent and with 503 while the limiter cannot count, and no challenge is made either time."""
+    alice = _user("alice")
+    h = Harness(monkeypatch, alice)
+    from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+    asked = []
+
+    def _spent(*a, **kw):
+        if kw.get("prefix") == "passkey_register":
+            asked.append((kw.get("identifier"), kw.get("fail_open")))
+            return False, 0, 0
+        return True, 1, 0
+    monkeypatch.setattr(rate_limiter, "check_rate_limit", _spent)
+    status, body = _call(h.S, "POST", "/users/me/passkeys/register/options", {"current_password": "pw"})
+    assert status == 429 and "Too many registration attempts" in body["detail"], body
+    assert asked == [(str(alice.id), False)]
+
+    def _down(*a, **kw):
+        if kw.get("prefix") == "passkey_register":
+            raise RateLimiterUnavailable("down")
+        return True, 1, 0
+    monkeypatch.setattr(rate_limiter, "check_rate_limit", _down)
+    status, body = _call(h.S, "POST", "/users/me/passkeys/register/options", {"current_password": "pw"})
+    assert status == 503 and "temporarily unavailable" in body["detail"], body
+    assert h.redis.rows == {}
+
+
 def test_the_auditor_grant_remembers_the_passkeys_it_was_approved_with():
     set_bare_api_env()
     from app.core import auditor_rights

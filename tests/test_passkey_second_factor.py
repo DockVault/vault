@@ -158,6 +158,37 @@ def test_a_wrong_assertion_at_the_second_step_counts_against_the_pending_login(m
     assert _call_h(h2.S, "POST", "/auth/second-factor/passkey/options", None, headers2)[0] == 400
 
 
+def test_the_second_step_is_refused_with_503_while_its_budget_cannot_count(monkeypatch):
+    """The second step met by a passkey is on the second step's own budget, which fails closed: while the limiter
+    cannot count, the challenge and the answer are refused with 503, nothing is counted against the pending sign-in
+    and it is not spent; once the limiter counts again, the same answer finishes the sign-in."""
+    alice = _user()
+    h = Harness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    pending, headers = h.pending_for(alice)
+    status, body = _call_h(h.S, "POST", "/auth/second-factor/passkey/options", None, headers)
+    assert status == 200, body
+    answer = {"challenge_id": body["challenge_id"],
+              "credential": auth.get_assertion(body["options"], ORIGIN, sign_count=1)}
+    from app.core.rate_limiter import rate_limiter, RateLimiterUnavailable
+    counting = rate_limiter.check_rate_limit
+
+    def _down(*a, **kw):
+        if kw.get("fail_open", True):
+            return True, 1, 0
+        raise RateLimiterUnavailable("down")
+    monkeypatch.setattr(rate_limiter, "check_rate_limit", _down)
+    assert _call_h(h.S, "POST", "/auth/second-factor/passkey/verify", answer, headers) == (
+        503, {"detail": "Service temporarily unavailable."})
+    status, out = _call_h(h.S, "POST", "/auth/second-factor/passkey/options", None, headers)
+    assert status == 503 and "temporarily unavailable" in out["detail"], out
+    assert pending.attempts == 0 and pending.consumed_at is None and row.sign_count == 0
+    monkeypatch.setattr(rate_limiter, "check_rate_limit", counting)
+    status, out = _call_h(h.S, "POST", "/auth/second-factor/passkey/verify", answer, headers)
+    assert status == 200, out
+    assert pending.consumed_at is not None and row.sign_count == 1
+
+
 def test_after_a_provider_sign_in_the_passkey_is_the_second_step_also_for_a_provider_only_account(monkeypatch):
     """An account that signs in only through its identity provider holds no usable password; after the provider its
     passkey finishes the second step (the provider proved who the person is), and the token names the provider. Only

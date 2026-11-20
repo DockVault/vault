@@ -476,7 +476,24 @@ def _routes():
          {"token": "t" * 40, "payload": A.ReceiverUploadOpen(filename="a", total_size=1, total_chunks=1)},
          ["receiver_open", "receiver_open_ip"]),
         (A.finish_sign_in, {"body": A.SignInFinishRequest(code="c" * 43, verifier="v" * 43)}, ["sign_in_finish"]),
+        # Passkeys: the challenge anyone may ask for, the challenge for a session's or a pending sign-in's own keys,
+        # and the second step met by a passkey (the budget of the second step whatever the factor).
+        (A.passkey_sign_in_options, {"body": A.PasskeySignInOptionsRequest()}, ["passkey_challenge"]),
+        (A.passkey_step_up_options, {"current_user": user}, ["passkey_challenge_session"]),
+        (A.passkey_second_factor_options, {"principal": (user, SimpleNamespace(attempts=0))},
+         ["passkey_challenge_session"]),
+        (A.passkey_second_factor_verify,
+         {"body": A.PasskeyAssertionRequest(challenge_id="c" * 32, credential={}), "principal": (user, None)},
+         ["sf_login_verify"]),
     ]
+
+
+# A budget that sits in a helper is tested through every route that calls the helper.
+HELPERS = {"_serve_public_link_download": {"download_public_link"},
+           "_passkey_limit_challenge": {"passkey_sign_in_options"},
+           "_passkey_challenge_for": {"passkey_step_up_options", "passkey_second_factor_options"}}
+# Budgets of a signed-in account kept per account, not per client: each has its own test.
+PER_ACCOUNT = {"search_users", "passkey_register_options"}
 
 
 def _route_keys(monkeypatch, fn, kwargs, address):
@@ -517,14 +534,15 @@ def test_every_public_route_budget_answers_503_while_the_limiter_cannot_count(mo
 
     monkeypatch.setattr(RL.rate_limiter, "check_rate_limit", _cannot_count)
     routes = _routes()
-    # The table is every route of the server with a fail-closed budget, but the signed-in user search's
-    # (download_public_link's sits in the helper it calls).
+    # The table is every route of the server with a fail-closed budget, but the ones kept per signed-in account
+    # (a budget in a helper is listed under the routes that call it).
     tree = ast.parse((ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8"))
     closed = {fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
               and any(isinstance(k, ast.keyword) and k.arg == "fail_open" and getattr(k.value, "value", None) is False
                       for k in ast.walk(fn))}
-    closed = {"download_public_link" if name == "_serve_public_link_download" else name for name in closed}
-    assert closed - {"search_users"} == {fn.__name__ for fn, _k, _p in routes}, sorted(closed)
+    assert PER_ACCOUNT <= closed and set(HELPERS) <= closed, sorted(closed)
+    closed = set().union(*(HELPERS.get(name, {name}) for name in closed))
+    assert closed - PER_ACCOUNT == {fn.__name__ for fn, _k, _p in routes}, sorted(closed)
     for fn, kwargs, _prefixes in routes:
         with pytest.raises(HTTPException) as refused:
             run_coroutine(fn(request=_request(PLAIN), db=None, **kwargs))
