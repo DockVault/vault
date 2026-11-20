@@ -100,13 +100,17 @@ _spec(ALLOWED_ALGS, "list", ["ES256", "RS256", "EdDSA"], "Signature algorithms",
       help="Removing one leaves existing keys of it usable for 30 days, with a notice to their owners.")
 _spec(ATTESTATION, "enum", NONE, "Attestation", choices=(NONE, DIRECT), level=registry.ADVANCED,
       help="Direct asks the authenticator to prove its make, checked against the trust anchors in "
-           "WEBAUTHN_ATTESTATION_ROOTS; without anchors it cannot be turned on.")
+           "WEBAUTHN_ATTESTATION_ROOTS; without anchors it cannot be turned on. It applies to passkeys added from "
+           "then on: one added earlier keeps signing in, and no longer proves a compliance step-up.")
 _spec(ALLOWED_AAGUIDS, "list", [], "Allowed authenticator makes", level=registry.ADVANCED, validate=_uuids,
-      help="Authenticator identifiers (AAGUIDs); only with direct attestation, which alone proves them.")
+      help="Authenticator identifiers (AAGUIDs); only with direct attestation, which alone proves them. A "
+           "passkey of a make not on the list is not added; one added earlier keeps signing in, and no longer "
+           "proves a compliance step-up.")
 _spec(DEVICE_BOUND_ROLES, "list", [], "Roles whose passkeys must be device-bound", choices=ROLES,
       level=registry.ADVANCED,
       help="A synced passkey (one copied between devices) is refused for these roles at registration and in "
-           "a compliance step-up.")
+           "a compliance step-up. Without direct attestation the authenticator's own word is taken for whether "
+           "it is synced.")
 
 
 # --------------------------------------------------------------------------- the values in force
@@ -205,6 +209,20 @@ def policy():
     return PasskeyPolicy(require_uv=require_uv(), allowed_algs=allowed_alg_codes(),
                          attestation=DIRECT if direct else NONE,
                          allowed_aaguids=allowed_aaguids() if direct else (), trust_anchors=anchors)
+
+
+def unattested_count(db) -> Optional[int]:
+    """How many passkeys in use were added without direct attestation, while the vault asks for it; None while it
+    does not (the number would say nothing). The Sign-in page shows it: those keys keep signing in and prove no
+    compliance step-up until their owners add them again."""
+    if attestation() != DIRECT:
+        return None
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not has_table(db, WebAuthnCredential.__tablename__):
+        return 0
+    return db.query(WebAuthnCredential.id).filter(WebAuthnCredential.retired_at.is_(None),
+                                                  WebAuthnCredential.attested.is_(False)).count()
 
 
 # --------------------------------------------------------------------------- the requirement and its grace

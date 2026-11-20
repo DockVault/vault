@@ -172,6 +172,20 @@
         }
     }
 
+    // Under direct attestation: the passkeys added before it, which keep signing in and prove no compliance step-up.
+    function drawOlder(data) {
+        const line = byId('signin-passkey-older');
+        if (!line) return;
+        const count = Number(data.unattested_passkeys);
+        if (!(count > 0)) { line.textContent = ''; line.hidden = true; return; }
+        line.hidden = false;
+        line.textContent = (count === 1 ? '1 passkey in use was' : `${count} passkeys in use were`)
+            + ' added before this vault checked authenticator makes. '
+            + (count === 1 ? 'It keeps' : 'They keep') + ' signing in and serving as a second factor, and '
+            + (count === 1 ? 'does' : 'do') + ' not prove a compliance step-up until '
+            + (count === 1 ? 'its owner adds it' : 'their owners add them') + ' again.';
+    }
+
     async function load() {
         const box = byId('signin-passkey-settings');
         if (!box) return;
@@ -188,6 +202,7 @@
         }
         if (mine !== loads) return;
         drawReadiness(data);
+        drawOlder(data);
         box.replaceChildren(...(data.settings || []).map(drawRow));
     }
 
@@ -198,6 +213,8 @@
         if (box) box.replaceChildren();
         const line = byId('signin-passkey-readiness');
         if (line) { line.textContent = ''; line.hidden = true; }
+        const older = byId('signin-passkey-older');
+        if (older) { older.textContent = ''; older.hidden = true; }
     }
 
     document.addEventListener('click', (e) => {

@@ -11505,6 +11505,7 @@ def _passkey_public(row, now=None) -> dict:
     return {"id": str(row.id), "label": row.label or "", "created_at": _passkey_time(row.created_at),
             "last_used_at": _passkey_time(row.last_used_at), "synced": bool(row.backup_eligible),
             "transports": list(row.transports or []), "algorithm": _PASSKEY_ALG_NAMES.get(row.cose_alg, str(row.cose_alg)),
+            "attested": bool(getattr(row, "attested", False)),
             "provisional": provisional, "provisional_until": _passkey_time(row.provisional_until) if provisional else None}
 
 
@@ -11746,6 +11747,7 @@ async def passkey_register_verify(
         id=uuid.uuid4(), user_id=user.id, credential_id=key.credential_id, public_key_cose=key.public_key_cose,
         cose_alg=key.cose_alg, sign_count=key.sign_count, transports=list(key.transports) or None, aaguid=key.aaguid,
         backup_eligible=key.backup_eligible, backup_state=key.backup_state, uv_initialized=key.uv_initialized,
+        attested=policy.attestation == webauthn_settings.DIRECT,
         discoverable=key.discoverable, label=_passkey_label(body.label), created_at=now,
         created_by_session=_current_session_hash(request), provisional_until=_passkey_provisional_until(db, user.id, now))
     db.add(row)
@@ -11795,6 +11797,7 @@ async def list_my_passkeys(
     _passkey_refuse_temp(current_user)
     now = datetime.utcnow()
     return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
+            "attestation": webauthn_settings.attestation(),
             "enabled": _passkeys_enabled(db),
             "requirement": webauthn_settings.requirement_public(webauthn_settings.requirement(db, current_user))}
 
@@ -12296,6 +12299,18 @@ def _passkey_step_up_factor(db, user, request, body) -> str:
         if webauthn_settings.device_bound_for(user) and row.backup_eligible:
             raise _refuse("synced_key", "Your role needs a passkey bound to one device for compliance step-ups; a "
                                         "synced passkey cannot prove this one.")
+        if policy.attestation == webauthn_settings.DIRECT:
+            # The vault checks authenticator makes. A key added before it did was never checked (its make and its
+            # device-bound flag are the authenticator's own word), and a make taken off the list since is no
+            # longer one the vault accepts: neither proves a compliance step-up. Both keep signing in.
+            if not getattr(row, "attested", False):
+                raise _refuse("not_attested", "This passkey was added before the vault checked authenticator makes, so "
+                                              "it cannot prove a compliance step-up. Add it again, or use your "
+                                              "authenticator app.")
+            allowed = {str(a).lower() for a in (policy.allowed_aaguids or ())}
+            if allowed and str(row.aaguid).lower() not in allowed:
+                raise _refuse("make_not_allowed", "This passkey's make is not on the vault's list for compliance "
+                                                  "step-ups. Use another passkey or your authenticator app.")
         if getattr(user, "role", None) != RoleEnum.ADMIN:
             # Anyone but an administrator acts here by the auditor right: only a key the right was approved
             # (or last reconfirmed) with vouches, whichever compliance step the action is.
@@ -28270,6 +28285,8 @@ def _run_lightweight_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS privacy_seen_version INTEGER",
             # The passkeys an auditor grant was approved with (see AuditorGrant in models.py). Nullable.
             "ALTER TABLE auditor_grants ADD COLUMN IF NOT EXISTS approved_credential_ids JSON",
+            # Whether a passkey was registered under direct attestation (see WebAuthnCredential in models.py).
+            "ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS attested BOOLEAN NOT NULL DEFAULT FALSE",
             # When a role's passkey requirement first applied to the account, and the host operator's clearance.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_required_since TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_requirement_cleared_at TIMESTAMP",

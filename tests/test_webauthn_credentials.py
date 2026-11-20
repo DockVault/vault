@@ -22,7 +22,7 @@ def test_the_table_holds_what_the_authenticator_made_and_what_the_vault_must_rem
     assert t.name == "webauthn_credentials"
     assert set(t.columns.keys()) == {
         "id", "user_id", "credential_id", "public_key_cose", "cose_alg", "sign_count", "transports", "aaguid",
-        "backup_eligible", "backup_state", "uv_initialized", "discoverable", "label", "created_at", "last_used_at",
+        "attested", "backup_eligible", "backup_state", "uv_initialized", "discoverable", "label", "created_at", "last_used_at",
         "created_by_session", "provisional_until", "retired_at", "prf_slot_id"}
     # The authenticator's id is unique across accounts; the key goes with the account.
     assert t.c.credential_id.unique and not t.c.credential_id.nullable

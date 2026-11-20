@@ -402,3 +402,57 @@ def test_direct_attestation_without_readable_anchors_refuses_registrations(monke
     monkeypatch.setattr(wss, "trust_anchors", lambda: ())
     status, body, _auth = h.register(label="k")
     assert status == 400 and body["detail"]["reason"] == "attestation_unverifiable" and h.rows() == [], body
+
+
+def test_under_direct_attestation_only_an_attested_key_of_a_listed_make_proves_a_compliance_step_up(monkeypatch):
+    """Direct attestation and the list of makes bind what is added from then on. A key added before (its make and
+    its device-bound flag were the authenticator's own word) and a key of a make taken off the list keep signing in
+    and keep proving the other step-ups; neither proves a compliance step-up."""
+    registry, wss = _mod()
+    alice = _user()
+    h = StepHarness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    row.attested = False
+    row.aaguid = uuid.uuid4()
+    from app.core import auditor_rights
+    monkeypatch.setattr(auditor_rights, "open_grant",
+                        lambda db, user_id, **kw: types.SimpleNamespace(approved_credential_ids=[str(row.id)]))
+    monkeypatch.setattr(wss, "trust_anchors", lambda: (b"anchor",))
+    count = [0]
+
+    def step_up(action):
+        count[0] += 1
+        return h.step_up_with_passkey(auth, action, sign_count=count[0])
+
+    assert step_up("compliance.case.request")[0] == 200                    # the vault asks for no attestation
+    _resolving(monkeypatch, registry, {wss.ATTESTATION: "direct"})
+    status, body = step_up("compliance.case.request")
+    assert status == 403 and "added before the vault checked authenticator makes" in body["detail"], body
+    assert step_up("admin.retention.write")[0] == 200                      # every other step-up takes it still
+    row.attested = True
+    assert step_up("compliance.case.request")[0] == 200
+    _resolving(monkeypatch, registry, {wss.ATTESTATION: "direct", wss.ALLOWED_AAGUIDS: [str(uuid.uuid4())]})
+    status, body = step_up("compliance.case.request")
+    assert status == 403 and "not on the vault's list" in body["detail"], body
+    assert step_up("admin.retention.write")[0] == 200
+    _resolving(monkeypatch, registry, {wss.ATTESTATION: "direct", wss.ALLOWED_AAGUIDS: [str(row.aaguid).upper()]})
+    assert step_up("compliance.case.request")[0] == 200                    # its make is on the list, however written
+    reasons = [a for a in h.audits if a == ("action", "second_factor_failed")]
+    assert len(reasons) == 2
+
+
+def test_the_sign_in_page_is_told_how_many_passkeys_were_added_without_attestation(monkeypatch):
+    registry, wss = _mod()
+    from _memory_db import MemoryDB
+    from app.core.models import WebAuthnCredential
+    from app.core import table_presence
+    monkeypatch.setattr(table_presence, "has_table", lambda db, name: True)
+
+    def key(**kw):
+        fields = dict(id=uuid.uuid4(), user_id=uuid.uuid4(), retired_at=None, attested=False)
+        fields.update(kw)
+        return types.SimpleNamespace(**fields)
+    db = MemoryDB({WebAuthnCredential: [key(), key(), key(attested=True), key(retired_at=datetime.utcnow())]})
+    assert wss.unattested_count(db) is None                                # no attestation asked: the number says nothing
+    _resolving(monkeypatch, registry, {wss.ATTESTATION: "direct"})
+    assert wss.unattested_count(db) == 2                                   # not the attested one, not the retired one

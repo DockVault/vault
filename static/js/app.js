@@ -7446,6 +7446,10 @@ async function renderAccountPasskeys() {
             key.last_used_at ? 'last used ' + _passkeyWhen(key.last_used_at) : 'never used',
             key.synced ? 'synced across devices' : 'on one device'];
         text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
+        if (data.attestation === 'direct' && key.attested === false) {
+            text.appendChild(_el('div', 'text-secondary text-xs', 'Added before this vault checked authenticator makes: '
+                + 'it signs you in, and does not prove a compliance action. Add it again to change that.'));
+        }
         if (key.provisional) {
             text.appendChild(_el('div', 'text-warning text-xs', 'Waiting for your confirmation until '
                 + (_passkeyWhen(key.provisional_until) || 'its provisional period ends')

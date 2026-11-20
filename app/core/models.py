@@ -3773,6 +3773,9 @@ class WebAuthnCredential(Base):
     sign_count = Column(BigInteger, nullable=False, default=0, server_default='0')   # 0: the authenticator does not count
     transports = Column(JSON(none_as_null=True), nullable=True)   # internal, hybrid, usb, nfc, ble, as reported
     aaguid = Column(UUID(as_uuid=True), nullable=True)      # as received; unverified under attestation 'none'
+    # Registered under direct attestation: the make (aaguid) and the device-bound flag were proved by the
+    # authenticator's own certificate chain. False for a key added while the vault did not ask.
+    attested = Column(Boolean, nullable=False, default=False, server_default='false')
     backup_eligible = Column(Boolean, nullable=False, default=False, server_default='false')   # BE at registration, pinned
     backup_state = Column(Boolean, nullable=False, default=False, server_default='false')      # BS as last seen
     uv_initialized = Column(Boolean, nullable=False, default=False, server_default='false')    # UV at registration

@@ -577,3 +577,26 @@ def test_the_registries_know_the_new_names():
     assert cc.label(cc.PASSKEY) == "Passkey removed" and cc.request_label(cc.PASSKEY) == "Remove a passkey"
     spec = ea.SPEC_BY_KEY["sign_in_method_changed"]
     assert spec["category"] == ea.SYSTEM and "{{action.change}}" in spec["default_body_html"]
+
+
+def test_a_key_is_marked_attested_only_when_it_was_registered_under_direct_attestation(monkeypatch):
+    """What the route records beside the key: whether the vault asked for direct attestation when it was added. The
+    chain itself is the service's to check (its own tests); here the policy in force is what is written down."""
+    import dataclasses
+    from app.services import webauthn_service as ws
+    h = Harness(monkeypatch, _user())
+    status, shown, _auth = h.register()
+    assert status == 201 and shown["attested"] is False and h.rows()[0].attested is False
+    S = h.S
+    plain = S._passkey_policy
+    monkeypatch.setattr(S, "_passkey_policy",
+                        lambda db: dataclasses.replace(plain(db), attestation="direct", trust_anchors=(b"anchor",)))
+    options, verify = ws.registration_options, ws.verify_registration
+    monkeypatch.setattr(ws, "registration_options", lambda rp, policy, **kw: options(rp, plain(None), **kw))
+    monkeypatch.setattr(ws, "verify_registration", lambda rp, policy, **kw: verify(rp, plain(None), **kw))
+    status, shown, _auth = h.register(label="second", receipt="ok")
+    assert status == 201 and shown["attested"] is True, shown
+    assert [r.attested for r in h.rows()] == [False, True]
+    status, listed = _call(S, "GET", "/users/me/passkeys")
+    assert status == 200 and listed["attestation"] == "none"               # the setting itself, as the profile reads it
+    assert [k["attested"] for k in listed["passkeys"]] == [False, True]
