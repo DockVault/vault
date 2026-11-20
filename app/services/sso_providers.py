@@ -49,12 +49,36 @@ _SCOPE = re.compile(r"^[\x21\x23-\x5B\x5D-\x7E]+$")        # a scope token (RFC 
 _CLAIM = re.compile(r"^[A-Za-z0-9_.:/-]{1,120}$")
 
 
+# What each field is called on the page, so that a refusal reads on its own wherever it is shown.
+LABELS = {
+    "name": "Name", "preset": "Provider", "label": "Button text", "icon": "Icon", "sort_order": "Order",
+    "show_on_sign_in": "Button on the sign-in page", "issuer": "Issuer", "discovery_url": "Discovery address",
+    "private_network": "Inside the network", "client_id": "Client ID", "client_secret": "Client secret",
+    "token_auth": "How the secret is sent", "scopes": "Scopes", "claims": "Claim names",
+    "policy.sso_account_creation": "Accounts", "policy.sso_default_role": "Role of the accounts made",
+    "policy.sso_password_login": "Password sign-in", "policy.sso_link_by_email": "Link by email",
+    "policy.sso_admin_mapping": "Administrator group", "policy.sso_use_signup_domains": "Sign-up domain list",
+    "policy.sso_backchannel_logout": "Back-channel logout", "policy.sso_idp_logout": "Provider logout",
+    "policy.sso_trust_idp_mfa": "Second factor at the provider", "policy.sso_accepted_amr": "Accepted methods (amr)",
+    "policy.sso_accepted_acr": "Accepted levels (acr)", "policy.sso_requested_acr": "Level to ask for (acr_values)",
+    "policy.sso_allowed_tenants": "Tenants", "policy.sso_allowed_domains": "Domains",
+    "policy.sso_required_groups": "Required groups", "policy.sso_freshness_days": "Days without signing in",
+    "policy.sso_refusal_ends_access": "A refusal ends access",
+}
+
+
 class Invalid(ValueError):
     """A value a save may not hold; ``field`` names it for the form."""
 
     def __init__(self, field: str, message: str):
         super().__init__(message)
         self.field = field
+
+    @property
+    def said(self) -> str:
+        """The refusal as a sentence that names its field: ``Issuer: The endpoint must use https.``"""
+        label = LABELS.get(self.field)
+        return f"{label}: {self}" if label else str(self)
 
 
 class Conflict(ValueError):

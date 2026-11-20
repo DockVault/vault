@@ -1,0 +1,300 @@
+/*
+ * Single sign-on in the browser: the provider buttons of the sign-in screen, the proof a tab keeps for a flow that
+ * leaves the page, what the page does when the provider sends the browser back, and the person's own linked
+ * providers in Your account.
+ *
+ * A flow leaves the page for the provider and comes back as a new page load with a short fragment:
+ *   #sso=<code>         a sign-in: the code is turned into the session by POST /auth/finish
+ *   #sso-linked=<code>  a link the signed-in person started: claimed by POST /users/me/identities/finish
+ *   #sso-test=<code>    an administrator's test sign-in: claimed by POST /admin/sso/providers/{id}/test/finish
+ *   #sso-stepup=<code>  a fresh sign-in that confirms the person: staged by POST /users/me/identities/reauth/finish
+ *   #sso-error=<code>   a refusal, as a reason code; its sentence comes from GET /auth/sso/reasons
+ * Nothing in a fragment is a session, and a code is worth nothing without this tab's verifier: made here before the
+ * page is left (32 random bytes), kept in sessionStorage for this tab only, sent to the server as its SHA-256 at the
+ * start and as itself at the finish, and forgotten the moment the page comes back, whatever came back.
+ *
+ * The fragment is taken out of the address before anything else reads it (takeReturn, called by app.js as the page
+ * loads). An address the server answers is followed only when it is https (or http on this computer).
+ *
+ * Uses app.js's API_BASE, apiRequest, showConfirm, showError, showSuccess and _el. Builds everything with
+ * createElement and textContent.
+ */
+(function () {
+    'use strict';
+
+    const FLOW_KEY = 'dv_sso_flow';
+    const FLOW_MAX_AGE_MS = 15 * 60 * 1000;      // a state lives ten minutes at the server; a flow older is not this one
+    const FRAGMENT = /^#(sso|sso-error|sso-linked|sso-test|sso-stepup)=([A-Za-z0-9._~-]{1,200})(?:&return_to=([A-Za-z0-9_-]{1,40}))?$/;
+    const GENERIC = 'Single sign-on did not finish. Try again.';
+    let reasonTexts = null;
+
+    function base64url(bytes) {
+        let text = '';
+        bytes.forEach((b) => { text += String.fromCharCode(b); });
+        return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    async function sha256Hex(text) {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+        return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function available() {
+        return !!(window.crypto && crypto.subtle && typeof crypto.getRandomValues === 'function');
+    }
+
+    // Begin a flow that leaves the page: this tab's verifier is made and kept with what the flow is for, and its
+    // hash is returned for the start request. One flow at a time: a new one forgets the last.
+    async function begin(purpose, more) {
+        if (!available()) throw new Error('Single sign-on needs a secure page (https).');
+        const bytes = new Uint8Array(32);
+        crypto.getRandomValues(bytes);
+        const verifier = base64url(bytes);
+        const flow = Object.assign({ purpose, verifier, at: Date.now() }, more || {});
+        sessionStorage.setItem(FLOW_KEY, JSON.stringify(flow));
+        return sha256Hex(verifier);
+    }
+
+    function forget() {
+        try { sessionStorage.removeItem(FLOW_KEY); } catch (_) {}
+    }
+
+    // The flow this tab began, read once and forgotten; null when there is none, or it is not one of ours.
+    function recall() {
+        let raw = null;
+        try { raw = sessionStorage.getItem(FLOW_KEY); } catch (_) {}
+        forget();
+        if (!raw) return null;
+        try {
+            const flow = JSON.parse(raw);
+            if (!flow || typeof flow !== 'object' || typeof flow.verifier !== 'string' || typeof flow.purpose !== 'string') return null;
+            if (typeof flow.at !== 'number' || Date.now() - flow.at > FLOW_MAX_AGE_MS) return null;
+            return flow;
+        } catch (_) { return null; }
+    }
+
+    // What the provider's redirect brought back, taken out of the address at once: {kind, value, returnTo, flow},
+    // or null when the address holds nothing of single sign-on. The tab's flow is forgotten whenever a fragment of
+    // ours arrived.
+    function takeReturn() {
+        const found = (location.hash || '').match(FRAGMENT);
+        if (!found) return null;
+        try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
+        return { kind: found[1], value: found[2], returnTo: found[3] || '', flow: recall() };
+    }
+
+    // Follow an address the server answered: only https, or http on this computer, and never anything else.
+    function leaveFor(address) {
+        let url = null;
+        try { url = new URL(String(address)); } catch (_) { url = null; }
+        const local = url && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]');
+        if (!url || !(url.protocol === 'https:' || (url.protocol === 'http:' && local))) {
+            forget();
+            throw new Error('The provider\'s address is not one this page will open.');
+        }
+        window.location.assign(url.href);
+    }
+
+    function refusalText(data, fallback) {
+        const detail = data && data.detail;
+        if (detail && typeof detail === 'object' && typeof detail.message === 'string') return detail.message;
+        if (typeof detail === 'string') return detail;
+        return fallback;
+    }
+
+    // The sentence for a reason code, from the server's own list (kept once it was read; a list that could not be
+    // read is asked for again the next time); a code the list does not hold gets the general sentence, never the code.
+    async function reasonText(code) {
+        if (reasonTexts === null) {
+            try {
+                const res = await fetch(`${API_BASE}/auth/sso/reasons`, { headers: { Accept: 'application/json' } });
+                const data = res.ok ? await res.json() : null;
+                if (!data || typeof data.reasons !== 'object' || !data.reasons) return GENERIC;
+                reasonTexts = data.reasons;
+            } catch (_) { return GENERIC; }
+        }
+        const text = Object.prototype.hasOwnProperty.call(reasonTexts, code) ? reasonTexts[code] : null;
+        return typeof text === 'string' && text ? text : GENERIC;
+    }
+
+    // ---------------------------------------------------------------- the sign-in screen
+
+    // Start a sign-in at a provider from the sign-in screen. `invitation` is the token of an invitation being
+    // accepted through the provider.
+    async function startSignIn(providerId, options) {
+        const opts = options || {};
+        const hash = await begin('sign_in', { provider: providerId });
+        const body = { verifier_hash: hash };
+        if (opts.invitation) body.invitation = opts.invitation;
+        if (opts.returnTo) body.return_to = opts.returnTo;
+        const res = await fetch(`${API_BASE}/auth/sso/${encodeURIComponent(providerId)}/start`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify(body),
+        });
+        let data = null;
+        try { data = await res.json(); } catch (_) { data = null; }
+        if (!res.ok || !data || typeof data.authorization_url !== 'string') {
+            forget();
+            throw new Error(refusalText(data, 'This sign-in could not be started. Try again in a moment.'));
+        }
+        leaveFor(data.authorization_url);
+    }
+
+    // The provider buttons, from /auth/policy's methods.providers: [{id, label, kind, icon, order}], in the order
+    // given. `onError(message)` shows what a start that failed said.
+    function renderButtons(providers, onError) {
+        const box = document.getElementById('sso-sign-in');
+        if (!box) return;
+        const list = Array.isArray(providers) ? providers.filter((p) => p && typeof p.id === 'string' && p.id) : [];
+        box.replaceChildren();
+        box.style.display = list.length ? '' : 'none';
+        list.forEach((provider) => {
+            const button = _el('button', 'btn btn-secondary btn-block mt-sm sso-sign-in-btn',
+                typeof provider.label === 'string' && provider.label ? provider.label : 'Single sign-on');
+            button.type = 'button';
+            button.dataset.provider = provider.id;
+            if (typeof provider.icon === 'string' && /^[a-z]{1,20}$/.test(provider.icon)) button.dataset.icon = provider.icon;
+            button.addEventListener('click', async () => {
+                box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+                try { await startSignIn(provider.id); }
+                catch (e) {
+                    box.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+                    if (typeof onError === 'function') onError((e && e.message) || GENERIC);
+                }
+            });
+            box.appendChild(button);
+        });
+    }
+
+    // ---------------------------------------------------------------- flows of a signed-in person
+
+    async function startAuthed(path, purpose, more, body) {
+        const hash = await begin(purpose, more);
+        let data;
+        try {
+            data = await apiRequest(path, { method: 'POST', silent: true, body: JSON.stringify(Object.assign({ verifier_hash: hash }, body || {})) });
+        } catch (e) { forget(); throw e; }
+        if (!data || typeof data.authorization_url !== 'string') {
+            forget();
+            throw new Error('This could not be started. Try again in a moment.');
+        }
+        leaveFor(data.authorization_url);
+    }
+
+    const startLink = (providerId) => startAuthed(`/users/me/identities/${encodeURIComponent(providerId)}/start`,
+        'link', { provider: providerId });
+    const startTest = (providerId) => startAuthed(`/admin/sso/providers/${encodeURIComponent(providerId)}/test/start`,
+        'test', { provider: providerId });
+    // A fresh sign-in at the provider that confirms the person for `action`; `then` names what the page does once
+    // it is back ('add-passkey').
+    const startConfirm = (providerId, action, then) => startAuthed(
+        `/users/me/identities/${encodeURIComponent(providerId)}/reauth`, 'step_up',
+        { provider: providerId, action, then: then || '' }, { action });
+
+    // What a signed-in page does with what came back, once the app is shown. Returns what happened, for the caller
+    // to act on: {kind: 'linked'} | {kind: 'tested', provider, summary} | {kind: 'confirmed', action, then} |
+    // {kind: 'error', message} | null.
+    async function resume(back) {
+        if (!back) return null;
+        if (back.kind === 'sso-error') return { kind: 'error', message: await reasonText(back.value) };
+        if (back.kind === 'sso') return null;        // a sign-in's code is not for a page that is already signed in
+        const flow = back.flow;
+        const expected = { 'sso-linked': 'link', 'sso-test': 'test', 'sso-stepup': 'step_up' }[back.kind];
+        if (!flow || flow.purpose !== expected) {
+            return { kind: 'error', message: 'That did not come back to the tab that started it. Start again.' };
+        }
+        const claim = { method: 'POST', silent: true, body: JSON.stringify({ code: back.value, verifier: flow.verifier }) };
+        try {
+            if (back.kind === 'sso-linked') {
+                await apiRequest('/users/me/identities/finish', claim);
+                return { kind: 'linked' };
+            }
+            if (back.kind === 'sso-test') {
+                const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(flow.provider)}/test/finish`, claim);
+                return { kind: 'tested', provider: flow.provider, summary: (out && out.summary) || {} };
+            }
+            const out = await apiRequest('/users/me/identities/reauth/finish', claim);
+            return { kind: 'confirmed', action: (out && out.action) || flow.action || '', then: flow.then || '' };
+        } catch (e) {
+            return { kind: 'error', message: (e && e.message) || GENERIC };
+        }
+    }
+
+    // ---------------------------------------------------------------- Your account
+
+    function when(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        return isNaN(d.getTime()) ? '' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+
+    // The person's linked providers, and the providers they could link, in Your account. Hidden when the vault has
+    // no provider for them.
+    async function renderAccount() {
+        const section = document.getElementById('us-identities-section');
+        const body = document.getElementById('us-identities-body');
+        if (!section || !body) return;
+        body.replaceChildren(_el('div', 'spinner'));
+        let data;
+        try { data = await apiRequest('/users/me/identities', { silent: true }); }
+        catch (_) { section.style.display = 'none'; return; }
+        const identities = (data && Array.isArray(data.identities)) ? data.identities : [];
+        const providers = (data && Array.isArray(data.providers)) ? data.providers : [];
+        const linkable = providers.filter((p) => p && !p.linked);
+        if (!identities.length && !linkable.length) { section.style.display = 'none'; return; }
+        section.style.display = '';
+        body.replaceChildren();
+        if (!identities.length) {
+            body.appendChild(_el('p', 'text-secondary text-sm mb-sm',
+                'Not linked. Linking lets you sign in through your organisation\'s own sign-in as well.'));
+        }
+        identities.forEach((identity) => {
+            const row = _el('div', 'identity-row flex items-center gap-sm mb-sm');
+            row.dataset.identityId = identity.id;
+            const text = _el('div', 'flex-1');
+            text.appendChild(_el('div', 'text-sm font-bold', identity.provider || 'A provider'));
+            const bits = ['Linked ' + (when(identity.linked_at) || 'earlier'),
+                identity.last_sign_in_at ? 'last signed in ' + when(identity.last_sign_in_at) : 'never signed in through it'];
+            text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
+            row.appendChild(text);
+            const unlink = _el('button', 'btn btn-danger btn-sm', 'Unlink');
+            unlink.type = 'button';
+            unlink.addEventListener('click', async () => {
+                const ok = await showConfirm('Unlink ' + (identity.provider || 'this provider') + '? You will no longer '
+                    + 'sign in through it.', 'Unlink single sign-on', null, 'Unlink');
+                if (!ok) return;
+                try {
+                    await apiRequest('/users/me/identities/' + encodeURIComponent(identity.id), { method: 'DELETE' });
+                    showSuccess('Unlinked.');
+                } catch (e) { showError((e && e.message) || 'It was not unlinked.'); }
+                renderAccount();
+            });
+            row.appendChild(unlink);
+            body.appendChild(row);
+        });
+        linkable.forEach((provider) => {
+            const link = _el('button', 'btn btn-secondary btn-sm mr-sm mb-sm identity-link', 'Link ' + (provider.label || 'a provider'));
+            link.type = 'button';
+            link.dataset.provider = provider.id;
+            link.addEventListener('click', async () => {
+                link.disabled = true;
+                try { await startLink(provider.id); }
+                catch (e) { link.disabled = false; showError((e && e.message) || 'The link could not be started.'); }
+            });
+            body.appendChild(link);
+        });
+    }
+
+    function reset() {
+        forget();
+        const body = document.getElementById('us-identities-body');
+        if (body) body.replaceChildren();
+        const section = document.getElementById('us-identities-section');
+        if (section) section.style.display = 'none';
+    }
+
+    window.Sso = {
+        available, takeReturn, reasonText, renderButtons, startSignIn, startLink, startTest, startConfirm, resume,
+        renderAccount, reset,
+    };
+})();

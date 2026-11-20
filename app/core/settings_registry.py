@@ -97,7 +97,8 @@ SPEC_MODULES: tuple[str, ...] = ("app.core.rate_limit_settings", "app.core.setti
                                  "app.core.audit_retention", "app.core.security_records",
                                  "app.core.audit_privacy", "app.core.compliance_settings", "app.core.audit_integrity",
                                  "app.core.audit_archive", "app.core.person_erase", "app.core.working_records",
-                                 "app.core.settings_pages", "app.core.audit_rewrite", "app.core.webauthn_settings")
+                                 "app.core.settings_pages", "app.core.audit_rewrite", "app.core.webauthn_settings",
+                                 "app.core.sso_settings")
 
 # Keys that only .env sets and that no registry spec describes. PUT /settings refuses them too (settings_refusal),
 # so a settings save can never look as if it had changed one: nothing reads them from the settings store.

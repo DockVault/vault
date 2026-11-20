@@ -100,7 +100,7 @@ def test_a_draft_is_made_after_the_step_up_and_recorded(monkeypatch):
     h = Admin(monkeypatch)
     # Judged before anything is asked of the administrator.
     assert h.call("POST", "/admin/sso/providers", {"name": "x", "preset": "made-up"}) == (
-        400, {"detail": {"field": "preset", "message": "Unknown preset."}})
+        400, {"detail": {"reason": "invalid", "field": "preset", "message": "Provider: Unknown preset."}})
     assert h.order == [] and h.rows() == []
     status, out = h.call("POST", "/admin/sso/providers", {"name": " Entra ", "preset": "entra"})
     assert status == 201, out
@@ -121,10 +121,13 @@ def test_a_change_is_judged_then_stepped_up_then_written_and_recorded_by_field_n
                     created_at=None, updated_at=None)
     h = Admin(monkeypatch, [row])
     path = f"/admin/sso/providers/{row.id}"
-    for body, field in (({"issuer": "http://plain.example.org"}, "issuer"), ({"made_up": 1}, "made_up"),
-                        ({"policy": {"sso_freshness_days": 999}}, "policy.sso_freshness_days")):
+    for body, field, said in (
+            ({"issuer": "http://plain.example.org"}, "issuer", "Issuer: The endpoint must use https."),
+            ({"made_up": 1}, "made_up", "Unknown field."),
+            ({"policy": {"sso_freshness_days": 999}}, "policy.sso_freshness_days",
+             "Days without signing in: A whole number from 0 to 365.")):
         status, out = h.call("PATCH", path, body)
-        assert status == 400 and out["detail"]["field"] == field, out
+        assert status == 400 and out["detail"] == {"reason": "invalid", "field": field, "message": said}, out
     status, out = h.call("PATCH", path, {"policy": {"sso_account_creation": "jit"}})
     assert status == 409 and out["detail"]["reason"] == "needs_restriction"
     assert h.order == [] and row.issuer is None and h.audits == []
@@ -370,3 +373,35 @@ def test_what_changed_while_the_administrator_confirmed_is_judged_again(monkeypa
     status, out = h.call("PATCH", path, {"name": "taken"})
     assert status == 409 and out["detail"]["reason"] == "name_taken" and row.name == "contoso"
     assert h.order == ["step_up"] * 3 and h.audits == [] and h.told == []
+
+
+# --------------------------------------------------------------------------- Your account
+
+def test_your_account_lists_the_providers_it_is_linked_to_or_could_link(monkeypatch):
+    shown = _provider(name="b-shown", label="Company sign-in", sort_order=2, icon="microsoft")
+    first = _provider(name="a-first", label=None, sort_order=1, icon=None,
+                      last_test={"outcome": "ok", "auth_time_present": True})
+    hidden = _provider(name="hidden", show_on_sign_in=False)
+    hidden_linked = _provider(name="hidden-linked", label=None, show_on_sign_in=False, sort_order=3)
+    off = _provider(name="off", state="disabled")
+    off_linked = _provider(name="off-linked", label=None, state="disabled")
+    half = _provider(name="half", client_secret_enc=None)
+    h = Admin(monkeypatch, [shown, first, hidden, hidden_linked, off, off_linked, half])
+    from app.core.models import ExternalIdentity
+    h.db.rows_of(ExternalIdentity).extend([_identity(h.root, first), _identity(h.root, hidden_linked, subject="s-2"),
+                                           _identity(h.root, off_linked, subject="s-3"),
+                                           _identity(_user("someone"), shown, subject="s-4")])
+    status, out = h.call("GET", "/users/me/identities")
+    assert status == 200, out
+    assert sorted(i["provider"] for i in out["identities"]) == ["a-first", "hidden-linked", "off-linked"]
+    assert out["providers"] == [
+        {"id": str(first.id), "label": "a-first", "icon": "generic", "linked": True, "reauth": True},
+        {"id": str(shown.id), "label": "Company sign-in", "icon": "microsoft", "linked": False, "reauth": False},
+        {"id": str(hidden_linked.id), "label": "hidden-linked", "icon": "generic", "linked": True, "reauth": False}]
+    # Nothing of a provider's connection rides along.
+    assert not {"issuer", "client_id", "name", "state"} & set(out["providers"][0])
+    # Without an address a provider can send the browser back to, nothing can be linked: none is offered.
+    from app.core import public_url
+    monkeypatch.setattr(public_url, "public_base_url", lambda: "")
+    out = h.call("GET", "/users/me/identities")[1]
+    assert out["providers"] == [] and len(out["identities"]) == 3

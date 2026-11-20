@@ -2,10 +2,9 @@
 
 The providers keep a table of their own (``sso_providers``), with each provider's policy on its row, so the
 registry lists them as a group the deployment may lock: with ``SETTINGS_LOCKED_KEYS`` naming ``sso`` (or ``*``),
-the providers are the deployment's, and the panel adds, changes, turns on or off and removes nothing; it still
-lists them, runs a test sign-in and shows who is linked. Sign-ins go on as before.
-
-The group joins the registry with the page that shows it (:func:`_register`).
+the providers are the deployment's: nothing is added, changed, turned on or off, or removed through the panel or
+its routes, and the Settings page lists the group among what the deployment set. Reading the providers and running
+a test sign-in stay open to an administrator. Sign-ins go on as before.
 """
 from __future__ import annotations
 
@@ -33,3 +32,6 @@ def _register() -> None:
         help="The identity providers people may sign in through, and each provider's rules: who it admits, "
              "whether it makes accounts, its groups, its sessions.",
         shown=_in_words)
+
+
+_register()

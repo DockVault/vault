@@ -110,6 +110,15 @@ def test_a_value_of_the_wrong_shape_is_refused_by_its_field_name(P, field, value
     assert refused.value.field == field and str(refused.value)
 
 
+def test_every_field_and_policy_setting_has_a_name_a_refusal_can_say(P):
+    from app.core import sso_policy
+    wanted = {*P.FIELDS, "preset", *("policy." + key for key in sso_policy.DEFAULTS)} - {"policy"}
+    assert set(P.LABELS) == wanted
+    assert all(label and label[0].isupper() and not label.endswith(".") for label in P.LABELS.values())
+    assert P.Invalid("issuer", "The endpoint must use https.").said == "Issuer: The endpoint must use https."
+    assert P.Invalid("made_up", "Unknown field.").said == "Unknown field."
+
+
 def test_an_unknown_field_is_refused_and_so_is_anything_that_is_not_a_set_of_fields(P):
     for body in ({"client_secret_enc": "x"}, {"state": "enabled"}, {"last_test": {}}, {"id": "1"}, {"kind": "saml"}):
         with pytest.raises(P.Invalid) as refused:

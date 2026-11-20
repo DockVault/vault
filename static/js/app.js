@@ -1246,6 +1246,7 @@ async function applyLoginPolicyLabel() {
         _initSignupAffordance(policy);
         _initForgotAffordance(policy);
         _initPasskeySignIn(policy);
+        _initSsoSignIn(policy);
     } catch (_) { /* keep the static fallback */ }
 }
 // A page that replaced a tab told of a sign-out in another tab asks for the sign-in screen's policy when it is next
@@ -1918,6 +1919,88 @@ function _noteSignInOrigin(policy, kinds) {
     note.appendChild(document.createTextNode(`Signing in with ${kinds.join(' or ')} works at `));
     note.appendChild(link);
     note.appendChild(document.createTextNode('. Open the vault there to use it.'));
+}
+
+// Single sign-on at sign-in (static/js/sso.js makes the tab's proof and leaves for the provider). The buttons are
+// the providers /auth/policy lists (methods.providers), in the administrator's order. A sign-in that came back from
+// a provider is a sign-in under way on this page until the app is shown or it ends, as a passkey's is.
+function _initSsoSignIn(policy) {
+    if (!window.Sso) return;
+    const providers = (policy && policy.methods && Array.isArray(policy.methods.providers)) ? policy.methods.providers : [];
+    Sso.renderButtons(providers, (message) => { _showLoginError(message); });
+}
+
+// A link an organisation hands out (/?sso=<provider>) starts that provider at once from the sign-in screen: the
+// server says whether the provider can serve a sign-in, and its refusal is shown like any other.
+function _ssoStartHandOut(providerId) {
+    if (!window.Sso) return;
+    Sso.startSignIn(providerId).catch((e) => { _showLoginError((e && e.message) || 'This sign-in could not be started.'); });
+}
+
+// The page came back from a provider to the sign-in screen: a refusal is said in the server's words for its
+// reason; a sign-in's code is turned into the session (or the step that still follows) with this tab's verifier.
+async function _ssoOnSignInScreen(back) {
+    if (!back || !window.Sso) return;
+    if (back.kind === 'sso-error') { _showReasonNote(await Sso.reasonText(back.value)); return; }
+    if (back.kind !== 'sso') return;       // a link, a test or a confirmation belongs to a page that is signed in
+    if (!back.flow || back.flow.purpose !== 'sign_in') {
+        _showReasonNote('That sign-in did not come back to the tab that started it. Start again.');
+        return;
+    }
+    _stopPasskeyOffer();
+    _passkeyHoldsPage();
+    let said = '';
+    let wentOn = false;
+    try {
+        const resp = await fetch(`${API_BASE}/auth/finish`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: back.value, verifier: back.flow.verifier })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            const detail = data && data.detail;
+            said = typeof detail === 'string' ? detail : (detail && detail.message) || 'This sign-in could not be finished. Start again.';
+            _showLoginError(said);
+            return;
+        }
+        if (back.returnTo) _hashForSignIn = '#' + back.returnTo;
+        wentOn = true;
+        await _passkeySignInAnswer(data);
+    } catch (_) {
+        wentOn = false;
+        said = 'This sign-in could not be finished. Start again.';
+        _showLoginError(said);
+    } finally {
+        if (!wentOn) _passkeyLetsGo(said);
+    }
+}
+
+// The page came back from a provider while signed in: a link, an administrator's test or a confirmation is claimed
+// with this tab's verifier, and the person is told what happened.
+async function _ssoResume(back) {
+    if (!back || !window.Sso || !authToken || !currentUser) return;
+    const out = await Sso.resume(back);
+    if (!out) return;
+    if (out.kind === 'error') { showError(out.message); return; }
+    if (out.kind === 'linked') {
+        showSuccess('Your account is linked: you can now sign in through it.');
+        openUserSettingsModal();
+        return;
+    }
+    if (out.kind === 'tested') {
+        if (window.SsoSettings && typeof window.SsoSettings.showTest === 'function') {
+            window.SsoSettings.showTest(out.provider, out.summary);
+        } else {
+            showSuccess('The test sign-in passed.');
+        }
+        return;
+    }
+    if (out.kind === 'confirmed' && out.then === 'add-passkey') {
+        openUserSettingsModal();
+        _addPasskey({ confirmed: true });
+        return;
+    }
+    if (out.kind === 'confirmed') showSuccess('Confirmed with your organisation\'s sign-in. Continue within two minutes.');
 }
 
 async function _initPasskeySignIn(policy) {
@@ -3208,6 +3291,13 @@ function logout(how, reason) {
     // The erase form (Settings): the name typed and its preview, with the near-miss names the records hold.
     if (window.EraseSettings && typeof window.EraseSettings.reset === 'function') {
         try { window.EraseSettings.reset(); } catch (_) {}
+    }
+    // Single sign-on: the tab's proof for a flow under way, and the linked providers shown in Your account.
+    if (window.Sso && typeof window.Sso.reset === 'function') {
+        try { window.Sso.reset(); } catch (_) {}
+    }
+    if (window.SsoSettings && typeof window.SsoSettings.reset === 'function') {
+        try { window.SsoSettings.reset(); } catch (_) {}
     }
     // The sign-in settings (Settings): what one administrator read is not left for the next person.
     if (window.SignInSettings && typeof window.SignInSettings.reset === 'function') {
@@ -7499,6 +7589,7 @@ async function renderAccountPasskeys() {
     }
     // An account that signs in only through its provider: a passkey never stands in for that sign-in.
     if (data.provider_only) body.appendChild(_el('p', 'text-secondary text-sm mb-sm passkey-provider-only', data.provider_only));
+    _passkeyFirstProof = (data.first_proof && typeof data.first_proof === 'object') ? data.first_proof : null;
     const keys = (data && data.passkeys) || [];
     const limit = (data && data.limit) || 0;
     if (!keys.length) {
@@ -7590,7 +7681,29 @@ async function renderAccountPasskeys() {
     body.appendChild(add);
 }
 
-async function _addPasskey() {
+let _passkeyFirstProof = null;     // how this account proves adding a passkey, from the last list read
+
+// `confirmed`: the page has just come back from the provider's fresh sign-in for this.
+async function _addPasskey({ confirmed = false } = {}) {
+    // An account with no factor and no password it could type proves a fresh sign-in at its provider first: the
+    // page leaves for the provider and comes back here to go on.
+    const proof = _passkeyFirstProof;
+    if (!confirmed && proof && proof.kind === 'provider' && window.Sso) {
+        const provider = (Array.isArray(proof.providers) ? proof.providers : [])[0];
+        if (!provider) { showError('No sign-in of your organisation can confirm you here. Ask an administrator.'); return; }
+        const ok = await showConfirm('To add a passkey, confirm it is you with a fresh sign-in at '
+            + (provider.label || 'your organisation\'s sign-in') + '. You will come back here afterwards.',
+            'Confirm it is you', null, 'Continue');
+        if (!ok) return;
+        try { await Sso.startConfirm(provider.id, proof.action || 'account.second_factor', 'add-passkey'); }
+        catch (e) { showError((e && e.message) || 'The confirmation could not be started.'); }
+        return;
+    }
+    if (!confirmed && proof && proof.kind === 'none') {
+        showError('Your account has no password and no second factor yet, and no sign-in of your organisation can confirm '
+            + 'you here. Ask an administrator.');
+        return;
+    }
     let password = null;
     for (let attempt = 0; attempt < 2; attempt++) {
         let start;
@@ -7737,6 +7850,7 @@ function openUserSettingsModal() {
         loadUserSshKeys(currentUser.id, modal);
         renderAccount2FA();   // populate the Two-factor section from GET /users/me/second-factor
         renderAccountPasskeys();
+        if (window.Sso) Sso.renderAccount();      // the providers the account is linked to, or could be
     }
     const tm = window.themeManager;
     const themeSel = document.getElementById('us-theme'); if (themeSel && tm) themeSel.value = (tm.currentTheme === 'dark') ? 'dark' : 'light';
@@ -24798,6 +24912,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // perhaps of an earlier person's session), or the page that replaces a signed-out one. It is never opened.
     let navType = '';
     try { const nav = performance.getEntriesByType('navigation')[0]; navType = nav ? nav.type : ''; } catch (_) {}
+    // What a single sign-on flow brought back (static/js/sso.js), taken out of the address before anything below
+    // reads the hash. It is acted on only when this load brought it: never from Back or Forward, never on the page
+    // that replaces a signed-out one (its code is spent, and its tab's proof is gone either way).
+    const ssoTaken = (window.Sso && typeof window.Sso.takeReturn === 'function') ? window.Sso.takeReturn() : null;
+    const ssoBack = (navType === 'back_forward' || signedOutNote !== null) ? null : ssoTaken;
     if (location.hash && (navType === 'back_forward' || signedOutNote !== null)) {
         try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
     }
@@ -24851,15 +24970,25 @@ document.addEventListener('DOMContentLoaded', () => {
         try { history.replaceState(null, '', location.pathname + location.search); } catch (_) {}
     }
 
+    // A hand-out link (/?sso=<provider>): the parameter leaves the address at once, and the provider is started
+    // from the sign-in screen below. A page that is signed in, or one a provider just sent back, ignores it.
+    let handOut = new URLSearchParams(location.search).get('sso');
+    if (handOut !== null) {
+        try { history.replaceState(null, '', location.pathname + location.hash); } catch (_) {}
+        if (hasSession || ssoBack || !/^[0-9a-f-]{36}$/.test(handOut)) handOut = null;
+    }
+
     if (hasSession) {
         // The pre-paint splash (auth-boot.js) is up. VERIFY the cached token with the
         // server before revealing anything, so an expired token routes to login
         // instead of flashing the dashboard shell.
-        enterAuthedSession();
+        enterAuthedSession().then(() => _ssoResume(ssoBack)).catch(() => {});
     } else {
         // No session — release the boot splash (if any) and show login.
         document.documentElement.removeAttribute('data-auth');
         showScreen('login-screen');
+        _ssoOnSignInScreen(ssoBack);
+        if (handOut) _ssoStartHandOut(handOut);
     }
     
     // Logout button (old - can be removed after testing)

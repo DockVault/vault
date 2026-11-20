@@ -36,7 +36,8 @@ PASSKEYS = ("app/services/webauthn_service.py", "app/core/webauthn_settings.py",
 SINGLE_SIGN_ON = ("app/api/sso_router.py", "app/api/sso_admin_router.py", "app/services/sso_sign_in.py",
                   "app/services/sso_freshness.py", "app/services/sso_groups.py", "app/services/oidc_client.py",
                   "app/core/sso_only.py", "app/core/sso_policy.py", "app/core/sso_state.py",
-                  "app/core/privileged_accounts.py")
+                  "app/core/privileged_accounts.py", "app/api/sso_providers_router.py",
+                  "app/services/sso_providers.py", "app/core/sso_presets.py", "app/core/sso_settings.py")
 MODULES = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "app").rglob("*.py")
                  if any(name in p.name for name in NAMED))
 

@@ -97,7 +97,7 @@ def _row_or_404(db, provider_id, *, lock: bool = False) -> SsoProvider:
 
 def _refused(exc) -> HTTPException:
     if isinstance(exc, providers.Invalid):
-        return HTTPException(status_code=400, detail={"field": exc.field, "message": str(exc)})
+        return HTTPException(status_code=400, detail={"reason": "invalid", "field": exc.field, "message": exc.said})
     return HTTPException(status_code=409, detail={"reason": exc.reason, "message": str(exc)})
 
 
@@ -203,7 +203,8 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     api = _api()
     _refuse_locked()
     if body.state not in (providers.ENABLED, providers.DISABLED):
-        raise HTTPException(status_code=400, detail={"field": "state", "message": "One of: enabled, disabled."})
+        raise HTTPException(status_code=400, detail={"reason": "invalid", "field": "state",
+                                                     "message": "One of: enabled, disabled."})
     row = _row_or_404(db, provider_id)
     if row.state == body.state:
         return {"provider": providers.public(db, row), "changed": False}

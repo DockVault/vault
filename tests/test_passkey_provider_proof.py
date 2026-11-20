@@ -186,7 +186,7 @@ def test_the_list_carries_the_sentence_for_a_provider_only_account_and_nothing_f
 def test_the_page_shows_the_sentence_above_the_list():
     from pathlib import Path
     app = (Path(__file__).resolve().parents[1] / "static" / "js" / "app.js").read_text(encoding="utf-8")
-    section = app[app.index("async function renderAccountPasskeys() {"):app.index("async function _addPasskey() {")]
+    section = app[app.index("async function renderAccountPasskeys() {"):app.index("let _passkeyFirstProof = null;")]
     line = "    if (data.provider_only) body.appendChild(_el('p', 'text-secondary text-sm mb-sm passkey-provider-only', data.provider_only));"
     assert section.count(line) == 1
     # Before the list and its "No passkeys yet" line, as text, never as markup.
