@@ -537,7 +537,7 @@ def count_failed_attempt(db, pending: PendingLogin) -> None:
 
 
 def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: bool = False,
-                  enrollment_methods=None) -> PendingStep:
+                  enrollment_methods=None, passkey_required: Optional[bool] = None) -> PendingStep:
     """Hold ``result`` for one more step. The pre-authentication token carries ``stage``, the pending
     login's id, the proofs so far and the provider; it has no ``session_token``, which is the confinement
     (the session dependency, the monitor handshake and the sign-out route each refuse a token without
@@ -545,7 +545,8 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
 
     The body is the pending answer the web app knows (``second_factor_required`` means a step follows),
     plus ``stage`` and, for an enrollment, what may be enrolled. The password stage names the account so
-    the page can ask for the password alone.
+    the page can ask for the password alone. ``passkey_required``, for an enrollment that offers a passkey: whether
+    the account's role must hold one (True), or the passkey is one way to meet the second factor asked for (False).
     """
     from app.api import api_server as api
     if stage not in STAGES:
@@ -604,6 +605,8 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
         why = api._why_a_factor_is_set_up_again(db, user)
         if why:
             body["set_up_again"] = why
+    if enrollment_required and passkey_required is not None and "passkey" in body["enrollment_methods"]:
+        body["passkey_required"] = bool(passkey_required)
     return PendingStep(stage=stage, body=body)
 
 
@@ -703,7 +706,8 @@ def finish(db, result: SignInResult):
         # sign-in stops at the enrollment (a user-verified passkey meets a pending authenticator enrollment too).
         passkey = api._passkey_requirement(db, user)
         enrollment_methods = list(ENROLLMENT_METHODS) if enrollment_pending else []
-        own_factor_first = password_first = False
+        own_factor_first = False
+        passkey_required = None
         if passkey.paused:
             result.passkey_grace = GRACE_ENDS
         elif not passkey.required and getattr(user, "passkey_required_since", None) is not None:
@@ -716,11 +720,11 @@ def finish(db, result: SignInResult):
                 result.passkey_grace = GRACE_ENDS
         if passkey.required:
             result.passkey_grace = GRACE_BEGINS
-            if passkey.overdue or not password_owed_before_an_enrollment(user, result.methods, result.provider_id):
-                # Within the time given, a hold made for another enrollment offers the passkey only where the
-                # registration will take it: a provider's sign-in of an account that has a password it can type
-                # owes that password first (the authenticator's enrollment asks for it itself).
-                enrollment_methods.append("passkey")
+            # A hold made for an enrollment offers the passkey the role must hold. Whenever such a hold is made the
+            # registration takes it: an account that owes its password first (a provider's sign-in of an account
+            # that has one it can type) is held at the password stage before any enrollment, below.
+            enrollment_methods.append("passkey")
+            passkey_required = True
             if passkey.overdue:
                 # A passkey outlives whatever proved the sign-in it was set up at (it signs in after a provider
                 # was turned off, an identity unlinked), so it is added on no less than Your account asks for the
@@ -733,7 +737,19 @@ def finish(db, result: SignInResult):
                     own_factor_first = True
                 else:
                     enrollment_pending = True
-                    password_first = password_owed_before_an_enrollment(user, result.methods, result.provider_id)
+        elif enrollment_pending and a_passkey_meets_the_enrollment(result):
+            # No role asks for a passkey, a second factor is to be set up, and the provider's sign-in is all this
+            # account can give: a passkey is offered beside the authenticator (it serves after the provider's
+            # sign-in, as the authenticator's code does: refuse_without_the_provider).
+            enrollment_methods.append("passkey")
+            passkey_required = False
+        # An account with no factor sets its first one up on the proof Your account asks for the same act. Where the
+        # sign-in came through a provider and the account has a password it can type, that password comes first: the
+        # authenticator's enrollment asks for it, and after the round trip to the provider the page holds none to
+        # send. An account with no password it can type goes on: the provider's sign-in is its proof
+        # (provider_proves_an_enrollment).
+        password_first = enrollment_pending and password_owed_before_an_enrollment(
+            user, result.methods, result.provider_id)
         try:
             stage = second_factor_due(user, result.methods, factor_in_effect=bool(in_effect),
                                       enrollment_pending=enrollment_pending,
@@ -764,7 +780,7 @@ def finish(db, result: SignInResult):
             pass
     if stage == ENROLL:
         return begin_pending(db, result, STAGE_SECOND_FACTOR, enrollment_required=True,
-                             enrollment_methods=enrollment_methods)
+                             enrollment_methods=enrollment_methods, passkey_required=passkey_required)
     return begin_pending(db, result, stage)
 
 
@@ -774,17 +790,43 @@ def holds_a_factor(db, user) -> bool:
     return active_factors(db, user.id).any
 
 
-def password_owed_before_an_enrollment(user, methods, provider_id) -> bool:
-    """Whether a sign-in that came through a provider owes the account's password before it sets a passkey up: the
-    password is not among its proofs, and the account has one it can type. An account that signs in only through
-    its provider has none; its passkey signs nobody in without the provider, so the provider is proof enough. An
-    account whose password nobody knows (made at a first provider sign-in, say: app/core/password_origin.py) has
-    none it can type either: asked for it, it could never answer, and would be shut out by the requirement."""
-    if not provider_id or PASSWORD in set(methods or ()):
-        return False
+def has_a_password_it_can_type(user) -> bool:
+    """Whether somebody can type the account's password: it has one, it does not sign in only through its provider
+    (such an account's password works nowhere: app/core/sso_only.py), and the password is not one nobody knows
+    (random bytes set when the account was made at a provider's sign-in, say: app/core/password_origin.py)."""
     from app.core import password_origin
     return (bool(getattr(user, "password_hash", None)) and not getattr(user, "sso_only", False)
             and not password_origin.nobody_knows(user))
+
+
+def password_owed_before_an_enrollment(user, methods, provider_id) -> bool:
+    """Whether a sign-in that came through a provider owes the account's password before it sets a second factor
+    up (a passkey, an authenticator): the password is not among its proofs, and the account has one it can type.
+    An account that signs in only through its provider has none; its passkey signs nobody in without the provider,
+    so the provider is proof enough. An account whose password nobody knows has none it can type either: asked
+    for it, it could never answer, and would be shut out by the requirement."""
+    if not provider_id or PASSWORD in set(methods or ()):
+        return False
+    return has_a_password_it_can_type(user)
+
+
+def provider_proves_an_enrollment(user, pending) -> bool:
+    """Whether a sign-in held for an enrollment is itself the proof the authenticator's enrollment asks for, in
+    place of the account's password: it came through a provider, and the account has no password it can type.
+    The other side of :func:`password_owed_before_an_enrollment`, for the one enrollment that asks for the
+    password in its own request. The provider's sign-in is all such an account can give, and what it sets up
+    serves after that sign-in only (a code is never a first proof)."""
+    return pending is not None and bool(provider_of(pending)) and not has_a_password_it_can_type(user)
+
+
+def a_passkey_meets_the_enrollment(result: SignInResult) -> bool:
+    """Whether a sign-in held for the enrollment of a second factor is offered a passkey beside the authenticator
+    where no role must hold one: it came through a provider, the account has no password it can type, and a
+    passkey can be made at the vault's address now. An account with a password is offered what the policy's
+    enrollment has always offered it, and adds a passkey under Your account."""
+    from app.core import webauthn_settings
+    return (bool(result.provider_id) and not has_a_password_it_can_type(result.user)
+            and webauthn_settings.enabled() and webauthn_settings.passkeys_can_be_made())
 
 
 def refuse_enrollment_before_the_accounts_factor(db, user, pending) -> None:

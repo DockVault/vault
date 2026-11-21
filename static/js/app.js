@@ -2385,7 +2385,9 @@ function beginSecondFactor(data) {
                 ? 'Your passkeys are of a kind this vault no longer accepts, so you set a second factor up again here.'
                 : '';
         if (kinds.includes('passkey') && (canMake || !kinds.includes('totp'))) {
-            renderPasskeyEnrollment(box, { preAuthToken: pre, password: pw, authenticatorToo: kinds.includes('totp'), why });
+            // passkey_required false: no role asks for a passkey, it is one way to set the second factor up.
+            renderPasskeyEnrollment(box, { preAuthToken: pre, password: pw, authenticatorToo: kinds.includes('totp'),
+                required: data.passkey_required !== false, why });
         } else {
             renderEnrollmentWizard(box, { preAuthToken: pre, password: pw, why });
         }
@@ -2534,9 +2536,13 @@ function renderVerifyCard(box, opts) {
 function renderPasskeyEnrollment(box, opts) {
     const preAuthToken = opts.preAuthToken;
     const canMake = !!window.Passkeys && Passkeys.supported();
+    const required = opts.required !== false;        // the role must hold a passkey; else a second factor of any kind
     box.replaceChildren();
-    box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Add a passkey to finish signing in'));
-    box.appendChild(_el('p', 'text-secondary text-sm mb-md', canMake
+    box.appendChild(_el('h2', 'text-lg font-bold mb-xs', required ? 'Add a passkey to finish signing in'
+        : 'Set up a second factor to finish signing in'));
+    box.appendChild(_el('p', 'text-secondary text-sm mb-md', !required
+        ? 'Your administrator requires a second factor for your account. A passkey is one: your device will ask for its PIN, fingerprint or face, or for a security key.'
+        : canMake
         ? 'Your administrator requires a passkey for your account. Your device will ask for its PIN, fingerprint or face, or for a security key.'
         : 'Your administrator requires a passkey for your account, and this browser cannot make one here. Sign in from a browser that can, or ask an administrator.'));
     if (opts.why) box.appendChild(_el('p', 'text-secondary text-sm mb-md sf-set-up-again', opts.why));
@@ -2599,6 +2605,7 @@ function renderEnrollmentWizard(box, opts) {
     // The enroll endpoints accept either. onComplete: called after a successful acknowledge on the
     // settings path (where acknowledge returns NO access_token because the user is already signed in).
     const token = opts.token || opts.preAuthToken || authToken;
+    const preAuthToken = opts.preAuthToken || null;      // set at a sign-in held for the enrollment, not under Your account
     const password = opts.password || '';
     const onComplete = typeof opts.onComplete === 'function' ? opts.onComplete : null;
     const auth = { 'Authorization': `Bearer ${token}` };
@@ -2624,8 +2631,14 @@ function renderEnrollmentWizard(box, opts) {
                 const e = await resp.json().catch(() => ({}));
                 status.className = 'alert alert-error mt-sm';
                 status.textContent = (e && e.detail) || 'Could not start enrollment.';
-                const back = _el('a', 'mt-md', '← Back to sign in'); back.href = '#'; back.setAttribute('role', 'button'); back.style.display = 'block';
-                back.addEventListener('click', (ev) => { ev.preventDefault(); _sfCancel(preAuthToken); });
+                // The way back: the sign-in form for a held sign-in, the two-factor block under Your account.
+                const back = _el('a', 'mt-md', preAuthToken ? '← Back to sign in' : '← Back'); back.href = '#';
+                back.setAttribute('role', 'button'); back.style.display = 'block';
+                back.addEventListener('click', (ev) => {
+                    ev.preventDefault();
+                    if (preAuthToken) _sfCancel(preAuthToken);
+                    else if (onComplete) onComplete();
+                });
                 box.appendChild(back);
                 return;
             }
@@ -7917,6 +7930,13 @@ async function renderAccount2FA() {
         const msg = _el('div', 'mt-sm'); body.appendChild(msg);
         regen.addEventListener('click', () => account2FARegenerate(msg));
         off.addEventListener('click', () => account2FADisable(msg));
+    } else if (st && st.password_to_type === false) {
+        // The set-up here asks for the account's password, and this account has none anybody can type.
+        const none = _el('p', 'text-secondary text-sm mb-sm',
+            'Two-factor authentication is off. Your account has no password of its own, so an authenticator app is set '
+            + 'up at a sign-in that asks for a second factor. Where this vault offers passkeys, you can add one here.');
+        none.id = 'us-2fa-no-password';
+        body.appendChild(none);
     } else {
         body.appendChild(_el('p', 'text-secondary text-sm mb-sm',
             'Two-factor authentication is off. Add an authenticator app for a second sign-in factor.'));

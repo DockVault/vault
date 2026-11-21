@@ -455,12 +455,13 @@ def test_an_account_whose_password_nobody_knows_is_asked_for_none_before_it_sets
     assert bare.password_nobody_knows is None
 
 
-def test_a_hold_within_the_time_given_offers_a_passkey_only_where_the_registration_takes_it(monkeypatch):
+def test_a_hold_within_the_time_given_is_made_only_where_what_it_offers_can_be_set_up(monkeypatch):
     """An authenticator is required by policy and the role must hold a passkey, with time left. A sign-in held for
-    the enrollment lists what can be set up now. For a provider's sign-in of an account that has a password it can
-    type, the passkey's registration would answer "Enter your password first": it is not offered there (the
-    authenticator's enrollment asks for the password itself). With the password given, or none anybody can type,
-    it is offered."""
+    the enrollment lists what can be set up now. A provider's sign-in of an account that has a password it can
+    type could set up neither: the passkey's registration would answer "Enter your password first", and the
+    authenticator's enrollment asks for the password in a request the page cannot fill after the provider's round
+    trip. No such hold is made: the password comes first. With the password given, or none anybody can type, the
+    hold offers both, and says the passkey is the role's."""
     registry, wss = _mod()
     from app.core import password_origin
     from app.services import sign_in
@@ -477,13 +478,17 @@ def test_a_hold_within_the_time_given_offers_a_passkey_only_where_the_registrati
     def offered(user, methods, **kw):
         outcome = sign_in.finish(h.db, sign_in.SignInResult(user, methods, "203.0.113.9", **kw))
         assert isinstance(outcome, sign_in.PendingStep) and outcome.body["enrollment_required"] is True, outcome
+        assert outcome.body["passkey_required"] is True
         return outcome.body["enrollment_methods"]
 
     assert wss.requirement(h.db, alice).overdue is False
-    assert "passkey" not in offered(alice, [], provider_id="p") and offered(alice, [], provider_id="p")
-    assert "passkey" in offered(alice, ["pwd"], provider_id="p")
-    assert "passkey" in offered(alice, ["pwd"])
-    assert "passkey" in offered(dana, [], provider_id="p")
+    first = sign_in.finish(h.db, sign_in.SignInResult(alice, [], "203.0.113.9", provider_id="p"))
+    assert isinstance(first, sign_in.PendingStep) and first.body["stage"] == "password", first
+    assert first.body["enrollment_required"] is False and first.body["enrollment_methods"] == []
+    assert "passkey_required" not in first.body
+    assert offered(alice, ["pwd"], provider_id="p") == ["totp", "passkey"]
+    assert offered(alice, ["pwd"]) == ["totp", "passkey"]
+    assert offered(dana, [], provider_id="p") == ["totp", "passkey"]
 
 
 def test_an_administrator_does_not_reset_away_the_last_passkey_their_own_role_must_hold(monkeypatch):

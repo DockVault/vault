@@ -6967,9 +6967,11 @@ def _mask_email(address) -> str:
     return f"{local[:1]}***@{domain}"
 
 
-def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=False):
+def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=False, own_password=True):
     """(title, sentence) for a credential change that was made, from what applying it returned. With
-    ``mask_new_email``, an email change names the new address masked (the email to the old address)."""
+    ``mask_new_email``, an email change names the new address masked (the email to the old address).
+    ``own_password``: whether the account has a password somebody can type (a reset's notice says how the next
+    factor is set up)."""
     from app.core import credential_changes as cc
     who = "The server's operator" if by_host else "An administrator"
     result = result or {}
@@ -6983,9 +6985,10 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
                 f"{who} created a password reset link for your account. Whoever uses it can set a new "
                 "password.")
     if kind == cc.SECOND_FACTOR:
+        how = ("a new one, with your own password, at your next sign-in." if own_password
+               else "a new one at your next sign-in through your organisation.")
         return ("Your second factor was reset",
-                f"{who} reset your second factor and signed your account out everywhere. You will set up "
-                "a new one, with your own password, at your next sign-in.")
+                f"{who} reset your second factor and signed your account out everywhere. You will set up {how}")
     if kind == cc.EMAIL and result.get("confirmed_only"):
         return ("Your email address was confirmed",
                 f"{who} confirmed that {result.get('new_email')} is your email address. Your organisation's "
@@ -7021,7 +7024,8 @@ def _notify_credential_change(db, kind, target, result, *, by_name, approved_by=
                               ntype="account_changed") -> None:
     """The notice for a credential change that was made. An email change is told to the OLD address."""
     from app.core import credential_changes as cc
-    title, change = _credential_change_notice(kind, result, by_host=(by_name == cc.HOST_OPERATOR))
+    title, change = _credential_change_notice(kind, result, by_host=(by_name == cc.HOST_OPERATOR),
+                                              own_password=sign_in.has_a_password_it_can_type(target))
     by = _actor_text(by_name)
     if approved_by:
         by += f", approved by {_actor_text(approved_by)}"
@@ -11603,6 +11607,8 @@ async def get_my_second_factor(
         "status": enr.status if enr else "not_setup",
         "awaiting_acknowledge": bool(enr and enr.status == "unconfirmed" and enr.confirmed_at is not None),
         "recovery_codes_remaining": _sf_recovery_remaining(db, current_user.id),
+        # Whether the account has a password somebody can type: the authenticator's set-up here asks for it.
+        "password_to_type": sign_in.has_a_password_it_can_type(current_user),
     }
 
 
@@ -11630,13 +11636,19 @@ async def enroll_totp(
     """Begin TOTP enrollment: mint a sealed seed, store it 'unconfirmed', and return the otpauth URI +
     base32 secret. Re-proves the account password (first-enrollment gate). An already-active enrollment
     must be disabled first (re-enroll = disable then enroll), so an active method is never replaced here.
-    Reachable with a normal session OR a forced-enrollment pre-auth token."""
+    Reachable with a normal session OR a forced-enrollment pre-auth token.
+
+    One account has no password to prove: a sign-in that came through a provider, held for this enrollment, of
+    an account with no password it can type (it signs in only through its provider, or its password is one nobody
+    knows). Asked for a password it could never answer, and every sign-in would end here. The held sign-in is its
+    proof (sign_in.provider_proves_an_enrollment), on the conditions the passkey's enrollment has at the same
+    hold: the sign-in could still finish, and an account that holds a factor gives that factor first."""
     from app.core.security import verify_password, encrypt_secret
     from app.core import second_factor as sf
     from app.core.models import SecondFactorEnrollment
     from app.config.effective import get_effective_branding
 
-    current_user, _pending = principal
+    current_user, pending = principal
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
     user = db.query(User).filter(User.id == current_user.id).first()
@@ -11644,8 +11656,17 @@ async def enroll_totp(
         raise HTTPException(status_code=404, detail="User not found")
     if _sf_enrollment(db, user.id, status="active"):
         raise HTTPException(status_code=409, detail="A second factor is already active; disable it before enrolling a new one.")
-    _factor_before_another_from_a_session(db, user, request, _pending)
-    if not user.password_hash or not verify_password(body.current_password, user.password_hash):
+    _factor_before_another_from_a_session(db, user, request, pending)
+    if sign_in.provider_proves_an_enrollment(user, pending):
+        sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, get_client_ip(request))
+        sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
+    elif pending is None and not sign_in.has_a_password_it_can_type(user):
+        # Under Your account such an account is asked for nothing it cannot give: it is told where its
+        # authenticator is set up (a sign-in that asks for a second factor), and that a passkey can be added here.
+        raise HTTPException(status_code=409, detail=(
+            "Your account has no password of its own, so an authenticator app is set up at a sign-in that asks "
+            "for a second factor. A passkey can be added here."))
+    elif not user.password_hash or not verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
 
     seed = sf.generate_totp_secret()
