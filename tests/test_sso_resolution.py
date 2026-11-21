@@ -851,6 +851,47 @@ def test_a_link_that_ends_the_password_ends_the_sessions_it_made_and_not_the_one
     assert ended == [[elsewhere.id]]
 
 
+def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_the_account(monkeypatch):
+    """Confirming an address matters for one thing: a provider that links by email finding the account. The
+    account page and the Users page offer it exactly then: the address is there and not confirmed, a provider
+    that is on links by email and the account is not linked to it yet, and the account is one such a link may
+    reach (not an administrator, no second factor of its own)."""
+    from app.services import sso_sign_in as sso
+    open_, done = _user("open", email_confirmed_at=None), _user("done")
+    bare = _user("bare", email=None, email_confirmed_at=None)
+    root = _user("root", role="admin", email_confirmed_at=None)
+    guarded, linked = _user("guarded", email_confirmed_at=None), _user("linked", email_confirmed_at=None)
+    links = _provider(name="links", label="Links", policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    plain = _provider(name="plain", label="Plain")
+    people = [open_, done, bare, root, guarded, linked]
+    h = Resolving(monkeypatch, people, [links, plain],
+                  identities=[_identity(linked, links, subject="s-linked"), _identity(open_, plain, subject="s-open")])
+    _factor(h, guarded, "authenticator")
+    monkeypatch.setattr(h.S, "_smtp_configured", lambda db: True)
+
+    def wanted():
+        one_by_one = {u.username for u in people if sso.confirmed_address_wanted(h.db, u)}
+        together = sso.confirmed_address_wanted_among(h.db, people, with_a_factor={guarded.id})
+        assert {u.username for u in people if u.id in together} == one_by_one
+        return one_by_one
+
+    assert wanted() == {"open"}
+    # The account page is told the same, with whether a code can be sent.
+    h.current_user = open_
+    status, out, _ = _call(h.S, "GET", "/users/me/identities")
+    assert status == 200 and out["email"] == {"address": "open@example.test", "can_send_code": True}, out
+    monkeypatch.setattr(h.S, "_smtp_configured", lambda db: False)
+    assert _call(h.S, "GET", "/users/me/identities")[1]["email"] == {"address": "open@example.test", "can_send_code": False}
+    h.current_user = done
+    assert _call(h.S, "GET", "/users/me/identities")[1]["email"] is None
+    # No provider links by email (it is off, or its setting is): nothing to offer anybody.
+    links.state = "disabled"
+    assert wanted() == set()
+    links.state = "enabled"
+    links.policy = {"sso_allowed_domains": ["example.test"]}
+    assert wanted() == set()
+
+
 def _provider_locks(h):
     from app.core.models import SsoProvider
     return [entry[2] for entry in h.db.log if entry[0] == "lock" and entry[1] is SsoProvider]

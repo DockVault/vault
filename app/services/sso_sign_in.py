@@ -971,6 +971,47 @@ def reauth_allowed(db, user, action: Optional[str] = None) -> bool:
     return reauth_permitted(db, user, action) and reauth_available(db, user)
 
 
+def confirmed_address_wanted(db, user) -> bool:
+    """Whether confirming ``user``'s address would let a provider's sign-in find the account: it has an address
+    the vault has not confirmed, some provider that is on links by email and the account is not linked to it yet,
+    and the account is one a link by email may reach at all (not privileged, no second factor of its own). The
+    pages offer the confirmation only then."""
+    from app.core import email_confirmation, privileged_accounts
+    from app.core.models import ExternalIdentity, SsoProvider
+    if not (getattr(user, "email", None) or "").strip() or email_confirmation.confirmed(user):
+        return False
+    if not _has_identities(db):
+        return False
+    linking = [p for p in db.query(SsoProvider).filter(SsoProvider.state == "enabled").all()
+               if policy_of(p)["sso_link_by_email"]]
+    linked = {i.provider_id for i in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all()}
+    if all(p.id in linked for p in linking):        # also: no provider links by email at all
+        return False
+    return privileged_accounts.kind(db, user) is None and not set_up_its_own_factor(db, user)
+
+
+def confirmed_address_wanted_among(db, users, *, with_a_factor=()) -> set:
+    """:func:`confirmed_address_wanted` for a list of accounts (the Users page), as the ids it holds for: one
+    read of the providers and one of the identities, whatever the length of the list. ``with_a_factor``: the ids
+    the caller already knows to hold a second factor of their own. An account with the auditor right is not
+    told apart here: the page would offer a confirmation that links nothing for it, and does no harm."""
+    from app.core import email_confirmation
+    from app.core.models import ExternalIdentity, RoleEnum, SsoProvider
+    open_ = [u for u in users if (getattr(u, "email", None) or "").strip() and not email_confirmation.confirmed(u)
+             and getattr(u, "role", None) != RoleEnum.ADMIN and u.id not in set(with_a_factor)
+             and getattr(u, "second_factor_reset_at", None) is None]
+    if not open_ or not _has_identities(db):
+        return set()
+    linking = {p.id for p in db.query(SsoProvider).filter(SsoProvider.state == "enabled").all()
+               if policy_of(p)["sso_link_by_email"]}
+    if not linking:
+        return set()
+    linked = {}
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id.in_([u.id for u in open_])).all():
+        linked.setdefault(identity.user_id, set()).add(identity.provider_id)
+    return {u.id for u in open_ if not linking <= linked.get(u.id, set())}
+
+
 def reauth_stands(db, user, provider_id) -> bool:
     """Whether the provider a re-authentication was made at may still confirm ``user``: one of the account's own
     that confirms afresh now (:func:`reauth_providers`). A confirmation made at a provider that was turned off

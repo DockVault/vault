@@ -1083,7 +1083,11 @@ async def list_my_identities(
                            # Linking it ends the account's password: the page says so before it starts the link.
                            "ends_password": (str(p.id) not in linked and sso_only.password_less(p)
                                              and not getattr(current_user, "sso_only", False)),
-                           "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)} for p in offered]}
+                           "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)} for p in offered],
+            # The account's address, when confirming it would let a provider's sign-in find the account: the
+            # page then offers the code (or says who can confirm it, where the vault sends no email).
+            "email": ({"address": current_user.email, "can_send_code": bool(_api()._smtp_configured(db))}
+                      if sso.confirmed_address_wanted(db, current_user) else None)}
 
 
 @router.post("/users/me/identities/{provider_id}/start")

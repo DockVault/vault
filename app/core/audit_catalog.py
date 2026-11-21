@@ -127,6 +127,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("credential_change_withdrawn", "accounts", "Held change withdrawn", "info"),
     AuditAction("email_change_confirmed", "accounts", "Email address changed", "notice"),
     AuditAction("email_change_requested", "accounts", "Email change requested", "info"),
+    AuditAction("email_confirmation_requested", "accounts", "A code to confirm the account's own address requested", "info"),
+    AuditAction("email_confirmed", "accounts", "Email address confirmed by its owner with a code", "notice"),
     # An account whose password someone else set was made an administrator: the password was made
     # unusable and its sessions ended, and the person sets a new one with a reset link.
     AuditAction("password_reset_at_promotion", "accounts", "Password taken back at promotion", "notice"),

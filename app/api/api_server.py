@@ -1053,6 +1053,9 @@ class SignupRequest(BaseModel):
 
 class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
+    # True: an administrator vouches that the address the account holds is the person's (as setting it does).
+    # A change to someone's sign-in details like the address itself; never one's own (the code is for that).
+    email_confirmed: Optional[bool] = None
     password: Optional[str] = Field(None, min_length=8)
     role: Optional[RoleEnum] = None
     is_active: Optional[bool] = None
@@ -1124,6 +1127,9 @@ class UserResponse(BaseModel):
     # Whether the vault itself confirmed the account's address (app/core/email_confirmation.py): only such an
     # account is linked to a provider by its email address. Filled in by the admin users list.
     email_confirmed: bool = False
+    # Whether confirming the address would let a provider's sign-in find the account (some provider links by
+    # email, and the account is one such a link may reach): the Users page offers the confirmation then.
+    email_confirm_wanted: bool = False
     # New sign-ins to this account are paused by failed ones ({scope: "address" | "account",
     # addresses, until}), or None. Sessions carry on; an administrator's unlock clears it. Filled in
     # by the admin users list.
@@ -6583,6 +6589,16 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
         sign_in.spend_sign_ins_under_way(db, target.id)
         return {"had_second_factor": had_factor, "passkeys_retired": int(retired or 0)}
+    if kind == cc.EMAIL and payload.get("confirm"):
+        # Only the mark: an administrator vouches for the address the account holds. Asked for one address; an
+        # account that holds another by now (the request waited for an approval meanwhile) is not confirmed by it.
+        held_now = normalize_email(target.email) if (target.email or "").strip() else None
+        if held_now is None or held_now != normalize_email(payload.get("email")):
+            raise HTTPException(status_code=409, detail=(
+                "The account's email address changed since this was asked; nothing was confirmed."))
+        email_confirmation.confirm(target)
+        target.updated_at = datetime.now(timezone.utc)
+        return {"old_email": target.email, "new_email": target.email, "confirmed_only": True}
     if kind == cc.EMAIL:
         new_email = payload.get("email")
         if new_email is not None and (email_in_use(db, new_email, exclude_user_id=target.id)
@@ -6730,11 +6746,13 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
     return _CredentialOutcome(change, True, last=last)
 
 
-def _request_summary(kind, *, delivery=None, new_email=None, key_name=None, fingerprint=None):
+def _request_summary(kind, *, delivery=None, new_email=None, key_name=None, fingerprint=None, confirm=False):
     """The line a request's row shows under its heading ("Change the email address for carol"): only
     what the heading does not already say, or None when it says it all. It used to repeat the heading
     ("Change the email address to ...")."""
     from app.core import credential_changes as cc
+    if kind == cc.EMAIL and confirm:
+        return f"The address stays {new_email}: it is confirmed as theirs"
     if kind == cc.EMAIL:
         return f"New address: {new_email}" if new_email else "The address is removed"
     if kind == cc.RESET_LINK:
@@ -6958,6 +6976,10 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
         return ("Your second factor was reset",
                 f"{who} reset your second factor and signed your account out everywhere. You will set up "
                 "a new one, with your own password, at your next sign-in.")
+    if kind == cc.EMAIL and result.get("confirmed_only"):
+        return ("Your email address was confirmed",
+                f"{who} confirmed that {result.get('new_email')} is your email address. Your organisation's "
+                "sign-in can now find your account by it.")
     if kind == cc.EMAIL:
         old, new = result.get("old_email"), result.get("new_email")
         shown = _mask_email(new) if mask_new_email else (new or "(none)")
@@ -10964,6 +10986,9 @@ async def list_users(
         User.id.in_({u.password_set_by for u in users if u.password_set_by is not None})).all())
     from app.services import sso_freshness
     freshness = sso_freshness.standing_of(db)
+    from app.services import sso_sign_in
+    confirm_wanted = sso_sign_in.confirmed_address_wanted_among(
+        db, users, with_a_factor={u.id for u in users if u.id in mfa_user_ids or passkey_counts.get(u.id, 0)})
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
@@ -10972,6 +10997,7 @@ async def list_users(
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
         item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))
         item.email_confirmed = email_confirmation.confirmed(user)
+        item.email_confirm_wanted = user.id in confirm_wanted
         item.sso_providers = provider_names.get(user.id, [])
         block = blocks.get(user.id)
         if block is not None:
@@ -10996,7 +11022,9 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
     """
     Get current user information.
     """
-    return UserResponse.model_validate(current_user)
+    answer = UserResponse.model_validate(current_user)
+    answer.email_confirmed = email_confirmation.confirmed(current_user)
+    return answer
 
 
 @app.patch("/users/me", response_model=UserResponse)
@@ -11192,6 +11220,106 @@ async def request_email_change(
         pass
     return JSONResponse(status_code=202, content={
         "message": "If that address can receive mail, a verification code has been sent to it."})
+
+
+# -- The address an account already holds, confirmed by its owner --------------
+# An address the person typed themselves (at sign-up, at an invitation that carried none, with the password) is
+# their claim: the vault links no provider's sign-in to the account by it. Typing back a code the vault sent to
+# that address proves the mailbox is theirs, as for a new address. No password is asked: the code goes to the
+# address the account holds, which only the password could have changed.
+class EmailConfirmationCode(BaseModel):
+    code: str = Field(..., min_length=1, max_length=32)
+
+
+@app.post("/users/me/email/confirmation/request")
+async def request_email_confirmation(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Send a one-time code to the address the caller's account holds, to confirm it."""
+    from app.core import otp_service
+    from app.core.rate_limiter import rate_limiter as _rl
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    address = normalize_email(user.email) if (user.email or "").strip() else None
+    if address is None:
+        raise HTTPException(status_code=400, detail="Your account has no email address to confirm.")
+    if email_confirmation.confirmed(user):
+        raise HTTPException(status_code=409, detail={"reason": "already_confirmed",
+                                                     "message": "Your email address is confirmed already."})
+    if not _smtp_configured(db):
+        raise HTTPException(status_code=400, detail=(
+            "This vault sends no email, so no code can be sent. An administrator can confirm your address."))
+    # The code lands in a mailbox that may not be the requester's (an address typed on the wrong account).
+    allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=3, window=300,
+                                             prefix="email_confirm_code")
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many codes were asked for; wait a few minutes.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
+    ttl = _email_change_otp_ttl_minutes(db)
+    code = otp_service.issue(db, purpose="email_confirm", user_id=user.id, destination=address,
+                             ttl_minutes=ttl, pepper=settings.jwt_secret_key)
+    from app.core import email_send as _es
+    from app.core.email_actions import send_action_email
+    try:
+        send_action_email(db, "email_confirm", recipient={"email": address, "username": user.username},
+                          action_context={"code": code, "expires": f"in {ttl} minutes"}, raise_errors=True)
+    except _es.EmailSendError as e:
+        raise HTTPException(status_code=(status.HTTP_400_BAD_REQUEST if e.category == "config"
+                                         else status.HTTP_502_BAD_GATEWAY), detail=e.message)
+    try:
+        AuditLogger(db).log_action(action="email_confirmation_requested", status="success", user=user,
+                                   ip_address=get_client_ip(request), details={})
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse(status_code=202, content={"sent": True, "expires_in_minutes": ttl})
+
+
+@app.post("/users/me/email/confirmation")
+async def confirm_own_email(
+    body: EmailConfirmationCode,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Confirm the address the caller's account holds with the code sent to it: single use, and only for the
+    address the code was sent to (an address changed meanwhile is not confirmed by it)."""
+    from app.core import otp_service
+    from app.core.rate_limiter import rate_limiter as _rl
+
+    if getattr(current_user, "_is_temp_session", False):
+        raise HTTPException(status_code=403, detail="Temporary credentials cannot change account settings.")
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    allowed, _, reset = _rl.check_rate_limit(identifier=str(user.id), limit=10, window=300,
+                                             prefix="email_confirm_try")
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts; please wait a few minutes.",
+                            headers={"Retry-After": str(retry_after_seconds(reset, 300))})
+    result = otp_service.verify(db, purpose="email_confirm", user_id=user.id, code=body.code,
+                                pepper=settings.jwt_secret_key)
+    if not result.ok or not result.destination:
+        raise HTTPException(status_code=400, detail="That code is invalid or has expired.")
+    held_now = normalize_email(user.email) if (user.email or "").strip() else None
+    if held_now is None or held_now != result.destination:
+        raise HTTPException(status_code=409, detail=(
+            "Your email address changed since the code was sent. Ask for a new code."))
+    email_confirmation.confirm(user)            # the person typed the code the vault sent to this address
+    db.commit()
+    try:
+        AuditLogger(db).log_action(action="email_confirmed", status="success", user=user,
+                                   ip_address=get_client_ip(request), details={"by": "code"})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"email": user.email, "email_confirmed": True}
 
 
 @app.post("/users/me/confirm-email-change", response_model=UserResponse)
@@ -13393,6 +13521,30 @@ async def update_user(
                 held.append(outcome)
             else:
                 changes['email'] = {'old': outcome.result['old_email'], 'new': new_email}
+                made.append(("email", outcome))
+
+    # An administrator vouches for the address the account already holds: the vault takes it as the person's,
+    # as when an administrator sets it, and a sign-in through a provider may then find the account by it. A
+    # change to someone's sign-in details like the address itself (counted, held and told the same way); never
+    # one's own, which the code sent to the address is for. Nothing to do where the request also changed the
+    # address (that confirmed it, or waits), the account has none, or it is confirmed already.
+    if user_update.email_confirmed is True and "email" not in changes and not held:
+        if is_self:
+            raise HTTPException(status_code=400, detail=(
+                "Confirm your own email address from account settings, with the code sent to it."))
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="Only an administrator confirms someone's email address.")
+        if not (user.email or "").strip():
+            raise HTTPException(status_code=400, detail="This account has no email address to confirm.")
+        if not email_confirmation.confirmed(user):
+            outcome = _credential_change(
+                db, current_user, user, "email",
+                summary=_request_summary("email", new_email=user.email, confirm=True),
+                payload={"email": normalize_email(user.email), "confirm": True}, request=request)
+            if outcome.held:
+                held.append(outcome)
+            else:
+                changes['email_confirmed'] = {'old': False, 'new': True}
                 made.append(("email", outcome))
 
     if user_update.password is not None:

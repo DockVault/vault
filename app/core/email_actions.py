@@ -60,6 +60,21 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "email_confirm": {
+        "name": "Email address confirmation",
+        "subject": "Confirm your email address",
+        "body_html": (
+            "<h2>Confirm your email address</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>Use this code to confirm that this address is yours on <strong>{{vault.name}}</strong>:</p>"
+            "<h1>{{action.code}}</h1>"
+            "<p>This code expires {{action.expires}}. Type it only into {{vault.name}} itself. If you did not ask "
+            "for it, ignore this email and give the code to nobody: someone entered your address on an account "
+            "that is not yours.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "password_reset": {
         "name": "Password reset",
         "subject": "Reset your password",
@@ -355,6 +370,8 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
 _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("email_change", "Email change verification",
      "Sent to a new address when a user changes their email — carries the confirmation code.", SYSTEM),
+    ("email_confirm", "Email address confirmation",
+     "Sent to the address an account already holds when its owner asks to confirm it — carries the code.", SYSTEM),
     ("password_reset", "Password reset",
      "Sent when a user requests a password reset — carries the reset link.", SYSTEM),
     ("account_invite", "Account invitation",

@@ -19,6 +19,7 @@ pytestmark = pytest.mark.unit
 _ACTION_KEYS = {a["key"] for a in ea.ACTION_CATALOG}
 # Which required dynamic token each SYSTEM security action's body must carry.
 _REQUIRED_TOKEN = {"email_change": "action.code",
+                   "email_confirm": "action.code",
                    "password_reset": "action.link",
                    "account_invite": "action.link",
                    "account_changed_by_admin": "action.change",
