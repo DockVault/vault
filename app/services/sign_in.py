@@ -70,6 +70,7 @@ SESSION_ROW_LIFETIME = timedelta(days=31)
 ENROLLMENT_METHODS = ("totp",)
 
 # What a held sign-in is told once its account's sessions were ended, and where its time ran out.
+BUSY = "Signing in is busy right now. Try again in a moment."
 EXPIRED = "This login attempt has expired; start again."
 
 # The order of the locks.
@@ -297,18 +298,40 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
     A temporary credential's sign-in is not the account's own and is left as it is."""
     if result.is_temporary:
         return
+    from sqlalchemy.exc import InvalidRequestError, OperationalError
     from app.api import api_server as api
     user = result.user
-    api._sessions_turn(db, user.id)
+    try:
+        api._sessions_turn(db, user.id)
+    except OperationalError as waited:
+        # The turn was held for longer than the connection waits (a change that settles many accounts at once).
+        # Nothing was written: the sign-in is refused as busy, and a session its proof made goes with it.
+        if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
+            raise
+        db.rollback()
+        drop_the_session_the_proof_made(db, result)
+        raise HTTPException(status_code=503, detail=BUSY, headers={"Retry-After": "5"}) from None
     refresh = getattr(db, "refresh", None)
     if refresh is not None:
-        refresh(user)                              # as committed: everything below reads this
+        try:
+            refresh(user)                          # as committed: everything below reads this
+        except InvalidRequestError:
+            # The account is no longer there (deleted while the sign-in waited): refused as from before a change.
+            db.rollback()
+            drop_the_session_the_proof_made(db, result)
+            raise HTTPException(status_code=401, detail=EXPIRED) from None
     if as_read(user) != result.sessions_ended:
-        made, result.session_token = result.session_token, None
-        if made:
-            delete_session_by_token(db, made)      # the session the proof made goes with the sign-in
+        drop_the_session_the_proof_made(db, result)
         raise HTTPException(status_code=401, detail=EXPIRED)
     refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
+
+
+def drop_the_session_the_proof_made(db, result: "SignInResult") -> None:
+    """A sign-in that is refused where it would be written leaves no session behind: the one its proof made (the
+    password door writes its own, in its turn) is deleted with it."""
+    made, result.session_token = result.session_token, None
+    if made:
+        delete_session_by_token(db, made)
 
 
 def delete_session_by_token(db, session_token: Optional[str]) -> None:

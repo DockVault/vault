@@ -140,6 +140,89 @@ def test_a_sign_in_is_not_written_for_an_account_turned_off_while_it_waited_for_
     assert _rows(db, table, alice) == 0 and _count(db, alice) == 0
 
 
+def test_the_end_of_an_accounts_sessions_is_counted_in_the_accounts_turn(db, monkeypatch):
+    """The count is added to under the turn, so the count a sign-in compares with in its own turn is one nobody
+    is changing: the turn first, then the count."""
+    alice = _user(db, "alice")
+    alice_id, order = alice.id, []
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: order.append(("turn", user_id)))
+
+    @sa.event.listens_for(db.get_bind(), "before_cursor_execute")
+    def _statement(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE USERS") and "sessions_ended" in statement:
+            order.append(("counted", None))
+    try:
+        api._revoke_sessions(db, user_id=alice_id)
+        db.commit()
+    finally:
+        sa.event.remove(db.get_bind(), "before_cursor_execute", _statement)
+    assert order == [("turn", alice_id), ("counted", None)], order
+
+
+@pytest.mark.parametrize("written", ["a session", "a held sign-in"])
+def test_a_turn_held_too_long_refuses_the_sign_in_as_busy_and_leaves_no_session(db, monkeypatch, written):
+    """Something holds the account's turn for longer than the connection waits (a change that settles many
+    accounts in one transaction). The sign-in is refused as busy, with a time to come back, and writes nothing;
+    the session the password door made for it, in a commit of its own, is deleted with it."""
+    from sqlalchemy.exc import OperationalError
+    from app.services.auth_service import AuthService
+    alice = _user(db, "alice")
+    write = (sign_in.complete_sign_in if written == "a session"
+             else lambda db_, result: sign_in.begin_pending(db_, result, sign_in.STAGE_SECOND_FACTOR))
+    made = AuthService(db)._create_session(alice, None, IP, channel="web")
+    assert _rows(db, "active_sessions", alice) == 1
+
+    class _Held(Exception):
+        pgcode = "55P03"
+
+    class _Other(Exception):
+        pgcode = "40001"
+
+    def held(error):
+        def turn(db_, user_id):
+            raise OperationalError("SELECT pg_advisory_xact_lock", {}, error)
+        return turn
+    monkeypatch.setattr(api, "_sessions_turn", held(_Held()))
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, session_token=made,
+                                  sessions_ended=sign_in.as_read(alice))
+    with pytest.raises(HTTPException) as busy:
+        write(db, result)
+    assert (busy.value.status_code, busy.value.detail) == (503, sign_in.BUSY)
+    assert busy.value.headers == {"Retry-After": "5"} and result.session_token is None
+    assert _rows(db, "active_sessions", alice) == 0 and _rows(db, "pending_logins", alice) == 0
+    # Another failure of the database is its own: not a busy turn.
+    monkeypatch.setattr(api, "_sessions_turn", held(_Other()))
+    with pytest.raises(OperationalError):
+        write(db, sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, sessions_ended=sign_in.as_read(alice)))
+
+
+def test_a_sign_in_from_before_a_change_leaves_no_session_of_its_proof(db, monkeypatch):
+    """The password door writes its session in its own turn and commits it. Where the sign-in then finds, in the
+    turn it writes in, that the account's sessions were ended since, that session is deleted with the sign-in."""
+    from app.services.auth_service import AuthService
+    alice = _user(db, "alice")
+    made = AuthService(db)._create_session(alice, None, IP, channel="web")
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, session_token=made,
+                                  sessions_ended=sign_in.as_read(alice))
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: _elsewhere(
+        db, "UPDATE users SET sessions_ended = sessions_ended + 1 WHERE id = :id", id=alice.id.hex))
+    with pytest.raises(HTTPException) as refused:
+        sign_in.begin_pending(db, result, sign_in.STAGE_SECOND_FACTOR)
+    assert (refused.value.status_code, refused.value.detail) == (401, sign_in.EXPIRED)
+    assert result.session_token is None
+    assert _rows(db, "active_sessions", alice) == 0 and _rows(db, "pending_logins", alice) == 0
+
+
+def test_a_sign_in_for_an_account_deleted_while_it_waited_is_refused_and_not_an_error(db, monkeypatch):
+    alice = _user(db, "alice")
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, sessions_ended=sign_in.as_read(alice))
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: _elsewhere(
+        db, "DELETE FROM users WHERE id = :id", id=alice.id.hex))
+    with pytest.raises(HTTPException) as refused:
+        sign_in.complete_sign_in(db, result)
+    assert (refused.value.status_code, refused.value.detail) == (401, sign_in.EXPIRED)
+
+
 def test_a_sign_in_that_does_not_say_what_it_read_is_taken_as_read_where_it_was_made(db):
     alice = _user(db, "alice")
     assert sign_in.SignInResult(alice, [sign_in.PASSWORD], IP).sessions_ended == 0
