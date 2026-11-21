@@ -494,8 +494,9 @@ def test_an_administrator_removes_a_passkey_as_a_credential_change_and_never_the
     ("a passkey retired earlier", True)])
 def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_as_a_reset(monkeypatch, left, marked):
     """An administrator removes one passkey. Where that leaves the account with no factor it can give (no other
-    passkey that can be used, and no authenticator), it is what a reset is: the account is marked, sets the next
-    factor up at its next sign-in, and counts as an account with a factor of its own until then. A key of an
+    passkey that can be used, and no authenticator), it is what a reset is: the account sets the next factor up
+    at its next sign-in, and counts as an account with a factor of its own until then. It is marked for that
+    where no key is left; a key it still holds and cannot use says the same by itself. A key of an
     algorithm that was removed and has run out is refused at every use: it is none. With a factor left, nothing
     is marked. Marked or not, the account's sessions end and its sign-ins under way are spent: somebody else took
     a key from it, and nothing says which sessions that key made. A removal an account makes of its own key marks
@@ -537,7 +538,13 @@ def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_a
     assert key.retired_at is not None
     assert result == {"passkey_id": str(key.id), "passkey_label": "yubikey", "left_without_a_factor": marked,
                       "signed_out": True}
-    assert (target.second_factor_reset_at is not None) is marked
+    # The mark is for an account left with no key at all. One that still holds a key it cannot use sets a factor
+    # up again because of that key, with no mark, and the key counts again by itself should its algorithm (or the
+    # vault's address) come back; with the mark, the next start would retire it as a key from before a reset.
+    kept = left == "another passkey of a removed algorithm"
+    assert (target.second_factor_reset_at is not None) is (marked and not kept)
+    if kept:
+        assert S._second_factor_to_set_up_again(db, target) is True and keys[1].retired_at is None
     assert other.second_factor_reset_at is None and admin.second_factor_reset_at is None
     assert ended == [target.id] and spent == [target.id]
     title, sentence = S._credential_change_notice(cc.PASSKEY, result)

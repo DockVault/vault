@@ -547,6 +547,14 @@ def finish(db, result: SignInResult):
         own_factor_first = password_first = False
         if passkey.paused:
             api._passkey_pause_grace(user)
+        elif not passkey.required and getattr(user, "passkey_required_since", None) is not None:
+            # The requirement is met again by a passkey the account holds (one made at an address the vault went
+            # back to, or of an algorithm that is accepted again). The day the requirement began, written while it
+            # was not met, ends here: should the account's last passkey leave it later, its time to set one up
+            # starts over, as it does when a key is registered.
+            from app.core import webauthn_settings
+            if webauthn_settings.usable_passkeys(db, user.id) > 0:
+                api._passkey_pause_grace(user)
         if passkey.required:
             api._passkey_mark_required(user)
             if passkey.overdue or not password_owed_before_an_enrollment(user, result.methods, result.provider_id):

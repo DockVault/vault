@@ -276,6 +276,21 @@ def at_this_address(key, here: Optional[str] = None) -> bool:
     return bool(here) and (made_at is None or made_at == here)
 
 
+def fill_the_addresses_not_recorded(db) -> int:
+    """Write the address the vault has now on every passkey that has none on record, in the caller's transaction;
+    returns how many. Run at start. No released database holds such a key (the column came with the table), so
+    this is for a table an earlier build of this release made: the keys in it were made at the address the vault
+    had then, which is taken to be the one it has at this start. Nothing while the vault has no address a passkey
+    can be made at."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    here = address_now()
+    if not here or not has_table(db, WebAuthnCredential.__tablename__):
+        return 0
+    return int(db.query(WebAuthnCredential).filter(WebAuthnCredential.rp_id.is_(None)).update(
+        {WebAuthnCredential.rp_id: here}, synchronize_session=False) or 0)
+
+
 def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None,
                     whatever_the_switch: bool = False) -> int:
     """How many passkeys of the account can still be used: not retired, made at the address the vault has now

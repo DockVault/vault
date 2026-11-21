@@ -122,27 +122,61 @@ def test_an_account_whose_passkeys_were_made_at_another_address_sets_a_factor_up
     assert body["enrollment_required"] is False and body["methods"] == ["totp", "recovery", "passkey"], body
 
 
-def test_a_role_that_must_hold_a_passkey_is_asked_again_without_its_grace_starting_over(monkeypatch):
-    """The key that met the requirement was made at another address: the requirement applies again. Nothing
-    writes the day it began (cleared when the key was registered), so no grace starts over, however often the
-    account signs in; the account sets a factor up again because its only factor is gone, as after a reset."""
+def test_a_role_that_must_hold_a_passkey_has_one_grace_while_its_keys_are_elsewhere_and_none_left_when_they_are_back(
+        monkeypatch):
+    """The key that met the requirement was made at another address: the requirement applies again, and the
+    account sets a factor up again because its only factor is gone, as after a reset. Through the sign-in, as the
+    server runs it: the first sign-in after the move writes the day the requirement began, and no later one moves
+    it, so the grace runs once and does not start over. The address back, the key meets the requirement again
+    and the next sign-in ends that day: left on the account, it would have made the account overdue at once, with
+    no grace at all, the next time its last passkey left it."""
     registry, wss = _mod()
+    from datetime import timedelta
     from app.core.models import WebAuthnCredential
+    from app.services import sign_in
     S = _api()
+    in_effect, effective = S._login_second_factor_in_effect, S._second_factor_effective      # as the server has them
     carol = _user("carol", passkey_required_since=None, passkey_requirement_cleared_at=None)
     h = SignInHarness(monkeypatch, [carol])
+    monkeypatch.setattr(S, "_login_second_factor_in_effect", in_effect)
+    monkeypatch.setattr(S, "_second_factor_effective", effective)
     _resolving(monkeypatch, registry, {wss.MODE: wss.REQUIRED_FOR_ROLES, wss.REQUIRED_ROLES: ["user"]})
     monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: True)
     h.db.rows_of(WebAuthnCredential).append(_key(carol, RP_ID))
+
+    def signs_in():
+        return sign_in.finish(h.db, sign_in.SignInResult(carol, ["pwd"], IP))
     assert wss.requirement(h.db, carol).required is False
+    signs_in()
+    assert carol.passkey_required_since is None            # a requirement that is met writes nothing
     _address(monkeypatch, "new.example.test")
+    assert wss.requirement(h.db, carol).required is True and S._second_factor_to_set_up_again(h.db, carol) is True
+    held = signs_in()
+    assert isinstance(held, sign_in.PendingStep) and held.body["set_up_again"] == "passkeys_at_another_address"
+    began = carol.passkey_required_since
+    assert began is not None
     for _again in range(3):
-        need = wss.requirement(h.db, carol)
-        assert need.required is True and need.since is None and need.overdue is False
-        assert S._second_factor_to_set_up_again(h.db, carol) is True
-    assert carol.passkey_required_since is None
+        signs_in()
+        assert carol.passkey_required_since == began       # the grace runs once: no sign-in starts it over
     _address(monkeypatch, RP_ID)
+    assert wss.requirement(h.db, carol).required is False and carol.passkey_required_since == began
+    signs_in()
+    assert carol.passkey_required_since is None            # ended where the key meets the requirement again
+    # The vault moves again, weeks later: a grace of its own, from the first sign-in after that move.
+    _address(monkeypatch, "new.example.test")
+    later = datetime.utcnow() + timedelta(days=60)
+    need = wss.requirement(h.db, carol, now=later)
+    assert need.required is True and need.since is None and need.overdue is False
+    # Only a passkey the account can use ends that day. A requirement that stops applying for another reason
+    # (the role's rule switched off for a while) leaves it, as it always did: switching the rule off and on
+    # hands nobody a new grace.
+    signs_in()
+    began_again = carol.passkey_required_since
+    assert began_again is not None
+    _resolving(monkeypatch, registry, {wss.MODE: "optional"})
     assert wss.requirement(h.db, carol).required is False
+    signs_in()
+    assert carol.passkey_required_since == began_again
 
 
 def test_a_key_records_the_address_it_is_made_at_and_one_with_none_gets_it_at_its_first_use(monkeypatch):
@@ -189,8 +223,19 @@ def test_an_administrators_removal_that_leaves_only_keys_made_elsewhere_leaves_n
     monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db_, user_id: 0)
     result = S._apply_credential_change(db, cc.PASSKEY, carol, {"passkey_id": str(lost.id)}, actor_id=admin.id,
                                         actor_name="root")
+    assert result["left_without_a_factor"] is True and ended == [carol.id] and old.retired_at is None
+    # No mark of a factor taken away: the key she still holds says by itself that she sets one up again, and
+    # says nothing once it can be used again. With the mark, the next start would have retired that key as one
+    # from before a reset, and the mark would have outlived the address going back.
+    assert carol.second_factor_reset_at is None
+    assert S._second_factor_to_set_up_again(db, carol) is True
+    _address(monkeypatch, ELSEWHERE)
+    assert wss.usable_passkeys(db, carol.id) == 1 and S._second_factor_to_set_up_again(db, carol) is False
+    # Her last key of all, removed: nothing is left to say it, so the mark does.
+    _address(monkeypatch, RP_ID)
+    result = S._apply_credential_change(db, cc.PASSKEY, carol, {"passkey_id": str(old.id)}, actor_id=admin.id,
+                                        actor_name="root")
     assert result["left_without_a_factor"] is True and carol.second_factor_reset_at is not None
-    assert ended == [carol.id] and old.retired_at is None
 
 
 def test_the_deployment_says_where_its_passkeys_were_made():
@@ -245,3 +290,52 @@ def test_the_host_tool_says_how_many_passkeys_stop_working_at_another_address():
     assert tool.passkey_host("vault.example.test") == "vault.example.test"
     assert tool.passkey_host("https://Vault.Example.test:8443,other") == "vault.example.test"
     assert tool.passkey_host("203.0.113.9") == "" and tool.passkey_host("") == ""
+
+
+def test_a_key_with_no_address_on_record_is_given_the_vaults_at_start_and_none_while_the_vault_has_none():
+    """A table an earlier build of this release made holds keys with no address. Taken as made here only until
+    they next answered, such a key went on counting after the vault moved, where no browser offers it. The start
+    writes the address the vault has on each of them, once; with no address a passkey can be made at, nothing."""
+    set_bare_api_env()
+    from _kept_db import kept_database
+    from app.core import webauthn_settings as wss
+    from app.core.models import RoleEnum, User, WebAuthnCredential
+    made = wss.address_now
+    try:
+        with kept_database() as (make, _engine):
+            with make() as db:
+                ann = User(username="ann", email=None, password_hash="x", role=RoleEnum.USER, is_active=True)
+                db.add(ann)
+                db.flush()
+                for index, address in enumerate((None, None, ELSEWHERE)):
+                    db.add(WebAuthnCredential(user_id=ann.id, credential_id=bytes([index + 1]) * 8,
+                                              public_key_cose=b"k", cose_alg=-7, rp_id=address))
+                db.commit()
+
+                def addresses():
+                    db.expire_all()
+                    return sorted(str(row.rp_id) for row in db.query(WebAuthnCredential).all())
+                wss.address_now = lambda: ""
+                assert wss.fill_the_addresses_not_recorded(db) == 0
+                db.commit()
+                assert addresses() == ["None", "None", ELSEWHERE]
+                wss.address_now = lambda: "vault.example.test"
+                assert wss.fill_the_addresses_not_recorded(db) == 2
+                db.commit()
+                assert addresses() == [ELSEWHERE, "vault.example.test", "vault.example.test"]
+                # Moved since: the keys stay where they were made, and the start writes nothing more.
+                wss.address_now = lambda: "new.example.test"
+                assert wss.fill_the_addresses_not_recorded(db) == 0
+                assert addresses() == [ELSEWHERE, "vault.example.test", "vault.example.test"]
+                assert wss.usable_passkeys(db, ann.id, whatever_the_switch=True) == 0
+    finally:
+        wss.address_now = made
+
+
+def test_the_start_fills_the_addresses_in_a_step_of_its_own_after_the_column_is_there():
+    import inspect
+    from app.api import api_server
+    source = inspect.getsource(api_server)
+    column = source.index('"ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS rp_id VARCHAR(253)"')
+    filled = source.index("_passkey_settings.fill_the_addresses_not_recorded(db)")
+    assert column < source.index("for stmt in statements:") < filled

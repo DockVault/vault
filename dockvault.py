@@ -801,7 +801,7 @@ def passkey_host(allowed_hosts):
     there (see sign_in_address_reason)."""
     if sign_in_address_reason(allowed_hosts) is not None:
         return ""
-    return _allowed_hosts_first(allowed_hosts)[1]
+    return _allowed_hosts_first(allowed_hosts)[1].rstrip(".")        # as the vault records it: no trailing dot
 
 
 def passkeys_elsewhere_note(answer, host):

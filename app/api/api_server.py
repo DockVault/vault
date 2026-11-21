@@ -6550,7 +6550,16 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             authenticator = db.query(SecondFactorEnrollment.id).filter(
                 SecondFactorEnrollment.user_id == target.id, SecondFactorEnrollment.status == "active").first() is not None
             left_without = not usable_left and not authenticator
-            if left_without:
+            # The mark of a factor taken away is for an account left with no key at all. One that still holds
+            # keys it cannot use now (made at another address, of an algorithm that ran out) sets a factor up
+            # again because of them, with no mark (webauthn_settings.only_lapsed_passkeys), and they count again
+            # by themselves if the address or the algorithm comes back. With the mark they would be retired at
+            # the next start, as keys from before a reset are (RETIRE_PASSKEYS_FROM_BEFORE_A_RESET), and the
+            # mark would outlive the address going back.
+            others_kept = db.query(WebAuthnCredential.id).filter(
+                WebAuthnCredential.user_id == target.id, WebAuthnCredential.retired_at.is_(None),
+                WebAuthnCredential.id != row.id).first() is not None
+            if left_without and not others_kept:
                 target.second_factor_reset_at = datetime.utcnow()
             # Somebody else took a key from the account: a device that is lost, or a key that may be another's.
             # Nothing says which sessions that key made, so all of the account's sessions end, and its sign-ins
@@ -28873,6 +28882,24 @@ END $$;""",
                     # /health has nothing to consult, and a deployment missing a column reports
                     # itself well until an endpoint that needed the column returns a 500.
                     recorder.record(stmt, SchemaStep.OUTCOME_FAILED, str(e))
+
+            # A passkey with no address on record (a table an earlier build of this release made) is taken
+            # as made at the address the vault has now, and says so from this start on. Left empty until it
+            # next answered, such a key went on counting after the vault moved to another host name, where no
+            # browser offers it. Nothing is written while the vault has no address a passkey can be made at.
+            address_step = "conditional: webauthn_credentials.rp_id filled with the vault's address where it is empty"
+            try:
+                from app.core import webauthn_settings as _passkey_settings
+                db.execute(text("SET LOCAL lock_timeout = 0"))
+                filled = _passkey_settings.fill_the_addresses_not_recorded(db)
+                db.commit()
+                recorder.record(address_step, SchemaStep.OUTCOME_APPLIED)
+                if filled:
+                    print(f"[OK] Passkeys: {filled} key(s) with no address on record are taken as made at this one")
+            except Exception as e:
+                db.rollback()
+                print(f"⚠ webauthn_credentials.rp_id fill skipped: {e}")
+                recorder.record(address_step, SchemaStep.OUTCOME_FAILED, str(e))
 
             # Whose password each account holds (app/core/password_origin.py): the two columns are added,
             # and filled from the audit log, once, in one transaction. Deliberately NOT a string in the

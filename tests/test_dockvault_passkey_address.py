@@ -173,6 +173,17 @@ def test_the_note_about_passkeys_made_at_another_address_counts_those_and_no_oth
 def test_the_host_passkeys_are_made_for_is_the_one_the_vault_gives_out():
     assert dv.passkey_host("https://vault.example.com") == "vault.example.com"
     assert dv.passkey_host("https://vault.example.com:8443") == "vault.example.com"
+    # As the vault records it on a key (app/core/public_url.py): lower case, and no trailing dot.
+    for written in ("vault.example.com.", "https://vault.example.com.:8443", "https://VAULT.Example.COM", "Vault.Example.Com."):
+        assert dv.passkey_host(written) == "vault.example.com", written
+    from app.core import allowed_hosts, public_url
+    for written in ("vault.example.com", "vault.example.com.", "https://VAULT.Example.COM:8443",
+                    "*.example.com,vault.example.com", "https://xn--bcher-kva.example", "https://vault.example.com./"):
+        try:
+            public_url.link_base, kept = (lambda w=written: allowed_hosts.link_base(w)), public_url.link_base
+            assert dv.passkey_host(written) == public_url.rp_id() != "", written
+        finally:
+            public_url.link_base = kept
     for none_can_be_made in ("https://203.0.113.9:8443", "http://vault.lan:8080", "", None):
         assert dv.passkey_host(none_can_be_made) == "", none_can_be_made
 
