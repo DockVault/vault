@@ -36,7 +36,7 @@ ACKNOWLEDGE_KEYS = {"enrolled", "method", "access_token", "token_type"}
 # A session token's claims (every sign-in has an id of its own, which its renewals keep), and what a second kind of
 # factor adds.
 TOKEN_KEYS = {"sub", "username", "session_token", "is_temporary", "amr", "auth_time", "sign_in_id", "exp", "iat"}
-PRE_AUTH_KEYS = {"sub", "username", "stage", "pre_auth", "methods_so_far", "exp", "iat"}
+PRE_AUTH_KEYS = {"sub", "username", "stage", "pre_auth", "methods_so_far", "ended", "exp", "iat"}
 
 
 def _db(sql):
@@ -73,8 +73,16 @@ def _pending_row(user_id):
     return pid
 
 
+def _ended(user_id) -> int:
+    """How many times the account's sessions were ended as a whole: what a held sign-in carries from its first
+    proof, and is compared with when it is completed."""
+    return int(_db(f"select sessions_ended from users where id = '{user_id}'"))
+
+
 def _mint(claims, minutes=5):
-    """A pre-authentication token signed with the server's own key, minted inside the API container."""
+    """A pre-authentication token signed with the server's own key, minted inside the API container. It carries
+    the account's count as it stands, as a sign-in held just now would."""
+    claims = {"ended": _ended(claims["sub"]), **claims}
     code = ("import json, sys; from datetime import timedelta; from app.core.security import create_access_token; "
             f"print(create_access_token(json.loads(sys.argv[1]), expires_delta=timedelta(minutes={minutes})))")
     r = subprocess.run(["docker", "exec", _API_CONTAINER, "python", "-c", code, json.dumps(claims)],
@@ -308,7 +316,7 @@ def _store_code(user_id, methods, verifier, **flags):
     write it, with the tab verifier's hash."""
     code = ("import json, sys; from app.core import sign_in_codes as c; d = json.loads(sys.argv[1]); "
             "print(c.store(c.Handover(verifier_hash=c.digest(sys.argv[2]), **d)))")
-    record = {"user_id": user_id, "methods": methods, "client_ip": None, **flags}
+    record = {"user_id": user_id, "methods": methods, "client_ip": None, "ended": _ended(user_id), **flags}
     r = subprocess.run(["docker", "exec", _API_CONTAINER, "python", "-c", code, json.dumps(record), verifier],
                        capture_output=True, text=True, timeout=90)
     assert r.returncode == 0, r.stderr
