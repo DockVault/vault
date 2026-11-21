@@ -876,12 +876,14 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
     links = _provider(name="links", label="Links", policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
     plain = _provider(name="plain", label="Plain")
     keyed, retired = _user("keyed", email_confirmed_at=None), _user("retired", email_confirmed_at=None)
-    people = [open_, done, bare, root, guarded, linked, resetting, keyed, retired]
+    started = _user("started", email_confirmed_at=None)        # an authenticator begun and never confirmed: none
+    people = [open_, done, bare, root, guarded, linked, resetting, keyed, retired, started]
     h = Resolving(monkeypatch, people, [links, plain],
                   identities=[_identity(linked, links, subject="s-linked"), _identity(open_, plain, subject="s-open")])
     _factor(h, guarded, "authenticator")
     _factor(h, keyed, "passkey")
     _factor(h, retired, "passkey retired")
+    _factor(h, started, "enrollment never confirmed")
     monkeypatch.setattr(h.S, "_smtp_configured", lambda db: True)
 
     def wanted():
@@ -890,12 +892,12 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
         assert {u.username for u in people if u.id in together} == one_by_one
         return one_by_one
 
-    assert wanted() == {"open", "retired"}
+    assert wanted() == {"open", "retired", "started"}
     # With passkeys switched off the kept key is no factor for a sign-in, and still keeps a link by email out.
     switched_on = webauthn_settings.enabled
     monkeypatch.setattr(webauthn_settings, "enabled", lambda: False)
     assert h.S._passkey_counts(h.db, [keyed.id]) == {} and sso.set_up_its_own_factor(h.db, keyed) is True
-    assert wanted() == {"open", "retired"}
+    assert wanted() == {"open", "retired", "started"}
     assert sso.accounts_that_set_up_a_factor(h.db, people) == {guarded.id, resetting.id, keyed.id}
     assert sso.accounts_that_set_up_a_factor(h.db, []) == set()
     monkeypatch.setattr(webauthn_settings, "enabled", switched_on)
@@ -987,6 +989,37 @@ def test_a_link_from_your_account_is_made_on_the_provider_as_it_stands_when_the_
     h.db.on_lock.append(lambda: setattr(q, "state", "disabled"))
     status, out = h.finish_link(location)
     assert status == 409 and out["detail"]["reason"] == "provider_disabled" and h.identities() == [], out
+
+
+def test_a_provider_row_that_a_save_still_holds_links_nobody_and_says_so(monkeypatch):
+    """A save of the provider holds its row; the read that a link is made on gives up after a short wait. The
+    sign-in is sent back to the sign-in page as for a provider that did not answer, with a record of it, and the
+    link from Your account answers 503: nothing is linked either way, and the person starts again."""
+    from app.api import sso_router
+    alice = _user("alice")
+    p = _provider(name="a", label="A")
+    h = Resolving(monkeypatch, [alice], [p])
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-linked="), location
+
+    def busy(db, provider_id):
+        raise sso_router.ProviderRowBusy()
+    as_it_is = sso_router._provider_as_it_stands
+    monkeypatch.setattr(sso_router, "_provider_as_it_stands", busy)
+    status, out = h.finish_link(location)
+    assert status == 503 and out["detail"]["reason"] == "temporarily_unavailable", out
+    assert "being saved" in out["detail"]["message"] and h.identities() == []
+    # A sign-in that comes back while the row is held.
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    before = len(h.audits)
+    status, location, _ = h.callback(p, state)
+    assert status in (302, 303, 307) and location.endswith("sso-error=temporarily_unavailable"), (status, location)
+    assert any("temporarily_unavailable" in str(row) for row in h.audits[before:]), h.audits[before:]
+    assert h.identities() == []
+    monkeypatch.setattr(sso_router, "_provider_as_it_stands", as_it_is)
 
 
 def test_an_identity_linked_by_email_does_not_stand_in_for_a_factor_the_account_set_up_later(monkeypatch):
