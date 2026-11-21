@@ -866,7 +866,8 @@ def passkey_host(allowed_hosts):
     there (see sign_in_address_reason)."""
     if sign_in_address_reason(allowed_hosts) is not None:
         return ""
-    return _allowed_hosts_first(allowed_hosts)[1]
+    # As the vault records it on a key: lower case. (A name written with a dot at its end is refused above.)
+    return _sign_in_address_host(allowed_hosts).lower()
 
 
 def _holders_of_passkeys_elsewhere(holders, host):

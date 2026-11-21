@@ -17,7 +17,14 @@ those headers (``host: str = Header(None)``, or by its alias) is a read, and so 
 whole to another function, which the check cannot follow. A ``url`` is taken for a request's whatever it is read
 from (a helper's parameter is declared as nothing and may be called anything), a reader taken off the headers and
 called by another name (``get = request.headers.get``) is a read where it is called, and what builds a request
-keeps a name the check knows: it is imported under no other.
+keeps a name the check knows: it is imported under no other, and neither is the marker that fills a parameter from
+a header. ``getattr(x, 'headers')`` is the headers of whatever ``x`` is, as ``x.headers`` is, and what a raw
+application is called with (``__call__(self, scope, receive, send)``) is a scope whatever the parameter is named.
+
+What the check does not chase: a read written to hide from it (a method reached through ``__call__`` or
+``__getattribute__``, a private attribute of the request, ``vars()``, ``operator.attrgetter``). No source check
+ends that list. The address itself is held by behaviour, whatever reads it: tests/test_sso_addresses.py and the
+passkey address tests start a sign-in with a request that names another host and find the configured one given out.
 
 This holds every module of the sign-in pipeline, passkeys and single sign-on: every module under app/ named for one
 of them, so a new one is read without being listed, and the ones listed below by name, so a rename shows here and
@@ -47,8 +54,10 @@ SINGLE_SIGN_ON = ("app/api/sso_router.py", "app/api/sso_admin_router.py", "app/s
                   "app/core/sso_only.py", "app/core/sso_policy.py", "app/core/sso_state.py",
                   "app/core/privileged_accounts.py", "app/api/sso_providers_router.py",
                   "app/services/sso_providers.py", "app/core/sso_presets.py", "app/core/sso_settings.py")
-MODULES = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "app").rglob("*.py")
-                 if any(name in p.name for name in NAMED))
+# Read too, though not named for sign-in: where every link's base is taken from, and the password door.
+ALSO_READ = ("app/core/allowed_hosts.py", "app/services/auth_service.py")
+MODULES = sorted({p.relative_to(ROOT).as_posix() for p in (ROOT / "app").rglob("*.py")
+                  if any(name in p.name for name in NAMED)} | set(ALSO_READ))
 
 ADDRESS_HEADERS = ("host", "origin", "referer", "forwarded", "x-original-host", "x-host", "x-original-url",
                    "x-rewrite-url")
@@ -93,13 +102,17 @@ def _names_an_address(header) -> bool:
 
 
 def _declared_requests(tree) -> set:
-    """The parameters that hold a request by what they are declared as, whatever they are called."""
+    """The parameters that hold a request by what they are declared as, whatever they are called, and the scope
+    a raw application is called with: the first parameter after ``self`` of ``__call__(self, x, receive, send)``."""
     named = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
                 if arg.annotation is not None and REQUEST_TYPES.search(ast.unparse(arg.annotation)):
                     named.add(arg.arg)
+            positional = [arg.arg for arg in node.args.posonlyargs + node.args.args]
+            if getattr(node, "name", "") == "__call__" and len(positional) == 4 and positional[2:] == ["receive", "send"]:
+                named.add(positional[1])
     return named
 
 
@@ -182,10 +195,13 @@ def _assignments(tree):
                 yield target, value
 
 
-def _headers_by_getattr(node, declared) -> bool:
-    """``getattr(<a request>, 'headers', ...)``: the request's headers by another spelling."""
+def _headers_by_getattr(node, declared, of_anything=False) -> bool:
+    """``getattr(<a request>, 'headers', ...)``: the request's headers by another spelling. With ``of_anything``,
+    the headers of whatever it is taken from: where a header is read out of it, ``x.headers`` is taken for a
+    request's whatever ``x`` is called (a helper's parameter is declared as nothing), and so is this. Where headers
+    are handed on whole it must be a request's: an error's own headers go back on its answer."""
     return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
-            and len(node.args) > 1 and _a_request(node.args[0], declared)
+            and len(node.args) > 1 and (of_anything or _a_request(node.args[0], declared))
             and isinstance(node.args[1], ast.Constant) and node.args[1].value == "headers")
 
 
@@ -203,7 +219,7 @@ def request_addresses(tree) -> list:
     found.extend(_header_parameters(tree))
     constants, from_headers, kept_as = {}, set(), set()
     for target, value in _assignments(tree):
-        carries = any((isinstance(n, ast.Attribute) and n.attr == "headers") or _headers_by_getattr(n, declared)
+        carries = any((isinstance(n, ast.Attribute) and n.attr == "headers") or _headers_by_getattr(n, declared, True)
                       or _built_from_a_request(n, declared, ("Headers",)) for n in ast.walk(value))
         if isinstance(target, ast.Name):
             if isinstance(value, ast.Constant) and isinstance(value.value, str):
@@ -225,7 +241,7 @@ def request_addresses(tree) -> list:
 
     def holds_headers(node) -> bool:
         return any((isinstance(n, ast.Attribute) and (n.attr == "headers" or n.attr in kept_as))
-                   or (isinstance(n, ast.Name) and n.id in from_headers) or _headers_by_getattr(n, declared)
+                   or (isinstance(n, ast.Name) and n.id in from_headers) or _headers_by_getattr(n, declared, True)
                    or _built_from_a_request(n, declared, ("Headers",)) for n in ast.walk(node))
 
     # A name that walks over a fixed list of names (``for name in ("purpose", "sec-purpose")``) names each of them.
@@ -339,7 +355,7 @@ def renamed_builders(tree) -> list:
                 continue
             if name in REQUEST_BUILDERS and not bound.endswith("Request"):
                 found.append(f"{alias.name} as {bound}")
-            elif name in ("Headers", "MutableHeaders", "URL"):
+            elif name in ("Headers", "MutableHeaders", "URL", "Header"):
                 found.append(f"{alias.name} as {bound}")
     return found
 
@@ -362,8 +378,17 @@ def test_the_reads_a_name_of_ones_own_would_hide_are_seen():
     assert reads("def f(request, name):\n    get = request.headers.get\n    return get(name)\n") == ["get(name)"]
     assert reads("def f(request):\n    get = request.headers.get\n    return get('user-agent')\n") == []
     planted = ast.parse("from starlette.requests import Request as R\nfrom starlette.datastructures import URL as U\n"
-                        "from starlette.requests import Request as _Request\nimport starlette.requests\n")
-    assert renamed_builders(planted) == ["Request as R", "URL as U"]
+                        "from starlette.requests import Request as _Request\nimport starlette.requests\n"
+                        "from fastapi import Header as _H\nfrom fastapi import Header\n")
+    assert renamed_builders(planted) == ["Request as R", "URL as U", "Header as _H"]
+    # The headers by getattr, of whatever they are taken from; a raw application's scope under any name.
+    assert reads("def _seen(conn):\n    return getattr(conn, 'headers').get('host')\n") == ["getattr(conn, 'headers').get('host')"]
+    assert reads("def _agent(conn):\n    return getattr(conn, 'headers').get('user-agent')\n") == []
+    assert reads("def _answer(exc):\n    return JSONResponse(content={}, headers=getattr(exc, 'headers', None))\n") == []
+    raw = ("class Seen:\n    async def __call__(self, s, receive, send):\n        host = dict(s['headers']).get(b'host')\n"
+           "        await self.app(s, receive, send)\n")
+    assert reads(raw) == ["s['headers']"]
+    assert reads("class Other:\n    def __call__(self, s, a, b):\n        return s['headers']\n") == []
 
 
 def test_the_modules_listed_by_name_are_among_those_read():
