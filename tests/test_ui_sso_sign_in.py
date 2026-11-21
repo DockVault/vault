@@ -561,6 +561,28 @@ def test_an_enrollment_that_cannot_start_says_why_and_leads_back_to_the_sign_in_
     assert cancelled == ["Bearer held-for-set-up"] and errors == [], (cancelled, errors)
 
 
+def test_a_set_up_whose_start_never_reached_the_server_leads_back_to_the_sign_in_form(page: Page, base_url):
+    """The request that starts the authenticator fails on the network (the server restarting, a connection that
+    dropped). The page says so, and the step has its way back as every other one: without it an account that
+    signs in only through its provider would be left on a step that can only be reloaded."""
+    errors, cancelled = [], []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    stand = Stand(page, base_url)
+    stand.finish_answer = _held_for_a_set_up(["totp"])
+    page.route("**/users/me/second-factor/totp/enroll", lambda route: route.abort())
+    page.route("**/auth/second-factor/cancel", lambda route: (cancelled.append(route.request.headers.get("authorization")),
+                                                              route.fulfill(status=200, json={}))[-1])
+    _sign_in_screen(page)
+    page.locator("#sso-sign-in .sso-sign-in-btn").first.click()
+    box = page.locator("#login-second-factor")
+    expect(box).to_contain_text("Could not reach the server. Please try again.", timeout=20000)
+    expect(box.locator(".sf-wizard-back")).to_have_count(1)
+    box.locator(".sf-wizard-back").click()
+    expect(page.locator("#login-form")).to_be_visible(timeout=10000)
+    expect(box).to_be_hidden()
+    assert cancelled == ["Bearer held-for-set-up"] and errors == [], (cancelled, errors)
+
+
 def test_a_set_up_whose_hold_ran_out_leads_back_to_the_sign_in_form_from_the_code(page: Page, base_url):
     """A sign-in held for the set-up lasts five minutes; installing an authenticator app can take longer. The code
     is then refused ("this login attempt has expired"), and would be at every try. Each step of the set-up at a
