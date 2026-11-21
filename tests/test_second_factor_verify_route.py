@@ -146,7 +146,8 @@ def verify(monkeypatch):
 
     monkeypatch.setitem(S.app.dependency_overrides, get_db, _fake_db)
     monkeypatch.setattr(AuthService, "_create_session",
-                        lambda self, u, t, ip, expires_at=None, channel=None: made["sessions"].append(u.username) or "sess")
+                        lambda self, u, t, ip, expires_at=None, channel=None, commit=True:
+                        made["sessions"].append(u.username) or "sess")
     monkeypatch.setattr(S, "AuditLogger", _Audit)
     monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, user: True)
     monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {"state": "setup", "in_effect": True})
@@ -170,7 +171,7 @@ def _pending_token(S, user, methods, **extra):
                                     enrollment_required=False,
                                     expires_at=datetime.now(timezone.utc) + timedelta(minutes=3))
     token = create_access_token({"sub": str(user.id), "username": user.username, "stage": "second_factor",
-                                 "pre_auth": str(pending.id), "methods_so_far": list(methods), **extra},
+                                 "pre_auth": str(pending.id), "methods_so_far": list(methods), "ended": 0, **extra},
                                 expires_delta=timedelta(minutes=5))
     return pending, token
 

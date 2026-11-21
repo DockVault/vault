@@ -69,6 +69,31 @@ SESSION_ROW_LIFETIME = timedelta(days=31)
 # What the person may enroll when the policy requires a factor they do not have.
 ENROLLMENT_METHODS = ("totp",)
 
+# What a held sign-in is told once its account's sessions were ended, and where its time ran out.
+EXPIRED = "This login attempt has expired; start again."
+
+# The order of the locks.
+#
+# A sign-in, and a change to how an account signs in, take these in this order, and never one of them after one
+# that stands later in the list:
+#
+#   1. the account's turn at signing in (app/core/sign_in_lockout.py take_turn; the password door alone);
+#   2. a provider's row (sso_providers), read under a lock or written;
+#   3. the account's turn at its sessions (take_sessions_turn there; api_server._sessions_turn);
+#   4. the account's row (users), read under a lock or written;
+#   5. a row of credential_changes, read under a lock or written.
+#
+# Any of them may be skipped, and one already held may be taken again. The turns are an account's own: another
+# account's row may be held when a turn is taken. A lock the application takes on an account's row under a turn
+# leaves the row's key free (FOR NO KEY UPDATE), so the rows that name the account (a session, a held sign-in, a
+# passkey, an audit row) are written without waiting for it. Two transactions that keep to the order cannot wait
+# for each other in a ring. tests/_lock_order_recorder.py watches a test stack for a transaction that does not.
+#
+# What is written in the account's turn at its sessions: a session, a sign-in held for a further step, and a
+# factor set up at a held sign-in, each in one transaction with a check that its proof still stands
+# (in_the_accounts_turn), committed once. What ends an account's sessions takes the same turn, so each of the two
+# comes wholly before the other.
+
 
 @dataclass
 class SignInResult:
@@ -95,6 +120,14 @@ class SignInResult:
     passwordless_allowed: bool = False
     auth_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     channel: str = "web"
+    # How many times the account's sessions had been ended when the first proof of this sign-in read the account
+    # (:func:`as_read`; a held sign-in carries it in its token, :func:`ended_of`). A door passes what it read
+    # with the account, before it checked anything; left out, it is read off ``user`` as it stands here.
+    sessions_ended: Optional[int] = None
+
+    def __post_init__(self):
+        if self.sessions_ended is None:
+            self.sessions_ended = as_read(self.user)
 
 
 @dataclass
@@ -212,6 +245,8 @@ def read_pre_auth(payload: dict, pending: PendingLogin) -> None:
     provider = payload.get("idp")
     pending._provider_id = provider if isinstance(provider, str) else None
     pending._provider_mfa_trusted = payload.get("provider_mfa") is True
+    ended = payload.get("ended")
+    pending._sessions_ended = ended if isinstance(ended, int) and not isinstance(ended, bool) else None
 
 
 def methods_so_far(pending: Optional[PendingLogin]) -> List[str]:
@@ -233,6 +268,49 @@ def provider_mfa_of(pending: Optional[PendingLogin]) -> bool:
     return bool(getattr(pending, "_provider_mfa_trusted", False))
 
 
+def as_read(user) -> int:
+    """How many times the account's sessions had been ended as a whole when ``user`` was read
+    (``users.sessions_ended``). A door takes it right after it loads the account, before it checks anything."""
+    return int(getattr(user, "sessions_ended", 0) or 0)
+
+
+def ended_of(pending: Optional[PendingLogin]) -> int:
+    """The count a held sign-in carries from its first proof (read from its token). A token that carries none
+    was made before the count was kept: it matches no account, so that sign-in starts again."""
+    read = getattr(pending, "_sessions_ended", None)
+    return read if isinstance(read, int) else -1
+
+
+def in_the_accounts_turn(db, result: "SignInResult") -> None:
+    """Before a session or a held sign-in is written for ``result``: take the account's turn at its sessions and
+    judge the sign-in again in it, on the account as it is committed.
+
+    What ends an account's sessions (a new password, a reset link used, a second-factor reset, a sign-out
+    everywhere, a lock) takes that turn, counts itself on the account, and ends the sessions and the held
+    sign-ins it finds. A sign-in whose proof was read before such a change and that writes after it would leave
+    a session, or a held sign-in, the change never saw. So the writer takes the turn, reads the account again and
+    compares the count with the one the sign-in's first proof read: a sign-in from before the change is refused,
+    and one that passes commits before the next change can begin, which then finds what it wrote. The account's
+    state is judged again on the same read (locked, turned off). The caller writes and commits once, without
+    another commit in between: the commit is what lets the turn go.
+
+    A temporary credential's sign-in is not the account's own and is left as it is."""
+    if result.is_temporary:
+        return
+    from app.api import api_server as api
+    user = result.user
+    api._sessions_turn(db, user.id)
+    refresh = getattr(db, "refresh", None)
+    if refresh is not None:
+        refresh(user)                              # as committed: everything below reads this
+    if as_read(user) != result.sessions_ended:
+        made, result.session_token = result.session_token, None
+        if made:
+            delete_session_by_token(db, made)      # the session the proof made goes with the sign-in
+        raise HTTPException(status_code=401, detail=EXPIRED)
+    refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
+
+
 def delete_session_by_token(db, session_token: Optional[str]) -> None:
     """Delete the session the password check just made, so a sign-in with a step still to go leaves no
     usable session behind. The stored value is the token's SHA-256 hash."""
@@ -244,12 +322,14 @@ def delete_session_by_token(db, session_token: Optional[str]) -> None:
     db.commit()
 
 
-def consume_pending(db, pending: PendingLogin) -> None:
-    """Spend a pending login, one winner only: a second completion of the same step is refused."""
+def consume_pending(db, pending: PendingLogin, *, commit: bool = True) -> None:
+    """Spend a pending login, one winner only: a second completion of the same step is refused. ``commit=False``
+    leaves the commit to the caller, who writes what the pending login becomes in the same transaction."""
     done = db.query(PendingLogin).filter(
         PendingLogin.id == pending.id, PendingLogin.consumed_at.is_(None)).update(
         {"consumed_at": datetime.now(timezone.utc)}, synchronize_session=False)
-    db.commit()
+    if commit:
+        db.commit()
     if done != 1:
         raise HTTPException(status_code=401, detail="This login attempt was already completed.")
 
@@ -284,14 +364,17 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
     if stage not in STAGES:
         raise ValueError(f"not a pending stage: {stage!r}")
     user = result.user
+    # In the account's turn, in one transaction: the sign-in judged again, the pending login it continued spent,
+    # the new one written.
+    in_the_accounts_turn(db, result)
     if result.pending is not None:
-        consume_pending(db, result.pending)
+        consume_pending(db, result.pending, commit=False)
     pending = PendingLogin(user_id=user.id, client_ip=result.client_ip, enrollment_required=enrollment_required,
                            expires_at=datetime.now(timezone.utc) + timedelta(minutes=PRE_AUTH_TTL_MINUTES))
     db.add(pending)
     db.commit()
     claims = {"sub": str(user.id), "username": user.username, "stage": stage, "pre_auth": str(pending.id),
-              "methods_so_far": list(result.methods)}
+              "methods_so_far": list(result.methods), "ended": result.sessions_ended}
     if result.provider_id:
         claims["idp"] = result.provider_id
     if result.provider_mfa_trusted:
@@ -398,23 +481,21 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
     from app.api import api_server as api
     from app.services.auth_service import AuthService
     user = result.user
+    # In the account's turn, in one transaction: the sign-in judged again, its pending login spent, the session
+    # written, and the account's last sign-in stamped (the one the Users page shows and a dormant-account rule
+    # reads: every door stamps it here). One commit, so nothing sees a part of it.
+    in_the_accounts_turn(db, result)
     if result.pending is not None:
-        consume_pending(db, result.pending)
+        consume_pending(db, result.pending, commit=False)
     session_token = result.session_token
     if not session_token:
         auth = AuthService(db)
         session_token = auth._create_session(
             user, None, result.client_ip, expires_at=datetime.now(timezone.utc) + SESSION_ROW_LIFETIME,
-            channel=auth.WEB)
+            channel=auth.WEB, commit=False)
     now = datetime.now(timezone.utc)
-    # The account's last sign-in, the one the Users page shows and a dormant-account rule reads: every door stamps
-    # it here (the password door stamped it before any second factor; a passkey or a provider sign-in has no other
-    # place). Never a reason to refuse a sign-in that is whole.
-    try:
-        user.last_login = now
-        db.commit()
-    except Exception:  # noqa: BLE001
-        db.rollback()
+    user.last_login = now
+    db.commit()
     claims = {
         "sub": str(user.id), "username": user.username, "session_token": session_token,
         "is_temporary": result.is_temporary, "amr": list(result.methods),

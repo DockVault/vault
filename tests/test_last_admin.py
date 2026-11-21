@@ -154,7 +154,7 @@ def test_the_rule_locks_every_administrator_row_in_a_fixed_order():
     src = (ROOT / "app" / "core" / "last_admin.py").read_text(encoding="utf-8")
     body = src[src.index("def removes_last_admin"):]
     assert re.search(r"\.filter\(User\.role == RoleEnum\.ADMIN\)\.order_by\(User\.id\)\s*"
-                     r"\.populate_existing\(\)\.with_for_update\(\)\.all\(\)", body)
+                     r"\.populate_existing\(\)\.with_for_update\(key_share=True\)\.all\(\)", body)
 
 
 # --------------------------------------------------------------------------- the routes ask first

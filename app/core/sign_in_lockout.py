@@ -243,6 +243,35 @@ def take_turn(db, user_id) -> None:
                    "UPDATE sign_in_lockouts SET failed_attempts = failed_attempts WHERE 1 = 0")
 
 
+# The advisory lock class of an account's turn at its sessions ("ST"); the turn at signing in has its own.
+_SESSIONS_TURN_LOCK_CLASS = 0x5354
+
+
+def take_sessions_turn(db, user_id, *, busy: bool = False) -> None:
+    """Take the account's turn at its sessions, in the caller's transaction, and keep it until that transaction
+    ends (commit or rollback). What ends an account's sessions together, a renewal, and whatever writes a session,
+    a held sign-in or a factor for the account take it before they read what they depend on, so each of them
+    comes wholly before or wholly after the others (app/services/sign_in.py, "The order of the locks").
+
+    On PostgreSQL the turn is a transaction-scoped advisory lock keyed on the account, in a class of its own: two
+    accounts whose ids hash alike share a queue, which costs a wait and nothing else, and the wait is bounded by
+    the connection's lock_timeout. With ``busy`` a wait that ran out raises :class:`Busy`, with the transaction
+    rolled back, as the turn at signing in does; without it the database's error stands. Elsewhere (the tests'
+    SQLite, a stand-in store) one writer works at a time already and nothing is taken."""
+    get_bind = getattr(db, "get_bind", None)
+    if get_bind is None or get_bind().dialect.name != "postgresql":
+        return
+    from sqlalchemy.exc import OperationalError
+    try:
+        db.execute(text("SELECT pg_advisory_xact_lock(:cls, hashtext(:account))"),
+                   {"cls": _SESSIONS_TURN_LOCK_CLASS, "account": str(user_id)})
+    except OperationalError as exc:
+        if busy and getattr(getattr(exc, "orig", None), "pgcode", None) == "55P03":   # lock_not_available
+            db.rollback()
+            raise Busy() from None
+        raise
+
+
 def _wait_for_turn(db, lock_class, key, write_nothing) -> None:
     """take_turn's wait, for any turn: a transaction-scoped advisory lock of ``lock_class`` on ``key``
     on PostgreSQL, elsewhere the database's write lock, taken by ``write_nothing``. Raises Busy, with

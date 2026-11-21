@@ -110,7 +110,7 @@ def finish(monkeypatch):
         def log_action(self, **kw):
             made["audit"].append(("action", kw.get("action")))
 
-    def _create_session(self, user, temp_credential_id, ip, expires_at=None, channel=None):
+    def _create_session(self, user, temp_credential_id, ip, expires_at=None, channel=None, commit=True):
         made["sessions"].append((user.username, ip, channel))
         return "sess-" + user.username
 
@@ -139,7 +139,7 @@ def finish(monkeypatch):
 def _code(f, user, methods=("hwk",), **kw):
     verifier = f.codes.make_secret()
     record = f.codes.Handover(user_id=str(user.id), methods=list(methods), client_ip="10.0.0.1",
-                              verifier_hash=f.codes.digest(verifier), **kw)
+                              verifier_hash=f.codes.digest(verifier), **{"ended": 0, **kw})
     return f.codes.store(record, redis=f.redis), verifier
 
 
@@ -247,7 +247,7 @@ def test_the_desktop_app_proves_itself_with_pkce(finish):
     f = finish
     code_verifier = f.codes.make_secret() + f.codes.make_secret()[:10]
     record = f.codes.Handover(user_id=str(f.alice.id), methods=["hwk"], client_ip=None, purpose="app",
-                              user_verified=True, passwordless_allowed=True,
+                              user_verified=True, passwordless_allowed=True, ended=0,
                               code_challenge=f.codes.pkce_challenge(code_verifier))
     code = f.codes.store(record, redis=f.redis)
     assert _post(f.S, "/auth/finish", {"code": code, "verifier": code_verifier})[0] == 401   # wrong kind of proof

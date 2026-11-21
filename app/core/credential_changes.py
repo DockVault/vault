@@ -362,8 +362,11 @@ def approvers(db, requester_id, change: Optional[CredentialChange] = None, *, ta
 
 def _lock_account(db, target_id) -> None:
     """Take the account's row lock, so two administrators changing it at the same moment are counted
-    one after the other: the second waits for the first to commit, then finds its change."""
-    db.query(User.id).filter(User.id == target_id).with_for_update().first()
+    one after the other: the second waits for the first to commit, then finds its change. The caller holds the
+    account's turn at its sessions already (app/services/sign_in.py, "The order of the locks"). The lock leaves
+    the row's key free (FOR NO KEY UPDATE): a row that names the account, written by a sign-in in its turn, waits
+    for nothing here."""
+    db.query(User.id).filter(User.id == target_id).with_for_update(key_share=True).first()
 
 
 def decide(db, *, requester_id, target_id, now: Optional[datetime] = None) -> Optional[CredentialChange]:

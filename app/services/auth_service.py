@@ -602,7 +602,22 @@ class AuthService:
                               ip_address: str, channel: str = "web") -> Tuple[User, str]:
         """authenticate_user for an account, in the account's turn (take_turn), which the transaction's
         end lets go: a refusal commits the releases it made and raises, a wrong password commits its
-        count, a right one commits its session."""
+        count, a right one commits its session.
+
+        The account's turn at its sessions is taken next, and the account is read again in it. What ends the
+        account's sessions (a new password, a reset, a sign-out everywhere) takes that turn, so from here to
+        this sign-in's commit nothing of the account changes unseen: the password checked is the one that
+        stands now, also for an attempt that waited for its turn while the password was changed, and the
+        session is written before such a change, which then ends it, or not at all."""
+        try:
+            sign_in_lockout.take_sessions_turn(self.db, user.id, busy=True)
+        except sign_in_lockout.Busy as busy:
+            raise RateLimitExceededError(str(busy), retry_after=busy.retry_after)
+        refresh = getattr(self.db, "refresh", None)
+        if refresh is not None:
+            refresh(user)
+        # What a sign-in held for a further step is compared with later (app/services/sign_in.py).
+        self.sessions_ended_as_read = int(getattr(user, "sessions_ended", 0) or 0)
         # Automatic locks whose time has run out end here, recorded with this sign-in's address:
         # the account row's timed lock from before they moved (an administrator's, with no end,
         # stays), and the address's or the account-wide lock. The releases commit with whatever this
@@ -660,7 +675,7 @@ class AuthService:
         # operation, so ending another session there cut off a client's parallel connections, and a
         # web sign-in cut off the account's SFTP transfers in flight.
         if channel == self.WEB:
-            self._terminate_existing_sessions(user.id)
+            self._terminate_existing_sessions(user.id, commit=False)     # with this sign-in's session, in its turn
 
         # Create new session with an absolute server-side lifetime. Regular logins used to store
         # expires_at = NULL, which cleanup_expired_sessions never sweeps, so abandoned rows
@@ -1750,10 +1765,11 @@ class AuthService:
         session.is_active = False
         self.db.commit()
     
-    def _terminate_existing_sessions(self, user_id: uuid.UUID):
+    def _terminate_existing_sessions(self, user_id: uuid.UUID, commit: bool = True):
         """Mark the account's other web sessions inactive (never a temporary credential's, never an
         SFTP session): a web sign-in with a password keeps one web session at a time. A session written
-        by an earlier release (no channel) counts as a web one."""
+        by an earlier release (no channel) counts as a web one. ``commit=False`` leaves the commit to the
+        caller: a commit here would end the caller's turns before its own session is written."""
         existing_sessions = self.db.query(ActiveSession).filter(
             and_(
                 ActiveSession.user_id == user_id,
@@ -1764,7 +1780,10 @@ class AuthService:
         ).all()
         
         for session in existing_sessions:
-            self._terminate_session(session)
+            if commit:
+                self._terminate_session(session)
+            else:
+                session.is_active = False
     
     def _global_setting(self, key, default):
         """A positive-integer override from the admin SystemSetting('global') blob, or `default`

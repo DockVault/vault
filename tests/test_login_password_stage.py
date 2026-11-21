@@ -139,7 +139,7 @@ def stage(monkeypatch):
 def _stage_token(S, user, pending, methods=("hwk",), stage="password", **extra):
     from app.core.security import create_access_token
     claims = {"sub": str(user.id), "username": user.username, "stage": stage, "pre_auth": str(pending.id),
-              "methods_so_far": list(methods), **extra}
+              "methods_so_far": list(methods), "ended": 0, **extra}
     return create_access_token(claims, expires_delta=timedelta(minutes=5))
 
 

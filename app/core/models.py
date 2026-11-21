@@ -225,6 +225,13 @@ class User(Base):
     password_set_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     password_set_by_other_at = Column(DateTime, nullable=True)
 
+    # How many times the account's sessions were ended as a whole (a new password, a second-factor reset, a
+    # sign-out everywhere, a lock or a deactivation). A sign-in notes the count it read with the account, and is
+    # written, as a session or as a sign-in held for a further step, only while that count still stands
+    # (app/services/sign_in.py, in_the_accounts_turn). Added by the boot DDL with its default, so an earlier
+    # release writes its rows without naming it.
+    sessions_ended = Column(Integer, nullable=False, default=0, server_default=text('0'))
+
     # SFTP access controls (per account). sftp_enabled gates ALL direct SFTP login
     # for this user; sftp_password_auth allows password-based SFTP (key auth via
     # user_ssh_keys is allowed whenever sftp_enabled and a key matches). Both default

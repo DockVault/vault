@@ -43,7 +43,16 @@ def removes_last_admin(db, target) -> bool:
     count read the rows as they stand under the lock, not as this session first loaded them.
 
     Call it BEFORE changing anything on ``target``: the refresh reloads every administrator this
-    session holds, and would discard an edit not yet written."""
+    session holds, and would discard an edit not yet written.
+
+    The routes that ask go on to end ``target``'s sessions (a lock, a deactivation, a demotion), which takes the
+    account's turn at its sessions: that turn comes before any account's row (app/services/sign_in.py, "The order
+    of the locks"), so it is taken here first. The rows are locked with their keys left free, so a row that names
+    an administrator, written meanwhile, waits for nothing."""
+    target_id = getattr(target, "id", None)
+    if target_id is not None:
+        from app.core import sign_in_lockout
+        sign_in_lockout.take_sessions_turn(db, target_id)
     admins = (db.query(User).filter(User.role == RoleEnum.ADMIN).order_by(User.id)
-              .populate_existing().with_for_update().all())
+              .populate_existing().with_for_update(key_share=True).all())
     return is_last_able_admin(admins, getattr(target, "id", None))

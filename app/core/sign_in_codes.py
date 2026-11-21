@@ -105,6 +105,9 @@ class Handover:
     verifier_hash: Optional[str] = None
     code_challenge: Optional[str] = None
     created_at: int = field(default_factory=lambda: int(time.time()))
+    # How many times the account's sessions had been ended when the proof read the account
+    # (app/services/sign_in.py, in_the_accounts_turn). A record without it matches no account.
+    ended: Optional[int] = None
 
     @classmethod
     def from_payload(cls, data) -> Optional["Handover"]:
@@ -208,6 +211,7 @@ def from_result(result, *, verifier_hash: Optional[str] = None, code_challenge: 
         user_verified=bool(result.user_verified), passwordless_allowed=bool(result.passwordless_allowed),
         pending_id=str(result.pending.id) if result.pending is not None else None,
         purpose=purpose, verifier_hash=verifier_hash, code_challenge=code_challenge,
+        ended=result.sessions_ended,
     )
 
 
@@ -244,4 +248,7 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
         pending=pending, provider_id=handover.provider_id,
         provider_mfa_trusted=handover.provider_mfa_trusted, user_verified=handover.user_verified,
         passwordless_allowed=handover.passwordless_allowed,
+        # What the proof read, not what the account says now: the code lives a minute, and a change in that
+        # minute ends the sign-in it carries.
+        sessions_ended=handover.ended if isinstance(handover.ended, int) else -1,
     )

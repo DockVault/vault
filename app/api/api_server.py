@@ -6509,6 +6509,9 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
     requester_id = actor.id if actor is not None else None
     requester_name = actor.username if actor is not None else cc.HOST_OPERATOR
     now = cc.utcnow()
+    # The account's turn at its sessions before its row (cc.decide locks the row): a sign-in writes in that turn
+    # and then needs the row, so taken the other way round the two would wait for each other.
+    _sessions_turn(db, target.id)
     try:
         last = cc.decide(db, requester_id=requester_id, target_id=target.id, now=now)
     except cc.NotAnAdministrator as refused:
@@ -7521,7 +7524,9 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
     # A link someone else made is judged again as its maker and the account stand now, under a share lock
     # on both rows until the password is set: refused exactly like an unknown one, revoked, and recorded
     # (_reset_link_refusal). A promotion made after the link was made is seen here. Judged before the
-    # password is, so a refused link answers as an unknown one whatever password comes with it.
+    # password is, so a refused link answers as an unknown one whatever password comes with it. The account's turn
+    # at its sessions comes before the rows (the reset ends the sessions, in that turn).
+    _sessions_turn(db, user.id)
     reason = _reset_link_refusal(db, r, user, lock=True)
     if reason is not None:
         _refuse_reset_link(db, r, user, reason, ip=ip)
@@ -8461,7 +8466,7 @@ async def second_factor_login_verify(
     outcome = sign_in.finish(db, sign_in.SignInResult(
         user, sign_in.methods_so_far(pending) + [(body.method or "").lower()], client_ip,
         pending=pending, provider_id=sign_in.provider_of(pending),
-        provider_mfa_trusted=sign_in.provider_mfa_of(pending)))
+        provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending)))
     if isinstance(outcome, sign_in.PendingStep):
         return JSONResponse(status_code=200, content=outcome.body)
     access_token = outcome.access_token
@@ -8726,7 +8731,10 @@ async def login(
             result = sign_in.SignInResult(user, sign_in.methods_so_far(pending) + [sign_in.PASSWORD], client_ip,
                                           session_token=session_token, pending=pending,
                                           provider_id=sign_in.provider_of(pending),
-                                          provider_mfa_trusted=sign_in.provider_mfa_of(pending))
+                                          provider_mfa_trusted=sign_in.provider_mfa_of(pending),
+                                          # What the first proof read: the held sign-in's, or this check's.
+                                          sessions_ended=(sign_in.ended_of(pending) if pending is not None
+                                                          else getattr(auth_service, "sessions_ended_as_read", None)))
 
         # The pipeline decides whether a step follows (the second factor, its enrollment) and holds the
         # sign-in in a pending login with no session if so; otherwise it makes the session, the token
@@ -9258,13 +9266,26 @@ def _sessions_turn(db, user_id) -> None:
     On PostgreSQL the turn is a transaction-scoped advisory lock keyed on the account, as the turn at signing in
     is (app/core/sign_in_lockout.py take_turn), in a class of its own: two accounts whose ids hash alike share a
     queue, which costs a wait and nothing else, and the wait is bounded by the connection's lock_timeout.
-    Elsewhere (the tests' SQLite, a stand-in store) one writer works at a time already and nothing is taken."""
-    get_bind = getattr(db, "get_bind", None)
-    if get_bind is None or get_bind().dialect.name != "postgresql":
+    Elsewhere (the tests' SQLite, a stand-in store) one writer works at a time already and nothing is taken.
+
+    Where it stands among the other locks: app/services/sign_in.py, "The order of the locks"."""
+    from app.core import sign_in_lockout
+    sign_in_lockout.take_sessions_turn(db, user_id)
+
+
+def _count_the_end_of_the_accounts_sessions(db, user_id) -> None:
+    """One more on the account's count of the times its sessions were ended as a whole, in the caller's
+    transaction and under the account's turn at its sessions: the count read here is the committed one, and
+    nobody else is adding to it. A sign-in that read the account before this is written no session and no held
+    sign-in after it (app/services/sign_in.py, in_the_accounts_turn)."""
+    from app.core.table_presence import has_table
+    if not has_table(db, User.__tablename__):
+        return                                     # a database built with only the tables a test needs
+    counted = db.query(User.sessions_ended).filter(User.id == user_id).first()
+    if counted is None:
         return
-    from sqlalchemy import text
-    db.execute(text("SELECT pg_advisory_xact_lock(:cls, hashtext(:account))"),
-               {"cls": _SESSIONS_TURN_CLASS, "account": str(user_id)})
+    db.query(User).filter(User.id == user_id).update(
+        {User.sessions_ended: int(counted[0] or 0) + 1}, synchronize_session=False)
 
 
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
@@ -9298,6 +9319,8 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
 
     if user_id is not None:
         _sessions_turn(db, user_id)
+        if durable:
+            _count_the_end_of_the_accounts_sessions(db, user_id)
 
     # Release any chunked upload the credential had open. Those sessions are bound to the
     # principal that started them, so once the credential is gone nobody can finish them and
@@ -11178,7 +11201,7 @@ async def acknowledge_recovery_codes(
         outcome = sign_in.finish(db, sign_in.SignInResult(
             current_user, sign_in.methods_so_far(pending) + [sign_in.TOTP], client_ip,
             pending=pending, provider_id=sign_in.provider_of(pending),
-            provider_mfa_trusted=sign_in.provider_mfa_of(pending)))
+            provider_mfa_trusted=sign_in.provider_mfa_of(pending), sessions_ended=sign_in.ended_of(pending)))
         if isinstance(outcome, sign_in.PendingStep):
             # The table asks for one more step (the password, for an account made an administrator during
             # its sign-in): the enrollment stands, the sign-in is held again.
@@ -12111,6 +12134,12 @@ def _open_credential_request(db, change_id):
     decided (gone, already decided, or its seven days ran out)."""
     from app.core import credential_changes as cc
     from app.core.models import CredentialChange
+    # The order of the locks: the account's turn at its sessions, its row, then the request. Which account it
+    # is does not change, so it is read first without a lock.
+    named = db.query(CredentialChange.target_user_id).filter(CredentialChange.id == change_id).first()
+    if named is not None and named[0] is not None:
+        _sessions_turn(db, named[0])
+        cc._lock_account(db, named[0])
     change = (db.query(CredentialChange).filter(CredentialChange.id == change_id)
               .with_for_update().first())
     if change is None:
@@ -27211,6 +27240,9 @@ END $$;""",
             # The revision of the role defaults an account has been given, so a start grants each default
             # once instead of granting again one an administrator revoked. Nullable, for the same reason.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_defaults_revision INTEGER",
+            # How many times the account's sessions were ended as a whole: what a sign-in is compared with
+            # before its session is written (app/services/sign_in.py). An earlier release ignores it.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS sessions_ended INTEGER NOT NULL DEFAULT 0",
             # An administrator's invitation keeps its inviter's lineage from the moment it is made, for
             # the two-administrator rule (app/core/admin_grants.py). Nullable, for the same reason.
             "ALTER TABLE account_invitations ADD COLUMN IF NOT EXISTS inviter_lineage JSON",
