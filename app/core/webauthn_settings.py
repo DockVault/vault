@@ -305,15 +305,18 @@ RETIRE_PASSKEYS_FROM_BEFORE_A_RESET = (
 # (that release saw no factor on it). Every reset another administrator or the server's operator makes is also
 # kept, with its time, among the changes to the account's sign-in details, on every release since 0.33.0, for
 # the 14 days such a record is kept. A passkey made before the account's latest recorded reset is retired as of
-# it. A reset made by this release retires the account's passkeys itself, so here this finds nothing to do; a
-# request that was never applied has no time, and counts for nothing.
+# it. A reset made by this release retires the account's passkeys itself, so here this finds nothing to do. Only a
+# change that was applied counts (made at once, or approved): a request that was never applied has no time today,
+# and is left out by what it is as well, whatever a later release may write on such a row.
 RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET = (
     "UPDATE webauthn_credentials SET retired_at = "
     "(SELECT max(c.applied_at) FROM credential_changes c "
-    "WHERE c.target_user_id = webauthn_credentials.user_id AND c.kind = 'second_factor') "
+    "WHERE c.target_user_id = webauthn_credentials.user_id AND c.kind = 'second_factor' "
+    "AND c.status IN ('made', 'approved')) "
     "WHERE retired_at IS NULL AND created_at < "
     "(SELECT max(c.applied_at) FROM credential_changes c "
-    "WHERE c.target_user_id = webauthn_credentials.user_id AND c.kind = 'second_factor')"
+    "WHERE c.target_user_id = webauthn_credentials.user_id AND c.kind = 'second_factor' "
+    "AND c.status IN ('made', 'approved'))"
 )
 
 

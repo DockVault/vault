@@ -77,6 +77,8 @@ def test_passkeys_from_before_a_reset_the_account_has_not_answered_are_retired_a
     before, after, others = _passkey(db, lost), _passkey(db, lost), _passkey(db, fine)
     already = _passkey(db, lost, retired=True)
     before.created_at, after.created_at, others.created_at, already.created_at = earlier, later, earlier, earlier
+    at_once = _passkey(db, lost)                         # made at the very moment of the reset: not from before it
+    at_once.created_at = reset_at
     db.commit()
     for _ in range(2):                                   # run at every start: a second run changes nothing
         db.execute(sa.text(wss.RETIRE_PASSKEYS_FROM_BEFORE_A_RESET))
@@ -85,7 +87,9 @@ def test_passkeys_from_before_a_reset_the_account_has_not_answered_are_retired_a
             db.refresh(row)
         assert before.retired_at == reset_at
         assert after.retired_at is None and others.retired_at is None and already.retired_at == datetime(2026, 11, 1)
-    assert S._passkey_counts(db, [lost.id, fine.id]) == {lost.id: 1, fine.id: 1}
+        db.refresh(at_once)
+        assert at_once.retired_at is None
+    assert S._passkey_counts(db, [lost.id, fine.id]) == {lost.id: 2, fine.id: 1}
     # It is among the statements the server runs at start, after the table has its columns.
     source = inspect.getsource(S)
     assert source.count("_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,") == 1
@@ -118,12 +122,15 @@ def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_n
     earlier, reset_at, later = datetime(2026, 11, 1), datetime(2026, 11, 10), datetime(2026, 11, 12)
     answered, passkey_only = _user(db, "answered"), _user(db, "passkey-only")
     asked_only, other_change, untouched = _user(db, "asked-only"), _user(db, "new-password"), _user(db, "untouched")
-    for user in (answered, passkey_only):
+    for user, how in ((answered, "made"), (passkey_only, "approved")):     # made at once; held, then approved
         assert user.second_factor_reset_at is None                # nothing on the account says a reset happened
-        _change(db, user, "second_factor", reset_at)
+        _change(db, user, "second_factor", reset_at, status=how)
     _change(db, answered, "second_factor", datetime(2026, 11, 4))    # an older one: the latest is what counts
     _change(db, answered, "password", datetime(2026, 11, 15))        # a later change of another kind: not a reset
     _change(db, asked_only, "second_factor", None, status="denied")  # asked for, never applied: no time
+    # A row that says it was not applied counts for nothing whatever time it carries (none carries one today).
+    _change(db, asked_only, "second_factor", datetime(2026, 11, 20), status="denied")
+    _change(db, answered, "second_factor", datetime(2026, 11, 20), status="expired")
     _change(db, other_change, "password", reset_at)                  # not a reset of the factor
     planted, since = _passkey(db, answered), _passkey(db, answered)
     only = _passkey(db, passkey_only)
@@ -132,6 +139,10 @@ def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_n
     for row in (planted, only, already, *kept):
         row.created_at = earlier
     since.created_at = later
+    # A key made at the very moment of the reset is not one from before it (the reset's own time is taken first,
+    # and whatever is made in that moment is the account's answer or made beside it: left).
+    at_once = _passkey(db, passkey_only)
+    at_once.created_at = reset_at
     db.commit()
     for _ in range(2):                                   # run at every start: a second run changes nothing
         db.execute(sa.text(wss.RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET))
@@ -141,6 +152,8 @@ def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_n
         assert planted.retired_at == reset_at and only.retired_at == reset_at
         assert since.retired_at is None and [row.retired_at for row in kept] == [None, None, None]
         assert already.retired_at == datetime(2026, 11, 1)
+        db.refresh(at_once)
+        assert at_once.retired_at is None
     # The statement that reads the account's mark finds nothing here: only the record says these were reset.
     planted.retired_at = None
     db.commit()
