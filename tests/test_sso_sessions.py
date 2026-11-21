@@ -957,7 +957,9 @@ def test_a_providers_row_held_too_long_refuses_the_sign_in_as_busy_and_writes_no
         sign_in.hold_the_providers_row(raising(Held()), result)
     assert busy.value.status_code == 503 and "busy" in busy.value.detail and rolled == [1]
     # A time to come back, and the session the password door made for this sign-in is deleted with it.
-    assert busy.value.headers == {"Retry-After": "5"} and dropped == ["the-doors"] and result.session_token is None
+    from app.core import sign_in_lockout
+    assert busy.value.headers == {"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}
+    assert dropped == ["the-doors"] and result.session_token is None
     result.session_token = None
     with pytest.raises(OperationalError):
         sign_in.hold_the_providers_row(raising(Other()), result)

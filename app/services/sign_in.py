@@ -700,9 +700,10 @@ def hold_the_providers_row(db, result: "SignInResult") -> None:
             raise
         db.rollback()
         drop_the_session_the_proof_made(db, result)
+        from app.core import sign_in_lockout
         raise HTTPException(status_code=503, detail=(
             "Signing in through your organisation is busy right now. Try again in a moment."),
-            headers={"Retry-After": "5"}) from None
+            headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}) from None
 
 
 def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
