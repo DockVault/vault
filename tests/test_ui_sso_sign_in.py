@@ -449,6 +449,140 @@ def test_an_administrator_back_from_the_provider_is_asked_for_the_password_in_wo
     expect(page.locator("#login-stage-note")).not_to_contain_text("signed in through your organisation")
 
 
+def _held_for_a_set_up(methods, **more):
+    """The server's answer to a provider's sign-in that is held for the set-up of a second factor."""
+    return (200, {"access_token": None, "second_factor_required": True, "stage": "second_factor",
+                  "enrollment_required": True, "methods": [], "enrollment_methods": methods,
+                  "pre_auth_token": "held-for-set-up", **more})
+
+
+class Wizard:
+    """The authenticator's three requests, stood in for; what the page sent is kept."""
+
+    def __init__(self, page: Page, session=None, refuse=None):
+        self.enrolls, self.confirms, self.acknowledged = [], [], []
+
+        def enroll(route):
+            self.enrolls.append((route.request.headers.get("authorization"), route.request.post_data_json))
+            if refuse is not None:
+                route.fulfill(status=refuse[0], json={"detail": refuse[1]})
+            else:
+                route.fulfill(status=200, json={"secret": "JBSWY3DPEHPK3PXP", "otpauth_uri": "otpauth://totp/x",
+                                                 "qr_svg": ""})
+        page.route("**/users/me/second-factor/totp/enroll", enroll)
+
+        def confirm(route):
+            self.confirms.append((route.request.headers.get("authorization"), route.request.post_data_json))
+            route.fulfill(status=200, json={"recovery_codes": ["aaaa-bbbb-cccc-dddd-eeee"] * 10})
+        page.route("**/users/me/second-factor/totp/confirm", confirm)
+
+        def acknowledge(route):
+            self.acknowledged.append(route.request.headers.get("authorization"))
+            route.fulfill(status=200, json={"enrolled": True, "method": "totp", "token_type": "bearer",
+                                             "access_token": (session or {}).get("access_token")})
+        page.route("**/users/me/second-factor/recovery/acknowledge", acknowledge)
+
+
+def test_a_second_factor_is_set_up_after_a_provider_with_no_password_asked_and_ends_in_the_app(page: Page, base_url,
+                                                                                              fresh_user):
+    """A provider's sign-in held for the set-up of a second factor. The page came back from the provider: the
+    password field is empty, and stays so. The authenticator is started with the held sign-in's own token and no
+    password (the server takes that sign-in as the proof for an account that has no password to type), the code
+    and the recovery codes follow, and the last answer is the session."""
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    stand = Stand(page, base_url)
+    stand.finish_answer = _held_for_a_set_up(["totp"])
+    wizard = Wizard(page, session=ApiClient(base_url).login(fresh_user["_username"], fresh_user["_password"]))
+    _sign_in_screen(page)
+    page.locator("#sso-sign-in .sso-sign-in-btn").first.click()
+    box = page.locator("#login-second-factor")
+    expect(box).to_contain_text("Scan this QR code", timeout=20000)
+    assert wizard.enrolls == [("Bearer held-for-set-up", {"current_password": ""})]
+    expect(page.locator("#sf-enroll-secret")).to_have_text("JBSWY3DPEHPK3PXP")
+    page.fill("#sf-enroll-code", "123456")
+    page.keyboard.press("Enter")
+    expect(box).to_contain_text("Save your recovery codes", timeout=10000)
+    assert wizard.confirms == [("Bearer held-for-set-up", {"code": "123456"})]
+    page.check("#sf-ack-cb")
+    box.get_by_role("button", name="Finish and sign in").click()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=20000)
+    assert wizard.acknowledged == ["Bearer held-for-set-up"]
+    assert errors == [], errors
+
+
+def test_a_passkey_offered_beside_the_authenticator_is_said_to_be_a_choice(page: Page, base_url):
+    """Where the server offers a passkey as one way to set the second factor up (no role must hold one), the page
+    says a second factor is required and that a passkey is one, with the authenticator one click away. Where the
+    role must hold a passkey, it says that."""
+    stand = Stand(page, base_url)
+    wizard = Wizard(page)
+    stand.finish_answer = _held_for_a_set_up(["totp", "passkey"], passkey_required=False)
+    _sign_in_screen(page)
+    page.locator("#sso-sign-in .sso-sign-in-btn").first.click()
+    box = page.locator("#login-second-factor")
+    expect(box).to_contain_text("Set up a second factor to finish signing in", timeout=20000)
+    expect(box).to_contain_text("Your administrator requires a second factor for your account. A passkey is one")
+    expect(box).not_to_contain_text("requires a passkey")
+    expect(page.locator("#sf-passkey-enroll")).to_be_visible()
+    assert wizard.enrolls == []                                   # nothing is started until the person chooses
+    page.click("#sf-enroll-authenticator")
+    expect(box).to_contain_text("Scan this QR code", timeout=10000)
+    assert wizard.enrolls == [("Bearer held-for-set-up", {"current_password": ""})]
+    # The role's own passkey, as before: said as a requirement.
+    stand.finish_answer = _held_for_a_set_up(["totp", "passkey"], passkey_required=True)
+    _sign_in_screen(page)
+    page.locator("#sso-sign-in .sso-sign-in-btn").first.click()
+    expect(box).to_contain_text("Add a passkey to finish signing in", timeout=20000)
+    expect(box).to_contain_text("Your administrator requires a passkey for your account")
+
+
+def test_an_enrollment_that_cannot_start_says_why_and_leads_back_to_the_sign_in_form(page: Page, base_url):
+    """The start of the authenticator is refused (here: the server's own words). The page shows them, and its way
+    back works: the sign-in form is there again, and the held sign-in is given up at the server."""
+    errors, cancelled = [], []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    stand = Stand(page, base_url)
+    stand.finish_answer = _held_for_a_set_up(["totp"])
+    Wizard(page, refuse=(400, "Your current password is required and must be correct."))
+    page.route("**/auth/second-factor/cancel", lambda route: (cancelled.append(route.request.headers.get("authorization")),
+                                                              route.fulfill(status=200, json={}))[-1])
+    _sign_in_screen(page)
+    page.locator("#sso-sign-in .sso-sign-in-btn").first.click()
+    box = page.locator("#login-second-factor")
+    expect(box).to_contain_text("Your current password is required and must be correct.", timeout=20000)
+    box.get_by_role("button", name="Back to sign in").click()
+    expect(page.locator("#login-form")).to_be_visible(timeout=10000)
+    expect(box).to_be_hidden()
+    assert cancelled == ["Bearer held-for-set-up"] and errors == [], (cancelled, errors)
+
+
+def test_your_account_asks_an_account_without_a_password_for_none(page: Page, base_url, fresh_user):
+    """Under Your account the authenticator's set-up asks for the account's password. An account that has none
+    anybody can type is told where its authenticator is set up instead, and is shown no form it cannot fill."""
+    state = {"enrolled": False, "method": None, "status": "not_setup", "awaiting_acknowledge": False,
+             "recovery_codes_remaining": 0, "password_to_type": False}
+    page.route("**/users/me/second-factor", lambda route: route.fulfill(status=200, json=state)
+               if route.request.method == "GET" else route.continue_())
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    page.click("#profile-btn")
+    page.click("#settings-btn")
+    expect(page.locator("#user-settings-modal")).to_be_visible(timeout=10000)
+    told = page.locator("#us-2fa-no-password")
+    expect(told).to_contain_text("Your account has no password of its own", timeout=10000)
+    expect(page.locator("#us-2fa-body").get_by_role("button", name="Set up two-factor")).to_have_count(0)
+    # The account that has one is offered the set-up as before.
+    state["password_to_type"] = True
+    page.evaluate("() => renderAccount2FA()")
+    expect(page.locator("#us-2fa-body").get_by_role("button", name="Set up two-factor")).to_be_visible(timeout=10000)
+    expect(told).to_have_count(0)
+    # An answer that does not say (a server from before this) is no reason to withhold the set-up.
+    del state["password_to_type"]
+    page.evaluate("() => renderAccount2FA()")
+    expect(page.locator("#us-2fa-body").get_by_role("button", name="Set up two-factor")).to_be_visible(timeout=10000)
+    expect(told).to_have_count(0)
+
+
 def test_the_password_form_waits_behind_a_link_when_every_provider_holds_its_people_to_no_password(page: Page, base_url,
                                                                                                 fresh_user):
     """The administrator's providers all sign their people in without a vault password, and the sign-in page says
