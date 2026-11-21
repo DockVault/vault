@@ -82,6 +82,17 @@ class World:
         assert isinstance(outcome, sign_in.PendingStep), outcome
         return outcome.body, {"Authorization": f"Bearer {outcome.body['pre_auth_token']}"}
 
+    def held_with(self, user, methods):
+        """A sign-in held for an enrollment that came through the provider as the account's identity, with
+        ``methods`` proved so far, however such a token came to be."""
+        from app.core.security import create_access_token
+        pending, _headers = self.h.pending_for(user, methods=methods)
+        pending.enrollment_required = True
+        claims = {"sub": str(user.id), "username": user.username, "pre_auth": str(pending.id),
+                  "stage": "second_factor", "methods_so_far": list(methods), "idp": str(self.provider.id),
+                  "idp_sub": self.identity(user).subject}
+        return pending, {"Authorization": f"Bearer {create_access_token(claims)}"}
+
     def set_an_authenticator_up(self, headers, password=""):
         """The wizard's three requests; the last one's answer."""
         from app.core import second_factor as sf
@@ -143,6 +154,15 @@ def test_the_held_sign_in_is_that_proof_only_for_an_account_without_a_password_a
     pending.enrollment_required = True
     assert _call_h(w.S, "POST", ENROLL, {"current_password": ""}, headers)[0] == 400
     assert all(p.consumed_at is None for p in w.db.rows_of(PendingLogin))
+    # An account that holds a factor gives that factor before another is set up on a held sign-in, as at the
+    # passkey's enrollment: the provider's sign-in alone starts no authenticator beside a passkey it holds.
+    w.h.enroll(dana)
+    _pending, headers = w.held_with(dana, ())
+    status, body = _call_h(w.S, "POST", ENROLL, {"current_password": ""}, headers)
+    assert status == 401 and body["detail"] == "Confirm your second factor first; start the sign-in again.", body
+    from app.core.models import WebAuthnCredential
+    w.db.rows_of(WebAuthnCredential).clear()                    # without that passkey the same sign-in starts it
+    assert _call_h(w.S, "POST", ENROLL, {"current_password": ""}, headers)[0] == 200
     # Under Your account (a session, no held sign-in): told, not asked; and the page knows beforehand.
     session = {"Authorization": "Bearer session"}
     signed_in = {}

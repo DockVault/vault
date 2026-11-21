@@ -605,7 +605,7 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
         why = api._why_a_factor_is_set_up_again(db, user)
         if why:
             body["set_up_again"] = why
-    if enrollment_required and passkey_required is not None and "passkey" in body["enrollment_methods"]:
+    if passkey_required is not None:
         body["passkey_required"] = bool(passkey_required)
     return PendingStep(stage=stage, body=body)
 
@@ -629,7 +629,7 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
 
     Two kinds of account. One that signs in only through its provider (``users.sso_only``): whatever the proof.
     And one whose password nobody knows (made at a first provider sign-in, say: app/core/password_origin.py), when
-    a passkey is the proof and no password is among the proofs. Such an account can type no password, so nothing
+    a passkey is the proof (no password can be among its proofs). Such an account can type no password, so nothing
     but its provider's sign-in stood behind the key when it was set up (Your account asks it for a fresh sign-in
     there, and so does the enrollment at a sign-in). A key set up on the provider's word alone does not outlive
     that word: by itself it would sign in after the provider refused the person, after the time without a sign-in
@@ -643,7 +643,7 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
     methods = set(result.methods)
     passkey = bool(methods & PASSKEYS)
     provider_only = bool(getattr(user, "sso_only", False))
-    key_alone = passkey and PASSWORD not in methods and password_origin.nobody_knows(user)
+    key_alone = passkey and password_origin.nobody_knows(user)
     if not (provider_only or key_alone):
         return
     from app.api import api_server as api
@@ -758,10 +758,10 @@ def finish(db, result: SignInResult):
                     own_factor_first = True
                 else:
                     enrollment_pending = True
-        elif enrollment_pending and a_passkey_meets_the_enrollment(result):
-            # No role asks for a passkey, a second factor is to be set up, and the provider's sign-in is all this
-            # account can give: a passkey is offered beside the authenticator (it serves after the provider's
-            # sign-in, as the authenticator's code does: refuse_without_the_provider).
+        elif a_passkey_meets_the_enrollment(user):
+            # No role asks for a passkey. Where a second factor is to be set up (the list is read only then), this
+            # account has nothing but its provider's sign-in to give: a passkey is offered beside the authenticator
+            # (it serves after the provider's sign-in, as the authenticator's code does: refuse_without_the_provider).
             enrollment_methods.append("passkey")
             passkey_required = False
         # An account with no factor sets its first one up on the proof Your account asks for the same act. Where the
@@ -840,13 +840,13 @@ def provider_proves_an_enrollment(user, pending) -> bool:
     return pending is not None and bool(provider_of(pending)) and not has_a_password_it_can_type(user)
 
 
-def a_passkey_meets_the_enrollment(result: SignInResult) -> bool:
+def a_passkey_meets_the_enrollment(user) -> bool:
     """Whether a sign-in held for the enrollment of a second factor is offered a passkey beside the authenticator
-    where no role must hold one: it came through a provider, the account has no password it can type, and a
-    passkey can be made at the vault's address now. An account with a password is offered what the policy's
+    where no role must hold one: the account has no password it can type (its sign-ins come through its provider),
+    and a passkey can be made at the vault's address now. An account with a password is offered what the policy's
     enrollment has always offered it, and adds a passkey under Your account."""
     from app.core import webauthn_settings
-    return (bool(result.provider_id) and not has_a_password_it_can_type(result.user)
+    return (not has_a_password_it_can_type(user)
             and webauthn_settings.enabled() and webauthn_settings.passkeys_can_be_made())
 
 
