@@ -271,12 +271,15 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         f"in through {label} until an administrator has tested it again and turned it on. If the sign-in you meet "
         "there next does not look like the one you know, stop and tell an administrator."))
     # A change another person made to how an account signs in is told to its owner.
+    # Said as it is for the account that reads it: a provider that is off signs nobody in.
+    is_on = row.state == providers.ENABLED
+    while_off = f" {label} is turned off at the moment: ask an administrator."
     _tell_accounts(made, "Your password no longer works on this vault", (
         f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
-        "its password and its SFTP password sign-in no longer work."))
+        "its password and its SFTP password sign-in no longer work." + ("" if is_on else while_off)))
     _tell_accounts(restored, "You can set a password again", (
-        f"An administrator allowed password sign-in again for accounts linked to {label}. {SET_A_PASSWORD} You can "
-        f"still sign in through {label}."))
+        f"An administrator allowed password sign-in again for accounts linked to {label}. {SET_A_PASSWORD}"
+        + (f" You can still sign in through {label}." if is_on else while_off)))
     if outcome["changed"]:
         _audit(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
                details={"provider_id": str(row.id), "name": row.name, "changed": outcome["changed"],
@@ -305,8 +308,9 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     """Turn a provider on or off. On: only with an address the provider can send a browser back to, the connection
     filled in, and a test sign-in passed with it as it is now. Off: never refused (an incident may need it at
     once); the sessions that came through it are ended, and an account whose sign-in there had already lapsed stays
-    held, so that turning it off hands nobody their keys back. The answer says how many accounts sign in only
-    through a provider and are linked to this one, since they cannot sign in while it is off."""
+    held, so that turning it off hands nobody their keys back. The answer says for how many linked accounts this
+    provider is the only way in (no password they can type, no other provider that lets them in), since nothing
+    signs them in while it is off; the administrators' notice of the change says so too."""
     api = _api()
     _refuse_locked()
     if body.state not in (providers.ENABLED, providers.DISABLED):
@@ -338,6 +342,10 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     said = f"{current_user.username} turned the single sign-on provider {row.name} {turned}."
     if off and ended:
         said += f" {ended} session(s) that came through it were ended."
+    shown = providers.public(db, row)
+    if off and shown["only_way_in_accounts"]:
+        said += (f" {shown['only_way_in_accounts']} account(s) linked to it have no other way to sign in: nothing "
+                 "signs them in while it is off.")
     if off and held:
         said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each under Identities when it "
                  "should have its keys back.")

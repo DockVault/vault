@@ -448,9 +448,10 @@
     // ---------------------------------------------------------------- the dialog
 
     async function setState(state) {
-        if (state === 'disabled' && open.sso_only_accounts) {
-            const ok = await showConfirm(`${open.sso_only_accounts} account(s) sign in only through a provider and are linked `
-                + 'to this one: they cannot sign in while it is off.', 'Turn the provider off', null, 'Turn off');
+        if (state === 'disabled' && open.only_way_in_accounts) {
+            const ok = await showConfirm(`${open.only_way_in_accounts} account(s) linked to this provider have no other way `
+                + 'to sign in (no password of their own, and no other provider that is on): nothing signs them in while '
+                + 'it is off.', 'Turn the provider off', null, 'Turn off');
             if (!ok) return;
         }
         const asked = open.id;

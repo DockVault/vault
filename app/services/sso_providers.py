@@ -280,18 +280,29 @@ def addresses(row) -> Optional[dict]:
 
 
 def _counts(db, row) -> dict:
-    """How many accounts are linked to ``row``, how many of them sign in only through a provider, and how many
-    identities a refusal still holds. A refusal the person has answered since, by a sign-in the provider admitted,
-    is not one of them: it holds nobody, and nothing could clear it."""
+    """How many accounts are linked to ``row``, how many of them sign in only through a provider, for how many
+    this provider is the only way in, and how many identities a refusal still holds. A refusal the person has
+    answered since, by a sign-in the provider admitted, is not one of them: it holds nobody, and nothing could
+    clear it.
+
+    The only way in: the account has no password it can type (it signs in only through a provider, or its
+    password is one nobody knows, as for an account made at its first sign-in here) and no other identity that
+    lets it in (app/core/sso_only.py another_way_in). Its passkey signs in after a provider only. While this
+    provider is off, nothing signs such an account in."""
+    from app.core import sso_only
     from app.core.models import ExternalIdentity, User
-    from app.services import sso_freshness
+    from app.services import sign_in, sso_freshness
     identities = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all()
-    only = 0
+    only, only_way_in = 0, 0
     for identity in identities:
         user = db.query(User).filter(User.id == identity.user_id).first()
-        if user is not None and getattr(user, "sso_only", False):
+        if user is None:
+            continue
+        if getattr(user, "sso_only", False):
             only += 1
-    return {"identities": len(identities), "sso_only_accounts": only,
+        if not sign_in.has_a_password_it_can_type(user) and not sso_only.another_way_in(db, user, without=identity):
+            only_way_in += 1
+    return {"identities": len(identities), "sso_only_accounts": only, "only_way_in_accounts": only_way_in,
             "refusals": sum(1 for i in identities if sso_freshness.refusal_in_force(i))}
 
 

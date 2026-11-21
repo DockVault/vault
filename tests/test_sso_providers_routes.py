@@ -679,3 +679,104 @@ def test_the_client_secret_is_in_no_text_made_of_the_provider():
     provider = oc.ProviderConfig(id="p", issuer="https://login.example.org", client_id="client-1", client_secret="s3cret-value")
     assert "s3cret-value" not in repr(provider) and "s3cret-value" not in str(provider) and "s3cret-value" not in f"{provider}"
     assert provider.client_secret == "s3cret-value" and "client-1" in repr(provider)
+
+
+def _linked_every_way(monkeypatch):
+    """A provider that is on, with six accounts linked: one with a password of its own, and five with none they
+    can type, of which one is signed in by another provider that is on."""
+    from datetime import datetime
+    from app.core import password_origin
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    other = _provider(name="other", label="Other", created_at=None, updated_at=None)
+    off = _provider(name="off", label="Off", state="disabled", created_at=None, updated_at=None)
+    own = _user("own")                                             # a password of her own
+    held = _user("held", sso_only=True)                            # signs in only through a provider
+    made = _user("made", password_hash="argon2:of-random-bytes")   # made at its first sign-in here
+    password_origin.mark_nobody_knows(made)
+    two = _user("two", sso_only=True)                              # another provider that is on signs it in
+    two_off = _user("twooff", sso_only=True)                       # its other provider is off
+    refused = _user("refused", sso_only=True)                      # its other provider has refused it
+    users = [own, held, made, two, two_off, refused]
+    identities = [_identity(u, row, subject="s-" + u.username) for u in users]
+    identities += [_identity(two, other, subject="o-two"), _identity(two_off, off, subject="x-two"),
+                   _identity(refused, other, subject="o-refused", refused_at=datetime.utcnow())]
+    return Admin(monkeypatch, [row, other, off], users=users, identities=identities), row
+
+
+def test_turning_a_provider_off_says_for_how_many_accounts_it_is_the_only_way_in(monkeypatch):
+    """Counted for what it is: an account with no password it can type (held to its provider, or made at its first
+    sign-in with a password nobody knows) and no other identity that lets it in. Not an account with a password of
+    its own, nor one that another provider signs in. The answer carries the count, and the administrators' notice
+    of the turn-off says it."""
+    from app.core import sso_only
+    from app.services import sign_in, sso_providers
+    h, row = _linked_every_way(monkeypatch)
+    shown = sso_providers.public(h.db, row)
+    assert (shown["identities"], shown["sso_only_accounts"], shown["only_way_in_accounts"]) == (6, 4, 4), shown
+    # The count is the rule the unlink goes by, account by account.
+    from app.core.models import ExternalIdentity, User
+    by_rule = 0
+    for identity in [i for i in h.db.rows_of(ExternalIdentity) if i.provider_id == row.id]:
+        user = next(u for u in h.db.rows_of(User) if u.id == identity.user_id)
+        by_rule += (not sign_in.has_a_password_it_can_type(user)
+                    and not sso_only.another_way_in(h.db, user, without=identity))
+    assert by_rule == 4
+    _watch_turn_off(monkeypatch, h, ended=0, held=0)
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "disabled"})
+    assert status == 200 and out["provider"]["only_way_in_accounts"] == 4, out
+    assert h.told[-1][2].endswith("4 account(s) linked to it have no other way to sign in: nothing signs them in "
+                                  "while it is off."), h.told[-1]
+    # Turned on again: nothing of the kind is said.
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "enabled"})
+    assert status == 200 and "no other way to sign in" not in h.told[-1][2]
+
+
+def test_a_turn_off_that_strands_nobody_says_nothing_of_it(monkeypatch):
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    own = _user("own")
+    h = Admin(monkeypatch, [row], users=[own], identities=[_identity(own, row)])
+    _watch_turn_off(monkeypatch, h, ended=0, held=0)
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "disabled"})
+    assert status == 200 and out["provider"]["only_way_in_accounts"] == 0
+    assert "no other way to sign in" not in h.told[-1][2]
+
+
+def test_the_page_asks_before_a_turn_off_that_leaves_accounts_no_way_in():
+    """The administrator's page confirms a turn-off by the count of accounts it leaves no way in, not by the
+    count of accounts held to a provider (one of those may have another provider; an account made at its first
+    sign-in is held to none and still has no other way in)."""
+    from pathlib import Path
+    page = (Path(__file__).resolve().parents[1] / "static" / "js" / "settings-sso.js").read_text(encoding="utf-8")
+    assert "if (state === 'disabled' && open.only_way_in_accounts) {" in page
+    assert "open.sso_only_accounts" not in page
+    assert "have no other way " in page and "nothing signs them in while " in page
+
+
+@pytest.mark.parametrize("state", ["enabled", "disabled"])
+def test_an_account_is_told_of_the_password_rule_as_its_provider_stands(monkeypatch, state):
+    """Password sign-in turned off, then allowed again, for a provider: each linked account is told. Where the
+    provider is turned off at that moment, nothing signs in through it, and the account is not told that it does."""
+    row = _provider(state=state, created_at=None, updated_at=None)
+    alice = _user("alice")
+    h = Admin(monkeypatch, [row], users=[alice], identities=[_identity(alice, row)])
+    from app.core import security
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    label = row.label or row.name
+    while_off = f" {label} is turned off at the moment: ask an administrator."
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_password_login": "disabled"}})
+    assert status == 200 and out["made_sso_only"] == ["alice"], out
+    told = h.accounts_told[-1][2]
+    assert told.startswith(f"An administrator turned password sign-in off for {label}. Your account now signs in "
+                           f"only through {label}: its password and its SFTP password sign-in no longer work.")
+    assert told.endswith(while_off) is (state == "disabled") and (while_off in told) is (state == "disabled")
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_password_login": "allowed"}})
+    assert status == 200 and out["restored"] == ["alice"], out
+    told = h.accounts_told[-1][2]
+    assert (f"You can still sign in through {label}." in told) is (state == "enabled")
+    assert told.endswith(while_off) is (state == "disabled")
+
+
+def test_the_account_page_does_not_point_here_for_a_factor_it_cannot_set_up_here():
+    from pathlib import Path
+    page = (Path(__file__).resolve().parents[1] / "static" / "js" / "sso.js").read_text(encoding="utf-8")
+    assert "set one up '" in page and "(email.factor_here === false ? '' : 'here ') + 'first if you have none.'" in page
