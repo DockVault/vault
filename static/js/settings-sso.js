@@ -421,8 +421,11 @@
             'Give the provider the back-channel logout address on the Connection page.');
         const out = tick('sso-idp-logout', 'Signing out here also signs the person out at the provider', policy.sso_idp_logout,
             'When a person signs out here, the browser goes to the provider to end its session too, then comes back to '
-            + 'the sign-in page. A session that runs out on its own ends here only. Give the provider the sign-out '
-            + 'return address on the Connection page first.');
+            + 'the sign-in page. A session that runs out on its own ends here only. The address the browser goes to '
+            + 'carries the person\'s sign-in token, as the provider\'s standard asks: it signs nobody in, but it names '
+            + 'the person and their email address, and it stays in that browser\'s history. On a computer several '
+            + 'people share, the history is cleared as well. Give the provider the sign-out return address on the '
+            + 'Connection page first.');
         const fresh = input('sso-freshness', policy.sso_freshness_days, 'number');
         fresh.min = 0; fresh.max = 365;
         const ends = tick('sso-refusal', 'When the provider refuses a known person, their access here ends', policy.sso_refusal_ends_access,
