@@ -1206,8 +1206,11 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
     A session made without the password (the token's ``amr`` names none): an administrator always types the
     password, so the session of an account promoted since is not renewed; and a passkey alone is the whole sign-in
     only for a person the policy lets in without the password, so a session a passkey made on its own is not renewed
-    once the role left the passwordless roles or the account was given the auditor right. A token from before the
-    proofs were written on it names none and was made with the password: it is read as one.
+    once the role left the passwordless roles or the account was given the auditor right. Nor is it for an
+    account whose password nobody knows: its passkey signs in after its provider only
+    (:func:`refuse_without_the_provider`), and a session the key made alone, before the account came to hold such
+    a password, is not kept going past that. A token from before the proofs were written on it names none and
+    was made with the password: it is read as one.
 
     A role that must hold a passkey, past its grace, with none on the account: the next sign-in stops at the
     enrollment, so the renewal is refused, whatever the old token shows (a passkey it was made with is gone).
@@ -1227,6 +1230,11 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
         if (methods & PASSKEYS) and not old.get("idp") and not api._passkey_passwordless_allowed(db, user):
             raise HTTPException(status_code=403, detail=(
                 "A passkey alone no longer signs you in. Sign in again with your password."))
+        if (methods & PASSKEYS) and not old.get("idp"):
+            from app.core import password_origin
+            if password_origin.nobody_knows(user):
+                from app.core import sso_only
+                raise HTTPException(status_code=403, detail=sso_only.passkey_after_the_provider_message(db, user))
     if api._passkey_requirement(db, user).overdue:
         raise HTTPException(status_code=403, detail=(
             "Your role must hold a passkey now. Sign in again: you will be asked to add one."))

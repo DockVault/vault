@@ -581,6 +581,62 @@ def test_an_account_that_is_provider_only_now_keeps_no_session_made_another_way(
     assert sign_in.renew(db, user, old, client_ip="127.0.0.1").access_token
 
 
+def test_a_session_a_passkey_made_alone_is_not_kept_going_once_nobody_knows_the_accounts_password(db, monkeypatch):
+    """A passkey of an account whose password nobody knows signs in after its provider only. A session the key made
+    by itself (while the account still had a password of its own; the account then came to sign in only through
+    its provider, and was later given password sign-in back with a password nobody knows) is not kept going by
+    "Stay signed in" either: signing in now would not end where that sign-in did. The refusal says where to sign
+    in. A password of the account's own ends the mark, and the session is renewed like anybody's."""
+    from app.core import password_origin
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db_, user_: True)
+    p = _provider(db)
+    user, identity, old = _through(db, p)
+    alone = {**{k: v for k, v in old.items() if k != "idp"}, "amr": ["swk"], "mfa_at": old["auth_time"]}
+    password_origin.mark_nobody_knows(user)
+    db.commit()
+    assert password_origin.nobody_knows(user) is True and not user.sso_only
+    said = _refused(db, user, alone)
+    assert said == sso_only.passkey_after_the_provider_message(db, user)
+    assert "through Contoso" in said and "after that sign-in" in said
+    # The same key after the provider is the account's second factor: that session is the provider's, and kept.
+    assert sign_in.renew(db, user, {**old, "amr": ["swk"]}, client_ip="127.0.0.1").access_token
+
+
+def test_a_passkeys_own_session_is_renewed_for_an_account_with_a_password_of_its_own(db, monkeypatch):
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db_, user_: True)
+    p = _provider(db)
+    user, identity, old = _through(db, p)
+    alone = {**{k: v for k, v in old.items() if k != "idp"}, "amr": ["swk"], "mfa_at": old["auth_time"]}
+    assert sign_in.renew(db, user, alone, client_ip="127.0.0.1").access_token
+
+
+def test_an_account_no_provider_vouches_for_is_told_of_the_reset_link_not_of_an_organisations_sign_in(db):
+    """The mark of a password nobody knows is also set where no provider is involved (a password taken back when
+    the account was made an administrator). Its passkey by itself is refused like any marked account's; the
+    words do not send it to a sign-in of an organisation it has none of."""
+    from app.core import password_origin
+    lone = User(username="lone", email="lone@example.com", password_hash=hash_password("x-1"), role=RoleEnum.USER,
+                is_active=True, is_locked=False)
+    db.add(lone)
+    db.commit()
+    password_origin.mark_nobody_knows(lone)
+    said = sso_only.passkey_after_the_provider_message(db, lone)
+    assert "organisation" not in said and "password reset link" in said and "no password of its own" in said
+    # Linked to a provider that is turned off: the same (nothing of it can be used now).
+    p = _provider(db, state="disabled")
+    _link(db, lone, p)
+    assert "organisation" not in sso_only.passkey_after_the_provider_message(db, lone)
+    p.state = "enabled"
+    db.commit()
+    said = sso_only.passkey_after_the_provider_message(db, lone)
+    assert said.startswith(sso_only.provider_only_message(db, lone)) and "after that sign-in" in said
+    # What an account that signs in only through its provider is told is as it was, with or without a provider on.
+    assert "through Contoso" in sso_only.provider_only_message(db, lone)
+    p.state = "disabled"
+    db.commit()
+    assert "not available on this vault right now" in sso_only.provider_only_message(db, lone)
+
+
 def test_an_account_with_a_password_keeps_its_own_session_whatever_its_provider_says(db):
     """A session made with the password, of an account that is not provider-only, is not the provider's: a refusal
     or a lapse pauses the account's keys and temporary credentials, and the password still signs it in."""

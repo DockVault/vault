@@ -182,6 +182,20 @@ def provider_only_message(db, user) -> str:
     """What a person is told when they try to sign in to an account that signs in only through its provider some
     other way (a passkey): the organisation's provider by name and the button to use, or the link when the provider
     is not on the sign-in page; when no provider of the account is enabled, to ask an administrator."""
+    names, buttons = _providers_to_name(db, user)
+    if not names:
+        return ("Your organisation signs this account in through its own sign-in, which is not available on this vault "
+                "right now. Ask your administrator.")
+    through = " or ".join(names)
+    if buttons:
+        return (f"Your organisation signs this account in through {through}. Use the "
+                + " or ".join(f"“{b}”" for b in buttons) + " button on the sign-in page.")
+    return (f"Your organisation signs this account in through {through}. Use the sign-in link your organisation "
+            "gave you.")
+
+
+def _providers_to_name(db, user) -> tuple:
+    """(the names, the button labels) of the enabled providers ``user`` is linked to, each once, in the order found."""
     from app.core.models import ExternalIdentity, SsoProvider
     names, buttons = [], []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
@@ -195,21 +209,18 @@ def provider_only_message(db, user) -> str:
         if getattr(row, "show_on_sign_in", True):
             if label and label not in buttons:
                 buttons.append(label)
-    if not names:
-        return ("Your organisation signs this account in through its own sign-in, which is not available on this vault "
-                "right now. Ask your administrator.")
-    through = " or ".join(names)
-    if buttons:
-        return (f"Your organisation signs this account in through {through}. Use the "
-                + " or ".join(f"“{b}”" for b in buttons) + " button on the sign-in page.")
-    return (f"Your organisation signs this account in through {through}. Use the sign-in link your organisation "
-            "gave you.")
+    return names, buttons
 
 
 def passkey_after_the_provider_message(db, user) -> str:
     """What a person is told when a passkey by itself would sign in an account whose password nobody knows: where
     the account signs in, that the passkey confirms them after that sign-in, and what makes the passkey a sign-in
-    of its own."""
+    of its own. An account no enabled provider vouches for (its password was taken back when it was made an
+    administrator, say, and it is linked to none) is not sent to an organisation's sign-in it does not have: what
+    it needs is a password of its own."""
+    if not _providers_to_name(db, user)[0]:
+        return ("Your account has no password of its own yet, and your passkey signs you in by itself only once it "
+                "has one. Use the password reset link you were given, or ask an administrator for one.")
     return (provider_only_message(db, user) + " Your passkey confirms it is you after that sign-in. It signs you "
             "in by itself once your account has a password of its own: ask for a password reset link.")
 
