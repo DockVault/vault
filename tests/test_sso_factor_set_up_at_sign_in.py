@@ -566,3 +566,39 @@ def test_a_sign_in_that_carries_no_trusted_mfa_is_not_asked_whether_it_still_cou
     asked = []
     monkeypatch.setattr(sso_sign_in, "provider_mfa_still_counts", lambda db, result: asked.append(1) or True)
     assert isinstance(w.through_the_provider(carol), sign_in.SignedIn) and asked == []
+
+
+def test_a_factor_set_up_at_a_providers_held_sign_in_holds_the_providers_row_before_the_accounts_turn(monkeypatch):
+    """The set-up writes its factor in the account's turn, and the session that follows is written in that same
+    turn. A save of the provider takes the provider's row and then each linked account's turn, so the set-up
+    takes them in that order too: the row first, shared, then the turn. Taken the other way round, the two
+    waited for each other."""
+    from app.core.models import SsoProvider
+    from app.services import sign_in
+    dana = _without_a_password("signs in only through its provider")
+    w = World(monkeypatch, [dana])
+    pending, _headers = w.held_with(dana, [])
+    pending._provider_id, pending._provider_sub = str(w.provider.id), w.identity(dana).subject
+    pending._sessions_ended, pending._methods_so_far = 0, ()
+    order, through = [], w.db.query
+
+    def query(*entities):
+        made = through(*entities)
+        lock = made.with_for_update
+
+        def with_for_update(**kw):
+            order.append(("row", getattr(entities[0], "__tablename__", None), kw))
+            return lock(**kw)
+        made.with_for_update = with_for_update
+        return made
+    monkeypatch.setattr(w.db, "query", query)
+    monkeypatch.setattr(w.S, "_sessions_turn", lambda db, user_id: order.append(("turn", str(user_id))))
+    sign_in.refuse_a_factor_the_sign_in_could_not_finish(w.db, dana, pending, IP)
+    assert order[:2] == [("row", SsoProvider.__tablename__, {"read": True}), ("turn", str(dana.id))], order
+    # A sign-in held through no provider takes the turn, and no row (and this account, which signs in only
+    # through its provider, is then refused in it).
+    del order[:]
+    other, _headers = w.held_with_no_provider(dana, ["pwd"])
+    with pytest.raises(sign_in.ProviderOnly):
+        sign_in.refuse_a_factor_the_sign_in_could_not_finish(w.db, dana, other, IP)
+    assert order == [("turn", str(dana.id))], order

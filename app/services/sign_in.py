@@ -1028,6 +1028,10 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
             channel=auth.WEB, commit=False)
     now = datetime.now(timezone.utc)
     user.last_login = now
+    # With the session, in the one transaction: what turns the provider off, or logs the person out at the
+    # provider, waits for this commit and then finds the session by this record. Written after it, a session
+    # could be live for a moment with nothing to find it by, and that moment is the one such a change wakes in.
+    _record_provider_session(db, result, session_token)
     db.commit()
     claims = {
         "sub": str(user.id), "username": user.username, "session_token": session_token,
@@ -1044,33 +1048,41 @@ def complete_sign_in(db, result: SignInResult) -> SignedIn:
     if not result.is_temporary:
         expires = timedelta(minutes=api._setting_int(db, "session_timeout", api.settings.jwt_access_token_expire_minutes))
     access_token = create_access_token(data=claims, expires_delta=expires)
-    _record_provider_session(db, result, session_token)
     _record(db, result, api)
     return SignedIn(access_token=access_token, user=user, is_temporary=result.is_temporary)
 
 
 def _record_provider_session(db, result: SignInResult, session_token: Optional[str]) -> None:
     """A session signed in through a provider remembers the provider's session id and subject (so the provider's
-    back-channel logout finds it) and, when the provider logout option is on, the ID token encrypted. Best effort:
-    a sign-in that is whole must not fail on its own record."""
+    back-channel logout, and a turn-off of the provider, find it) and, when the provider logout option is on, the
+    ID token encrypted. In the caller's transaction, with the session itself: the session is not there without
+    the record that finds it. The logout hint is a convenience; one that cannot be sealed is left out."""
     if not result.provider_id or not session_token:
         return
+    import uuid
+    from app.core.models import ActiveSession, SsoSession
     try:
-        import uuid
-        from app.core.models import ActiveSession, SsoSession
-        from app.core.security import encrypt_secret
-        row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(session_token)).first()
-        if row is None:
-            return
-        at = result.provider_auth_time or datetime.now(timezone.utc)
-        auth_time = at.astimezone(timezone.utc).replace(tzinfo=None) if at.tzinfo else at
-        db.add(SsoSession(session_id=row.id, provider_id=uuid.UUID(str(result.provider_id)),
-                          idp_sid=(result.provider_sid or None), idp_sub=(result.provider_sub or None),
-                          auth_time=auth_time,
-                          id_token_enc=encrypt_secret(result.provider_logout_hint) if result.provider_logout_hint else None))
-        db.commit()
-    except Exception:  # noqa: BLE001 -- the record is a record, never a refusal
-        db.rollback()
+        provider_id = uuid.UUID(str(result.provider_id))
+    except ValueError:
+        return                     # not a provider's id at all: refused where the provider is judged
+    flush = getattr(db, "flush", None)
+    if flush is not None:
+        flush()                    # the session written a moment ago, in this transaction, is read below
+    row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(session_token)).first()
+    if row is None:
+        return
+    at = result.provider_auth_time or datetime.now(timezone.utc)
+    auth_time = at.astimezone(timezone.utc).replace(tzinfo=None) if at.tzinfo else at
+    sealed = None
+    if result.provider_logout_hint:
+        try:
+            from app.core.security import encrypt_secret
+            sealed = encrypt_secret(result.provider_logout_hint)
+        except Exception:  # noqa: BLE001 -- the provider's own logout is then not offered at the sign-out
+            sealed = None
+    db.add(SsoSession(session_id=row.id, provider_id=provider_id,
+                      idp_sid=(result.provider_sid or None), idp_sub=(result.provider_sub or None),
+                      auth_time=auth_time, id_token_enc=sealed))
 
 
 def forget_provider_logout_hints(db, session_ids) -> int:

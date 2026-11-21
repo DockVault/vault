@@ -145,6 +145,38 @@ def test_a_provider_sign_in_remembers_the_providers_session_and_subject(monkeypa
             assert "eyJ" not in value or "enc:eyJ" in value
 
 
+def test_the_providers_session_is_remembered_in_the_commit_that_writes_the_session(monkeypatch):
+    """A turn-off of the provider, and a logout the provider sends, find the sessions to end by this record, and
+    wait for a sign-in that is being written. So the record is written with the session, in one commit: written
+    in a commit of its own after it, a session was live for a moment with nothing to find it by, which is the
+    moment such a change wakes in."""
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    waiting, _ = _sign_in(h, p, sid="s-1")
+    seen, commit = [], h.db.commit
+
+    def committed():
+        seen.append((len(h.active_sessions()), len(h.sso_sessions())))
+        return commit()
+    monkeypatch.setattr(h.db, "commit", committed)
+    assert h.finish(waiting)[0] == 200
+    assert (1, 1) in seen and all(sessions == records for sessions, records in seen), seen
+
+
+def test_a_logout_hint_that_cannot_be_sealed_is_left_out_and_the_sign_in_is_whole(monkeypatch):
+    alice, p = _user(), _provider(policy={"sso_idp_logout": True})
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    waiting, _ = _sign_in(h, p, sid="s-1")
+    from app.core import security
+
+    def no_key(value):
+        raise RuntimeError("no key")
+    monkeypatch.setattr(security, "encrypt_secret", no_key)
+    assert h.finish(waiting)[0] == 200
+    (record,) = h.sso_sessions()
+    assert record.idp_sid == "s-1" and record.id_token_enc is None
+
+
 def test_an_administrator_who_adds_the_password_gets_the_record_too(monkeypatch):
     root, p = _user("root", role="admin"), _provider(policy={"sso_idp_logout": True})
     h = Sessions(monkeypatch, [root], [p], identities=[_identity(root, p)])
