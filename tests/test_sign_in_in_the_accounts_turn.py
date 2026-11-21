@@ -270,6 +270,55 @@ def test_a_credential_change_takes_the_accounts_turn_before_its_row(db, monkeypa
     assert order[:2] == [("turn", alice.id), ("row", alice.id)], order
 
 
+def test_an_approval_takes_the_accounts_turn_then_its_row_then_the_request(db, monkeypatch):
+    """A held request is decided under the same order as a change made at once: the account's turn at its sessions,
+    its row, then the request's row. The request names the account, which is read first without a lock."""
+    from app.core.models import CredentialChange
+    ada, alice = _user(db, "ada", RoleEnum.ADMIN), _user(db, "alice")
+    held = CredentialChange(target_user_id=alice.id, requested_by_id=ada.id, requested_by_name=ada.username,
+                            kind=cc.PASSWORD, status=cc.HELD, requested_at=cc.utcnow(),
+                            expires_at=cc.utcnow() + timedelta(days=7))
+    db.add(held)
+    db.commit()
+    held_id, alice_id = held.id, alice.id          # read now: a read after the commit is a statement of its own
+    order, lock_account = [], cc._lock_account
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: order.append(("turn", user_id)))
+    monkeypatch.setattr(cc, "_lock_account", lambda db_, user_id: order.append(("row", user_id)) or lock_account(db_, user_id))
+
+    @sa.event.listens_for(db.get_bind(), "before_cursor_execute")
+    def _statement(conn, cursor, statement, parameters, context, executemany):
+        if "FROM credential_changes" in statement and "credential_changes.status" in statement:
+            order.append(("the request", None))
+    try:
+        change, target = api._open_credential_request(db, held_id)
+    finally:
+        sa.event.remove(db.get_bind(), "before_cursor_execute", _statement)
+    assert order == [("turn", alice_id), ("row", alice_id), ("the request", None)], order
+    assert change.id == held_id and target.id == alice_id
+    # A request that is not there names no account: no turn, and the answer it always had.
+    del order[:]
+    with pytest.raises(HTTPException) as gone:
+        api._open_credential_request(db, uuid.uuid4())
+    assert gone.value.status_code == 404 and order == []
+
+
+def test_a_reset_link_takes_the_accounts_turn_before_the_rows_it_locks():
+    """The reset ends the account's sessions, in the account's turn, and judges the link under a lock on the
+    account's row and its maker's. The turn comes first, as everywhere: read from the route as it is written,
+    since the route's limiter and its token are the server's."""
+    tree = ast.parse((ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8"))
+    (route,) = [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "do_reset"]
+    calls = [(n.lineno, ast.unparse(n)) for n in ast.walk(route) if isinstance(n, ast.Call)]
+    turns = [line for line, text in calls if text == "_sessions_turn(db, user.id)"]
+    locked = [line for line, text in calls if text == "_reset_link_refusal(db, r, user, lock=True)"]
+    ends = [line for line, text in calls if text.startswith("_revoke_sessions(")]
+    assert len(turns) == 1 and len(locked) == 1 and ends, (turns, locked, ends)
+    assert turns[0] < locked[0] < min(ends)
+    # Nothing between the turn and the commit locks a row before the turn: the only locking read is the link's.
+    before = [text for line, text in calls if line < turns[0] and "with_for_update" in text]
+    assert before == [], before
+
+
 def test_the_locks_on_an_accounts_row_leave_its_key_free():
     """A row that names the account (a session, a held sign-in, an audit row) is written by a sign-in in its turn.
     It waits for a lock that holds the row's key, and for none that leaves it free."""

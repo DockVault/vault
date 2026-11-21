@@ -287,6 +287,13 @@ def test_a_record_round_trips_through_the_pipelines_result():
     back = c.to_result(db, record, client_ip="10.0.0.2")
     assert back.user is user and back.methods == ["hwk"] and back.pending is pending
     assert back.client_ip == "10.0.0.2" and back.provider_id == "p1" and back.user_verified
+    # What the proof read of the account's sessions rides in the record. One that carries none (written before
+    # it was kept) matches no account: the sign-in it holds starts again, and is not taken as never ended.
+    assert record.ended == result.sessions_ended == 0 and back.sessions_ended == 0
+    counted = SignInResult(user, ["hwk"], "10.0.0.1", sessions_ended=3)
+    assert c.to_result(db, c.from_result(counted, verifier_hash=c.digest("v"))).sessions_ended == 3
+    record.ended = None
+    assert c.to_result(db, record, client_ip="10.0.0.2").sessions_ended == -1
     # The account must still be there and active; a pending login it names must still be live.
     assert c.to_result(MemoryDB({User: [], PendingLogin: [pending]}), record) is None
     user.is_active = False
