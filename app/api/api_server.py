@@ -756,7 +756,8 @@ class ClientIPMiddleware:
         except Exception:  # noqa: BLE001 — never fail a request over IP resolution
             ip = None
         # A trusted proxy's X-Forwarded-Proto sets the request's scheme, so request.url and base_url
-        # say https behind a TLS proxy (invitation, reset and share email links are built from them).
+        # say https behind a TLS proxy (for the transport-security header; the links the vault sends are
+        # built on its configured address, never on these).
         # uvicorn's own handling did this for 127.0.0.1 only and is off; this uses the same trust set
         # as the client address.
         try:

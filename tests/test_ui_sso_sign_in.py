@@ -459,7 +459,7 @@ def _held_for_a_set_up(methods, **more):
 class Wizard:
     """The authenticator's three requests, stood in for; what the page sent is kept."""
 
-    def __init__(self, page: Page, session=None, refuse=None):
+    def __init__(self, page: Page, session=None, refuse=None, expired_at_the_code=False):
         self.enrolls, self.confirms, self.acknowledged = [], [], []
 
         def enroll(route):
@@ -473,6 +473,9 @@ class Wizard:
 
         def confirm(route):
             self.confirms.append((route.request.headers.get("authorization"), route.request.post_data_json))
+            if expired_at_the_code:
+                route.fulfill(status=401, json={"detail": "This login attempt has expired; start again."})
+                return
             route.fulfill(status=200, json={"recovery_codes": ["aaaa-bbbb-cccc-dddd-eeee"] * 10})
         page.route("**/users/me/second-factor/totp/confirm", confirm)
 
@@ -504,6 +507,7 @@ def test_a_second_factor_is_set_up_after_a_provider_with_no_password_asked_and_e
     page.keyboard.press("Enter")
     expect(box).to_contain_text("Save your recovery codes", timeout=10000)
     assert wizard.confirms == [("Bearer held-for-set-up", {"code": "123456"})]
+    expect(box.locator(".sf-wizard-back")).to_have_count(1)        # a way back from the recovery codes too
     page.check("#sf-ack-cb")
     box.get_by_role("button", name="Finish and sign in").click()
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=20000)
@@ -552,6 +556,30 @@ def test_an_enrollment_that_cannot_start_says_why_and_leads_back_to_the_sign_in_
     box = page.locator("#login-second-factor")
     expect(box).to_contain_text("Your current password is required and must be correct.", timeout=20000)
     box.get_by_role("button", name="Back to sign in").click()
+    expect(page.locator("#login-form")).to_be_visible(timeout=10000)
+    expect(box).to_be_hidden()
+    assert cancelled == ["Bearer held-for-set-up"] and errors == [], (cancelled, errors)
+
+
+def test_a_set_up_whose_hold_ran_out_leads_back_to_the_sign_in_form_from_the_code(page: Page, base_url):
+    """A sign-in held for the set-up lasts five minutes; installing an authenticator app can take longer. The code
+    is then refused ("this login attempt has expired"), and would be at every try. Each step of the set-up at a
+    sign-in has a way back to the sign-in form, which also gives the held sign-in up at the server."""
+    errors, cancelled = [], []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    stand = Stand(page, base_url)
+    stand.finish_answer = _held_for_a_set_up(["totp"])
+    Wizard(page, expired_at_the_code=True)
+    page.route("**/auth/second-factor/cancel", lambda route: (cancelled.append(route.request.headers.get("authorization")),
+                                                              route.fulfill(status=200, json={}))[-1])
+    _sign_in_screen(page)
+    page.locator("#sso-sign-in .sso-sign-in-btn").first.click()
+    box = page.locator("#login-second-factor")
+    expect(box).to_contain_text("Scan this QR code", timeout=20000)
+    page.fill("#sf-enroll-code", "123456")
+    page.keyboard.press("Enter")
+    expect(box).to_contain_text("This login attempt has expired; start again.", timeout=10000)
+    box.locator(".sf-wizard-back").click()
     expect(page.locator("#login-form")).to_be_visible(timeout=10000)
     expect(box).to_be_hidden()
     assert cancelled == ["Bearer held-for-set-up"] and errors == [], (cancelled, errors)

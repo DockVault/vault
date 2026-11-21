@@ -2613,6 +2613,17 @@ function renderEnrollmentWizard(box, opts) {
 
     const clear = () => box.replaceChildren();
     const monoBlock = () => { const d = _el('div', 'mb-md'); d.style.fontFamily = 'monospace'; return d; };
+    // The way back to the sign-in form from a sign-in held for this set-up, on every step: a hold lasts five
+    // minutes, and one that ran out (an authenticator app takes a while to install) or was refused leaves the
+    // person with a step that can only fail again. Under Your account there is none: the block has its own.
+    const backToSignIn = () => {
+        if (!preAuthToken) return null;
+        const back = _el('a', 'mt-md', '\u2190 Back to sign in'); back.href = '#';
+        back.setAttribute('role', 'button'); back.style.display = 'block';
+        back.classList.add('sf-wizard-back');
+        back.addEventListener('click', (ev) => { ev.preventDefault(); _sfCancel(preAuthToken); });
+        return back;
+    };
 
     async function start() {
         clear();
@@ -2648,6 +2659,8 @@ function renderEnrollmentWizard(box, opts) {
         } catch (e) {
             status.className = 'alert alert-error mt-sm';
             status.textContent = 'Could not reach the server. Please try again.';
+            const back = backToSignIn();
+            if (back) box.appendChild(back);
         }
     }
 
@@ -2674,6 +2687,8 @@ function renderEnrollmentWizard(box, opts) {
         const grp = _el('div', 'form-group'); grp.appendChild(input); box.appendChild(grp);
         const e2 = _el('div', 'alert alert-error mt-sm'); e2.style.display = 'none'; e2.setAttribute('role', 'alert'); box.appendChild(e2);
         const next = _el('button', 'btn btn-primary btn-block mt-sm', 'Continue'); box.appendChild(next);
+        const backFromTheCode = backToSignIn();
+        if (backFromTheCode) box.appendChild(backFromTheCode);
 
         async function confirm() {
             const code = (input.value || '').trim();
@@ -2712,6 +2727,8 @@ function renderEnrollmentWizard(box, opts) {
         box.appendChild(label);
         const e3 = _el('div', 'alert alert-error mt-sm'); e3.style.display = 'none'; e3.setAttribute('role', 'alert'); box.appendChild(e3);
         const done = _el('button', 'btn btn-primary btn-block', onComplete ? 'Finish' : 'Finish and sign in'); box.appendChild(done);
+        const backFromTheCodes = backToSignIn();
+        if (backFromTheCodes) box.appendChild(backFromTheCodes);
 
         async function ack() {
             if (!cb.checked) { _sfError(e3, 'Please confirm you saved your recovery codes.'); return; }

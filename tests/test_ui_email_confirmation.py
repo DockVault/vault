@@ -109,6 +109,7 @@ def test_where_the_vault_sends_no_email_your_account_says_who_can_confirm(page: 
                            "name": "Contoso", "sso_only": False}]
     page.evaluate("() => window.Sso && Sso.renderAccount && Sso.renderAccount()")
     expect(box).to_contain_text("Link your organisation's sign-in above instead", timeout=10000)
+    expect(box).to_contain_text("set one up here first if you have none")       # the link asks for a second factor
     state["providers"] = []
     # And with nothing to say of the address, the section says nothing of it.
     state["email"] = None
