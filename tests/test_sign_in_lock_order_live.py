@@ -204,6 +204,9 @@ if pair in ("a change made at once", "an approval", "a reset link used", "the lo
     if pair == "a change made at once":
         ender = a_change_made_at_once(ada, alice)
     elif pair == "an approval":
+        # A third administrator, who could approve: with none, the second change is refused, not held. The
+        # database is the module's, so one from an earlier meeting would do, but this one stands by itself.
+        account("cora", RoleEnum.ADMIN)
         ender = an_approval(ada, bea, alice)
     elif pair == "a reset link used":
         ender = a_reset_link_used(alice)
