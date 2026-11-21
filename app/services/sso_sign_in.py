@@ -823,7 +823,7 @@ def link_refusal(db, row, user, answer: ProviderAnswer) -> None:
         raise Refusal(NOT_THIS_ACCOUNT, "this account already has an identity on the provider")
 
 
-def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str):
+def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str, keep_session=None):
     """Link ``answer``'s identity to ``user``: refused when the subject already belongs to another account, or
     the account already has an identity on this provider. In the caller's transaction, and in the same one the
     provider's password rule is applied to the account (app/core/sso_only.settle): linked to a provider whose
@@ -847,7 +847,7 @@ def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str):
                                 last_sign_in_at=None)
     db.add(identity)
     from app.core import sso_only
-    sso_only.settle(db, user, also=row)
+    sso_only.settle(db, user, also=row, keep_session=keep_session)
     return identity
 
 
@@ -969,6 +969,14 @@ def reauth_allowed(db, user, action: Optional[str] = None) -> bool:
     """Whether a provider sign-in may be offered to and taken from ``user`` for ``action`` now: the account and the
     action permit it (:func:`reauth_permitted`), and a provider the account is linked to can confirm it afresh."""
     return reauth_permitted(db, user, action) and reauth_available(db, user)
+
+
+def reauth_stands(db, user, provider_id) -> bool:
+    """Whether the provider a re-authentication was made at may still confirm ``user``: one of the account's own
+    that confirms afresh now (:func:`reauth_providers`). A confirmation made at a provider that was turned off
+    since (an incident), or that the account was unlinked from, confirms nothing, whatever other provider of
+    the account is on."""
+    return bool(provider_id) and any(str(p.id) == str(provider_id) for p in reauth_providers(db, user))
 
 
 def reauth_providers(db, user) -> list:

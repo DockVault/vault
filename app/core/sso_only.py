@@ -29,8 +29,19 @@ class Privileged(ValueError):
     """The account cannot be made SSO-only: it is privileged (the message names why)."""
 
 
-def make_sso_only(db, user) -> None:
-    """Make ``user`` sign in only through its provider, in the caller's transaction."""
+def _password_is_nobodys(user) -> None:
+    """The hash now holds random bytes: a password that is not its owner's. Marked as one somebody else set
+    (app/core/password_origin.py), so the rules for such a password apply to it: made an administrator later,
+    the account is sent a link to choose one; and until the person has chosen one, it approves no held change.
+    The mark goes when the person sets a password of their own."""
+    from app.core import password_origin
+    password_origin.set_by_other(user, None)
+
+
+def make_sso_only(db, user, *, keep_session=None) -> None:
+    """Make ``user`` sign in only through its provider, in the caller's transaction. The web sessions a password
+    made end with the password (:func:`end_sessions_no_provider_made`); ``keep_session`` is the id of the session
+    the request itself came through, where the person has just proved themselves at the provider in it."""
     from app.core.security import hash_password
     kind = privileged_accounts.kind(db, user)
     if kind is not None:
@@ -38,6 +49,34 @@ def make_sso_only(db, user) -> None:
     user.sso_only = True
     user.password_hash = hash_password(secrets.token_urlsafe(32))     # nobody knows it; a reset sets a real one
     user.sftp_password_auth = False
+    _password_is_nobodys(user)
+    end_sessions_no_provider_made(db, user, keep=keep_session)
+
+
+def end_sessions_no_provider_made(db, user, *, keep=None) -> int:
+    """End the account's web sessions that did not come through a provider, in the caller's transaction. They
+    were made with the password that has just stopped working (alone, or with a second factor), and whoever
+    holds one would otherwise stay signed in until it expires. Sessions that came through a provider stay, and
+    so do a temporary credential's (not the account's own sign-in) and SFTP's (a key made them; SFTP password
+    sign-in is off from now). Returns how many ended."""
+    from app.core.models import ActiveSession, SsoSession
+    from app.core.table_presence import has_table
+    if not has_table(db, ActiveSession.__tablename__):
+        return 0
+    rows = db.query(ActiveSession).filter(ActiveSession.user_id == user.id, ActiveSession.is_active.is_(True)).all()
+    mine = [r for r in rows if getattr(r, "temp_credential_id", None) is None
+            and getattr(r, "channel", None) in (None, "web") and r.id != keep]
+    if not mine:
+        return 0
+    through = set()
+    if has_table(db, SsoSession.__tablename__):
+        through = {s.session_id for s in
+                   db.query(SsoSession).filter(SsoSession.session_id.in_([r.id for r in mine])).all()}
+    ending = [r.id for r in mine if r.id not in through]
+    if not ending:
+        return 0
+    from app.api import api_server as api
+    return int(api._revoke_sessions(db, session_ids=ending, actor_username="system", durable=True) or 0)
 
 
 def allow_password_sign_in(db, user) -> None:
@@ -47,6 +86,7 @@ def allow_password_sign_in(db, user) -> None:
     from app.core.security import hash_password
     user.sso_only = False
     user.password_hash = hash_password(secrets.token_urlsafe(32))
+    _password_is_nobodys(user)
 
 
 def password_less(provider) -> bool:
@@ -83,7 +123,7 @@ def should_be_sso_only(db, user, *, also=None, without=None) -> bool:
 MADE, RESTORED = "made_sso_only", "restored"
 
 
-def settle(db, user, *, also=None, without=None) -> Optional[str]:
+def settle(db, user, *, also=None, without=None, keep_session=None) -> Optional[str]:
     """Bring ``user``'s flag in line with the providers it is linked to, in the caller's transaction: ``MADE`` when
     the account now signs in only through its providers (its password replaced, SFTP password sign-in off),
     ``RESTORED`` when it may hold a password again (nothing is minted), None when nothing changed. An account
@@ -92,7 +132,7 @@ def settle(db, user, *, also=None, without=None) -> Optional[str]:
     should = should_be_sso_only(db, user, also=also, without=without)
     flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:
-        make_sso_only(db, user)
+        make_sso_only(db, user, keep_session=keep_session)
         return MADE
     if flagged and not should:
         allow_password_sign_in(db, user)

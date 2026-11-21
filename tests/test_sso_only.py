@@ -25,8 +25,10 @@ def test_an_sso_only_account_has_a_password_nobody_knows_and_no_sftp_password(mo
     privileged_accounts, sso_only = _mod()
     from app.core import security
     monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    from _memory_db import MemoryDB
+    from app.core.models import ActiveSession
     alice = _user(sso_only=False)
-    db = types.SimpleNamespace()
+    db = MemoryDB({ActiveSession: []})
     monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: None)
     sso_only.make_sso_only(db, alice)
     assert alice.sso_only is True and alice.sftp_password_auth is False
@@ -35,6 +37,48 @@ def test_an_sso_only_account_has_a_password_nobody_knows_and_no_sftp_password(mo
     first = alice.password_hash
     sso_only.make_sso_only(db, alice)
     assert alice.password_hash != first
+
+
+def test_an_account_made_provider_only_keeps_no_session_its_password_made_and_owns_no_password(monkeypatch):
+    """The password stops working: the web sessions it made end with it (whoever holds one, a thief of the
+    password included, would otherwise stay signed in until it expires). What came through a provider stays,
+    and so do the session the request itself came through (the person has just proved themselves at the
+    provider in it), a temporary credential's, SFTP's, another account's and one that is over. The hash holds
+    random bytes from now, here and when passwords are allowed again: it is marked as a password somebody else
+    set, so an account made an administrator later is sent a link to choose one, where it must type it."""
+    privileged_accounts, sso_only = _mod()
+    from _memory_db import MemoryDB
+    from app.api import api_server as api
+    from app.core import password_origin, security
+    from app.core.models import ActiveSession, SsoSession
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: None)
+    alice = _user(sso_only=False, password_set_by=None, password_set_by_other_at=None)
+
+    def session(**extra):
+        fields = dict(id=uuid.uuid4(), user_id=alice.id, is_active=True, temp_credential_id=None, channel="web")
+        fields.update(extra)
+        return types.SimpleNamespace(**fields)
+
+    by_password, from_before_channels = session(), session(channel=None)
+    through_a_provider, this_request = session(), session()
+    stay = [through_a_provider, this_request, session(channel="sftp"), session(temp_credential_id=uuid.uuid4()),
+            session(user_id=uuid.uuid4()), session(is_active=False)]
+    db = MemoryDB({ActiveSession: [by_password, from_before_channels, *stay],
+                   SsoSession: [types.SimpleNamespace(session_id=through_a_provider.id)]})
+    ended = []
+    monkeypatch.setattr(api, "_revoke_sessions", lambda db, **kw: ended.append(kw) or len(kw["session_ids"]))
+    sso_only.make_sso_only(db, alice, keep_session=this_request.id)
+    assert ended == [{"session_ids": [by_password.id, from_before_channels.id], "actor_username": "system",
+                      "durable": True}]
+    assert password_origin.is_set_by_other(alice) and alice.password_set_by is None
+    # Nothing to end: nothing is asked of the session machinery.
+    del ended[:]
+    assert sso_only.end_sessions_no_provider_made(db, _user("bob")) == 0 and ended == []
+    # Passwords allowed again: the hash is still nobody's, and says so.
+    password_origin.set_by_self(alice)
+    sso_only.allow_password_sign_in(db, alice)
+    assert alice.sso_only is False and password_origin.is_set_by_other(alice) and alice.password_set_by is None
 
 
 @pytest.mark.parametrize("kind", ["administrator", "auditor_right"])

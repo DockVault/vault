@@ -8937,7 +8937,8 @@ async def second_factor_step_up(
             staged = False
             if sso_sign_in.reauth_allowed(db, current_user, body.action):
                 try:
-                    staged = sso_state.take_reauth(session_hash, body.action)
+                    staged = sso_sign_in.reauth_stands(db, current_user,
+                                                       sso_state.take_reauth(session_hash, body.action))
                 except sso_state.Unavailable:
                     staged = False
             if not staged:
@@ -11987,7 +11988,8 @@ def _passkey_first_proof(db, user, request, current_password) -> None:
         staged = sso_state.take_reauth(_current_session_hash(request), PASSKEY_FIRST_PROOF_ACTION)
     except sso_state.Unavailable:
         raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
-    if not staged:
+    from app.services import sso_sign_in
+    if not sso_sign_in.reauth_stands(db, user, staged):       # made at a provider that still confirms the account
         raise HTTPException(status_code=403, detail={
             "reason": "provider_confirmation_required", "action": PASSKEY_FIRST_PROOF_ACTION,
             "message": "Confirm with your organisation's sign-in first, then add the passkey.",

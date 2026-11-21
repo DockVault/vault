@@ -281,21 +281,25 @@ def _reauth_key(session_hash: str, action: str) -> str:
     return REAUTH_PREFIX + hashlib.sha256(f"{session_hash}:{action}".encode("utf-8")).hexdigest()
 
 
-def stage_reauth(session_hash: str, action: str, *, redis=None) -> None:
-    """Note that this session re-authenticated at its provider for ``action``: spent by :func:`take_reauth` once,
-    within :data:`REAUTH_TTL_SECONDS`. Raises :class:`Unavailable` without the store."""
+def stage_reauth(session_hash: str, action: str, provider_id, *, redis=None) -> None:
+    """Note that this session re-authenticated at the provider ``provider_id`` for ``action``: spent by
+    :func:`take_reauth` once, within :data:`REAUTH_TTL_SECONDS`. Raises :class:`Unavailable` without the store."""
     try:
-        _redis(redis).set(_reauth_key(session_hash, action), "1", ex=REAUTH_TTL_SECONDS)
+        _redis(redis).set(_reauth_key(session_hash, action), str(provider_id), ex=REAUTH_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable(str(exc)) from exc
 
 
-def take_reauth(session_hash: str, action: str, *, redis=None) -> bool:
-    """Spend the staged re-authentication of this session for ``action``: True once, then False."""
+def take_reauth(session_hash: str, action: str, *, redis=None) -> Optional[str]:
+    """Spend the staged re-authentication of this session for ``action``: the provider it was made at, once, then
+    None. Whoever spends it asks whether that provider may still confirm the account."""
     try:
-        return _redis(redis).getdel(_reauth_key(session_hash, action)) is not None
+        staged = _redis(redis).getdel(_reauth_key(session_hash, action))
     except Exception as exc:  # noqa: BLE001
         raise Unavailable(str(exc)) from exc
+    if staged is None:
+        return None
+    return staged.decode("utf-8", "replace") if isinstance(staged, bytes) else str(staged)
 
 
 def seen_logout_jti(jti: str, ttl_seconds: int, *, scope: str, redis=None) -> bool:

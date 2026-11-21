@@ -774,8 +774,12 @@ async def finish_reauth(
         raise HTTPException(status_code=401, detail="This code is not valid for this tab; start again.")
     if not sso.reauth_permitted(db, current_user, action):
         raise HTTPException(status_code=403, detail={"reason": "password_required", "message": sso.REAUTH_NOT_FOR_THIS})
+    if not sso.reauth_stands(db, current_user, record["provider_id"]):
+        # Turned off, or the account unlinked from it, while the person was at the provider.
+        raise HTTPException(status_code=409, detail={"reason": sso.PROVIDER_DISABLED,
+                                                     "message": sso.reason_text(sso.PROVIDER_DISABLED)})
     try:
-        sso_state.stage_reauth(record["session_hash"], action)
+        sso_state.stage_reauth(record["session_hash"], action, record["provider_id"])
     except sso_state.Unavailable:
         raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
     _audit(db, "step_up_idp_reauth", user=current_user, ip=api.get_client_ip(request),
@@ -899,7 +903,14 @@ async def finish_link(
     account = db.query(User).filter(User.id == current_user.id).first() or current_user
     had_password = not getattr(account, "sso_only", False)
     try:
-        identity = sso.link_identity(db, row, account, answer, linked_by="self")
+        # Where the link ends the account's password, the sessions the password made end with it; not this one,
+        # in which the person has just proved themselves at the provider.
+        from app.core.models import ActiveSession
+        from app.core.session_hash_utils import hash_session_token
+        named = _session_claims(request).get("session_token")
+        this_session = (db.query(ActiveSession.id).filter(
+            ActiveSession.session_token == hash_session_token(named)).scalar() if named else None)
+        identity = sso.link_identity(db, row, account, answer, linked_by="self", keep_session=this_session)
         password_stopped = had_password and bool(getattr(account, "sso_only", False))
         db.commit()
     except (sso.Refusal, IntegrityError) as exc:

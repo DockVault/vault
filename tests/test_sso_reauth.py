@@ -96,6 +96,54 @@ def test_a_fresh_provider_sign_in_meets_the_password_part_once(monkeypatch):
     assert h.step_up(method="password", password="pw")[0] == 200
 
 
+@pytest.mark.parametrize("meanwhile", ["turned off", "unlinked"])
+@pytest.mark.parametrize("when", ["before the tab claims the code", "after it was staged"])
+def test_a_confirmation_counts_only_while_the_provider_it_was_made_at_still_confirms_the_account(monkeypatch, when,
+                                                                                                meanwhile):
+    """The account is linked to two providers. It confirms itself at the first; before the step-up spends that
+    confirmation (it lives two minutes), an administrator turns the first provider off (an incident), or the
+    account is unlinked from it. The second provider is still on, so a provider can confirm the account: but
+    not this confirmation, which was made at the one that no longer stands. Made at a provider that still
+    stands, it counts as before."""
+    from app.core import sso_state
+    from app.core.models import ExternalIdentity
+    carol = _user("carol", sso_only=True)
+    one, two = _provider(name="one", label="One", last_test=TESTED), _provider(name="two", label="Two", last_test=TESTED)
+    first = _identity(carol, one, subject="at-one")
+    h = Reauth(monkeypatch, [carol], [one, two], identities=[first, _identity(carol, two, subject="at-two")])
+    h.current_user = carol
+
+    def gone():
+        if meanwhile == "turned off":
+            one.state = "disabled"
+        else:
+            h.db.rows_of(ExternalIdentity).remove(first)
+
+    status, location, _ = _stepped_up_url(h, one, sub="at-one", auth_time=int(time.time()) - 5)
+    assert status == 302 and location.startswith("/#sso-stepup="), location
+    if when == "before the tab claims the code":
+        gone()
+        status, body = h.finish_reauth(location)
+        assert status == 409 and body["detail"]["reason"] == "provider_disabled", body
+        assert not [k for k in h.redis.rows if k.startswith("sso:reauth:")]          # nothing was staged
+    else:
+        assert h.finish_reauth(location)[0] == 200
+        assert sso_state.take_reauth(h.session_hash, "admin.retention.write") == str(one.id)   # names its provider
+        sso_state.stage_reauth(h.session_hash, "admin.retention.write", one.id)
+        gone()
+    status, body = h.step_up(method="idp_reauth")
+    assert status == 403 and "Confirm with your organisation" in body["detail"], body
+    assert h.receipts == []
+    # The other provider still confirms the account, with a confirmation of its own.
+    status, location, _ = _stepped_up_url(h, two, sub="at-two", auth_time=int(time.time()) - 5)
+    assert h.finish_reauth(location)[0] == 200
+    assert h.step_up(method="idp_reauth")[0] == 200 and len(h.receipts) == 1
+    # A stage that names no provider of the account (one from before stages named theirs) confirms nothing.
+    for named in ("1", str(uuid.uuid4())):
+        sso_state.stage_reauth(h.session_hash, "admin.retention.write", named)
+        assert h.step_up(method="idp_reauth")[0] == 403
+
+
 def test_the_provider_must_be_linked_and_tested_with_auth_time(monkeypatch):
     alice, p, q = _user(sso_only=True), _provider(last_test=TESTED), _provider(name="untested", last_test={"outcome": "ok", "auth_time_present": False})
     h = Reauth(monkeypatch, [alice], [p, q], identities=[_identity(alice, q, subject="s-q")])
@@ -199,10 +247,10 @@ def test_a_provider_never_stands_in_for_a_password_the_account_has_or_for_a_comp
         assert status == 403 and body["detail"]["reason"] == "password_required", (user.username, status, body)
         assert "own password" in body["detail"]["message"]
         assert not [k for k in h.redis.rows if k.startswith("sso:state:")], user.username     # nothing was started
-        sso_state.stage_reauth(h.session_hash, action)         # a proof staged all the same (an older build, a bug)
+        sso_state.stage_reauth(h.session_hash, action, p.id)   # a proof staged all the same (an older build, a bug)
         status, body = h.step_up(action=action, method="idp_reauth")
         assert status == 403 and "Confirm with your organisation" in body["detail"], (user.username, body)
-        assert sso_state.take_reauth(h.session_hash, action) is True   # and it was not spent: nothing looked at it
+        assert sso_state.take_reauth(h.session_hash, action) == str(p.id)   # and it was not spent: nothing looked at it
         assert h.step_up(action=action, method="password", password="pw")[0] == 200
 
     for user in (alice, root, auditor):

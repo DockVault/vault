@@ -822,6 +822,35 @@ def test_under_the_sign_up_list_a_link_by_email_needs_the_address_itself_on_the_
     assert [i.user_id for i in h.identities()] == [inside.id]
 
 
+def test_a_link_that_ends_the_password_ends_the_sessions_it_made_and_not_the_one_that_links(monkeypatch):
+    """A person links, from Your account, a provider whose people hold no password. The password stops working
+    with the link, and the sessions it made elsewhere end with it. The session doing the linking stays: the
+    person has just proved themselves at the provider in it, and is shown what changed."""
+    from app.core.models import ActiveSession
+    alice = _user("alice")
+    p = _provider(name="a", label="A", policy={"sso_password_login": "disabled"})
+    h = Resolving(monkeypatch, [alice], [p])
+
+    def session(token):
+        return types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, is_active=True, temp_credential_id=None,
+                                     channel="web", session_token=token)
+
+    from app.core.session_hash_utils import hash_session_token
+    h.session_claims["session_token"] = "this-browsers-token"         # what the request's own token names
+    here, elsewhere = session(hash_session_token("this-browsers-token")), session(hash_session_token("another"))
+    h.db.rows_of(ActiveSession).extend([here, elsewhere])
+    ended = []
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: ended.append(kw["session_ids"]) or len(kw["session_ids"]))
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-linked="), location
+    assert ended == []                                           # nothing changes before the person is back
+    status, out = h.finish_link(location)
+    assert status == 200 and out.get("password_stopped") is True and alice.sso_only is True, out
+    assert ended == [[elsewhere.id]]
+
+
 def _provider_locks(h):
     from app.core.models import SsoProvider
     return [entry[2] for entry in h.db.log if entry[0] == "lock" and entry[1] is SsoProvider]

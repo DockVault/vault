@@ -40,8 +40,11 @@ class ProviderHarness(Harness):
         monkeypatch.setattr(sso_state, "_redis", lambda redis: self.redis)
         monkeypatch.setattr(self.S, "_current_session_hash", lambda request: "sess-1")
 
-    def confirm_at_the_provider(self, session="sess-1", action=ACTION):
-        self.sso_state.stage_reauth(session, action)
+    def confirm_at_the_provider(self, session="sess-1", action=ACTION, provider=None):
+        from app.core.models import SsoProvider
+        rows = self.db.rows_of(SsoProvider)
+        provider = provider if provider is not None else (rows[0] if rows else types.SimpleNamespace(id=uuid.uuid4()))
+        self.sso_state.stage_reauth(session, action, provider.id)
 
     def options(self, body=None):
         return _call(self.S, "POST", "/users/me/passkeys/register/options", body or {})
@@ -85,8 +88,8 @@ def test_a_confirmation_for_something_else_or_someone_elses_session_proves_nothi
     status, out = h.options()
     assert status == 403 and out["detail"]["reason"] == "provider_confirmation_required"
     # And neither of them was spent by the attempt.
-    assert h.sso_state.take_reauth("sess-1", "vault.delete") is True
-    assert h.sso_state.take_reauth("sess-2", ACTION) is True
+    assert h.sso_state.take_reauth("sess-1", "vault.delete") is not None
+    assert h.sso_state.take_reauth("sess-2", ACTION) is not None
 
 
 @pytest.mark.parametrize("providers", [
@@ -102,7 +105,7 @@ def test_an_account_nothing_can_confirm_is_told_to_ask_an_administrator(monkeypa
         assert status == 409, out
         assert out["detail"] == ("Your account has no password and no second factor yet, and no sign-in of your "
                                  "organisation can confirm you here. Ask an administrator.")
-        assert h.sso_state.take_reauth("sess-1", ACTION) is True       # left where it was
+        assert h.sso_state.take_reauth("sess-1", ACTION) is not None       # left where it was
 
 
 def test_only_the_accounts_own_identities_count(monkeypatch):
@@ -117,6 +120,21 @@ def test_only_the_accounts_own_identities_count(monkeypatch):
     listed = _call(h.S, "GET", "/users/me/passkeys")[1]
     assert listed["first_proof"] == {"kind": "none", "action": ACTION, "providers": []}
     assert "through its own sign-in;" in listed["provider_only"] and "Company sign-in" not in listed["provider_only"]
+
+
+def test_a_first_passkey_is_added_only_on_a_confirmation_from_a_provider_that_still_stands(monkeypatch):
+    """Linked to two providers, confirmed at the first, which is turned off before the passkey is added: the
+    other provider being on does not make that confirmation count, and it is spent all the same."""
+    entra, okta = _provider(), _provider(name="okta", label="Okta", sort_order=1)
+    h = ProviderHarness(monkeypatch, _provider_only(), [entra, okta])
+    h.confirm_at_the_provider(provider=entra)
+    entra.state = "disabled"
+    status, out = h.options()
+    assert status == 403 and out["detail"]["reason"] == "provider_confirmation_required", out
+    assert [p["label"] for p in out["detail"]["providers"]] == ["Okta"]
+    assert h.sso_state.take_reauth("sess-1", ACTION) is None           # spent, not left for later
+    h.confirm_at_the_provider(provider=okta)
+    assert h.options()[0] == 200
 
 
 def test_a_password_less_account_linked_to_a_provider_proves_it_the_same_way(monkeypatch):
@@ -134,7 +152,7 @@ def test_an_account_with_a_password_it_can_type_still_proves_the_password(monkey
     status, out = h.options()
     assert status == 400 and "password" in out["detail"]
     assert h.options({"current_password": "pw"})[0] == 200
-    assert h.sso_state.take_reauth("sess-1", ACTION) is True
+    assert h.sso_state.take_reauth("sess-1", ACTION) is not None
 
 
 def test_without_the_store_the_request_is_unavailable_not_refused_for_good(monkeypatch):
