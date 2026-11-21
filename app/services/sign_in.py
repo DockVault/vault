@@ -616,23 +616,44 @@ PROVIDER_ONLY_REASON = "Account signs in only through its identity provider"
 # The audit's reason for a provider sign-in that was not finished because its provider was turned off, or the
 # account unlinked from it, after the provider answered.
 PROVIDER_GONE_REASON = "The identity provider was turned off or unlinked before the sign-in finished"
+# The audit's reason for a passkey used by itself on an account whose password nobody knows: the key was set up on
+# the provider's sign-in alone and confirms the person after it.
+KEY_AFTER_THE_PROVIDER_REASON = "Passkey of an account without a password of its own, used without its identity provider"
 
 
 def refuse_without_the_provider(db, result: SignInResult) -> None:
-    """Refuse a sign-in of an account that signs in only through its provider (``users.sso_only``) when this sign-in
-    did not come through a provider: one audit row with the password door's reason, nothing counted (the proof was
-    good), and :class:`ProviderOnly`. A sign-in that came through the provider carries it in ``provider_id`` (also at
-    the second step, from the pending login), so the account's passkey still serves as its second factor there."""
+    """Refuse a sign-in that did not come through a provider for an account whose way in is its provider: one audit
+    row, nothing counted (the proof was good), and :class:`ProviderOnly`. A sign-in that came through the provider
+    carries it in ``provider_id`` (also at the second step, from the pending login), so the account's passkey still
+    serves as its second factor there.
+
+    Two kinds of account. One that signs in only through its provider (``users.sso_only``): whatever the proof.
+    And one whose password nobody knows (made at a first provider sign-in, say: app/core/password_origin.py), when
+    a passkey is the proof and no password is among the proofs. Such an account can type no password, so nothing
+    but its provider's sign-in stood behind the key when it was set up (Your account asks it for a fresh sign-in
+    there, and so does the enrollment at a sign-in). A key set up on the provider's word alone does not outlive
+    that word: by itself it would sign in after the provider refused the person, after the time without a sign-in
+    there ran out, and after the provider was turned off, none of which a passkey's own sign-in looks at. A
+    password of the account's own (set with a reset link) ends the mark, and the key signs in by itself as
+    anybody's does."""
     user = result.user
-    if result.is_temporary or result.provider_id or not getattr(user, "sso_only", False):
+    if result.is_temporary or result.provider_id:
+        return
+    from app.core import password_origin
+    methods = set(result.methods)
+    passkey = bool(methods & PASSKEYS)
+    provider_only = bool(getattr(user, "sso_only", False))
+    key_alone = passkey and PASSWORD not in methods and password_origin.nobody_knows(user)
+    if not (provider_only or key_alone):
         return
     from app.api import api_server as api
     from app.core import sso_only
-    message = sso_only.provider_only_message(db, user)
-    passkey = bool(set(result.methods) & {HARDWARE_KEY, SOFTWARE_KEY})
+    message = (sso_only.provider_only_message(db, user) if provider_only
+               else sso_only.passkey_after_the_provider_message(db, user))
     try:
-        api.AuditLogger(db).log_login_failure(user.username, result.client_ip, PROVIDER_ONLY_REASON, account=user,
-                                              login_identifier="passkey" if passkey else "username")
+        api.AuditLogger(db).log_login_failure(
+            user.username, result.client_ip, PROVIDER_ONLY_REASON if provider_only else KEY_AFTER_THE_PROVIDER_REASON,
+            account=user, login_identifier="passkey" if passkey else "username")
     except Exception:  # noqa: BLE001 -- the refusal stands without its row
         db.rollback()
     raise ProviderOnly(message)

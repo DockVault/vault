@@ -206,6 +206,14 @@ def provider_only_message(db, user) -> str:
             "gave you.")
 
 
+def passkey_after_the_provider_message(db, user) -> str:
+    """What a person is told when a passkey by itself would sign in an account whose password nobody knows: where
+    the account signs in, that the passkey confirms them after that sign-in, and what makes the passkey a sign-in
+    of its own."""
+    return (provider_only_message(db, user) + " Your passkey confirms it is you after that sign-in. It signs you "
+            "in by itself once your account has a password of its own: ask for a password reset link.")
+
+
 def passkey_note(db, user) -> Optional[str]:
     """What the passkey section tells an account that signs in only through its provider, or None for any other
     account: a passkey there confirms the person after the provider's sign-in and never stands in for it."""

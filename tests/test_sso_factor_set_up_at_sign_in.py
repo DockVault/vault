@@ -5,7 +5,7 @@ An account that can type no password (it signs in only through its provider, or 
 has nothing but the provider's sign-in to prove itself with. Held for a second factor it must set up, it sets up
 an authenticator, or a passkey where one can be made, on that sign-in; an account that has a password types it
 first. The cases: a factor required by the policy, an administrator's reset, an identity linked by email that is
-between two factors. Offline:
+between two factors. And the key such an account sets up serves after its provider, never around it. Offline:
 the routes through the ASGI app, an in-memory database, a real provider row and identity."""
 import types
 import uuid
@@ -325,3 +325,47 @@ def test_a_reset_of_an_account_linked_by_email_is_answered_at_the_provider_when_
     status, done = w.set_an_authenticator_up(headers)
     assert status == 200 and done.get("access_token") and carol.second_factor_reset_at is None, done
 
+
+def test_a_key_set_up_on_the_providers_word_signs_in_after_the_provider_and_never_around_it(monkeypatch):
+    """Dana's password is one nobody knows, and passwords are allowed at her provider, so her account is not one
+    that signs in only through it. Her passkey was set up on the provider's sign-in alone (nothing else could
+    prove it). A user-verified passkey of a user signs in by itself by default: hers would, after the provider
+    refused her, after her time without a sign-in there ran out, after the provider was turned off. So it does
+    not: by itself it is refused, with a message that says where to sign in, and it is her second factor after
+    the provider. Once she has a password of her own (a reset link), the mark is gone and the key signs in as
+    anybody's. An account with a password is not touched by any of this."""
+    from app.services import sign_in
+    dana, alice = _without_a_password("its password is one nobody knows"), _user("alice")
+    w = World(monkeypatch, [dana, alice], mfa_mode="optional")
+    auth, row = w.h.enroll(dana)
+    other, _row = w.h.enroll(alice)
+    failures_before = list(w.h.failures)
+    status, body = w.h.sign_in(auth, username="dana")
+    assert status == 403, body
+    assert "through Contoso" in body["detail"] and "after that sign-in" in body["detail"], body
+    assert "password reset link" in body["detail"]
+    assert w.h.failures[len(failures_before):] == [("dana", sign_in.KEY_AFTER_THE_PROVIDER_REASON, "passkey")]
+    assert w.h.counted == [] and row.sign_count == 1 and row.last_used_at is None        # the proof was good
+    # The pipeline's own rule, whatever door: a passkey without the provider, no password among the proofs.
+    for methods in (["hwk"], ["swk"]):
+        with pytest.raises(sign_in.ProviderOnly):
+            sign_in.finish(w.db, sign_in.SignInResult(dana, methods, IP, user_verified=True, passwordless_allowed=True))
+    # After the provider it is her second factor.
+    body, _headers = w.held(dana)
+    assert body["enrollment_required"] is False and body["methods"] == ["passkey"], body
+    identity = w.identity(dana)
+    assert isinstance(sign_in.finish(w.db, sign_in.SignInResult(
+        dana, ["hwk"], IP, provider_id=str(w.provider.id), provider_sub=identity.subject)), sign_in.SignedIn)
+    # An account with a password: its passkey signs in by itself, as before.
+    status, body = w.h.sign_in(other, username="alice")
+    assert status == 200 and body.get("access_token"), body
+    # A password of her own: another hash, so the mark no longer fits, and the key is hers alone.
+    dana.password_hash = "x"
+    status, body = w.h.sign_in(auth, username="dana", sign_count=2)
+    assert status == 200 and body.get("access_token"), body
+    # An account that signs in only through its provider is refused whatever the proof, with its own reason.
+    erin = _without_a_password("signs in only through its provider", name="erin")
+    w2 = World(monkeypatch, [erin], mfa_mode="optional")
+    with pytest.raises(sign_in.ProviderOnly):
+        sign_in.finish(w2.db, sign_in.SignInResult(erin, ["pwd"], IP))
+    assert w2.h.failures[-1] == ("erin", sign_in.PROVIDER_ONLY_REASON, "username")
