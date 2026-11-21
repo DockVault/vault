@@ -36,6 +36,7 @@ def _password_is_nobodys(user) -> None:
     The mark goes when the person sets a password of their own."""
     from app.core import password_origin
     password_origin.set_by_other(user, None)
+    password_origin.mark_nobody_knows(user)
 
 
 def make_sso_only(db, user, *, keep_session=None) -> None:
@@ -79,12 +80,19 @@ def end_sessions_no_provider_made(db, user, *, keep=None) -> int:
     return int(api._revoke_sessions(db, session_ids=ending, actor_username="system", durable=True) or 0)
 
 
-def allow_password_sign_in(db, user) -> None:
+def allow_password_sign_in(db, user, *, keep_password: bool = False) -> None:
     """Let ``user`` hold a password again, in the caller's transaction: the flag cleared, so a reset link can be made
     for the account and it may set a password. The hash stays one nobody knows until such a link is used (whatever
-    was written to it meanwhile is not a password), and nothing is minted here."""
+    was written to it meanwhile is not a password), and nothing is minted here.
+
+    ``keep_password``: for a privileged account met flagged. The flag on such an account comes from a release that
+    knew nothing of it, run for a while after going back to it, and that release may also have given the account a
+    real password (it had to, for the account to act as an administrator there): the hash is left as it is. Where
+    it is still the one nobody knows, its mark still says so."""
     from app.core.security import hash_password
     user.sso_only = False
+    if keep_password:
+        return
     user.password_hash = hash_password(secrets.token_urlsafe(32))
     _password_is_nobodys(user)
 
@@ -135,7 +143,7 @@ def settle(db, user, *, also=None, without=None, keep_session=None) -> Optional[
         make_sso_only(db, user, keep_session=keep_session)
         return MADE
     if flagged and not should:
-        allow_password_sign_in(db, user)
+        allow_password_sign_in(db, user, keep_password=privileged_accounts.kind(db, user) is not None)
         return RESTORED
     return None
 
@@ -151,7 +159,7 @@ def settle_privileged(db) -> list:
         kind = privileged_accounts.kind(db, user)
         if kind is None:
             continue
-        allow_password_sign_in(db, user)
+        allow_password_sign_in(db, user, keep_password=True)
         restored.append((user.id, user.username, user.email, privileged_accounts.TEXTS[kind]))
     return restored
 

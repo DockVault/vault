@@ -128,8 +128,9 @@ def test_a_confirmation_counts_only_while_the_provider_it_was_made_at_still_conf
         assert not [k for k in h.redis.rows if k.startswith("sso:reauth:")]          # nothing was staged
     else:
         assert h.finish_reauth(location)[0] == 200
-        assert sso_state.take_reauth(h.session_hash, "admin.retention.write") == str(one.id)   # names its provider
-        sso_state.stage_reauth(h.session_hash, "admin.retention.write", one.id)
+        # The stage names the provider and the identity it was made through.
+        assert sso_state.take_reauth(h.session_hash, "admin.retention.write") == (str(one.id), "at-one")
+        sso_state.stage_reauth(h.session_hash, "admin.retention.write", one.id, "at-one")
         gone()
     status, body = h.step_up(method="idp_reauth")
     assert status == 403 and "Confirm with your organisation" in body["detail"], body
@@ -140,8 +141,39 @@ def test_a_confirmation_counts_only_while_the_provider_it_was_made_at_still_conf
     assert h.step_up(method="idp_reauth")[0] == 200 and len(h.receipts) == 1
     # A stage that names no provider of the account (one from before stages named theirs) confirms nothing.
     for named in ("1", str(uuid.uuid4())):
-        sso_state.stage_reauth(h.session_hash, "admin.retention.write", named)
+        sso_state.stage_reauth(h.session_hash, "admin.retention.write", named, "at-two")
         assert h.step_up(method="idp_reauth")[0] == 403
+    # A confirmation made through an identity the account no longer holds on that provider is nobody's here: the
+    # provider is on and the account is linked to it, by another identity.
+    sso_state.stage_reauth(h.session_hash, "admin.retention.write", two.id, "the-identity-before")
+    assert h.step_up(method="idp_reauth")[0] == 403
+    sso_state.stage_reauth(h.session_hash, "admin.retention.write", two.id, "at-two")
+    assert h.step_up(method="idp_reauth")[0] == 200
+    # A stage of another shape (written before stages named theirs) is spent and counts for nothing.
+    h.redis.set(sso_state._reauth_key(h.session_hash, "admin.retention.write"), "1")
+    assert sso_state.take_reauth(h.session_hash, "admin.retention.write") is None
+    assert not [k for k in h.redis.rows if k.startswith("sso:reauth:")]
+
+
+def test_an_account_whose_password_nobody_knows_confirms_itself_at_its_provider(monkeypatch):
+    """An account made at a first provider sign-in holds a hash of random bytes, also where its provider allows
+    passwords. It has no password it could type, so for the password part of a step-up the provider is the one
+    thing that can confirm it, as for an account that signs in only through its provider. Once it has set a
+    password, the step-up means that password again."""
+    from app.core import password_origin
+    dana = _user("dana", password_hash="argon2:of-random-bytes", password_nobody_knows=None)
+    password_origin.mark_nobody_knows(dana)
+    p = _provider(last_test=TESTED)
+    h = Reauth(monkeypatch, [dana], [p], identities=[_identity(dana, p, subject="s-dana")])
+    h.current_user = dana
+    status, body = _call(h.S, "POST", "/auth/second-factor/challenge", {"action": "admin.retention.write"})[:2]
+    assert status == 200 and "idp_reauth" in body["methods"], body
+    status, location, _ = _stepped_up_url(h, p, sub="s-dana", auth_time=int(time.time()) - 5)
+    assert h.finish_reauth(location)[0] == 200 and h.step_up(method="idp_reauth")[0] == 200
+    dana.password_hash = "x"                                       # a password set since
+    status, body = _call(h.S, "POST", "/auth/second-factor/challenge", {"action": "admin.retention.write"})[:2]
+    assert status == 200 and "idp_reauth" not in body["methods"], body
+    assert h.start_reauth(p)[0] == 403
 
 
 def test_the_provider_must_be_linked_and_tested_with_auth_time(monkeypatch):
@@ -247,10 +279,11 @@ def test_a_provider_never_stands_in_for_a_password_the_account_has_or_for_a_comp
         assert status == 403 and body["detail"]["reason"] == "password_required", (user.username, status, body)
         assert "own password" in body["detail"]["message"]
         assert not [k for k in h.redis.rows if k.startswith("sso:state:")], user.username     # nothing was started
-        sso_state.stage_reauth(h.session_hash, action, p.id)   # a proof staged all the same (an older build, a bug)
+        subject = f"s-{user.username}"
+        sso_state.stage_reauth(h.session_hash, action, p.id, subject)   # a proof staged all the same (a bug)
         status, body = h.step_up(action=action, method="idp_reauth")
         assert status == 403 and "Confirm with your organisation" in body["detail"], (user.username, body)
-        assert sso_state.take_reauth(h.session_hash, action) == str(p.id)   # and it was not spent: nothing looked at it
+        assert sso_state.take_reauth(h.session_hash, action) == (str(p.id), subject)   # not spent: nothing looked
         assert h.step_up(action=action, method="password", password="pw")[0] == 200
 
     for user in (alice, root, auditor):

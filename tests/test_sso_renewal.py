@@ -170,6 +170,34 @@ def test_a_session_with_no_record_of_the_identity_it_came_through_is_not_renewed
     assert sign_in.provider_subject_of_session(db, OLD) is None and sign_in.provider_subject_of_session(db, None) is None
 
 
+def test_a_session_through_an_identity_linked_by_email_is_not_kept_going_past_a_factor_the_account_set_up(db):
+    """An identity was put on the account by its email address, and a session came through it on the provider's
+    trusted MFA. The owner then sets up a factor of their own. A new sign-in through that identity is asked for
+    that factor (the provider's word does not stand in for it); so "Stay signed in" does not keep the older
+    session going on the provider's word either. An identity the owner linked themselves is trusted as the policy
+    says, and so is an email-linked one while the account has no factor of its own."""
+    user = User(id=uuid.uuid4(), username="bob", email="bob@example.test", password_hash="x", role=RoleEnum.USER,
+                is_active=True, is_locked=False)
+    db.add(user)
+    db.commit()
+    provider = _provider(db, sso_trust_idp_mfa=True, sso_accepted_amr=["mfa"], sso_freshness_days=0)
+    identity = _link(db, user, provider)
+    identity.linked_by = "email"
+    db.commit()
+
+    def refusal():
+        return sso_sign_in.renewal_refusal(db, user, provider.id, methods=(), subject=identity.subject)
+
+    assert refusal() is None                                    # no factor of its own: the provider's MFA stands
+    db.add(SecondFactorEnrollment(id=uuid.uuid4(), user_id=user.id, method="totp", status="active", secret_enc="s"))
+    db.commit()
+    assert refusal() == "Signing in now needs your second factor; sign in again."
+    assert sso_sign_in.renewal_refusal(db, user, provider.id, methods=("totp",), subject=identity.subject) is None
+    identity.linked_by = "self"                                 # the owner's own link: trusted as the policy says
+    db.commit()
+    assert refusal() is None
+
+
 def test_the_provider_row_a_link_is_made_on_is_read_again_whole_and_loses_nothing_pending(db):
     """Where a link resumes after the provider's round trip, the provider row is read again. A session keeps a
     row as it first read it, so a plain query would hand the same stale object back: turned off by somebody else

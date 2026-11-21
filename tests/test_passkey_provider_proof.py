@@ -35,16 +35,17 @@ class ProviderHarness(Harness):
         from app.core.models import ExternalIdentity, SsoProvider
         self.db.rows_of(SsoProvider).extend(providers)
         self.db.rows_of(ExternalIdentity).extend(
-            types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, provider_id=p.id) for p in providers)
+            types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, provider_id=p.id, subject="subject-1")
+            for p in providers)
         self.sso_state = sso_state
         monkeypatch.setattr(sso_state, "_redis", lambda redis: self.redis)
         monkeypatch.setattr(self.S, "_current_session_hash", lambda request: "sess-1")
 
-    def confirm_at_the_provider(self, session="sess-1", action=ACTION, provider=None):
+    def confirm_at_the_provider(self, session="sess-1", action=ACTION, provider=None, subject="subject-1"):
         from app.core.models import SsoProvider
         rows = self.db.rows_of(SsoProvider)
         provider = provider if provider is not None else (rows[0] if rows else types.SimpleNamespace(id=uuid.uuid4()))
-        self.sso_state.stage_reauth(session, action, provider.id)
+        self.sso_state.stage_reauth(session, action, provider.id, subject)
 
     def options(self, body=None):
         return _call(self.S, "POST", "/users/me/passkeys/register/options", body or {})
@@ -135,6 +136,11 @@ def test_a_first_passkey_is_added_only_on_a_confirmation_from_a_provider_that_st
     assert h.sso_state.take_reauth("sess-1", ACTION) is None           # spent, not left for later
     h.confirm_at_the_provider(provider=okta)
     assert h.options()[0] == 200
+    # Made through an identity the account no longer holds on that provider (unlinked, another linked since): the
+    # provider is on, and the confirmation is still somebody else's.
+    h.confirm_at_the_provider(provider=okta, subject="the-identity-before")
+    status, out = h.options()
+    assert status == 403 and out["detail"]["reason"] == "provider_confirmation_required", out
 
 
 def test_a_password_less_account_linked_to_a_provider_proves_it_the_same_way(monkeypatch):

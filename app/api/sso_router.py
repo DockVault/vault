@@ -774,12 +774,12 @@ async def finish_reauth(
         raise HTTPException(status_code=401, detail="This code is not valid for this tab; start again.")
     if not sso.reauth_permitted(db, current_user, action):
         raise HTTPException(status_code=403, detail={"reason": "password_required", "message": sso.REAUTH_NOT_FOR_THIS})
-    if not sso.reauth_stands(db, current_user, record["provider_id"]):
+    if not sso.reauth_stands(db, current_user, record["provider_id"], record.get("subject")):
         # Turned off, or the account unlinked from it, while the person was at the provider.
         raise HTTPException(status_code=409, detail={"reason": sso.PROVIDER_DISABLED,
                                                      "message": sso.reason_text(sso.PROVIDER_DISABLED)})
     try:
-        sso_state.stage_reauth(record["session_hash"], action, record["provider_id"])
+        sso_state.stage_reauth(record["session_hash"], action, record["provider_id"], record.get("subject"))
     except sso_state.Unavailable:
         raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
     _audit(db, "step_up_idp_reauth", user=current_user, ip=api.get_client_ip(request),

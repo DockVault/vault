@@ -317,7 +317,10 @@ def test_an_account_made_through_a_provider_holds_a_password_that_is_not_its_own
     (invited,), (first,) = h.users_named("invited"), h.users_named("first")
     for made in (invited, first):
         assert password_origin.is_set_by_other(made) and made.password_set_by is None, made.username
+        # And it is marked as one nobody can type, so the account is asked for none.
+        assert password_origin.nobody_knows(made) is True, made.username
     assert not password_origin.is_set_by_other(bob) and bob.password_hash == "x"
+    assert password_origin.nobody_knows(bob) is False
 
 
 def test_every_new_account_gets_a_password_hash_of_its_own_that_nobody_knows(monkeypatch):

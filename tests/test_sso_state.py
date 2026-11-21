@@ -288,7 +288,7 @@ def test_while_redis_is_known_to_be_down_no_store_here_touches_the_socket(own_st
     with pytest.raises(s.Unavailable):
         s.take_handover(code)
     with pytest.raises(s.Unavailable):
-        s.stage_reauth("sess", "admin.retention.write", "provider-1")
+        s.stage_reauth("sess", "admin.retention.write", "provider-1", "subject-1")
     with pytest.raises(s.Unavailable):
         s.take_reauth("sess", "admin.retention.write")
     with pytest.raises(s.Unavailable):

@@ -281,25 +281,33 @@ def _reauth_key(session_hash: str, action: str) -> str:
     return REAUTH_PREFIX + hashlib.sha256(f"{session_hash}:{action}".encode("utf-8")).hexdigest()
 
 
-def stage_reauth(session_hash: str, action: str, provider_id, *, redis=None) -> None:
-    """Note that this session re-authenticated at the provider ``provider_id`` for ``action``: spent by
-    :func:`take_reauth` once, within :data:`REAUTH_TTL_SECONDS`. Raises :class:`Unavailable` without the store."""
+def stage_reauth(session_hash: str, action: str, provider_id, subject, *, redis=None) -> None:
+    """Note that this session re-authenticated at the provider ``provider_id`` as ``subject`` for ``action``: spent
+    by :func:`take_reauth` once, within :data:`REAUTH_TTL_SECONDS`. Raises :class:`Unavailable` without the store."""
+    import json
     try:
-        _redis(redis).set(_reauth_key(session_hash, action), str(provider_id), ex=REAUTH_TTL_SECONDS)
+        _redis(redis).set(_reauth_key(session_hash, action), json.dumps([str(provider_id), str(subject or "")]),
+                          ex=REAUTH_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable(str(exc)) from exc
 
 
-def take_reauth(session_hash: str, action: str, *, redis=None) -> Optional[str]:
-    """Spend the staged re-authentication of this session for ``action``: the provider it was made at, once, then
-    None. Whoever spends it asks whether that provider may still confirm the account."""
+def take_reauth(session_hash: str, action: str, *, redis=None) -> Optional[tuple]:
+    """Spend the staged re-authentication of this session for ``action``: (the provider it was made at, the
+    subject it was made as), once, then None. Whoever spends it asks whether that identity may still confirm the
+    account. A stage of another shape (one written before stages named theirs) is spent and is none."""
+    import json
     try:
         staged = _redis(redis).getdel(_reauth_key(session_hash, action))
     except Exception as exc:  # noqa: BLE001
         raise Unavailable(str(exc)) from exc
     if staged is None:
         return None
-    return staged.decode("utf-8", "replace") if isinstance(staged, bytes) else str(staged)
+    try:
+        provider_id, subject = json.loads(staged.decode("utf-8") if isinstance(staged, bytes) else staged)
+    except (TypeError, ValueError):
+        return None
+    return (provider_id, subject) if isinstance(provider_id, str) and isinstance(subject, str) else None
 
 
 def seen_logout_jti(jti: str, ttl_seconds: int, *, scope: str, redis=None) -> bool:

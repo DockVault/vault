@@ -511,6 +511,7 @@ def _password_is_nobodys(user, now) -> None:
     approves no held change. The mark goes when the person sets a password of their own."""
     from app.core import password_origin
     password_origin.set_by_other(user, None, now)
+    password_origin.mark_nobody_knows(user)       # and nobody can type it: the account is asked for none
 
 
 def _admitted_address(db, answer: ProviderAnswer, policy: dict, account_policy: dict) -> Optional[str]:
@@ -955,8 +956,10 @@ def reauth_permitted(db, user, action: Optional[str] = None) -> bool:
     which asks for the account's own second factor and its own password. With no ``action`` the question is
     about the account alone. Asked where the method is offered, where a re-authentication starts, where its
     answer is staged and where the step-up takes it: none of them trusts another."""
+    from app.core import password_origin
     from app.core import privileged_accounts, second_factor_actions as acts, second_factor_policy as pol
-    if user is None or not (getattr(user, "sso_only", False) or not getattr(user, "password_hash", None)):
+    if user is None or not (getattr(user, "sso_only", False) or not getattr(user, "password_hash", None)
+                            or password_origin.nobody_knows(user)):
         return False            # the account has a password it can type: the step-up means that password
     if privileged_accounts.kind(db, user) is not None:
         return False
@@ -1012,12 +1015,19 @@ def confirmed_address_wanted_among(db, users, *, with_a_factor=()) -> set:
     return {u.id for u in open_ if not linking <= linked.get(u.id, set())}
 
 
-def reauth_stands(db, user, provider_id) -> bool:
-    """Whether the provider a re-authentication was made at may still confirm ``user``: one of the account's own
-    that confirms afresh now (:func:`reauth_providers`). A confirmation made at a provider that was turned off
-    since (an incident), or that the account was unlinked from, confirms nothing, whatever other provider of
-    the account is on."""
-    return bool(provider_id) and any(str(p.id) == str(provider_id) for p in reauth_providers(db, user))
+def reauth_stands(db, user, provider_id, subject=None) -> bool:
+    """Whether the provider a re-authentication was made at may still confirm ``user``, by the identity it was
+    made through: one of the account's own providers that confirms afresh now (:func:`reauth_providers`), and the
+    account's identity there is still the one that confirmed (``subject``). A confirmation made at a provider
+    that was turned off since (an incident), or through an identity the account was unlinked from (another one
+    linked on the same provider since is another person's word), confirms nothing, whatever else is on."""
+    from app.core.models import ExternalIdentity
+    if not provider_id or not any(str(p.id) == str(provider_id) for p in reauth_providers(db, user)):
+        return False
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
+        if str(identity.provider_id) == str(provider_id):
+            return same_identity(identity, subject)
+    return False
 
 
 def reauth_providers(db, user) -> list:
@@ -1087,7 +1097,12 @@ def renewal_refusal(db, user, provider_id, *, methods=(), subject: Optional[str]
         return f"Sign in through {name} again to stay signed in."
     from app.api import api_server as api
     own_factor = set(methods or ()) & sign_in.SECOND_KINDS
-    if not own_factor and not policy_of(provider)["sso_trust_idp_mfa"] and api._login_second_factor_in_effect(db, user):
+    # The provider's MFA stands in for the account's factor where the policy trusts it, and never for an identity
+    # that was linked by email once the account set up a factor of its own (pipeline_result holds a new sign-in to
+    # the same): a session from before that factor is not kept going past it.
+    trusted = policy_of(provider)["sso_trust_idp_mfa"] and not (
+        getattr(identity, "linked_by", None) == LINKED_BY_EMAIL and set_up_its_own_factor(db, user))
+    if not own_factor and not trusted and api._login_second_factor_in_effect(db, user):
         return "Signing in now needs your second factor; sign in again."
     return None
 

@@ -375,13 +375,22 @@ def test_a_privileged_account_flagged_provider_only_gets_its_password_back_and_f
     assert sso_only.should_be_sso_only(h.db, held) is False and sso_only.should_be_sso_only(h.db, held, also=p) is False
     assert sso_only.should_be_sso_only(h.db, plain) is True
     # Met by any settling (a removal, an unlink, a change of the setting): the password back, nothing raised.
+    # Its password is left as it is: the release that made it an administrator may have given it a real one.
     before = held.password_hash
     assert sso_only.settle(h.db, held) == sso_only.RESTORED
-    assert held.sso_only is False and held.password_hash != before and held.password_hash.startswith("argon2:")
+    assert held.sso_only is False and held.password_hash == before
     assert sso_only.settle(h.db, held) is None and sso_only.settle(h.db, plain) is None and plain.sso_only is True
     # At start: every such account, and only those.
     held.sso_only = True
+    held.password_hash = "argon2:the-one-an-administrator-set-on-the-earlier-release"
     restored = sso_only.settle_privileged(h.db)
+    assert held.password_hash == "argon2:the-one-an-administrator-set-on-the-earlier-release"
+    # An ordinary account that may hold a password again still gets one nobody knows, and it says so.
+    from app.core import password_origin
+    ordinary = _user("ordinary", sso_only=True, password_hash="argon2:whatever-was-written")
+    sso_only.allow_password_sign_in(h.db, ordinary)
+    assert ordinary.sso_only is False and ordinary.password_hash != "argon2:whatever-was-written"
+    assert password_origin.nobody_knows(ordinary) is True
     assert [(r[1], r[3]) for r in restored] == [("held", privileged_accounts.TEXTS[privileged_accounts.kind(h.db, held)])]
     assert held.sso_only is False and plain.sso_only is True and root.sso_only is False
     assert sso_only.settle_privileged(h.db) == []
