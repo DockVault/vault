@@ -376,7 +376,7 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     label = row.label or row.name
     # Each account linked to it loses a way to sign in, and its flag follows the providers it is still linked to
     # (one held to no password by this provider alone may hold a password again; nothing is minted).
-    kept, may_set = [], []
+    kept, may_set, to_ask = [], [], []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
         user = db.query(User).filter(User.id == identity.user_id).first()
         if user is None:
@@ -384,15 +384,24 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         settled = sso_only.settle(db, user, without=identity)
         # Told how to get a password: an account that may hold one again, and one that has none it can type and
         # no other provider that is on (its passkey signs in after a provider only: nothing else would sign it in).
+        # Not one that another provider still holds to no password, though that provider is off: a reset link is
+        # refused for it, so it is told who can help and not to do what would be refused.
         from app.services import sign_in
         stranded = (not sign_in.has_a_password_it_can_type(user)
                     and not sso_only.another_way_in(db, user, without=identity))
-        (may_set if settled == sso_only.RESTORED or stranded else kept).append((user.id, user.username, user.email))
+        told = (user.id, user.username, user.email)
+        if settled == sso_only.RESTORED or (stranded and not getattr(user, "sso_only", False)):
+            may_set.append(told)
+        elif stranded:
+            to_ask.append(told)
+        else:
+            kept.append(told)
     db.delete(row)
     db.commit()
     removed = f"An administrator removed {label} from this vault: your account can no longer sign in through it."
     _tell_accounts(kept, "A sign-in method was removed from your account", removed)
     _tell_accounts(may_set, "A sign-in method was removed from your account", f"{removed} {SET_A_PASSWORD}")
+    _tell_accounts(to_ask, "A sign-in method was removed from your account", f"{removed} {sso_only.NO_PROVIDER_ON}")
     _audit(db, "sso_provider_deleted", user=current_user, ip=api.get_client_ip(request), row_id=gone["provider_id"],
            details={"provider_id": gone["provider_id"], "name": gone["name"], "identities": gone["identities"]})
     _tell_administrators(current_user.username, "A single sign-on provider was removed",

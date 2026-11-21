@@ -246,22 +246,35 @@ def test_a_removal_tells_an_account_left_with_no_way_in_how_to_get_a_password(mo
     """A provider is removed. An account linked to it that has a password is told it lost a way to sign in. One
     whose password nobody knows, linked to no other provider that is on, has nothing left that signs it in (its
     passkey signs in after a provider only): it is told how to get a password, as an account that may hold one
-    again is. With another provider that is on it is told what the first is told."""
+    again is. With another provider that is on it is told what the first is told; where that other provider has
+    refused it, nothing would sign it in there either, and it is told how to get a password. An account another
+    provider still holds to no password, that provider being off, cannot use a reset link (none is made or taken
+    for it): it is told to ask an administrator, not to do what would be refused."""
+    from datetime import datetime
     from app.api import sso_providers_router as router
-    from app.core import password_origin
+    from app.core import password_origin, sso_only
     row, other = _provider(created_at=None, updated_at=None, state="disabled"), _provider(name="Fabrikam")
-    alice, dana, erin = _user("alice"), _user("dana"), _user("erin")
-    for marked in (dana, erin):
+    no_password = _provider(name="Northwind", state="disabled")
+    no_password.policy = {"sso_password_login": "disabled"}
+    alice, dana, erin, frank, gina = _user("alice"), _user("dana"), _user("erin"), _user("frank"), _user("gina")
+    for marked in (dana, erin, gina):
         marked.sso_only, marked.password_hash, marked.password_nobody_knows = False, "argon2:of-random-bytes", None
         password_origin.mark_nobody_knows(marked)
-    h = Admin(monkeypatch, [row, other], users=[alice, dana, erin],
-              identities=[_identity(alice, row), _identity(dana, row), _identity(erin, row), _identity(erin, other)])
+    frank.sso_only, frank.password_hash, frank.password_nobody_knows = True, "argon2:of-random-bytes", None
+    password_origin.mark_nobody_knows(frank)
+    h = Admin(monkeypatch, [row, other, no_password], users=[alice, dana, erin, frank, gina],
+              identities=[_identity(alice, row), _identity(dana, row), _identity(erin, row), _identity(erin, other),
+                          _identity(frank, row), _identity(frank, no_password),
+                          _identity(gina, row),
+                          _identity(gina, other, refused_at=datetime.utcnow(), last_sign_in_at=None)])
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 200 and out == {"removed": True}, out
     removed = f"An administrator removed {row.label or row.name} from this vault: your account can no longer sign in through it."
     told = {tuple(names): text for names, _title, text in h.accounts_told}
     assert told[("alice", "erin")] == removed
-    assert told[("dana",)] == f"{removed} {router.SET_A_PASSWORD}"
+    assert told[("dana", "gina")] == f"{removed} {router.SET_A_PASSWORD}"
+    assert told[("frank",)] == f"{removed} {sso_only.NO_PROVIDER_ON}" and frank.sso_only is True
+    assert "Ask your administrator" in sso_only.NO_PROVIDER_ON and len(told) == 3
 
 
 def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_was_off(monkeypatch):

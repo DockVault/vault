@@ -184,8 +184,7 @@ def provider_only_message(db, user) -> str:
     is not on the sign-in page; when no provider of the account is enabled, to ask an administrator."""
     names, buttons = _providers_to_name(db, user)
     if not names:
-        return ("Your organisation signs this account in through its own sign-in, which is not available on this vault "
-                "right now. Ask your administrator.")
+        return NO_PROVIDER_ON
     through = " or ".join(names)
     if buttons:
         return (f"Your organisation signs this account in through {through}. Use the "
@@ -194,12 +193,20 @@ def provider_only_message(db, user) -> str:
             "gave you.")
 
 
+# What an account that signs in only through its provider is told where no provider it is linked to is on.
+NO_PROVIDER_ON = ("Your organisation signs this account in through its own sign-in, which is not available on this "
+                  "vault right now. Ask your administrator.")
+
+
 def another_way_in(db, user, *, without) -> bool:
-    """Whether ``user`` is linked to a provider that is on by an identity other than ``without``: a way to sign in
-    once ``without`` is gone, for an account that has no password it can type."""
+    """Whether ``user`` is linked to a provider that is on by an identity other than ``without``, one its provider
+    has not refused: a way to sign in once ``without`` is gone, for an account that has no password it can type.
+    A refusal in force lets nobody in through that identity until the provider admits the person again or an
+    administrator clears it, so it is no way in to count on."""
     from app.core.models import ExternalIdentity, SsoProvider
+    from app.services import sso_freshness
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
-        if identity.id == getattr(without, "id", None):
+        if identity.id == getattr(without, "id", None) or sso_freshness.refusal_in_force(identity):
             continue
         row = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
         if row is not None and getattr(row, "state", None) == "enabled":

@@ -634,7 +634,9 @@ def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_accoun
     monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: turns.append(owner))
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
     assert status == 200 and out == {"removed": True, "sessions_ended": 1} and h.identities() == [bobs], out
-    assert revoked == [{"session_ids": [through], "actor_username": "alice", "durable": True}] and turns == [str(alice.id)]
+    assert revoked == [{"session_ids": [through], "actor_username": "alice", "durable": True}]
+    # The account's turn: before its identities are read, and again where what came through this one ends.
+    assert [str(owner) for owner in turns] == [str(alice.id)] * 2
     assert mine.consumed_at is not None and others.consumed_at is None
     unlinked = [a for a in h.audits if a[0] == "sso_identity_unlinked"]
     assert len(unlinked) == 1 and unlinked[0][2]["sessions"] == 1 and h.step_ups.count("account.second_factor") == 4
@@ -1203,7 +1205,22 @@ def test_an_account_with_no_password_it_can_type_does_not_unlink_its_only_way_in
     q.state = "disabled"
     assert _call(h.S, "DELETE", path)[0] == 409
     q.state = "enabled"
+    # On, but it has refused the person since their last sign-in there: nobody gets in through it now.
+    other.refused_at, other.last_sign_in_at = datetime.utcnow(), None
+    assert _call(h.S, "DELETE", path)[0] == 409
+    other.refused_at = None
     monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: 0)
+    # Another unlink, of the other identity, got the account's turn first: this one waits for it and then finds
+    # the identity it counted on gone.
+    turns = []
+
+    def the_other_unlink_went_first(db, owner):
+        turns.append(str(owner))
+        if other in h.identities():
+            h.identities().remove(other)
+    monkeypatch.setattr(h.S, "_sessions_turn", the_other_unlink_went_first)
+    assert _call(h.S, "DELETE", path)[0] == 409 and turns == [str(dana.id)] and h.identities() == [identity]
+    h.identities().append(other)
     monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: None)
     status, out, _ = _call(h.S, "DELETE", path)
     assert status == 200 and out["removed"] is True and h.identities() == [other], out

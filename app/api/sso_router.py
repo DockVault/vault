@@ -1212,6 +1212,9 @@ async def unlink_my_identity(
     api = _api()
     _refuse_temp(current_user)
     api._enforce_step_up(db, current_user, request, "account.second_factor")
+    # The account's turn before its identities are read: two unlinks sent at once would each count the other's
+    # identity as the way in that is left, and both would go through.
+    api._sessions_turn(db, current_user.id)
     identity = db.query(ExternalIdentity).filter(ExternalIdentity.id == identity_id,
                                                  ExternalIdentity.user_id == current_user.id).first()
     if identity is None:

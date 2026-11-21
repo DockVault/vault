@@ -922,11 +922,15 @@ def linked_on_the_providers_word(db, user, identity) -> bool:
     hold it, or the device is gone, and the next one is to be set up by the account itself. Whoever holds its
     address at the provider would otherwise sign in on the provider's MFA alone for as long as the reset stays
     unanswered. Nobody is shut out by it: the sign-in is held for the set-up, which an account with a password
-    proves with that password (asked first), and one with none by the provider's sign-in itself."""
+    proves with that password (asked first), and one with none by the provider's sign-in itself. So the password
+    is what keeps the holder of the address out: an account with none it can type has the provider for its only
+    door, and for it the rule adds the set-up of a factor and keeps nobody out."""
     from app.services import sign_in
     if identity is None or getattr(identity, "linked_by", None) != LINKED_BY_EMAIL:
         return False
-    return sign_in.holds_a_factor(db, user) or bool(_api()._second_factor_to_set_up_again(db, user))
+    if sign_in.holds_a_factor(db, user):
+        return True
+    return bool(_api()._second_factor_to_set_up_again(db, user, has_active=False))     # none is active: just read
 
 
 def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:
