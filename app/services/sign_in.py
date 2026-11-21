@@ -310,7 +310,9 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
             raise
         db.rollback()
         drop_the_session_the_proof_made(db, result)
-        raise HTTPException(status_code=503, detail=BUSY, headers={"Retry-After": "5"}) from None
+        from app.core import sign_in_lockout
+        raise HTTPException(status_code=503, detail=BUSY,
+                            headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}) from None
     refresh = getattr(db, "refresh", None)
     if refresh is not None:
         try:

@@ -188,7 +188,8 @@ def test_a_turn_held_too_long_refuses_the_sign_in_as_busy_and_leaves_no_session(
     with pytest.raises(HTTPException) as busy:
         write(db, result)
     assert (busy.value.status_code, busy.value.detail) == (503, sign_in.BUSY)
-    assert busy.value.headers == {"Retry-After": "5"} and result.session_token is None
+    assert busy.value.headers == {"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}
+    assert result.session_token is None
     assert _rows(db, "active_sessions", alice) == 0 and _rows(db, "pending_logins", alice) == 0
     # Another failure of the database is its own: not a busy turn.
     monkeypatch.setattr(api, "_sessions_turn", held(_Other()))
