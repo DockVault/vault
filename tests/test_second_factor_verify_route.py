@@ -74,14 +74,14 @@ def test_a_held_sign_in_makes_no_factor_active_for_an_account_that_may_not_sign_
     from fastapi import HTTPException
     S = _api()
     from app.core import sign_in_lockout
-    from app.core.models import SecondFactorEnrollment, User
+    from app.core.models import PendingLogin, SecondFactorEnrollment, User
     from app.services import sign_in
     user = _user()
     user.second_factor_reset_at = None
     enrollment = types.SimpleNamespace(user_id=user.id, status="unconfirmed", method="totp",
                                        confirmed_at=datetime.utcnow())
-    db = MemoryDB({User: [user], SecondFactorEnrollment: [enrollment]})
-    pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, _methods_so_far=("password",))
+    pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, consumed_at=None, _methods_so_far=("password",))
+    db = MemoryDB({User: [user], SecondFactorEnrollment: [enrollment], PendingLogin: [pending]})   # still held
     asked = []
     monkeypatch.setattr(S, "_sf_recovery_remaining", lambda db, user_id: 10)
     monkeypatch.setattr(S, "get_client_ip", lambda request: "203.0.113.9")

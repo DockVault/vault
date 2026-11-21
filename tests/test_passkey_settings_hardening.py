@@ -606,8 +606,87 @@ def test_a_sign_in_under_way_ends_with_the_accounts_sessions(monkeypatch, what):
     assert _call_h(h.S, "POST", options_path, {}, others["headers"])[0] == 200
     # Every place that ends an account's sessions for such a reason does the same (a password set with a reset
     # link, the account's own change of it, a password taken back at a promotion, a lock or a deactivation).
+    # Each of those is driven in test_sign_ins_under_way_end.py; none is to be added without a case there.
     import inspect
+    from app.api import user_management_api
     assert inspect.getsource(h.S).count("sign_in.spend_sign_ins_under_way(") == 8
+    assert inspect.getsource(user_management_api).count("sign_in.spend_sign_ins_under_way(") == 3
+
+
+@pytest.mark.parametrize("found", ["spent", "gone"])
+@pytest.mark.parametrize("factor", ["a passkey", "an authenticator"])
+def test_a_held_sign_in_spent_while_it_waited_for_the_accounts_turn_writes_no_factor(monkeypatch, factor, found):
+    """Mallory's held sign-in sends the last request of a set-up in the moment an administrator's change is
+    applied. The token was read while the sign-in was still held; the change then spent it. The routes that write
+    a factor take the account's turn and read the held sign-in again in it, so the request that waited behind the
+    change finds itself spent and writes nothing: no key is stored, no authenticator is made active. The same
+    where the held sign-in is no longer there at all. The turn is stood in for by what a change holding it does
+    before it lets go."""
+    registry, wss = _mod()
+    from app.core.models import PendingLogin, SecondFactorEnrollment, SecondFactorRecoveryCode, WebAuthnCredential
+    from app.services import sign_in
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = StepHarness(monkeypatch, [alice])
+    _required(monkeypatch, registry, wss, ["user"])
+    pending, headers = h.pending_for(alice)
+    pending.enrollment_required = True
+    begun = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, method="totp", status="unconfirmed",
+                                  confirmed_at=datetime.utcnow(), secret_enc="sealed")
+    h.db.rows_of(SecondFactorEnrollment).append(begun)
+    h.db.rows_of(SecondFactorRecoveryCode).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, consumed_at=None))
+    if factor == "a passkey":
+        method, path, body = "POST", "/users/me/passkeys/register/verify", {"challenge_id": "ab" * 16, "credential": {}}
+        status, answer = _call_h(h.S, method, path, body, headers)
+        assert status == 400 and answer["detail"]["reason"] == "challenge_unknown", answer    # it reaches the challenge
+    else:
+        method, path, body = "POST", "/users/me/second-factor/recovery/acknowledge", None
+    turns = []
+
+    def a_change_held_the_turn_first(db, user_id):
+        turns.append((user_id, pending.consumed_at))
+        if found == "spent":
+            sign_in.spend_sign_ins_under_way(db, user_id)
+        else:
+            db.rows_of(PendingLogin).remove(pending)
+    monkeypatch.setattr(h.S, "_sessions_turn", a_change_held_the_turn_first)
+    status, answer = _call_h(h.S, method, path, body, headers)
+    assert turns == [(alice.id, None)], "the turn was asked for while the sign-in was still held"
+    assert status == 401 and answer["detail"] == "This login attempt has expired; start again.", answer
+    assert h.db.rows_of(WebAuthnCredential) == []
+    assert "active" not in [e.status for e in h.db.rows_of(SecondFactorEnrollment)]
+
+
+@pytest.mark.parametrize("change", ["a new password", "a second-factor reset", "the removal of a passkey"])
+def test_a_change_to_how_an_account_signs_in_takes_its_turn_before_it_reads_anything(monkeypatch, change):
+    """A sign-in held for a set-up writes its factor in the account's turn at its sessions. An administrator's
+    change takes that turn before it reads or writes anything of the account: taken only where the sessions are
+    ended, at its end, a reset had already retired the keys it found and would miss the one a held sign-in stored
+    meanwhile, and a removal had already counted the factors that are left."""
+    registry, wss = _mod()
+    from app.core import auditor_rights, credential_changes as cc, legal_holds
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential
+    alice, root = _user(password_set_by=None, password_set_by_other_at=None), _user("root", role="admin")
+    h = StepHarness(monkeypatch, [alice, root])
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: 0)
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, label="k", cose_alg=-7)
+    h.db.rows_of(WebAuthnCredential).append(key)
+    _authenticator(h, alice)
+    was = alice.password_hash
+
+    def untouched():
+        return (key.retired_at is None, len(h.db.rows_of(SecondFactorEnrollment)), alice.password_hash == was,
+                getattr(alice, "second_factor_reset_at", None) is None)
+    seen = []
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: seen.append((user_id, untouched())))
+    kind, payload = {"a new password": (cc.PASSWORD, {"password_hash": "another"}),
+                     "a second-factor reset": (cc.SECOND_FACTOR, {}),
+                     "the removal of a passkey": (cc.PASSKEY, {"passkey_id": str(key.id)})}[change]
+    h.S._apply_credential_change(h.db, kind, alice, payload, actor_id=root.id, actor_name="root")
+    assert seen == [(alice.id, (True, 1, True, True))]
+    assert untouched() != (True, 1, True, True), "and the change was then made"
 
 
 def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monkeypatch):

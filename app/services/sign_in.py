@@ -411,14 +411,34 @@ def spend_sign_ins_under_way(db, user_id) -> int:
     enrollment), in the caller's transaction; returns how many. Called where the account's sessions are ended
     because something about how it signs in changed, or because it is to be signed out everywhere: a held sign-in
     was proved by what the account had before (the old password, say), lives five minutes, and would otherwise
-    go on to a session, or set a passkey up, after the change that was meant to end it. A database built with
-    only the tables a test needs may hold no sign-ins at all: nothing to spend there."""
+    go on to a session, or set a passkey up, after the change that was meant to end it. An authenticator app the
+    account had begun to set up and not finished goes with them (:func:`_drop_a_set_up_left_half_way`). A
+    database built with only the tables a test needs may hold no sign-ins at all: nothing to spend there."""
     from app.core.table_presence import has_table
+    _drop_a_set_up_left_half_way(db, user_id)
     if not has_table(db, PendingLogin.__tablename__):
         return 0
     return int(db.query(PendingLogin).filter(
         PendingLogin.user_id == user_id, PendingLogin.consumed_at.is_(None)).update(
         {PendingLogin.consumed_at: datetime.now(timezone.utc)}, synchronize_session=False) or 0)
+
+
+def _drop_a_set_up_left_half_way(db, user_id) -> None:
+    """Remove the authenticator app the account began to set up and did not finish, with the recovery codes made
+    for it, in the caller's transaction. Whoever began it, at a sign-in now spent or in a session now ended, knows
+    its secret and its codes, and the last step of the set-up, sent later from any session of the account, would
+    have made that secret the account's second factor. An account holds one enrollment, so one that is not
+    finished means no authenticator is active and the codes are that set-up's own."""
+    from app.core.models import SecondFactorEnrollment, SecondFactorRecoveryCode
+    from app.core.table_presence import has_table
+    if not has_table(db, SecondFactorEnrollment.__tablename__):
+        return
+    dropped = db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.user_id == user_id, SecondFactorEnrollment.status == "unconfirmed").delete(
+        synchronize_session=False)
+    if dropped and has_table(db, SecondFactorRecoveryCode.__tablename__):
+        db.query(SecondFactorRecoveryCode).filter(SecondFactorRecoveryCode.user_id == user_id).delete(
+            synchronize_session=False)
 
 
 def consume_pending(db, pending: PendingLogin, *, commit: bool = True) -> None:
@@ -636,9 +656,21 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
     """On a held sign-in, before a factor is stored or made active for the account: refuse what :func:`finish`
     refuses. It is asked there only after the factor stands, and a factor outlives the sign-in it was set up at:
     one stored for an account that was locked or turned off while its enrollment was open would stay after the
-    refusal. With a session there is nothing to ask here: the session is the account's own."""
+    refusal. With a session there is nothing to ask here: the session is the account's own.
+
+    The account's turn at its sessions is taken first, and the held sign-in is read again in it. What ends the
+    account's sessions spends its sign-ins under way in that same turn (:func:`spend_sign_ins_under_way`), and a
+    change of its factors takes the turn before it reads them. So the factor is written wholly before such a
+    change, which then finds it (a reset retires it, a removal counts it), or not at all: without the turn, a
+    change that fell between the check of the token and the write left a factor set up on a proof the change had
+    just ended."""
     if pending is None:
         return
+    from app.api import api_server as api
+    api._sessions_turn(db, user.id)
+    on_record = db.query(PendingLogin.consumed_at).filter(PendingLogin.id == pending.id).first()
+    if on_record is None or on_record[0] is not None:
+        raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
     refuse_unless_the_account_may_sign_in(db, user, client_ip)
 
 

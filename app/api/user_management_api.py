@@ -650,7 +650,9 @@ async def update_user(
         # zero-knowledge vault keys were switched off above.
         if was_active and not user.is_active:
             from app.api.api_server import _revoke_sessions
+            from app.services import sign_in
             _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
+            sign_in.spend_sign_ins_under_way(db, user.id)        # and what was on its way to a session
 
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -770,7 +772,9 @@ async def toggle_user_active(
         # only while the account is off: a token that is not revoked works again the moment the
         # account is reactivated.
         from app.api.api_server import _revoke_sessions
+        from app.services import sign_in
         _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
+        sign_in.spend_sign_ins_under_way(db, user.id)            # and what was on its way to a session
     user.updated_at = datetime.now(timezone.utc)
     db.commit()
     
@@ -847,7 +851,9 @@ async def toggle_user_locked(
         # revocation + force-close of any live SFTP transport), matching the PATCH path.
         try:
             from app.api.api_server import _revoke_sessions
+            from app.services import sign_in
             _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
+            sign_in.spend_sign_ins_under_way(db, user.id)        # and what was on its way to a session
         except Exception as e:  # noqa: BLE001 — never let revoke break the lock
             print(f"⚠ toggle-lock session revoke failed: {e}")
 

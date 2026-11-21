@@ -51,6 +51,20 @@ def _register(client, label, auth=None):
     return r, auth
 
 
+def _signed_in_again_for_a_factor(client):
+    """A fresh client at the sign-in an account is held at once an administrator took its last factor: the
+    password at the form, then the step that sets a factor up. Its requests carry that held sign-in."""
+    fresh = ApiClient()
+    r = fresh.session.post(f"{fresh.base_url}/auth/login",
+                           json={"username": client.username, "password": client.password}, timeout=15)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("access_token") is None and body.get("enrollment_required") is True, body
+    fresh.session.headers["Authorization"] = f"Bearer {body['pre_auth_token']}"
+    fresh.username, fresh.password = client.username, client.password
+    return fresh
+
+
 def test_a_passkey_is_registered_listed_renamed_and_removed(person, admin):
     client, uid = person
     r, auth = _register(client, "live key")
@@ -77,11 +91,14 @@ def test_a_passkey_is_registered_listed_renamed_and_removed(person, admin):
     # An administrator removes it: a credential change made at once (the first on this account in 14 days).
     r = admin.delete(f"/users/{uid}/passkeys/{shown['id']}")
     assert r.status_code == 200, r.text
-    assert client.get("/users/me/passkeys").json()["passkeys"] == []
     assert admin.get(f"/users/{uid}/passkeys").json()["passkeys"] == []
-    # Gone from the step-up too: the account has no factor again, so a registration asks for the password.
-    r = client.post("/users/me/passkeys/register/options", json={"current_password": client.password})
-    assert r.status_code == 200
+    # It was the account's only factor: its sessions ended with it, as after a reset.
+    assert client.get("/users/me/passkeys").status_code == 401
+    # The next sign-in is held for a new factor, and the password given at the form is the proof a registration
+    # there asks for.
+    held = _signed_in_again_for_a_factor(client)
+    r = held.post("/users/me/passkeys/register/options", json={})
+    assert r.status_code == 200, r.text
 
 
 def test_a_second_administrator_change_within_the_window_waits(person, admin):
@@ -92,10 +109,14 @@ def test_a_second_administrator_change_within_the_window_waits(person, admin):
     # A second key, proved by the step-up? No method is available for a passkey-only account yet: register the
     # second one while the first still... cannot. So the administrator's first change removes the only key.
     assert admin.delete(f"/users/{uid}/passkeys/{first}").status_code == 200
-    r, _ = _register(client, "two")
+    # The removal ended the account's sessions: the second key is set up at the next sign-in, which it finishes.
+    held = _signed_in_again_for_a_factor(client)
+    r, _ = _register(held, "two", auth=SoftAuthenticator())
     assert r.status_code == 201, r.text
-    second = r.json()["id"]
-    assert r.json()["provisional"] is True            # within 14 days after the administrator's change
+    second = r.json()["passkey"]["id"]
+    assert r.json()["passkey"]["provisional"] is True  # within 14 days after the administrator's change
+    client = ApiClient()
+    client.session.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
     r = admin.delete(f"/users/{uid}/passkeys/{second}")
     # The two-person rule: held for another administrator (202), or refused outright when no other administrator
     # could approve it (409, the stack's only administrator). Either way the key stays.

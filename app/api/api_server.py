@@ -6433,6 +6433,13 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
     """The change itself, for _apply_credential_change, which every caller uses."""
     from app.core import credential_changes as cc
     payload = payload or {}
+    if kind in (cc.PASSWORD, cc.SECOND_FACTOR, cc.PASSKEY):
+        # The account's turn at its sessions, before anything of the account is read: a sign-in held for a
+        # set-up writes its factor in that turn (sign_in.refuse_a_factor_the_sign_in_could_not_finish). So this
+        # change finds that factor (a reset retires it, a removal counts it among the others), or the sign-in
+        # finds itself spent before it writes one. Each of these ends by ending the account's sessions, which
+        # takes the turn again and waits for nothing.
+        _sessions_turn(db, target.id)
     if kind == cc.PASSWORD:
         from app.core import password_origin
         target.password_hash = payload["password_hash"]
@@ -6545,7 +6552,9 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             left_without = not others and not authenticator
             if left_without:
                 target.second_factor_reset_at = datetime.utcnow()
-                # As a reset does: a session that key made (on the device that was lost, say) does not go on.
+                # The account is treated as reset, so its sessions end as a reset ends them, the one that key
+                # made on a lost device among them. A removal that leaves the account another factor ends
+                # none: the account is not reset, and "Sign out everywhere" is the administrator's to use.
                 _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
                 sign_in.spend_sign_ins_under_way(db, target.id)
         return {"passkey_id": str(row.id), "passkey_label": row.label or "", "left_without_a_factor": left_without}
