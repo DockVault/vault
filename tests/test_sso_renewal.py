@@ -225,12 +225,16 @@ def test_a_session_through_an_identity_linked_by_email_is_not_kept_going_past_a_
         return sso_sign_in.renewal_refusal(db, user, provider.id, methods=(), subject=identity.subject)
 
     assert refusal() is None                                    # no factor of its own: the provider's MFA stands
-    # Between two factors (an administrator's reset it has not answered) it holds none it could give: a new
-    # sign-in through the identity is not asked for one, and the session is kept going by the same rule.
+    # After an administrator's reset it has not answered, it owes a factor: a new sign-in through the identity is
+    # held for the set-up whatever the provider's MFA says, and the session is not kept going past the reset.
     user.second_factor_reset_at = datetime.utcnow()
     db.commit()
     assert api._login_second_factor_in_effect(db, user) is True and sign_in.holds_a_factor(db, user) is False
+    assert refusal() == "Signing in now needs your second factor; sign in again."
+    identity.linked_by = "self"                                 # her own link: the provider's MFA as the policy says
+    db.commit()
     assert refusal() is None
+    identity.linked_by = "email"
     user.second_factor_reset_at = None
     db.add(SecondFactorEnrollment(id=uuid.uuid4(), user_id=user.id, method="totp", status="active", secret_enc="s"))
     db.commit()
@@ -630,6 +634,15 @@ def test_an_account_no_provider_vouches_for_is_told_of_the_reset_link_not_of_an_
     db.commit()
     said = sso_only.passkey_after_the_provider_message(db, lone)
     assert said.startswith(sso_only.provider_only_message(db, lone)) and "after that sign-in" in said
+    # An account whose standing asks for the password at every sign-in is told of the reset link whatever it is
+    # linked to: through its provider it would be asked for that password, and its passkey never signs in alone.
+    p.state = "enabled"
+    lone.role = RoleEnum.ADMIN
+    db.commit()
+    said = sso_only.passkey_after_the_provider_message(db, lone)
+    assert "organisation" not in said and "password reset link" in said
+    lone.role = RoleEnum.USER
+    db.commit()
     # What an account that signs in only through its provider is told is as it was, with or without a provider on.
     assert "through Contoso" in sso_only.provider_only_message(db, lone)
     p.state = "disabled"

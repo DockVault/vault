@@ -1205,8 +1205,10 @@ async def unlink_my_identity(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Remove one of the caller's identities, under the account.second_factor step-up. Refused when the account
-    signs in only through single sign-on and this is its last identity (it would lose its only way in)."""
+    """Remove one of the caller's identities, under the account.second_factor step-up. Refused when this is the
+    last identity, on a provider that is on, of an account that has no password it can type (one that signs in
+    only through single sign-on, or whose password nobody knows): it would lose its only way in. A passkey of
+    such an account signs in after its provider only, so it is no other way."""
     api = _api()
     _refuse_temp(current_user)
     api._enforce_step_up(db, current_user, request, "account.second_factor")
@@ -1215,16 +1217,18 @@ async def unlink_my_identity(
     if identity is None:
         raise HTTPException(status_code=404, detail="That identity was not found.")
     account = db.query(User).filter(User.id == current_user.id).first() or current_user
-    if getattr(account, "sso_only", False):
-        # The account holds no password: after the unlink it must still have a provider that is on to sign in
-        # through. One that is off, or not finished, is no way in.
-        others = [i for i in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == account.id,
-                                                               ExternalIdentity.id != identity.id).all()]
-        ways_in = [i for i in others if getattr(_provider(db, i.provider_id), "state", None) == "enabled"]
-        if not ways_in:
+    from app.services import sign_in
+    if not sign_in.has_a_password_it_can_type(account):
+        # The account holds no password anybody can type: after the unlink it must still have a provider that is
+        # on to sign in through. One that is off, or not finished, is no way in.
+        if not sso_only.another_way_in(db, account, without=identity):
             raise HTTPException(status_code=409, detail=(
                 "Your account signs in only through single sign-on, and this is its only identity on a provider "
-                "that is on. Ask an administrator for a password first."))
+                "that is on. Ask an administrator for a password first."
+                if getattr(account, "sso_only", False) else
+                "Your account has no password of its own, and this is its only identity on a provider that is on: "
+                "without it nothing would sign you in. Set a password first (\"Forgot password\" on the sign-in "
+                "page, or ask an administrator for a reset link), then unlink."))
     row = _provider(db, identity.provider_id)
     # An identity whose provider refused the person, or whose freshness has lapsed, is not unlinked by its owner:
     # unlinking would end the provider's say over the account's keys and credentials.

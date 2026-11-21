@@ -1177,6 +1177,42 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     assert len(told) == 1
 
 
+@pytest.mark.parametrize("kind", ["its password is one nobody knows", "it has no password at all"])
+def test_an_account_with_no_password_it_can_type_does_not_unlink_its_only_way_in(monkeypatch, kind):
+    """A passkey of an account whose password nobody knows signs in after its provider only. Unlinked from its only
+    provider that is on, such an account had nothing left that signs it in. The unlink is refused as it is for an
+    account that signs in only through single sign-on, and says what to do first; with another provider that is
+    on, or once the account has a password of its own, it goes through."""
+    from app.core import password_origin
+    dana, p, q = _user("dana", sso_only=False), _provider(), _provider(name="Fabrikam")
+    dana.password_nobody_knows = None
+    if kind == "it has no password at all":
+        dana.password_hash = None
+    else:
+        dana.password_hash = "argon2:of-random-bytes"
+        password_origin.mark_nobody_knows(dana)
+    identity = _identity(dana, p)
+    h = Harness(monkeypatch, [dana], [p, q], identities=[identity])
+    path = f"/users/me/identities/{identity.id}"
+    status, out, _ = _call(h.S, "DELETE", path)
+    assert status == 409 and "no password of its own" in out["detail"] and "Set a password first" in out["detail"], out
+    assert h.identities() == [identity]
+    # Linked to another provider, but one that is off: still no way in.
+    other = _identity(dana, q, subject="at-fabrikam")
+    h.identities().append(other)
+    q.state = "disabled"
+    assert _call(h.S, "DELETE", path)[0] == 409
+    q.state = "enabled"
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: 0)
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: None)
+    status, out, _ = _call(h.S, "DELETE", path)
+    assert status == 200 and out["removed"] is True and h.identities() == [other], out
+    # A password of its own (the mark no longer fits): the last identity goes like anybody's.
+    dana.password_hash = "x"
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{other.id}")
+    assert status == 200 and h.identities() == [], out
+
+
 def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_owner(monkeypatch):
     """Unlinking would end the provider's say over the account's keys and credentials: refused while the provider's
     refusal stands or its window has lapsed, whatever the provider's state; allowed once the person signed in again."""

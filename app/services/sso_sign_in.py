@@ -898,10 +898,10 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     give, the provider's MFA does not stand in for it at sign-ins through that identity, and the account's
     factor is asked. Its owner makes the link their own by linking the provider again from Your account.
 
-    "Holds a factor it can give" is what a sign-in can be asked for now (:func:`linked_on_the_providers_word`),
-    less than :func:`set_up_its_own_factor`: an account between two factors (a reset it has not answered, passkeys
-    kept while they are switched off, a key that can no longer be used) holds none, and asked for one it could
-    never answer. It goes on as an account without a factor does."""
+    The rule is :func:`linked_on_the_providers_word`: a factor it can give now, or one it is to set up again
+    (after a reset, a removed last passkey, a key that can no longer be used: the sign-in is then held for that
+    set-up). It is less than :func:`set_up_its_own_factor`: passkeys kept while they are switched off are no
+    factor and nothing is owed for them, so such an account goes on as one without a factor does."""
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
     on_the_providers_word = linked_on_the_providers_word(db, user, identity)
@@ -915,10 +915,18 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
 def linked_on_the_providers_word(db, user, identity) -> bool:
     """Whether the provider's MFA is not taken for the account's second factor at a sign-in (or the renewal of a
     session) through ``identity``: the identity was linked by email, on the provider's word, and the account holds
-    a second factor it can give now (an authenticator, a passkey that can be used)."""
+    a second factor it can give now (an authenticator, a passkey that can be used) or is to set one up again (an
+    administrator reset it, or removed its last passkey, or its only passkey can no longer be used).
+
+    The second half is what a reset is for: the factor was taken from the account because somebody else may
+    hold it, or the device is gone, and the next one is to be set up by the account itself. Whoever holds its
+    address at the provider would otherwise sign in on the provider's MFA alone for as long as the reset stays
+    unanswered. Nobody is shut out by it: the sign-in is held for the set-up, which an account with a password
+    proves with that password (asked first), and one with none by the provider's sign-in itself."""
     from app.services import sign_in
-    return (identity is not None and getattr(identity, "linked_by", None) == LINKED_BY_EMAIL
-            and sign_in.holds_a_factor(db, user))
+    if identity is None or getattr(identity, "linked_by", None) != LINKED_BY_EMAIL:
+        return False
+    return sign_in.holds_a_factor(db, user) or bool(_api()._second_factor_to_set_up_again(db, user))
 
 
 def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:

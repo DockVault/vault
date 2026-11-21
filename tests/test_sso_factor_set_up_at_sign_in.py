@@ -93,6 +93,12 @@ class World:
                   "idp_sub": self.identity(user).subject}
         return pending, {"Authorization": f"Bearer {create_access_token(claims)}"}
 
+    def held_with_no_provider(self, user, methods):
+        """A sign-in held for an enrollment that came through no provider (the password form)."""
+        pending, headers = self.h.pending_for(user, methods=methods)
+        pending.enrollment_required = True
+        return pending, headers
+
     def set_an_authenticator_up(self, headers, password=""):
         """The wizard's three requests; the last one's answer."""
         from app.core import second_factor as sf
@@ -146,6 +152,11 @@ def test_the_held_sign_in_is_that_proof_only_for_an_account_without_a_password_a
     # be): its password, as ever.
     pending, headers = w.h.pending_for(alice, methods=(), provider=str(w.provider.id))
     pending.enrollment_required = True
+    for typed in ("", "pw"):                    # the password belongs at its own stage, as at the passkey's enrollment
+        status, body = _call_h(w.S, "POST", ENROLL, {"current_password": typed}, headers)
+        assert status == 401 and body["detail"] == "Enter your password first; start the sign-in again.", body
+    # Held after that stage (the password among the proofs), the enrollment asks for it as ever.
+    _pending, headers = w.held_with(alice, ("pwd",))
     status, body = _call_h(w.S, "POST", ENROLL, {"current_password": ""}, headers)
     assert status == 400 and body["detail"] == "Your current password is required and must be correct.", body
     assert _call_h(w.S, "POST", ENROLL, {"current_password": "pw"}, headers)[0] == 200
@@ -293,13 +304,15 @@ STATES = ["an authenticator", "a passkey that can be used", "a reset it has not 
 
 
 @pytest.mark.parametrize("state", STATES)
-def test_an_identity_linked_by_email_loses_the_providers_mfa_only_while_the_account_holds_a_factor(monkeypatch, state):
+def test_an_identity_linked_by_email_loses_the_providers_mfa_while_the_account_holds_a_factor_or_owes_one(monkeypatch, state):
     """Carol's identity was put on her account by its email address, and the provider's MFA is trusted. While she
     holds a factor she can give (an authenticator, a passkey that can be used), a sign-in through that identity
-    is asked for it: the provider's word does not stand in for her own factor. Between two factors she holds none
-    (a reset she has not answered, passkeys kept while they are switched off, a key of a removed algorithm):
-    asked for one she could never answer. She goes on as an account without a factor does, on the provider's
-    trusted MFA. No new link by email reaches her in any of these states (sso_sign_in.set_up_its_own_factor)."""
+    is asked for it: the provider's word does not stand in for her own factor. Nor does it while she is to set a
+    factor up again (a reset she has not answered, a key of a removed algorithm): the sign-in is held for that
+    set-up, which her provider's sign-in proves, as she has no password. With passkeys kept while they are
+    switched off nothing is owed, and with nothing at all she goes on as an account without a factor does, on
+    the provider's trusted MFA. No new link by email reaches her in any state but the last
+    (sso_sign_in.set_up_its_own_factor)."""
     from app.core.models import SecondFactorEnrollment, WebAuthnCredential
     from app.services import sign_in, sso_sign_in
     carol = _without_a_password("signs in only through its provider", name="carol")
@@ -316,14 +329,22 @@ def test_an_identity_linked_by_email_loses_the_providers_mfa_only_while_the_acco
     usable = state != "a key that can no longer be used"
     monkeypatch.setattr(w.wss, "algorithm_usable", lambda db, cose_alg, now=None: (usable, False))
     holds = state in ("an authenticator", "a passkey that can be used")
+    owes = state in ("a reset it has not answered", "a key that can no longer be used")
     identity = w.identity(carol)
     assert sign_in.holds_a_factor(w.db, carol) is holds
-    assert sso_sign_in.linked_on_the_providers_word(w.db, carol, identity) is holds
+    assert bool(w.S._second_factor_to_set_up_again(w.db, carol)) is owes
+    assert sso_sign_in.linked_on_the_providers_word(w.db, carol, identity) is (holds or owes)
     assert sso_sign_in.set_up_its_own_factor(w.db, carol) is (state != "nothing")
     outcome = w.through_the_provider(carol, with_its_mfa=True)
     if holds:
         assert isinstance(outcome, sign_in.PendingStep) and outcome.body["enrollment_required"] is False
         assert outcome.body["methods"] == (["totp", "recovery"] if state == "an authenticator" else ["passkey"])
+    elif owes:
+        assert isinstance(outcome, sign_in.PendingStep) and outcome.body["enrollment_required"] is True, (state, outcome)
+        assert "totp" in outcome.body["enrollment_methods"] and outcome.body["stage"] == "second_factor"
+        headers = {"Authorization": f"Bearer {outcome.body['pre_auth_token']}"}
+        status, done = w.set_an_authenticator_up(headers)                # proved by the provider's sign-in
+        assert status == 200 and done.get("access_token") and carol.second_factor_reset_at is None, done
     else:
         assert isinstance(outcome, sign_in.SignedIn), (state, outcome)
     # An identity she linked herself is trusted as the policy says, whatever she holds; and so is no identity at
@@ -333,6 +354,66 @@ def test_an_identity_linked_by_email_loses_the_providers_mfa_only_while_the_acco
     assert sso_sign_in.linked_on_the_providers_word(w.db, carol, None) is False
 
 
+@pytest.mark.parametrize("owed", ["an administrator's reset", "a key that can no longer be used"])
+def test_an_account_with_a_password_linked_by_email_answers_what_it_owes_behind_its_password(monkeypatch, owed):
+    """Alice has a password, and her identity at the provider was linked by her email address. An administrator
+    reset her second factor (a lost phone, or a factor somebody may have planted); or her only passkey lapsed.
+    Whoever holds that identity at the provider would have signed in on the provider's trusted MFA alone, with no
+    password and no factor, for as long as the reset stayed unanswered: the door the reset was made to close.
+    The sign-in is held now: the password first, then the set-up of the factor, proved by that password. The
+    same identity linked by herself is trusted as the policy says."""
+    from app.core.models import WebAuthnCredential
+    from app.services import sign_in
+    alice = _user()
+    w = World(monkeypatch, [alice], mfa_mode="optional", trust=True, linked_by="email")
+    assert isinstance(w.through_the_provider(alice, with_its_mfa=True), sign_in.SignedIn)       # nothing owed yet
+    if owed == "an administrator's reset":
+        alice.second_factor_reset_at = datetime.utcnow()
+    else:
+        w.db.rows_of(WebAuthnCredential).append(
+            types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, cose_alg=-257))
+        monkeypatch.setattr(w.wss, "algorithm_usable", lambda db, cose_alg, now=None: (False, False))
+    body, _headers = w.held(alice, with_its_mfa=True)
+    assert body["stage"] == "password" and body["enrollment_required"] is False and body["access_token"] is None, body
+    identity = w.identity(alice)
+    outcome = sign_in.finish(w.db, sign_in.SignInResult(alice, ["pwd"], IP, provider_id=str(w.provider.id),
+                                                        provider_sub=identity.subject))
+    assert isinstance(outcome, sign_in.PendingStep) and outcome.body["enrollment_required"] is True, outcome
+    status, done = w.set_an_authenticator_up({"Authorization": f"Bearer {outcome.body['pre_auth_token']}"}, password="pw")
+    assert status == 200 and _claims(done["access_token"])["amr"] == ["pwd", "totp"], done
+    assert alice.second_factor_reset_at is None
+    # Her own link: the provider's MFA is taken as the policy says, whatever she owes (she vouched for the link).
+    bob = _user("bob")
+    own = World(monkeypatch, [bob], mfa_mode="optional", trust=True, linked_by="self")
+    bob.second_factor_reset_at = datetime.utcnow()
+    assert isinstance(own.through_the_provider(bob, with_its_mfa=True), sign_in.SignedIn)
+
+
+def test_a_factor_the_account_came_to_hold_since_the_hold_is_given_before_another_is_set_up(monkeypatch):
+    """Alice signed in with her password and is held for the set-up of a factor. Before the wizard runs, her
+    account comes to hold a passkey (she registered one elsewhere within the five minutes). The passkey's
+    enrollment on that hold answers "confirm your second factor first"; so does the authenticator's now, at its
+    start and again where it would be made active, so no second factor is set beside one that was never asked."""
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential
+    alice = _user()
+    w = World(monkeypatch, [alice])
+    first = "Confirm your second factor first; start the sign-in again."
+    _pending, headers = w.held_with_no_provider(alice, ("pwd",))
+    from app.core import second_factor as sf
+    status, started = _call_h(w.S, "POST", ENROLL, {"current_password": "pw"}, headers)
+    assert status == 200, started
+    code = sf._totp_at_step(started["secret"], sf.current_totp_step())
+    assert _call_h(w.S, "POST", CONFIRM, {"code": code}, headers)[0] == 200
+    w.h.enroll(alice)                                              # a passkey, since the hold
+    status, body = _call_h(w.S, "POST", ACKNOWLEDGE, None, headers)
+    assert status == 401 and body["detail"] == first, body
+    assert [e.status for e in w.db.rows_of(SecondFactorEnrollment)] == ["unconfirmed"]
+    status, body = _call_h(w.S, "POST", ENROLL, {"current_password": "pw"}, headers)
+    assert status == 401 and body["detail"] == first, body
+    w.db.rows_of(WebAuthnCredential).clear()                       # without it, the same hold goes on
+    assert _call_h(w.S, "POST", ACKNOWLEDGE, None, headers)[0] == 200
+
+
 def test_a_reset_of_an_account_linked_by_email_is_answered_at_the_provider_when_its_mfa_is_not_there(monkeypatch):
     """The same account after a reset, on a sign-in that did not carry the provider's MFA: held for the set-up,
     which the provider's sign-in proves. Before, this account was held at an authenticator's enrollment that asked
@@ -340,8 +421,9 @@ def test_a_reset_of_an_account_linked_by_email_is_answered_at_the_provider_when_
     carol = _without_a_password("signs in only through its provider", name="carol")
     w = World(monkeypatch, [carol], mfa_mode="optional", trust=True, linked_by="email")
     carol.second_factor_reset_at = datetime.utcnow()
-    body, headers = w.held(carol)
-    assert body["enrollment_required"] is True and body["enrollment_methods"] == ["totp", "passkey"], body
+    for there in (True, False):                         # with the provider's MFA there too: the reset is owed
+        body, headers = w.held(carol, with_its_mfa=there)
+        assert body["enrollment_required"] is True and body["enrollment_methods"] == ["totp", "passkey"], (there, body)
     status, done = w.set_an_authenticator_up(headers)
     assert status == 200 and done.get("access_token") and carol.second_factor_reset_at is None, done
 

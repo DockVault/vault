@@ -194,6 +194,19 @@ def provider_only_message(db, user) -> str:
             "gave you.")
 
 
+def another_way_in(db, user, *, without) -> bool:
+    """Whether ``user`` is linked to a provider that is on by an identity other than ``without``: a way to sign in
+    once ``without`` is gone, for an account that has no password it can type."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
+        if identity.id == getattr(without, "id", None):
+            continue
+        row = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+        if row is not None and getattr(row, "state", None) == "enabled":
+            return True
+    return False
+
+
 def _providers_to_name(db, user) -> tuple:
     """(the names, the button labels) of the enabled providers ``user`` is linked to, each once, in the order found."""
     from app.core.models import ExternalIdentity, SsoProvider
@@ -217,8 +230,11 @@ def passkey_after_the_provider_message(db, user) -> str:
     the account signs in, that the passkey confirms them after that sign-in, and what makes the passkey a sign-in
     of its own. An account no enabled provider vouches for (its password was taken back when it was made an
     administrator, say, and it is linked to none) is not sent to an organisation's sign-in it does not have: what
-    it needs is a password of its own."""
-    if not _providers_to_name(db, user)[0]:
+    it needs is a password of its own. Neither is an account whose standing asks for the password at every
+    sign-in (an administrator, a holder of the auditor right): through its provider it would be asked for that
+    password, and its passkey never signs in by itself."""
+    from app.core import privileged_accounts
+    if privileged_accounts.kind(db, user) is not None or not _providers_to_name(db, user)[0]:
         return ("Your account has no password of its own yet, and your passkey signs you in by itself only once it "
                 "has one. Use the password reset link you were given, or ask an administrator for one.")
     return (provider_only_message(db, user) + " Your passkey confirms it is you after that sign-in. It signs you "

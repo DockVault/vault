@@ -11326,7 +11326,8 @@ async def request_email_confirmation(
     if not _smtp_configured(db):
         raise HTTPException(status_code=400, detail=(
             "This vault sends no email, so no code can be sent. Linking your organisation's sign-in from Your "
-            "account needs no confirmed address. An administrator can confirm your address; that counts as a "
+            "account needs no confirmed address (it asks for your second factor: set one up there first if you "
+            "have none). An administrator can confirm your address; that counts as a "
             "change to your sign-in details and holds your zero-knowledge vaults for up to 14 days, which on "
             "this vault only the person who runs the server can lift."))
     # The code lands in a mailbox that may not be the requester's (an address typed on the wrong account).
@@ -11696,9 +11697,11 @@ async def enroll_totp(
     if _sf_enrollment(db, user.id, status="active"):
         raise HTTPException(status_code=409, detail="A second factor is already active; disable it before enrolling a new one.")
     _factor_before_another_from_a_session(db, user, request, pending)
+    # A held sign-in, whatever proved it: an account that came to hold a factor since gives that factor first,
+    # as at the passkey's enrollment on the same hold.
+    sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     if sign_in.provider_proves_an_enrollment(user, pending):
         sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, get_client_ip(request))
-        sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     elif pending is None and not sign_in.has_a_password_it_can_type(user):
         # Under Your account such an account is asked for nothing it cannot give: it is told where its
         # authenticator is set up (a sign-in that asks for a second factor), and that a passkey can be added here.
@@ -11798,9 +11801,11 @@ async def acknowledge_recovery_codes(
         raise HTTPException(status_code=400, detail="Confirm a code and generate recovery codes first.")
     if _sf_recovery_remaining(db, current_user.id) == 0:
         raise HTTPException(status_code=400, detail="Generate recovery codes before activating.")
-    # A sign-in held for this enrollment: the factor is made active only where the sign-in could still finish.
-    # From a session: only while the session stands, read again in the account's turn.
+    # A sign-in held for this enrollment: the factor is made active only where the sign-in could still finish,
+    # and not beside a factor the account came to hold since the hold (that one is given first). From a session:
+    # only while the session stands, read again in the account's turn.
     sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, current_user, pending, get_client_ip(request))
+    sign_in.refuse_enrollment_before_the_accounts_factor(db, current_user, pending)
     if pending is None:
         _session_still_stands_in_the_turn(db, current_user, request)
     enr.status = "active"

@@ -242,6 +242,28 @@ def test_a_provider_is_removed_with_its_links_only_when_nothing_depends_on_it(mo
     assert h.call("DELETE", path)[0] == 404
 
 
+def test_a_removal_tells_an_account_left_with_no_way_in_how_to_get_a_password(monkeypatch):
+    """A provider is removed. An account linked to it that has a password is told it lost a way to sign in. One
+    whose password nobody knows, linked to no other provider that is on, has nothing left that signs it in (its
+    passkey signs in after a provider only): it is told how to get a password, as an account that may hold one
+    again is. With another provider that is on it is told what the first is told."""
+    from app.api import sso_providers_router as router
+    from app.core import password_origin
+    row, other = _provider(created_at=None, updated_at=None, state="disabled"), _provider(name="Fabrikam")
+    alice, dana, erin = _user("alice"), _user("dana"), _user("erin")
+    for marked in (dana, erin):
+        marked.sso_only, marked.password_hash, marked.password_nobody_knows = False, "argon2:of-random-bytes", None
+        password_origin.mark_nobody_knows(marked)
+    h = Admin(monkeypatch, [row, other], users=[alice, dana, erin],
+              identities=[_identity(alice, row), _identity(dana, row), _identity(erin, row), _identity(erin, other)])
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 200 and out == {"removed": True}, out
+    removed = f"An administrator removed {row.label or row.name} from this vault: your account can no longer sign in through it."
+    told = {tuple(names): text for names, _title, text in h.accounts_told}
+    assert told[("alice", "erin")] == removed
+    assert told[("dana",)] == f"{removed} {router.SET_A_PASSWORD}"
+
+
 def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_was_off(monkeypatch):
     """A removed provider has no identities left to count days for. A person whose days ran out while it was off
     would get their keys back for good, unseen: the removal holds them first, the hold is kept whatever becomes of

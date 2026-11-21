@@ -382,7 +382,12 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         if user is None:
             continue
         settled = sso_only.settle(db, user, without=identity)
-        (may_set if settled == sso_only.RESTORED else kept).append((user.id, user.username, user.email))
+        # Told how to get a password: an account that may hold one again, and one that has none it can type and
+        # no other provider that is on (its passkey signs in after a provider only: nothing else would sign it in).
+        from app.services import sign_in
+        stranded = (not sign_in.has_a_password_it_can_type(user)
+                    and not sso_only.another_way_in(db, user, without=identity))
+        (may_set if settled == sso_only.RESTORED or stranded else kept).append((user.id, user.username, user.email))
     db.delete(row)
     db.commit()
     removed = f"An administrator removed {label} from this vault: your account can no longer sign in through it."
