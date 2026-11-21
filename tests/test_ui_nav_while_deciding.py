@@ -118,12 +118,16 @@ def _expect_the_dashboard(page: Page):
 
 # What the Compliance page itself asks (everything but the account's own standing), and the Activity page.
 _PAGES_ASK = r"^/compliance/(?!me$)|^/activity(/|$)|^/audit(/|$)"
+# The same for an administrator, whose dashboard reads its own recent events (GET /audit/events) whenever its turn
+# among the dashboard's requests comes, sooner or later than the navigation below: that request is the dashboard's,
+# asked because the account is an administrator, and says nothing of the page that waits.
+_PAGES_ASK_OF_AN_ADMINISTRATOR = r"^/compliance/(?!me$)|^/activity(/|$)"
 
 
 def test_compliance_asked_for_right_after_sign_in_waits_for_the_answer_and_opens(page: Page, admin_creds):
     page.goto("/")
     held = _Held(page, "**/compliance/me")
-    asked = _requests(page, _PAGES_ASK)
+    asked = _requests(page, _PAGES_ASK_OF_AN_ADMINISTRATOR)
     _login(page, admin_creds["username"], admin_creds["password"])
     page.evaluate("() => navigateToSection('compliance')")
     held.wait()
