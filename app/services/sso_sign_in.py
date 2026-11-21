@@ -1034,8 +1034,14 @@ def renewal_refusal(db, user, provider_id, *, methods=(), subject: Optional[str]
 def provider_logout_url(db, session_row) -> Optional[str]:
     """Where the browser goes after a vault sign-out when the session's provider wants its own logout: the
     provider's end-session address with the ID token as the hint and the vault's sign-in page to come back to.
-    None when the session was not a provider's, the option is off, the provider has no such address, the vault has
-    no configured address to come back to, or anything fails: the vault's sign-out stands on its own."""
+    None when the session was not a provider's, the option is off, the provider has no such address or one the
+    endpoint rule refuses, the vault has no configured address to come back to, or anything fails: the vault's
+    sign-out stands on its own.
+
+    The provider may have to be asked for its discovery document (a wait of up to the provider call's whole
+    time). What is needed of the database is read first and the read transaction ended, so the wait holds no
+    database connection; the caller has nothing pending here (its own writes are committed), and where it had,
+    the transaction is left as it is."""
     if session_row is None:
         return None
     try:
@@ -1051,11 +1057,17 @@ def provider_logout_url(db, session_row) -> Optional[str]:
         row = db.query(SsoProvider).filter(SsoProvider.id == sso_session.provider_id).first()
         if row is None or not policy_of(row)["sso_idp_logout"]:
             return None
-        discovery = oc.discover(provider_config(row), fetch=oc.fetch_json)
+        config, hint = provider_config(row), decrypt_secret(sso_session.id_token_enc)
+        if not any(getattr(db, pending, None) for pending in ("new", "dirty", "deleted")):
+            db.rollback()
+        discovery = oc.discover(config, fetch=oc.fetch_json)
         if not discovery.end_session_endpoint:
             return None
+        # Judged again where it is used, as every endpoint is: the document may be a kept copy, older than the
+        # rule's last look at it, and this is an address the vault sends a browser to.
+        oc.check_endpoint(discovery.end_session_endpoint, private_network=config.private_network)
         import secrets
-        query = urlencode({"id_token_hint": decrypt_secret(sso_session.id_token_enc),
+        query = urlencode({"id_token_hint": hint,
                            "post_logout_redirect_uri": come_back_to, "state": secrets.token_urlsafe(16)})
         separator = "&" if "?" in discovery.end_session_endpoint else "?"
         return f"{discovery.end_session_endpoint}{separator}{query}"

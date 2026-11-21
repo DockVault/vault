@@ -778,3 +778,71 @@ def test_the_vault_sign_out_answers_the_providers_logout_address_when_the_option
     monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
     assert sso.provider_logout_url(h.db, session) is None
     assert sso.provider_logout_url(h.db, None) is None
+
+
+@pytest.mark.parametrize("address, served", [
+    ("http://idp.example.test/logout", "fresh"),                 # not https
+    ("https://inside.example.test/logout", "fresh"),             # a name that resolves to a private address
+    ("https://inside.example.test/logout", "kept"),              # the same, in a copy kept from before
+])
+def test_the_browser_is_sent_to_no_end_session_address_the_endpoint_rule_refuses(monkeypatch, address, served):
+    """The provider's discovery document names where its own logout is. It is an address the vault sends a
+    browser to, so it is held to the endpoint rule like the ones the vault calls itself: https, and a public
+    host unless the provider is marked as inside. The document refuses such an address when it is fetched, and
+    the sign-out judges the address again when it uses it (a kept copy may be older than the name's answer):
+    the answer then carries no provider address, and the vault's own sign-out stands."""
+    from app.services import oidc_client as oc
+    from app.services import sso_sign_in as sso
+    alice, p = _user(), _provider(policy={"sso_idp_logout": True})
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    h.discovery_overrides["end_session_endpoint"] = ISSUER + "/protocol/openid-connect/logout"
+    _signed_in(h, p, sid="s-1")
+    (session,) = h.active_sessions()
+    inside = lambda host: ["10.0.0.7"] if host.startswith("inside.") else ["8.8.8.8"]    # noqa: E731
+    if served == "fresh":
+        monkeypatch.setattr(oc, "_resolve", inside)
+        h.discovery_overrides["end_session_endpoint"] = address
+        monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
+        with pytest.raises(oc.OidcError) as refused:                # the document itself is refused
+            oc.discover(sso.provider_config(p), fetch=oc.fetch_json)
+        assert refused.value.code == oc.ENDPOINT_REFUSED
+        assert sso.provider_logout_url(h.db, session) is None
+        return
+    # A copy fetched while the name still answered a public address is kept; the name answers inside now.
+    h.discovery_overrides["end_session_endpoint"] = address
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
+    assert sso.provider_logout_url(h.db, session).startswith(address + "?")
+    monkeypatch.setattr(oc, "_resolve", inside)
+    assert oc.discover(sso.provider_config(p), fetch=oc.fetch_json).end_session_endpoint == address   # the kept copy
+    assert sso.provider_logout_url(h.db, session) is None
+    p.private_network = True                                         # a provider marked as inside may be there
+    assert sso.provider_logout_url(h.db, session).startswith(address + "?")
+
+
+def test_the_sign_out_holds_no_database_connection_while_the_provider_is_asked(monkeypatch):
+    """A sign-out more than an hour after the provider's document was last fetched asks the provider for it
+    again, and waits for the answer. What the address needs of the database is read before that and the read
+    transaction ended, so a slow provider keeps no connection of the pool. Where the caller has something
+    pending, its transaction is left alone."""
+    from app.services import oidc_client as oc
+    from app.services import sso_sign_in as sso
+    alice, p = _user(), _provider(policy={"sso_idp_logout": True})
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    h.discovery_overrides["end_session_endpoint"] = ISSUER + "/protocol/openid-connect/logout"
+    _signed_in(h, p, sid="s-1")
+    (session,) = h.active_sessions()
+    real, seen = oc.discover, []
+
+    def asked(config, **kw):
+        seen.append(list(h.db.log))
+        return real(config, **kw)
+
+    monkeypatch.setattr(oc, "discover", asked)
+    del h.db.log[:]
+    assert sso.provider_logout_url(h.db, session)
+    assert seen and seen[0][-1:] == [("rollback",)]                 # ended before the provider is asked
+    # Something of the caller's is pending: nothing is thrown away.
+    h.db.dirty = [object()]
+    del h.db.log[:], seen[:]
+    assert sso.provider_logout_url(h.db, session)
+    assert seen == [[]]
