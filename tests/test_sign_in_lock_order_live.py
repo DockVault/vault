@@ -106,9 +106,9 @@ _take, here, in_turn = sign_in_lockout.take_sessions_turn, threading.local(), th
 
 def take_and_hold(db, user_id, busy=False):
     _take(db, user_id, busy=busy)
-    pause = getattr(here, "pause", 0)
+    pause = getattr(here, "stay", 0)
     if pause:
-        here.pause = 0
+        here.stay = 0
         in_turn.set()
         time.sleep(pause)
 sign_in_lockout.take_sessions_turn = take_and_hold
@@ -121,7 +121,7 @@ def writer(uid):
         try:
             user = s.get(User, uid)
             result = sign_in.SignInResult(user, [sign_in.PASSWORD], IP, sessions_ended=sign_in.as_read(user))
-            here.pause = 1.6
+            here.stay = 1.6
             sign_in.complete_sign_in(s, result)
             return "signed in"
         finally:
