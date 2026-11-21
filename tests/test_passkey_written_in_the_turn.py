@@ -179,3 +179,53 @@ def test_the_passkey_door_hands_on_what_it_read_of_the_account_before_the_key(mo
     status, body = h.sign_in(auth)[:2]
     assert (status, body["detail"]) == (401, "This login attempt has expired; start again."), body
     assert h.db.rows_of(ActiveSession) == []
+
+
+@pytest.mark.parametrize("ends_in", ["a session", "a held sign-in"])
+@pytest.mark.parametrize("grace", ["begins", "ends"])
+def test_the_day_a_passkey_requirement_began_is_written_with_the_sign_in_on_a_real_database(monkeypatch, grace, ends_in):
+    """The sign-in reads the account again in its turn before it writes. What it had decided about the day the
+    role's passkey requirement began (it begins at the first sign-in under the requirement; it ends where the
+    requirement waits or is met again) is written after that read, with the sign-in, in one commit. Written on
+    the account before the read, it was lost with every sign-in that ended in a session at once: no day was ever
+    kept, so the requirement was never overdue. Read here from another connection: only what was committed counts."""
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+    from _kept_db import kept_database
+    from app.core import webauthn_settings as wss
+    from app.core.models import RoleEnum, User
+    from app.core.security import hash_password
+    from app.services import sign_in
+    from test_passkey_sign_in import _api
+    S = _api()
+    monkeypatch.setattr(S, "_force_close_after_commit", lambda *a, **k: None)
+    monkeypatch.setattr(sign_in, "_record", lambda *a, **k: None)
+    held = ends_in == "a held sign-in"
+    monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db_, u: held)
+    monkeypatch.setattr(S, "_second_factor_effective", lambda db_, u: {"state": "active", "in_effect": held})
+    monkeypatch.setattr(sign_in, "holds_a_factor", lambda db_, u: True)
+    before = datetime(2026, 11, 1) if grace == "ends" else None
+    need = wss.Requirement(False, paused=True) if grace == "ends" else wss.Requirement(True, since=None)
+    monkeypatch.setattr(S, "_passkey_requirement", lambda db_, u: need)
+    with kept_database() as (make, _engine):
+        with make() as db:
+            alice = User(username="alice", email=None, password_hash=hash_password("Old-Password-8x!"),
+                         role=RoleEnum.USER, is_active=True, is_locked=False, passkey_required_since=before)
+            db.add(alice)
+            db.commit()
+
+            def committed():
+                other = sessionmaker(bind=db.get_bind())()
+                try:
+                    return other.execute(sa.text("SELECT passkey_required_since FROM users WHERE id = :id"),
+                                         {"id": alice.id.hex}).fetchall()[0][0]
+                finally:
+                    other.close()
+            outcome = sign_in.finish(db, sign_in.SignInResult(alice, [sign_in.PASSWORD], "192.0.2.1"))
+            assert isinstance(outcome, sign_in.PendingStep if held else sign_in.SignedIn), outcome
+            assert (committed() is not None) is (grace == "begins"), committed()
+            if grace == "begins":
+                # The grace runs once: a second sign-in does not move the day.
+                first = committed()
+                sign_in.finish(db, sign_in.SignInResult(alice, [sign_in.PASSWORD], "192.0.2.1"))
+                assert committed() == first

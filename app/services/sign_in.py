@@ -126,6 +126,11 @@ class SignInResult:
     # this person sign in with a user-verified passkey alone.
     user_verified: bool = False
     passwordless_allowed: bool = False
+    # What this sign-in does to the day the account's passkey requirement began: GRACE_BEGINS (the first sign-in
+    # under the requirement) or GRACE_ENDS (the requirement waits, or is met again). Noted where the sign-in is
+    # judged and written where it is written, in the account's turn, on the account as it is read again there:
+    # written on the account before that, it was lost when the account was read again.
+    passkey_grace: Optional[str] = None
     auth_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     channel: str = "web"
     # How many times the account's sessions had been ended when the first proof of this sign-in read the account
@@ -385,6 +390,22 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
         drop_the_session_the_proof_made(db, result)
         raise HTTPException(status_code=401, detail=EXPIRED)
     refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
+    write_the_passkey_grace(result)
+
+
+GRACE_BEGINS, GRACE_ENDS = "begins", "ends"
+
+
+def write_the_passkey_grace(result: "SignInResult") -> None:
+    """Write what the sign-in does to the day the account's passkey requirement began, on the account as it was
+    read again in its turn, for the commit that writes the sign-in: the day begins only where none is set, and
+    ends only where one is. The account object holds nothing unwritten before the turn, so nothing of it is lost
+    when it is read again there."""
+    from app.api import api_server as api
+    if result.passkey_grace == GRACE_BEGINS:
+        api._passkey_mark_required(result.user)
+    elif result.passkey_grace == GRACE_ENDS:
+        api._passkey_pause_grace(result.user)
 
 
 def drop_the_session_the_proof_made(db, result: "SignInResult") -> None:
@@ -546,7 +567,7 @@ def finish(db, result: SignInResult):
         enrollment_methods = list(ENROLLMENT_METHODS) if enrollment_pending else []
         own_factor_first = password_first = False
         if passkey.paused:
-            api._passkey_pause_grace(user)
+            result.passkey_grace = GRACE_ENDS
         elif not passkey.required and getattr(user, "passkey_required_since", None) is not None:
             # The requirement is met again by a passkey the account holds (one made at an address the vault went
             # back to, or of an algorithm that is accepted again). The day the requirement began, written while it
@@ -554,9 +575,9 @@ def finish(db, result: SignInResult):
             # starts over, as it does when a key is registered.
             from app.core import webauthn_settings
             if webauthn_settings.usable_passkeys(db, user.id) > 0:
-                api._passkey_pause_grace(user)
+                result.passkey_grace = GRACE_ENDS
         if passkey.required:
-            api._passkey_mark_required(user)
+            result.passkey_grace = GRACE_BEGINS
             if passkey.overdue or not password_owed_before_an_enrollment(user, result.methods, result.provider_id):
                 # Within the time given, a hold made for another enrollment offers the passkey only where the
                 # registration will take it: a provider's sign-in of an account that has a password it can type
