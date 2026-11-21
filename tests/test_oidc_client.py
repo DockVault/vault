@@ -818,7 +818,11 @@ def test_every_call_to_a_provider_holds_its_connection_to_public_addresses_unles
                      resolve=_PUBLIC)
     oc.userinfo(provider, d, "at", expected_sub="user-1", fetch=fetch, resolve=_PUBLIC)
     assert held == [(name, not private_network) for name in ("openid-configuration", "certs", "token", "userinfo")]
-    assert oc._PUBLIC_ONLY.get() is False
+    # After the call the rule is what it is with no call under way: public addresses only. A fetch made without
+    # saying whose it is connects to nothing else.
+    assert oc._PUBLIC_ONLY.get() is True
+    import contextvars
+    assert contextvars.Context().run(oc._PUBLIC_ONLY.get) is True
 
 
 def test_every_address_the_vault_calls_or_sends_a_browser_to_is_vetted_at_use():

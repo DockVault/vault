@@ -13,9 +13,12 @@ error text never reaches the person.
 
 Two deliberate narrowings of the design: ``userinfo`` is read as JSON only (the vault never registers a signed
 userinfo response, so a JWT answer is a provider error), and the host's addresses are vetted by a lookup of our own
-before the connection rather than pinned into it. A name that flips to a private address between the two lookups
-reaches an internal host only through a TLS handshake that must present a certificate valid for the provider's
-name, which an attacker who merely controls that name cannot place inside the network.
+before the connection rather than pinned into it. The connection then judges its own lookup as well: made directly,
+it takes only the public addresses its name answers, unless the provider is marked as inside the network
+(:func:`_reach`), so a name that answers a public address to the first lookup and a private one to the second
+reaches nothing. Through a proxy the proxy looks the name up, and the vault cannot judge the address it connects
+to: there the check before the call and the TLS handshake are what stand (the handshake must present a certificate
+valid for the provider's name, which whoever merely controls that name cannot place inside the network).
 """
 from __future__ import annotations
 
@@ -291,9 +294,10 @@ class _NotPublic(OSError):
     """The name answered no public address where the connection was made."""
 
 
-# Whether the connections made now may take only public addresses: set around each call to a provider that is not
-# marked as inside (:func:`_reach`), read where the connection looks the name up (:class:`_DeadlineConnection`).
-_PUBLIC_ONLY: contextvars.ContextVar = contextvars.ContextVar("oidc_public_addresses_only", default=False)
+# Whether the connections made now may take only public addresses, read where the connection looks the name up
+# (:class:`_DeadlineConnection`). They may not take any other unless a call says so: :func:`_reach` lifts it for a
+# provider marked as inside, for that call. A fetch made some other way is held to public addresses.
+_PUBLIC_ONLY: contextvars.ContextVar = contextvars.ContextVar("oidc_public_addresses_only", default=True)
 
 
 def _reach(provider: "ProviderConfig", fetch: Callable, url: str, **kw) -> dict:

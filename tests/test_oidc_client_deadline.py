@@ -23,6 +23,17 @@ TRICKLE_SECONDS = 1.2      # how long the slow server keeps sending, a byte at a
 BYTE_EVERY = 0.05
 
 
+@pytest.fixture(autouse=True)
+def _reached_as_a_provider_inside_is():
+    """The servers of these tests listen on this machine. A connection takes only public addresses unless its call
+    says the provider is inside the network (oidc_client._reach); these tests are about the time a call takes and
+    what it sends, so they reach their server as such a provider is reached. The tests of the rule itself set it."""
+    oc = _oc()
+    token = oc._PUBLIC_ONLY.set(False)
+    yield
+    oc._PUBLIC_ONLY.reset(token)
+
+
 def _oc():
     set_bare_api_env()
     from app.services import oidc_client as oc
@@ -226,6 +237,12 @@ def test_a_name_that_answers_inside_where_the_connection_is_made_reaches_nothing
     assert server.accepted == 1                                  # no connection was opened
     assert oc._PUBLIC_ONLY.get() is False                        # the rule ends with the call, failed or not
     assert oc._reach(inside, fetch, url) == {"a": 1} and server.accepted == 2
+    # A fetch that says nothing of its provider (made outside _reach, with nothing set around it) is held to
+    # public addresses: it reaches nothing here either.
+    import contextvars
+    with pytest.raises(oc.OidcError) as unsaid:
+        contextvars.Context().run(fetch, url)
+    assert unsaid.value.code == oc.ENDPOINT_REFUSED and server.accepted == 2
     # Through a proxy the connection is the proxy's to make: this one reaches the proxy as before.
     connection = oc._DeadlineConnection("127.0.0.1", server.port, timeout=5)
     token = oc._PUBLIC_ONLY.set(True)
@@ -247,7 +264,7 @@ def test_a_name_that_answers_inside_where_the_connection_is_made_reaches_nothing
     answered = [entry("10.0.0.5"), entry("8.8.8.8"), entry("127.0.0.1"), entry("169.254.169.254"), entry("1.1.1.1"),
                 (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 443, 0, 0)),
                 (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700:4700::1111", 443, 0, 0))]
-    assert oc._addresses_allowed(answered, through_a_proxy=False) == answered        # no call is held: all of them
+    assert oc._addresses_allowed(answered, through_a_proxy=False) == answered        # reached as inside: all of them
     token = oc._PUBLIC_ONLY.set(True)
     try:
         assert [found[4][0] for found in oc._addresses_allowed(answered, through_a_proxy=False)] == [
