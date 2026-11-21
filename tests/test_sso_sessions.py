@@ -598,6 +598,46 @@ def test_a_logout_reads_the_sessions_again_under_the_turn_of_the_accounts_it_nam
     assert any(a[0] == "sso_backchannel_logout" and a[1] == "success" and a[2]["sessions"] == 1 for a in h.audits), h.audits
 
 
+def test_an_unlink_reads_the_sessions_again_under_the_turn_of_the_accounts_that_own_them(monkeypatch):
+    """The same for an unlink. It ends the sessions that came through the identity: it finds them, takes the turn
+    of the accounts they belong to, and reads them again under it. A renewal of one of them that committed while
+    the unlink waited for the turn moved the provider's record to a new session; ended by the ids read first, that
+    new session would go on working until its token ran out, signed in through an identity that is gone."""
+    from app.api import sso_router
+    from app.core.models import ActiveSession, SsoSession
+    alice, bob, p = _user(), _user("bob"), _provider()
+    identity = _identity(alice, p)
+    h = Sessions(monkeypatch, [alice, bob], [p], identities=[identity, _identity(bob, p, subject="subject-bob")])
+    _signed_in(h, p, sid="s-1")
+    _signed_in(h, p, sid="s-bob", sub="subject-bob", email="bob@example.test")
+    old = [s for s in h.active_sessions() if s.user_id == alice.id][0]
+    kept = [r for r in h.sso_sessions() if r.session_id == old.id][0]
+    order, made = [], []
+
+    def turn(db, user_id):
+        order.append(("turn", str(user_id)))
+        if not made:
+            new = ActiveSession(session_token=uuid.uuid4().hex, user_id=alice.id, ip_address="127.0.0.1")
+            h.db.add(new)
+            h.db.add(SsoSession(session_id=new.id, provider_id=kept.provider_id, idp_sid=kept.idp_sid,
+                                idp_sub=kept.idp_sub, auth_time=kept.auth_time, id_token_enc="enc:hint"))
+            old.is_active, old.revoked = False, True
+            h.sso_sessions().remove(kept)                       # the record moved with the renewal
+            made.append(new)
+    monkeypatch.setattr(h.S, "_sessions_turn", turn)
+    through = h.S._revoke_sessions
+
+    def revoke(db, **kw):
+        order.append(("revoke", sorted(str(i) for i in kw["session_ids"])))
+        return through(db, **kw)
+    monkeypatch.setattr(h.S, "_revoke_sessions", revoke)
+    sso_router._end_what_came_through(h.db, alice, identity)
+    # Alice's turn, then what the second read found: the session the renewal made, not the id read before it.
+    assert order == [("turn", str(alice.id)), ("revoke", [str(made[0].id)])]
+    assert made[0].is_active is False and made[0].revoked is True
+    assert [s for s in h.active_sessions() if s.is_active and s.user_id == bob.id]      # bob's is another identity's
+
+
 def test_a_logout_that_names_several_accounts_takes_their_turns_in_one_order(monkeypatch):
     """By subject, a token can name sessions of one account only; by a session id shared across accounts it cannot
     either. The order is fixed all the same, so two logouts never wait on each other's turn."""
