@@ -70,7 +70,7 @@ def db():
                 return
             compiled = state.statement.compile(dialect=postgresql.dialect())
             sql = str(compiled)
-            if "FOR UPDATE" in sql:
+            if "FOR UPDATE" in sql or "FOR NO KEY UPDATE" in sql:      # the administrators' rows leave their keys free
                 table = next((t for t in ("vaults", "users", "account_invitations")
                               if f"FROM {t}" in sql), sql)
                 locks.append((table, sql, compiled.params))
