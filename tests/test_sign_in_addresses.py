@@ -14,7 +14,10 @@ declared as, whatever a parameter is called. A request or a scope read as the ma
 and the like) is a read of it, and so is a ``URL`` or a set of ``Headers`` built from one; a name given a
 ``Request`` built from a scope, or a request itself, is a request. A parameter the framework fills from one of
 those headers (``host: str = Header(None)``, or by its alias) is a read, and so are a request's headers handed
-whole to another function, which the check cannot follow.
+whole to another function, which the check cannot follow. A ``url`` is taken for a request's whatever it is read
+from (a helper's parameter is declared as nothing and may be called anything), a reader taken off the headers and
+called by another name (``get = request.headers.get``) is a read where it is called, and what builds a request
+keeps a name the check knows: it is imported under no other.
 
 This holds every module of the sign-in pipeline, passkeys and single sign-on: every module under app/ named for one
 of them, so a new one is read without being listed, and the ones listed below by name, so a rename shows here and
@@ -246,7 +249,9 @@ def request_addresses(tree) -> list:
         if isinstance(node, ast.Attribute):
             if node.attr == "base_url":
                 found.append(ast.unparse(node))
-            elif node.attr in ("url", "scope") and _a_request(node.value, declared):
+            elif node.attr == "url" or (node.attr == "scope" and _a_request(node.value, declared)):
+                # A ``url`` of anything: a helper handed a request under a name of its own (``conn.url.hostname``)
+                # reads the same address. A scope is known by its name: other things are called one.
                 parent = parents.get(node)
                 harmless = (node.attr == "url" and isinstance(parent, ast.Attribute)
                             and parent.attr in URL_PARTS_THAT_NAME_NO_HOST)
@@ -270,6 +275,12 @@ def request_addresses(tree) -> list:
                     if not (isinstance(part, ast.Constant) and part.value not in SCOPE_PARTS_THAT_NAME_AN_ADDRESS):
                         found.append(ast.unparse(node))
                 elif node.func.attr in WHOLE_MAPPING_READS:
+                    found.append(ast.unparse(node))
+            if isinstance(node.func, ast.Name) and node.func.id in from_headers:
+                # A reader taken off the headers and called by its new name: ``get = request.headers.get``.
+                named = node.args[0] if node.args else None
+                header = header_named(named) if named is not None else None
+                if header is None or _names_an_address(header):
                     found.append(ast.unparse(node))
             if isinstance(node.func, ast.Attribute) and holds_headers(node.func.value):
                 if node.func.attr in HEADER_READS:
@@ -313,6 +324,46 @@ def _is_headers(node, from_headers, kept_as) -> bool:
     if isinstance(node, ast.Attribute):
         return node.attr == "headers" or node.attr in kept_as
     return isinstance(node, ast.Name) and node.id in from_headers
+
+
+def renamed_builders(tree) -> list:
+    """The imports that give what builds a request, its headers or its URL a name the check does not know it by.
+    A request's builder may be called anything that ends in "Request"; the others keep their own names."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for alias in node.names:
+            name, bound = alias.name.split(".")[-1], alias.asname
+            if bound is None or bound == name:
+                continue
+            if name in REQUEST_BUILDERS and not bound.endswith("Request"):
+                found.append(f"{alias.name} as {bound}")
+            elif name in ("Headers", "MutableHeaders", "URL"):
+                found.append(f"{alias.name} as {bound}")
+    return found
+
+
+@pytest.mark.parametrize("module", MODULES + [MAIN_MODULE])
+def test_what_builds_a_request_keeps_a_name_the_check_knows(module):
+    tree = ast.parse((ROOT / module).read_text(encoding="utf-8"))
+    assert renamed_builders(tree) == [], module
+
+
+def test_the_reads_a_name_of_ones_own_would_hide_are_seen():
+    """A request handed to a helper under another name, a header reader called by another name, and a builder
+    imported under another name: each is reported, and what looks like them and reads no address is not."""
+    def reads(source):
+        return request_addresses(ast.parse(source))
+    assert reads("def _host(conn):\n    return conn.url.hostname\n") == ["conn.url.hostname"]
+    assert reads("def _where(connection):\n    return str(connection.url)\n") == ["connection.url"]
+    assert reads("def _path(conn):\n    return conn.url.path, conn.url.query\n") == []
+    assert reads("def f(request):\n    get = request.headers.get\n    return get('host')\n") == ["get('host')"]
+    assert reads("def f(request, name):\n    get = request.headers.get\n    return get(name)\n") == ["get(name)"]
+    assert reads("def f(request):\n    get = request.headers.get\n    return get('user-agent')\n") == []
+    planted = ast.parse("from starlette.requests import Request as R\nfrom starlette.datastructures import URL as U\n"
+                        "from starlette.requests import Request as _Request\nimport starlette.requests\n")
+    assert renamed_builders(planted) == ["Request as R", "URL as U"]
 
 
 def test_the_modules_listed_by_name_are_among_those_read():
