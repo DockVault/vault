@@ -193,7 +193,7 @@ elif pair in ("a passkey from a session", "a passkey from a session the reset en
     else:
         a_change(ada, alice, cc.SECOND_FACTOR)()
         out = together(writer=store)
-out["after"] = state(alice)
+out["after"], out["the turn was held"] = state(alice), in_turn.is_set()
 print(json.dumps(out))
 '''
 
@@ -201,6 +201,7 @@ print(json.dumps(out))
 def test_a_passkey_stored_at_a_held_sign_in_and_a_reset_both_finish_and_the_reset_retires_it(db_name):
     out = run_in(db_name, SCENARIO, env={"PAIR": "a passkey at a held sign-in"})
     assert out["writer"] == ["ok", "stored"] and out["ender"] == ["ok", "changed"], out
+    assert out["the turn was held"] is True, out             # the key was stored in the account's turn
     assert out["ender seconds"] >= 1.0, out                  # the reset waited for the turn the store held
     after = out["after"]
     assert after["keys retired"] == [True] and after["to set up again"] is True and after["held open"] == 0, out
@@ -209,6 +210,7 @@ def test_a_passkey_stored_at_a_held_sign_in_and_a_reset_both_finish_and_the_rese
 def test_an_authenticator_made_active_at_a_held_sign_in_and_a_new_password_both_finish(db_name):
     out = run_in(db_name, SCENARIO, env={"PAIR": "an authenticator at a held sign-in"})
     assert out["writer"] == ["ok", "active"] and out["ender"] == ["ok", "changed"], out
+    assert out["the turn was held"] is True, out
     assert out["ender seconds"] >= 1.0, out
     after = out["after"]
     # A new password takes no factor away: the authenticator set up before it stands, and the held sign-in is spent.
@@ -218,6 +220,7 @@ def test_an_authenticator_made_active_at_a_held_sign_in_and_a_new_password_both_
 def test_a_passkey_stored_from_a_session_is_retired_by_the_reset_that_waited_for_it(db_name):
     out = run_in(db_name, SCENARIO, env={"PAIR": "a passkey from a session"})
     assert out["writer"] == ["ok", "stored"] and out["ender"] == ["ok", "changed"], out
+    assert out["the turn was held"] is True, out             # the key was stored in the account's turn
     assert out["ender seconds"] >= 1.0, out
     after = out["after"]
     assert after["keys retired"] == [True] and after["sessions"] == [[False, True]], out
