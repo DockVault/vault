@@ -28290,6 +28290,7 @@ def _run_lightweight_migrations():
                 f"ALTER TABLE {_tbl} ENABLE ALWAYS TRIGGER trg_{_tbl}_retire")
 
         from app.core.webauthn_settings import (
+            RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET as _RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET,
             RETIRE_PASSKEYS_FROM_BEFORE_A_RESET as _RETIRE_PASSKEYS_FROM_BEFORE_A_RESET)
         statements = _retire_ddl + [
             "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS unlock_remember_minutes INTEGER",
@@ -28416,6 +28417,9 @@ END $$;""",
             # Passkeys from before a second-factor reset the account has not answered (app/core/webauthn_settings.py).
             # After the column above: a database from before that column existed gets both in one start.
             _RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,
+            # And from before a reset the account answered since, or made of an account whose only factor was a
+            # passkey: read from the record of the change (the table is made before this list is run).
+            _RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET,
             # The mark of a password nobody knows (see User in models.py). Nullable.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_nobody_knows VARCHAR(64)",
             # The revision of the role defaults an account has been given, so a start grants each default

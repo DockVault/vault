@@ -24,10 +24,10 @@ def S():
 
 @pytest.fixture
 def db(S):
-    from app.core.models import User, WebAuthnCredential
+    from app.core.models import CredentialChange, User, WebAuthnCredential
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'passkeys.db'}")
-        for model in (User, WebAuthnCredential):
+        for model in (User, WebAuthnCredential, CredentialChange):
             model.__table__.create(engine)
         session = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
         yield session
@@ -94,6 +94,68 @@ def test_passkeys_from_before_a_reset_the_account_has_not_answered_are_retired_a
     # the statement would fail (and the start report itself as incomplete) if it came first.
     assert source.index("ADD COLUMN IF NOT EXISTS second_factor_reset_at") < source.index(
         "_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,")
+
+
+def _change(db, user, kind, applied_at, status="made"):
+    """A change to ``user``'s sign-in details as another administrator's request leaves it on record."""
+    from app.core.models import CredentialChange
+    row = CredentialChange(target_user_id=user.id, kind=kind, status=status, requested_by_name="root",
+                           requested_at=datetime(2026, 11, 9), applied_at=applied_at)
+    db.add(row)
+    db.commit()
+    return row
+
+
+def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_not_it_was_answered(S, db):
+    """The earlier release clears the reset's mark on the account when the account sets a factor up again (it asks
+    for that at the next sign-in), and sets none for an account whose only factor was a passkey. It records every
+    reset another administrator makes among the changes to the account's sign-in details, with its time. At every
+    start a passkey made before the account's latest recorded reset is retired as of it: the one of an account that
+    answered its reset, and the one of an account that had no factor the earlier release knew. A passkey made after
+    the reset, a request that was never applied, a change of another kind, and the keys of other accounts are left."""
+    import inspect
+    from app.core import webauthn_settings as wss
+    earlier, reset_at, later = datetime(2026, 11, 1), datetime(2026, 11, 10), datetime(2026, 11, 12)
+    answered, passkey_only = _user(db, "answered"), _user(db, "passkey-only")
+    asked_only, other_change, untouched = _user(db, "asked-only"), _user(db, "new-password"), _user(db, "untouched")
+    for user in (answered, passkey_only):
+        assert user.second_factor_reset_at is None                # nothing on the account says a reset happened
+        _change(db, user, "second_factor", reset_at)
+    _change(db, answered, "second_factor", datetime(2026, 11, 4))    # an older one: the latest is what counts
+    _change(db, asked_only, "second_factor", None, status="denied")  # asked for, never applied: no time
+    _change(db, other_change, "password", reset_at)                  # not a reset of the factor
+    planted, since = _passkey(db, answered), _passkey(db, answered)
+    only = _passkey(db, passkey_only)
+    kept = [_passkey(db, user) for user in (asked_only, other_change, untouched)]
+    already = _passkey(db, answered, retired=True)
+    for row in (planted, only, already, *kept):
+        row.created_at = earlier
+    since.created_at = later
+    db.commit()
+    for _ in range(2):                                   # run at every start: a second run changes nothing
+        db.execute(sa.text(wss.RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET))
+        db.commit()
+        for row in (planted, since, only, already, *kept):
+            db.refresh(row)
+        assert planted.retired_at == reset_at and only.retired_at == reset_at
+        assert since.retired_at is None and [row.retired_at for row in kept] == [None, None, None]
+        assert already.retired_at == datetime(2026, 11, 1)
+    # The statement that reads the account's mark finds nothing here: only the record says these were reset.
+    planted.retired_at = None
+    db.commit()
+    db.execute(sa.text(wss.RETIRE_PASSKEYS_FROM_BEFORE_A_RESET))
+    db.commit()
+    db.refresh(planted)
+    assert planted.retired_at is None
+    # Among the statements the server runs at start, once, after the one that reads the mark; the table it reads
+    # is one of the models, made before that list is run.
+    source = inspect.getsource(S)
+    in_the_list = " " * 12 + "_RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET,"       # the entry, not the import
+    assert source.count(in_the_list) == 1
+    assert source.index("_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,") < source.index(in_the_list)
+    from app.core.models import Base, CredentialChange
+    assert CredentialChange.__tablename__ == "credential_changes" and "credential_changes" in Base.metadata.tables
+    assert {"target_user_id", "kind", "applied_at"} <= set(CredentialChange.__table__.columns.keys())
 
 
 def test_the_statement_fails_on_a_database_that_has_not_got_the_column_yet(S):

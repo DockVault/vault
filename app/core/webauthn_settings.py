@@ -277,12 +277,28 @@ def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None
 # Run at every start. A reset of an account's second factor retires its passkeys; one made by a release that knew
 # no passkeys (run for a while after going back to it) left them as they were, though the account's second factor
 # was taken from it for a reason (a lost device, an account taken over). A passkey made before the reset the
-# account has not answered yet is retired as of that reset; one made after it (its answer) is left.
+# account has not answered yet is retired as of that reset; one made after it (its answer) is left. An account
+# with no reset has no such moment: nothing is earlier than it, and nothing of that account is touched.
 RETIRE_PASSKEYS_FROM_BEFORE_A_RESET = (
     "UPDATE webauthn_credentials SET retired_at = "
     "(SELECT u.second_factor_reset_at FROM users u WHERE u.id = webauthn_credentials.user_id) "
-    "WHERE retired_at IS NULL AND EXISTS (SELECT 1 FROM users u WHERE u.id = webauthn_credentials.user_id "
-    "AND u.second_factor_reset_at IS NOT NULL AND webauthn_credentials.created_at < u.second_factor_reset_at)"
+    "WHERE retired_at IS NULL AND created_at < "
+    "(SELECT u.second_factor_reset_at FROM users u WHERE u.id = webauthn_credentials.user_id)"
+)
+# The same from the record of the reset. The mark above is gone once the account set a factor up again (the earlier
+# release asks for that at the next sign-in), and was never set for an account whose only factor was a passkey
+# (that release saw no factor on it). Every reset another administrator or the server's operator makes is also
+# kept, with its time, among the changes to the account's sign-in details, on every release since 0.33.0, for
+# the 14 days such a record is kept. A passkey made before the account's latest recorded reset is retired as of
+# it. A reset made by this release retires the account's passkeys itself, so here this finds nothing to do; a
+# request that was never applied has no time, and counts for nothing.
+RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET = (
+    "UPDATE webauthn_credentials SET retired_at = "
+    "(SELECT max(c.applied_at) FROM credential_changes c "
+    "WHERE c.target_user_id = webauthn_credentials.user_id AND c.kind = 'second_factor') "
+    "WHERE retired_at IS NULL AND created_at < "
+    "(SELECT max(c.applied_at) FROM credential_changes c "
+    "WHERE c.target_user_id = webauthn_credentials.user_id AND c.kind = 'second_factor')"
 )
 
 
