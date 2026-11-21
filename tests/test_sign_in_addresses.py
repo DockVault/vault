@@ -23,6 +23,7 @@ function (every one of them: two that share a name, as every middleware's ``__ca
 functions that read such a value for another purpose named below.
 Offline, from the source."""
 import ast
+import copy
 import re
 from pathlib import Path
 
@@ -104,10 +105,15 @@ def _a_request(node, declared=frozenset(), *, short_names=True) -> bool:
     a parameter declared as one), a socket's connection (``websocket``) or a raw scope (``scope``). ``req`` is a
     request by its name where an attribute of it is read; where it is subscripted it is one only when declared so
     (the name is also used for other things that are subscripted)."""
+    if isinstance(node, ast.Call):
+        # A request built where it is read: ``Request(scope).url``, under whatever name the builder was imported
+        # (``_Request``), is a request.
+        return _called(node) in REQUEST_BUILDERS or _called(node).endswith("Request")
     name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else ""
     if isinstance(node, ast.Name) and name in declared:
         return True
-    return name.lower().endswith(("request", "websocket")) or name.lower() == "scope" or (short_names and name.lower() == "req")
+    bare = name.lstrip("_").lower()            # ``self._scope`` and ``ctx._scope`` are the scope, kept
+    return bare.endswith(("request", "websocket")) or bare == "scope" or (short_names and bare == "req")
 
 
 def _called(node) -> str:
@@ -347,6 +353,25 @@ def _main_module_functions() -> list:
     return _functions_of(ast.parse((ROOT / MAIN_MODULE).read_text(encoding="utf-8")))
 
 
+def _outside_functions(tree):
+    """``tree`` with every function taken out (each is read by itself): what is left runs when the module is
+    loaded, a lambda bound to a name among it."""
+    class _Without(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            return ast.Pass()
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    return ast.fix_missing_locations(_Without().visit(copy.deepcopy(tree)))
+
+
+def test_the_main_modules_code_outside_its_functions_reads_no_address_either():
+    tree = ast.parse((ROOT / MAIN_MODULE).read_text(encoding="utf-8"))
+    assert request_addresses(_outside_functions(tree)) == []
+    planted = ast.parse("class A:\n    def f(self, request):\n        return request.url.hostname\n"
+                        "_host_of = lambda request: request.headers.get('host')\n")
+    assert request_addresses(_outside_functions(planted)) == ["request.headers.get('host')"]
+
+
 def test_every_function_is_read_also_the_ones_that_share_a_name():
     source = ("class A:\n    def __call__(self, scope):\n        return scope['server']\n"
               "class B:\n    def __call__(self, scope):\n        return 1\n"
@@ -487,6 +512,14 @@ def test_a_read_added_to_a_function_that_may_read_one_is_seen():
     "u = str(URL(scope=request.scope))",
     "r = Request(scope, receive)\nx = r['server']",
     "r = Request(scope)\nx = r.url.hostname",
+    # A request built where it is read, under any name of the builder; the scope a context keeps.
+    "x = _Request(scope).url.netloc",
+    "x = Request(scope)['server']",
+    "x = StarletteRequest(scope).headers.get('host')",
+    "x = dict(ctx._scope.get('headers') or []).get(b'host')",
+    "x = current_request_context()._scope['headers']",
+    "x = Request(current_request_context()._scope).url.netloc",
+    "x = self._request.url.hostname",
     # A parameter the framework fills from the header, by its name or its alias.
     "async def cb(host: str = Header(None)):\n    return host",
     "async def cb(x_forwarded_host: Optional[str] = Header(None)):\n    return x_forwarded_host",
@@ -550,6 +583,9 @@ def test_the_check_finds_each_way_a_request_names_its_address(source):
     "receipt = request.headers.get('X-Second-Factor')\nok = spend(receipt=receipt)",     # a value read out of them
     "headers = dict(refused.headers)\nanswer = respond(page, headers=headers)",          # headers the vault sends
     "r = requirement\nx = r['server']",                   # not a request, whatever it is given
+    "ip = client_ip(_Request(scope))",                    # a request handed to what reads the caller, not the address
+    "body = TotpEnrollRequest(code='1').code",            # a model that happens to be called a request
+    "x = _scopes['read']",                                # another name altogether
     "peer = scope.get('client')",                         # who called
     "path = scope.get('path', '')",                       # what was asked for, not where
     "files = scope.get('files')",                         # a credential's scope, which happens to share the name
