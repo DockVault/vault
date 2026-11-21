@@ -247,7 +247,8 @@ class Harness:
         monkeypatch.setattr(S, "_fire_action_email", lambda db, key, *, email, username=None, action_context=None: (
             self.emails.append((key, email, action_context))))
         self.notice_bodies = []            # the same notices with what they say: (ids, title, body)
-        monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
+        monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None,
+                            once=False: (
             self.notice_bodies.append((list(ids), title, body)) or self.notices.append((list(ids), title)) or list(ids)))
         monkeypatch.setattr(S, "_enforce_step_up", lambda db, user, request, action: self.step_ups.append(action))
         self.session_hash = "sess-hash"

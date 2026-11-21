@@ -102,10 +102,14 @@ REASON_TEXTS = {
 
 
 class Refusal(Exception):
-    def __init__(self, code: str, detail: str = ""):
+    """``about``: the account a refusal kept the sign-in away from, when there is one. It is for the vault's own
+    notices to that account; nothing of it is shown to the person at the provider."""
+
+    def __init__(self, code: str, detail: str = "", about=None):
         super().__init__(code if not detail else f"{code}: {detail}")
         self.code = code
         self.detail = detail
+        self.about = about
 
 
 def reason_text(code: str) -> str:
@@ -595,6 +599,14 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     email = usable_email(answer.email) if answer.email_verified else None
     if email is None or not sso_policy.address_admitted(policy, email):
         return None                  # the hosted-domain claim admits the sign-in; the address must be on the list too
+    if account_policy is not None:
+        # The vault's sign-up list is what restricts this provider. Where a hosted-domain claim admitted the
+        # sign-in, the address has not been judged yet: it must be on that list itself, as for a new account,
+        # or a member of the organisation would reach the account behind any address they hold at the provider.
+        from app.core.account_policy import email_allowed_by_domain_gate
+        if not email_allowed_by_domain_gate(email, account_policy.get("signup_email_domain_mode"),
+                                            account_policy.get("signup_email_domains")):
+            return None
     user = find_user_by_email(db, email)
     if user is None or not account_usable(user):
         return None
@@ -602,7 +614,7 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     if kind is not None:
         # An administrator, or an account with the auditor right (open), reaches other people's vaults: a takeover of
         # its address at the provider must not reach it silently. It links only from its own profile, under step-up.
-        raise Refusal(RESTRICTED, f"privileged_account:{kind}")
+        raise Refusal(RESTRICTED, f"privileged_account:{kind}", about=user)
     if not email_confirmation.confirmed(user):
         raise Refusal(NO_ACCOUNT, ADDRESS_NOT_CONFIRMED)
     if set_up_its_own_factor(db, user):
@@ -612,7 +624,7 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         # could leave the first sign-in at the account's factor, start a second one through the link now made, and
         # be asked for nothing of the account's. Such an account links the provider from its own profile, where
         # its own sign-in and its own factor stand behind the link.
-        raise Refusal(LINK_FROM_PROFILE, HOLDS_A_FACTOR)
+        raise Refusal(LINK_FROM_PROFILE, HOLDS_A_FACTOR, about=user)
     if db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
                                             ExternalIdentity.user_id == user.id).first() is not None:
         return None          # the account's identity on this provider is another one: an administrator sorts it out

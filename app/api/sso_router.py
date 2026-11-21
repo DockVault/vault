@@ -429,6 +429,7 @@ async def sign_in_callback(
             if invitation_id:
                 api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip,
                                           reason=exc.detail or exc.code)
+            _tell_of_a_sign_in_kept_out(db, row, exc)
             return _redirect("sso-error=" + exc.code)
         user = found.user
         # The provider's groups into departments and roles, for this token (a held request for the administrator
@@ -994,6 +995,43 @@ def _identity_public(identity: ExternalIdentity, row: Optional[SsoProvider]) -> 
             "provider": (row.label or row.name) if row is not None else "a removed provider",
             "linked_at": _t(identity.linked_at), "linked_by": identity.linked_by,
             "last_sign_in_at": _t(identity.last_sign_in_at)}
+
+
+def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
+    """A sign-in at the provider carried the verified address of an account that is never linked by its address
+    (it set up a second factor of its own, or it is privileged). Whoever holds that address at the provider
+    learns little from the answer; the account's owner would learn nothing at all, and an address taken over at
+    the provider shows here first. So the owner is told, in the app, at most once a day for a provider; for a
+    privileged account the other administrators are told as well. No email: the notice is not something a
+    stranger at the provider may send at will. Never raises."""
+    user = getattr(refusal, "about", None)
+    if user is None:
+        return
+    api = _api()
+    label = (getattr(row, "label", None) or getattr(row, "name", None) or "a provider").strip()
+    key = f"sso_kept_out:{row.id}:{datetime.utcnow():%Y-%m-%d}"
+    try:
+        api._notify_users([str(user.id)], "account_changed", title=f"A sign-in through {label} with your address was kept out",
+                          body=(f"Someone signed in through {label} with your email address. Nobody was signed in to your "
+                                f"account and nothing was linked: your account is linked to {label} only by you, under "
+                                f"Your account. If that was you, link it there. If it was not, your address at {label} "
+                                "may be in someone else's hands: tell an administrator."),
+                          target="#profile", dedup_prefix=key, once=True)
+        if refusal.code == sso.RESTRICTED:
+            from app.core import setting_changes
+            from app.core.models import RoleEnum
+            others = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all()
+                      if a.is_active and a.id != user.id]
+            if others:
+                api._notify_users(others, setting_changes.NOTICE_TYPE,
+                                  title=f"A sign-in through {label} tried to reach {user.username}'s account",
+                                  body=(f"A sign-in through {label} carried the email address of {user.username}, an "
+                                        "account that is never linked to a provider by its address. Nobody was signed "
+                                        f"in. If {user.username} did not try this, the address may be in someone else's "
+                                        f"hands at {label}."),
+                                  target="#users", dedup_prefix=f"{key}:{user.id}", once=True)
+    except Exception as exc:  # noqa: BLE001
+        log.info("sso kept-out notice skipped: %s", type(exc).__name__)
 
 
 def _tell_owner(db, user, row, title: str, change: str) -> None:

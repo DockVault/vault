@@ -442,7 +442,9 @@ def test_a_privileged_account_is_never_linked_by_its_verified_email(monkeypatch,
         h.db.rows_of(AuditorGrant).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=bob.id, status=arrange))
     location, _ = _sign_in(h, p, email="bob@example.test")
     assert location == "/#sso-error=restricted", location
-    assert h.identities() == [] and h.codes() == [] and h.notices == []
+    assert h.identities() == [] and h.codes() == [] and h.emails == []
+    # The owner is told that it was tried (and nobody else here: there is no other administrator).
+    assert h.notices == [([str(bob.id)], "A sign-in through Sign in with Contoso with your address was kept out")]
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "restricted"
                and a[2].get("refused_because") == f"privileged_account:{kind}" for a in h.audits), h.audits
     # An ended grant is no standing: the account links.
@@ -670,8 +672,9 @@ def test_an_account_with_its_own_second_factor_is_never_linked_by_email(monkeypa
     for _ in range(3):                                   # the first try, and the ones that would ride on it
         location, _state = _sign_in(h, p, sub="someone-at-the-provider", email="bob@example.test", amr=["pwd", "mfa"])
         assert location == "/#sso-error=link_from_profile", location
-        assert h.identities() == [] and h.codes() == [] and h.notices == [] and h.emails == []
+        assert h.identities() == [] and h.codes() == [] and h.emails == []
         assert (bob.password_hash, bob.sso_only, bob.sftp_password_auth) == before
+    assert {tuple(told[0]) for told in h.notices} == {(str(bob.id),)}       # only the owner hears of it
     refused = [a[2] for a in h.audits if a[0] == "sso_sign_in_refused"]
     assert len(refused) == 3 and all(r.get("reason") == "link_from_profile"
                                      and r.get("refused_because") == "account_holds_a_factor" for r in refused), h.audits
@@ -757,6 +760,66 @@ def test_a_provider_with_a_hosted_domain_claim_is_judged_on_that_claim_and_not_o
     location, _state = _sign_in(h, p, hd="example.test", **claims)               # the organisation's own
     assert location.startswith("/#sso="), location
     assert len(h.identities()) == 1
+
+
+def test_the_owner_is_told_when_a_sign_in_with_their_address_was_kept_out(monkeypatch):
+    """The answer at the provider says little. The owner of the account the sign-in was kept away from is told in
+    the app, once a day for a provider, with no email (a stranger at the provider cannot send mail at will); for a
+    privileged account the other administrators are told as well. An address nobody confirmed, or nobody's, is no
+    account's to be told about."""
+    from datetime import datetime
+    bob, carol = _user("bob"), _user("carol", email_confirmed_at=None)
+    root, second, gone = _user("root", role="admin"), _user("second", role="admin"), _user("gone", role="admin", is_active=False)
+    p = _provider(policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [bob, carol, root, second, gone], [p])
+    _factor(h, bob, "authenticator")
+    told = []
+    monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None,
+                        once=False: told.append((list(ids), ntype, title, body, target, dedup_prefix, once)) or list(ids))
+    key = f"sso_kept_out:{p.id}:{datetime.utcnow():%Y-%m-%d}"
+    location, _ = _sign_in(h, p, sub="s-1", email="bob@example.test")
+    assert location == "/#sso-error=link_from_profile"
+    (ids, ntype, title, body, target, dedup, once), = told
+    assert (ids, ntype, target, dedup, once) == ([str(bob.id)], "account_changed", "#profile", key, True)
+    assert title == "A sign-in through Sign in with Contoso with your address was kept out"
+    assert "Nobody was signed in" in body and "under Your account" in body and "tell an administrator" in body
+    # A privileged account: its owner, and the other administrators who are active.
+    del told[:]
+    location, _ = _sign_in(h, p, sub="s-2", email="root@example.test")
+    assert location == "/#sso-error=restricted"
+    owner, others = told
+    assert owner[0] == [str(root.id)] and owner[5] == key and owner[6] is True
+    assert others[0] == [str(second.id)] and others[4] == "#users" and others[5] == f"{key}:{root.id}" and others[6] is True
+    assert "tried to reach root's account" in others[2] and "Nobody was signed in" in others[3]
+    # No account the vault can speak for: nobody is told.
+    del told[:]
+    for address in ("carol@example.test", "nobody@example.test"):
+        location, _ = _sign_in(h, p, sub="s-3", email=address)
+        assert location == "/#sso-error=no_account", location
+    assert told == [] and h.emails == []
+
+
+@pytest.mark.parametrize("row", ["names a hosted-domain claim", "judged on the address"])
+def test_under_the_sign_up_list_a_link_by_email_needs_the_address_itself_on_the_list(monkeypatch, row):
+    """The vault's sign-up list restricts the provider. With a hosted-domain claim the sign-in is admitted on the
+    claim, and the address it carries has not been judged: a member of the organisation holding, at the
+    provider, the address of somebody outside it (a collaborator's account at another domain) is not linked to
+    that account. An address on the list links as before; without the claim the address was judged already."""
+    inside, outside = _user("inside"), _user("outside", email="outside@partner.test")
+    root = _user("root", role="admin")
+    shape = {"claims": {"domain": "hd"}} if row == "names a hosted-domain claim" else {}
+    p = _provider(policy={"sso_use_signup_domains": True, "sso_link_by_email": True}, **shape)
+    h = Resolving(monkeypatch, [inside, outside, root], [p],
+                  account_policy={"signup_email_domain_mode": "allowlist", "signup_email_domains": ["example.test"]})
+    location, _ = _sign_in(h, p, sub="s-1", email="outside@partner.test", hd="example.test")
+    if row == "names a hosted-domain claim":
+        assert location == "/#sso-error=no_account", location
+    else:
+        assert location == "/#sso-error=restricted", location           # the address itself is what is judged
+    assert h.identities() == []
+    location, _ = _sign_in(h, p, sub="s-2", email="inside@example.test", hd="example.test")
+    assert location.startswith("/#sso="), location
+    assert [i.user_id for i in h.identities()] == [inside.id]
 
 
 def _provider_locks(h):
