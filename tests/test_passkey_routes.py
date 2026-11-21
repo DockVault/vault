@@ -694,3 +694,35 @@ def test_a_key_is_marked_attested_only_when_it_was_registered_under_direct_attes
     status, listed = _call(S, "GET", "/users/me/passkeys")
     assert status == 200 and listed["attestation"] == "none"               # the setting itself, as the profile reads it
     assert [k["attested"] for k in listed["passkeys"]] == [False, True]
+
+
+def test_what_a_removal_leaves_is_counted_whatever_the_passkey_switch_says(monkeypatch):
+    """Passkeys are switched off, by the deployment's switch, which may be turned back on. An administrator removes
+    one of an account's two keys. The other is still the account's: the removal is not taken for the last one
+    because of the switch, and no set-up is owed. Removing that one too leaves nothing, and is. Either removal,
+    made by somebody else, signs the account out."""
+    from app.core import credential_changes as cc
+    from app.core import webauthn_settings
+    from app.core.models import User
+    admin, target = _user("root", role="admin"), _user("carol")
+    h = Harness(monkeypatch, admin)
+    h.db.rows_of(User).append(target)
+    now = datetime.utcnow()
+    keys = [types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, credential_id=bytes([i]), retired_at=None,
+                                  provisional_until=None, created_at=now, transports=["usb"], label=f"key-{i}",
+                                  backup_eligible=False, cose_alg=-7, last_used_at=None) for i in (1, 2)]
+    h.rows().extend(keys)
+    monkeypatch.setattr(webauthn_settings, "enabled", lambda: False)
+    assert webauthn_settings.usable_passkeys(h.db, target.id) == 0                     # none is a factor now
+    assert webauthn_settings.usable_passkeys(h.db, target.id, whatever_the_switch=True) == 2
+    assert webauthn_settings.usable_passkeys(h.db, target.id, without=keys[0].id, whatever_the_switch=True) == 1
+
+    def remove(key):
+        return h.S._apply_credential_change(h.db, cc.PASSKEY, target, {"passkey_id": str(key.id)},
+                                            actor_id=admin.id, actor_name=admin.username, request=None)
+    out = remove(keys[0])
+    assert out["left_without_a_factor"] is False and out["signed_out"] is True, out
+    assert target.second_factor_reset_at is None and keys[0].retired_at is not None
+    out = remove(keys[1])
+    assert out["left_without_a_factor"] is True and out["signed_out"] is True, out
+    assert target.second_factor_reset_at is not None

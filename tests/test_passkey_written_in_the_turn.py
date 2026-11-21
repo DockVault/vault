@@ -160,3 +160,22 @@ def test_the_passkey_door_reads_the_key_again_after_the_account(monkeypatch):
     status, body = h.sign_in(auth)[:2]
     assert status == 401 and row in read_again, body
     assert h.db.rows_of(ActiveSession) == []
+
+
+def test_the_passkey_door_hands_on_what_it_read_of_the_account_before_the_key(monkeypatch):
+    """The count of the account's ended sessions is taken where the account is read, before the key is read again
+    and the assertion checked. A change that is committed in that time has counted itself: the sign-in carries
+    the earlier count, and the compare in the turn refuses it. Taken where the sign-in is handed on, the count
+    would be the later one, and that change would go unseen."""
+    from app.core.models import ActiveSession
+    alice = _user()
+    h = SignInHarness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+
+    def as_committed(obj):
+        if obj is row:
+            alice.sessions_ended += 1                      # a change committed while the key was read again
+    monkeypatch.setattr(h.db, "refresh", as_committed, raising=False)
+    status, body = h.sign_in(auth)[:2]
+    assert (status, body["detail"]) == (401, "This login attempt has expired; start again."), body
+    assert h.db.rows_of(ActiveSession) == []

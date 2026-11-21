@@ -159,6 +159,15 @@ def test_a_key_records_the_address_it_is_made_at_and_one_with_none_gets_it_at_it
     status, body = s.sign_in(auth)[:2]
     assert status == 200, body
     assert row.rp_id == RP_ID and ORIGIN.endswith(RP_ID)
+    # And so where such a key first answers at a further step (a step-up, a second factor), not at a sign-in.
+    from test_passkey_second_factor import Harness as StepHarness
+    fay = _user("fay")
+    f = StepHarness(monkeypatch, [fay])
+    auth, row = f.enroll(fay)
+    assert getattr(row, "rp_id", None) is None
+    status, body = f.step_up_with_passkey(auth, "account.second_factor")
+    assert status == 200 and "receipt" in body, body
+    assert row.rp_id == RP_ID
 
 
 def test_an_administrators_removal_that_leaves_only_keys_made_elsewhere_leaves_no_factor(monkeypatch):

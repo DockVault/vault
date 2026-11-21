@@ -133,3 +133,95 @@ def test_the_example_environment_says_it_beside_the_address():
     tail = before[-2500:]
     assert "Passkeys need https and a HOST NAME" in tail and "reached by IP" in tail and "plain http" in tail
     assert "xn-- form" in tail and "waits meanwhile" in tail and "dockvault.py setup and status say so" in tail
+
+
+def test_the_note_about_passkeys_made_at_another_address_counts_those_and_no_others():
+    """Setup and status say how many passkeys in use were made at another address than the vault gives out now, of
+    how many accounts, where, and what follows. Nothing is said when every key was made here, when there is none,
+    or when the deployment could not be asked."""
+    here = "vault.example.com"
+    answer = {"ok": True, "here": here, "made_at": [
+        {"address": here, "passkeys": 3, "accounts": 2},
+        {"address": "old.example.com", "passkeys": 2, "accounts": 1},
+        {"address": "older.example.com", "passkeys": 1, "accounts": 1},
+        {"address": "empty.example.com", "passkeys": 0, "accounts": 0},
+        {"address": "broken.example.com", "passkeys": "many", "accounts": 1}, "not an entry"]}
+    note = dv.passkeys_elsewhere_note(answer, here)
+    assert note.startswith("3 passkeys (of 2 accounts) were made at old.example.com, older.example.com and cannot "
+                           "be used at vault.example.com."), note
+    assert "sets a second factor up again at its next sign-in" in note
+    assert "with its password, or through its organisation's sign-in where it has none" in note
+    assert note.endswith("The passkeys work again if the vault goes back to that address.")
+    assert "empty.example.com" not in note and "broken.example.com" not in note
+    one = dv.passkeys_elsewhere_note({"made_at": [{"address": "old.example.com", "passkeys": 1, "accounts": 1}]}, here)
+    assert one.startswith("1 passkey (of 1 account) was made at old.example.com and cannot be used at "), one
+    # Every key made here (a host name is one name however it is written), no key, no answer: nothing to say.
+    for made_here in (here, "VAULT.Example.COM"):
+        assert dv.passkeys_elsewhere_note({"made_at": [{"address": made_here, "passkeys": 3, "accounts": 2}]}, here) is None
+    assert dv.passkeys_elsewhere_note({"made_at": [{"address": here, "passkeys": 3, "accounts": 2}]}, "Vault.Example.com") is None
+    for nothing in (None, {}, {"made_at": "text"}, {"made_at": []}, "text", []):
+        assert dv.passkeys_elsewhere_note(nothing, here) is None, nothing
+    # An address no passkey can be made at: every key in use was made somewhere else.
+    stranded = dv.passkeys_elsewhere_note({"made_at": [{"address": here, "passkeys": 2, "accounts": 2}]}, "")
+    assert "cannot be used at the address the vault has now (no passkey can be made there)" in stranded, stranded
+    # A key with no address on record is reported by the deployment under its own address; one that still comes
+    # with none is named for what it is.
+    unnamed = dv.passkeys_elsewhere_note({"made_at": [{"address": "", "passkeys": 1, "accounts": 1}]}, here)
+    assert "made at an address that was not recorded" in unnamed, unnamed
+
+
+def test_the_host_passkeys_are_made_for_is_the_one_the_vault_gives_out():
+    assert dv.passkey_host("https://vault.example.com") == "vault.example.com"
+    assert dv.passkey_host("https://vault.example.com:8443") == "vault.example.com"
+    for none_can_be_made in ("https://203.0.113.9:8443", "http://vault.lan:8080", "", None):
+        assert dv.passkey_host(none_can_be_made) == "", none_can_be_made
+
+
+def test_status_says_which_passkeys_were_made_at_another_address(monkeypatch, tmp_path):
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    Tool = next(c for c in vars(dv).values() if isinstance(c, type) and hasattr(c, "_print_status"))
+    tool = Tool.__new__(Tool)
+    tool.pal = types.SimpleNamespace(paint=lambda text, colour=None: text)
+    monkeypatch.setattr(tool, "_is_locked", lambda: False)
+    monkeypatch.setattr(tool, "_env_lock_path", lambda: str(tmp_path / "none.lock"))
+    monkeypatch.setattr(tool, "_env_archives", lambda: [])
+    monkeypatch.setattr(tool, "_env_path", lambda: str(tmp_path / ".env"))
+    (tmp_path / ".env").write_text("ALLOWED_HOSTS='https://vault.example.com'\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "_load_env", lambda: {"ALLOWED_HOSTS": "https://vault.example.com"})
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: None)
+    monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
+    asked = []
+    answers = [{"ok": True, "here": "vault.example.com", "made_at": [
+        {"address": "vault.example.com", "passkeys": 4, "accounts": 3},
+        {"address": "old.example.com", "passkeys": 2, "accounts": 1}]}]
+    monkeypatch.setattr(tool, "_passkey_addresses", lambda: (asked.append(1), answers[0])[1])
+    tool._print_status("combined")
+    lines = [line for line in printed if "Passkeys:" in line]
+    assert len(lines) == 1 and "2 passkeys (of 1 account) were made at old.example.com" in lines[0], printed
+    assert "cannot be used at vault.example.com" in lines[0] and asked == [1]
+    # Every key made here, or a deployment that could not be asked: no line.
+    for quiet in ({"ok": True, "made_at": [{"address": "vault.example.com", "passkeys": 4, "accounts": 3}]}, None):
+        printed.clear()
+        answers[0] = quiet
+        tool._print_status("combined")
+        assert not any("Passkeys:" in line for line in printed), (quiet, printed)
+
+
+def test_the_deployment_that_cannot_be_asked_about_its_passkeys_answers_nothing(monkeypatch):
+    Tool = next(c for c in vars(dv).values() if isinstance(c, type) and hasattr(c, "_passkey_addresses"))
+    tool = Tool.__new__(Tool)
+    monkeypatch.setattr(dv, "docker_available", lambda: (False, "no docker"))
+    assert tool._passkey_addresses() is None
+    monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
+
+    def gone(*a, **k):
+        raise OSError("no such command")
+    monkeypatch.setattr(tool, "_run_dc", gone)
+    assert tool._passkey_addresses() is None
+    # An answer that says it failed is no answer; one that is whole is handed on.
+    said = ['{"ok": false, "error": "x"}']
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: types.SimpleNamespace(stdout=said[0], returncode=0))
+    assert tool._passkey_addresses() is None
+    said[0] = '{"ok": true, "here": "vault.example.com", "made_at": []}'
+    assert tool._passkey_addresses() == {"ok": True, "here": "vault.example.com", "made_at": []}
