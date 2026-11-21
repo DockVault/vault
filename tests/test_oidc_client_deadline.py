@@ -72,7 +72,8 @@ def test_a_reply_trickled_inside_the_sockets_timeout_is_cut_off_at_the_calls_dea
 
 
 class _Server:
-    """An https server on this machine: ``/ok`` answers a JSON object, ``/slow`` trickles its headers."""
+    """An https server on this machine: ``/ok`` answers a JSON object, ``/slow`` trickles its headers, and
+    ``/redirect`` sends whoever asks to a plain-http listener beside it, which notes what reaches it."""
 
     def __init__(self, tmp_path):
         authority = certs.authority("Test Provider Authority")
@@ -85,8 +86,36 @@ class _Server:
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
         self.port = self.listener.getsockname()[1]
+        self.elsewhere = socket.socket()
+        self.elsewhere.bind(("127.0.0.1", 0))
+        self.elsewhere.listen(8)
+        self.elsewhere_port = self.elsewhere.getsockname()[1]
+        self.reached_elsewhere = []
         self.open = True
         threading.Thread(target=self._serve, daemon=True).start()
+        threading.Thread(target=self._serve_elsewhere, daemon=True).start()
+
+    def _serve_elsewhere(self):
+        while self.open:
+            try:
+                conn, _ = self.elsewhere.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(5)
+                asked = b""
+                while b"\r\n\r\n" not in asked:
+                    more = conn.recv(4096)
+                    if not more:
+                        break
+                    asked += more
+                self.reached_elsewhere.append(asked.decode("latin-1"))
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
+                             b"Connection: close\r\n\r\n{}")
+            except OSError:
+                pass
+            finally:
+                conn.close()
 
     def _serve(self):
         while self.open:
@@ -107,6 +136,17 @@ class _Server:
                     asked += more
                 if asked.startswith(b"GET /slow"):
                     _trickle(conn, b"HTTP/1.1 200 OK\r\nX-Slow: ", b"\r\nContent-Length: 2\r\n\r\n{}")
+                elif b" /redirect " in asked.split(b"\r\n", 1)[0]:
+                    head, _, body = asked.partition(b"\r\n\r\n")
+                    lengths = [line.split(b":", 1)[1] for line in head.split(b"\r\n")
+                               if line.lower().startswith(b"content-length:")]
+                    while lengths and len(body) < int(lengths[0]):      # the whole request, before the answer
+                        more = conn.recv(4096)
+                        if not more:
+                            break
+                        body += more
+                    conn.sendall(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:%d/latest/meta-data\r\n"
+                                 b"Content-Length: 0\r\nConnection: close\r\n\r\n" % self.elsewhere_port)
                 else:
                     body = b'{"a": 1}'
                     conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
@@ -115,11 +155,12 @@ class _Server:
             pass
 
     def opener(self, oc):
-        return urllib.request.build_opener(oc._Https(context=self.trusting), oc._NoRedirects())
+        return oc._build_opener(self.trusting)          # the module's own opener, trusting this server
 
     def close(self):
         self.open = False
         self.listener.close()
+        self.elsewhere.close()
 
 
 @pytest.fixture
@@ -130,6 +171,36 @@ def server(tmp_path, monkeypatch):
     made = _Server(tmp_path)
     yield made
     made.close()
+
+
+def test_an_answer_that_points_elsewhere_is_refused_and_the_clients_credentials_go_nowhere(server):
+    """A provider's endpoint (or whoever can make it answer) says 302, to a plain-http address inside. urllib's
+    own handling would go there, as a GET that still carries the request's headers: the code exchange's
+    ``Authorization: Basic`` with the client's secret. The address was never judged under the endpoint rule. The
+    module's opener follows no redirect: the call is refused and nothing reaches the other address."""
+    oc = _oc()
+    url = f"https://127.0.0.1:{server.port}/redirect"
+    headers = {"Authorization": "Basic Y2xpZW50OnNlY3JldA==", "Content-Type": "application/x-www-form-urlencoded"}
+    # The opener the module's calls use, and the one this server hands out, come from the one place; every
+    # redirect handler in them is the one that refuses.
+    for opener in (oc._opener, server.opener(oc)):
+        redirectors = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
+        assert redirectors and all(isinstance(h, oc._NoRedirects) for h in redirectors), redirectors
+        assert any(isinstance(h, oc._Https) for h in opener.handlers)
+    # The control: urllib's own redirect handling does follow this answer, and does carry the header along.
+    following = urllib.request.build_opener(oc._Https(context=server.trusting))
+    request = urllib.request.Request(url, data=b"grant_type=authorization_code", headers=headers, method="POST")
+    with following.open(request, timeout=10) as answer:
+        assert answer.status == 200
+    assert len(server.reached_elsewhere) == 1 and server.reached_elsewhere[0].startswith("GET /latest/meta-data")
+    assert "authorization: basic y2xpzw50onnly3jlda==" in server.reached_elsewhere[0].lower()
+    server.reached_elsewhere.clear()
+    with pytest.raises(oc.OidcError):
+        oc.fetch_json(url, method="POST", data=b"grant_type=authorization_code", headers=headers,
+                      opener=server.opener(oc))
+    with pytest.raises(oc.OidcError):
+        oc.fetch_json(url, opener=server.opener(oc))
+    assert server.reached_elsewhere == []
 
 
 def test_a_whole_call_ends_at_its_timeout_however_slowly_the_provider_sends_its_headers(server):

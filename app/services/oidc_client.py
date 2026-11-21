@@ -386,8 +386,15 @@ class _Https(urllib.request.HTTPSHandler):
         return super().do_open(_DeadlineConnection, req, **http_conn_args)
 
 
-# https only: no file, ftp, data or plain-http handler can ever answer, whatever the address.
-_opener = urllib.request.build_opener(_Https(), _NoRedirects())
+def _build_opener(context=None):
+    """The opener every call of this module is made with (``context``: a test's own trust store). Every
+    connection is held to the call's deadline, and no redirect is followed: the address a redirect names was
+    never judged under the endpoint rule, and urllib would replay the request there with its headers, the
+    client's credentials among them."""
+    return urllib.request.build_opener(_Https(context=context) if context is not None else _Https(), _NoRedirects())
+
+
+_opener = _build_opener()
 
 
 def fetch_json(url: str, *, method: str = "GET", data: Optional[bytes] = None, headers: Optional[dict] = None,
