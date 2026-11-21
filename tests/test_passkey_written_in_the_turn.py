@@ -1,0 +1,162 @@
+"""A passkey is written in the account's turn at its sessions, by a session that still stands or a sign-in that
+still holds, and the passkey door notes what it read before it checks anything (offline; the turn is stood in for by
+what another transaction holding it would have done before letting go; test_passkey_lock_order_live.py forces the
+same on PostgreSQL).
+
+- A key stored from a session in the moment of a second-factor reset stayed on the account, unretired, though the
+  session that stored it was one the reset ended. The store takes the turn and reads the session again in it.
+- The marks a new key answers (a reset to set a factor up again, the day a role's requirement began) are cleared
+  in the key's own transaction. Cleared after it, a reset that came in between had its own mark cleared.
+- A sign-in with a passkey notes the account's count when it reads the account, then reads the key again: a reset
+  that retired the key before is seen at the key, one after it at the count.
+"""
+import types
+from datetime import datetime
+
+import pytest
+
+from _webauthn_softauth import SoftAuthenticator
+from test_passkey_routes import ORIGIN, Harness as RouteHarness, _call
+from test_passkey_sign_in import Harness as SignInHarness, _user
+
+pytestmark = pytest.mark.unit
+
+ENDED = "Session has been terminated. Please login again."
+
+
+@pytest.mark.parametrize("found", ["revoked", "gone"])
+def test_a_key_is_stored_from_a_session_only_while_the_session_stands(monkeypatch, found):
+    """The session passed its check when the request came in. An administrator's reset then took the account's
+    turn, retired the keys, ended the sessions and let go. The store reads the session again in the turn and is
+    refused: no key is stored after the reset that was meant to leave none."""
+    from app.core.models import ActiveSession
+    alice = _user()
+    h = RouteHarness(monkeypatch, alice)
+    status, body = _call(h.S, "POST", "/users/me/passkeys/register/options", {"current_password": "pw"})
+    assert status == 200, body
+    credential = SoftAuthenticator().make_credential(body["options"], ORIGIN)
+    turns = []
+
+    def a_reset_held_the_turn_first(db, user_id):
+        turns.append((user_id, h.session.revoked))
+        if found == "revoked":
+            h.session.revoked = True
+        else:
+            db.rows_of(ActiveSession).remove(h.session)
+    monkeypatch.setattr(h.S, "_sessions_turn", a_reset_held_the_turn_first)
+    status, out = _call(h.S, "POST", "/users/me/passkeys/register/verify",
+                        {"challenge_id": body["challenge_id"], "credential": credential, "label": "late"})
+    assert (status, out["detail"]) == (401, ENDED), out
+    assert turns == [(alice.id, False)] and h.rows() == []
+
+
+def test_a_session_that_is_only_idle_stores_a_key(monkeypatch):
+    """The periodic cleanup marks a web session inactive after an hour idle, and its token goes on working: it is
+    the account's own session still, and stores a key like any other."""
+    alice = _user()
+    h = RouteHarness(monkeypatch, alice)
+    h.session.is_active = False
+    status, shown, _auth = h.register(label="after lunch")
+    assert status == 201 and len(h.rows()) == 1, shown
+
+
+def test_the_marks_a_new_key_answers_are_cleared_in_the_keys_own_transaction(monkeypatch):
+    alice = _user(second_factor_reset_at=datetime(2026, 11, 20), passkey_required_since=datetime(2026, 11, 1))
+    h = RouteHarness(monkeypatch, alice)
+    seen, commit = [], h.db.commit
+
+    def committed():
+        seen.append((len(h.rows()), alice.second_factor_reset_at, alice.passkey_required_since))
+        return commit()
+    monkeypatch.setattr(h.db, "commit", committed)
+    status, shown, _auth = h.register(label="the answer")
+    assert status == 201, shown
+    with_the_key = [state for state in seen if state[0] == 1]
+    assert with_the_key and with_the_key[0] == (1, None, None), seen
+
+
+def test_a_reset_that_comes_after_the_keys_commit_keeps_its_mark(monkeypatch):
+    """The reset lands between the key's commit and what the route does next (the owner's notice). Its mark was
+    read back and cleared there; the account then held no factor and owed none."""
+    alice = _user(second_factor_reset_at=datetime(2026, 11, 20))
+    h = RouteHarness(monkeypatch, alice)
+    reset_at = datetime(2026, 11, 21, 12, 0)
+
+    def the_reset_lands_here(db, user, title, change):
+        for row in h.rows():
+            row.retired_at = reset_at
+        user.second_factor_reset_at = reset_at
+    monkeypatch.setattr(h.S, "_passkey_notice", the_reset_lands_here)
+    status, shown, _auth = h.register(label="raced")
+    assert status == 201, shown
+    assert alice.second_factor_reset_at == reset_at and [row.retired_at for row in h.rows()] == [reset_at]
+
+
+def test_an_authenticator_is_made_active_from_a_session_only_while_the_session_stands(monkeypatch):
+    from _async_run import run_coroutine
+    from _memory_db import MemoryDB
+    from app.core.models import ActiveSession, SecondFactorEnrollment, User
+    from test_passkey_sign_in import _api
+    import uuid
+    S = _api()
+    alice = _user()
+    begun = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, method="totp", status="unconfirmed",
+                                  confirmed_at=datetime.utcnow())
+    session = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, is_active=True, revoked=False,
+                                    session_token=S.hash_session_token("the-session"))
+    db = MemoryDB({User: [alice], SecondFactorEnrollment: [begun], ActiveSession: [session]})
+    monkeypatch.setattr(S, "_sf_recovery_remaining", lambda db_, user_id: 10)
+    monkeypatch.setattr(S, "_current_session_token", lambda request: "the-session")
+    monkeypatch.setattr(S, "get_client_ip", lambda request: "203.0.113.9")
+    monkeypatch.setattr(S, "_sessions_turn", lambda db_, user_id: setattr(session, "revoked", True))
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(S.acknowledge_recovery_codes(request=None, principal=(alice, None), db=db), timeout=30)
+    assert (refused.value.status_code, refused.value.detail) == (401, ENDED)
+    assert begun.status == "unconfirmed" and ("commit",) not in db.log
+
+
+# ------------------------------------------------------------------------------------------------- the passkey door
+
+def test_a_sign_in_with_a_passkey_is_not_written_after_the_accounts_sessions_were_ended(monkeypatch):
+    """The key was read, the account was read, the assertion checked. A reset then took the turn, retired the
+    key, counted itself on the account and let go. The sign-in reads the account again in the turn before it
+    writes its session, finds the count moved, and writes none."""
+    from app.core.models import ActiveSession
+    alice = _user()
+    h = SignInHarness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    turns = []
+
+    def a_reset_held_the_turn_first(db, user_id):
+        turns.append(user_id)
+        row.retired_at = datetime.utcnow()
+        alice.sessions_ended += 1
+    monkeypatch.setattr(h.S, "_sessions_turn", a_reset_held_the_turn_first)
+    status, body = h.sign_in(auth)[:2]
+    assert (status, body["detail"]) == (401, "This login attempt has expired; start again."), body
+    assert turns == [alice.id] and h.db.rows_of(ActiveSession) == []
+    # Nothing ended meanwhile: the same key signs in.
+    row.retired_at = None
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: None)
+    status, body = h.sign_in(auth, sign_count=2)[:2]
+    assert status == 200 and body["access_token"], body
+
+
+def test_the_passkey_door_reads_the_key_again_after_the_account(monkeypatch):
+    """A reset that retired the key before the account was read left a count the sign-in would match. The key is
+    read again after the account, so that reset is seen at the key."""
+    from app.core.models import ActiveSession
+    alice = _user()
+    h = SignInHarness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    read_again = []
+
+    def as_committed(obj):
+        read_again.append(obj)
+        if obj is row:
+            row.retired_at = datetime.utcnow()             # what a reset committed before the account was read
+    monkeypatch.setattr(h.db, "refresh", as_committed, raising=False)
+    status, body = h.sign_in(auth)[:2]
+    assert status == 401 and row in read_again, body
+    assert h.db.rows_of(ActiveSession) == []

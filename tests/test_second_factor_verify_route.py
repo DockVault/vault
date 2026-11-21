@@ -111,6 +111,10 @@ def test_a_held_sign_in_makes_no_factor_active_for_an_account_that_may_not_sign_
     # where sessions are (an account locked or turned off has none).
     monkeypatch.setattr(S, "_revoke_sessions", lambda *a, **kw: 0)
     monkeypatch.setattr(S, "_current_session_token", lambda request: "the-session")
+    # Read again in the account's turn before the factor is made active: it stands.
+    from app.core.models import ActiveSession
+    db.tables[ActiveSession] = [types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, is_active=True, revoked=False,
+                                                      session_token=S.hash_session_token("the-session"))]
     out = acknowledge((user, None))
     assert out["enrolled"] is True and enrollment.status == "active" and asked == []
 

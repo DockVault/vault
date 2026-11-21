@@ -6540,24 +6540,25 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         row.retired_at = datetime.utcnow()
         left_without = False
         if for_someone_else:
-            # The last factor the account set up for itself, taken away by somebody else (a lost device, as a
-            # reset is): the account sets the next one up at its next sign-in, with its own proof, and until
-            # then it counts as an account that has one. Another passkey on the account, whatever its state, or
-            # an authenticator, and nothing changes.
-            others = db.query(WebAuthnCredential.id).filter(
-                WebAuthnCredential.user_id == target.id, WebAuthnCredential.retired_at.is_(None),
-                WebAuthnCredential.id != row.id).first() is not None
+            # The last factor the account could give, taken away by somebody else (a lost device, as a reset
+            # is): the account sets the next one up at its next sign-in, with its own proof, and until then it
+            # counts as an account that has one. What is left is judged by the keys that can be used (one of an
+            # algorithm that was removed and has run out is none), whatever the passkey switch says: a removal
+            # made while passkeys are off is not taken for the last one because of that.
+            from app.core import webauthn_settings
+            usable_left = webauthn_settings.usable_passkeys(db, target.id, without=row.id, whatever_the_switch=True)
             authenticator = db.query(SecondFactorEnrollment.id).filter(
                 SecondFactorEnrollment.user_id == target.id, SecondFactorEnrollment.status == "active").first() is not None
-            left_without = not others and not authenticator
+            left_without = not usable_left and not authenticator
             if left_without:
                 target.second_factor_reset_at = datetime.utcnow()
-                # The account is treated as reset, so its sessions end as a reset ends them, the one that key
-                # made on a lost device among them. A removal that leaves the account another factor ends
-                # none: the account is not reset, and "Sign out everywhere" is the administrator's to use.
-                _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
-                sign_in.spend_sign_ins_under_way(db, target.id)
-        return {"passkey_id": str(row.id), "passkey_label": row.label or "", "left_without_a_factor": left_without}
+            # Somebody else took a key from the account: a device that is lost, or a key that may be another's.
+            # Nothing says which sessions that key made, so all of the account's sessions end, and its sign-ins
+            # under way with them. The person signs in again with what the account still has.
+            _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
+            sign_in.spend_sign_ins_under_way(db, target.id)
+        return {"passkey_id": str(row.id), "passkey_label": row.label or "", "left_without_a_factor": left_without,
+                "signed_out": bool(for_someone_else)}
     raise ValueError(f"unknown credential change: {kind}")
 
 
@@ -6884,11 +6885,11 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
                     f"{who} approved removing a passkey from your account; it had already been removed.")
         label = result.get("passkey_label") or ""
         named = f"the passkey \"{label}\"" if label else "an unnamed passkey"
-        last = (" It was your account's last second factor: your account was signed out everywhere, and you "
-                "will set up a new one at your next sign-in."
+        out = " Your account was signed out everywhere." if result.get("signed_out") else ""
+        last = (" It was your account's last second factor: you will set up a new one at your next sign-in."
                 if result.get("left_without_a_factor") else "")
         return ("A passkey was removed from your account",
-                f"{who} removed {named} from your account. It can no longer sign in or prove a step-up.{last}")
+                f"{who} removed {named} from your account. It can no longer sign in or prove a step-up.{out}{last}")
     return ("Your account was changed", f"{who} changed your sign-in details.")
 
 
@@ -11157,6 +11158,34 @@ class PreferencesUpdate(BaseModel):
     tables: Optional[str] = None
 
 
+def _why_a_factor_is_set_up_again(db, user) -> Optional[str]:
+    """For the page of a sign-in held for a set-up: why an account that holds passkeys sets a factor up again
+    (none of them can be used at the vault's address as it is now, or they are of a kind no longer accepted).
+    None for every other account: the page then says what it always said."""
+    from app.core import webauthn_settings
+    return webauthn_settings.why_none_can_be_used(db, user.id)
+
+
+def _session_still_stands_in_the_turn(db, user, request) -> None:
+    """Before a factor is written from a session: take the account's turn at its sessions and read the session
+    again in it. What ends the account's sessions (a second-factor reset among them, which also retires its
+    passkeys) takes that turn, so the factor is written wholly before such a change, which then finds it, or by
+    a session the change has ended, which is refused here. Without it a key stored in the moment of a reset
+    stayed on the account, unretired, though the session that stored it was the one the reset ended.
+
+    Refused: a session that is gone or was revoked, which is what the session check itself refuses. A session
+    only marked inactive (the periodic cleanup marks one so after an hour idle, and its token goes on working)
+    is the account's own still."""
+    from app.core.models import ActiveSession
+    _sessions_turn(db, user.id)
+    token = _current_session_token(request)
+    stands = (db.query(ActiveSession.revoked).filter(
+                  ActiveSession.session_token == hash_session_token(token), ActiveSession.user_id == user.id).first()
+              if token else None)
+    if stands is None or stands[0]:
+        raise HTTPException(status_code=401, detail="Session has been terminated. Please login again.")
+
+
 def _current_session_hash(request) -> Optional[str]:
     """The hash of the CURRENT request's session (matches ActiveSession.session_token), or None. Used to
     keep the caller's own session when revoking the account's OTHER sessions, and (later) to bind a
@@ -11348,7 +11377,10 @@ async def acknowledge_recovery_codes(
     if _sf_recovery_remaining(db, current_user.id) == 0:
         raise HTTPException(status_code=400, detail="Generate recovery codes before activating.")
     # A sign-in held for this enrollment: the factor is made active only where the sign-in could still finish.
+    # From a session: only while the session stands, read again in the account's turn.
     sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, current_user, pending, get_client_ip(request))
+    if pending is None:
+        _session_still_stands_in_the_turn(db, current_user, request)
     enr.status = "active"
     # Set up again after an administrator's reset: the requirement that asked for it is met.
     current_user.second_factor_reset_at = None
@@ -11785,9 +11817,12 @@ async def passkey_register_verify(
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     # A held sign-in stores a key only where it could still finish: a passkey signs in after the sign-in it was
-    # set up at, so one stored for an account the pipeline then refuses would stay.
+    # set up at, so one stored for an account the pipeline then refuses would stay. A session stores one only
+    # while it stands. Either way the account's turn at its sessions is held from here to the key's commit.
     sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, get_client_ip(request))
     sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
+    if pending is None:
+        _session_still_stands_in_the_turn(db, user, request)
     try:
         challenge = webauthn_challenges.take(body.challenge_id, purpose=webauthn_challenges.REGISTER)
     except webauthn_challenges.Unavailable:
@@ -11824,8 +11859,17 @@ async def passkey_register_verify(
         backup_eligible=key.backup_eligible, backup_state=key.backup_state, uv_initialized=key.uv_initialized,
         attested=policy.attestation == webauthn_settings.DIRECT,
         discoverable=key.discoverable, label=_passkey_label(body.label), created_at=now,
-        created_by_session=_current_session_hash(request), provisional_until=_passkey_provisional_until(db, user.id, now))
+        created_by_session=_current_session_hash(request), provisional_until=_passkey_provisional_until(db, user.id, now),
+        rp_id=rp.rp_id)
     db.add(row)
+    # In the key's own transaction, inside the turn: a factor set up again after an administrator's reset meets
+    # the requirement that asked for it, and the passkey a role must hold is held now (its grace is over; should
+    # the account's last passkey leave it later, the time to set one up starts again, as for a new requirement).
+    # Cleared after the commit, the mark read back could be that of a reset that came in between: its own.
+    if getattr(user, "second_factor_reset_at", None) is not None:
+        user.second_factor_reset_at = None
+    if getattr(user, "passkey_required_since", None) is not None:
+        user.passkey_required_since = None
     db.commit()
     shown = _passkey_public(row, now)
     _passkey_audit(db, user, request, "passkey_registered",
@@ -11837,16 +11881,6 @@ async def passkey_register_verify(
                    "provisional: it signs you in, but does not count for the actions that need your own factor "
                    f"until you confirm it with an older factor or until {row.provisional_until.date().isoformat()}.")
     _passkey_notice(db, user, "A passkey was added to your account", change)
-    # A factor set up again after an administrator's reset: the requirement that asked for it is met.
-    if getattr(user, "second_factor_reset_at", None) is not None:
-        user.second_factor_reset_at = None
-        db.commit()
-    # The passkey a role must hold is held now: its grace is over. Should the account's last passkey leave it
-    # later (an administrator removed it, or a reset retired it; its holder cannot remove it), the time to set
-    # one up starts again, as for a new requirement.
-    if getattr(user, "passkey_required_since", None) is not None:
-        user.passkey_required_since = None
-        db.commit()
     if pending is not None:
         # Forced enrollment: the pipeline spends the pending login and finishes the sign-in with the new key as
         # the second proof (or holds it for another step the table asks for).
@@ -11854,7 +11888,7 @@ async def passkey_register_verify(
         outcome = sign_in.finish(db, sign_in.SignInResult(
             user, sign_in.methods_so_far(pending) + [method], get_client_ip(request), pending=pending,
             provider_id=sign_in.provider_of(pending), provider_mfa_trusted=sign_in.provider_mfa_of(pending),
-            user_verified=bool(row.uv_initialized)))
+            user_verified=bool(row.uv_initialized), sessions_ended=sign_in.ended_of(pending)))
         if isinstance(outcome, sign_in.PendingStep):
             return JSONResponse(status_code=201, content={"passkey": shown, **outcome.body})
         return JSONResponse(status_code=201, content={"passkey": shown, "access_token": outcome.access_token,
@@ -12206,6 +12240,15 @@ async def passkey_sign_in_verify(
     user = db.query(User).filter(User.id == row.user_id).first()
     if user is None:
         raise await _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
+    # What the account's sessions had been ended to when the account was read: the sign-in is written only while
+    # that still stands (sign_in.in_the_accounts_turn). The key is read again after it. So a reset or a removal
+    # that retired the key before the account was read is seen here, and one that came after it is seen there.
+    ended = sign_in.as_read(user)
+    refresh = getattr(db, "refresh", None)
+    if refresh is not None:
+        refresh(row)
+    if row.retired_at is not None:
+        raise await _passkey_sign_in_refused(db, request, client_ip, user=None, reason="unknown passkey")
     # The lockouts first, before anything is counted against the account or the signature is checked, as the
     # password path does: a locked account's guesses stay bounded, and nothing here adds to its counts.
     lock = sign_in_lockout.lock_in_force(db, user.id, client_ip)
@@ -12229,9 +12272,12 @@ async def passkey_sign_in_verify(
                                              credential=body.credential, key=known, allow_ids=allow_ids)
     except ws.Refused as refused:
         raise await _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}")
+    if getattr(row, "rp_id", None) is None:
+        row.rp_id = rp.rp_id                     # a row from before the address was recorded: it answered here
     method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
     result = sign_in.SignInResult(user, [method], client_ip, user_verified=assertion.uv,
-                                  passwordless_allowed=_passkey_passwordless_allowed(db, user))
+                                  passwordless_allowed=_passkey_passwordless_allowed(db, user),
+                                  sessions_ended=ended)
     try:
         outcome = sign_in.finish(db, result)
     except AccountLockedError as locked:
@@ -12303,6 +12349,8 @@ def _passkey_assert(db, user, *, purpose: str, challenge_id, credential, policy)
     row.sign_count = assertion.sign_count
     row.backup_state = assertion.bs
     row.last_used_at = datetime.utcnow()
+    if getattr(row, "rp_id", None) is None:
+        row.rp_id = rp.rp_id                     # a row from before the address was recorded: it answered here
     db.commit()
     return row, assertion
 
@@ -12474,7 +12522,7 @@ async def passkey_second_factor_verify(
     outcome = sign_in.finish(db, sign_in.SignInResult(
         user, sign_in.methods_so_far(pending) + [method], client_ip, pending=pending,
         provider_id=sign_in.provider_of(pending), provider_mfa_trusted=sign_in.provider_mfa_of(pending),
-        user_verified=assertion.uv))
+        user_verified=assertion.uv, sessions_ended=sign_in.ended_of(pending)))
     if isinstance(outcome, sign_in.PendingStep):
         return JSONResponse(status_code=200, content=outcome.body)
     return {"access_token": outcome.access_token, "token_type": "bearer", "recovery_code_used": False,
@@ -28377,6 +28425,9 @@ def _run_lightweight_migrations():
             "ALTER TABLE auditor_grants ADD COLUMN IF NOT EXISTS approved_credential_ids JSON",
             # Whether a passkey was registered under direct attestation (see WebAuthnCredential in models.py).
             "ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS attested BOOLEAN NOT NULL DEFAULT FALSE",
+            # The address a passkey was made at (see WebAuthnCredential in models.py). For a database whose table
+            # an earlier build of this release made; create_all builds it with the column everywhere else.
+            "ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS rp_id VARCHAR(253)",
             # When a role's passkey requirement first applied to the account, and the host operator's clearance.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_required_since TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_requirement_cleared_at TIMESTAMP",

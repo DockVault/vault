@@ -119,8 +119,12 @@ def test_status_says_passkeys_are_hidden_at_an_ip(monkeypatch, tmp_path):
 def test_setup_says_it_once_the_address_is_known():
     source = io.open(ROOT / "dockvault.py", encoding="utf-8").read()
     setup = source[source.index("def _collect_setup_config"):source.index("def _resolve_cert_cfg")]
-    assert "sign_in_address_note(allowed_hosts_value(" in setup
-    assert setup.index("web_public = public_web_address(") < setup.index("sign_in_address_note(")
+    # The address as it will be written, made once and judged twice: whether passkeys can be made there, and
+    # which of the passkeys that exist were made somewhere else.
+    assert setup.count("address = allowed_hosts_value(") == 1
+    assert "sign_in_address_note(address)" in setup and "passkey_host(address)" in setup
+    assert (setup.index("web_public = public_web_address(") < setup.index("address = allowed_hosts_value(")
+            < setup.index("sign_in_address_note(address)") < setup.index("passkey_host(address)"))
 
 
 def test_the_example_environment_says_it_beside_the_address():

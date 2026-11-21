@@ -15,6 +15,16 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _the_vault_has_an_address(monkeypatch):
+    """A passkey counts only at the address it was made at; these tests are not about the address, so the vault
+    has one, and every key here was made at it (or says nothing, which is taken as here)."""
+    set_bare_api_env()
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(
+        rp_id="vault.example.test", origin="https://vault.example.test", name=name or "DockVault"))
+
+
 def test_the_table_holds_what_the_authenticator_made_and_what_the_vault_must_remember():
     set_bare_api_env()
     from app.core.models import WebAuthnCredential
@@ -23,7 +33,8 @@ def test_the_table_holds_what_the_authenticator_made_and_what_the_vault_must_rem
     assert set(t.columns.keys()) == {
         "id", "user_id", "credential_id", "public_key_cose", "cose_alg", "sign_count", "transports", "aaguid",
         "attested", "backup_eligible", "backup_state", "uv_initialized", "discoverable", "label", "created_at", "last_used_at",
-        "created_by_session", "provisional_until", "retired_at", "prf_slot_id"}
+        "created_by_session", "provisional_until", "retired_at", "prf_slot_id", "rp_id"}
+    assert t.c.rp_id.nullable                  # a row from before the address was recorded says nothing
     # The authenticator's id is unique across accounts; the key goes with the account.
     assert t.c.credential_id.unique and not t.c.credential_id.nullable
     (fk,) = t.c.user_id.foreign_keys

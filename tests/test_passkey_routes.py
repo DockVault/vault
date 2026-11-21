@@ -85,7 +85,7 @@ def _user(username="alice", role="user", password_hash="x", **extra):
     now = datetime.utcnow()
     fields = dict(id=uuid.uuid4(), username=username, email=f"{username}@example.test", role=RoleEnum(role), is_active=True,
                   is_locked=False, locked_until=None, password_hash=password_hash, second_factor_reset_at=None,
-                  created_at=now, groups=[], _is_temp_session=False)
+                  created_at=now, groups=[], _is_temp_session=False, sessions_ended=0)
     fields.update(extra)
     return types.SimpleNamespace(**fields)
 
@@ -96,16 +96,20 @@ class Harness:
     def __init__(self, monkeypatch, user, *, totp=False, changes=()):
         from app.core import second_factor as sf
         from app.core import webauthn_challenges as wc
-        from app.core.models import (CredentialChange, SecondFactorAction, SecondFactorEnrollment,
+        from app.core.models import (ActiveSession, CredentialChange, SecondFactorAction, SecondFactorEnrollment,
                                      SecondFactorRecoveryCode, SystemSetting, User, WebAuthnCredential)
         from app.services import webauthn_service as ws
         self.S = S = _api()
         self.user = user
         self.redis = FakeRedis()
         enrollments = [types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, method="totp", status="active")] if totp else []
+        # The session the caller acts from: a factor is written from it only while it stands.
+        self.session = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, is_active=True, revoked=False,
+                                             session_token=S.hash_session_token("the-session"))
+        monkeypatch.setattr(S, "_current_session_token", lambda request: "the-session")
         self.db = DB({User: [user], WebAuthnCredential: [], SecondFactorEnrollment: enrollments,
                             SecondFactorRecoveryCode: [], SecondFactorAction: [], SystemSetting: [],
-                            CredentialChange: list(changes)})
+                            CredentialChange: list(changes), ActiveSession: [self.session]})
         self.db.query_groups = []
         S.app.dependency_overrides[S.get_db] = lambda: self.db
         S.app.dependency_overrides[S.get_current_user] = lambda: user
@@ -485,15 +489,17 @@ def test_an_administrator_removes_a_passkey_as_a_credential_change_and_never_the
 
 
 @pytest.mark.parametrize("left, marked", [
-    ("nothing else", True), ("another passkey", False), ("another passkey of a removed algorithm", False),
+    ("nothing else", True), ("another passkey", False), ("another passkey of a removed algorithm", True),
     ("an authenticator", False), ("an authenticator not confirmed yet", True), ("another account's passkey", True),
     ("a passkey retired earlier", True)])
 def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_as_a_reset(monkeypatch, left, marked):
-    """An administrator removes one passkey. Where that leaves the account with no factor it set up for itself (no
-    other passkey that was not retired, whatever its state, and no authenticator), it is what a reset is: the
-    account is marked, sets the next factor up at its next sign-in, and counts as an account with a factor of its
-    own until then. With anything of its own left, nothing is marked. A removal an account makes of its own key
-    marks nothing either (it is not made through this change at all)."""
+    """An administrator removes one passkey. Where that leaves the account with no factor it can give (no other
+    passkey that can be used, and no authenticator), it is what a reset is: the account is marked, sets the next
+    factor up at its next sign-in, and counts as an account with a factor of its own until then. A key of an
+    algorithm that was removed and has run out is refused at every use: it is none. With a factor left, nothing
+    is marked. Marked or not, the account's sessions end and its sign-ins under way are spent: somebody else took
+    a key from it, and nothing says which sessions that key made. A removal an account makes of its own key marks
+    and ends nothing (it is not made through this change at all)."""
     from app.core import credential_changes as cc
     from app.core.models import SecondFactorEnrollment, WebAuthnCredential, User
     S = _api()
@@ -513,16 +519,30 @@ def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_a
                                                  status="unconfirmed" if "not confirmed" in left else "active"))
     db = MemoryDB({User: [admin, target, other], WebAuthnCredential: keys, SecondFactorEnrollment: enrollments})
     from app.core import auditor_rights, legal_holds
+    from app.services import sign_in
     monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
     monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(rp_id=RP_ID, origin=ORIGIN, name=name))
+    if "removed algorithm" in left:
+        # Taken off the allowed list long ago: its 30 days are over, and the key is refused at every use.
+        from app.core import webauthn_settings as wss
+        monkeypatch.setattr(wss, "allowed_alg_codes", lambda: (-7,))
+        monkeypatch.setattr(wss, "_removed", lambda db_: {"RS256": datetime(2026, 1, 1).isoformat()})
+    ended, spent = [], []
+    monkeypatch.setattr(S, "_revoke_sessions", lambda db_, **kw: ended.append(kw["user_id"]) or 0)
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db_, user_id: spent.append(user_id) or 0)
     result = S._apply_credential_change(db, cc.PASSKEY, target, {"passkey_id": str(key.id)}, actor_id=admin.id,
                                         actor_name="root")
     assert key.retired_at is not None
-    assert result == {"passkey_id": str(key.id), "passkey_label": "yubikey", "left_without_a_factor": marked}
+    assert result == {"passkey_id": str(key.id), "passkey_label": "yubikey", "left_without_a_factor": marked,
+                      "signed_out": True}
     assert (target.second_factor_reset_at is not None) is marked
     assert other.second_factor_reset_at is None and admin.second_factor_reset_at is None
+    assert ended == [target.id] and spent == [target.id]
     title, sentence = S._credential_change_notice(cc.PASSKEY, result)
     assert ("last second factor" in sentence) is marked and 'removed the passkey "yubikey"' in sentence
+    assert "Your account was signed out everywhere." in sentence
     # The same change made as the account's own act (an administrator on their own account, through a route of
     # theirs) is no reset by somebody else.
     again = types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, retired_at=None, label="own", cose_alg=-7)
@@ -532,6 +552,8 @@ def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_a
     own = S._apply_credential_change(db, cc.PASSKEY, other, {"passkey_id": str(again.id)}, actor_id=other.id,
                                      actor_name="dave", for_someone_else=False)
     assert own["left_without_a_factor"] is False and other.second_factor_reset_at is None
+    assert own["signed_out"] is False and ended == [target.id] and spent == [target.id]
+    assert "signed out" not in S._credential_change_notice(cc.PASSKEY, own)[1]
 
 
 def test_a_second_factor_reset_retires_every_passkey_and_a_gone_key_is_reported(monkeypatch):

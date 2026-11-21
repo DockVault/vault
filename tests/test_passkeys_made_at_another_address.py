@@ -1,0 +1,238 @@
+"""A passkey answers only at the address it was made at, so one made at another address than the vault has now is
+no second factor here (app/core/webauthn_settings.py, at_this_address).
+
+The vault moves to another host name (a supported change: dockvault.py setup), or its address becomes one that can
+carry no passkey. Every key was made for the old name, and the browser has none to give for the new one. Counted
+as the account's factor all the same, such a key left every account whose only factor was a passkey, administrators
+among them, held at a step it could not answer. Each key records the address it was made at; only the keys of the
+address the vault has now count; an account left with none it can use sets a factor up again at its next sign-in,
+as after a reset, and is told why. If the address goes back, the keys count again by themselves.
+"""
+import types
+import uuid
+from datetime import datetime
+
+import pytest
+
+from _bare_api_env import set_bare_api_env
+from test_passkey_routes import Harness as RouteHarness
+from test_passkey_settings import _mod, _resolving
+from test_passkey_sign_in import ORIGIN, RP_ID, Harness as SignInHarness, _api, _user
+
+pytestmark = pytest.mark.unit
+
+ELSEWHERE = "old.example.test"
+IP = "203.0.113.9"
+
+
+def _address(monkeypatch, host):
+    """The vault's address as it is now: ``host``, or none a passkey can be made at."""
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: (
+        ws.RelyingParty(rp_id=host, origin=f"https://{host}", name="DockVault") if host else None))
+
+
+def _key(user, made_at, **extra):
+    fields = dict(id=uuid.uuid4(), user_id=user.id, retired_at=None, cose_alg=-7, rp_id=made_at, label="key")
+    fields.update(extra)
+    return types.SimpleNamespace(**fields)
+
+
+def test_a_key_is_one_of_the_address_it_was_made_at(monkeypatch):
+    registry, wss = _mod()
+    from app.core.models import WebAuthnCredential
+    alice = _user()
+    h = SignInHarness(monkeypatch, [alice])
+    _resolving(monkeypatch, registry, {wss.MODE: "optional"})
+    here, there, unrecorded = _key(alice, RP_ID), _key(alice, ELSEWHERE), _key(alice, None)
+    assert wss.address_now() == RP_ID
+    assert [wss.at_this_address(k) for k in (here, there, unrecorded)] == [True, False, True]
+    h.db.rows_of(WebAuthnCredential).extend([there])
+    assert wss.usable_passkeys(h.db, alice.id) == 0 and wss.only_lapsed_passkeys(h.db, alice.id) is True
+    assert wss.why_none_can_be_used(h.db, alice.id) == "passkeys_at_another_address"
+    h.db.rows_of(WebAuthnCredential).append(here)
+    assert wss.usable_passkeys(h.db, alice.id) == 1 and wss.only_lapsed_passkeys(h.db, alice.id) is False
+    assert wss.why_none_can_be_used(h.db, alice.id) is None
+    assert wss.usable_passkeys(h.db, alice.id, without=here.id) == 0
+    # The vault at the other address: the other key is the one that counts.
+    _address(monkeypatch, ELSEWHERE)
+    assert [wss.at_this_address(k) for k in (here, there, unrecorded)] == [False, True, True]
+    assert wss.usable_passkeys(h.db, alice.id) == 1
+    # An address no passkey can be made at: none can be used there, whatever was recorded.
+    _address(monkeypatch, None)
+    assert wss.address_now() == "" and not any(wss.at_this_address(k) for k in (here, there, unrecorded))
+    assert wss.usable_passkeys(h.db, alice.id) == 0 and wss.only_lapsed_passkeys(h.db, alice.id) is True
+    # A key made here of an algorithm that ran out is told apart from one made elsewhere.
+    _address(monkeypatch, RP_ID)
+    h.db.rows_of(WebAuthnCredential).remove(there)
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db, alg, now=None: (False, False))
+    assert wss.why_none_can_be_used(h.db, alice.id) == "passkeys_no_longer_accepted"
+    # With passkeys turned off none is a factor, by the deployment's choice: nothing to set up again.
+    _resolving(monkeypatch, registry, {wss.MODE: "off"})
+    assert wss.only_lapsed_passkeys(h.db, alice.id) is False and wss.why_none_can_be_used(h.db, alice.id) is None
+
+
+@pytest.mark.parametrize("role", ["user", "admin"])
+@pytest.mark.parametrize("address", ["another host name", "one that can carry no passkey"])
+def test_an_account_whose_passkeys_were_made_at_another_address_sets_a_factor_up_again_and_signs_in(
+        monkeypatch, role, address):
+    """From the password to a session. Before the move the account is asked for its passkey. After it the browser
+    has none to give: the sign-in is held for a set-up instead, behind the password, and says why; with an
+    authenticator set up it ends in a session. The address back, the passkey is asked for again."""
+    registry, wss = _mod()
+    from app.core.models import PendingLogin, SecondFactorEnrollment, WebAuthnCredential
+    from app.services import sign_in
+    S = _api()
+    in_effect, effective = S._login_second_factor_in_effect, S._second_factor_effective      # as the server has them
+    bob = _user("bob", role=role)
+    h = SignInHarness(monkeypatch, [bob])
+    monkeypatch.setattr(S, "_login_second_factor_in_effect", in_effect)
+    monkeypatch.setattr(S, "_second_factor_effective", effective)
+    _resolving(monkeypatch, registry, {wss.MODE: "optional"})
+    h.db.rows_of(WebAuthnCredential).append(_key(bob, RP_ID))
+
+    def after_the_password():
+        outcome = sign_in.finish(h.db, sign_in.SignInResult(bob, ["pwd"], IP))
+        assert isinstance(outcome, sign_in.PendingStep)
+        return outcome.body
+
+    body = after_the_password()
+    assert body["enrollment_required"] is False and body["methods"] == ["passkey"], body
+    assert "set_up_again" not in body
+    # The vault moves.
+    _address(monkeypatch, "new.example.test" if address == "another host name" else None)
+    assert S._second_factor_to_set_up_again(h.db, bob) is True and sign_in.holds_a_factor(h.db, bob) is False
+    body = after_the_password()
+    assert body["stage"] == "second_factor" and body["enrollment_required"] is True, body
+    assert body["methods"] == [] and "totp" in body["enrollment_methods"], body
+    assert body["set_up_again"] == "passkeys_at_another_address"
+    # The set-up, then the code: a session.
+    h.db.rows_of(SecondFactorEnrollment).append(
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=bob.id, method="totp", status="active"))
+    held = h.db.rows_of(PendingLogin)[-1]
+    done = sign_in.finish(h.db, sign_in.SignInResult(bob, ["pwd", "totp"], IP, pending=held, sessions_ended=0))
+    assert isinstance(done, sign_in.SignedIn) and held.consumed_at is not None
+    # It holds a factor again: asked for the code, never for a key it cannot give.
+    assert S._second_factor_to_set_up_again(h.db, bob) is False
+    body = after_the_password()
+    assert body["enrollment_required"] is False and body["methods"] == ["totp", "recovery"], body
+    # The address goes back: the passkey counts again, by itself.
+    _address(monkeypatch, RP_ID)
+    body = after_the_password()
+    assert body["enrollment_required"] is False and body["methods"] == ["totp", "recovery", "passkey"], body
+
+
+def test_a_role_that_must_hold_a_passkey_is_asked_again_without_its_grace_starting_over(monkeypatch):
+    """The key that met the requirement was made at another address: the requirement applies again. Nothing
+    writes the day it began (cleared when the key was registered), so no grace starts over, however often the
+    account signs in; the account sets a factor up again because its only factor is gone, as after a reset."""
+    registry, wss = _mod()
+    from app.core.models import WebAuthnCredential
+    S = _api()
+    carol = _user("carol", passkey_required_since=None, passkey_requirement_cleared_at=None)
+    h = SignInHarness(monkeypatch, [carol])
+    _resolving(monkeypatch, registry, {wss.MODE: wss.REQUIRED_FOR_ROLES, wss.REQUIRED_ROLES: ["user"]})
+    monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: True)
+    h.db.rows_of(WebAuthnCredential).append(_key(carol, RP_ID))
+    assert wss.requirement(h.db, carol).required is False
+    _address(monkeypatch, "new.example.test")
+    for _again in range(3):
+        need = wss.requirement(h.db, carol)
+        assert need.required is True and need.since is None and need.overdue is False
+        assert S._second_factor_to_set_up_again(h.db, carol) is True
+    assert carol.passkey_required_since is None
+    _address(monkeypatch, RP_ID)
+    assert wss.requirement(h.db, carol).required is False
+
+
+def test_a_key_records_the_address_it_is_made_at_and_one_with_none_gets_it_at_its_first_use(monkeypatch):
+    alice = _user()
+    h = RouteHarness(monkeypatch, alice)
+    status, shown, _auth = h.register(label="new")
+    assert status == 201, shown
+    assert [row.rp_id for row in h.rows()] == [RP_ID]
+    # A row written before the address was recorded: it is taken as made here, and says so once it answered here.
+    erin = _user("erin")
+    s = SignInHarness(monkeypatch, [erin])
+    auth, row = s.enroll(erin)
+    assert getattr(row, "rp_id", None) is None
+    status, body = s.sign_in(auth)[:2]
+    assert status == 200, body
+    assert row.rp_id == RP_ID and ORIGIN.endswith(RP_ID)
+
+
+def test_an_administrators_removal_that_leaves_only_keys_made_elsewhere_leaves_no_factor(monkeypatch):
+    registry, wss = _mod()
+    from _memory_db import MemoryDB
+    from app.core import auditor_rights, credential_changes as cc, legal_holds
+    from app.core.models import SecondFactorEnrollment, User, WebAuthnCredential
+    from app.services import sign_in
+    S = _api()
+    _address(monkeypatch, RP_ID)
+    _resolving(monkeypatch, registry, {wss.MODE: "optional"})
+    admin, carol = _user("root", role="admin"), _user("carol")
+    lost, old = _key(carol, RP_ID, label="phone"), _key(carol, ELSEWHERE, label="old")
+    db = MemoryDB({User: [admin, carol], WebAuthnCredential: [lost, old], SecondFactorEnrollment: []})
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    ended = []
+    monkeypatch.setattr(S, "_revoke_sessions", lambda db_, **kw: ended.append(kw["user_id"]) or 0)
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db_, user_id: 0)
+    result = S._apply_credential_change(db, cc.PASSKEY, carol, {"passkey_id": str(lost.id)}, actor_id=admin.id,
+                                        actor_name="root")
+    assert result["left_without_a_factor"] is True and carol.second_factor_reset_at is not None
+    assert ended == [carol.id] and old.retired_at is None
+
+
+def test_the_deployment_says_where_its_passkeys_were_made():
+    set_bare_api_env()
+    from _kept_db import kept_database
+    from app.core import host_operator, webauthn_settings as wss
+    from app.core.models import RoleEnum, User, WebAuthnCredential
+    made = wss.address_now
+    try:
+        wss.address_now = lambda: "vault.example.test"
+        with kept_database() as (make, _engine):
+            with make() as db:
+                people = [User(username=n, email=None, password_hash="x", role=RoleEnum.USER, is_active=True)
+                          for n in ("ann", "ben", "cy")]
+                db.add_all(people)
+                db.flush()
+                for index, (owner, address, retired) in enumerate((
+                        (people[0], "vault.example.test", None), (people[0], ELSEWHERE, None),
+                        (people[1], ELSEWHERE, None), (people[1], ELSEWHERE, datetime(2026, 11, 1)),
+                        (people[2], None, None))):
+                    db.add(WebAuthnCredential(user_id=owner.id, credential_id=bytes([index + 1]) * 8,
+                                              public_key_cose=b"k", cose_alg=-7, rp_id=address, retired_at=retired))
+                db.commit()
+                said = host_operator.passkey_addresses(db)
+    finally:
+        wss.address_now = made
+    assert said == {"here": "vault.example.test", "made_at": [
+        {"address": ELSEWHERE, "passkeys": 2, "accounts": 2},
+        {"address": "vault.example.test", "passkeys": 2, "accounts": 2}]}
+
+
+def test_the_host_tool_says_how_many_passkeys_stop_working_at_another_address():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("dockvault_tool_for_passkeys",
+                                                  Path(__file__).resolve().parents[1] / "dockvault.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    answer = {"ok": True, "here": "old.example.test", "made_at": [
+        {"address": "old.example.test", "passkeys": 3, "accounts": 2}]}
+    assert tool.passkeys_elsewhere_note(answer, "old.example.test") is None
+    said = tool.passkeys_elsewhere_note(answer, "new.example.test")
+    assert said.startswith("3 passkeys (of 2 accounts) were made at old.example.test and cannot be used at "
+                           "new.example.test.")
+    assert "sets a second factor up again at its next sign-in" in said and "goes back to that address" in said
+    one = tool.passkeys_elsewhere_note({"made_at": [{"address": "old.example.test", "passkeys": 1, "accounts": 1}]}, "")
+    assert one.startswith("1 passkey (of 1 account) was made at old.example.test and cannot be used at the address "
+                          "the vault has now (no passkey can be made there).")
+    # Nothing known, nothing in use, or an answer that is not one: nothing is said.
+    for nothing in (None, {}, {"made_at": []}, {"made_at": [{"address": "x", "passkeys": 0}]}, {"made_at": "?"}):
+        assert tool.passkeys_elsewhere_note(nothing, "new.example.test") is None
+    assert tool.passkey_host("vault.example.test") == "vault.example.test"
+    assert tool.passkey_host("https://Vault.Example.test:8443,other") == "vault.example.test"
+    assert tool.passkey_host("203.0.113.9") == "" and tool.passkey_host("") == ""

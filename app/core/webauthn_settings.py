@@ -258,35 +258,78 @@ def requirement(db, user, *, now: Optional[datetime] = None) -> Requirement:
     return Requirement(True, since=since, due=due, overdue=bool(due is not None and now > due))
 
 
-def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None) -> int:
-    """How many passkeys of the account can still be used: not retired, and of an algorithm that is allowed now or
-    was removed less than 30 days ago (:func:`algorithm_usable`). A key of an algorithm an administrator removed
-    is refused at every use once its 30 days are over; it is on the account in name only, and a role's requirement
-    is not met by it. ``without`` leaves one key out (the one about to be removed)."""
+def address_now() -> str:
+    """The relying-party id a passkey is made for at the vault's address as it is now: the address's host name.
+    "" when no passkey can be made or used there (no address, one sign-in cannot be built on, an IP address)."""
+    from app.services import webauthn_service as ws
+    rp = ws.relying_party("")
+    return rp.rp_id if rp is not None else ""
+
+
+def at_this_address(key, here: Optional[str] = None) -> bool:
+    """Whether ``key`` can be offered at the vault's address as it is now. A passkey is bound to the host name it
+    was made at: after the vault moves to another name, the browser has no key to give for the new one, and the
+    old ones answer again only if the name goes back. A key with no address recorded (a row from before it was)
+    is taken as made here."""
+    here = address_now() if here is None else here
+    made_at = getattr(key, "rp_id", None)
+    return bool(here) and (made_at is None or made_at == here)
+
+
+def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None,
+                    whatever_the_switch: bool = False) -> int:
+    """How many passkeys of the account can still be used: not retired, made at the address the vault has now
+    (:func:`at_this_address`), and of an algorithm that is allowed now or was removed less than 30 days ago
+    (:func:`algorithm_usable`). A key of an algorithm an administrator removed is refused at every use once its 30
+    days are over, and a key made at another address is never offered by the browser: each is on the account in
+    name only, is no second factor, and does not meet a role's requirement. ``without`` leaves one key out (the
+    one about to be removed). With passkeys turned off none is a factor; ``whatever_the_switch`` counts them all
+    the same, for the one who asks what a removal leaves (the switch is the deployment's and may be turned back
+    on)."""
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
-    if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
+    if (not whatever_the_switch and not enabled()) or not has_table(db, WebAuthnCredential.__tablename__):
         return 0
     now = now or datetime.utcnow()
     keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == user_id,
                                                WebAuthnCredential.retired_at.is_(None)).all()
+    here = address_now()
     return sum(1 for key in keys
-               if getattr(key, "id", None) != without and algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0])
+               if getattr(key, "id", None) != without and at_this_address(key, here)
+               and algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0])
+
+
+def why_none_can_be_used(db, user_id, *, now: Optional[datetime] = None) -> Optional[str]:
+    """For an account that holds passkeys of which none can be used: why. ``passkeys_at_another_address`` when
+    none was made at the address the vault has now (the vault moved, or its address can carry no passkey);
+    ``passkeys_no_longer_accepted`` when the ones made here are of an algorithm that was removed and has run out.
+    None for an account that holds none, or one it can use, and with passkeys turned off."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
+        return None
+    now = now or datetime.utcnow()
+    keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == user_id,
+                                               WebAuthnCredential.retired_at.is_(None)).all()
+    here = address_now()
+    made_here = [key for key in keys if at_this_address(key, here)]
+    if not keys or any(algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0] for key in made_here):
+        return None
+    return "passkeys_no_longer_accepted" if made_here else "passkeys_at_another_address"
 
 
 def only_lapsed_passkeys(db, user_id, *, now: Optional[datetime] = None) -> bool:
     """Whether the account holds passkeys and none of them can be used any more: each is of an algorithm an
-    administrator removed more than 30 days ago. Its factor went away under it, by nobody's act on the account.
-    False with passkeys turned off (none is a factor then, by the deployment's choice), and for an account that
-    holds none."""
+    administrator removed more than 30 days ago, or was made at another address than the vault has now. Its
+    factor went away under it, by nobody's act on the account: it sets one up again at its next sign-in, as after
+    a reset, and the keys count again by themselves if the algorithm, or the address, comes back. False with
+    passkeys turned off (none is a factor then, by the deployment's choice), and for an account that holds none."""
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
     if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
         return False
     now = now or datetime.utcnow()
-    keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == user_id,
-                                               WebAuthnCredential.retired_at.is_(None)).all()
-    return bool(keys) and not any(algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0] for key in keys)
+    return why_none_can_be_used(db, user_id, now=now) is not None
 
 
 # Run at every start. A reset of an account's second factor retires its passkeys; one made by a release that knew

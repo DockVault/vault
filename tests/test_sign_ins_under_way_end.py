@@ -35,12 +35,14 @@ def db():
 
 @pytest.fixture
 def under_way(db):
-    """Gives each account it is called with a held sign-in and an authenticator begun and not finished (its
-    secret shown, a code confirmed, two recovery codes made)."""
+    """Gives each account it is called with two held sign-ins (one held for a set-up, one for a step that is no
+    set-up: the second factor, or the password after another proof) and an authenticator begun and not finished
+    (its secret shown, a code confirmed, two recovery codes made)."""
     def begin(*users):
         for user in users:
-            db.add(PendingLogin(user_id=user.id, client_ip="192.0.2.44", enrollment_required=True,
-                                expires_at=datetime.utcnow() + timedelta(minutes=5)))
+            for set_up in (True, False):
+                db.add(PendingLogin(user_id=user.id, client_ip="192.0.2.44", enrollment_required=set_up,
+                                    expires_at=datetime.utcnow() + timedelta(minutes=5)))
             db.add(SecondFactorEnrollment(user_id=user.id, method="totp", secret_enc="sealed", status="unconfirmed",
                                           confirmed_at=datetime.utcnow()))
             for prefix in ("aaaaaaaa", "bbbbbbbb"):
@@ -127,11 +129,12 @@ def test_what_ends_an_accounts_sessions_ends_its_sign_ins_under_way_and_a_set_up
     account's second factor. Bob's are his own and stay."""
     ada, alice, bob = _user(db, "ada", RoleEnum.ADMIN), _user(db, "alice"), _user(db, "bob")
     under_way(alice, bob)
-    assert _left(db, alice) == _left(db, bob) == (1, 0, 1, 2)
+    assert _left(db, alice) == _left(db, bob) == (2, 0, 1, 2)
     ENDS[what](db, ada, alice, monkeypatch)
     assert world.revoked.count(alice.id) >= 1 and bob.id not in world.revoked, "the sessions it ended are Alice's"
-    assert _left(db, alice) == (0, 1, 0, 0)
-    assert _left(db, bob) == (1, 0, 1, 2)
+    # Both of hers are spent: the one held for a set-up, and the one held at the second factor or the password.
+    assert _left(db, alice) == (0, 2, 0, 0)
+    assert _left(db, bob) == (2, 0, 1, 2)
 
 
 def test_a_reset_link_spends_them_in_the_transaction_that_writes_the_password(db, world, under_way, monkeypatch):
@@ -152,7 +155,7 @@ def test_a_reset_link_spends_them_in_the_transaction_that_writes_the_password(db
     monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", spent_when)
     _a_reset_link_used(db, None, alice, monkeypatch)
     assert seen == [(alice.id, True)], "the new password was committed before the sign-ins under way were spent"
-    assert _left(db, alice) == (0, 1, 0, 0)
+    assert _left(db, alice) == (0, 2, 0, 0)
 
 
 def test_an_authenticator_in_use_and_its_codes_stay(db, world, under_way):
@@ -163,6 +166,6 @@ def test_an_authenticator_in_use_and_its_codes_stay(db, world, under_way):
     under_way(alice)
     db.query(SecondFactorEnrollment).filter(SecondFactorEnrollment.user_id == alice.id).update({"status": "active"})
     db.commit()
-    assert sign_in.spend_sign_ins_under_way(db, alice.id) == 1
+    assert sign_in.spend_sign_ins_under_way(db, alice.id) == 2
     db.commit()
-    assert _left(db, alice) == (0, 1, 1, 2)
+    assert _left(db, alice) == (0, 2, 1, 2)

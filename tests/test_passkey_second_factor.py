@@ -28,6 +28,12 @@ class Harness(SignInHarness):
         self.current_user = users[0]
         monkeypatch.setitem(S.app.dependency_overrides, S.get_current_user, lambda: self.current_user)
         monkeypatch.setattr(S, "_current_session_hash", lambda request: "sess-1")
+        # The session the caller acts from: a factor is written from it only while it stands.
+        from app.core.models import ActiveSession
+        self.session = types.SimpleNamespace(id=uuid.uuid4(), user_id=users[0].id, is_active=True, revoked=False,
+                                             session_token=S.hash_session_token("the-session"))
+        monkeypatch.setattr(S, "_current_session_token", lambda request: "the-session")
+        self.db.rows_of(ActiveSession).append(self.session)
         self.receipts = {}
 
         def issue(db, *, user_id, action, session_hash, redis=None, method=""):
@@ -56,7 +62,7 @@ class Harness(SignInHarness):
                                         expires_at=datetime.now(timezone.utc) + timedelta(minutes=3))
         self.db.rows_of(PendingLogin).append(pending)
         claims = {"sub": str(user.id), "username": user.username, "pre_auth": str(pending.id),
-                  "stage": "second_factor", "methods_so_far": list(methods)}
+                  "stage": "second_factor", "methods_so_far": list(methods), "ended": 0}
         if provider is not None:
             claims["idp"] = provider            # the sign-in came through an identity provider
         if provider_mfa:

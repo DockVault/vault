@@ -15,6 +15,16 @@ from _bare_api_env import set_bare_api_env
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _the_vault_has_an_address(monkeypatch):
+    """A passkey counts only at the address it was made at; these tests are not about the address, so the vault
+    has one, and every key here was made at it (or says nothing, which is taken as here)."""
+    set_bare_api_env()
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(
+        rp_id="vault.example.test", origin="https://vault.example.test", name=name or "DockVault"))
+
+
 @pytest.fixture
 def S():
     set_bare_api_env()
@@ -202,7 +212,9 @@ def test_an_administrators_removal_of_the_only_passkey_marks_the_account_before_
     result = S._apply_credential_change(db, cc.PASSKEY, dave, {"passkey_id": str(first.id)}, actor_id=admin.id,
                                         actor_name="root")
     assert result["left_without_a_factor"] is False and dave.second_factor_reset_at is None
-    assert ended == [carol.id] and spent == [carol.id]            # a key removed beside another ends nothing
+    # A key removed beside another: the account is not reset, and its sessions end all the same. Nothing says
+    # which of them that key made, on the device that was lost.
+    assert ended == [carol.id, dave.id] and spent == [carol.id, dave.id]
 
 
 def test_the_statement_fails_on_a_database_that_has_not_got_the_column_yet(S):

@@ -19,6 +19,16 @@ from test_passkey_sign_in import DB, ORIGIN, _call, _claims, _user
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _the_vault_has_an_address(monkeypatch):
+    """A passkey counts only at the address it was made at; these tests are not about the address, so the vault
+    has one, and every key here was made at it (or says nothing, which is taken as here)."""
+    set_bare_api_env()
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(
+        rp_id="vault.example.test", origin="https://vault.example.test", name=name or "DockVault"))
+
+
 def _mod():
     set_bare_api_env()
     from app.core import settings_registry as registry
@@ -303,6 +313,7 @@ def test_a_required_role_past_its_grace_is_held_for_a_passkey_enrollment(monkeyp
     assert outcome.body["methods"] == [] and outcome.body["stage"] == "second_factor"
     (pending,) = h.db.rows_of(PendingLogin)
     # Registering under the pre-auth token needs no password (the form had it) and finishes the sign-in.
+    sign_in.read_pre_auth(_claims(outcome.body["pre_auth_token"]), pending)      # as the token's reader does
     monkeypatch.setitem(S.app.dependency_overrides, S.get_enrolling_principal, lambda: (alice, pending))
     status, body = _rcall(S, "POST", "/users/me/passkeys/register/options", {})
     assert status == 200, body

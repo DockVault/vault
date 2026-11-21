@@ -3774,6 +3774,11 @@ class WebAuthnCredential(Base):
     credential_id = Column(LargeBinary, nullable=False, unique=True)
     public_key_cose = Column(LargeBinary, nullable=False)
     cose_alg = Column(Integer, nullable=False)              # -7 ES256, -257 RS256, -8 EdDSA
+    # The relying party the key was made for: the host name of the vault's address then. A browser offers the key
+    # at that address alone, so a key made at another address than the vault has now is no factor here
+    # (app/core/webauthn_settings.py, at_this_address). Empty only on a row written before the address was
+    # recorded: such a key is taken as made here, and gets the address at its first use here.
+    rp_id = Column(String(253), nullable=True)
     sign_count = Column(BigInteger, nullable=False, default=0, server_default='0')   # 0: the authenticator does not count
     transports = Column(JSON(none_as_null=True), nullable=True)   # internal, hybrid, usb, nfc, ble, as reported
     aaguid = Column(UUID(as_uuid=True), nullable=True)      # as received; unverified under attestation 'none'

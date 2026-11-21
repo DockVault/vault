@@ -2207,10 +2207,16 @@ function beginSecondFactor(data) {
         // authenticator pending is the passkey's card whatever the browser, which then says what to do.
         const kinds = Array.isArray(data.enrollment_methods) && data.enrollment_methods.length ? data.enrollment_methods : ['totp'];
         const canMake = !!window.Passkeys && Passkeys.supported();
+        // An account that holds passkeys and sets a factor up all the same is told why.
+        const why = data.set_up_again === 'passkeys_at_another_address'
+            ? 'Your passkeys cannot be used at the address this vault has now, so you set a second factor up again here.'
+            : data.set_up_again === 'passkeys_no_longer_accepted'
+                ? 'Your passkeys are of a kind this vault no longer accepts, so you set a second factor up again here.'
+                : '';
         if (kinds.includes('passkey') && (canMake || !kinds.includes('totp'))) {
-            renderPasskeyEnrollment(box, { preAuthToken: pre, password: pw, authenticatorToo: kinds.includes('totp') });
+            renderPasskeyEnrollment(box, { preAuthToken: pre, password: pw, authenticatorToo: kinds.includes('totp'), why });
         } else {
-            renderEnrollmentWizard(box, { preAuthToken: pre, password: pw });
+            renderEnrollmentWizard(box, { preAuthToken: pre, password: pw, why });
         }
     } else {
         renderVerifyCard(box, { preAuthToken: pre, methods: Array.isArray(data.methods) ? data.methods : ['totp', 'recovery'] });
@@ -2362,6 +2368,7 @@ function renderPasskeyEnrollment(box, opts) {
     box.appendChild(_el('p', 'text-secondary text-sm mb-md', canMake
         ? 'Your administrator requires a passkey for your account. Your device will ask for its PIN, fingerprint or face, or for a security key.'
         : 'Your administrator requires a passkey for your account, and this browser cannot make one here. Sign in from a browser that can, or ask an administrator.'));
+    if (opts.why) box.appendChild(_el('p', 'text-secondary text-sm mb-md sf-set-up-again', opts.why));
     const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert');
     box.appendChild(err);
     const said = (answer, fallback) => {
@@ -2434,6 +2441,7 @@ function renderEnrollmentWizard(box, opts) {
         box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Set up two-factor authentication'));
         box.appendChild(_el('p', 'text-secondary text-sm mb-md',
             'Your administrator requires a second factor. Scan the QR code with an authenticator app, then enter the code it shows.'));
+        if (opts.why) box.appendChild(_el('p', 'text-secondary text-sm mb-md sf-set-up-again', opts.why));
         const status = _el('div', 'alert alert-info mt-sm', 'Preparing…'); status.setAttribute('role', 'status');
         box.appendChild(status);
         try {

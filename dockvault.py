@@ -796,6 +796,46 @@ def sign_in_address_reason(allowed_hosts):
     return "ip"
 
 
+def passkey_host(allowed_hosts):
+    """The host name passkeys are made for at the address ALLOWED_HOSTS gives out, or "" when none can be made
+    there (see sign_in_address_reason)."""
+    if sign_in_address_reason(allowed_hosts) is not None:
+        return ""
+    return _allowed_hosts_first(allowed_hosts)[1]
+
+
+def passkeys_elsewhere_note(answer, host):
+    """What setup and status say about the passkeys in use that were made at another address than ``host`` (the
+    host name the vault gives out; "" when no passkey can be made there): how many, of how many accounts, where,
+    and what follows. A passkey answers only at the address it was made at. ``answer`` is the deployment's own
+    account of them (python -m app.core.host_operator passkey-addresses). None when every passkey in use was made
+    at ``host``, when there is none, or when the deployment could not be asked."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("made_at"), list):
+        return None
+    host = (host or "").lower()
+    elsewhere = []
+    for entry in answer["made_at"]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            keys, accounts = int(entry.get("passkeys") or 0), int(entry.get("accounts") or 0)
+        except (TypeError, ValueError):
+            continue
+        address = str(entry.get("address") or "")
+        if keys > 0 and address.lower() != host:
+            elsewhere.append((server_text(address) or "an address that was not recorded", keys, accounts))
+    if not elsewhere:
+        return None
+    keys, accounts = sum(e[1] for e in elsewhere), sum(e[2] for e in elsewhere)
+    where = ", ".join(sorted(e[0] for e in elsewhere))
+    here = ("at %s" % host) if host else "at the address the vault has now (no passkey can be made there)"
+    return ("%d passkey%s (of %d account%s) %s made at %s and cannot be used %s. Each of those accounts sets a "
+            "second factor up again at its next sign-in: with its password, or through its organisation's sign-in "
+            "where it has none. The passkeys work again if the vault goes back to that address."
+            % (keys, "" if keys == 1 else "s", accounts, "" if accounts == 1 else "s",
+               "was" if keys == 1 else "were", where, here))
+
+
 def sign_in_address_note(allowed_hosts):
     """What setup and status say when no passkey can be made at the address the vault gives out, or None: what is
     in the way, what to change, and that a passkey requirement set for a role waits meanwhile."""
@@ -5286,6 +5326,10 @@ class DockVault:
         passkey_note = sign_in_address_note(env.get("ALLOWED_HOSTS")) if env else None
         if passkey_note:
             print(pal.paint("  Passkeys: hidden - %s" % passkey_note, "yellow"))
+        if env:
+            elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(env.get("ALLOWED_HOSTS")))
+            if elsewhere:
+                print(pal.paint("  Passkeys: %s" % elsewhere, "yellow"))
         try:
             self._run_dc("ps", capture=False, timeout=30)
         except (OSError, subprocess.SubprocessError):
@@ -5663,10 +5707,16 @@ class DockVault:
             self._fail("invalid SFTP client port (1-65535): %r" % sftp_public_port)
         # The address people open, as it will be written: passkeys need https and a host name there, so plain http
         # and an IP are said now.
-        passkey_note = sign_in_address_note(allowed_hosts_value(
-            {"server_name": server, "web_public_address": web_public, "web_host_port": web_port}))
+        address = allowed_hosts_value(
+            {"server_name": server, "web_public_address": web_public, "web_host_port": web_port})
+        passkey_note = sign_in_address_note(address)
         if passkey_note:
             print(pal.paint("  Note: %s" % passkey_note, "yellow"))
+        # A passkey answers only at the address it was made at: when the address changes while passkeys exist,
+        # say how many stop working and what their holders do next.
+        elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(address))
+        if elsewhere:
+            print(pal.paint("  Note: with this address, %s%s" % (elsewhere[0].lower(), elsewhere[1:]), "yellow"))
 
         return {
             "server_name": server,
@@ -8924,6 +8974,24 @@ class DockVault:
         # image previously pulled by the Update menu with a local build).
         self._recreate_stack(build=False)
         print(pal.paint("  Applied.\n", "green"))
+
+    def _passkey_addresses(self):
+        """Where the passkeys in use were made, as the running deployment says (python -m app.core.host_operator
+        passkey-addresses), or None when it cannot be asked: no Docker, nothing running, an image from before
+        passkeys. Asked for a warning only, so nothing here fails the command that asks."""
+        try:
+            ok, _why = docker_available()
+            if not ok:
+                return None
+            for service in ("vault", "vault-api"):
+                r = self._run_dc("exec", "-T", service, "python", "-m", "app.core.host_operator",
+                                 "passkey-addresses", timeout=60)
+                answer = parse_operator_answer(getattr(r, "stdout", ""))
+                if answer is not None:
+                    return answer if answer.get("ok") else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return None
 
     def _run_account_tool(self, *tool_args):
         """Run `python -m app.core.host_operator ...` inside the running web container and return its

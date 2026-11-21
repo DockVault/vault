@@ -516,6 +516,11 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
     }
     if stage == STAGE_PASSWORD:
         body["username"] = user.username
+    if enrollment_required:
+        # An account that holds passkeys and sets a factor up all the same is told why.
+        why = api._why_a_factor_is_set_up_again(db, user)
+        if why:
+            body["set_up_again"] = why
     return PendingStep(stage=stage, body=body)
 
 

@@ -46,7 +46,7 @@ import uuid
 
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
            "regranted-defaults", "unlock", "zk-status", "downgrade-blockers", "release-key-hold",
-           "clear-passkey-requirement")
+           "clear-passkey-requirement", "passkey-addresses")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -119,6 +119,28 @@ def _describe(db, user):
         "passkeys": passkeys,
         "passkey_requirement_cleared": getattr(user, "passkey_requirement_cleared_at", None) is not None,
     }
+
+
+def passkey_addresses(db) -> dict:
+    """Where the passkeys in use were made, for the host tool: the address the vault has now (its host name; None
+    when it has none a passkey can be made at) and, for each address a key in use was made at, how many keys and
+    how many accounts. A passkey answers only at the address it was made at, so the ones made elsewhere are no
+    second factor while the vault stays where it is, and their holders set one up again at their next sign-in.
+    A key with no address recorded counts as made here."""
+    from sqlalchemy import func
+    from app.core import webauthn_settings
+    from app.core.models import WebAuthnCredential
+    here = webauthn_settings.address_now() or None
+    rows = (db.query(WebAuthnCredential.rp_id, func.count(WebAuthnCredential.id),
+                     func.count(func.distinct(WebAuthnCredential.user_id)))
+            .filter(WebAuthnCredential.retired_at.is_(None)).group_by(WebAuthnCredential.rp_id).all())
+    made_at = {}
+    for address, keys, accounts in rows:
+        name = address or here or ""
+        entry = made_at.setdefault(name, {"address": name, "passkeys": 0, "accounts": 0})
+        entry["passkeys"] += int(keys)
+        entry["accounts"] += int(accounts)
+    return {"here": here, "made_at": sorted(made_at.values(), key=lambda e: e["address"])}
 
 
 def user_managers(db):
@@ -320,6 +342,8 @@ def _run(args, api) -> int:
 
         if args.action == "user-managers":
             return _answer({"ok": True, "accounts": user_managers(db)})
+        if args.action == "passkey-addresses":
+            return _answer({"ok": True, **passkey_addresses(db)})
 
         if args.action == "regranted-defaults":
             return _answer({"ok": True, "permissions": regranted_defaults(db)})
