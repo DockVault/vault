@@ -553,6 +553,63 @@ def test_a_held_enrollment_registers_no_passkey_for_an_account_that_may_not_sign
     assert h.db.rows_of(WebAuthnCredential) == [] and pending.consumed_at is None
 
 
+@pytest.mark.parametrize("what", ["an administrator sets a new password", "an administrator resets the second factor",
+                                  "an administrator signs the account out everywhere",
+                                  "an administrator removes its last passkey"])
+def test_a_sign_in_under_way_ends_with_the_accounts_sessions(monkeypatch, what):
+    """Mallory has Alice's password. Alice's role must hold a passkey, so Mallory's sign-in is held at the passkey's
+    enrollment, for five minutes. Alice reports it: an administrator changes her password, resets her second
+    factor, signs her out everywhere. Each ended her sessions and left that held sign-in alone: it went on to set
+    a passkey up, on the old password's proof, made after the reset and so kept by it, and a passkey signs in by
+    itself. Each of them now spends the account's sign-ins under way with its sessions; another account's is left."""
+    registry, wss = _mod()
+    from app.core import auditor_rights, credential_changes as cc, legal_holds
+    from app.core.models import WebAuthnCredential
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None, password_set_by=None,
+                  password_set_by_other_at=None)
+    bob, root = _user("bob", passkey_required_since=overdue, passkey_requirement_cleared_at=None), _user("root", role="admin")
+    h = StepHarness(monkeypatch, [alice, bob, root])
+    _required(monkeypatch, registry, wss, ["user"])
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    ended = []
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: ended.append(kw["user_id"]) or 0)
+    options_path = "/users/me/passkeys/register/options"
+    held, others = {}, {}
+    for name, user, into in (("alice", alice, held), ("bob", bob, others)):
+        pending, headers = h.pending_for(user)
+        pending.enrollment_required = True
+        into.update(pending=pending, headers=headers)
+        assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 200, name          # while nothing has changed
+    if what == "an administrator sets a new password":
+        h.S._apply_credential_change(h.db, cc.PASSWORD, alice, {"password_hash": "another"}, actor_id=root.id,
+                                     actor_name="root")
+    elif what == "an administrator resets the second factor":
+        h.S._apply_credential_change(h.db, cc.SECOND_FACTOR, alice, {}, actor_id=root.id, actor_name="root")
+    elif what == "an administrator removes its last passkey":
+        key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, label="k", cose_alg=-7)
+        h.db.rows_of(WebAuthnCredential).append(key)
+        h.S._apply_credential_change(h.db, cc.PASSKEY, alice, {"passkey_id": str(key.id)}, actor_id=root.id,
+                                     actor_name="root")
+    else:
+        from _async_run import run_coroutine
+        import app.core.endpoint_permissions as ep
+        monkeypatch.setattr(ep, "check_endpoint_permission", lambda *a, **k: None)
+        monkeypatch.setattr(h.S, "_enforce_step_up", lambda db, user, request, action: None)
+        request = types.SimpleNamespace(headers={}, client=types.SimpleNamespace(host="203.0.113.9"), state=types.SimpleNamespace())
+        run_coroutine(h.S.terminate_user_sessions(user_id=alice.id, request=request, current_user=root, db=h.db))
+    assert ended == [alice.id]
+    assert held["pending"].consumed_at is not None and others["pending"].consumed_at is None
+    status, body = _call_h(h.S, "POST", options_path, {}, held["headers"])
+    assert status == 401 and body["detail"] == "This login attempt has expired; start again.", body
+    assert _call_h(h.S, "POST", options_path, {}, others["headers"])[0] == 200
+    # Every place that ends an account's sessions for such a reason does the same (a password set with a reset
+    # link, the account's own change of it, a password taken back at a promotion, a lock or a deactivation).
+    import inspect
+    assert inspect.getsource(h.S).count("sign_in.spend_sign_ins_under_way(") == 8
+
+
 def test_an_enrollment_token_without_the_accounts_factor_registers_nothing(monkeypatch):
     """The registration routes refuse a held sign-in that would enroll a passkey before the account's own factor
     was given, whatever made the token, a trusted provider's MFA included; with the code among its proofs it

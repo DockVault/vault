@@ -133,12 +133,14 @@ def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_n
     _change(db, answered, "second_factor", datetime(2026, 11, 20), status="expired")
     _change(db, other_change, "password", reset_at)                  # not a reset of the factor
     planted, since = _passkey(db, answered), _passkey(db, answered)
+    between = _passkey(db, answered)               # made after the first reset and before the latest one
     only = _passkey(db, passkey_only)
     kept = [_passkey(db, user) for user in (asked_only, other_change, untouched)]
     already = _passkey(db, answered, retired=True)
     for row in (planted, only, already, *kept):
         row.created_at = earlier
     since.created_at = later
+    between.created_at = datetime(2026, 11, 7)
     # A key made at the very moment of the reset is not one from before it (the reset's own time is taken first,
     # and whatever is made in that moment is the account's answer or made beside it: left).
     at_once = _passkey(db, passkey_only)
@@ -154,6 +156,8 @@ def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_n
         assert already.retired_at == datetime(2026, 11, 1)
         db.refresh(at_once)
         assert at_once.retired_at is None
+        db.refresh(between)
+        assert between.retired_at == reset_at                 # from before the latest reset: that is what counts
     # The statement that reads the account's mark finds nothing here: only the record says these were reset.
     planted.retired_at = None
     db.commit()
@@ -183,14 +187,22 @@ def test_an_administrators_removal_of_the_only_passkey_marks_the_account_before_
                                           for c in table.columns]).create(db.get_bind())
     monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
     monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    from app.services import sign_in
+    ended, spent = [], []
+    monkeypatch.setattr(S, "_revoke_sessions", lambda db, **kw: ended.append(kw["user_id"]))
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db, user_id: spent.append(user_id))
     admin, carol, dave = _user(db, "root"), _user(db, "carol"), _user(db, "dave")
     only, first, _second = _passkey(db, carol), _passkey(db, dave), _passkey(db, dave)
     result = S._apply_credential_change(db, cc.PASSKEY, carol, {"passkey_id": str(only.id)}, actor_id=admin.id,
                                         actor_name="root")
     assert result["left_without_a_factor"] is True and carol.second_factor_reset_at is not None
+    # As a reset does: the account's sessions end (one that key made, on the lost device, among them), and what
+    # was on its way to a session with them.
+    assert ended == [carol.id] and spent == [carol.id]
     result = S._apply_credential_change(db, cc.PASSKEY, dave, {"passkey_id": str(first.id)}, actor_id=admin.id,
                                         actor_name="root")
     assert result["left_without_a_factor"] is False and dave.second_factor_reset_at is None
+    assert ended == [carol.id] and spent == [carol.id]            # a key removed beside another ends nothing
 
 
 def test_the_statement_fails_on_a_database_that_has_not_got_the_column_yet(S):

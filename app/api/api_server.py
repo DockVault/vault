@@ -6445,6 +6445,7 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             password_origin.set_by_self(target)
         # A stolen session must not outlive the response to a suspected compromise.
         _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
+        sign_in.spend_sign_ins_under_way(db, target.id)
         return {}
     if kind == cc.RESET_LINK:
         base_url = _public_base_url()
@@ -6492,6 +6493,7 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             target.second_factor_reset_at = datetime.utcnow()
         # A change to how the account authenticates should not leave standing sessions.
         _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
+        sign_in.spend_sign_ins_under_way(db, target.id)
         return {"had_second_factor": had_factor, "passkeys_retired": int(retired or 0)}
     if kind == cc.EMAIL:
         new_email = payload.get("email")
@@ -6543,6 +6545,9 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
             left_without = not others and not authenticator
             if left_without:
                 target.second_factor_reset_at = datetime.utcnow()
+                # As a reset does: a session that key made (on the device that was lost, say) does not go on.
+                _revoke_sessions(db, user_id=target.id, actor_username=actor_name)
+                sign_in.spend_sign_ins_under_way(db, target.id)
         return {"passkey_id": str(row.id), "passkey_label": row.label or "", "left_without_a_factor": left_without}
     raise ValueError(f"unknown credential change: {kind}")
 
@@ -6870,7 +6875,8 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
                     f"{who} approved removing a passkey from your account; it had already been removed.")
         label = result.get("passkey_label") or ""
         named = f"the passkey \"{label}\"" if label else "an unnamed passkey"
-        last = (" It was your account's last second factor: you will set up a new one at your next sign-in."
+        last = (" It was your account's last second factor: your account was signed out everywhere, and you "
+                "will set up a new one at your next sign-in."
                 if result.get("left_without_a_factor") else "")
         return ("A passkey was removed from your account",
                 f"{who} removed {named} from your account. It can no longer sign in or prove a step-up.{last}")
@@ -7017,6 +7023,7 @@ def _take_back_password_at_promotion(db, user, *, by) -> Optional[dict]:
     password_origin.mark_nobody_knows(user)
     user.updated_at = datetime.now(timezone.utc)
     _revoke_sessions(db, user_id=user.id, actor_username=by.username if by is not None else cc.HOST_OPERATOR)
+    sign_in.spend_sign_ins_under_way(db, user.id)
     db.add(AuditLogger(db).build_row(
         action="password_reset_at_promotion", status="success", user=by,
         username=None if by is not None else cc.HOST_OPERATOR,
@@ -7655,6 +7662,7 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
         # (a hijacked session must not outlive the reset). _revoke_sessions mutates the session rows but does not
         # commit. On a failure nothing changed, the link is not used, and the person is told to try it again.
         _revoke_sessions(db, user_id=user.id, actor_username="password-reset")   # force re-login everywhere
+        sign_in.spend_sign_ins_under_way(db, user.id)                             # and what was on its way to one
         db.commit()
     except Exception as exc:  # noqa: BLE001
         try:
@@ -10888,6 +10896,7 @@ async def update_own_account(
     # tell apart from an attacker's.
     if "password" in changes:
         _revoke_sessions(db, user_id=user.id, actor_username=user.username)
+        sign_in.spend_sign_ins_under_way(db, user.id)
     db.commit()
     db.refresh(user)
     try:
@@ -13041,6 +13050,7 @@ async def update_user(
         # is_locked re-checks would otherwise only catch it at the next op).
         if user_update.is_locked is True or user_update.is_active is False:
             revoked = _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
+            sign_in.spend_sign_ins_under_way(db, user.id)
             if revoked:
                 print(f"🔒 Revoked {revoked} live session(s) for locked/deactivated user {user.username}")
 
@@ -13585,6 +13595,7 @@ async def terminate_user_sessions(
     terminated_count = _revoke_sessions(
         db, user_id=user_id, actor_username=current_user.username, durable=True
     )
+    sign_in.spend_sign_ins_under_way(db, user_id)
     db.commit()
 
     audit_logger = AuditLogger(db)

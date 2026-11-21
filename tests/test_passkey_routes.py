@@ -472,6 +472,7 @@ def test_an_administrator_removes_a_passkey_as_a_credential_change_and_never_the
     # told so, and sets the next one up at her next sign-in.
     assert target.second_factor_reset_at is not None
     assert "your account's last second factor" in h.notices[-1]["body"]
+    assert "signed out everywhere" in h.notices[-1]["body"]
     assert "set up a new one at your next sign-in" in h.notices[-1]["body"]
     # Removing it again: 404. An administrator's own passkey: not through this route.
     status, out = _call(h.S, "DELETE", f"/users/{target.id}/passkeys/{key.id}")

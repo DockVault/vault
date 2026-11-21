@@ -406,6 +406,21 @@ def delete_session_by_token(db, session_token: Optional[str]) -> None:
     db.commit()
 
 
+def spend_sign_ins_under_way(db, user_id) -> int:
+    """Spend every sign-in of the account that is held for a further step (its second factor, its password, an
+    enrollment), in the caller's transaction; returns how many. Called where the account's sessions are ended
+    because something about how it signs in changed, or because it is to be signed out everywhere: a held sign-in
+    was proved by what the account had before (the old password, say), lives five minutes, and would otherwise
+    go on to a session, or set a passkey up, after the change that was meant to end it. A database built with
+    only the tables a test needs may hold no sign-ins at all: nothing to spend there."""
+    from app.core.table_presence import has_table
+    if not has_table(db, PendingLogin.__tablename__):
+        return 0
+    return int(db.query(PendingLogin).filter(
+        PendingLogin.user_id == user_id, PendingLogin.consumed_at.is_(None)).update(
+        {PendingLogin.consumed_at: datetime.now(timezone.utc)}, synchronize_session=False) or 0)
+
+
 def consume_pending(db, pending: PendingLogin, *, commit: bool = True) -> None:
     """Spend a pending login, one winner only: a second completion of the same step is refused. ``commit=False``
     leaves the commit to the caller, who writes what the pending login becomes in the same transaction."""

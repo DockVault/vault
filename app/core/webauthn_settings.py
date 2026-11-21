@@ -305,7 +305,9 @@ RETIRE_PASSKEYS_FROM_BEFORE_A_RESET = (
 # (that release saw no factor on it). Every reset another administrator or the server's operator makes is also
 # kept, with its time, among the changes to the account's sign-in details, on every release since 0.33.0, for
 # the 14 days such a record is kept. A passkey made before the account's latest recorded reset is retired as of
-# it. A reset made by this release retires the account's passkeys itself, so here this finds nothing to do. Only a
+# it. A reset made by this release retires the account's passkeys itself, so on its own data this finds nothing,
+# but for a key registered in the very moment of a reset (made a moment before the reset's record, written a
+# moment after the reset looked): that one is from before the reset, and is retired here at the next start. Only a
 # change that was applied counts (made at once, or approved): a request that was never applied has no time today,
 # and is left out by what it is as well, whatever a later release may write on such a row.
 RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET = (
