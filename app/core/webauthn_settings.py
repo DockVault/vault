@@ -274,6 +274,21 @@ def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None
                if getattr(key, "id", None) != without and algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0])
 
 
+def only_lapsed_passkeys(db, user_id, *, now: Optional[datetime] = None) -> bool:
+    """Whether the account holds passkeys and none of them can be used any more: each is of an algorithm an
+    administrator removed more than 30 days ago. Its factor went away under it, by nobody's act on the account.
+    False with passkeys turned off (none is a factor then, by the deployment's choice), and for an account that
+    holds none."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
+        return False
+    now = now or datetime.utcnow()
+    keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == user_id,
+                                               WebAuthnCredential.retired_at.is_(None)).all()
+    return bool(keys) and not any(algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0] for key in keys)
+
+
 # Run at every start. A reset of an account's second factor retires its passkeys; one made by a release that knew
 # no passkeys (run for a while after going back to it) left them as they were, though the account's second factor
 # was taken from it for a reason (a lost device, an account taken over). A passkey made before the reset the

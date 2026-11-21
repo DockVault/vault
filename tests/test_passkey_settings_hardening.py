@@ -303,6 +303,85 @@ def test_an_account_left_with_a_dead_key_signs_in_and_sets_a_new_passkey_up(monk
     assert sign_in.holds_a_factor(h.db, erin) is True and wss.requirement(h.db, erin).required is False
 
 
+def test_an_account_whose_only_factor_can_no_longer_be_used_sets_one_up_again_at_its_next_sign_in(monkeypatch):
+    """Erin's only second factor is a passkey of an algorithm an administrator removed. For thirty days it still
+    signs her in; after that it is refused at every use. No policy asks her for a factor, so her sign-in would go
+    on with the password alone, for good, and nothing would tell her. Instead it is as after a reset: the next
+    sign-in takes her through setting a factor up, whatever the login switch says. It ends by itself once she
+    holds a factor again. The dead key is hers to remove, whatever a rule asks her account to hold. With passkeys
+    turned off nothing lapsed: none is a factor then, by the deployment's choice."""
+    registry, wss = _mod()
+    from test_passkey_sign_in import _api
+    from app.core.models import SecondFactorAction, SecondFactorEnrollment, WebAuthnCredential
+    from app.services import sign_in
+    S = _api()
+    in_effect, effective = S._login_second_factor_in_effect, S._second_factor_effective      # as the server has them
+    erin, bare = _user("erin"), _user("bare")
+    h = SignInHarness(monkeypatch, [erin, bare])
+    monkeypatch.setattr(S, "_login_second_factor_in_effect", in_effect)
+    monkeypatch.setattr(S, "_second_factor_effective", effective)
+    _resolving(monkeypatch, registry, {wss.MODE: "optional"})
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, retired_at=None, cose_alg=-257)
+    h.db.rows_of(WebAuthnCredential).append(key)
+
+    def after_the_password(user):
+        """The held step's answer, or None when the password was the whole sign-in."""
+        outcome = sign_in.finish(h.db, sign_in.SignInResult(user, ["pwd"], "203.0.113.9"))
+        return None if isinstance(outcome, sign_in.SignedIn) else outcome.body
+
+    # In its thirty days the key is her factor and is asked for.
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db, cose_alg, now=None: (True, True))
+    assert wss.only_lapsed_passkeys(h.db, erin.id) is False and S._second_factor_to_set_up_again(h.db, erin) is False
+    body = after_the_password(erin)
+    assert body["enrollment_required"] is False and body["methods"] == ["passkey"], body
+    # After them: a factor to set up again.
+    _only_this_algorithm_left(monkeypatch, wss)
+    assert wss.only_lapsed_passkeys(h.db, erin.id) is True and S._second_factor_to_set_up_again(h.db, erin) is True
+    state = S._second_factor_effective(h.db, erin)
+    assert state["state"] == "pending" and state["required"] is True and state["source"] == "reset", state
+    assert S._login_second_factor_in_effect(h.db, erin) is True
+    body = after_the_password(erin)
+    assert body["stage"] == "second_factor" and body["enrollment_required"] is True, body
+    assert body["enrollment_methods"] == ["totp"] and body["access_token"] is None
+    # Whatever the login switch says, as after a reset.
+    switch = types.SimpleNamespace(key="login", require_otp=False, require_password=False)
+    h.db.rows_of(SecondFactorAction).append(switch)
+    assert S._login_second_factor_in_effect(h.db, erin) is True
+    assert S._login_second_factor_in_effect(h.db, bare) is False            # the control: the switch is off
+    h.db.rows_of(SecondFactorAction).remove(switch)
+    # The dead key is hers to remove, though "a second factor is required" of her account now.
+    assert S._passkey_last_factor_refusal(h.db, erin, key) is None
+    # An account that never held a passkey has nothing that lapsed, and neither has one whose keys were retired.
+    assert wss.only_lapsed_passkeys(h.db, bare.id) is False and S._second_factor_to_set_up_again(h.db, bare) is False
+    assert after_the_password(bare) is None
+    key.retired_at = datetime(2026, 11, 1)
+    assert wss.only_lapsed_passkeys(h.db, erin.id) is False
+    key.retired_at = None
+    # It ends by itself: an authenticator set up, or a passkey that can be used beside the dead one.
+    enrollment = types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, method="totp", status="active")
+    h.db.rows_of(SecondFactorEnrollment).append(enrollment)
+    assert S._second_factor_to_set_up_again(h.db, erin) is False
+    body = after_the_password(erin)
+    assert body["enrollment_required"] is False and body["methods"] == ["totp", "recovery"], body
+    h.db.rows_of(SecondFactorEnrollment).remove(enrollment)
+    good = types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, retired_at=None, cose_alg=-7)
+    h.db.rows_of(WebAuthnCredential).append(good)
+    assert wss.only_lapsed_passkeys(h.db, erin.id) is False and S._second_factor_to_set_up_again(h.db, erin) is False
+    # The usable key beside it is the account's factor: under a rule that asks for one it does not go, the dead one does.
+    assert S._passkey_last_factor_refusal(h.db, erin, key) is None
+    monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {**effective(db, user), "required": True})
+    assert "this is its last one" in S._passkey_last_factor_refusal(h.db, erin, good)
+    monkeypatch.setattr(S, "_second_factor_effective", effective)
+    h.db.rows_of(WebAuthnCredential).remove(good)
+    # With passkeys turned off none is a factor, by the deployment's choice: nothing lapsed, nothing is asked.
+    _resolving(monkeypatch, registry, {wss.MODE: "off"})
+    assert wss.only_lapsed_passkeys(h.db, erin.id) is False and S._login_second_factor_in_effect(h.db, erin) is False
+    assert after_the_password(erin) is None
+    # A reset's own mark still says the same by itself.
+    bare.second_factor_reset_at = datetime.utcnow()
+    assert S._second_factor_to_set_up_again(h.db, bare) is True
+
+
 def test_an_account_whose_password_nobody_knows_is_asked_for_none_before_it_sets_its_passkey_up(monkeypatch):
     """An account made at a first provider sign-in holds a hash of random bytes: no password anybody can type.
     Asked for "its password" before the enrollment of the passkey its role must hold, it could never answer, and

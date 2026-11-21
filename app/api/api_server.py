@@ -6529,7 +6529,21 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         if row is None or row.retired_at is not None:
             return {"passkey_gone": True}
         row.retired_at = datetime.utcnow()
-        return {"passkey_id": str(row.id), "passkey_label": row.label or ""}
+        left_without = False
+        if for_someone_else:
+            # The last factor the account set up for itself, taken away by somebody else (a lost device, as a
+            # reset is): the account sets the next one up at its next sign-in, with its own proof, and until
+            # then it counts as an account that has one. Another passkey on the account, whatever its state, or
+            # an authenticator, and nothing changes.
+            others = db.query(WebAuthnCredential.id).filter(
+                WebAuthnCredential.user_id == target.id, WebAuthnCredential.retired_at.is_(None),
+                WebAuthnCredential.id != row.id).first() is not None
+            authenticator = db.query(SecondFactorEnrollment.id).filter(
+                SecondFactorEnrollment.user_id == target.id, SecondFactorEnrollment.status == "active").first() is not None
+            left_without = not others and not authenticator
+            if left_without:
+                target.second_factor_reset_at = datetime.utcnow()
+        return {"passkey_id": str(row.id), "passkey_label": row.label or "", "left_without_a_factor": left_without}
     raise ValueError(f"unknown credential change: {kind}")
 
 
@@ -6856,8 +6870,10 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
                     f"{who} approved removing a passkey from your account; it had already been removed.")
         label = result.get("passkey_label") or ""
         named = f"the passkey \"{label}\"" if label else "an unnamed passkey"
+        last = (" It was your account's last second factor: you will set up a new one at your next sign-in."
+                if result.get("left_without_a_factor") else "")
         return ("A passkey was removed from your account",
-                f"{who} removed {named} from your account. It can no longer sign in or prove a step-up.")
+                f"{who} removed {named} from your account. It can no longer sign in or prove a step-up.{last}")
     return ("Your account was changed", f"{who} changed your sign-in details.")
 
 
@@ -8390,7 +8406,23 @@ def _second_factor_effective(db, user) -> dict:
         mode=p["mfa_mode"], required_group_ids=p["mfa_required_group_ids"],
         required_user_ids=p["mfa_required_user_ids"], user_group_ids=_sf_user_group_ids(db, user),
         user_id=user.id, has_active_enrollment=has_active,
-        reset_by_admin=getattr(user, "second_factor_reset_at", None) is not None)
+        reset_by_admin=_second_factor_to_set_up_again(db, user, has_active=has_active))
+
+
+def _second_factor_to_set_up_again(db, user, *, has_active: Optional[bool] = None) -> bool:
+    """Whether the account had a second factor that was taken from it and has not set the next one up: an
+    administrator reset it (``second_factor_reset_at``), or its only factor was a passkey of an algorithm an
+    administrator removed, refused at every use since its 30 days ran out. The second leaves no mark on the
+    account: it is read from what the account holds, and ends when it holds a factor again. Either way the next
+    sign-in takes the person through setting one up, as after a reset; without this the account would go on as
+    one with a password alone, and nothing would say so."""
+    if getattr(user, "second_factor_reset_at", None) is not None:
+        return True
+    from app.core import webauthn_settings
+    if has_active is None:
+        from app.core.active_factors import active_factors
+        has_active = active_factors(db, user.id).any
+    return not has_active and webauthn_settings.only_lapsed_passkeys(db, user.id)
 
 
 def _login_second_factor_in_effect(db, user) -> bool:
@@ -8401,8 +8433,9 @@ def _login_second_factor_in_effect(db, user) -> bool:
 
     One exception: after an administrator reset the account's second factor, the next sign-in takes
     the user through setting it up again whatever the switch or the policy says. They sign in with their
-    own password and enroll a factor of their own; nobody else chose it."""
-    if getattr(user, "second_factor_reset_at", None) is not None:
+    own password and enroll a factor of their own; nobody else chose it. The same holds for an account whose
+    only factor can no longer be used (_second_factor_to_set_up_again)."""
+    if _second_factor_to_set_up_again(db, user):
         return True
     login_otp, _ = _sf_action_toggles(db, "login")
     if not login_otp:
@@ -11620,6 +11653,10 @@ def _passkey_last_factor_refusal(db, user, row) -> Optional[str]:
     factors = active_factors(db, user.id)
     usable = webauthn_settings.usable_passkeys
     others = usable(db, user.id, without=row.id)
+    if webauthn_settings.enabled() and others == usable(db, user.id):
+        # A key that can no longer be used (its algorithm was removed, its 30 days are over) is no factor: the
+        # account gives nothing up with it, whatever a rule asks the account to hold.
+        return None
     if webauthn_settings.must_hold(user) and usable(db, user.id) > 0 and usable(db, user.id, without=row.id) <= 0:
         # A role's passkey is not dropped by its holder: registering one ends the time given to set it up, and
         # that time starts again when the account has none, so adding one at the deadline and removing it at

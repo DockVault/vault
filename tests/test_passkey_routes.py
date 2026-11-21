@@ -468,6 +468,11 @@ def test_an_administrator_removes_a_passkey_as_a_credential_change_and_never_the
     assert listed["passkeys"] == []
     assert h.audits[-1]["action"] == "passkey_admin_removed" and h.audits[-1]["details"]["target_username"] == "carol"
     assert h.notices[-1]["ids"] == [str(target.id)] and 'passkey "yubikey"' in h.notices[-1]["body"]
+    # It was the last factor she had set up, taken away by somebody else (a lost device, as a reset is): she is
+    # told so, and sets the next one up at her next sign-in.
+    assert target.second_factor_reset_at is not None
+    assert "your account's last second factor" in h.notices[-1]["body"]
+    assert "set up a new one at your next sign-in" in h.notices[-1]["body"]
     # Removing it again: 404. An administrator's own passkey: not through this route.
     status, out = _call(h.S, "DELETE", f"/users/{target.id}/passkeys/{key.id}")
     assert status == 404
@@ -476,6 +481,56 @@ def test_an_administrator_removes_a_passkey_as_a_credential_change_and_never_the
     h.rows().append(own)
     status, out = _call(h.S, "DELETE", f"/users/{admin.id}/passkeys/{own.id}")
     assert status == 400 and "profile" in out["detail"] and own.retired_at is None
+
+
+@pytest.mark.parametrize("left, marked", [
+    ("nothing else", True), ("another passkey", False), ("another passkey of a removed algorithm", False),
+    ("an authenticator", False), ("an authenticator not confirmed yet", True), ("another account's passkey", True),
+    ("a passkey retired earlier", True)])
+def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_as_a_reset(monkeypatch, left, marked):
+    """An administrator removes one passkey. Where that leaves the account with no factor it set up for itself (no
+    other passkey that was not retired, whatever its state, and no authenticator), it is what a reset is: the
+    account is marked, sets the next factor up at its next sign-in, and counts as an account with a factor of its
+    own until then. With anything of its own left, nothing is marked. A removal an account makes of its own key
+    marks nothing either (it is not made through this change at all)."""
+    from app.core import credential_changes as cc
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential, User
+    S = _api()
+    admin, target, other = _user("root", role="admin"), _user("carol"), _user("dave")
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, retired_at=None, label="yubikey", cose_alg=-7)
+    keys, enrollments = [key], []
+    if left.startswith("another passkey"):
+        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, retired_at=None, label="phone",
+                                          cose_alg=-257 if "removed algorithm" in left else -7))
+    elif left == "another account's passkey":
+        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, retired_at=None, label="his", cose_alg=-7))
+    elif left == "a passkey retired earlier":
+        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, retired_at=datetime(2026, 11, 1),
+                                          label="old", cose_alg=-7))
+    elif left.startswith("an authenticator"):
+        enrollments.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, method="totp",
+                                                 status="unconfirmed" if "not confirmed" in left else "active"))
+    db = MemoryDB({User: [admin, target, other], WebAuthnCredential: keys, SecondFactorEnrollment: enrollments})
+    from app.core import auditor_rights, legal_holds
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    result = S._apply_credential_change(db, cc.PASSKEY, target, {"passkey_id": str(key.id)}, actor_id=admin.id,
+                                        actor_name="root")
+    assert key.retired_at is not None
+    assert result == {"passkey_id": str(key.id), "passkey_label": "yubikey", "left_without_a_factor": marked}
+    assert (target.second_factor_reset_at is not None) is marked
+    assert other.second_factor_reset_at is None and admin.second_factor_reset_at is None
+    title, sentence = S._credential_change_notice(cc.PASSKEY, result)
+    assert ("last second factor" in sentence) is marked and 'removed the passkey "yubikey"' in sentence
+    # The same change made as the account's own act (an administrator on their own account, through a route of
+    # theirs) is no reset by somebody else.
+    again = types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, retired_at=None, label="own", cose_alg=-7)
+    db.rows_of(WebAuthnCredential).append(again)
+    for mine in [k for k in keys if k.user_id == other.id]:
+        mine.retired_at = datetime(2026, 11, 1)
+    own = S._apply_credential_change(db, cc.PASSKEY, other, {"passkey_id": str(again.id)}, actor_id=other.id,
+                                     actor_name="dave", for_someone_else=False)
+    assert own["left_without_a_factor"] is False and other.second_factor_reset_at is None
 
 
 def test_a_second_factor_reset_retires_every_passkey_and_a_gone_key_is_reported(monkeypatch):
