@@ -260,6 +260,80 @@ def test_the_provider_row_a_link_is_made_on_is_read_again_whole_and_loses_nothin
     assert sso_router._provider_as_it_stands(db, uuid.uuid4()) is None
 
 
+def test_the_provider_row_is_waited_for_a_short_time_only_and_busy_is_said_so():
+    """A save of the provider holds its row until it has settled every linked account. A link that comes back
+    meanwhile waits for the row on the server's one loop, so every request waits with it: the wait is half a
+    second, set for this read alone and put back after it, in place of the connection's five. Still held, the
+    transaction is rolled back and the caller is told the row is busy; any other database error is not taken for
+    that."""
+    from sqlalchemy.exc import OperationalError
+    from app.api import sso_router
+    from app.core import database
+    assert sso_router.PROVIDER_ROW_WAIT_MS == 500 < database._LOCK_TIMEOUT_MS
+    pid = uuid.uuid4()
+
+    class Held(Exception):
+        pgcode = "55P03"
+
+    class Other(Exception):
+        pgcode = "40001"
+
+    class Postgres:
+        """What the function is given, on PostgreSQL: the statements it runs are kept, the row read answers
+        ``answer`` (a row, or an error to raise)."""
+
+        def __init__(self, answer):
+            self.answer, self.ran, self.rolled_back = answer, [], 0
+
+        def flush(self):
+            self.ran.append("flush")
+
+        def get_bind(self):
+            return type("Bind", (), {"dialect": type("Dialect", (), {"name": "postgresql"})()})()
+
+        def execute(self, statement):
+            self.ran.append(str(statement))
+
+        def rollback(self):
+            self.rolled_back += 1
+
+        def query(self, *entities):
+            session = self
+
+            class Query:
+                def filter(self, *a):
+                    return self
+
+                def populate_existing(self):
+                    return self
+
+                def with_for_update(self, **kw):
+                    session.ran.append(f"for update {kw}")
+                    return self
+
+                def first(self):
+                    if isinstance(session.answer, Exception):
+                        raise session.answer
+                    return session.answer
+            return Query()
+
+    row = object()
+    free = Postgres(row)
+    assert sso_router._provider_as_it_stands(free, pid) is row
+    assert free.ran == ["flush", "SET LOCAL lock_timeout = 500", "for update {'read': True}",
+                        f"SET LOCAL lock_timeout = {database._LOCK_TIMEOUT_MS}"] and free.rolled_back == 0
+    held = Postgres(OperationalError("SELECT ... FOR SHARE", {}, Held()))
+    with pytest.raises(sso_router.ProviderRowBusy):
+        sso_router._provider_as_it_stands(held, pid)
+    assert held.rolled_back == 1 and held.ran[-1].startswith("for update")       # nothing run after the failure
+    other = Postgres(OperationalError("SELECT ... FOR SHARE", {}, Other()))
+    with pytest.raises(OperationalError):
+        sso_router._provider_as_it_stands(other, pid)
+    assert other.rolled_back == 0
+    # Where the database has no such setting (SQLite here), none is set.
+    assert sso_router._on_postgres(free) is True and sso_router._on_postgres(object()) is False
+
+
 def test_an_unlink_followed_by_a_link_on_the_same_provider_keeps_no_session_of_the_first_identity(db):
     """Somebody was linked to the account at the provider (by its address, or a provider account taken over) and
     signed in. The owner unlinks that identity, then links their own on the same provider, as their organisation

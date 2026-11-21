@@ -26,6 +26,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import text as sa_text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.api.user_management_api import get_current_user, require_interactive_admin
@@ -176,14 +178,50 @@ def _provider_as_it_stands(db, provider_id) -> Optional[SsoProvider]:
     meanwhile turned the provider off, or changed whether its people hold a password, changed it for this link
     too; and a save that comes while the link is being made waits for it (the save, the state change and the
     removal take the row for themselves), so it settles this account with the others. What this session has
-    pending is written first: the row is read again whole."""
+    pending is written first: the row is read again whole.
+
+    A save of this provider that is under way holds the row, and settles every linked account before it commits.
+    This read waits for it a short time only (PROVIDER_ROW_WAIT_MS, in place of the connection's own, longer
+    wait): the routes that call it are answered on the server's one loop, and a wait here is a wait for every
+    request. Still held after that, :class:`ProviderRowBusy`: nothing was written, and the person tries again."""
     try:
         pid = uuid.UUID(str(provider_id))
     except ValueError:
         return None
     db.flush()
-    return (db.query(SsoProvider).filter(SsoProvider.id == pid)
-            .populate_existing().with_for_update(read=True).first())
+    waits = _on_postgres(db)
+    if waits:
+        db.execute(sa_text(f"SET LOCAL lock_timeout = {int(PROVIDER_ROW_WAIT_MS)}"))
+    try:
+        row = (db.query(SsoProvider).filter(SsoProvider.id == pid)
+               .populate_existing().with_for_update(read=True).first())
+    except OperationalError as held:
+        if getattr(getattr(held, "orig", None), "pgcode", None) != LOCK_NOT_AVAILABLE:
+            raise
+        db.rollback()
+        raise ProviderRowBusy() from None
+    if waits:
+        from app.core import database
+        db.execute(sa_text(f"SET LOCAL lock_timeout = {int(database._LOCK_TIMEOUT_MS)}"))
+    return row
+
+
+# How long a link waits for a provider's row that a save of that provider holds, and the database's word for
+# "still held" (lock_not_available).
+PROVIDER_ROW_WAIT_MS = 500
+LOCK_NOT_AVAILABLE = "55P03"
+
+
+class ProviderRowBusy(Exception):
+    """The provider's row was still held by a save of that provider after the short wait: the transaction was
+    rolled back, nothing was linked."""
+
+
+def _on_postgres(db) -> bool:
+    try:
+        return db.get_bind().dialect.name == "postgresql"
+    except Exception:  # noqa: BLE001 -- a stand-in session of a test, or SQLite: no such setting there
+        return False
 
 
 def _limit_start(client_ip: str) -> None:
@@ -393,7 +431,13 @@ async def sign_in_callback(
     # The provider's answer took its time (up to the whole wait). The row is read again as it stands, and held:
     # a provider turned off meanwhile, by an administrator or by a change to its connection, links nobody, makes
     # no account and applies no password rule on the strength of an answer it gave before.
-    row = _provider_as_it_stands(db, login.provider_id)
+    try:
+        row = _provider_as_it_stands(db, login.provider_id)
+    except ProviderRowBusy:
+        # A save of this provider is under way and holds its row: nothing was written, the person starts again.
+        _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure",
+               details={**details, "reason": oc.TEMPORARILY_UNAVAILABLE})
+        return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
     why = sso.usable_for(row, login.purpose) if row is not None else sso.PROVIDER_DISABLED
     if why is not None:
         db.rollback()
@@ -892,7 +936,12 @@ async def finish_link(
     _refuse_temp(current_user)
     client_ip = api.get_client_ip(request)
     record = _claim_handover(db, request, current_user, body, purpose=sso_state.LINK)
-    row = _provider_as_it_stands(db, record["provider_id"])      # as it stands now, held until the link is written
+    try:
+        row = _provider_as_it_stands(db, record["provider_id"])  # as it stands now, held until the link is written
+    except ProviderRowBusy:
+        raise HTTPException(status_code=503, detail={
+            "reason": oc.TEMPORARILY_UNAVAILABLE,
+            "message": "This provider's settings are being saved. Start the link again in a moment."})
     if row is None or sso.usable_for(row, sso_state.LINK) is not None:
         raise HTTPException(status_code=409, detail={"reason": sso.PROVIDER_DISABLED,
                                                      "message": sso.reason_text(sso.PROVIDER_DISABLED)})
