@@ -40,9 +40,9 @@ def _password_is_nobodys(user) -> None:
 
 
 def make_sso_only(db, user, *, keep_session=None) -> None:
-    """Make ``user`` sign in only through its provider, in the caller's transaction. The web sessions a password
-    made end with the password (:func:`end_sessions_no_provider_made`); ``keep_session`` is the id of the session
-    the request itself came through, where the person has just proved themselves at the provider in it."""
+    """Make ``user`` sign in only through its provider, in the caller's transaction. The sessions a password made
+    end with the password (:func:`end_sessions_no_provider_made`); ``keep_session`` is the id of the session the
+    request itself came through, where the person has just proved themselves at the provider in it."""
     from app.core.security import hash_password
     kind = privileged_accounts.kind(db, user)
     if kind is not None:
@@ -55,18 +55,33 @@ def make_sso_only(db, user, *, keep_session=None) -> None:
 
 
 def end_sessions_no_provider_made(db, user, *, keep=None) -> int:
-    """End the account's web sessions that did not come through a provider, in the caller's transaction. They
-    were made with the password that has just stopped working (alone, or with a second factor), and whoever
-    holds one would otherwise stay signed in until it expires. Sessions that came through a provider stay, and
-    so do a temporary credential's (not the account's own sign-in) and SFTP's (a key made them; SFTP password
-    sign-in is off from now). Returns how many ended."""
+    """End the account's sessions that a password made, in the caller's transaction: the password has just stopped
+    working, and whoever holds one of them (a thief of the password among them) would otherwise stay signed in
+    until it expires.
+
+    Every session that is not revoked is looked at, not only the active ones: a web session a later sign-in
+    replaced is marked inactive and never revoked, and its token goes on working until it expires. Ended are the
+    web sessions that did not come through a provider, and the SFTP sessions a password made (they carry an end;
+    a key's session carries none, and the key goes on working). What came through a provider stays, and so do a
+    temporary credential's sessions (not the account's own sign-in) and ``keep``: the session the request itself
+    came through, where the person has just proved themselves at the provider in it. The account's turn at its
+    sessions is taken first, so a renewal under way comes wholly before or wholly after. Returns how many ended."""
     from app.core.models import ActiveSession, SsoSession
     from app.core.table_presence import has_table
     if not has_table(db, ActiveSession.__tablename__):
         return 0
-    rows = db.query(ActiveSession).filter(ActiveSession.user_id == user.id, ActiveSession.is_active.is_(True)).all()
-    mine = [r for r in rows if getattr(r, "temp_credential_id", None) is None
-            and getattr(r, "channel", None) in (None, "web") and r.id != keep]
+    from app.api import api_server as api
+    api._sessions_turn(db, user.id)
+    rows = db.query(ActiveSession).filter(ActiveSession.user_id == user.id, ActiveSession.revoked.is_(False)).all()
+
+    def a_password_made(row) -> bool:
+        if getattr(row, "temp_credential_id", None) is not None or row.id == keep:
+            return False
+        if getattr(row, "channel", None) in (None, "web"):
+            return True
+        return getattr(row, "expires_at", None) is not None        # SFTP: a password's session has an end
+
+    mine = [r for r in rows if a_password_made(r)]
     if not mine:
         return 0
     through = set()
@@ -76,7 +91,6 @@ def end_sessions_no_provider_made(db, user, *, keep=None) -> int:
     ending = [r.id for r in mine if r.id not in through]
     if not ending:
         return 0
-    from app.api import api_server as api
     return int(api._revoke_sessions(db, session_ids=ending, actor_username="system", durable=True) or 0)
 
 

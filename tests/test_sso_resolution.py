@@ -835,8 +835,8 @@ def test_a_link_that_ends_the_password_ends_the_sessions_it_made_and_not_the_one
     h = Resolving(monkeypatch, [alice], [p])
 
     def session(token):
-        return types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, is_active=True, temp_credential_id=None,
-                                     channel="web", session_token=token)
+        return types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, is_active=True, revoked=False,
+                                     temp_credential_id=None, channel="web", expires_at=None, session_token=token)
 
     from app.core.session_hash_utils import hash_session_token
     h.session_claims["session_token"] = "this-browsers-token"         # what the request's own token names

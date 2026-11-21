@@ -170,6 +170,42 @@ def test_a_session_with_no_record_of_the_identity_it_came_through_is_not_renewed
     assert sign_in.provider_subject_of_session(db, OLD) is None and sign_in.provider_subject_of_session(db, None) is None
 
 
+def test_no_token_a_password_made_works_after_the_account_came_to_sign_in_only_through_its_provider(db):
+    """On a real database, with the vault's own revocation: somebody who knows the password signed in on the web
+    and over SFTP; the owner signed in later, which replaced the first web session (marked inactive, not revoked:
+    its token still works). The account then comes to sign in only through its provider. Every one of those
+    sessions is revoked, so no token a password made is taken any more; the provider's session and an SFTP
+    session a key made go on."""
+    user = User(id=uuid.uuid4(), username="alice", email="alice@example.test", password_hash="x",
+                role=RoleEnum.USER, is_active=True, is_locked=False)
+    db.add(user)
+    provider = _provider(db)
+
+    def session(token, **extra):
+        fields = dict(id=uuid.uuid4(), session_token=hash_session_token(token), user_id=user.id, ip_address="192.0.2.7",
+                      is_active=True, revoked=False, channel="web", expires_at=datetime.utcnow() + timedelta(days=30))
+        fields.update(extra)
+        row = ActiveSession(**fields)
+        db.add(row)
+        return row
+
+    replaced = session("the-thiefs-web-session", is_active=False)
+    owners = session("the-owners-web-session")
+    sftp_password = session("an-sftp-password-session", channel="sftp")
+    sftp_key = session("an-sftp-key-session", channel="sftp", expires_at=None)
+    through = session("the-providers-session")
+    db.add(SsoSession(session_id=through.id, provider_id=provider.id, idp_sub="subject-1"))
+    db.commit()
+    assert sso_only.end_sessions_no_provider_made(db, user) == 3
+    db.commit()
+    for row in (replaced, owners, sftp_password, sftp_key, through):
+        db.refresh(row)
+    assert (replaced.revoked, owners.revoked, sftp_password.revoked) == (True, True, True)
+    assert (owners.is_active, sftp_password.is_active) == (False, False)
+    assert (sftp_key.revoked, sftp_key.is_active, through.revoked, through.is_active) == (False, True, False, True)
+    assert sso_only.end_sessions_no_provider_made(db, user) == 0           # nothing left that a password made
+
+
 def test_a_session_through_an_identity_linked_by_email_is_not_kept_going_past_a_factor_the_account_set_up(db):
     """An identity was put on the account by its email address, and a session came through it on the provider's
     trusted MFA. The owner then sets up a factor of their own. A new sign-in through that identity is asked for

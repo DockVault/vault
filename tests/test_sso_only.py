@@ -5,6 +5,7 @@ refused; no password change; the provider setting's save-time refusal naming the
 the linked accounts both ways. Offline."""
 import types
 import uuid
+from datetime import datetime
 
 import pytest
 
@@ -40,12 +41,14 @@ def test_an_sso_only_account_has_a_password_nobody_knows_and_no_sftp_password(mo
 
 
 def test_an_account_made_provider_only_keeps_no_session_its_password_made_and_owns_no_password(monkeypatch):
-    """The password stops working: the web sessions it made end with it (whoever holds one, a thief of the
-    password included, would otherwise stay signed in until it expires). What came through a provider stays,
-    and so do the session the request itself came through (the person has just proved themselves at the
-    provider in it), a temporary credential's, SFTP's, another account's and one that is over. The hash holds
-    random bytes from now, here and when passwords are allowed again: it is marked as a password somebody else
-    set, so an account made an administrator later is sent a link to choose one, where it must type it."""
+    """The password stops working: the sessions it made end with it (whoever holds one, a thief of the password
+    included, would otherwise stay signed in until it expires). That is every web session that is not revoked,
+    also one a later sign-in replaced (marked inactive, never revoked: its token still works), and an SFTP
+    session a password made. What came through a provider stays, and so do the session the request itself came
+    through (the person has just proved themselves at the provider in it), a temporary credential's, an SFTP
+    session a key made, another account's and one that is revoked already. The hash holds random bytes from now,
+    here and when passwords are allowed again: it is marked as a password somebody else set, so an account made
+    an administrator later is sent a link to choose one, where it must type it."""
     privileged_accounts, sso_only = _mod()
     from _memory_db import MemoryDB
     from app.api import api_server as api
@@ -56,21 +59,27 @@ def test_an_account_made_provider_only_keeps_no_session_its_password_made_and_ow
     alice = _user(sso_only=False, password_set_by=None, password_set_by_other_at=None)
 
     def session(**extra):
-        fields = dict(id=uuid.uuid4(), user_id=alice.id, is_active=True, temp_credential_id=None, channel="web")
+        fields = dict(id=uuid.uuid4(), user_id=alice.id, is_active=True, revoked=False, temp_credential_id=None,
+                      channel="web", expires_at=datetime(2026, 12, 21))
         fields.update(extra)
         return types.SimpleNamespace(**fields)
 
     by_password, from_before_channels = session(), session(channel=None)
+    replaced_by_a_later_sign_in, sftp_by_password = session(is_active=False), session(channel="sftp")
     through_a_provider, this_request = session(), session()
-    stay = [through_a_provider, this_request, session(channel="sftp"), session(temp_credential_id=uuid.uuid4()),
-            session(user_id=uuid.uuid4()), session(is_active=False)]
-    db = MemoryDB({ActiveSession: [by_password, from_before_channels, *stay],
+    stay = [through_a_provider, this_request, session(channel="sftp", expires_at=None),       # a key made it
+            session(temp_credential_id=uuid.uuid4()), session(user_id=uuid.uuid4()),
+            session(is_active=False, revoked=True)]
+    db = MemoryDB({ActiveSession: [by_password, from_before_channels, replaced_by_a_later_sign_in, sftp_by_password,
+                                   *stay],
                    SsoSession: [types.SimpleNamespace(session_id=through_a_provider.id)]})
-    ended = []
+    ended, turns = [], []
+    monkeypatch.setattr(api, "_sessions_turn", lambda db, user_id: turns.append((user_id, len(ended))))
     monkeypatch.setattr(api, "_revoke_sessions", lambda db, **kw: ended.append(kw) or len(kw["session_ids"]))
     sso_only.make_sso_only(db, alice, keep_session=this_request.id)
-    assert ended == [{"session_ids": [by_password.id, from_before_channels.id], "actor_username": "system",
-                      "durable": True}]
+    assert ended == [{"session_ids": [by_password.id, from_before_channels.id, replaced_by_a_later_sign_in.id,
+                                      sftp_by_password.id], "actor_username": "system", "durable": True}]
+    assert turns == [(alice.id, 0)]                              # the account's turn, before its sessions are read
     assert password_origin.is_set_by_other(alice) and alice.password_set_by is None
     # Nothing to end: nothing is asked of the session machinery.
     del ended[:]
