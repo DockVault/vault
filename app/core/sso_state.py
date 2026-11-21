@@ -337,36 +337,51 @@ def forget_logout_jti(jti, *, scope: str, redis=None) -> None:
         pass
 
 
-LOGOUT_SID_PREFIX = "sso:logout-sid:"
+LOGGED_OUT_PREFIX = "sso:logged-out:"
 # Longer than a sign-in under way can go without being judged again: the handover code lives a minute and a held
 # step five, and each step that follows another is judged where it is written.
-LOGOUT_SID_TTL_SECONDS = 900
+LOGGED_OUT_TTL_SECONDS = 900
 
 
-def _logout_sid_key(sid: str, scope: str) -> str:
+def _logged_out_key(kind: str, value: str, scope: str) -> str:
     import hashlib
-    return LOGOUT_SID_PREFIX + hashlib.sha256(f"{scope}:{sid}".encode("utf-8")).hexdigest()
+    return LOGGED_OUT_PREFIX + hashlib.sha256(f"{scope}:{kind}:{value}".encode("utf-8")).hexdigest()
 
 
-def note_logged_out_sid(sid: str, *, scope: str, redis=None) -> None:
-    """Remember that the provider ``scope`` logged its session ``sid`` out, for as long as a sign-in under way
-    that came through that session could still be finished. Raises :class:`Unavailable` without the store: the
-    logout is then answered as failed, and the provider's retry notes it."""
+def note_logged_out(*, scope: str, sid=None, sub=None, at: Optional[float] = None, redis=None) -> None:
+    """Remember when the provider ``scope`` logged out what its token named (its session ``sid``, or the person
+    ``sub``), for as long as a sign-in under way that the provider answered before that moment could still be
+    finished. Raises :class:`Unavailable` without the store: the logout is then answered as failed, and the
+    provider's retry notes it."""
+    moment = repr(float(time.time() if at is None else at))
     try:
-        _redis(redis).set(_logout_sid_key(sid, scope), "1", ex=LOGOUT_SID_TTL_SECONDS)
+        for kind, value in (("sid", sid), ("sub", sub)):
+            if isinstance(value, str) and value:
+                _redis(redis).set(_logged_out_key(kind, value, scope), moment, ex=LOGGED_OUT_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in state store cannot be reached") from exc
 
 
-def sid_logged_out(sid, *, scope: str, redis=None) -> bool:
-    """Whether the provider ``scope`` logged its session ``sid`` out a moment ago (:func:`note_logged_out_sid`).
-    Raises :class:`Unavailable` without the store."""
-    if not isinstance(sid, str) or not sid:
-        return False
+def logged_out_since(*, scope: str, sid=None, sub=None, redis=None) -> Optional[float]:
+    """When the provider ``scope`` last logged out its session ``sid`` or the person ``sub``
+    (:func:`note_logged_out`), or None when it logged out neither in the time such a note is kept. A note that
+    cannot be read counts as a logout made now. Raises :class:`Unavailable` without the store."""
+    latest = None
     try:
-        return _redis(redis).get(_logout_sid_key(sid, scope)) is not None
+        for kind, value in (("sid", sid), ("sub", sub)):
+            if not isinstance(value, str) or not value:
+                continue
+            raw = _redis(redis).get(_logged_out_key(kind, value, scope))
+            if raw is None:
+                continue
+            try:
+                moment = float(raw.decode("ascii") if isinstance(raw, bytes) else raw)
+            except (TypeError, ValueError, UnicodeDecodeError):
+                moment = time.time()
+            latest = moment if latest is None else max(latest, moment)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in state store cannot be reached") from exc
+    return latest
 
 
 LOGOUT_HINT_PREFIX = "sso:logout-hint:"

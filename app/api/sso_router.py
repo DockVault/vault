@@ -732,11 +732,15 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         if db.query(SsoProvider).filter(SsoProvider.id == row_id).with_for_update(key_share=True).first() is None:
             db.rollback()
             return invalid                 # removed since the token came in: its sessions went with it
+        # A sign-in held for a further step, or waiting in its handover code, carries the provider's session
+        # and the person, and would record them on a new vault session that no later logout names. What the
+        # token names (the session, else the person) is remembered as logged out now, for as long as such a
+        # sign-in can last: one the provider answered before this moment is refused where it is written, and
+        # one it answers after is a new sign-in.
         if by == "sid":
-            # A sign-in held for a further step, or waiting in its handover code, carries the same session of the
-            # provider and would record it on a new vault session that no later logout names. The session id is
-            # remembered as logged out for as long as such a sign-in can last, and refused where one is written.
-            sso_state.note_logged_out_sid(sid, scope=scope)
+            sso_state.note_logged_out(scope=scope, sid=sid)
+        else:
+            sso_state.note_logged_out(scope=scope, sub=sub)
         # Whose sessions the token names, then, under each of those accounts' turn at its sessions, which sessions.
         # A renewal ("Stay signed in") moves the provider's session to its new session row under the same turn, so
         # the read made under it sees a renewal wholly done or not begun: the live session is among those ended.
@@ -754,11 +758,6 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         session_ids = [s.session_id for s in query.all()]
         ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
                                      durable=True) if session_ids else 0
-        if by == "sub" and person is not None:
-            # By the subject, every session of the person at this provider ends, and no session id says which
-            # sign-ins under way came through one of them: all of the account's are spent, in its turn.
-            from app.services import sign_in
-            sign_in.spend_sign_ins_under_way(db, person.user_id)
     except Exception as exc:  # noqa: BLE001 -- nothing was applied: the token is not spent, so the provider's retry works
         db.rollback()
         sso_state.forget_logout_jti(claims.get("jti"), scope=scope)

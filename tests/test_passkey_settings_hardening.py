@@ -21,8 +21,15 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def the_providers_own_check():
-    """Asked for by a test that gives its provider real rows: the check below is left as it is for that test."""
+def the_providers_own_check(monkeypatch):
+    """Asked for by a test that gives its provider real rows: the check below is left as it is for that test. The
+    check asks the store whether the provider logged the person out since; the store is stood in for."""
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    from app.core import sso_state
+    from test_sso_state import FakeRedis
+    store = FakeRedis()
+    monkeypatch.setattr(sso_state, "_redis", lambda redis: store)
 
 
 @pytest.fixture(autouse=True)

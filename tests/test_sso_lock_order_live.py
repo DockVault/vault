@@ -127,13 +127,16 @@ def after_the_turn_is_held(fn):
     return run
 
 
-def through_the_provider(uid, pid, sid, pause=0.0):
-    """A sign-in that came through the provider and completes: its session written in the account's turn."""
+def through_the_provider(uid, pid, sid, pause=0.0, answered=None):
+    """A sign-in that came through the provider and completes: its session written in the account's turn. The
+    provider answered it at ``answered`` (now, when the meeting starts, if not given)."""
+    answered = time.time() if answered is None else answered
+
     def run():
         with SessionLocal() as s:
             user = s.get(User, uid)
             result = sign_in.SignInResult(user, [], IP, provider_id=str(pid), provider_sub=SUBJECT, provider_sid=sid,
-                                          sessions_ended=sign_in.as_read(user))
+                                          provider_answered_at=answered, sessions_ended=sign_in.as_read(user))
             here.stay = pause
             sign_in.complete_sign_in(s, result)
             return "signed in"
@@ -195,9 +198,15 @@ elif pair == "logged out while a sign-in is written":
     out = together(writer=through_the_provider(alice, contoso, "s-held", pause=1.6),
                    ender=after_the_turn_is_held(logout(contoso, "s-held", sub=None)))
 elif pair == "a sign-in after the logout":
+    before = time.time()
+    time.sleep(0.05)
     out = {"ender": ["ok", logout(contoso, "s-held")()]}
-    out.update(together(writer=through_the_provider(alice, contoso, "s-held"),
-                        other=through_the_provider(alice, contoso, "s-other")))
+    time.sleep(0.05)
+    # The provider answered the first before its logout. The second came through another session of the
+    # provider's; the third is the person signing in again, answered after the logout with the session id kept.
+    out.update(together(writer=through_the_provider(alice, contoso, "s-held", answered=before)))
+    out.update(together(other=through_the_provider(alice, contoso, "s-other", answered=before)))
+    out.update(together(again=through_the_provider(alice, contoso, "s-held")))
 elif pair == "saved while a held sign-in sets a factor up":
     hold = held_sign_in(alice)
 
@@ -256,7 +265,8 @@ def test_a_sign_in_through_a_provider_session_that_was_logged_out_is_refused_and
     out = run_in(db_name, SCENARIO, env={"PAIR": "a sign-in after the logout"})
     assert out["ender"] == ["ok", 200] and out["writer"] == REFUSED, out
     assert out["other"] == ["ok", "signed in"], out          # another session of the provider's is its own sign-in
-    assert out["after"]["sessions"] == [[True, False]] and out["after"]["provider sessions"] == 1, out
+    assert out["again"] == ["ok", "signed in"], out          # answered after the logout: a new sign-in
+    assert out["after"]["sessions"] == [[True, False], [True, False]] and out["after"]["provider sessions"] == 2, out
 
 
 def test_a_provider_saved_while_a_held_sign_in_sets_a_factor_up_waits_and_both_finish(db_name):

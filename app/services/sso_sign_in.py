@@ -908,7 +908,7 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     return SignInResult(user, [], client_ip, provider_id=provider_id, sessions_ended=sign_in_as_read(user),
                         provider_mfa_trusted=mfa_trusted(row, answer) and not on_the_providers_word,
                         provider_auth_time=answer.auth_time,
-                        provider_sid=answer.sid, provider_sub=answer.subject,
+                        provider_sid=answer.sid, provider_sub=answer.subject, provider_answered_at=time.time(),
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)
 
 

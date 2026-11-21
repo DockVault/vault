@@ -126,6 +126,9 @@ class SignInResult:
     # the ID token (plain here, encrypted at rest) when the provider logout option wants it.
     provider_sid: Optional[str] = None
     provider_sub: Optional[str] = None
+    # When the vault took the provider's answer (seconds since the epoch): a logout the provider sends later ends
+    # the sign-ins under way that it answered before, and not one it answers after.
+    provider_answered_at: Optional[float] = None
     # The ID token, for the provider's own logout; only when wanted. Never in the result's text form.
     provider_logout_hint: Optional[str] = field(default=None, repr=False)
     # When the provider says the person authenticated there (its own session, which may be days old). Kept with the
@@ -273,6 +276,9 @@ def read_pre_auth(payload: dict, pending: PendingLogin) -> None:
     sid, sub = payload.get("idp_sid"), payload.get("idp_sub")
     pending._provider_sid = sid if isinstance(sid, str) else None
     pending._provider_sub = sub if isinstance(sub, str) else None
+    answered = payload.get("idp_at")
+    pending._provider_answered_at = (float(answered) if isinstance(answered, (int, float))
+                                     and not isinstance(answered, bool) else None)
     at = payload.get("idp_auth_time")
     pending._provider_auth_time = (datetime.fromtimestamp(at, tz=timezone.utc)
                                    if isinstance(at, int) and not isinstance(at, bool) and 0 <= at < 2 ** 33 else None)
@@ -457,6 +463,7 @@ def provider_session_of(pending: Optional[PendingLogin]) -> dict:
     provider's session id, subject and authentication time from the pre-authentication token, and the logout hint
     staged for it (read back encrypted from the store, opened here; nothing when the store or the key has none)."""
     fields = {"provider_sid": getattr(pending, "_provider_sid", None), "provider_sub": getattr(pending, "_provider_sub", None),
+              "provider_answered_at": getattr(pending, "_provider_answered_at", None),
               "provider_auth_time": getattr(pending, "_provider_auth_time", None), "provider_logout_hint": None}
     if pending is not None and getattr(pending, "_provider_id", None) and getattr(pending, "id", None) is not None:
         try:
@@ -576,6 +583,8 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
             claims["idp_sid"] = result.provider_sid
         if result.provider_sub:
             claims["idp_sub"] = result.provider_sub
+        if result.provider_answered_at is not None:
+            claims["idp_at"] = result.provider_answered_at
         if result.provider_auth_time is not None:
             claims["idp_auth_time"] = int(result.provider_auth_time.timestamp())
         if result.provider_logout_hint:
@@ -733,23 +742,35 @@ def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
 
 
 def logged_out_at_the_provider(row, result: SignInResult) -> bool:
-    """Whether the provider has said, by a back-channel logout, that the session this sign-in came through is over
-    (app/api/sso_router.py backchannel_logout). Finished all the same, the sign-in would record that session on a
-    new vault session, and no later logout would name it. Asked only where the provider's logouts are taken, and
-    for a sign-in that carries the provider's session id. A store that cannot be reached refuses the sign-in as
-    busy: whether the person was logged out cannot be told."""
-    sid = result.provider_sid or getattr(result.pending, "_provider_sid", None)
-    if not isinstance(sid, str) or not sid:
+    """Whether the provider has said, by a back-channel logout made after it answered this sign-in, that the
+    session the sign-in came through, or the person, is logged out (app/api/sso_router.py backchannel_logout).
+    Finished all the same, the sign-in would record the provider's session on a new vault session, and no later
+    logout would name it. A sign-in the provider answered after its logout is a new one, whatever session id it
+    carries (a provider may keep one): it is not refused. One that does not say when it was answered is taken as
+    answered before. Asked only where the provider's logouts are taken. A store that cannot be reached refuses
+    the sign-in as busy: whether the person was logged out cannot be told."""
+    pending = result.pending
+    sid = result.provider_sid or getattr(pending, "_provider_sid", None)
+    sub = result.provider_sub or getattr(pending, "_provider_sub", None)
+    if not (isinstance(sid, str) and sid) and not (isinstance(sub, str) and sub):
         return False
     from app.core import sso_state
     from app.services import sso_sign_in
     if not sso_sign_in.policy_of(row)["sso_backchannel_logout"]:
         return False
     try:
-        return sso_state.sid_logged_out(sid, scope=str(row.id))
+        since = sso_state.logged_out_since(scope=str(row.id), sid=sid, sub=sub)
     except sso_state.Unavailable:
         raise HTTPException(status_code=503, detail=(
             "Signing in through your organisation is busy right now. Try again in a moment.")) from None
+    if since is None:
+        return False
+    answered = result.provider_answered_at
+    if answered is None:
+        answered = getattr(pending, "_provider_answered_at", None)
+    if not isinstance(answered, (int, float)) or isinstance(answered, bool):
+        return True
+    return answered <= since
 
 
 def carry_provider_session(result: SignInResult) -> None:

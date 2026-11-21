@@ -111,6 +111,7 @@ class Handover:
     provider_sub: Optional[str] = None
     provider_logout_hint_enc: Optional[str] = None
     provider_auth_time: Optional[int] = None          # when the provider said the person authenticated; None if it did not say
+    provider_answered_at: Optional[float] = None      # when the vault took the provider's answer
     created_at: int = field(default_factory=lambda: int(time.time()))
     # How many times the account's sessions had been ended when the proof read the account
     # (app/services/sign_in.py, in_the_accounts_turn). A record without it matches no account.
@@ -143,6 +144,9 @@ class Handover:
             if value is not None and not isinstance(value, str):
                 return None
         if not isinstance(handover.created_at, int):
+            return None
+        answered = handover.provider_answered_at
+        if answered is not None and (not isinstance(answered, (int, float)) or isinstance(answered, bool)):
             return None
         # A sign-in needs a first proof: the password, a passkey or an identity provider.
         if not handover.methods and not handover.provider_id:
@@ -224,6 +228,7 @@ def from_result(result, *, verifier_hash: Optional[str] = None, code_challenge: 
         provider_logout_hint_enc=_encrypted(getattr(result, "provider_logout_hint", None)),
         provider_auth_time=(int(result.provider_auth_time.timestamp())
                             if getattr(result, "provider_auth_time", None) is not None else None),
+        provider_answered_at=getattr(result, "provider_answered_at", None),
     )
 
 
@@ -302,6 +307,7 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
         provider_mfa_trusted=handover.provider_mfa_trusted, user_verified=handover.user_verified,
         passwordless_allowed=handover.passwordless_allowed,
         provider_sid=handover.provider_sid, provider_sub=handover.provider_sub,
+        provider_answered_at=handover.provider_answered_at,
         provider_logout_hint=_decrypted(handover.provider_logout_hint_enc),
         # What the proof read, not what the account says now: the code lives a minute, and a change in that
         # minute ends the sign-in it carries.

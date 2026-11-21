@@ -57,6 +57,11 @@ class World:
             show_on_sign_in=True, sort_order=0,
             policy={"sso_trust_idp_mfa": trust, "sso_accepted_amr": ["mfa"]})
         h.db.tables[SsoProvider] = [self.provider]
+        # The store a provider's logouts are remembered in (asked where a provider's sign-in is finished).
+        from app.core import sso_state
+        from test_sso_state import FakeRedis
+        self.redis = FakeRedis()
+        monkeypatch.setattr(sso_state, "_redis", lambda redis: self.redis)
         h.db.tables[ExternalIdentity] = [
             types.SimpleNamespace(id=uuid.uuid4(), user_id=u.id, provider_id=self.provider.id,
                                   subject=f"subject-{u.username}", linked_by=linked_by) for u in users]
