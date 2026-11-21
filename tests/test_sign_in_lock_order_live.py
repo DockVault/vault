@@ -211,7 +211,7 @@ if pair in ("a change made at once", "an approval", "a reset link used", "the lo
         target, _ = account("cora", RoleEnum.ADMIN)
         ender = a_lock(ada, target)
     out = together(writer=writer(target), ender=after_the_turn_is_held(ender))
-    out["sessions"] = sessions(target)
+    out["sessions"], out["the turn was held"] = sessions(target), in_turn.is_set()
 elif pair == "the password door":
     checked, changed, check = threading.Event(), threading.Event(), auth_mod.verify_password
 
@@ -281,6 +281,7 @@ print(json.dumps(out))
 def test_a_sign_in_writing_in_its_turn_and_what_ends_the_sessions_both_finish(db_name, ender):
     out = run_in(db_name, SCENARIO, env={"PAIR": ender})
     assert out["writer"] == ["ok", "signed in"], out
+    assert out["the turn was held"] is True, out             # the sign-in wrote in the account's turn
     assert out["ender"][0] == "ok", out                      # not ended by the database as one of a ring of waiters
     assert out["ender seconds"] >= 1.0, out                  # it waited for the turn the sign-in held
     assert out["sessions"] == [[False, True]], out           # and then ended the session that sign-in wrote
