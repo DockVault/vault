@@ -424,7 +424,7 @@
             + 'the sign-in page. A session that runs out on its own ends here only. The address the browser goes to '
             + 'carries the person\'s sign-in token, as the provider\'s standard asks: it signs nobody in, but it names '
             + 'the person and their email address, and it stays in that browser\'s history. On a computer several '
-            + 'people share, the history is cleared as well. Give the provider the sign-out return address on the '
+            + 'people share, clear that browser\'s history as well. Give the provider the sign-out return address on the '
             + 'Connection page first.');
         const fresh = input('sso-freshness', policy.sso_freshness_days, 'number');
         fresh.min = 0; fresh.max = 365;
