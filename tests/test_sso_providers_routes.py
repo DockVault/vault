@@ -682,8 +682,10 @@ def test_the_client_secret_is_in_no_text_made_of_the_provider():
 
 
 def _linked_every_way(monkeypatch):
-    """A provider that is on, with six accounts linked: one with a password of its own, and five with none they
-    can type, of which one is signed in by another provider that is on."""
+    """A provider that is on, with seven accounts linked: one with a password of its own, and six with none they
+    can type, of which one is signed in by another provider that is on. Four are held to a provider and two were
+    made at a first sign-in, so the accounts held to a provider and the accounts it is the only way in for are
+    different sets, of different sizes."""
     from datetime import datetime
     from app.core import password_origin
     row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
@@ -693,10 +695,12 @@ def _linked_every_way(monkeypatch):
     held = _user("held", sso_only=True)                            # signs in only through a provider
     made = _user("made", password_hash="argon2:of-random-bytes")   # made at its first sign-in here
     password_origin.mark_nobody_knows(made)
+    also_made = _user("alsomade", password_hash="argon2:of-random-bytes")
+    password_origin.mark_nobody_knows(also_made)
     two = _user("two", sso_only=True)                              # another provider that is on signs it in
     two_off = _user("twooff", sso_only=True)                       # its other provider is off
     refused = _user("refused", sso_only=True)                      # its other provider has refused it
-    users = [own, held, made, two, two_off, refused]
+    users = [own, held, made, also_made, two, two_off, refused]
     identities = [_identity(u, row, subject="s-" + u.username) for u in users]
     identities += [_identity(two, other, subject="o-two"), _identity(two_off, off, subject="x-two"),
                    _identity(refused, other, subject="o-refused", refused_at=datetime.utcnow())]
@@ -712,7 +716,7 @@ def test_turning_a_provider_off_says_for_how_many_accounts_it_is_the_only_way_in
     from app.services import sign_in, sso_providers
     h, row = _linked_every_way(monkeypatch)
     shown = sso_providers.public(h.db, row)
-    assert (shown["identities"], shown["sso_only_accounts"], shown["only_way_in_accounts"]) == (6, 4, 4), shown
+    assert (shown["identities"], shown["sso_only_accounts"], shown["only_way_in_accounts"]) == (7, 4, 5), shown
     # The count is the rule the unlink goes by, account by account.
     from app.core.models import ExternalIdentity, User
     by_rule = 0
@@ -720,11 +724,11 @@ def test_turning_a_provider_off_says_for_how_many_accounts_it_is_the_only_way_in
         user = next(u for u in h.db.rows_of(User) if u.id == identity.user_id)
         by_rule += (not sign_in.has_a_password_it_can_type(user)
                     and not sso_only.another_way_in(h.db, user, without=identity))
-    assert by_rule == 4
+    assert by_rule == 5
     _watch_turn_off(monkeypatch, h, ended=0, held=0)
     status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "disabled"})
-    assert status == 200 and out["provider"]["only_way_in_accounts"] == 4, out
-    assert h.told[-1][2].endswith("4 account(s) linked to it have no other way to sign in: nothing signs them in "
+    assert status == 200 and out["provider"]["only_way_in_accounts"] == 5, out
+    assert h.told[-1][2].endswith("5 account(s) linked to it have no other way to sign in: nothing signs them in "
                                   "while it is off."), h.told[-1]
     # Turned on again: nothing of the kind is said.
     status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "enabled"})

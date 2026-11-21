@@ -395,6 +395,8 @@ def test_the_modules_listed_by_name_are_among_those_read():
     """The pipeline's modules are on every tree. Passkeys and single sign-on arrive whole: a tree that has one of a
     group's modules has them all, so a module renamed or moved fails here."""
     assert set(PIPELINE) <= set(MODULES), sorted(set(PIPELINE) - set(MODULES))
+    # And the two that are named for nothing of sign-in: where every link's base comes from, and the password door.
+    assert set(ALSO_READ) <= set(MODULES) and all((ROOT / path).is_file() for path in ALSO_READ)
     for group in (PASSKEYS, SINGLE_SIGN_ON):
         here = [m for m in group if (ROOT / m).is_file()]
         assert not here or len(here) == len(group), sorted(set(group) - set(here))

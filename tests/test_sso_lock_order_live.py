@@ -8,8 +8,9 @@ themselves. So each of those comes wholly after a sign-in that is being written,
 before it, and the sign-in is refused:
 
 - the provider turned off while a sign-in through it is written, and a sign-in written after the turn-off;
-- a provider's logout (the back-channel route itself) while a sign-in that carries the same provider session is
-  written, and such a sign-in written after the logout;
+- a provider's logout (the back-channel route itself, with a token that names the provider's session and not
+  the person) while a sign-in that carries the same provider session is written, and such a sign-in written
+  after a logout;
 - a provider saved, which settles its accounts in their turns, while a held sign-in sets a factor up and goes on to
   its session. The set-up took the turn before the provider's row once, the save the row before the turn: the two
   waited for each other.
@@ -150,8 +151,10 @@ def turn_off(pid):
     return run
 
 
-def logout(pid, sid):
-    """The provider's back-channel logout, through the route."""
+def logout(pid, sid, sub=SUBJECT):
+    """The provider's back-channel logout, through the route. With ``sub`` None the token names the provider's
+    session only, so nothing but the provider's row makes the logout wait for a sign-in that is being written
+    (with the person named, their turn would too)."""
     class Request:
         headers = {}
         client = types.SimpleNamespace(host=IP)
@@ -161,7 +164,9 @@ def logout(pid, sid):
 
     def run():
         logout_claims.clear()
-        logout_claims.update({"sid": sid, "sub": SUBJECT, "jti": uuid.uuid4().hex})
+        logout_claims.update({"sid": sid, "jti": uuid.uuid4().hex})
+        if sub is not None:
+            logout_claims["sub"] = sub
         with SessionLocal() as s:
             return asyncio.run(sso_router.backchannel_logout(str(pid), Request(), s)).status_code
     return run
@@ -188,7 +193,7 @@ elif pair == "a sign-in after the turn-off":
     out.update(together(writer=through_the_provider(alice, contoso, "s-1")))
 elif pair == "logged out while a sign-in is written":
     out = together(writer=through_the_provider(alice, contoso, "s-held", pause=1.6),
-                   ender=after_the_turn_is_held(logout(contoso, "s-held")))
+                   ender=after_the_turn_is_held(logout(contoso, "s-held", sub=None)))
 elif pair == "a sign-in after the logout":
     out = {"ender": ["ok", logout(contoso, "s-held")()]}
     out.update(together(writer=through_the_provider(alice, contoso, "s-held"),
@@ -217,7 +222,7 @@ elif pair == "saved while a held sign-in sets a factor up":
             s.commit()
             return "saved"
     out = together(writer=set_up, ender=after_the_turn_is_held(save))
-out["after"] = state(alice, contoso)
+out["after"], out["the turn was held"] = state(alice, contoso), in_turn.is_set()
 print(json.dumps(out))
 '''
 
@@ -227,6 +232,7 @@ REFUSED = ["error", "HTTPException", "401", "This sign-in cannot be completed; s
 def test_a_provider_turned_off_while_a_sign_in_is_written_waits_for_it_and_ends_its_session(db_name):
     out = run_in(db_name, SCENARIO, env={"PAIR": "turned off while a sign-in is written"})
     assert out["writer"] == ["ok", "signed in"] and out["ender"] == ["ok", 1], out
+    assert out["the turn was held"] is True, out
     assert out["ender seconds"] >= 1.0, out                  # the turn-off waited for the row the sign-in held
     after = out["after"]
     assert after["provider"] == "disabled" and after["sessions"] == [[False, True]], out
@@ -241,6 +247,7 @@ def test_a_sign_in_written_after_its_provider_was_turned_off_is_refused_and_writ
 def test_a_providers_logout_while_a_sign_in_through_its_session_is_written_ends_what_was_written(db_name):
     out = run_in(db_name, SCENARIO, env={"PAIR": "logged out while a sign-in is written"})
     assert out["writer"] == ["ok", "signed in"] and out["ender"] == ["ok", 200], out
+    assert out["the turn was held"] is True, out
     assert out["ender seconds"] >= 1.0, out                  # the logout waited for the row the sign-in held
     assert out["after"]["sessions"] == [[False, True]] and out["after"]["provider"] == "enabled", out
 
@@ -255,6 +262,7 @@ def test_a_sign_in_through_a_provider_session_that_was_logged_out_is_refused_and
 def test_a_provider_saved_while_a_held_sign_in_sets_a_factor_up_waits_and_both_finish(db_name):
     out = run_in(db_name, SCENARIO, env={"PAIR": "saved while a held sign-in sets a factor up"})
     assert out["writer"] == ["ok", "signed in"] and out["ender"] == ["ok", "saved"], out
+    assert out["the turn was held"] is True, out
     assert out["ender seconds"] >= 1.0, out                  # the save waited for the row; nothing waited in a ring
     after = out["after"]
     assert after["sessions"] == [[True, False]] and after["held open"] == 0 and after["sso only"] is False, out
