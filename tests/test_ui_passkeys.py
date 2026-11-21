@@ -499,6 +499,45 @@ def test_a_required_passkey_is_set_up_at_the_sign_in_after_the_accounts_code(pag
     assert held.sent["credential"]["type"] == "public-key" and held.sent["label"] is None
 
 
+WHY_AGAIN = {
+    "passkeys_at_another_address": "Your passkeys cannot be used at the address this vault has now, so you set a "
+                                   "second factor up again here.",
+    "passkeys_no_longer_accepted": "Your passkeys are of a kind this vault no longer accepts, so you set a second "
+                                   "factor up again here.",
+}
+
+
+@pytest.mark.parametrize("why", [*WHY_AGAIN, None])
+def test_an_account_that_holds_passkeys_and_sets_a_factor_up_again_is_told_why(page: Page, no_offer, authenticator,
+                                                                              fresh_user, why):
+    """The vault moved to another address, or the account's keys are of a kind that was removed: the sign-in is
+    held for a set-up though the account holds passkeys. The card says why, in the server's reason's words; an
+    account that simply owes its first factor is told nothing of the kind."""
+    more = {"set_up_again": why} if why else {}
+    HeldSignIn(page, fresh_user, first=_held("held-1", enrollment_required=True, enrollment_methods=["passkey"], **more))
+    _type_the_password(page, fresh_user)
+    expect(page.locator("#sf-passkey-enroll")).to_be_visible(timeout=8000)
+    note = page.locator("#login-second-factor .sf-set-up-again")
+    if why:
+        expect(note).to_have_text(WHY_AGAIN[why])
+    else:
+        expect(note).to_have_count(0)
+
+
+def test_the_authenticators_set_up_says_why_on_the_step_with_the_code(page: Page, no_offer, fresh_user):
+    """Where an authenticator is what is set up again, the reason stays on the step the person reads: the one with
+    the QR code, not only the moment before it."""
+    HeldSignIn(page, fresh_user, first=_held("held-1", enrollment_required=True, enrollment_methods=["totp"],
+                                             set_up_again="passkeys_at_another_address"))
+    page.route("**/users/me/second-factor/totp/enroll", lambda route: route.fulfill(status=200, json={
+        "secret": "JBSWY3DPEHPK3PXP", "otpauth_uri": "otpauth://totp/x", "qr_svg": ""}))
+    _type_the_password(page, fresh_user)
+    box = page.locator("#login-second-factor")
+    expect(box).to_contain_text("Scan this QR code", timeout=10000)
+    expect(box.locator(".sf-set-up-again")).to_have_text(WHY_AGAIN["passkeys_at_another_address"])
+    expect(box.locator(".sf-set-up-again")).to_have_count(1)
+
+
 def test_an_account_with_no_factor_sets_its_required_passkey_up_after_the_password(page: Page, no_offer, authenticator,
                                                                                    fresh_user):
     """The first hold is the enrollment itself: the passkey card, never the authenticator-app wizard nobody asked

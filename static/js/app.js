@@ -2470,6 +2470,9 @@ function renderEnrollmentWizard(box, opts) {
     function renderQrStep(d) {
         clear();
         box.appendChild(_el('h2', 'text-lg font-bold mb-xs', 'Scan this QR code'));
+        // Why an account that holds passkeys sets a factor up all the same: said on this step too, which is
+        // the one the person reads (the step before it is on screen for a moment).
+        if (opts.why) box.appendChild(_el('p', 'text-secondary text-sm mb-md sf-set-up-again', opts.why));
         if (d.qr_svg) {
             // Server-rendered SVG shown as a CSP-safe data: image (img-src allows data:).
             const img = _el('img', 'mb-sm'); img.alt = 'Two-factor QR code';
