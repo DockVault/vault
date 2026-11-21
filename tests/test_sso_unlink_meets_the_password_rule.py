@@ -130,3 +130,43 @@ def test_an_account_not_yet_written_is_settled_without_a_turn(db, world, monkeyp
     monkeypatch.setattr(api, "_sessions_turn", lambda session, owner: turns.append(owner))
     monkeypatch.setattr(sso_only, "should_be_sso_only", lambda *a, **k: False)
     assert sso_only.settle(db, SimpleNamespace(id=None, sso_only=False)) is None and turns == []
+
+
+def test_an_account_whose_flag_already_says_what_its_links_say_is_settled_without_a_turn(db, world, monkeypatch):
+    """A save settles every account linked to the provider. Where nothing is to change for an account, no turn is
+    taken for it: a provider with thousands of accounts would otherwise hold thousands of turns to one commit."""
+    from app.core import sso_only
+    from app.core.models import User
+    provider, alice, identity = _linked(db)                 # passwords allowed: she keeps hers, and is not held
+    turns = []
+    monkeypatch.setattr(api, "_sessions_turn", lambda session, owner: turns.append(str(owner)))
+    assert sso_only.settle(db, db.get(User, alice.id)) is None and turns == []
+
+
+def test_a_promotion_made_while_the_settling_waits_for_its_turn_is_what_it_decides_on(db, world, monkeypatch):
+    """The rule's settling read Alice as a user. While it waits for her turn she is made an administrator, who
+    must keep a password of her own. The decision is made again in the turn, on her role as it is committed: she
+    is not held to no password. Decided on the role read before, an administrator was left with a password nobody
+    knows until the next start."""
+    from app.core import sso_only
+    from app.core.models import User
+    provider, alice, identity = _linked(db, policy={"sso_password_login": "disabled"})
+    saving = _another(db)
+    target = saving.get(User, alice.id)
+    assert sso_only.should_be_sso_only(saving, target) is True
+    turns = []
+
+    def a_promotion_commits_while_the_rule_waits(session, owner):
+        turns.append(str(owner))
+        if len(turns) > 1:
+            return
+        other = _another(db)
+        other.get(User, alice.id).role = api.RoleEnum.ADMIN
+        other.commit()
+        other.close()
+    monkeypatch.setattr(api, "_sessions_turn", a_promotion_commits_while_the_rule_waits)
+    outcome = sso_only.settle(saving, target)
+    saving.commit()
+    saving.close()
+    assert outcome is None and turns == [str(alice.id)], (outcome, turns)
+    assert _as_left(db, alice) == (False, 1)

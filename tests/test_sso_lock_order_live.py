@@ -15,6 +15,10 @@ before it, and the sign-in is refused:
   its session. The set-up took the turn before the provider's row once, the save the row before the turn: the two
   waited for each other.
 
+- a provider saved, with its password rule changed, while "Stay signed in" moves the record of the provider's
+  session to the new session in the account's turn. The record refers to the provider; the save took the
+  provider's row with its key, and then the account's turn.
+
 test_sso_sessions.py holds the same rules offline, where the row and the turn are stood in for.
 """
 import pytest
@@ -40,6 +44,7 @@ from app.core.rate_limiter import rate_limiter
 from app.core.security import hash_password
 from app.services import oidc_client as oc
 from app.services import sign_in, sso_sign_in
+from app.services.auth_service import AuthService
 
 IP, SUBJECT = "192.0.2.44", "subject-1"
 api._force_close_after_commit = lambda *a, **k: None
@@ -231,6 +236,33 @@ elif pair == "saved while a held sign-in sets a factor up":
             s.commit()
             return "saved"
     out = together(writer=set_up, ender=after_the_turn_is_held(save))
+elif pair == "saved while a renewal moves the provider's session":
+    through_the_provider(alice, contoso, "s-old")()
+
+    def renewal():
+        """What "Stay signed in" does in the account's turn: the old session read under a lock, a new one
+        made, and the record of the provider's session moved to it (the rules it asks before are left out)."""
+        with SessionLocal() as s:
+            user = s.get(User, alice)
+            here.stay = 1.6
+            api._sessions_turn(s, alice)
+            old_row = (s.query(ActiveSession).filter(ActiveSession.user_id == alice)
+                       .populate_existing().with_for_update().first())
+            auth = AuthService(s)
+            new_session = auth._create_session(user, None, IP, expires_at=datetime.utcnow() + timedelta(hours=1),
+                                               channel=auth.WEB, commit=False)
+            sign_in.carry_renewed_provider_session(s, old_row, new_session)
+            s.commit()
+            return "renewed"
+
+    def save():
+        with SessionLocal() as s:
+            row = R._row_or_404(s, contoso, lock=True)
+            row.policy = {"sso_backchannel_logout": True, "sso_password_login": "disabled"}
+            changed = sso_only.apply_password_login(s, row)
+            s.commit()
+            return len(changed["made_sso_only"])
+    out = together(writer=renewal, ender=after_the_turn_is_held(save))
 out["after"], out["the turn was held"] = state(alice, contoso), in_turn.is_set()
 print(json.dumps(out))
 '''
@@ -276,3 +308,11 @@ def test_a_provider_saved_while_a_held_sign_in_sets_a_factor_up_waits_and_both_f
     assert out["ender seconds"] >= 1.0, out                  # the save waited for the row; nothing waited in a ring
     after = out["after"]
     assert after["sessions"] == [[True, False]] and after["held open"] == 0 and after["sso only"] is False, out
+
+
+def test_a_provider_saved_while_a_renewal_moves_the_providers_session_waits_and_both_finish(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "saved while a renewal moves the provider's session"})
+    assert out["writer"] == ["ok", "renewed"] and out["ender"] == ["ok", 1], out
+    assert out["the turn was held"] is True, out
+    assert out["ender seconds"] >= 1.0, out                  # the save waited for the turn; nothing waited in a ring
+    assert out["after"]["sso only"] is True and out["after"]["provider sessions"] == 2, out

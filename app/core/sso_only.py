@@ -151,14 +151,23 @@ def settle(db, user, *, also=None, without=None, keep_session=None) -> Optional[
     ``RESTORED`` when it may hold a password again (nothing is minted), None when nothing changed. An account
     that must keep a password of its own is never made provider-only and is given its password back when it is
     met flagged (:func:`should_be_sso_only`); nothing is raised for it."""
-    if getattr(user, "id", None) is not None:
-        # The account's turn at its sessions before its identities are read: what unlinks one, and what links
-        # one, take it too, so this decides on the links as they are, not as they were a moment before a change
-        # that is being made (a decision on the old ones left an account held to no password with no provider).
-        from app.api import api_server as api
-        api._sessions_turn(db, user.id)
     should = should_be_sso_only(db, user, also=also, without=without)
     flagged = bool(getattr(user, "sso_only", False))
+    if should == flagged:
+        return None                 # nothing to change: no turn is taken (a save settles every linked account)
+    if getattr(user, "id", None) is not None:
+        # A change is to be made: the account's turn at its sessions, and the decision made again in it. What
+        # unlinks an identity, and what links one, take the turn too, so the change is decided on the links, the
+        # flag and the role as they are, not as they were a moment before a change that is being made (decided on
+        # the old ones, it left an account held to no password with no provider). Only what is read again is
+        # read again: nothing else the caller set on the account is touched.
+        from app.api import api_server as api
+        api._sessions_turn(db, user.id)
+        refresh = getattr(db, "refresh", None)
+        if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
+            refresh(user, attribute_names=["sso_only", "role"])
+        should = should_be_sso_only(db, user, also=also, without=without)
+        flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:
         make_sso_only(db, user, keep_session=keep_session)
         return MADE
@@ -274,8 +283,11 @@ def passkey_note(db, user) -> Optional[str]:
 
 
 def linked_accounts(db, provider) -> List:
+    """The accounts linked to ``provider``, by the account's id: the one order in which several accounts' turns
+    are taken, so two changes that settle the same accounts never wait for each other's turn."""
     from app.core.models import ExternalIdentity, User
-    ids = [row.user_id for row in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == provider.id).all()]
+    ids = sorted({row.user_id for row in db.query(ExternalIdentity).filter(
+        ExternalIdentity.provider_id == provider.id).all()}, key=str)
     return [u for u in (db.query(User).filter(User.id == uid).first() for uid in ids) if u is not None]
 
 

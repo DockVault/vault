@@ -784,3 +784,48 @@ def test_the_account_page_does_not_point_here_for_a_factor_it_cannot_set_up_here
     from pathlib import Path
     page = (Path(__file__).resolve().parents[1] / "static" / "js" / "sso.js").read_text(encoding="utf-8")
     assert "set one up '" in page and "(email.factor_here === false ? '' : 'here ') + 'first if you have none.'" in page
+
+
+def test_what_changes_a_provider_takes_its_row_with_the_key_left_free(monkeypatch):
+    """A save, a turn-off and a removal take the provider's row for themselves, so they come one at a time and
+    none while a sign-in through the provider is being written. The row's key is left free: the record of a
+    session that "Stay signed in" moves is written in the account's turn and refers to the provider, and a save
+    settles accounts in their turns while it holds the row. Taken with its key, the two waited for each other."""
+    row = _provider(created_at=None, updated_at=None)
+    h = Admin(monkeypatch, [row])
+    seen, through = [], h.db.query
+
+    def query(*entities):
+        made = through(*entities)
+        lock = made.with_for_update
+
+        def with_for_update(**kw):
+            seen.append(kw)
+            return lock(**kw)
+        made.with_for_update = with_for_update
+        return made
+    monkeypatch.setattr(h.db, "query", query)
+    assert h.R._row_or_404(h.db, str(row.id), lock=True) is row and seen == [{"key_share": True}]
+    del seen[:]
+    assert h.R._row_or_404(h.db, str(row.id)) is row and seen == []
+
+
+def test_the_accounts_a_change_settles_are_taken_by_their_id_however_they_were_linked(monkeypatch):
+    """A save and a removal settle every account linked to the provider, each in its turn. Two changes that
+    settle the same accounts take those turns in one order, by the account's id, as a logout and a turn-off do."""
+    from app.core import sso_only
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    users = [_user(f"user{i}") for i in range(6)]
+    by_id = sorted(users, key=lambda u: str(u.id))
+    linked = [_identity(u, row, subject="s-" + u.username) for u in reversed(by_id)]
+    linked[0], linked[3] = linked[3], linked[0]                    # linked in no order at all
+    h = Admin(monkeypatch, [row], users=users, identities=linked)
+    assert [u.username for u in sso_only.linked_accounts(h.db, row)] == [u.username for u in by_id]
+    settled = []
+    monkeypatch.setattr(sso_only, "settle", lambda db, user, **kw: settled.append(user.username))
+    sso_only.apply_password_login(h.db, row)
+    assert settled == [u.username for u in by_id]
+    del settled[:]
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 200, out
+    assert settled == [u.username for u in by_id]

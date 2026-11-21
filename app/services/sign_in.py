@@ -699,8 +699,10 @@ def hold_the_providers_row(db, result: "SignInResult") -> None:
         if getattr(getattr(held, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
             raise
         db.rollback()
+        drop_the_session_the_proof_made(db, result)
         raise HTTPException(status_code=503, detail=(
-            "Signing in through your organisation is busy right now. Try again in a moment.")) from None
+            "Signing in through your organisation is busy right now. Try again in a moment."),
+            headers={"Retry-After": "5"}) from None
 
 
 def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:

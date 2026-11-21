@@ -88,7 +88,12 @@ def _row_or_404(db, provider_id, *, lock: bool = False) -> SsoProvider:
         raise HTTPException(status_code=404, detail="Unknown provider.")
     query = db.query(SsoProvider).filter(SsoProvider.id == pid)
     if lock:
-        query = query.populate_existing().with_for_update()      # one change at a time, on the row as it stands
+        # One change at a time, on the row as it stands, and none while a sign-in through the provider is being
+        # written (it holds the row shared). The row's key is left free: a row that only refers to the provider
+        # (the record of a session that "Stay signed in" moves, written in the account's turn) waits for nothing.
+        # Taken with its key, the row and that turn were asked for in both orders: a save settles accounts in
+        # their turns while it holds the row.
+        query = query.populate_existing().with_for_update(key_share=True)
     row = query.first()
     if row is None:
         raise HTTPException(status_code=404, detail="Unknown provider.")
@@ -385,7 +390,9 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     # Each account linked to it loses a way to sign in, and its flag follows the providers it is still linked to
     # (one held to no password by this provider alone may hold a password again; nothing is minted).
     kept, may_set, to_ask = [], [], []
-    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
+    # In the one order every route takes several accounts' turns in (sso_router._owners_of): by the account's id.
+    for identity in sorted(db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all(),
+                           key=lambda linked: str(linked.user_id)):
         user = db.query(User).filter(User.id == identity.user_id).first()
         if user is None:
             continue

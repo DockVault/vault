@@ -684,6 +684,14 @@ def test_a_logout_that_names_several_accounts_takes_their_turns_in_one_order(mon
     assert sso_router._owners_of(h.db, ids) == sorted([str(alice.id), str(bob.id)])
     assert sso_router._owners_of(h.db, list(reversed(ids))) == sorted([str(alice.id), str(bob.id)])
     assert sso_router._owners_of(h.db, []) == [] and sso_router._owners_of(h.db, [uuid.uuid4()]) == []
+    # Many owners, their sessions found in no order: by the account's id all the same.
+    many = sorted(uuid.uuid4() for _ in range(12))
+    rows = [types.SimpleNamespace(id=uuid.uuid4(), user_id=owner, is_active=True, revoked=False)
+            for owner in reversed(many)]
+    rows[0], rows[5] = rows[5], rows[0]
+    h.db.rows_of(ActiveSession).extend(rows)
+    assert sso_router._owners_of(h.db, [r.id for r in rows]) == sorted(str(owner) for owner in many)
+    del h.db.rows_of(ActiveSession)[-len(rows):]
     # A token that names no session and nobody the vault knows takes no turn and ends nothing. One that names a
     # person takes that account's turn, with or without a session of theirs: a sign-in of theirs being written is
     # waited for, and the sessions are read after it.
@@ -925,7 +933,7 @@ def test_the_providers_row_is_not_asked_for_by_a_sign_in_that_came_through_none(
     assert asked == []
 
 
-def test_a_providers_row_held_too_long_refuses_the_sign_in_as_busy_and_writes_nothing():
+def test_a_providers_row_held_too_long_refuses_the_sign_in_as_busy_and_writes_nothing(monkeypatch):
     import types as _types
     from fastapi import HTTPException
     from sqlalchemy.exc import OperationalError
@@ -942,10 +950,15 @@ def test_a_providers_row_held_too_long_refuses_the_sign_in_as_busy_and_writes_no
         def query(*a):
             raise OperationalError("select", {}, orig)
         return _types.SimpleNamespace(query=query, rollback=lambda: rolled.append(1))
-    result = _types.SimpleNamespace(is_temporary=False, provider_id=str(uuid.uuid4()))
+    dropped = []
+    monkeypatch.setattr(sign_in, "delete_session_by_token", lambda db, token: dropped.append(token))
+    result = _types.SimpleNamespace(is_temporary=False, provider_id=str(uuid.uuid4()), session_token="the-doors")
     with pytest.raises(HTTPException) as busy:
         sign_in.hold_the_providers_row(raising(Held()), result)
     assert busy.value.status_code == 503 and "busy" in busy.value.detail and rolled == [1]
+    # A time to come back, and the session the password door made for this sign-in is deleted with it.
+    assert busy.value.headers == {"Retry-After": "5"} and dropped == ["the-doors"] and result.session_token is None
+    result.session_token = None
     with pytest.raises(OperationalError):
         sign_in.hold_the_providers_row(raising(Other()), result)
 
