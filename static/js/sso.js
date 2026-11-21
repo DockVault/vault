@@ -257,7 +257,8 @@
         const identities = (data && Array.isArray(data.identities)) ? data.identities : [];
         const providers = (data && Array.isArray(data.providers)) ? data.providers : [];
         const linkable = providers.filter((p) => p && !p.linked);
-        if (!identities.length && !linkable.length) { section.style.display = 'none'; return; }
+        const email = (data && data.email && data.email.address) ? data.email : null;
+        if (!identities.length && !linkable.length && !email) { section.style.display = 'none'; return; }
         section.style.display = '';
         body.replaceChildren();
         if (!identities.length) {
@@ -307,6 +308,68 @@
             });
             body.appendChild(link);
         });
+        if (email) body.appendChild(emailConfirmation(email));
+    }
+
+    // The address an account holds is its owner's own claim until the vault confirmed it, and the organisation's
+    // sign-in finds an account by a confirmed address only. The owner confirms it here with a code the vault
+    // sends to that address; where the vault sends no email, an administrator confirms it.
+    function emailConfirmation(email) {
+        const box = _el('div', 'identity-email-confirm mt-sm');
+        box.id = 'us-email-confirm';
+        box.appendChild(_el('p', 'text-secondary text-sm mb-sm', 'Your email address (' + email.address + ') is not '
+            + 'confirmed yet. Your organisation\'s sign-in finds your account by a confirmed address only.'));
+        if (!email.can_send_code) {
+            box.appendChild(_el('p', 'text-secondary text-sm', 'This vault sends no email, so it cannot send you a '
+                + 'code. Ask an administrator to confirm your address.'));
+            return box;
+        }
+        const send = _el('button', 'btn btn-secondary btn-sm', 'Send me a code');
+        send.type = 'button';
+        send.id = 'us-email-confirm-send';
+        const row = _el('div', 'flex items-center gap-sm mt-sm');
+        row.id = 'us-email-confirm-row';
+        row.style.display = 'none';
+        const code = document.createElement('input');
+        code.type = 'text';
+        code.id = 'us-email-confirm-code';
+        code.className = 'form-input';
+        code.autocomplete = 'one-time-code';
+        code.inputMode = 'numeric';
+        code.maxLength = 32;
+        code.placeholder = 'Code';
+        code.setAttribute('aria-label', 'The code sent to your email address');
+        const confirm = _el('button', 'btn btn-primary btn-sm', 'Confirm');
+        confirm.type = 'button';
+        confirm.id = 'us-email-confirm-submit';
+        row.append(code, confirm);
+        send.addEventListener('click', async () => {
+            send.disabled = true;
+            try {
+                await apiRequest('/users/me/email/confirmation/request', { method: 'POST' });
+                row.style.display = '';
+                send.textContent = 'Send another code';
+                showSuccess('A code was sent to ' + email.address + '.');
+                code.focus();
+            } catch (e) { showError((e && e.message) || 'The code could not be sent.'); }
+            send.disabled = false;
+        });
+        const submit = async () => {
+            const typed = code.value.trim();
+            if (!typed) { showError('Enter the code from the email.'); return; }
+            confirm.disabled = true;
+            try {
+                await apiRequest('/users/me/email/confirmation', { method: 'POST', body: JSON.stringify({ code: typed }) });
+                showSuccess('Your email address is confirmed.');
+                renderAccount();
+                return;
+            } catch (e) { showError((e && e.message) || 'That code was not accepted.'); }
+            confirm.disabled = false;
+        };
+        confirm.addEventListener('click', submit);
+        code.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+        box.append(send, row);
+        return box;
     }
 
     function reset() {

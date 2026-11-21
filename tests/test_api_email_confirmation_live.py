@@ -135,3 +135,102 @@ def test_the_one_time_statement_writes_on_postgresql_the_mark_the_vault_reads(ad
             psql("DELETE FROM account_invitations WHERE id IN (" + ", ".join(f"'{p}'" for p in probes) + ")")
         for account in ids:
             admin.delete_user(account)
+
+
+def _typed_address(admin):
+    """An account whose address is its owner's own claim: (the account, its signed-in client, the address)."""
+    made = admin.create_user(role="user")
+    person = ApiClient()
+    person.login(made["_username"], made["_password"])
+    typed = unique("typed") + "@example.com"
+    r = person.patch("/users/me", json={"email": typed, "current_password": made["_password"]})
+    if r.status_code == 202 or (r.status_code == 200 and r.json().get("email") != typed):
+        admin.delete_user(made["id"])
+        pytest.skip("this stack asks for an emailed code before an address changes")
+    assert r.status_code == 200, r.text
+    return made, person, typed
+
+
+def test_an_administrator_confirms_the_address_a_person_typed_and_never_their_own(admin):
+    made, person, typed = _typed_address(admin)
+    try:
+        name = made["_username"]
+        assert _confirmed(admin, name) == (False, typed)
+        assert person.get("/users/me").json()["email_confirmed"] is False
+        # Nobody confirms their own this way, and nobody who is no administrator confirms anybody's.
+        r = person.patch(f"/users/{made['id']}", json={"email_confirmed": True})
+        assert r.status_code == 403, r.text                        # not theirs to change by its id at all
+        me = admin.get("/users/me").json()
+        r = admin.patch(f"/users/{me['id']}", json={"email_confirmed": True})
+        assert r.status_code == 400 and "Confirm your own email address" in r.text, r.text
+        assert _confirmed(admin, name)[0] is False
+        r = admin.patch(f"/users/{made['id']}", json={"email_confirmed": True})
+        assert r.status_code == 200, r.text
+        assert _confirmed(admin, name) == (True, typed)                  # the address is as it was
+        assert person.get("/users/me").json()["email_confirmed"] is True
+        # The owner is told, in the app, what an administrator said of their address.
+        notes = person.get("/notifications").json()
+        notes = notes.get("notifications", notes) if isinstance(notes, dict) else notes
+        assert any("Your email address was confirmed" in (n.get("title") or "") for n in notes), notes
+        # Changed by the person once more, it is their claim once more.
+        again = unique("again") + "@example.com"
+        r = person.patch("/users/me", json={"email": again, "current_password": made["_password"]})
+        assert r.status_code == 200, r.text
+        assert _confirmed(admin, name) == (False, again)
+    finally:
+        admin.delete_user(made["id"])
+
+
+def test_a_person_confirms_their_own_address_with_a_code_and_only_with_that_code(admin):
+    """The code itself only ever reaches the mailbox. So the request is held to what this stack can do (it sends
+    no email: the answer says who can confirm instead), and the confirmation is run against codes written into
+    the store as the vault writes them, their hash made with the server's own pepper."""
+    import subprocess
+    import uuid
+
+    from _account_change_helpers import API, REDIS, psql
+    from app.core.otp_service import hash_code
+
+    made, person, typed = _typed_address(admin)
+    uid = made["id"]
+    pepper = subprocess.run(["docker", "exec", API, "printenv", "JWT_SECRET_KEY"], capture_output=True, text=True,
+                            timeout=20).stdout.strip()
+    if not pepper:
+        admin.delete_user(uid)
+        pytest.skip("the server's pepper cannot be read on this stack")
+
+    def seed(purpose, destination, code):
+        subprocess.run(["docker", "exec", REDIS, "redis-cli", "DEL", f"otp:{purpose}:{uid}"], capture_output=True,
+                       text=True, timeout=20)
+        psql(f"DELETE FROM otp_codes WHERE user_id = '{uid}'")
+        psql("INSERT INTO otp_codes (id, purpose, user_id, destination, code_hash, attempts, max_attempts, "
+             "expires_at, consumed_at, created_at) VALUES "
+             f"('{uuid.uuid4()}', '{purpose}', '{uid}', '{destination}', '{hash_code(code, pepper)}', 0, 3, "
+             "now() + interval '15 minutes', NULL, now())")
+
+    try:
+        r = person.post("/users/me/email/confirmation/request")
+        if r.status_code == 202:
+            pytest.skip("this stack sends email: the code went to a mailbox this test cannot read")
+        assert r.status_code == 400 and "An administrator can confirm your address" in r.text, r.text
+        # A code for changing an address confirms nothing here.
+        seed("email_change", typed, "246810")
+        r = person.post("/users/me/email/confirmation", json={"code": "246810"})
+        assert r.status_code == 400, r.text
+        # A code that was sent to another address than the account holds now confirms nothing.
+        seed("email_confirm", "elsewhere@example.com", "135790")
+        r = person.post("/users/me/email/confirmation", json={"code": "135790"})
+        assert r.status_code == 409 and "changed since" in r.text, r.text
+        assert _confirmed(admin, made["_username"])[0] is False
+        # The code sent to the address the account holds: wrong once, then right; and it serves once.
+        seed("email_confirm", typed, "112233")
+        assert person.post("/users/me/email/confirmation", json={"code": "000000"}).status_code == 400
+        r = person.post("/users/me/email/confirmation", json={"code": "112233"})
+        assert r.status_code == 200 and r.json() == {"email": typed, "email_confirmed": True}, r.text
+        assert _confirmed(admin, made["_username"]) == (True, typed)
+        assert person.post("/users/me/email/confirmation", json={"code": "112233"}).status_code == 400
+        r = person.post("/users/me/email/confirmation/request")
+        assert r.status_code == 409 and r.json()["detail"]["reason"] == "already_confirmed", r.text
+    finally:
+        psql(f"DELETE FROM otp_codes WHERE user_id = '{uid}'")
+        admin.delete_user(uid)

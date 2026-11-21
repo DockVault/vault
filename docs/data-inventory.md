@@ -333,6 +333,7 @@ link.
 |---|---|---|
 | Password reset | The account's address. **New in 0.33.0:** for 14 days after an administrator changed it, a reset the person asks for goes to the address before (nothing is sent if there was none). **New in 0.34.0:** also sent the same way when the person is made an administrator while holding a password someone else set | A reset link; when it goes to the address before, a line saying why; at a promotion, a line saying why. |
 | Email change verification | The new address | A confirmation code. |
+| Email address confirmation | The address the account holds, when its owner asks to confirm it | A confirmation code. |
 | Account invitation | The invitee | The invitation link and their username. |
 | Account changed by an administrator **New in 0.33.0** | The person; for an email change, the **old** address | What changed (for an email change, the old address and the new one masked, as n***@example.com; an SSH key's name and fingerprint), when, and the administrator's username. **New in 0.34.0:** also that their password was reset when they were made an administrator, because someone else had set it. It cannot be switched off. |
 | New administrator **New in 0.33.0** | Every other active administrator | Which account became an administrator, how (created, promoted, or an invitation accepted), by whom, and when. It cannot be switched off. |

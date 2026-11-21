@@ -7173,6 +7173,29 @@ async function decideCredentialRequest(req, action, btn) {
     }
 }
 
+// An administrator vouches that the address an account holds is the person's: a change to their sign-in
+// details like setting the address (it may be held for a second administrator).
+async function confirmUserEmail(userId, btn) {
+    const u = (usersView.users || []).find(x => x.id === userId);
+    const name = u ? u.username : 'this user';
+    const address = (u && u.email) || 'the address';
+    if (!await confirmCredentialChange(u, 'The address is confirmed',
+        'You confirm that ' + address + ' belongs to ' + name + '. A sign-in through your organisation’s provider '
+        + 'with that address is then linked to this account.', 'Confirm the email address?')) return;
+    if (btn) btn.disabled = true;
+    try {
+        const r = await apiRequest('/users/' + encodeURIComponent(userId), {
+            method: 'PATCH', body: JSON.stringify({ email_confirmed: true }) });
+        if (r && (r.held || r.held_changes)) showHeldChange(r);
+        else showSuccess('Email address confirmed for ' + name + '.');
+        await loadUsers();
+    } catch (e) {
+        showError('Could not confirm the email address: ' + (e.message || ''));
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 async function resetUserSecondFactor(userId, btn) {
     const u = (usersView.users || []).find(x => x.id === userId);
     const name = u ? u.username : 'this user';
@@ -7216,6 +7239,10 @@ function fillCredentialChangeNotes() {
         if (u && u.credential_change) lines.push(credentialChangeNoteText(u.credential_change));
         if (u && u.second_factor_reset_pending) {
             lines.push('Second factor reset: they set up a new one at their next sign-in.');
+        }
+        if (u && u.email_confirm_wanted) {
+            lines.push('Email address not confirmed: they typed it themselves, so your organisation’s sign-in does '
+                + 'not find this account by it. They can confirm it under Your account, or you can.');
         }
         if (u && u.sign_in_block) {
             const b = u.sign_in_block;
@@ -7475,6 +7502,7 @@ function renderUserDetail(u) {
                 ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
                 <button class="btn btn-sm btn-secondary copy-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('link', 'icon-sm')} Copy reset link</button>
                 ${u.second_factor_enabled && u.username !== currentUser.username ? `<button class="btn btn-sm btn-secondary reset-second-factor-btn" data-user-id="${u.id}">${iconSvg('shield', 'icon-sm')} Reset second factor</button>` : ''}
+                ${currentUser.role === 'admin' && u.email_confirm_wanted && u.username !== currentUser.username ? `<button class="btn btn-sm btn-secondary confirm-email-btn" data-user-id="${u.id}">${iconSvg('check', 'icon-sm')} Confirm address</button>` : ''}
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
                 ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}
                 ${u.username !== currentUser.username ? `<button class="btn btn-sm btn-danger delete-user-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('trash', 'icon-sm')} Delete</button>` : ''}
@@ -8157,6 +8185,11 @@ function attachUserListeners() {
                 showError('Could not create a reset link: ' + (e.message || ''));
             } finally { btn.disabled = false; }
         });
+    });
+
+    // Confirm the address an account holds (a credential change too)
+    document.querySelectorAll('.confirm-email-btn').forEach(btn => {
+        btn.addEventListener('click', () => confirmUserEmail(btn.getAttribute('data-user-id'), btn));
     });
 
     // Reset second factor buttons (a credential change: may be held for a second administrator)
