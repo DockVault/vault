@@ -243,3 +243,25 @@ def test_a_trusted_provider_mfa_carried_by_the_stage_finishes_an_administrator_w
     status, body = _post_login(stage.S, {"username": "root", "password": "right"}, token2)
     assert status == 200 and body["access_token"] is None and body["stage"] == "second_factor", body
     assert _claims(body["pre_auth_token"])["methods_so_far"] == ["pwd"]
+
+
+def test_the_form_sign_in_is_handed_on_with_what_the_door_read_of_the_account(stage, monkeypatch):
+    """The password door reads how often the account's sessions were ended, in its turn, and writes its session
+    there. The sign-in is handed on with that count, so a change that ended the account's sessions after the
+    door's commit is seen where the sign-in is written. Read again where the sign-in is handed on, the count
+    would be the later one, and that change would go unseen."""
+    from app.services import sign_in
+    from app.services.auth_service import AuthService
+    S, alice = stage.S, stage.alice
+    alice.sessions_ended = 4
+
+    def door(self, username, password, client_ip, *, login_identifier="username", channel="web"):
+        self.sessions_ended_as_read = 4            # what the door read in its turn
+        alice.sessions_ended = 5                   # the sessions ended again, after the door's commit
+        return alice, "sess-alice"
+    monkeypatch.setattr(AuthService, "authenticate_user", door)
+    handed, finish = [], sign_in.finish
+    monkeypatch.setattr(sign_in, "finish", lambda db, result: (handed.append(result.sessions_ended), finish(db, result))[1])
+    status, body = _post_login(S, {"username": "alice", "password": "right"})
+    assert handed == [4]
+    assert status == 401 and body["detail"] == sign_in.EXPIRED, body

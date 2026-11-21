@@ -121,6 +121,25 @@ def test_a_sign_in_read_before_the_accounts_sessions_were_ended_writes_nothing(d
     assert _rows(db, table, alice) == 1 and turns[-1] == (alice.id, "quiet")
 
 
+@pytest.mark.parametrize("written", ["a session", "a held sign-in"])
+def test_a_sign_in_is_not_written_for_an_account_turned_off_while_it_waited_for_its_turn(db, monkeypatch, written):
+    """The account's state is judged again in the turn, on the account as it is committed, whatever the count
+    says. An account turned off by something that ended no session of it (it had none to end, so nothing was
+    counted) is refused where the sign-in is written, as it would be at the door."""
+    alice = _user(db, "alice")
+    write = (sign_in.complete_sign_in if written == "a session"
+             else lambda db_, result: sign_in.begin_pending(db_, result, sign_in.STAGE_SECOND_FACTOR))
+    table = "active_sessions" if written == "a session" else "pending_logins"
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, sessions_ended=sign_in.as_read(alice))
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: _elsewhere(
+        db, "UPDATE users SET is_active = 0 WHERE id = :id", id=alice.id.hex))
+    with pytest.raises(HTTPException) as refused:
+        write(db, result)
+    assert (refused.value.status_code, refused.value.detail) == (401, "Invalid username or password")
+    db.rollback()
+    assert _rows(db, table, alice) == 0 and _count(db, alice) == 0
+
+
 def test_a_sign_in_that_does_not_say_what_it_read_is_taken_as_read_where_it_was_made(db):
     alice = _user(db, "alice")
     assert sign_in.SignInResult(alice, [sign_in.PASSWORD], IP).sessions_ended == 0

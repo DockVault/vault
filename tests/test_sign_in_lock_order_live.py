@@ -168,13 +168,15 @@ def an_approval(admin_id, other_admin_id, uid):
     return run
 
 
-def a_reset_link_used(uid):
+def a_reset_link_used(uid, maker_id):
+    """A link an administrator made for the account: used, it is judged again under a lock on the maker's row and
+    the account's, which is what the account's turn must come before (a link the account made itself locks none)."""
     token, prefix = password_reset.mint_reset_token()
     with SessionLocal() as s:
         s.add(PasswordResetToken(user_id=uid, token_prefix=prefix,
                                  token_hash=password_reset.hash_reset_token(token, api._reset_pepper()),
-                                 expires_at=datetime.utcnow() + timedelta(minutes=5), created_by=None,
-                                 made_by_other=False))
+                                 expires_at=datetime.utcnow() + timedelta(minutes=5), created_by=maker_id,
+                                 made_by_other=True))
         s.commit()
 
     def run():
@@ -209,7 +211,7 @@ if pair in ("a change made at once", "an approval", "a reset link used", "the lo
         account("cora", RoleEnum.ADMIN)
         ender = an_approval(ada, bea, alice)
     elif pair == "a reset link used":
-        ender = a_reset_link_used(alice)
+        ender = a_reset_link_used(alice, ada)
     else:
         target, _ = account("cora", RoleEnum.ADMIN)
         ender = a_lock(ada, target)
