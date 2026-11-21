@@ -90,7 +90,7 @@ class World:
         pending.enrollment_required = True
         claims = {"sub": str(user.id), "username": user.username, "pre_auth": str(pending.id),
                   "stage": "second_factor", "methods_so_far": list(methods), "idp": str(self.provider.id),
-                  "idp_sub": self.identity(user).subject}
+                  "idp_sub": self.identity(user).subject, "ended": 0}
         return pending, {"Authorization": f"Bearer {create_access_token(claims)}"}
 
     def held_with_no_provider(self, user, methods):
@@ -475,3 +475,94 @@ def test_a_key_set_up_on_the_providers_word_signs_in_after_the_provider_and_neve
     with pytest.raises(sign_in.ProviderOnly):
         sign_in.finish(w2.db, sign_in.SignInResult(erin, ["pwd"], IP))
     assert w2.h.failures[-1] == ("erin", sign_in.PROVIDER_ONLY_REASON, "username")
+
+
+@pytest.mark.parametrize("kind", NO_PASSWORD[:2])
+def test_passkeys_made_at_another_address_are_set_up_again_at_the_providers_sign_in(monkeypatch, kind):
+    """The vault moved to another host name. Dana can type no password and holds one passkey, made at the old
+    name: no browser offers it at the new one. Her sign-in through her provider is held for a set-up (not for a
+    key she cannot give), the page is told why, and the provider's sign-in proves the set-up: she ends with a
+    session. Back at the old name the key counts again by itself, and is what she is asked for."""
+    from app.core.models import WebAuthnCredential
+    from app.services import sign_in
+    dana = _without_a_password(kind)
+    w = World(monkeypatch, [dana], mfa_mode="optional")
+    here = w.wss.address_now()
+    assert here
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=dana.id, retired_at=None, cose_alg=-7,
+                                rp_id="old.example.test")
+    w.db.rows_of(WebAuthnCredential).append(key)
+    monkeypatch.setattr(w.wss, "algorithm_usable", lambda db, cose_alg, now=None: (True, False))
+    assert w.wss.usable_passkeys(w.db, dana.id) == 0 and sign_in.holds_a_factor(w.db, dana) is False
+    assert w.wss.why_none_can_be_used(w.db, dana.id) == "passkeys_at_another_address"
+    assert bool(w.S._second_factor_to_set_up_again(w.db, dana)) is True
+    outcome = w.through_the_provider(dana)
+    assert isinstance(outcome, sign_in.PendingStep) and outcome.body["enrollment_required"] is True, outcome
+    assert outcome.body["set_up_again"] == "passkeys_at_another_address", outcome.body
+    assert "totp" in outcome.body["enrollment_methods"] and "passkey" not in outcome.body.get("methods", [])
+    # The address goes back before she sets anything up: the key is hers to give again, and nothing is owed.
+    key.rp_id = here
+    assert w.wss.usable_passkeys(w.db, dana.id) == 1 and w.wss.why_none_can_be_used(w.db, dana.id) is None
+    again = w.through_the_provider(dana)
+    assert isinstance(again, sign_in.PendingStep) and again.body["enrollment_required"] is False, again
+    assert again.body["methods"] == ["passkey"] and "set_up_again" not in again.body
+    # Moved again, she sets an authenticator up on the provider's sign-in, with no password asked for.
+    key.rp_id = "old.example.test"
+    held = w.through_the_provider(dana)
+    headers = {"Authorization": f"Bearer {held.body['pre_auth_token']}"}
+    status, done = w.set_an_authenticator_up(headers)
+    assert status == 200 and done.get("access_token"), done
+    # A key with no address on record (made before it was kept) is taken as made here.
+    key.rp_id = None
+    assert w.wss.usable_passkeys(w.db, dana.id) == 1
+
+
+@pytest.mark.parametrize("came_to_hold", ["an authenticator", "a reset it has not answered", "nothing"])
+def test_the_providers_mfa_of_an_identity_linked_by_email_is_judged_again_where_the_sign_in_is_finished(monkeypatch, came_to_hold):
+    """The provider answered while Carol held no factor, so its trusted MFA stood in for one. The sign-in is
+    finished up to a minute later (its handover code), or five (a held step). A factor she came to hold in that
+    time, or a reset, is what counts where the sign-in is finished: she gives her own factor, or sets one up. An
+    identity she linked herself keeps the provider's MFA, as the policy says."""
+    from app.core.models import SecondFactorEnrollment
+    from app.services import sign_in, sso_sign_in
+    carol = _without_a_password("signs in only through its provider", name="carol")
+    w = World(monkeypatch, [carol], mfa_mode="optional", trust=True, linked_by="email")
+    identity = w.identity(carol)
+
+    def answered():
+        answer = sso_sign_in.ProviderAnswer(
+            claims={}, subject=identity.subject, issuer="https://idp.example", tenant_id=None, email=None,
+            email_verified=False, display_name=None, auth_time=None, amr=["mfa"])
+        return sso_sign_in.pipeline_result(w.db, w.provider, carol, answer, provider_id=str(w.provider.id),
+                                           client_ip=IP, identity=identity)
+    result = answered()
+    assert result.provider_mfa_trusted is True               # as she stood when the provider answered
+    if came_to_hold == "an authenticator":
+        w.db.rows_of(SecondFactorEnrollment).append(
+            types.SimpleNamespace(id=uuid.uuid4(), user_id=carol.id, method="totp", status="active"))
+    elif came_to_hold == "a reset it has not answered":
+        carol.second_factor_reset_at = datetime.utcnow()
+    outcome = sign_in.finish(w.db, result)
+    if came_to_hold == "nothing":
+        assert isinstance(outcome, sign_in.SignedIn) and result.provider_mfa_trusted is True
+        return
+    assert result.provider_mfa_trusted is False
+    assert isinstance(outcome, sign_in.PendingStep), outcome
+    assert outcome.body["enrollment_required"] is (came_to_hold != "an authenticator")
+    if came_to_hold == "an authenticator":
+        assert outcome.body["methods"] == ["totp", "recovery"]
+    # The same change on an identity she linked herself: the provider's MFA is taken as the policy says.
+    identity.linked_by = "self"
+    own = answered()
+    assert own.provider_mfa_trusted is True
+    kept = sign_in.finish(w.db, own)
+    assert own.provider_mfa_trusted is True and isinstance(kept, sign_in.SignedIn), kept
+
+
+def test_a_sign_in_that_carries_no_trusted_mfa_is_not_asked_whether_it_still_counts(monkeypatch):
+    from app.services import sign_in, sso_sign_in
+    carol = _without_a_password("signs in only through its provider", name="carol")
+    w = World(monkeypatch, [carol], mfa_mode="optional", trust=False)
+    asked = []
+    monkeypatch.setattr(sso_sign_in, "provider_mfa_still_counts", lambda db, result: asked.append(1) or True)
+    assert isinstance(w.through_the_provider(carol), sign_in.SignedIn) and asked == []

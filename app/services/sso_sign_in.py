@@ -905,7 +905,7 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
     on_the_providers_word = linked_on_the_providers_word(db, user, identity)
-    return SignInResult(user, [], client_ip, provider_id=provider_id,
+    return SignInResult(user, [], client_ip, provider_id=provider_id, sessions_ended=sign_in_as_read(user),
                         provider_mfa_trusted=mfa_trusted(row, answer) and not on_the_providers_word,
                         provider_auth_time=answer.auth_time,
                         provider_sid=answer.sid, provider_sub=answer.subject,
@@ -931,6 +931,29 @@ def linked_on_the_providers_word(db, user, identity) -> bool:
     if sign_in.holds_a_factor(db, user):
         return True
     return bool(_api()._second_factor_to_set_up_again(db, user, has_active=False))     # none is active: just read
+
+
+def sign_in_as_read(user) -> int:
+    """What the account's sessions had been ended to when the account was read for this sign-in
+    (app/services/sign_in.py, as_read)."""
+    from app.services import sign_in
+    return sign_in.as_read(user)
+
+
+def provider_mfa_still_counts(db, result) -> bool:
+    """Whether the provider's MFA a sign-in carries is still taken for the account's second factor, where the
+    sign-in is finished: not for an identity linked by email once the account holds a factor of its own or is to
+    set one up again (:func:`linked_on_the_providers_word`), whatever was so when the provider answered."""
+    import uuid
+    from app.core.models import ExternalIdentity
+    try:
+        provider_id = uuid.UUID(str(result.provider_id))
+    except ValueError:
+        return True                    # not a provider's id at all: refused where the provider is judged
+    identity = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == provider_id,
+                                                 ExternalIdentity.user_id == result.user.id).first()
+    # No identity here: nothing was linked by email to judge (the sign-in is refused where the provider is judged).
+    return identity is None or not linked_on_the_providers_word(db, result.user, identity)
 
 
 def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:

@@ -130,7 +130,7 @@ def _user(username="alice", role="user", **extra):
     fields = dict(id=uuid.uuid4(), username=username, email=f"{username}@example.test", role=RoleEnum(role), is_active=True,
                   is_locked=False, locked_until=None, password_hash="x", second_factor_reset_at=None, created_at=now,
                   last_login=None, sftp_enabled=True, sftp_password_auth=True, storage_quota_bytes=None, groups=[],
-                  failed_login_attempts=0, sso_only=False, _is_temp_session=False,
+                  failed_login_attempts=0, sso_only=False, _is_temp_session=False, sessions_ended=0,
                   email_confirmed_at=now)          # an address an administrator set, unless the test says otherwise
     fields.update(extra)
     if "email_confirmed_for" not in fields:          # the mark is for the address the account is made with
@@ -608,7 +608,7 @@ def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_accoun
     identity, bobs = _identity(alice, p), _identity(bob, p, subject="bob-subject")
     h = Harness(monkeypatch, [alice, bob], [p], identities=[identity, bobs])
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
-    assert status == 409 and "only identity" in out["detail"]
+    assert status == 409 and "no other identity on a provider that is on can sign you in now" in out["detail"]
     alice.sso_only = False
     assert _call(h.S, "DELETE", f"/users/me/identities/{uuid.uuid4()}")[0] == 404
     assert _call(h.S, "DELETE", f"/users/me/identities/{bobs.id}")[0] == 404           # someone else's
@@ -635,8 +635,9 @@ def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_accoun
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
     assert status == 200 and out == {"removed": True, "sessions_ended": 1} and h.identities() == [bobs], out
     assert revoked == [{"session_ids": [through], "actor_username": "alice", "durable": True}]
-    # The account's turn: before its identities are read, and again where what came through this one ends.
-    assert [str(owner) for owner in turns] == [str(alice.id)] * 2
+    # The account's turn: before its identities are read, where its flag is settled, and where what came through
+    # this identity ends. Taken again, a turn the transaction holds waits for nothing.
+    assert turns and {str(owner) for owner in turns} == {str(alice.id)} and str(turns[0]) == str(alice.id)
     assert mine.consumed_at is not None and others.consumed_at is None
     unlinked = [a for a in h.audits if a[0] == "sso_identity_unlinked"]
     assert len(unlinked) == 1 and unlinked[0][2]["sessions"] == 1 and h.step_ups.count("account.second_factor") == 4

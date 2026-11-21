@@ -380,6 +380,11 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
     from sqlalchemy.exc import InvalidRequestError, OperationalError
     from app.api import api_server as api
     user = result.user
+    # A sign-in that came through a provider: the provider's row first, under a share lock (it stands before the
+    # turn in the order of the locks). A turn-off, a save or a removal of the provider takes the row for itself,
+    # so it comes wholly before this write, which then finds the provider as it left it, or wholly after, and
+    # ends what was written.
+    hold_the_providers_row(db, result)
     try:
         with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))
     except OperationalError as waited:
@@ -412,6 +417,8 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
         drop_the_session_the_proof_made(db, result)
         raise HTTPException(status_code=401, detail=EXPIRED)
     refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
+    refuse_without_the_provider(db, result)
+    refuse_unless_the_provider_stands(db, result)
     write_the_passkey_grace(result)
 
 
@@ -616,6 +623,7 @@ PROVIDER_ONLY_REASON = "Account signs in only through its identity provider"
 # The audit's reason for a provider sign-in that was not finished because its provider was turned off, or the
 # account unlinked from it, after the provider answered.
 PROVIDER_GONE_REASON = "The identity provider was turned off or unlinked before the sign-in finished"
+PROVIDER_LOGGED_OUT_REASON = "The identity provider logged the person out before the sign-in finished"
 # The audit's reason for a passkey used by itself on an account whose password nobody knows: the key was set up on
 # the provider's sign-in alone and confirms the person after it.
 KEY_AFTER_THE_PROVIDER_REASON = "Passkey of an account without a password of its own, used without its identity provider"
@@ -659,6 +667,33 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
     raise ProviderOnly(message)
 
 
+def hold_the_providers_row(db, result: "SignInResult") -> None:
+    """Read the row of the provider ``result`` came through again, under a share lock kept until the transaction
+    ends: the second of the locks in their order, before the account's turn at its sessions. Nothing for a
+    sign-in that came through none. A row another transaction holds for itself longer than the connection waits
+    (a save that settles many accounts) refuses the sign-in as busy, with nothing written."""
+    if result.is_temporary or not result.provider_id:
+        return
+    import uuid
+    from sqlalchemy.exc import OperationalError
+    from app.core.models import SsoProvider
+    from app.core.table_presence import has_table
+    try:
+        provider_id = uuid.UUID(str(result.provider_id))
+    except ValueError:
+        return                                     # not a provider's id at all: refused where the provider is judged
+    if not has_table(db, SsoProvider.__tablename__):
+        return
+    try:
+        db.query(SsoProvider).filter(SsoProvider.id == provider_id).populate_existing().with_for_update(read=True).first()
+    except OperationalError as held:
+        if getattr(getattr(held, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
+            raise
+        db.rollback()
+        raise HTTPException(status_code=503, detail=(
+            "Signing in through your organisation is busy right now. Try again in a moment.")) from None
+
+
 def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
     """A sign-in that came through a provider is finished only while that provider is on and the account is still
     linked to it by the identity the sign-in came through (an identity unlinked meanwhile, and another linked on the
@@ -668,28 +703,53 @@ def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
     with it: without this each would still become a session, and would stamp its identity as freshly signed in."""
     if result.is_temporary or not result.provider_id:
         return
-    stands = False
+    stands, reason = False, PROVIDER_GONE_REASON
     try:
         import uuid
         from app.core.models import ExternalIdentity, SsoProvider
         provider_id = uuid.UUID(str(result.provider_id))
-        row = db.query(SsoProvider).filter(SsoProvider.id == provider_id).first()
+        # Both as they are committed, not as this request first loaded them: the check is made again in the
+        # account's turn, after a wait in which either may have changed.
+        row = db.query(SsoProvider).filter(SsoProvider.id == provider_id).populate_existing().first()
         if row is not None and getattr(row, "state", None) == "enabled":
             from app.services import sso_sign_in
-            identity = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == provider_id,
-                                                         ExternalIdentity.user_id == result.user.id).first()
+            identity = (db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == provider_id,
+                                                          ExternalIdentity.user_id == result.user.id)
+                        .populate_existing().first())
             stands = identity is not None and sso_sign_in.same_identity(identity, result.provider_sub)
+            if stands and logged_out_at_the_provider(row, result):
+                stands, reason = False, PROVIDER_LOGGED_OUT_REASON
     except ValueError:
         stands = False                  # not a provider's id at all
     if stands:
         return
     from app.api import api_server as api
     try:
-        api.AuditLogger(db).log_login_failure(result.user.username, result.client_ip, PROVIDER_GONE_REASON,
+        api.AuditLogger(db).log_login_failure(result.user.username, result.client_ip, reason,
                                               account=result.user, login_identifier="sso")
     except Exception:  # noqa: BLE001 -- the refusal stands without its row
         db.rollback()
     raise HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")
+
+
+def logged_out_at_the_provider(row, result: SignInResult) -> bool:
+    """Whether the provider has said, by a back-channel logout, that the session this sign-in came through is over
+    (app/api/sso_router.py backchannel_logout). Finished all the same, the sign-in would record that session on a
+    new vault session, and no later logout would name it. Asked only where the provider's logouts are taken, and
+    for a sign-in that carries the provider's session id. A store that cannot be reached refuses the sign-in as
+    busy: whether the person was logged out cannot be told."""
+    sid = result.provider_sid or getattr(result.pending, "_provider_sid", None)
+    if not isinstance(sid, str) or not sid:
+        return False
+    from app.core import sso_state
+    from app.services import sso_sign_in
+    if not sso_sign_in.policy_of(row)["sso_backchannel_logout"]:
+        return False
+    try:
+        return sso_state.sid_logged_out(sid, scope=str(row.id))
+    except sso_state.Unavailable:
+        raise HTTPException(status_code=503, detail=(
+            "Signing in through your organisation is busy right now. Try again in a moment.")) from None
 
 
 def carry_provider_session(result: SignInResult) -> None:
@@ -721,6 +781,11 @@ def finish(db, result: SignInResult):
         refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
         refuse_without_the_provider(db, result)
         refuse_unless_the_provider_stands(db, result)
+        if result.provider_id and result.provider_mfa_trusted:
+            # Taken at the provider's answer, up to a minute ago (a handover code) or five (a held step): the
+            # account may hold a factor of its own since, or owe one. Judged again as the account stands now.
+            from app.services import sso_sign_in
+            result.provider_mfa_trusted = sso_sign_in.provider_mfa_still_counts(db, result)
         in_effect = api._login_second_factor_in_effect(db, user)
         enrollment_pending = bool(in_effect) and api._second_factor_effective(db, user)["state"] == "pending"
         # A role that must hold a passkey: the grace runs from the first sign-in under the requirement; past it the
@@ -911,6 +976,12 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
         return
     from sqlalchemy.exc import OperationalError
     from app.api import api_server as api
+    held = SignInResult(user, methods_so_far(pending), client_ip, pending=pending, provider_id=provider_of(pending),
+                        provider_mfa_trusted=provider_mfa_of(pending), sessions_ended=ended_of(pending),
+                        provider_sub=getattr(pending, "_provider_sub", None))
+    # The provider's row before the turn, as where the sign-in is written (the order of the locks): the session
+    # that follows the factor is written in this same turn, and takes the row it already holds.
+    hold_the_providers_row(db, held)
     try:
         with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))
     except OperationalError as waited:
@@ -924,9 +995,6 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
     if on_record is None or on_record[0] is not None:
         raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
     refuse_unless_the_account_may_sign_in(db, user, client_ip)
-    held = SignInResult(user, methods_so_far(pending), client_ip, pending=pending, provider_id=provider_of(pending),
-                        provider_mfa_trusted=provider_mfa_of(pending),
-                        provider_sub=getattr(pending, "_provider_sub", None))
     refuse_without_the_provider(db, held)
     refuse_unless_the_provider_stands(db, held)
 

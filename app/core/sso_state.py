@@ -337,6 +337,38 @@ def forget_logout_jti(jti, *, scope: str, redis=None) -> None:
         pass
 
 
+LOGOUT_SID_PREFIX = "sso:logout-sid:"
+# Longer than a sign-in under way can go without being judged again: the handover code lives a minute and a held
+# step five, and each step that follows another is judged where it is written.
+LOGOUT_SID_TTL_SECONDS = 900
+
+
+def _logout_sid_key(sid: str, scope: str) -> str:
+    import hashlib
+    return LOGOUT_SID_PREFIX + hashlib.sha256(f"{scope}:{sid}".encode("utf-8")).hexdigest()
+
+
+def note_logged_out_sid(sid: str, *, scope: str, redis=None) -> None:
+    """Remember that the provider ``scope`` logged its session ``sid`` out, for as long as a sign-in under way
+    that came through that session could still be finished. Raises :class:`Unavailable` without the store: the
+    logout is then answered as failed, and the provider's retry notes it."""
+    try:
+        _redis(redis).set(_logout_sid_key(sid, scope), "1", ex=LOGOUT_SID_TTL_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable("the sign-in state store cannot be reached") from exc
+
+
+def sid_logged_out(sid, *, scope: str, redis=None) -> bool:
+    """Whether the provider ``scope`` logged its session ``sid`` out a moment ago (:func:`note_logged_out_sid`).
+    Raises :class:`Unavailable` without the store."""
+    if not isinstance(sid, str) or not sid:
+        return False
+    try:
+        return _redis(redis).get(_logout_sid_key(sid, scope)) is not None
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable("the sign-in state store cannot be reached") from exc
+
+
 LOGOUT_HINT_PREFIX = "sso:logout-hint:"
 
 

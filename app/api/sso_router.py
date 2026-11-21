@@ -600,8 +600,8 @@ def _end_what_came_through(db, account, identity) -> int:
         if session_ids:
             ended = int(api._revoke_sessions(db, session_ids=session_ids, actor_username=account.username,
                                              durable=True) or 0)
-    db.query(PendingLogin).filter(PendingLogin.user_id == account.id, PendingLogin.consumed_at.is_(None)).update(
-        {PendingLogin.consumed_at: datetime.utcnow()}, synchronize_session=False)
+    from app.services import sign_in
+    sign_in.spend_sign_ins_under_way(db, account.id)      # and a set-up begun at one of them, left half-way
     return ended
 
 
@@ -724,15 +724,41 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         return invalid
     session_ids = []
     try:
+        # The provider's row for this logout, first (it stands before the accounts' turns in the order of the
+        # locks, app/services/sign_in.py). A sign-in through this provider that is being written holds the row
+        # shared until it commits: the logout comes wholly after it, and ends the session it wrote, or wholly
+        # before it, and the sign-in finds the provider's session logged out. The key is left free, so a row that
+        # only refers to the provider waits for nothing.
+        if db.query(SsoProvider).filter(SsoProvider.id == row_id).with_for_update(key_share=True).first() is None:
+            db.rollback()
+            return invalid                 # removed since the token came in: its sessions went with it
+        if by == "sid":
+            # A sign-in held for a further step, or waiting in its handover code, carries the same session of the
+            # provider and would record it on a new vault session that no later logout names. The session id is
+            # remembered as logged out for as long as such a sign-in can last, and refused where one is written.
+            sso_state.note_logged_out_sid(sid, scope=scope)
         # Whose sessions the token names, then, under each of those accounts' turn at its sessions, which sessions.
         # A renewal ("Stay signed in") moves the provider's session to its new session row under the same turn, so
         # the read made under it sees a renewal wholly done or not begun: the live session is among those ended.
+        # The person the token names takes a turn too, with or without a session yet.
         named = [s.session_id for s in query.all()]
-        for owner in _owners_of(db, named):
+        owners = set(_owners_of(db, named))
+        person = None
+        if isinstance(sub, str) and sub:
+            person = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row_id,
+                                                       ExternalIdentity.subject == sub).first()
+            if person is not None:
+                owners.add(str(person.user_id))
+        for owner in sorted(owners):
             api._sessions_turn(db, owner)
-        session_ids = [s.session_id for s in query.all()] if named else []
+        session_ids = [s.session_id for s in query.all()]
         ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
                                      durable=True) if session_ids else 0
+        if by == "sub" and person is not None:
+            # By the subject, every session of the person at this provider ends, and no session id says which
+            # sign-ins under way came through one of them: all of the account's are spent, in its turn.
+            from app.services import sign_in
+            sign_in.spend_sign_ins_under_way(db, person.user_id)
     except Exception as exc:  # noqa: BLE001 -- nothing was applied: the token is not spent, so the provider's retry works
         db.rollback()
         sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
@@ -1136,8 +1162,17 @@ async def list_my_identities(
                            "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)} for p in offered],
             # The account's address, when confirming it would let a provider's sign-in find the account: the
             # page then offers the code (or says who can confirm it, where the vault sends no email).
-            "email": ({"address": current_user.email, "can_send_code": bool(_api()._smtp_configured(db))}
+            "email": ({"address": current_user.email, "can_send_code": bool(_api()._smtp_configured(db)),
+                       # Whether the account can set a second factor up under Your account: an authenticator
+                       # asks for the password again, and one with none it can type is left the passkey.
+                       "factor_here": _a_factor_can_be_set_up_here(current_user)}
                       if sso.confirmed_address_wanted(db, current_user) else None)}
+
+
+def _a_factor_can_be_set_up_here(user) -> bool:
+    from app.core import webauthn_settings
+    from app.services import sign_in
+    return sign_in.has_a_password_it_can_type(user) or webauthn_settings.passkeys_can_be_made()
 
 
 @router.post("/users/me/identities/{provider_id}/start")
@@ -1219,19 +1254,21 @@ async def unlink_my_identity(
                                                  ExternalIdentity.user_id == current_user.id).first()
     if identity is None:
         raise HTTPException(status_code=404, detail="That identity was not found.")
-    account = db.query(User).filter(User.id == current_user.id).first() or current_user
+    # The account as it is committed, read in the turn: the one the request was checked with was loaded before
+    # it, and a setting that makes the account sign in only through its provider may have been saved since.
+    account = db.query(User).filter(User.id == current_user.id).populate_existing().first() or current_user
     from app.services import sign_in
     if not sign_in.has_a_password_it_can_type(account):
         # The account holds no password anybody can type: after the unlink it must still have a provider that is
         # on to sign in through. One that is off, or not finished, is no way in.
         if not sso_only.another_way_in(db, account, without=identity):
             raise HTTPException(status_code=409, detail=(
-                "Your account signs in only through single sign-on, and this is its only identity on a provider "
-                "that is on. Ask an administrator for a password first."
+                "Your account signs in only through single sign-on, and no other identity on a provider that is "
+                "on can sign you in now. Ask an administrator for a password first."
                 if getattr(account, "sso_only", False) else
-                "Your account has no password of its own, and this is its only identity on a provider that is on: "
-                "without it nothing would sign you in. Set a password first (\"Forgot password\" on the sign-in "
-                "page, or ask an administrator for a reset link), then unlink."))
+                "Your account has no password of its own, and no other identity on a provider that is on can sign "
+                "you in now: without this one nothing would sign you in. Set a password first (\"Forgot password\" "
+                "on the sign-in page, or ask an administrator for a reset link), then unlink."))
     row = _provider(db, identity.provider_id)
     # An identity whose provider refused the person, or whose freshness has lapsed, is not unlinked by its owner:
     # unlinking would end the provider's say over the account's keys and credentials.

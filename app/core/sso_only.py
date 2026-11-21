@@ -151,6 +151,12 @@ def settle(db, user, *, also=None, without=None, keep_session=None) -> Optional[
     ``RESTORED`` when it may hold a password again (nothing is minted), None when nothing changed. An account
     that must keep a password of its own is never made provider-only and is given its password back when it is
     met flagged (:func:`should_be_sso_only`); nothing is raised for it."""
+    if getattr(user, "id", None) is not None:
+        # The account's turn at its sessions before its identities are read: what unlinks one, and what links
+        # one, take it too, so this decides on the links as they are, not as they were a moment before a change
+        # that is being made (a decision on the old ones left an account held to no password with no provider).
+        from app.api import api_server as api
+        api._sessions_turn(db, user.id)
     should = should_be_sso_only(db, user, also=also, without=without)
     flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:

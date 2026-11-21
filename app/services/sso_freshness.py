@@ -251,9 +251,8 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
     identity.refused_at = now or datetime.utcnow()
     ended = api._revoke_sessions(db, user_id=user.id, actor_username="system", durable=True)
     # A sign-in already under way (a pending password or second-factor step) does not finish after the refusal.
-    from app.core.models import PendingLogin
-    db.query(PendingLogin).filter(PendingLogin.user_id == user.id, PendingLogin.consumed_at.is_(None)).update(
-        {PendingLogin.consumed_at: identity.refused_at}, synchronize_session=False)
+    from app.services import sign_in
+    sign_in.spend_sign_ins_under_way(db, user.id)
     from app.services.audit_logger import AuditLogger
     db.add(AuditLogger(db).build_row(
         action=ENDED, status="success", user=user, ip_address=client_ip, resource_type="user",

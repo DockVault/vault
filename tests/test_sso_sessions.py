@@ -248,6 +248,9 @@ def test_every_bad_logout_token_is_the_same_400_and_ends_nothing(monkeypatch, sp
         fields_token = h.logout_token(sid="s-1", iat=int(time.time()) - 3600)
     elif spoil == "replayed":
         assert h.logout(p, token)[0] == 200
+        # The provider's session id is remembered as logged out only while a sign-in under way could carry it.
+        from app.core import sso_state
+        h.redis.delete(sso_state._logout_sid_key("s-1", str(p.id)))
         _signed_in(h, p, sid="s-1")                      # a new session with the same provider session id
     elif spoil == "option_off":
         p.policy = {"sso_backchannel_logout": False}
@@ -651,12 +654,132 @@ def test_a_logout_that_names_several_accounts_takes_their_turns_in_one_order(mon
     assert sso_router._owners_of(h.db, ids) == sorted([str(alice.id), str(bob.id)])
     assert sso_router._owners_of(h.db, list(reversed(ids))) == sorted([str(alice.id), str(bob.id)])
     assert sso_router._owners_of(h.db, []) == [] and sso_router._owners_of(h.db, [uuid.uuid4()]) == []
-    # A token that names nothing takes no turn and ends nothing.
+    # A token that names no session and nobody the vault knows takes no turn and ends nothing. One that names a
+    # person takes that account's turn, with or without a session of theirs: a sign-in of theirs being written is
+    # waited for, and the sessions are read after it.
     turns = []
-    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: turns.append(user_id))
-    status, _ = h.logout(p, h.logout_token(sid="no-such-session", sub="subject-1"))
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: turns.append(str(user_id)))
+    status, _ = h.logout(p, h.logout_token(sid="no-such-session", sub="nobody-here"))
     assert status == 200 and turns == [] and h.revoked == []
+    status, _ = h.logout(p, h.logout_token(sid="no-such-session"))
+    assert status == 200 and turns == [] and h.revoked == []
+    status, _ = h.logout(p, h.logout_token(sid="no-such-session", sub="subject-1"))
+    assert status == 200 and turns == [str(alice.id)] and h.revoked == []
     assert all(s.is_active for s in h.db.rows_of(ActiveSession))
+    # Sessions of one account and the person named being another: both turns, in the one order.
+    del turns[:]
+    status, _ = h.logout(p, h.logout_token(sid="s-bob", sub="subject-1"))
+    assert status == 200 and turns == sorted([str(alice.id), str(bob.id)]), turns
+
+
+def test_a_logout_by_session_id_ends_the_sign_in_under_way_that_came_through_that_session(monkeypatch):
+    """A sign-in waiting in its handover code, or held for a further step, carries the provider's session id and
+    would record it on a new vault session that no later logout names. The logout remembers the session id; the
+    sign-in is refused where it is written, and the refusal is recorded for what it is."""
+    from app.core import sso_state
+    from app.services import sign_in
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    order = []
+    lock = h.db.query
+
+    def query(*entities):
+        made = lock(*entities)
+        through = made.with_for_update
+
+        def with_for_update(**kw):
+            order.append(("row", getattr(entities[0], "__tablename__", None), kw))
+            return through(**kw)
+        made.with_for_update = with_for_update
+        return made
+    monkeypatch.setattr(h.db, "query", query)
+    noted = sso_state.note_logged_out_sid
+    monkeypatch.setattr(sso_state, "note_logged_out_sid",
+                        lambda sid, **kw: (order.append(("note", sid, kw["scope"])), noted(sid, **kw))[1])
+    waiting, _ = _sign_in(h, p, sid="s-held")
+    other, _ = _sign_in(h, p, sid="s-other")
+    del order[:]
+    assert h.logout(p, h.logout_token(sid="s-held", sub="subject-1"))[0] == 200
+    # The provider's row for the logout before anything else, the key left free; then the session id noted.
+    assert order[:2] == [("row", "sso_providers", {"key_share": True}), ("note", "s-held", str(p.id))], order
+    status, body = h.finish(waiting)
+    assert status == 401 and body == {"detail": "This sign-in cannot be completed; start again."}, body
+    assert not h.active_sessions()
+    assert ("login_failure", alice.username, sign_in.PROVIDER_LOGGED_OUT_REASON) in h.audits, h.audits
+    # Another session of the provider's is another sign-in: finished as ever.
+    assert h.finish(other)[0] == 200 and len(h.active_sessions()) == 1
+    # The same session id at another provider is not this provider's.
+    assert sso_state.sid_logged_out("s-held", scope=str(p.id)) is True
+    assert sso_state.sid_logged_out("s-held", scope=str(uuid.uuid4())) is False
+    assert sso_state.sid_logged_out("", scope=str(p.id)) is False and sso_state.sid_logged_out(None, scope=str(p.id)) is False
+    # Kept for longer than a sign-in under way lives: the handover code's minute and a held step's five.
+    assert h.redis.ttl[sso_state._logout_sid_key("s-held", str(p.id))] == sso_state.LOGOUT_SID_TTL_SECONDS
+    assert sso_state.LOGOUT_SID_TTL_SECONDS > sso_state.HANDOVER_TTL_SECONDS + sign_in.PRE_AUTH_TTL_MINUTES * 60
+
+
+def test_a_logged_out_session_is_asked_about_only_where_the_providers_logouts_are_taken(monkeypatch):
+    """With the provider's logout option off nothing is noted and nothing asked; with it on, a store that cannot
+    be reached refuses the sign-in as busy (whether the person was logged out cannot be told), and writes none."""
+    from app.core import sso_state
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    waiting, _ = _sign_in(h, p, sid="s-1")
+    again, _ = _sign_in(h, p, sid="s-2")
+
+    def down(*a, **kw):
+        raise sso_state.Unavailable("down")
+    monkeypatch.setattr(sso_state, "sid_logged_out", down)
+    status, body = h.finish(waiting)
+    assert status == 503 and "busy" in body["detail"], body
+    assert not h.active_sessions()
+    p.policy = {"sso_backchannel_logout": False}
+    assert h.finish(again)[0] == 200 and len(h.active_sessions()) == 1
+
+
+def test_a_logout_that_cannot_note_the_session_id_fails_and_ends_nothing(monkeypatch):
+    """The store down where the session id is noted: the logout failed (501), nothing is ended, and the token is
+    not spent, so the provider's retry is honoured."""
+    from app.core import sso_state
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    token = h.logout_token(sid="s-1", sub="subject-1")
+    real = sso_state.note_logged_out_sid
+
+    def down(*a, **kw):
+        raise sso_state.Unavailable("down")
+    monkeypatch.setattr(sso_state, "note_logged_out_sid", down)
+    status, body = h.logout(p, token)
+    assert status == 501 and body == {"error": "logout_failed"}, body
+    assert all(s.is_active for s in h.active_sessions()) and h.revoked == []
+    monkeypatch.setattr(sso_state, "note_logged_out_sid", real)
+    assert h.logout(p, token)[0] == 200 and not [s for s in h.active_sessions() if s.is_active]
+
+
+def test_a_logout_by_subject_spends_the_persons_sign_ins_under_way_and_nobody_elses(monkeypatch):
+    """By the subject, every session of the person at this provider ends, and no session id says which sign-ins
+    under way came through one: the account's held sign-ins are spent with them, in its turn. By a session id they
+    are left to the session id's own check."""
+    from app.core.models import PendingLogin
+    alice, bob, p = _user(), _user("bob"), _provider()
+    h = Sessions(monkeypatch, [alice, bob], [p], identities=[_identity(alice, p), _identity(bob, p, subject="subject-bob")])
+    held = h.db.tables.setdefault(PendingLogin, [])
+    for owner in (alice, alice, bob):
+        held.append(PendingLogin(id=uuid.uuid4(), user_id=owner.id, consumed_at=None,
+                                 expires_at=datetime.utcnow() + timedelta(minutes=5)))
+    order = []
+    turn = h.S._sessions_turn
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: (order.append(("turn", str(user_id))), turn(db, user_id))[1])
+    from app.services import sign_in
+    spend = sign_in.spend_sign_ins_under_way
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way",
+                        lambda db, user_id: (order.append(("spend", str(user_id))), spend(db, user_id))[1])
+    assert h.logout(p, h.logout_token(sid="s-none", sub="subject-1"))[0] == 200
+    assert all(row.consumed_at is None for row in held) and ("spend", str(alice.id)) not in order
+    del order[:]
+    assert h.logout(p, h.logout_token(sub="subject-1"))[0] == 200
+    assert order == [("turn", str(alice.id)), ("spend", str(alice.id))], order
+    assert [row.consumed_at is not None for row in held] == [True, True, False]
 
 
 def test_a_commit_that_fails_spends_the_token_only_when_the_logout_took_effect(monkeypatch):
@@ -888,3 +1011,102 @@ def test_the_sign_out_holds_no_database_connection_while_the_provider_is_asked(m
         assert sso.provider_logout_url(h.db, session), pending
         assert seen == [[]], pending
         delattr(h.db, pending)
+
+
+def test_a_sign_in_through_a_provider_holds_the_providers_row_before_the_accounts_turn(monkeypatch):
+    """Where a session or a held sign-in is written: the provider's row first, shared (what turns the provider off,
+    saves it or removes it takes the row for itself and waits, or is waited for), then the account's turn, then the
+    account and the provider judged again as they are committed. A sign-in through no provider takes no row."""
+    from app.core.models import SsoProvider
+    from app.services import sign_in
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    order = []
+    through = h.db.query
+
+    def query(*entities):
+        made = through(*entities)
+        lock = made.with_for_update
+
+        def with_for_update(**kw):
+            order.append(("row", getattr(entities[0], "__tablename__", None), kw))
+            return lock(**kw)
+        made.with_for_update = with_for_update
+        return made
+    monkeypatch.setattr(h.db, "query", query)
+    turn = h.S._sessions_turn
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: (order.append(("turn", str(user_id))), turn(db, user_id))[1])
+    stands = sign_in.refuse_unless_the_provider_stands
+    monkeypatch.setattr(sign_in, "refuse_unless_the_provider_stands",
+                        lambda db, result: (order.append(("provider judged",)), stands(db, result))[1])
+    waiting, _ = _sign_in(h, p, sid="s-1")
+    del order[:]
+    assert h.finish(waiting)[0] == 200
+    rows = [i for i, step in enumerate(order) if step[:2] == ("row", SsoProvider.__tablename__)]
+    turns = [i for i, step in enumerate(order) if step[0] == "turn"]
+    judged = [i for i, step in enumerate(order) if step == ("provider judged",)]
+    assert rows and turns and rows[0] < turns[0], order
+    assert order[rows[0]][2] == {"read": True}, order           # shared: sign-ins do not wait for each other
+    assert judged and judged[-1] > turns[0], order               # judged again in the turn, after any wait
+    # Turned off while the sign-in waited for its turn: refused in the turn, and nothing is written.
+    another, _ = _sign_in(h, p, sid="s-2")
+    before = len(h.active_sessions())
+
+    def turned_off_meanwhile(db, user_id):
+        p.state = "disabled"
+    monkeypatch.setattr(h.S, "_sessions_turn", turned_off_meanwhile)
+    status, body = h.finish(another)
+    assert status == 401 and body == {"detail": "This sign-in cannot be completed; start again."}, body
+    assert len(h.active_sessions()) == before
+
+
+def test_the_providers_row_is_not_asked_for_by_a_sign_in_that_came_through_none():
+    import types as _types
+    from app.services import sign_in
+    asked = []
+    db = _types.SimpleNamespace(query=lambda *a: asked.append(a))
+    sign_in.hold_the_providers_row(db, _types.SimpleNamespace(is_temporary=False, provider_id=None))
+    sign_in.hold_the_providers_row(db, _types.SimpleNamespace(is_temporary=True, provider_id=str(uuid.uuid4())))
+    sign_in.hold_the_providers_row(db, _types.SimpleNamespace(is_temporary=False, provider_id="not-an-id"))
+    assert asked == []
+
+
+def test_a_providers_row_held_too_long_refuses_the_sign_in_as_busy_and_writes_nothing():
+    import types as _types
+    from fastapi import HTTPException
+    from sqlalchemy.exc import OperationalError
+    from app.services import sign_in
+
+    class Held(Exception):
+        pgcode = "55P03"
+
+    class Other(Exception):
+        pgcode = "40001"
+    rolled = []
+
+    def raising(orig):
+        def query(*a):
+            raise OperationalError("select", {}, orig)
+        return _types.SimpleNamespace(query=query, rollback=lambda: rolled.append(1))
+    result = _types.SimpleNamespace(is_temporary=False, provider_id=str(uuid.uuid4()))
+    with pytest.raises(HTTPException) as busy:
+        sign_in.hold_the_providers_row(raising(Held()), result)
+    assert busy.value.status_code == 503 and "busy" in busy.value.detail and rolled == [1]
+    with pytest.raises(OperationalError):
+        sign_in.hold_the_providers_row(raising(Other()), result)
+
+
+def test_what_ends_a_providers_sessions_spends_the_sign_ins_under_way_through_one_helper():
+    """An unlink and a provider's refusal end the sessions that came through the identity, and the account's
+    sign-ins under way with them: through the helper every other such place uses, which also drops a set-up left
+    half-way. Counted, so a place added later is seen."""
+    import inspect
+    from app.api import sso_router
+    from app.services import sso_freshness
+    spends = "sign_in.spend_sign_ins_under_way("
+    assert inspect.getsource(sso_router).count(spends) == 2          # the unlink's ending; a logout by the subject
+    assert spends in inspect.getsource(sso_router._end_what_came_through)
+    assert spends in inspect.getsource(sso_router.backchannel_logout)
+    assert inspect.getsource(sso_freshness).count(spends) == 1
+    for module in (sso_router, sso_freshness):
+        assert "PendingLogin.consumed_at:" not in inspect.getsource(module), module.__name__

@@ -1,0 +1,132 @@
+"""An unlink and a change of the provider's password rule that meet (app/api/sso_router.py unlink_my_identity,
+app/core/sso_only.py settle): whichever is given the account's turn second decides on what the first one left.
+
+The rule saved first: the unlink, given the turn, reads the account as it is committed (held to no password now)
+and refuses to remove its only way in. The unlink first: the settling of the rule takes the turn before it reads
+the account's identities, finds none, and does not hold the account to no password. Either order used to leave an
+account that signs in only through a provider and is linked to none, which nothing brought back. Offline, on a
+database with every table; the turn itself is PostgreSQL's and is stood in for by what runs when it is asked for."""
+import uuid
+
+import pytest
+from fastapi import HTTPException
+
+from _async_run import run_coroutine
+from test_password_origin import _request, _user, api, world  # noqa: F401
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def db():
+    from _kept_db import kept_database
+    with kept_database() as (make, _engine):
+        session = make()
+        yield session
+        session.close()
+
+
+def _another(db):
+    from sqlalchemy.orm import sessionmaker
+    return sessionmaker(bind=db.get_bind())()
+
+
+def _linked(db, policy=None):
+    """Alice, with a password of her own and one identity, on a provider that is on."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    provider = SsoProvider(id=uuid.uuid4(), state="enabled", kind="oidc", name="contoso", label="Contoso",
+                           issuer="https://idp.example/", client_id="c", client_secret_enc="e", policy=policy)
+    db.add(provider)
+    alice = _user(db, "alice")
+    identity = ExternalIdentity(user_id=alice.id, provider_id=provider.id, issuer="https://idp.example/",
+                                subject="s-1", subject_source="oidc:sub", linked_by="self")
+    db.add(identity)
+    db.commit()
+    return provider, alice, identity
+
+
+def _as_left(db, alice):
+    from app.core.models import ExternalIdentity, User
+    after = _another(db)
+    try:
+        account = after.get(User, alice.id)
+        return bool(account.sso_only), after.query(ExternalIdentity).filter(
+            ExternalIdentity.user_id == alice.id).count()
+    finally:
+        after.close()
+
+
+def test_the_rule_saved_while_the_unlink_waits_is_what_the_unlink_decides_on(db, world, monkeypatch):
+    from app.api import sso_router
+    from app.core import password_origin
+    from app.core.models import SsoProvider, User
+    from app.services import sign_in
+    provider, alice, identity = _linked(db)
+    # The request: the account is loaded in the request's session, as the check of the session does.
+    me = db.query(User).filter(User.id == alice.id).first()
+    assert sign_in.has_a_password_it_can_type(me)
+    monkeypatch.setattr(sso_router, "_tell_owner", lambda *a, **k: None)
+    monkeypatch.setattr(sso_router, "_audit", lambda *a, **k: None)
+    turns = []
+
+    def the_rule_commits_while_the_unlink_waits(session, owner):
+        turns.append(str(owner))
+        if len(turns) > 1:
+            return
+        # An administrator turned password sign-in off for the provider: its settling held Alice's turn and made
+        # her account sign in only through it. It commits, and the unlink is given the turn.
+        other = _another(db)
+        account = other.get(User, alice.id)
+        other.get(SsoProvider, provider.id).policy = {"sso_password_login": "disabled"}
+        account.sso_only = True
+        account.password_hash = "argon2:of-random-bytes"
+        password_origin.mark_nobody_knows(account)
+        other.commit()
+        other.close()
+    monkeypatch.setattr(api, "_sessions_turn", the_rule_commits_while_the_unlink_waits)
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(sso_router.unlink_my_identity(identity_id=identity.id, request=_request(),
+                                                    current_user=me, db=db))
+    assert refused.value.status_code == 409, refused.value.detail
+    assert "no other identity on a provider that is on can sign you in now" in refused.value.detail
+    assert refused.value.detail.startswith("Your account signs in only through single sign-on")
+    assert turns and turns[0] == str(alice.id)
+    db.rollback()
+    assert _as_left(db, alice) == (True, 1)              # held to no password, and still linked: a way in
+
+
+def test_the_unlink_done_while_the_rule_waits_is_what_the_rule_settles_on(db, world, monkeypatch):
+    from app.core import sso_only
+    from app.core.models import ExternalIdentity, User
+    provider, alice, identity = _linked(db, policy={"sso_password_login": "disabled"})
+    saving = _another(db)
+    target = saving.get(User, alice.id)
+    assert sso_only.should_be_sso_only(saving, target) is True       # as the links stand before the unlink
+    turns = []
+
+    def the_unlink_commits_while_the_rule_waits(session, owner):
+        turns.append(str(owner))
+        if len(turns) > 1:
+            return
+        # Alice, who has a password, unlinked her only identity: the unlink held her turn. It commits, and the
+        # settling of the rule is given the turn.
+        other = _another(db)
+        other.query(ExternalIdentity).filter(ExternalIdentity.id == identity.id).delete(synchronize_session=False)
+        other.commit()
+        other.close()
+    monkeypatch.setattr(api, "_sessions_turn", the_unlink_commits_while_the_rule_waits)
+    outcome = sso_only.settle(saving, target)
+    saving.commit()
+    saving.close()
+    assert outcome is None and turns == [str(alice.id)], (outcome, turns)
+    assert _as_left(db, alice) == (False, 0)             # her password still hers; linked to nothing, held by nothing
+
+
+def test_an_account_not_yet_written_is_settled_without_a_turn(db, world, monkeypatch):
+    """An account being made at its first sign-in has no id yet, and no sessions to take a turn at."""
+    from types import SimpleNamespace
+    from app.core import sso_only
+    turns = []
+    monkeypatch.setattr(api, "_sessions_turn", lambda session, owner: turns.append(owner))
+    monkeypatch.setattr(sso_only, "should_be_sso_only", lambda *a, **k: False)
+    assert sso_only.settle(db, SimpleNamespace(id=None, sso_only=False)) is None and turns == []

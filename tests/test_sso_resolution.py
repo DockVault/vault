@@ -917,9 +917,23 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
     # The account page is told the same, with whether a code can be sent.
     h.current_user = open_
     status, out, _ = _call(h.S, "GET", "/users/me/identities")
-    assert status == 200 and out["email"] == {"address": "open@example.test", "can_send_code": True}, out
+    assert status == 200 and out["email"] == {"address": "open@example.test", "can_send_code": True,
+                                              "factor_here": True}, out
     monkeypatch.setattr(h.S, "_smtp_configured", lambda db: False)
-    assert _call(h.S, "GET", "/users/me/identities")[1]["email"] == {"address": "open@example.test", "can_send_code": False}
+    assert _call(h.S, "GET", "/users/me/identities")[1]["email"] == {"address": "open@example.test",
+                                                                     "can_send_code": False, "factor_here": True}
+    # Whether a second factor can be set up under Your account, which the page's hint goes by: not by an account
+    # with no password it can type where no passkey can be made (an authenticator asks for the password again).
+    from app.services import sign_in
+    with monkeypatch.context() as m:
+        m.setattr(sign_in, "has_a_password_it_can_type", lambda user: False)
+        m.setattr(webauthn_settings, "passkeys_can_be_made", lambda: False)
+        assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is False
+        m.setattr(webauthn_settings, "passkeys_can_be_made", lambda: True)
+        assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is True
+        m.setattr(webauthn_settings, "passkeys_can_be_made", lambda: False)
+        m.setattr(sign_in, "has_a_password_it_can_type", lambda user: True)
+        assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is True
     h.current_user = done
     assert _call(h.S, "GET", "/users/me/identities")[1]["email"] is None
     # No provider links by email (it is off, or its setting is): nothing to offer anybody.

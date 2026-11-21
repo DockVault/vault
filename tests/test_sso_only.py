@@ -471,7 +471,7 @@ def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatc
     # The remaining provider is off: the unlink would leave no way in, and is refused.
     b.state = "disabled"
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_a.id}")
-    assert status == 409 and "only identity on a provider that is on" in out["detail"], out
+    assert status == 409 and "no other identity on a provider that is on can sign you in now" in out["detail"], out
     assert alice.sso_only is True and len(h.identities()) == 2
     # With it on, the unlink goes through and the account may hold a password again; it is told how to set one.
     b.state = "enabled"

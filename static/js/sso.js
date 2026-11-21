@@ -323,8 +323,8 @@
         if (!email.can_send_code) {
             box.appendChild(_el('p', 'text-secondary text-sm', 'This vault sends no email, so it cannot send you a '
                 + 'code.' + (canLink ? ' Link your organisation\'s sign-in above instead: it then finds your account '
-                    + 'without your address. Linking asks for your second factor: set one up here first if '
-                    + 'you have none.' : '')));
+                    + 'without your address. Linking asks for your second factor: set one up '
+                    + (email.factor_here === false ? '' : 'here ') + 'first if you have none.' : '')));
             const cost = _el('p', 'text-secondary text-sm', 'An administrator can confirm your address. That counts as '
                 + 'a change to your sign-in details: your zero-knowledge vaults are then held for up to 14 days, and on '
                 + 'this vault only the person who runs the server can lift that.');
