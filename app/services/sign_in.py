@@ -509,7 +509,11 @@ def finish(db, result: SignInResult):
             api._passkey_pause_grace(user)
         if passkey.required:
             api._passkey_mark_required(user)
-            enrollment_methods.append("passkey")
+            if passkey.overdue or not password_owed_before_an_enrollment(user, result.methods, result.provider_id):
+                # Within the time given, a hold made for another enrollment offers the passkey only where the
+                # registration will take it: a provider's sign-in of an account that has a password it can type
+                # owes that password first (the authenticator's enrollment asks for it itself).
+                enrollment_methods.append("passkey")
             if passkey.overdue:
                 # A passkey outlives whatever proved the sign-in it was set up at (it signs in after a provider
                 # was turned off, an identity unlinked), so it is added on no less than Your account asks for the
@@ -566,10 +570,14 @@ def holds_a_factor(db, user) -> bool:
 def password_owed_before_an_enrollment(user, methods, provider_id) -> bool:
     """Whether a sign-in that came through a provider owes the account's password before it sets a passkey up: the
     password is not among its proofs, and the account has one it can type. An account that signs in only through
-    its provider has none; its passkey signs nobody in without the provider, so the provider is proof enough."""
+    its provider has none; its passkey signs nobody in without the provider, so the provider is proof enough. An
+    account whose password nobody knows (made at a first provider sign-in, say: app/core/password_origin.py) has
+    none it can type either: asked for it, it could never answer, and would be shut out by the requirement."""
     if not provider_id or PASSWORD in set(methods or ()):
         return False
-    return bool(getattr(user, "password_hash", None)) and not getattr(user, "sso_only", False)
+    from app.core import password_origin
+    return (bool(getattr(user, "password_hash", None)) and not getattr(user, "sso_only", False)
+            and not password_origin.nobody_knows(user))
 
 
 def refuse_enrollment_before_the_accounts_factor(db, user, pending) -> None:

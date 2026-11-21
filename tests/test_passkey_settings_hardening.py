@@ -227,6 +227,160 @@ def test_a_roles_last_passkey_is_not_removed_by_its_holder_and_the_grace_starts_
     assert wss.mark_required(alice) is True and wss.requirement(h.db, alice).overdue is False
 
 
+def _only_this_algorithm_left(monkeypatch, wss, removed=-257):
+    """An administrator removed an algorithm more than thirty days ago: its keys are refused at every use."""
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db, cose_alg, now=None: (cose_alg != removed, False))
+
+
+def test_a_key_that_can_no_longer_be_used_is_no_factor_and_not_the_last_passkey(monkeypatch):
+    """An administrator removed an algorithm, and its thirty days are over: a key of it is refused at every use. It
+    is on the account in name only. It meets no requirement, it is no second factor the account could give (asked
+    for it at the second step, the account could never answer and would be shut out), and it is nobody's "last
+    passkey": its holder removes it, and does not remove a usable one that would leave only the dead one."""
+    registry, wss = _mod()
+    from app.core.active_factors import active_factors
+    from app.services import sign_in
+    overdue = datetime.utcnow() - timedelta(days=20)
+    erin = _user("erin", passkey_required_since=None, passkey_requirement_cleared_at=None)
+    h = RouteHarness(monkeypatch, erin)
+    _required(monkeypatch, registry, wss, ["user"])
+    status, good, _auth = h.register()
+    assert status == 201, good
+    status, old, _auth = h.register(label="old key", receipt="ok")
+    assert status == 201, old
+    status, older, _auth = h.register(label="older key", receipt="ok")
+    assert status == 201, older
+    for made in (old, older):
+        next(row for row in h.rows() if str(row.id) == made["id"]).cose_alg = -257
+    _only_this_algorithm_left(monkeypatch, wss)
+    assert wss.usable_passkeys(h.db, erin.id) == 1 and active_factors(h.db, erin.id).passkeys == 1
+    receipt = {"X-Second-Factor": "ok"}
+    # A dead key goes also where a second factor is required of the account: the usable one stays, and the dead
+    # one was never among "the others".
+    was = h.S._second_factor_effective
+    monkeypatch.setattr(h.S, "_second_factor_effective", lambda db, user: {**was(db, user), "required": True})
+    status, body = _rcall(h.S, "DELETE", f"/users/me/passkeys/{older['id']}", None, receipt)
+    assert status == 200 and body == {"removed": True}, body
+    monkeypatch.setattr(h.S, "_second_factor_effective", was)
+    # The usable key does not go while only the dead one would stay; the dead one goes.
+    status, body = _rcall(h.S, "DELETE", f"/users/me/passkeys/{good['id']}", None, receipt)
+    assert status == 409 and "this is your last one" in body["detail"], body
+    # With only the dead key the account holds no factor: the requirement runs anew, and a sign-in is not held
+    # at a second step nobody can answer.
+    h.rows().remove(next(row for row in h.rows() if str(row.id) == good["id"]))
+    assert wss.usable_passkeys(h.db, erin.id) == 0
+    assert active_factors(h.db, erin.id).passkeys == 0 and sign_in.holds_a_factor(h.db, erin) is False
+    assert wss.requirement(h.db, erin).required is True
+    # The dead key is its holder's to remove (with a factor to prove the request by: an authenticator here).
+    _authenticator(h, erin)
+    status, body = _rcall(h.S, "DELETE", f"/users/me/passkeys/{old['id']}", None, receipt)
+    assert status == 200 and body == {"removed": True}, body
+    erin.passkey_required_since = overdue
+    assert wss.requirement(h.db, erin).overdue is True
+
+
+def test_an_account_left_with_a_dead_key_signs_in_and_sets_a_new_passkey_up(monkeypatch):
+    """The sign-in of such an account (its only passkey is of a removed algorithm, its requirement past the time
+    given) goes to the enrollment after its first proof, as for an account with no factor: it is not sent to a
+    second step whose only method is the key that is refused."""
+    registry, wss = _mod()
+    from app.core.models import WebAuthnCredential
+    from app.services import sign_in
+    overdue = datetime.utcnow() - timedelta(days=20)
+    erin = _user("erin", passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = SignInHarness(monkeypatch, [erin])
+    _required(monkeypatch, registry, wss, ["user"])
+    h.db.rows_of(WebAuthnCredential).append(
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, retired_at=None, cose_alg=-257))
+    _only_this_algorithm_left(monkeypatch, wss)
+    for methods, kw in ((["pwd"], {}), (["pwd"], {"provider_id": "p"}), (["pwd"], {"provider_id": "p", "provider_mfa_trusted": True})):
+        outcome = sign_in.finish(h.db, sign_in.SignInResult(erin, methods, "203.0.113.9", **kw))
+        assert isinstance(outcome, sign_in.PendingStep), (methods, kw)
+        assert outcome.body["enrollment_required"] is True and outcome.body["enrollment_methods"] == ["passkey"], (methods, kw)
+        assert outcome.body["methods"] == []
+    # The control: while the algorithm is allowed, the key is the account's factor and is asked for.
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db, cose_alg, now=None: (True, False))
+    assert sign_in.holds_a_factor(h.db, erin) is True and wss.requirement(h.db, erin).required is False
+
+
+def test_an_account_whose_password_nobody_knows_is_asked_for_none_before_it_sets_its_passkey_up(monkeypatch):
+    """An account made at a first provider sign-in holds a hash of random bytes: no password anybody can type.
+    Asked for "its password" before the enrollment of the passkey its role must hold, it could never answer, and
+    once the time given is over every sign-in would end there. So it is asked for none: the provider's sign-in
+    goes on to the enrollment, as for an account that signs in only through its provider. The mark is for that
+    very hash: once a password is set (a reset link, an administrator), the account has one it can type and gives
+    it first, like any other."""
+    registry, wss = _mod()
+    from app.core import password_origin
+    from app.services import sign_in
+    overdue = datetime.utcnow() - timedelta(days=20)
+    dana = _user("dana", passkey_required_since=overdue, passkey_requirement_cleared_at=None,
+                 password_hash="argon2:of-random-bytes", password_nobody_knows=None, sso_only=False)
+    password_origin.mark_nobody_knows(dana)
+    erin = _user("erin", passkey_required_since=overdue, passkey_requirement_cleared_at=None, sso_only=False)
+    h = StepHarness(monkeypatch, [dana, erin])
+    _required(monkeypatch, registry, wss, ["user"])
+
+    def finish(user, methods, **kw):
+        return sign_in.finish(h.db, sign_in.SignInResult(user, methods, "203.0.113.9", **kw))
+
+    assert password_origin.nobody_knows(dana) is True and password_origin.nobody_knows(erin) is False
+    for trusted in (False, True):
+        outcome = finish(dana, [], provider_id="p", provider_mfa_trusted=trusted)
+        assert outcome.body["stage"] == "second_factor" and outcome.body["enrollment_required"] is True, outcome.body
+        assert outcome.body["enrollment_methods"] == ["passkey"]
+        assert finish(erin, [], provider_id="p", provider_mfa_trusted=trusted).body["stage"] == "password"
+    # The registration routes take the held sign-in of such an account, and refuse the other's.
+    options_path = "/users/me/passkeys/register/options"
+    pending, headers = h.pending_for(dana, methods=(), provider="p")
+    pending.enrollment_required = True
+    assert _call_h(h.S, "POST", options_path, {}, headers)[0] == 200
+    pending, headers = h.pending_for(erin, methods=(), provider="p")
+    pending.enrollment_required = True
+    status, body = _call_h(h.S, "POST", options_path, {}, headers)
+    assert status == 401 and body["detail"] == "Enter your password first; start the sign-in again.", body
+    # A password set since: another hash, so the mark no longer fits, without anything having cleared it.
+    dana.password_hash = "argon2:set-with-a-reset-link"
+    assert password_origin.nobody_knows(dana) is False and dana.password_nobody_knows is not None
+    assert finish(dana, [], provider_id="p").body["stage"] == "password"
+    # Nothing to mark without a hash, and a mark of the wrong shape is none.
+    bare = _user("bare", password_hash=None, password_nobody_knows="x" * 64)
+    assert password_origin.nobody_knows(bare) is False
+    password_origin.mark_nobody_knows(bare)
+    assert bare.password_nobody_knows is None
+
+
+def test_a_hold_within_the_time_given_offers_a_passkey_only_where_the_registration_takes_it(monkeypatch):
+    """An authenticator is required by policy and the role must hold a passkey, with time left. A sign-in held for
+    the enrollment lists what can be set up now. For a provider's sign-in of an account that has a password it can
+    type, the passkey's registration would answer "Enter your password first": it is not offered there (the
+    authenticator's enrollment asks for the password itself). With the password given, or none anybody can type,
+    it is offered."""
+    registry, wss = _mod()
+    from app.core import password_origin
+    from app.services import sign_in
+    soon = datetime.utcnow() - timedelta(days=1)                       # within the 14 days
+    alice = _user(passkey_required_since=soon, passkey_requirement_cleared_at=None, sso_only=False)
+    dana = _user("dana", passkey_required_since=soon, passkey_requirement_cleared_at=None, sso_only=False,
+                 password_hash="argon2:of-random-bytes", password_nobody_knows=None)
+    password_origin.mark_nobody_knows(dana)
+    h = SignInHarness(monkeypatch, [alice, dana])
+    _required(monkeypatch, registry, wss, ["user"])
+    monkeypatch.setattr(h.S, "_login_second_factor_in_effect", lambda db, user: True)
+    monkeypatch.setattr(h.S, "_second_factor_effective", lambda db, user: {"state": "pending", "in_effect": True})
+
+    def offered(user, methods, **kw):
+        outcome = sign_in.finish(h.db, sign_in.SignInResult(user, methods, "203.0.113.9", **kw))
+        assert isinstance(outcome, sign_in.PendingStep) and outcome.body["enrollment_required"] is True, outcome
+        return outcome.body["enrollment_methods"]
+
+    assert wss.requirement(h.db, alice).overdue is False
+    assert "passkey" not in offered(alice, [], provider_id="p") and offered(alice, [], provider_id="p")
+    assert "passkey" in offered(alice, ["pwd"], provider_id="p")
+    assert "passkey" in offered(alice, ["pwd"])
+    assert "passkey" in offered(dana, [], provider_id="p")
+
+
 def test_an_administrator_does_not_reset_away_the_last_passkey_their_own_role_must_hold(monkeypatch):
     """A reset of the second factor retires every passkey, and the time to set one up starts again when the account
     has none. An administrator whose role must hold a passkey could so reset their own factor at each deadline and
@@ -254,7 +408,8 @@ def test_an_administrator_does_not_reset_away_the_last_passkey_their_own_role_mu
     assert status == 409 and "Your role must hold a passkey, and a reset would retire yours" in body["detail"], body
     assert len(h.rows()) == 1 and h.rows()[0].retired_at is None
     # Another administrator's account is theirs to reset, passkey or not.
-    h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=sam.id, retired_at=None))
+    h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=sam.id, retired_at=None, cose_alg=-7))
+    assert wss.usable_passkeys(h.db, sam.id) == 1 and wss.must_hold(sam) is True
     assert _rcall(h.S, "POST", others, None, receipt)[0] == 418
     # The rule waits with the requirement.
     monkeypatch.setattr(wss, "passkeys_can_be_made", lambda: False)

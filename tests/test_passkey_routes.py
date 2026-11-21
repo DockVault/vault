@@ -231,6 +231,22 @@ def test_a_password_less_account_with_no_factor_is_told_to_wait_for_the_provider
     assert status == 409 and "identity-provider" in body["detail"]
 
 
+def test_an_account_whose_password_nobody_knows_is_not_asked_to_prove_a_passkey_with_it(monkeypatch):
+    """The hash is of random bytes (an account made through a provider, a password taken back at a promotion): there
+    is nothing to type, so the registration does not ask for "your current password" and answers what an account
+    with no password is told. With a password set since, it asks for that password."""
+    from app.core import password_origin
+    user = _user(password_hash="argon2:of-random-bytes", password_nobody_knows=None)
+    password_origin.mark_nobody_knows(user)
+    h = Harness(monkeypatch, user)
+    for body in ({}, {"current_password": "pw"}):
+        status, out = _call(h.S, "POST", "/users/me/passkeys/register/options", body)
+        assert status == 409 and "has no password and no second factor yet" in out["detail"], out
+    user.password_hash = "x"                               # a password set since: the mark no longer fits
+    status, out = _call(h.S, "POST", "/users/me/passkeys/register/options", {})
+    assert status == 400 and "password" in out["detail"], out
+
+
 def test_a_temporary_credential_cannot_manage_passkeys(monkeypatch):
     h = Harness(monkeypatch, _user(_is_temp_session=True))
     for method, path in (("POST", "/users/me/passkeys/register/options"), ("GET", "/users/me/passkeys")):

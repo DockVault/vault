@@ -40,15 +40,12 @@ def active_factors(db, user_id) -> ActiveFactors:
 
 
 def _passkey_count(db, user_id) -> int:
-    """How many usable passkeys the account holds: registered and not retired by an administrator's reset. A
-    provisional one (registered soon after an administrator changed the account's sign-in details) counts
-    here, as a factor for signing in; the compliance step-ups ask about it separately."""
+    """How many usable passkeys the account holds: registered, not retired by an administrator's reset, and of
+    an algorithm that can still be used (app/core/webauthn_settings.py usable_passkeys). A provisional one
+    (registered soon after an administrator changed the account's sign-in details) counts here, as a factor for
+    signing in; the compliance step-ups ask about it separately. With passkeys turned off none counts (the rows
+    stay: reversible). A key of an algorithm an administrator removed is refused at every use once its 30 days are
+    over: it is no factor the account can give, and an account left with only such keys is one with no passkey
+    (asked for it at the second step, it could never answer)."""
     from app.core import webauthn_settings
-    from app.core.models import WebAuthnCredential
-    from app.core.table_presence import has_table
-    if not webauthn_settings.enabled():
-        return 0          # passkeys turned off: the rows stay (reversible), but none counts as a factor
-    if not has_table(db, WebAuthnCredential.__tablename__):
-        return 0
-    return db.query(WebAuthnCredential.id).filter(
-        WebAuthnCredential.user_id == user_id, WebAuthnCredential.retired_at.is_(None)).count()
+    return webauthn_settings.usable_passkeys(db, user_id)

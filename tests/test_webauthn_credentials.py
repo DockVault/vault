@@ -50,13 +50,16 @@ def test_a_passkey_counts_as_a_factor_unless_it_was_retired():
     uid, other = uuid.uuid4(), uuid.uuid4()
     now = datetime.now(timezone.utc)
     db = MemoryDB({SecondFactorEnrollment: [], WebAuthnCredential: [
-        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=None, provisional_until=now),
-        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=None, provisional_until=None),
-        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=now, provisional_until=None),
-        types.SimpleNamespace(id=uuid.uuid4(), user_id=other, retired_at=None, provisional_until=None),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=None, provisional_until=now, cose_alg=-7),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=None, provisional_until=None, cose_alg=-7),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=now, provisional_until=None, cose_alg=-7),
+        # Of an algorithm the vault does not take: refused at every use, so no factor the account could give.
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=None, provisional_until=None, cose_alg=-65535),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=other, retired_at=None, provisional_until=None, cose_alg=-7),
     ]})
     f = af.active_factors(db, uid)
-    assert f.passkeys == 2 and f.any and not f.code      # the provisional one counts to sign in; the retired one not
+    # The provisional one counts to sign in; the retired one and the one that cannot be used do not.
+    assert f.passkeys == 2 and f.any and not f.code
     assert af.active_factors(db, other).passkeys == 1
     assert af.active_factors(db, uuid.uuid4()) == af.ActiveFactors()
 

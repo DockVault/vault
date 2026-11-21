@@ -6998,6 +6998,7 @@ def _take_back_password_at_promotion(db, user, *, by) -> Optional[dict]:
     set_by = (db.query(User.username).filter(User.id == user.password_set_by).scalar()
               if user.password_set_by is not None else None)
     user.password_hash = hash_password(_secrets.token_urlsafe(32))   # nobody knows it
+    password_origin.mark_nobody_knows(user)
     user.updated_at = datetime.now(timezone.utc)
     _revoke_sessions(db, user_id=user.id, actor_username=by.username if by is not None else cc.HOST_OPERATOR)
     db.add(AuditLogger(db).build_row(
@@ -11580,7 +11581,8 @@ def _passkey_first_proof(db, user, request, current_password) -> None:
     if active_factors(db, user.id).any:
         _enforce_step_up(db, user, request, "account.second_factor")
         return
-    if not user.password_hash:
+    from app.core import password_origin
+    if not user.password_hash or password_origin.nobody_knows(user):
         raise HTTPException(status_code=409, detail=(
             "Your account has no password and no second factor yet, so it cannot prove this request here. "
             "Ask an administrator to set a password, or wait for the identity-provider confirmation step-up."))
@@ -11616,8 +11618,8 @@ def _passkey_last_factor_refusal(db, user, row) -> Optional[str]:
     from app.core import webauthn_settings
     from app.core.active_factors import active_factors
     factors = active_factors(db, user.id)
-    others = factors.passkeys - 1 if row.retired_at is None else factors.passkeys
     usable = webauthn_settings.usable_passkeys
+    others = usable(db, user.id, without=row.id)
     if webauthn_settings.must_hold(user) and usable(db, user.id) > 0 and usable(db, user.id, without=row.id) <= 0:
         # A role's passkey is not dropped by its holder: registering one ends the time given to set it up, and
         # that time starts again when the account has none, so adding one at the deadline and removing it at
@@ -28317,8 +28319,6 @@ def _run_lightweight_migrations():
             "ALTER TABLE auditor_grants ADD COLUMN IF NOT EXISTS approved_credential_ids JSON",
             # Whether a passkey was registered under direct attestation (see WebAuthnCredential in models.py).
             "ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS attested BOOLEAN NOT NULL DEFAULT FALSE",
-            # Passkeys from before a second-factor reset the account has not answered (app/core/webauthn_settings.py).
-            _RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,
             # When a role's passkey requirement first applied to the account, and the host operator's clearance.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_required_since TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_requirement_cleared_at TIMESTAMP",
@@ -28413,6 +28413,11 @@ END $$;""",
             # An administrator's second-factor reset asks the user to set the factor up again at the
             # next sign-in. Nullable, so a rollback to a release that does not know it is unaffected.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS second_factor_reset_at TIMESTAMP",
+            # Passkeys from before a second-factor reset the account has not answered (app/core/webauthn_settings.py).
+            # After the column above: a database from before that column existed gets both in one start.
+            _RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,
+            # The mark of a password nobody knows (see User in models.py). Nullable.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_nobody_knows VARCHAR(64)",
             # The revision of the role defaults an account has been given, so a start grants each default
             # once instead of granting again one an administrator revoked. Nullable, for the same reason.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_defaults_revision INTEGER",

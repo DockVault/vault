@@ -227,6 +227,26 @@ def test_the_persons_own_change_clears_it_but_the_same_password_again_does_not(d
     assert _marked(db, bob) == (None, False)
 
 
+def test_a_password_nobody_knows_is_marked_for_its_own_hash_only():
+    """The mark says nobody can type a password for this account, and it is a digest of the hash it was given for:
+    any other hash on the account (whoever wrote it, whatever release) is a password somebody set, and the mark no
+    longer speaks."""
+    user = SimpleNamespace(password_hash="argon2:random-one", password_nobody_knows=None)
+    assert po.nobody_knows(user) is False
+    po.mark_nobody_knows(user)
+    assert po.nobody_knows(user) is True and len(user.password_nobody_knows) == 64
+    assert "random-one" not in user.password_nobody_knows
+    kept = user.password_nobody_knows
+    user.password_hash = "argon2:a-real-one"
+    assert po.nobody_knows(user) is False and user.password_nobody_knows == kept
+    user.password_hash = "argon2:random-one"
+    assert po.nobody_knows(user) is True
+    for odd in (None, "", 7):
+        user.password_nobody_knows = odd
+        assert po.nobody_knows(user) is False
+    assert po.nobody_knows(SimpleNamespace(password_hash="x")) is False      # a row from before the column
+
+
 # --------------------------------------------------------------------------- at promotion
 
 def _patch_users(db, actor, target):
@@ -268,6 +288,7 @@ def test_a_promotion_takes_back_a_password_someone_else_set_and_emails_a_link(db
     after = db.get(User, bob.id)
     assert after.role == RoleEnum.ADMIN
     assert not verify_password(OLD, after.password_hash), "the password someone else set no longer works"
+    assert po.nobody_knows(after), "and it is marked as a password nobody can type"
     assert world.revoked.count(bob.id) >= 1, "their sessions end"
     assert _marked(db, bob) == (ada.id, True), "marked until they set their own"
     (row,) = _audit(db, "password_reset_at_promotion")
@@ -338,6 +359,7 @@ def test_a_promotion_leaves_a_password_of_the_persons_own(db, world, route):
     answer = _answer(PROMOTE[route](db, carol, bob))
     assert answer is None
     assert verify_password(OLD, db.get(User, bob.id).password_hash)
+    assert po.nobody_knows(db.get(User, bob.id)) is False
     assert _audit(db, "password_reset_at_promotion") == [] and world.sent == []
 
 

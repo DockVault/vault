@@ -57,6 +57,26 @@ def set_by_self(user) -> None:
     user.password_set_by_other_at = None
 
 
+def _digest(password_hash) -> str:
+    import hashlib
+    return hashlib.sha256(str(password_hash).encode("utf-8")).hexdigest()
+
+
+def mark_nobody_knows(user) -> None:
+    """Call it right after a hash of random bytes was written to ``user``: nobody, the person included, can type a
+    password for it. The mark is a digest of that very hash. It therefore counts only while the hash is unchanged:
+    a reset link, an administrator's password, the person's own, an earlier release that knows nothing of the
+    column, a statement over many rows all end it by writing another hash, without having to clear it."""
+    user.password_nobody_knows = _digest(user.password_hash) if getattr(user, "password_hash", None) else None
+
+
+def nobody_knows(user) -> bool:
+    """Whether ``user``'s password is one nobody can type (:func:`mark_nobody_knows`). Such an account is asked
+    for no password where one would otherwise be owed: it could not answer, and would be shut out."""
+    mark, stored = getattr(user, "password_nobody_knows", None), getattr(user, "password_hash", None)
+    return isinstance(mark, str) and bool(mark) and bool(stored) and mark == _digest(stored)
+
+
 def is_set_by_other(user) -> bool:
     return getattr(user, "password_set_by_other_at", None) is not None
 

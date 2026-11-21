@@ -668,5 +668,9 @@ Passkeys and single sign-on:
 - `users.passkey_required_since` and `users.passkey_requirement_cleared_at`: when a role's passkey requirement
   first applied to the account (its grace runs from there) and when the server's operator cleared it for the
   account; both go with the account.
+- `users.password_nobody_knows`: a digest of the account's password hash, written when that hash was made from
+  random bytes (a password taken back when the account was made an administrator; an account made through an
+  identity provider). It says that nobody can type a password for the account, so the vault asks it for none,
+  and it counts only while the hash is unchanged. It goes with the account.
 - `credential_changes` gained the kind `passkey` (an administrator removing someone's passkey), under the same
   two-person rule and 14-day retention as the other kinds.

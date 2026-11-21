@@ -229,6 +229,10 @@ class User(Base):
     # log once; an earlier release reads the table without them.
     password_set_by = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     password_set_by_other_at = Column(DateTime, nullable=True)
+    # A digest of the password hash, written when that hash was made from random bytes: nobody, the person
+    # included, knows a password for it (app/core/password_origin.py, mark_nobody_knows). It counts only while the
+    # hash is that very hash, so whatever sets a password later ends it without knowing of it. Nullable.
+    password_nobody_knows = Column(String(64), nullable=True)
 
     # How many times the account's sessions were ended as a whole (a new password, a second-factor reset, a
     # sign-out everywhere, a lock or a deactivation). A sign-in notes the count it read with the account, and is

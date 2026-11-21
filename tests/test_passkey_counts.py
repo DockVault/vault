@@ -90,6 +90,26 @@ def test_passkeys_from_before_a_reset_the_account_has_not_answered_are_retired_a
     source = inspect.getsource(S)
     assert source.count("_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,") == 1
     assert source.index("ADD COLUMN IF NOT EXISTS attested") < source.index("_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,")
+    # And after the column it reads: a database from before that column existed gets it in the same start, and
+    # the statement would fail (and the start report itself as incomplete) if it came first.
+    assert source.index("ADD COLUMN IF NOT EXISTS second_factor_reset_at") < source.index(
+        "_RETIRE_PASSKEYS_FROM_BEFORE_A_RESET,")
+
+
+def test_the_statement_fails_on_a_database_that_has_not_got_the_column_yet(S):
+    """Why the order matters, shown: on a users table from before the reset column, the statement is an error."""
+    from app.core import webauthn_settings as wss
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as con:
+        con.execute(sa.text("CREATE TABLE users (id TEXT PRIMARY KEY)"))
+        con.execute(sa.text("CREATE TABLE webauthn_credentials (id TEXT PRIMARY KEY, user_id TEXT, created_at TEXT, "
+                            "retired_at TEXT)"))
+        with pytest.raises(sa.exc.OperationalError):
+            con.execute(sa.text(wss.RETIRE_PASSKEYS_FROM_BEFORE_A_RESET))
+    with engine.begin() as con:
+        con.execute(sa.text("ALTER TABLE users ADD COLUMN second_factor_reset_at TEXT"))
+        con.execute(sa.text(wss.RETIRE_PASSKEYS_FROM_BEFORE_A_RESET))
+    engine.dispose()
 
 
 def test_only_the_accounts_asked_about_are_counted(S, db):
