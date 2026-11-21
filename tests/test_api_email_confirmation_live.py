@@ -94,3 +94,44 @@ def test_an_address_typed_at_self_sign_up_is_not_confirmed(admin):
         for u in admin.get("/users").json():
             if u["username"] == name:
                 admin.delete_user(u["id"])
+
+
+def test_the_one_time_statement_writes_on_postgresql_the_mark_the_vault_reads(admin):
+    """The statement that confirms, once, the accounts made from an invitation before the mark existed names
+    PostgreSQL's own functions for the mark. Here it is run on the stack's database as it is written, held to
+    three accounts of this test: the mark it writes for an address in mixed letters is the one the vault makes
+    and reads as confirmed; an invitation that carried another address, or none, confirms nothing."""
+    import uuid
+
+    from _account_change_helpers import psql
+    from app.core import email_confirmation
+
+    made = [admin.create_user(role="user") for _ in range(3)]
+    ids = [m["id"] for m in made]
+    listed = ", ".join(f"'{i}'" for i in ids)
+    mixed = f"MiXed.{made[0]['_username']}@Example.com"
+    carried = [mixed.lower(), "another." + made[1]["_username"] + "@example.com", None]
+    probes = []
+    try:
+        psql(f"UPDATE users SET email = '{mixed}' WHERE id = '{ids[0]}'")
+        psql(f"UPDATE users SET email_confirmed_at = NULL, email_confirmed_for = NULL WHERE id IN ({listed})")
+        for account, address in zip(ids, carried):
+            probe = str(uuid.uuid4())
+            probes.append(probe)
+            psql("INSERT INTO account_invitations (id, username, email, role, token_prefix, token_hash, expires_at, "
+                 "accepted_at, accepted_user_id, created_at) VALUES "
+                 f"('{probe}', 'probe-{probe[:8]}', {repr(address) if address else 'NULL'}, 'user', '{probe[:12]}', "
+                 f"'{uuid.uuid4().hex + uuid.uuid4().hex}', now(), '2026-03-01 10:00:00', '{account}', now())")
+        psql(email_confirmation.BACKFILL + f" AND users.id IN ({listed})")
+        rows = dict(line.split("|", 1) for line in psql(
+            f"SELECT id, coalesce(email_confirmed_for, '') || '|' || coalesce(email_confirmed_at::text, '') "
+            f"FROM users WHERE id IN ({listed})").splitlines())
+        assert rows[ids[0]] == f"{email_confirmation.mark_for(mixed)}|2026-03-01 10:00:00", rows
+        assert rows[ids[1]] == "|" and rows[ids[2]] == "|", rows
+        assert _confirmed(admin, made[0]["_username"]) == (True, mixed)
+        assert _confirmed(admin, made[1]["_username"])[0] is False and _confirmed(admin, made[2]["_username"])[0] is False
+    finally:
+        if probes:
+            psql("DELETE FROM account_invitations WHERE id IN (" + ", ".join(f"'{p}'" for p in probes) + ")")
+        for account in ids:
+            admin.delete_user(account)
