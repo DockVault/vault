@@ -890,22 +890,35 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     """The pipeline's result for a provider sign-in: the provider is the first proof (``amr`` carries what the
     vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
     provider's policy trusts the values the token carried, and never for an identity that stands on the provider's
-    word alone once the account has a factor of its own.
+    word alone while the account holds a factor of its own.
 
     ``identity``: the identity the sign-in came through. An identity is put on an account that set up its own
     second factor only by that account, from its profile (:func:`_email_match`, :func:`set_up_its_own_factor`).
-    One linked by email before the account set a factor up stays linked; from the day the account has its own
-    factor, the provider's MFA no longer stands in for it at sign-ins through that identity, and the account's
-    factor is asked. Its owner makes the link their own by linking the provider again from Your account."""
+    One linked by email before the account set a factor up stays linked; while the account holds a factor it can
+    give, the provider's MFA does not stand in for it at sign-ins through that identity, and the account's
+    factor is asked. Its owner makes the link their own by linking the provider again from Your account.
+
+    "Holds a factor it can give" is what a sign-in can be asked for now (:func:`linked_on_the_providers_word`),
+    less than :func:`set_up_its_own_factor`: an account between two factors (a reset it has not answered, passkeys
+    kept while they are switched off, a key that can no longer be used) holds none, and asked for one it could
+    never answer. It goes on as an account without a factor does."""
     from app.services.sign_in import SignInResult
     policy = policy_of(row)
-    on_the_providers_word = (identity is not None and getattr(identity, "linked_by", None) == LINKED_BY_EMAIL
-                             and set_up_its_own_factor(db, user))
+    on_the_providers_word = linked_on_the_providers_word(db, user, identity)
     return SignInResult(user, [], client_ip, provider_id=provider_id,
                         provider_mfa_trusted=mfa_trusted(row, answer) and not on_the_providers_word,
                         provider_auth_time=answer.auth_time,
                         provider_sid=answer.sid, provider_sub=answer.subject,
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)
+
+
+def linked_on_the_providers_word(db, user, identity) -> bool:
+    """Whether the provider's MFA is not taken for the account's second factor at a sign-in (or the renewal of a
+    session) through ``identity``: the identity was linked by email, on the provider's word, and the account holds
+    a second factor it can give now (an authenticator, a passkey that can be used)."""
+    from app.services import sign_in
+    return (identity is not None and getattr(identity, "linked_by", None) == LINKED_BY_EMAIL
+            and sign_in.holds_a_factor(db, user))
 
 
 def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:
@@ -1099,10 +1112,9 @@ def renewal_refusal(db, user, provider_id, *, methods=(), subject: Optional[str]
     from app.api import api_server as api
     own_factor = set(methods or ()) & sign_in.SECOND_KINDS
     # The provider's MFA stands in for the account's factor where the policy trusts it, and never for an identity
-    # that was linked by email once the account set up a factor of its own (pipeline_result holds a new sign-in to
+    # that was linked by email while the account holds a factor of its own (pipeline_result holds a new sign-in to
     # the same): a session from before that factor is not kept going past it.
-    trusted = policy_of(provider)["sso_trust_idp_mfa"] and not (
-        getattr(identity, "linked_by", None) == LINKED_BY_EMAIL and set_up_its_own_factor(db, user))
+    trusted = policy_of(provider)["sso_trust_idp_mfa"] and not linked_on_the_providers_word(db, user, identity)
     if not own_factor and not trusted and api._login_second_factor_in_effect(db, user):
         return "Signing in now needs your second factor; sign in again."
     return None
