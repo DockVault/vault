@@ -900,7 +900,20 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
     assert wanted() == {"open", "retired", "started"}
     assert sso.accounts_that_set_up_a_factor(h.db, people) == {guarded.id, resetting.id, keyed.id}
     assert sso.accounts_that_set_up_a_factor(h.db, []) == set()
+    # The Users page is told the same by its own route, passkeys switched off or on.
+    from _async_run import run_coroutine
+    import app.core.endpoint_permissions as ep
+    monkeypatch.setattr(ep, "check_endpoint_permission", lambda *a, **k: None)
+    for user in people:
+        user.password_set_by = user.password_set_by_other_at = None
+
+    def listed():
+        rows = run_coroutine(h.S.list_users(current_user=root, db=h.db))
+        return {row.username for row in rows if row.email_confirm_wanted}
+
+    assert listed() == {"open", "retired", "started"}
     monkeypatch.setattr(webauthn_settings, "enabled", switched_on)
+    assert listed() == {"open", "retired", "started"}
     # The account page is told the same, with whether a code can be sent.
     h.current_user = open_
     status, out, _ = _call(h.S, "GET", "/users/me/identities")

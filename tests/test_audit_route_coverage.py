@@ -47,8 +47,6 @@ NOT_RECORDED = {
         "starts a provider re-authentication for a step-up; nothing changes until the tab stages the provider's answer, which is recorded",
     ("app/api/api_server.py", "POST /auth/second-factor/challenge"):
         "only lists the methods a step-up accepts; the step-up itself is recorded when it fails",
-    ("app/api/api_server.py", "POST /users/me/second-factor/totp/enroll"):
-        "an unconfirmed enrollment; the second factor is recorded when it is switched on",
     ("app/api/api_server.py", "POST /users/me/second-factor/totp/confirm"):
         "an unconfirmed enrollment; the second factor is recorded when it is switched on",
     ("app/api/api_server.py", "PUT /users/me/preferences"):

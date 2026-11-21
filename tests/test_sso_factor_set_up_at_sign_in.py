@@ -370,6 +370,10 @@ def test_a_key_set_up_on_the_providers_word_signs_in_after_the_provider_and_neve
     for methods in (["hwk"], ["swk"]):
         with pytest.raises(sign_in.ProviderOnly):
             sign_in.finish(w.db, sign_in.SignInResult(dana, methods, IP, user_verified=True, passwordless_allowed=True))
+    # The rule is about the key. A sign-in that proved a password of this account's (there is none to type; the
+    # door that checks one would have refused) is not what it refuses.
+    held = sign_in.finish(w.db, sign_in.SignInResult(dana, ["pwd"], IP))
+    assert isinstance(held, sign_in.PendingStep) and held.body["methods"] == ["passkey"]
     # After the provider it is her second factor.
     body, _headers = w.held(dana)
     assert body["enrollment_required"] is False and body["methods"] == ["passkey"], body
