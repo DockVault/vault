@@ -122,6 +122,7 @@ def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_n
         assert user.second_factor_reset_at is None                # nothing on the account says a reset happened
         _change(db, user, "second_factor", reset_at)
     _change(db, answered, "second_factor", datetime(2026, 11, 4))    # an older one: the latest is what counts
+    _change(db, answered, "password", datetime(2026, 11, 15))        # a later change of another kind: not a reset
     _change(db, asked_only, "second_factor", None, status="denied")  # asked for, never applied: no time
     _change(db, other_change, "password", reset_at)                  # not a reset of the factor
     planted, since = _passkey(db, answered), _passkey(db, answered)
@@ -156,6 +157,27 @@ def test_passkeys_from_before_a_recorded_reset_are_retired_at_start_whether_or_n
     from app.core.models import Base, CredentialChange
     assert CredentialChange.__tablename__ == "credential_changes" and "credential_changes" in Base.metadata.tables
     assert {"target_user_id", "kind", "applied_at"} <= set(CredentialChange.__table__.columns.keys())
+
+
+def test_an_administrators_removal_of_the_only_passkey_marks_the_account_before_anything_is_written(S, db, monkeypatch):
+    """On a real session that writes nothing until it is told to: when the others are looked for, the key being
+    removed still reads as not retired in the database. It is left out by what it is, so the account whose only
+    passkey it was is marked as after a reset; with a second key on the account nothing is marked."""
+    from app.core import auditor_rights, credential_changes as cc, legal_holds
+    from app.core.models import SecondFactorEnrollment
+    table = SecondFactorEnrollment.__table__          # its columns, without the defaults only the server's database has
+    sa.Table(table.name, sa.MetaData(), *[sa.Column(c.name, c.type, primary_key=c.primary_key)
+                                          for c in table.columns]).create(db.get_bind())
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    admin, carol, dave = _user(db, "root"), _user(db, "carol"), _user(db, "dave")
+    only, first, _second = _passkey(db, carol), _passkey(db, dave), _passkey(db, dave)
+    result = S._apply_credential_change(db, cc.PASSKEY, carol, {"passkey_id": str(only.id)}, actor_id=admin.id,
+                                        actor_name="root")
+    assert result["left_without_a_factor"] is True and carol.second_factor_reset_at is not None
+    result = S._apply_credential_change(db, cc.PASSKEY, dave, {"passkey_id": str(first.id)}, actor_id=admin.id,
+                                        actor_name="root")
+    assert result["left_without_a_factor"] is False and dave.second_factor_reset_at is None
 
 
 def test_the_statement_fails_on_a_database_that_has_not_got_the_column_yet(S):

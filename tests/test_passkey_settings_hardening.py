@@ -377,6 +377,11 @@ def test_an_account_whose_only_factor_can_no_longer_be_used_sets_one_up_again_at
     _resolving(monkeypatch, registry, {wss.MODE: "off"})
     assert wss.only_lapsed_passkeys(h.db, erin.id) is False and S._login_second_factor_in_effect(h.db, erin) is False
     assert after_the_password(erin) is None
+    # Switched off, a key is not "one that can no longer be used": it is the account's factor again the day
+    # passkeys are switched back on, and under a rule that asks for a factor it is kept as before.
+    monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {**effective(db, user), "required": True})
+    assert "this is its last one" in S._passkey_last_factor_refusal(h.db, erin, key)
+    monkeypatch.setattr(S, "_second_factor_effective", effective)
     # A reset's own mark still says the same by itself.
     bare.second_factor_reset_at = datetime.utcnow()
     assert S._second_factor_to_set_up_again(h.db, bare) is True
