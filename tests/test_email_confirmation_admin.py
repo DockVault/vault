@@ -39,7 +39,7 @@ def test_an_administrator_confirms_the_address_an_account_holds(db, world, monke
     monkeypatch.setattr(api, "_notify_credential_change",
                         lambda db, kind, user, result, **kw: told.append((kind, user.username, dict(result), kw)))
     assert email_confirmation.confirmed(bob) is False
-    _patch(db, ada, bob, email_confirmed=True)
+    _patch(db, ada, bob, confirm_email="Bob@Example.com")          # the address as read, in whatever letters
     db.refresh(bob)
     assert bob.email == "bob@example.com" and email_confirmation.confirmed(bob) is True
     # A change to someone's sign-in details: recorded as one, and the owner is told what it was.
@@ -49,14 +49,60 @@ def test_an_administrator_confirms_the_address_an_account_holds(db, world, monke
                                       "confirmed_only": True}, {"by_name": "ada"})]
     assert any((d.get("changes") or d).get("email_confirmed") == {"old": False, "new": True}
                for d in _audited(db, "user_updated"))
+    # The record names the address that was vouched for, and who vouched.
+    (row,) = db.query(AuditLog).filter(AuditLog.action == "email_confirmed").all()
+    assert (row.user_id, row.resource_id) == (ada.id, str(bob.id))
+    assert row.details == {"method": "administrator", "target_username": "bob", "email": "bob@example.com"}
     # Confirmed already: nothing is done, counted or told a second time.
-    _patch(db, ada, bob, email_confirmed=True)
+    _patch(db, ada, bob, confirm_email="bob@example.com")
     assert db.query(CredentialChange).count() == 1 and len(told) == 1
-    # Sent with a new address, the address is what changes (and an administrator's change confirms it).
-    _patch(db, ada, _user(db, "dan"), email="set@example.com", email_confirmed=True)
-    dan = db.query(api.User).filter(api.User.username == "dan").one()
-    assert dan.email == "set@example.com" and email_confirmation.confirmed(dan) is True
-    assert told[-1][2] == {"old_email": "dan@example.com", "new_email": "set@example.com"}
+    # Setting an address and confirming one are two requests: sent together, nothing is done.
+    dan = _user(db, "dan")
+    with pytest.raises(HTTPException) as refused:
+        _patch(db, ada, dan, email="set@example.com", confirm_email="set@example.com")
+    assert refused.value.status_code == 400 and "not both at once" in refused.value.detail
+    db.refresh(dan)
+    assert dan.email == "dan@example.com" and email_confirmation.confirmed(dan) is False and len(told) == 1
+
+
+def test_what_an_administrator_read_is_what_is_confirmed_or_nothing_is(db, world):
+    """An administrator's page shows mallory's address as it was when the list was read. Mallory then changes her
+    own address, with her password alone, to one that is somebody else's, and asks to be confirmed. The request
+    names the address the administrator read: the account holds another now, so nothing is confirmed (the
+    confirmation would otherwise let the other person's sign-in through a provider be linked to mallory's
+    account). Read again, the administrator sees the new address and decides about that one."""
+    ada, mallory = _user(db, "ada", RoleEnum.ADMIN), _user(db, "mallory")
+    shown = mallory.email
+    mallory.email = "carol@example.com"                # her own change: the mark is gone with it
+    db.commit()
+    with pytest.raises(HTTPException) as refused:
+        _patch(db, ada, mallory, confirm_email=shown)
+    assert refused.value.status_code == 409 and refused.value.detail["reason"] == "address_changed"
+    db.refresh(mallory)
+    assert email_confirmation.confirmed(mallory) is False and db.query(CredentialChange).count() == 0
+    assert _audited(db, "email_confirmed") == []
+    for odd in ("", "not an address", "carol@example.com.evil.test"):
+        with pytest.raises(HTTPException) as refused:
+            _patch(db, ada, mallory, confirm_email=odd)
+        assert refused.value.status_code == 409, odd
+    assert email_confirmation.confirmed(mallory) is False
+
+
+@pytest.mark.parametrize("standing", ["administrator", "auditor right"])
+def test_no_confirmation_is_made_for_an_account_that_is_never_linked_by_its_address(db, world, monkeypatch, standing):
+    """An administrator's account, and one that holds the auditor right, is never linked to a provider by its
+    address. A confirmation would do nothing it is for, and would still count as a change to the account's sign-in
+    details (its keys held, an auditor's right suspended): it is refused."""
+    from app.core import privileged_accounts
+    ada = _user(db, "ada", RoleEnum.ADMIN)
+    target = _user(db, "eve", RoleEnum.ADMIN if standing == "administrator" else RoleEnum.USER)
+    if standing == "auditor right":
+        monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: "auditor_right" if user.id == target.id else None)
+    with pytest.raises(HTTPException) as refused:
+        _patch(db, ada, target, confirm_email=target.email)
+    assert refused.value.status_code == 400 and "never linked to a provider" in refused.value.detail
+    db.refresh(target)
+    assert email_confirmation.confirmed(target) is False and db.query(CredentialChange).count() == 0
 
 
 def test_what_the_owner_and_a_second_administrator_read_of_a_confirmation():
@@ -64,6 +110,7 @@ def test_what_the_owner_and_a_second_administrator_read_of_a_confirmation():
                                                            "confirmed_only": True})
     assert title == "Your email address was confirmed"
     assert text.startswith("An administrator confirmed that bob@example.com is your email address.")
+    assert "your zero-knowledge vaults ask for a code sent by email for the next 14 days" in text
     # The copy sent by email goes to that very address: nothing in it is masked.
     assert api._credential_change_notice(cc.EMAIL, {"new_email": "bob@example.com", "confirmed_only": True},
                                          mask_new_email=True)[1] == text
@@ -85,14 +132,14 @@ def test_a_confirmation_that_is_not_an_administrators_to_give_is_refused(db, wor
     db.commit()
     people["nobody"] = nobody
     with pytest.raises(HTTPException) as refused:
-        _patch(db, people[who], people[target], email_confirmed=True)
+        _patch(db, people[who], people[target], confirm_email=people[target].email or "nobody@example.com")
     assert refused.value.status_code == status and says in str(refused.value.detail)
     assert db.query(CredentialChange).count() == 0
     assert not any(email_confirmation.confirmed(u) for u in people.values())
     # Somebody who is no administrator confirms nobody's address but changes nothing of another account at all.
     with pytest.raises(HTTPException) as refused:
-        _patch(db, people["bob"], people["ada"], email_confirmed=True)
-    assert refused.value.status_code == 403 and email_confirmation.confirmed(people["ada"]) is False
+        _patch(db, people["bob"], people["nobody"], confirm_email="nobody@example.com")
+    assert refused.value.status_code == 403 and email_confirmation.confirmed(people["nobody"]) is False
 
 
 def test_a_confirmation_is_for_the_address_it_was_asked_for(db, world):
@@ -128,7 +175,7 @@ def test_a_second_change_within_the_window_waits_for_another_administrator(db, w
     it is not made on one administrator's word."""
     ada, eve, bob = _user(db, "ada", RoleEnum.ADMIN), _user(db, "eve", RoleEnum.ADMIN), _user(db, "bob")
     _patch(db, ada, bob, password="Admin-Chosen-8x!")
-    answer = _patch(db, ada, bob, email_confirmed=True)
+    answer = _patch(db, ada, bob, confirm_email="bob@example.com")
     db.refresh(bob)
     assert email_confirmation.confirmed(bob) is False, "not on one administrator's word"
     assert answer.status_code == 202
@@ -154,16 +201,25 @@ def test_an_account_reads_whether_its_own_address_is_confirmed(db, world):
 class _Codes:
     """The code machinery and the mail, standing in: what was issued, to where, and what was sent."""
 
+    CODE = "ab12cd34ef56"                  # as the vault makes them: twelve lower-case hex characters
+
     def __init__(self, monkeypatch, smtp=True):
         from app.core import email_actions, otp_service, rate_limiter
-        self.issued, self.sent, self.asked = [], [], []
-        monkeypatch.setattr(rate_limiter.rate_limiter, "check_rate_limit",
-                            lambda **kw: self.asked.append((kw["prefix"], kw["identifier"])) or (True, 0, 0))
+        self.issued, self.sent, self.asked, self.tried = [], [], [], []
+        self.limiter = (True, 0, 0)                     # what the limiter answers; an exception is raised
+
+        def limit(**kw):
+            self.asked.append((kw["prefix"], kw["identifier"], kw["limit"], kw["window"], kw["fail_open"]))
+            if isinstance(self.limiter, Exception):
+                raise self.limiter
+            return self.limiter
+
+        monkeypatch.setattr(rate_limiter.rate_limiter, "check_rate_limit", limit)
         monkeypatch.setattr(api, "_smtp_configured", lambda db: smtp)
         monkeypatch.setattr(api, "_email_change_otp_ttl_minutes", lambda db: 5)
-        monkeypatch.setattr(otp_service, "issue", lambda db, **kw: self.issued.append(kw) or "123456")
-        monkeypatch.setattr(otp_service, "verify", lambda db, **kw: SimpleNamespace(
-            ok=bool(self.issued) and kw["code"] == "123456" and kw["purpose"] == self.issued[-1]["purpose"]
+        monkeypatch.setattr(otp_service, "issue", lambda db, **kw: self.issued.append(kw) or self.CODE)
+        monkeypatch.setattr(otp_service, "verify", lambda db, **kw: self.tried.append(kw["code"]) or SimpleNamespace(
+            ok=bool(self.issued) and kw["code"] == self.CODE and kw["purpose"] == self.issued[-1]["purpose"]
             and kw["user_id"] == self.issued[-1]["user_id"],
             destination=self.issued[-1]["destination"] if self.issued else None))
         monkeypatch.setattr(email_actions, "send_action_email",
@@ -189,26 +245,30 @@ def test_a_person_confirms_the_address_they_hold_with_the_code_sent_to_it(db, wo
     assert (issued["purpose"], issued["user_id"], issued["destination"], issued["ttl_minutes"]) == (
         "email_confirm", bob.id, "bob@example.com", 5)
     assert codes.sent == [("email_confirm", {"email": "bob@example.com", "username": "bob"},
-                           {"code": "123456", "expires": "in 5 minutes"})]
-    assert codes.asked == [("email_confirm_code", str(bob.id))]
+                           {"code": codes.CODE, "expires": "in 5 minutes"})]
+    # Three codes in five minutes for one account, and refused while the limiter cannot be asked.
+    assert codes.asked == [("email_confirm_code", str(bob.id), 3, 300, False)]
     # A wrong code confirms nothing.
     with pytest.raises(HTTPException) as refused:
-        codes.confirm(db, bob, "000000")
+        codes.confirm(db, bob, "000000000000")
     assert refused.value.status_code == 400 and email_confirmation.confirmed(bob) is False
     # The address changed after the code was sent: the code was for another address.
     bob.email = "other@example.com"
     db.commit()
     with pytest.raises(HTTPException) as refused:
-        codes.confirm(db, bob, "123456")
+        codes.confirm(db, bob, codes.CODE)
     assert refused.value.status_code == 409 and "changed since" in refused.value.detail
     assert email_confirmation.confirmed(bob) is False
     bob.email = "Bob@Example.com"
     db.commit()
-    assert codes.confirm(db, bob, "123456") == {"email": "Bob@Example.com", "email_confirmed": True}
+    # Typed as a phone gives it: capitals, a space before and after. It is the same code.
+    assert codes.confirm(db, bob, "  AB12CD34EF56 ") == {"email": "Bob@Example.com", "email_confirmed": True}
+    assert codes.tried[-1] == codes.CODE
     db.refresh(bob)
     assert email_confirmation.confirmed(bob) is True and bob.email == "Bob@Example.com"
-    assert ("email_confirm_try", str(bob.id)) in codes.asked
-    assert _audited(db, "email_confirmation_requested") == [{}] and _audited(db, "email_confirmed") == [{"by": "code"}]
+    assert ("email_confirm_try", str(bob.id), 10, 300, False) in codes.asked          # ten tries in five minutes
+    assert _audited(db, "email_confirmation_requested") == [{}]
+    assert _audited(db, "email_confirmed") == [{"method": "code", "email": "Bob@Example.com"}]
     # Confirmed: there is nothing more to ask a code for.
     with pytest.raises(HTTPException) as refused:
         codes.request(db, bob)
@@ -235,7 +295,7 @@ def test_a_code_is_sent_only_where_it_can_prove_something(db, world, monkeypatch
     assert codes.issued == [] and codes.sent == []
     if state == "a temporary credential":
         with pytest.raises(HTTPException) as refused:
-            codes.confirm(db, bob, "123456")
+            codes.confirm(db, bob, codes.CODE)
         assert refused.value.status_code == 403
 
 
@@ -247,5 +307,27 @@ def test_the_code_is_its_own_and_no_other_codes(db, world, monkeypatch):
     codes.request(db, bob)
     codes.issued[-1]["purpose"] = "email_change"            # as if only an address change had been asked for
     with pytest.raises(HTTPException) as refused:
-        codes.confirm(db, bob, "123456")
+        codes.confirm(db, bob, codes.CODE)
     assert refused.value.status_code == 400 and email_confirmation.confirmed(bob) is False
+
+
+@pytest.mark.parametrize("limiter, status", [("used up", 429), ("cannot be asked", 503)])
+def test_a_code_and_a_try_are_refused_once_the_accounts_budget_is_used_up_or_cannot_be_counted(db, world, monkeypatch,
+                                                                                               limiter, status):
+    """A code is mail sent to an address, and a try is a guess at a code. Neither goes on once the account's budget
+    is used up (429, saying when to come back), and neither goes uncounted: while the limiter cannot be asked, both
+    are refused for the moment (503). No code is made and none is looked at."""
+    import time
+    from app.core.rate_limiter import RateLimiterUnavailable
+    bob = _user(db, "bob")
+    codes = _Codes(monkeypatch)
+    codes.request(db, bob)                                  # one code is out, so a try could succeed
+    made = len(codes.issued)
+    codes.limiter = (False, 0, int(time.time()) + 120) if limiter == "used up" else RateLimiterUnavailable("away")
+    for act in (lambda: codes.request(db, bob), lambda: codes.confirm(db, bob, codes.CODE)):
+        with pytest.raises(HTTPException) as refused:
+            act()
+        assert refused.value.status_code == status, refused.value.detail
+        if status == 429:
+            assert int(refused.value.headers["Retry-After"]) > 0
+    assert len(codes.issued) == made and codes.tried == [] and email_confirmation.confirmed(bob) is False

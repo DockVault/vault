@@ -422,6 +422,9 @@ def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_
     assert identity.user_id == bob.id and identity.linked_by == "email" and identity.email_at_link == "bob@example.test"
     assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "email"}) in h.audits
     assert ([str(bob.id)], "A sign-in method was added") in h.notices
+    # The account keeps its password here: what to do if it was not them is to remove the link and change it.
+    (said,) = [body for ids, title, body in h.notice_bodies if title == "A sign-in method was added"]
+    assert said.endswith("If you did not do this, remove it and change your password.")
     assert any(e[0] == "sign_in_method_changed" and e[1] == "bob@example.test" for e in h.emails), h.emails
     status, body = h.finish(location)
     assert status == 200 and _claims(body["access_token"])["sub"] == str(bob.id)
@@ -864,9 +867,12 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
     bare = _user("bare", email=None, email_confirmed_at=None)
     root = _user("root", role="admin", email_confirmed_at=None)
     guarded, linked = _user("guarded", email_confirmed_at=None), _user("linked", email_confirmed_at=None)
+    # An administrator reset this one's second factor, and it has not set a new one up yet: a link by email
+    # stays out until it has (its next factor is set up behind its own password).
+    resetting = _user("resetting", email_confirmed_at=None, second_factor_reset_at=datetime.utcnow())
     links = _provider(name="links", label="Links", policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
     plain = _provider(name="plain", label="Plain")
-    people = [open_, done, bare, root, guarded, linked]
+    people = [open_, done, bare, root, guarded, linked, resetting]
     h = Resolving(monkeypatch, people, [links, plain],
                   identities=[_identity(linked, links, subject="s-linked"), _identity(open_, plain, subject="s-open")])
     _factor(h, guarded, "authenticator")
@@ -932,6 +938,10 @@ def test_a_provider_turned_off_while_it_answered_links_nobody_and_changes_no_acc
         location, _state = _sign_in(h, p, **claims)
         assert location.startswith("/#sso="), location
     assert len(h.identities()) == 2 and bob.sso_only is True and len(h.users_named("newcomer")) == 1
+    # The link ended bob's password: he is not told to change a password he no longer has.
+    (said,) = [body for ids, title, body in h.notice_bodies
+               if ids == [str(bob.id)] and title == "A sign-in method was added"]
+    assert said.endswith("If you did not do this, tell an administrator at once.") and "change your password" not in said
 
 
 def test_a_link_from_your_account_is_made_on_the_provider_as_it_stands_when_the_person_is_back(monkeypatch):

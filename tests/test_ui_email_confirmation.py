@@ -51,7 +51,7 @@ def test_your_account_offers_a_code_for_an_address_the_vault_has_not_confirmed(p
     def confirm(route):
         code = (route.request.post_data_json or {}).get("code")
         tried.append(code)
-        if code == "123456":
+        if code == "ab12cd34ef56":
             state["email"] = None
             route.fulfill(status=200, json={"email": "typed@example.com", "email_confirmed": True})
         else:
@@ -74,17 +74,20 @@ def test_your_account_offers_a_code_for_an_address_the_vault_has_not_confirmed(p
     page.click("#us-email-confirm-submit")
     page.wait_for_timeout(300)
     assert tried == []
-    page.fill("#us-email-confirm-code", "000000")
+    # The code is letters and digits: the field asks a phone for its full keyboard, without capitals.
+    field = page.locator("#us-email-confirm-code")
+    assert field.get_attribute("inputmode") == "text" and field.get_attribute("autocapitalize") == "off"
+    page.fill("#us-email-confirm-code", "000000000000")
     page.click("#us-email-confirm-submit")
     expect(page.locator(".toast").filter(has_text="invalid or has expired").first).to_be_visible(timeout=8000)
-    assert tried == ["000000"]
+    assert tried == ["000000000000"]
     expect(box).to_be_visible()
     expect(page.locator("#us-email-confirm-submit")).to_be_enabled()
     # The right code, with Enter: confirmed, and there is nothing left to offer.
-    page.fill("#us-email-confirm-code", " 123456 ")
+    page.fill("#us-email-confirm-code", " ab12cd34ef56 ")
     page.press("#us-email-confirm-code", "Enter")
     expect(page.locator("#us-email-confirm")).to_have_count(0, timeout=10000)
-    assert tried == ["000000", "123456"]
+    assert tried == ["000000000000", "ab12cd34ef56"]
     expect(page.locator("#us-identities-section")).to_be_hidden()
 
 
@@ -147,13 +150,14 @@ def test_an_administrator_confirms_on_the_users_page_an_address_a_person_typed(p
         modal = page.locator("#confirm-modal.active")
         expect(modal).to_be_visible(timeout=8000)
         expect(modal).to_contain_text(typed)
+        expect(modal).to_contain_text("zero-knowledge vaults ask for a code")      # what else the confirmation does
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
         assert sent == []
         button.click()
         page.click("#confirm-modal-confirm-btn")
         expect(page.locator(".toast").filter(has_text="Email address confirmed for").first).to_be_visible(timeout=10000)
-        assert sent == [{"email_confirmed": True}]
+        assert sent == [{"confirm_email": typed}]                # the address that was shown, named
         mine = next(u for u in admin.get("/users").json() if u["id"] == made["id"])
         assert mine["email_confirmed"] is True and mine["email"] == typed
         # The list was read again. With the account's row open once more, its other actions are there and the

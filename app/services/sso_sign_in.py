@@ -997,11 +997,12 @@ def confirmed_address_wanted_among(db, users, *, with_a_factor=()) -> set:
     """:func:`confirmed_address_wanted` for a list of accounts (the Users page), as the ids it holds for: one
     read of the providers and one of the identities, whatever the length of the list. ``with_a_factor``: the ids
     the caller already knows to hold a second factor of their own. An account with the auditor right is not
-    told apart here: the page would offer a confirmation that links nothing for it, and does no harm."""
+    told apart here (it holds a factor wherever the right is in use); the server refuses a confirmation for it."""
     from app.core import email_confirmation
     from app.core.models import ExternalIdentity, RoleEnum, SsoProvider
+    holding = set(with_a_factor)
     open_ = [u for u in users if (getattr(u, "email", None) or "").strip() and not email_confirmation.confirmed(u)
-             and getattr(u, "role", None) != RoleEnum.ADMIN and u.id not in set(with_a_factor)
+             and getattr(u, "role", None) != RoleEnum.ADMIN and u.id not in holding
              and getattr(u, "second_factor_reset_at", None) is None]
     if not open_ or not _has_identities(db):
         return set()
@@ -1116,8 +1117,9 @@ def provider_logout_url(db, session_row) -> Optional[str]:
 
     The provider may have to be asked for its discovery document (a wait of up to the provider call's whole
     time). What is needed of the database is read first and the read transaction ended, so the wait holds no
-    database connection; the caller has nothing pending here (its own writes are committed), and where it had,
-    the transaction is left as it is."""
+    database connection. Call it after the commit: the sign-out has committed its own writes by then. Where the
+    session still holds rows it has not written (new, changed or deleted), the transaction is left as it is; work
+    already written and not committed is not seen here, and would be lost with the transaction."""
     if session_row is None:
         return None
     try:

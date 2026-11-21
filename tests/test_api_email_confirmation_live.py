@@ -158,13 +158,19 @@ def test_an_administrator_confirms_the_address_a_person_typed_and_never_their_ow
         assert _confirmed(admin, name) == (False, typed)
         assert person.get("/users/me").json()["email_confirmed"] is False
         # Nobody confirms their own this way, and nobody who is no administrator confirms anybody's.
-        r = person.patch(f"/users/{made['id']}", json={"email_confirmed": True})
+        r = person.patch(f"/users/{made['id']}", json={"confirm_email": typed})
         assert r.status_code == 403, r.text                        # not theirs to change by its id at all
         me = admin.get("/users/me").json()
-        r = admin.patch(f"/users/{me['id']}", json={"email_confirmed": True})
+        r = admin.patch(f"/users/{me['id']}", json={"confirm_email": me.get("email") or "admin@example.com"})
         assert r.status_code == 400 and "Confirm your own email address" in r.text, r.text
         assert _confirmed(admin, name)[0] is False
-        r = admin.patch(f"/users/{made['id']}", json={"email_confirmed": True})
+        # The request names the address the administrator read. Another one than the account holds: nothing.
+        r = admin.patch(f"/users/{made['id']}", json={"confirm_email": f"{name}@example.com"})
+        assert r.status_code == 409 and r.json()["detail"]["reason"] == "address_changed", r.text
+        r = admin.patch(f"/users/{made['id']}", json={"confirm_email": typed, "email": typed})
+        assert r.status_code == 400, r.text
+        assert _confirmed(admin, name) == (False, typed)
+        r = admin.patch(f"/users/{made['id']}", json={"confirm_email": typed.upper()})
         assert r.status_code == 200, r.text
         assert _confirmed(admin, name) == (True, typed)                  # the address is as it was
         assert person.get("/users/me").json()["email_confirmed"] is True
@@ -222,13 +228,14 @@ def test_a_person_confirms_their_own_address_with_a_code_and_only_with_that_code
         r = person.post("/users/me/email/confirmation", json={"code": "135790"})
         assert r.status_code == 409 and "changed since" in r.text, r.text
         assert _confirmed(admin, made["_username"])[0] is False
-        # The code sent to the address the account holds: wrong once, then right; and it serves once.
-        seed("email_confirm", typed, "112233")
-        assert person.post("/users/me/email/confirmation", json={"code": "000000"}).status_code == 400
-        r = person.post("/users/me/email/confirmation", json={"code": "112233"})
+        # The code sent to the address the account holds: wrong once, then right (typed in capitals with a space,
+        # as a phone gives it); and it serves once.
+        seed("email_confirm", typed, "ab12cd34ef56")
+        assert person.post("/users/me/email/confirmation", json={"code": "000000000000"}).status_code == 400
+        r = person.post("/users/me/email/confirmation", json={"code": " AB12CD34EF56 "})
         assert r.status_code == 200 and r.json() == {"email": typed, "email_confirmed": True}, r.text
         assert _confirmed(admin, made["_username"]) == (True, typed)
-        assert person.post("/users/me/email/confirmation", json={"code": "112233"}).status_code == 400
+        assert person.post("/users/me/email/confirmation", json={"code": "ab12cd34ef56"}).status_code == 400
         r = person.post("/users/me/email/confirmation/request")
         assert r.status_code == 409 and r.json()["detail"]["reason"] == "already_confirmed", r.text
     finally:

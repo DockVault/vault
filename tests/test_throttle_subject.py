@@ -493,7 +493,8 @@ HELPERS = {"_serve_public_link_download": {"download_public_link"},
            "_passkey_limit_challenge": {"passkey_sign_in_options"},
            "_passkey_challenge_for": {"passkey_step_up_options", "passkey_second_factor_options"}}
 # Budgets of a signed-in account kept per account, not per client: each has its own test.
-PER_ACCOUNT = {"search_users", "passkey_register_options"}
+# (The code that confirms an account's own address: tests/test_email_confirmation_admin.py.)
+PER_ACCOUNT = {"search_users", "passkey_register_options", "_email_confirmation_limit"}
 
 
 def _route_keys(monkeypatch, fn, kwargs, address):

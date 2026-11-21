@@ -841,8 +841,10 @@ def test_the_sign_out_holds_no_database_connection_while_the_provider_is_asked(m
     del h.db.log[:]
     assert sso.provider_logout_url(h.db, session)
     assert seen and seen[0][-1:] == [("rollback",)]                 # ended before the provider is asked
-    # Something of the caller's is pending: nothing is thrown away.
-    h.db.dirty = [object()]
-    del h.db.log[:], seen[:]
-    assert sso.provider_logout_url(h.db, session)
-    assert seen == [[]]
+    # Something of the caller's is not written yet (a new row, a changed one, one to delete): nothing is thrown away.
+    for pending in ("new", "dirty", "deleted"):
+        setattr(h.db, pending, [object()])
+        del h.db.log[:], seen[:]
+        assert sso.provider_logout_url(h.db, session), pending
+        assert seen == [[]], pending
+        delattr(h.db, pending)

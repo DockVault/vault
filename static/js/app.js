@@ -7181,16 +7181,21 @@ async function confirmUserEmail(userId, btn) {
     const address = (u && u.email) || 'the address';
     if (!await confirmCredentialChange(u, 'The address is confirmed',
         'You confirm that ' + address + ' belongs to ' + name + '. A sign-in through your organisation’s provider '
-        + 'with that address is then linked to this account.', 'Confirm the email address?')) return;
+        + 'with that address is then linked to this account. It counts as a change to their sign-in details: for 14 '
+        + 'days another change needs a second administrator, and their zero-knowledge vaults ask for a code sent to '
+        + 'that address (where this vault sends no email, only the person who runs the server can lift that).',
+        'Confirm the email address?')) return;
     if (btn) btn.disabled = true;
     try {
+        // The address that was shown is the one confirmed: the server refuses if the account holds another by now.
         const r = await apiRequest('/users/' + encodeURIComponent(userId), {
-            method: 'PATCH', body: JSON.stringify({ email_confirmed: true }) });
+            method: 'PATCH', body: JSON.stringify({ confirm_email: (u && u.email) || '' }) });
         if (r && (r.held || r.held_changes)) showHeldChange(r);
         else showSuccess('Email address confirmed for ' + name + '.');
         await loadUsers();
     } catch (e) {
         showError('Could not confirm the email address: ' + (e.message || ''));
+        await loadUsers();                    // the address may have changed: show the list as it is now
     } finally {
         if (btn) btn.disabled = false;
     }

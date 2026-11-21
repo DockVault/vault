@@ -1048,8 +1048,9 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
 def _tell_owner(db, user, row, title: str, change: str) -> None:
     api = _api()
     try:
-        api._notify_users([str(user.id)], "account_changed", title=title,
-                          body=f"{change} If you did not do this, remove it and change your password.", target="#profile")
+        advice = ("If you did not do this, tell an administrator at once." if getattr(user, "sso_only", False)
+                  else "If you did not do this, remove it and change your password.")
+        api._notify_users([str(user.id)], "account_changed", title=title, body=f"{change} {advice}", target="#profile")
     except Exception as exc:  # noqa: BLE001
         log.info("sso owner notice skipped: %s", type(exc).__name__)
     try:

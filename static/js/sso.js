@@ -335,7 +335,9 @@
         code.id = 'us-email-confirm-code';
         code.className = 'form-input';
         code.autocomplete = 'one-time-code';
-        code.inputMode = 'numeric';
+        code.inputMode = 'text';                  // letters and digits
+        code.autocapitalize = 'off';
+        code.spellcheck = false;
         code.maxLength = 32;
         code.placeholder = 'Code';
         code.setAttribute('aria-label', 'The code sent to your email address');
