@@ -16,7 +16,8 @@ from datetime import datetime
 import pytest
 
 from _webauthn_softauth import SoftAuthenticator
-from test_passkey_routes import ORIGIN, Harness as RouteHarness, _call
+# The route harness sets the application's overrides itself: cleared after every test here, as in its own file.
+from test_passkey_routes import ORIGIN, Harness as RouteHarness, _call, _clean_overrides  # noqa: F401
 from test_passkey_sign_in import Harness as SignInHarness, _user
 
 pytestmark = pytest.mark.unit

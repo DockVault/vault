@@ -15,7 +15,8 @@ from datetime import datetime
 import pytest
 
 from _bare_api_env import set_bare_api_env
-from test_passkey_routes import Harness as RouteHarness
+# The route harness sets the application's overrides itself: cleared after every test here, as in its own file.
+from test_passkey_routes import Harness as RouteHarness, _clean_overrides  # noqa: F401
 from test_passkey_settings import _mod, _resolving
 from test_passkey_sign_in import ORIGIN, RP_ID, Harness as SignInHarness, _api, _user
 

@@ -111,10 +111,12 @@ class Harness:
                             SecondFactorRecoveryCode: [], SecondFactorAction: [], SystemSetting: [],
                             CredentialChange: list(changes), ActiveSession: [self.session]})
         self.db.query_groups = []
-        S.app.dependency_overrides[S.get_db] = lambda: self.db
-        S.app.dependency_overrides[S.get_current_user] = lambda: user
-        S.app.dependency_overrides[S.get_enrolling_principal] = lambda: (user, None)
-        S.app.dependency_overrides[S.require_interactive_admin] = lambda: user
+        # Undone with the test, whichever file uses the harness: left set, the last test's account stayed signed
+        # in for whatever file ran next.
+        for dependency, answer in ((S.get_db, lambda: self.db), (S.get_current_user, lambda: user),
+                                   (S.get_enrolling_principal, lambda: (user, None)),
+                                   (S.require_interactive_admin, lambda: user)):
+            monkeypatch.setitem(S.app.dependency_overrides, dependency, answer)
         monkeypatch.setattr(wc, "_redis", lambda redis: self.redis)
         monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(rp_id=RP_ID, origin=ORIGIN, name=name))
         self.receipts = []
@@ -733,3 +735,15 @@ def test_what_a_removal_leaves_is_counted_whatever_the_passkey_switch_says(monke
     out = remove(keys[1])
     assert out["left_without_a_factor"] is True and out["signed_out"] is True, out
     assert target.second_factor_reset_at is not None
+
+
+def test_the_harness_leaves_no_override_behind_for_the_next_file(monkeypatch):
+    """The harness signs its account in by overriding the application's dependencies. They go with the test that
+    made them, in every file that uses the harness: two files once left them set, and the tests of the file that
+    ran next met another file's account."""
+    S = _api()
+    with monkeypatch.context() as m:
+        Harness(m, _user())
+        assert S.get_enrolling_principal in S.app.dependency_overrides and S.get_db in S.app.dependency_overrides
+    for dependency in (S.get_db, S.get_current_user, S.get_enrolling_principal, S.require_interactive_admin):
+        assert dependency not in S.app.dependency_overrides
