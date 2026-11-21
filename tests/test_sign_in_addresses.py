@@ -12,7 +12,9 @@ through another name, an attribute or a named constant; a header read whose name
 a variable, every header at once, the raw list) is refused too. A request is known by its name and by what it is
 declared as, whatever a parameter is called. A request or a scope read as the mapping it is (``.get``, ``.items``
 and the like) is a read of it, and so is a ``URL`` or a set of ``Headers`` built from one; a name given a
-``Request`` built from a scope is a request.
+``Request`` built from a scope, or a request itself, is a request. A parameter the framework fills from one of
+those headers (``host: str = Header(None)``, or by its alias) is a read, and so are a request's headers handed
+whole to another function, which the check cannot follow.
 
 This holds every module of the sign-in pipeline, passkeys and single sign-on: every module under app/ named for one
 of them, so a new one is read without being listed, and the ones listed below by name, so a rename shows here and
@@ -44,7 +46,10 @@ SINGLE_SIGN_ON = ("app/api/sso_router.py", "app/api/sso_admin_router.py", "app/s
 MODULES = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "app").rglob("*.py")
                  if any(name in p.name for name in NAMED))
 
-ADDRESS_HEADERS = ("host", "origin", "referer", "forwarded")
+ADDRESS_HEADERS = ("host", "origin", "referer", "forwarded", "x-original-host", "x-host", "x-original-url",
+                   "x-rewrite-url")
+# What may be given a request's headers whole: it keeps them as headers, and a read of the result is seen.
+HEADER_KEEPERS = ("dict", "list", "tuple", "Headers", "MutableHeaders", "len", "bool")
 URL_PARTS_THAT_NAME_NO_HOST = ("path", "query")
 HEADER_READS = ("get", "getlist", "get_all", "getall", "pop", "setdefault", "__getitem__")
 # Reads of every header at once: which header is taken from the result cannot be seen here.
@@ -120,15 +125,43 @@ def _built_from_a_request(node, declared, builders) -> bool:
     return any(_a_request(n, declared) for arg in given for n in ast.walk(arg) if isinstance(n, (ast.Name, ast.Attribute)))
 
 
+def _header_parameters(tree) -> list:
+    """The parameters the framework fills from a header that names an address: ``host: str = Header(None)``
+    (the header is the parameter's name), ``x: str = Header(None, alias='X-Forwarded-Host')``, the same inside an
+    ``Annotated[...]``; an alias the check cannot see is refused."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        positional = node.args.posonlyargs + node.args.args
+        defaults = [None] * (len(positional) - len(node.args.defaults)) + list(node.args.defaults)
+        for arg, default in list(zip(positional, defaults)) + list(zip(node.args.kwonlyargs, node.args.kw_defaults)):
+            marker = default if _called(default) == "Header" else None
+            if marker is None and arg.annotation is not None:
+                marker = next((n for n in ast.walk(arg.annotation) if _called(n) == "Header"), None)
+            if marker is None:
+                continue
+            alias = next((k.value for k in marker.keywords if k.arg == "alias"), None)
+            named = arg.arg.replace("_", "-") if alias is None else alias.value if isinstance(alias, ast.Constant) else None
+            if named is None or _names_an_address(named):
+                found.append(f"{arg.arg}=Header(...)")
+    return found
+
+
 def _assignments(tree):
-    """Every (target, value) a statement binds: a plain assignment, one with a declared type, and each pair of a
-    tuple taken apart (``a, b = request.headers, 1``); where the two sides cannot be paired, every target gets the
-    whole value."""
+    """Every (target, value) a statement binds: a plain assignment, one with a declared type, one made inside an
+    expression (``(h := request.headers)``), the name a ``with`` gives its value, and each pair of a tuple taken
+    apart (``a, b = request.headers, 1``); where the two sides cannot be paired, every target gets the whole
+    value."""
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             pairs = [(target, node.value) for target in node.targets]
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             pairs = [(node.target, node.value)]
+        elif isinstance(node, ast.NamedExpr):
+            pairs = [(node.target, node.value)]
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            pairs = [(item.optional_vars, item.context_expr) for item in node.items if item.optional_vars is not None]
         else:
             continue
         for target, value in pairs:
@@ -152,9 +185,13 @@ def request_addresses(tree) -> list:
     found = []
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     declared = _declared_requests(tree)
-    # A name given a request built from a scope is a request, whatever it is called.
+    # A name given a request built from a scope is a request, whatever it is called, and so is a name given a
+    # request itself (``r = request``).
     declared |= {target.id for target, value in _assignments(tree)
-                 if isinstance(target, ast.Name) and _built_from_a_request(value, declared, REQUEST_BUILDERS)}
+                 if isinstance(target, ast.Name) and (
+                     _built_from_a_request(value, declared, REQUEST_BUILDERS)
+                     or (isinstance(value, (ast.Name, ast.Attribute)) and _a_request(value, declared, short_names=False)))}
+    found.extend(_header_parameters(tree))
     constants, from_headers, kept_as = {}, set(), set()
     for target, value in _assignments(tree):
         carries = any((isinstance(n, ast.Attribute) and n.attr == "headers") or _headers_by_getattr(n, declared)
@@ -166,6 +203,16 @@ def request_addresses(tree) -> list:
                 from_headers.add(target.id)
         elif isinstance(target, ast.Attribute) and carries:
             kept_as.add(target.attr)                      # self.h = request.headers
+
+    # A request's headers themselves, as against something read out of them: ``request.headers``, the same by
+    # getattr or built from a scope, and a name given exactly that.
+    def the_headers(node, known=frozenset()) -> bool:
+        if isinstance(node, ast.Attribute) and node.attr == "headers":
+            return _a_request(node.value, declared)
+        return (_headers_by_getattr(node, declared) or _built_from_a_request(node, declared, ("Headers",))
+                or (isinstance(node, ast.Name) and node.id in known))
+
+    whole = {target.id for target, value in _assignments(tree) if isinstance(target, ast.Name) and the_headers(value)}
 
     def holds_headers(node) -> bool:
         return any((isinstance(n, ast.Attribute) and (n.attr == "headers" or n.attr in kept_as))
@@ -204,6 +251,9 @@ def request_addresses(tree) -> list:
         if isinstance(node, ast.Call):
             if getattr(node.func, "attr", None) == "url_for":
                 found.append(ast.unparse(node))
+            if _called(node) not in HEADER_KEEPERS and any(
+                    the_headers(given, whole) for given in list(node.args) + [k.value for k in node.keywords]):
+                found.append(ast.unparse(node))               # the headers, whole, to something the check cannot follow
             if _built_from_a_request(node, declared, ("URL",)):
                 found.append(ast.unparse(node))               # the request's own URL, by its other door
             if isinstance(node.func, ast.Attribute) and _a_request(node.func.value, declared, short_names=False):
@@ -437,6 +487,25 @@ def test_a_read_added_to_a_function_that_may_read_one_is_seen():
     "u = str(URL(scope=request.scope))",
     "r = Request(scope, receive)\nx = r['server']",
     "r = Request(scope)\nx = r.url.hostname",
+    # A parameter the framework fills from the header, by its name or its alias.
+    "async def cb(host: str = Header(None)):\n    return host",
+    "async def cb(x_forwarded_host: Optional[str] = Header(None)):\n    return x_forwarded_host",
+    "async def cb(where: str = Header(None, alias='X-Forwarded-Host')):\n    return where",
+    "async def cb(where: str = Header(None, alias=NAME)):\n    return where",
+    "async def cb(origin: Annotated[str, Header()] = None):\n    return origin",
+    "def cb(*, referer: str = Header(None)):\n    return referer",
+    # A request under another name; headers bound inside an expression or by a with; headers handed to a helper.
+    "r = request\nx = r.url.hostname",
+    "conn = self.request\nx = conn['server']",
+    "if (h := request.headers):\n    x = h.get('host')",
+    "with seen(request.headers) as h:\n    x = h.get('origin')",
+    "x = _hdr(request.headers, 'host')",
+    "x = pick(headers=request.headers)",
+    "h = request.headers\nx = pick(h)",
+    # The headers some proxies write the address in.
+    "x = request.headers.get('x-original-host')",
+    "x = request.headers.get('X-Host')",
+    "x = request.headers.get('X-Original-URL')",
     # A name bound with its type declared, and names bound by taking a tuple apart.
     "h: dict = request.headers\nx = h.get('host')",
     "a, b = request.headers, 1\nx = a.get('host')",
@@ -474,6 +543,13 @@ def test_the_check_finds_each_way_a_request_names_its_address(source):
     "a, b = 1, request.headers\nx = a.get('host')",       # the other one of the pair holds the headers
     "h: dict = {}\nx = h.get('host')",
     "need = policy.get('otp')",
+    "async def cb(user_agent: str = Header(None)):\n    return user_agent",       # a header that names no address
+    "async def cb(token: str = Header(None, alias='X-Second-Factor')):\n    return token",
+    "n = len(request.headers)",                           # how many, not which
+    "agent = pick(request.headers.get('user-agent'))",    # one header that names no address, handed on
+    "receipt = request.headers.get('X-Second-Factor')\nok = spend(receipt=receipt)",     # a value read out of them
+    "headers = dict(refused.headers)\nanswer = respond(page, headers=headers)",          # headers the vault sends
+    "r = requirement\nx = r['server']",                   # not a request, whatever it is given
     "peer = scope.get('client')",                         # who called
     "path = scope.get('path', '')",                       # what was asked for, not where
     "files = scope.get('files')",                         # a credential's scope, which happens to share the name
