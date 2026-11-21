@@ -6598,6 +6598,13 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         if held_now is None or held_now != normalize_email(payload.get("email")):
             raise HTTPException(status_code=409, detail=(
                 "The account's email address changed since this was asked; nothing was confirmed."))
+        from app.core import privileged_accounts
+        if privileged_accounts.kind(db, target) is not None:
+            # Asked for while the account was an ordinary one, applied (approved) after it became an
+            # administrator's or was given the auditor right: the same refusal as at the request.
+            raise HTTPException(status_code=409, detail=(
+                "This account is an administrator's, or holds the auditor right, by now: it is never linked to a "
+                "provider by its email address, and nothing was confirmed."))
         email_confirmation.confirm(target)
         target.updated_at = datetime.now(timezone.utc)
         # The record names the address that was vouched for, and who vouched (the one who asked; an approval
@@ -6756,6 +6763,31 @@ def _credential_change(db, actor, target, kind, *, summary, payload, request=Non
     return _CredentialOutcome(change, True, last=last)
 
 
+def _confirmation_refusal(db, user, *, is_self: bool, is_admin: bool, named, becomes_administrator: bool = False):
+    """Why an administrator's confirmation of the address ``user`` holds is not made, as the refusal to raise, or
+    None. Never one's own (the code sent to the address is for that); only an administrator's to give; for the
+    address the administrator read (``named``), or nothing; and never for an account that is never linked to a
+    provider by its address: an administrator's, a holder of the auditor right, or one the same request makes
+    an administrator. For those a confirmation would change nothing it is for, and would still count as a change
+    to the account's sign-in details (its keys held, an auditor's right suspended)."""
+    if is_self:
+        return HTTPException(status_code=400, detail=(
+            "Confirm your own email address from account settings, with the code sent to it."))
+    if not is_admin:
+        return HTTPException(status_code=403, detail="Only an administrator confirms someone's email address.")
+    if not (user.email or "").strip():
+        return HTTPException(status_code=400, detail="This account has no email address to confirm.")
+    if normalize_email(named) != normalize_email(user.email):
+        return HTTPException(status_code=409, detail={"reason": "address_changed", "message": (
+            "This account holds another email address now. Read the list again before you confirm.")})
+    from app.core import privileged_accounts
+    if becomes_administrator or privileged_accounts.kind(db, user) is not None:
+        return HTTPException(status_code=400, detail=(
+            "An administrator's account, and one that holds the auditor right, is never linked to a provider "
+            "by its email address: there is nothing a confirmation would do."))
+    return None
+
+
 def _request_summary(kind, *, delivery=None, new_email=None, key_name=None, fingerprint=None, confirm=False):
     """The line a request's row shows under its heading ("Change the email address for carol"): only
     what the heading does not already say, or None when it says it all. It used to repeat the heading
@@ -6885,7 +6917,7 @@ def _credential_request_dict(change, target_username, viewer_id=None, db=None) -
         "id": str(change.id),
         "kind": change.kind,
         # What it asks for ("Add an SSH key"), since a waiting change has not been made.
-        "label": cc.request_label(change.kind),
+        "label": cc.request_label(*cc.what_of(change)),
         "status": change.status,
         "target_user_id": str(change.target_user_id),
         "target_username": target_username,
@@ -6913,7 +6945,7 @@ def _held_body(outcome, target, viewer_id) -> dict:
                      "at": last.applied_at.isoformat() + "Z" if last.applied_at else None},
         "message": (f"{_earlier_changer(last, viewer_id)} already changed {target.username}'s sign-in details "
                     f"on {_cc_date(last.applied_at)}, and a second change within 14 days needs another "
-                    f"administrator's approval. Your request to {cc.phrase(change.kind)} is waiting for "
+                    f"administrator's approval. Your request to {cc.phrase(*cc.what_of(change))} is waiting for "
                     f"approval, and expires on {_cc_date(change.expires_at)} if nobody decides."),
     }
 
@@ -6990,10 +7022,14 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
         return ("Your second factor was reset",
                 f"{who} reset your second factor and signed your account out everywhere. You will set up {how}")
     if kind == cc.EMAIL and result.get("confirmed_only"):
+        from app.core import envelope_hold
+        days = envelope_hold.hold_days()
+        hold = ("" if days <= 0 else
+                " As after any change an administrator makes to your sign-in details, your zero-knowledge vaults "
+                f"ask for a code sent by email for the next {days} day{'' if days == 1 else 's'}.")
         return ("Your email address was confirmed",
                 f"{who} confirmed that {result.get('new_email')} is your email address. Your organisation's "
-                "sign-in can now find your account by it. As after any change an administrator makes to your "
-                "sign-in details, your zero-knowledge vaults ask for a code sent by email for the next 14 days.")
+                f"sign-in can now find your account by it.{hold}")
     if kind == cc.EMAIL:
         old, new = result.get("old_email"), result.get("new_email")
         shown = _mask_email(new) if mask_new_email else (new or "(none)")
@@ -7277,7 +7313,8 @@ def _announce_held_change(db, change, target) -> None:
     change is waiting. After the commit; best-effort."""
     from app.core import credential_changes as cc
     try:
-        what, who, until = cc.phrase(change.kind), change.requested_by_name, _cc_date(change.expires_at)
+        what, who, until = (cc.phrase(*cc.what_of(change)), change.requested_by_name,
+                            _cc_date(change.expires_at))
         if change.requested_by_id is not None:
             _notify_users([str(change.requested_by_id)], "credential_change_held",
                           title="Your change is waiting for approval",
@@ -7316,7 +7353,7 @@ def _announce_decided_change(db, change, target, outcome: str, result=None, appr
     ``approver_ids``: for a withdrawal, the administrators who were asked to approve it, told that
     there is nothing left to approve."""
     from app.core import credential_changes as cc
-    what, who, by = cc.phrase(change.kind), change.requested_by_name, change.decided_by_name
+    what, who, by = cc.phrase(*cc.what_of(change)), change.requested_by_name, change.decided_by_name
     requester = [str(change.requested_by_id)] if change.requested_by_id is not None else []
     try:
         if outcome == cc.APPROVED:
@@ -7569,7 +7606,7 @@ def _announce_withdrawn_requests(db, withdrawn) -> None:
         if target is None:
             continue
         try:
-            what, who = cc.phrase(change.kind), change.requested_by_name
+            what, who = cc.phrase(*cc.what_of(change)), change.requested_by_name
             why = _WITHDRAWN_BECAUSE.get(because, "can no longer act as an administrator")
             _notify_users(list(approver_ids), "credential_change_withdrawn", title="A request was withdrawn",
                           body=(f"{who}'s request to {what} for {target.username} was withdrawn, because {who} "
@@ -11002,8 +11039,7 @@ async def list_users(
     from app.services import sso_freshness
     freshness = sso_freshness.standing_of(db)
     from app.services import sso_sign_in
-    confirm_wanted = sso_sign_in.confirmed_address_wanted_among(
-        db, users, with_a_factor={u.id for u in users if u.id in mfa_user_ids or passkey_counts.get(u.id, 0)})
+    confirm_wanted = sso_sign_in.confirmed_address_wanted_among(db, users)
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
@@ -11021,7 +11057,7 @@ async def list_users(
         change = recent.get(user.id)
         if change is not None:
             item.credential_change = {
-                "kind": change.kind, "label": cc.label(change.kind), "by": change.requested_by_name,
+                "kind": change.kind, "label": cc.label(*cc.what_of(change)), "by": change.requested_by_name,
                 "at": change.applied_at.isoformat() + "Z",
                 "window_ends": cc.window_ends(change).isoformat() + "Z",
             }
@@ -11289,7 +11325,10 @@ async def request_email_confirmation(
                                                      "message": "Your email address is confirmed already."})
     if not _smtp_configured(db):
         raise HTTPException(status_code=400, detail=(
-            "This vault sends no email, so no code can be sent. An administrator can confirm your address."))
+            "This vault sends no email, so no code can be sent. Linking your organisation's sign-in from Your "
+            "account needs no confirmed address. An administrator can confirm your address; that counts as a "
+            "change to your sign-in details and holds your zero-knowledge vaults for up to 14 days, which on "
+            "this vault only the person who runs the server can lift."))
     # The code lands in a mailbox that may not be the requester's (an address typed on the wrong account).
     _email_confirmation_limit(user, EMAIL_CONFIRM_CODES, "email_confirm_code",
                               "Too many codes were asked for; wait a few minutes.")
@@ -13580,23 +13619,10 @@ async def update_user(
     # the password alone, to an address that is somebody else's). Nothing is done for an address that is
     # confirmed already.
     if user_update.confirm_email is not None:
-        if is_self:
-            raise HTTPException(status_code=400, detail=(
-                "Confirm your own email address from account settings, with the code sent to it."))
-        if not is_admin:
-            raise HTTPException(status_code=403, detail="Only an administrator confirms someone's email address.")
-        if not (user.email or "").strip():
-            raise HTTPException(status_code=400, detail="This account has no email address to confirm.")
-        if normalize_email(user_update.confirm_email) != normalize_email(user.email):
-            raise HTTPException(status_code=409, detail={"reason": "address_changed", "message": (
-                "This account holds another email address now. Read the list again before you confirm.")})
-        from app.core import privileged_accounts
-        if privileged_accounts.kind(db, user) is not None:
-            # Never linked to a provider by its address, so a confirmation would change nothing it is for, and
-            # it would still count as a change to the account's sign-in details.
-            raise HTTPException(status_code=400, detail=(
-                "An administrator's account, and one that holds the auditor right, is never linked to a provider "
-                "by its email address: there is nothing a confirmation would do."))
+        refusal = _confirmation_refusal(db, user, is_self=is_self, is_admin=is_admin, named=user_update.confirm_email,
+                                        becomes_administrator=user_update.role == RoleEnum.ADMIN)
+        if refusal is not None:
+            raise refusal
         if not email_confirmation.confirmed(user):
             outcome = _credential_change(
                 db, current_user, user, "email",

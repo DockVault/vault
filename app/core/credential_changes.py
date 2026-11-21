@@ -144,18 +144,37 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def label(kind: str) -> str:
+def is_confirmation(kind: str, payload) -> bool:
+    """Whether a change of ``kind`` with ``payload`` is an administrator's confirmation of the address the
+    account holds: recorded as a change to the email address (it is counted and held like one), and changing no
+    address. A request says ``confirm``; what an applied one keeps says ``confirmed_only``."""
+    payload = payload or {}
+    return kind == EMAIL and bool(payload.get("confirm") or payload.get("confirmed_only"))
+
+
+def what_of(change) -> tuple:
+    """(kind, payload) of a recorded change, for :func:`label`, :func:`phrase` and :func:`request_label`."""
+    return change.kind, getattr(change, "payload", None)
+
+
+def label(kind: str, payload=None) -> str:
+    if is_confirmation(kind, payload):
+        return "Email address confirmed"
     return KIND_LABELS.get(kind, kind)
 
 
-def phrase(kind: str) -> str:
+def phrase(kind: str, payload=None) -> str:
+    """What a change does, as it reads after "asked to": "change the email address". ``payload``, where the
+    caller has it, tells a confirmation of the address from a change of it."""
+    if is_confirmation(kind, payload):
+        return "confirm the email address"
     return KIND_PHRASES.get(kind, "change sign-in details")
 
 
-def request_label(kind: str) -> str:
+def request_label(kind: str, payload=None) -> str:
     """What a request waiting for approval asks for, as a heading: "Add an SSH key". A change that
     was made is named by label() instead ("SSH key added")."""
-    text = phrase(kind)
+    text = phrase(kind, payload)
     return text[:1].upper() + text[1:]
 
 
@@ -175,22 +194,27 @@ def email_changes_in_window(db, target_id, now: Optional[datetime] = None) -> Li
     """The email address changes an administrator (or the host operator) applied to this account within
     the window, oldest first. Their ``payload`` keeps the address before and after (see
     applied_email_payload), which a self-service reset link reads: within the window it goes to the
-    address the account had before (app/api/api_server.py, _self_service_reset_destination)."""
+    address the account had before (app/api/api_server.py, _self_service_reset_destination). A confirmation of
+    the address the account holds is recorded among them and moved no address: it is not one of these."""
     now = now or utcnow()
-    return (db.query(CredentialChange)
+    rows = (db.query(CredentialChange)
             .filter(CredentialChange.target_user_id == target_id,
                     CredentialChange.kind == EMAIL,
                     CredentialChange.status.in_(APPLIED),
                     CredentialChange.applied_at > now - WINDOW)
             .order_by(CredentialChange.applied_at.asc())
             .all())
+    return [row for row in rows if not is_confirmation(EMAIL, row.payload)]
 
 
 def applied_email_payload(result: dict) -> dict:
     """What an applied email change keeps, from what applying it returned: the address before and the
     address after. Kept for the window only; the periodic prune deletes the row after it."""
     result = result or {}
-    return {"previous_email": result.get("old_email"), "new_email": result.get("new_email")}
+    kept = {"previous_email": result.get("old_email"), "new_email": result.get("new_email")}
+    if result.get("confirmed_only"):
+        kept["confirmed_only"] = True       # the address stayed: an administrator vouched for it (is_confirmation)
+    return kept
 
 
 def applied_payload(kind: str, email_before, result: dict) -> dict:

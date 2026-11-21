@@ -1006,22 +1006,42 @@ def confirmed_address_wanted(db, user) -> bool:
     return privileged_accounts.kind(db, user) is None and not set_up_its_own_factor(db, user)
 
 
-def confirmed_address_wanted_among(db, users, *, with_a_factor=()) -> set:
+def accounts_that_set_up_a_factor(db, users) -> set:
+    """:func:`set_up_its_own_factor` for a list of accounts, as the ids it holds for, in two reads whatever the
+    length of the list: a reset not answered yet, an authenticator, or any passkey that was not retired, whether
+    or not passkeys are switched on."""
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential
+    from app.core.table_presence import has_table
+    ids = [u.id for u in users]
+    found = {u.id for u in users if getattr(u, "second_factor_reset_at", None) is not None}
+    if not ids:
+        return found
+    found |= {row[0] for row in db.query(SecondFactorEnrollment.user_id).filter(
+        SecondFactorEnrollment.user_id.in_(ids), SecondFactorEnrollment.status == "active").all()}
+    if has_table(db, WebAuthnCredential.__tablename__):
+        found |= {row[0] for row in db.query(WebAuthnCredential.user_id).filter(
+            WebAuthnCredential.user_id.in_(ids), WebAuthnCredential.retired_at.is_(None)).all()}
+    return found
+
+
+def confirmed_address_wanted_among(db, users) -> set:
     """:func:`confirmed_address_wanted` for a list of accounts (the Users page), as the ids it holds for: one
-    read of the providers and one of the identities, whatever the length of the list. ``with_a_factor``: the ids
-    the caller already knows to hold a second factor of their own. An account with the auditor right is not
-    told apart here (it holds a factor wherever the right is in use); the server refuses a confirmation for it."""
+    read of the providers, one of the identities and two of the factors, whatever the length of the list. An
+    account with the auditor right is not told apart here (it holds a factor wherever the right is in use); the
+    server refuses a confirmation for it."""
     from app.core import email_confirmation
     from app.core.models import ExternalIdentity, RoleEnum, SsoProvider
-    holding = set(with_a_factor)
     open_ = [u for u in users if (getattr(u, "email", None) or "").strip() and not email_confirmation.confirmed(u)
-             and getattr(u, "role", None) != RoleEnum.ADMIN and u.id not in holding
-             and getattr(u, "second_factor_reset_at", None) is None]
+             and getattr(u, "role", None) != RoleEnum.ADMIN]
     if not open_ or not _has_identities(db):
         return set()
     linking = {p.id for p in db.query(SsoProvider).filter(SsoProvider.state == "enabled").all()
                if policy_of(p)["sso_link_by_email"]}
     if not linking:
+        return set()
+    holding = accounts_that_set_up_a_factor(db, open_)
+    open_ = [u for u in open_ if u.id not in holding]
+    if not open_:
         return set()
     linked = {}
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id.in_([u.id for u in open_])).all():

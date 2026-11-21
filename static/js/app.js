@@ -7196,7 +7196,8 @@ async function confirmUserEmail(userId, btn) {
         'You confirm that ' + address + ' belongs to ' + name + '. A sign-in through your organisation’s provider '
         + 'with that address is then linked to this account. It counts as a change to their sign-in details: for 14 '
         + 'days another change needs a second administrator, and their zero-knowledge vaults ask for a code sent to '
-        + 'that address (where this vault sends no email, only the person who runs the server can lift that).',
+        + 'that address for as long as this vault holds keys after such a change, 14 days at most (where this vault '
+        + 'sends no email, only the person who runs the server can lift that).',
         'Confirm the email address?')) return;
     if (btn) btn.disabled = true;
     try {

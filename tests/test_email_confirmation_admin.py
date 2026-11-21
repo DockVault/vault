@@ -110,12 +110,123 @@ def test_what_the_owner_and_a_second_administrator_read_of_a_confirmation():
                                                            "confirmed_only": True})
     assert title == "Your email address was confirmed"
     assert text.startswith("An administrator confirmed that bob@example.com is your email address.")
-    assert "your zero-knowledge vaults ask for a code sent by email for the next 14 days" in text
+    assert "your zero-knowledge vaults ask for a code sent by email for the next 14 days." in text
     # The copy sent by email goes to that very address: nothing in it is masked.
     assert api._credential_change_notice(cc.EMAIL, {"new_email": "bob@example.com", "confirmed_only": True},
                                          mask_new_email=True)[1] == text
     assert "was changed" in api._credential_change_notice(cc.EMAIL, {"old_email": "a@example.com",
                                                                      "new_email": "b@example.com"})[0]
+
+
+@pytest.mark.parametrize("days, said", [(14, "for the next 14 days."), (3, "for the next 3 days."),
+                                        (1, "for the next 1 day."), (0, None)])
+def test_the_owners_notice_states_the_hold_this_vault_has(monkeypatch, days, said):
+    """The hold on the key envelope after an administrator's change is a setting, from none to 14 days. The notice
+    of a confirmation states the hold this vault has, and none where it has none."""
+    from app.core import envelope_hold
+    monkeypatch.setattr(envelope_hold, "hold_days", lambda: days)
+    _title, text = api._credential_change_notice(cc.EMAIL, {"new_email": "bob@example.com", "confirmed_only": True})
+    assert "Your organisation's sign-in can now find your account by it." in text
+    if said is None:
+        assert "zero-knowledge" not in text and text.endswith("can now find your account by it.")
+    else:
+        assert text.endswith("your zero-knowledge vaults ask for a code sent by email " + said)
+
+
+def test_a_confirmation_is_told_as_one_and_moves_no_reset_link(db, world):
+    """A confirmation is kept among the changes to the email address (it is counted and held like one), and it
+    changes no address. Everything that reads such a record tells the two apart: the request reads "confirm the
+    email address", the applied change "Email address confirmed"; and a self-service reset link asked for in
+    the 14 days after it goes to the account's address with no word of an address that "was changed"."""
+    ada, eve, bob = _user(db, "ada", RoleEnum.ADMIN), _user(db, "eve", RoleEnum.ADMIN), _user(db, "bob")
+    asked, applied = {"email": "bob@example.com", "confirm": True}, {"new_email": "bob@example.com", "confirmed_only": True}
+    assert cc.is_confirmation(cc.EMAIL, asked) and cc.is_confirmation(cc.EMAIL, applied)
+    assert not cc.is_confirmation(cc.EMAIL, {"email": "new@example.com"}) and not cc.is_confirmation(cc.EMAIL, None)
+    assert not cc.is_confirmation(cc.PASSWORD, asked)
+    assert cc.phrase(cc.EMAIL, asked) == "confirm the email address" and cc.phrase(cc.EMAIL) == "change the email address"
+    assert cc.request_label(cc.EMAIL, asked) == "Confirm the email address"
+    assert cc.label(cc.EMAIL, applied) == "Email address confirmed" and cc.label(cc.EMAIL) == "Email address change"
+    # Applied at once: what the record keeps says it was a confirmation.
+    _patch(db, ada, bob, confirm_email="bob@example.com")
+    (made,) = db.query(CredentialChange).all()
+    assert made.payload == {"previous_email": "bob@example.com", "new_email": "bob@example.com", "confirmed_only": True}
+    assert cc.what_of(made) == (cc.EMAIL, made.payload) and cc.label(*cc.what_of(made)) == "Email address confirmed"
+    assert cc.email_changes_in_window(db, bob.id) == []
+    assert api._self_service_reset_destination(db, bob) == ("bob@example.com", "")
+    # A real change of the address is still one, and still moves the link.
+    made.payload = {"previous_email": "old@example.com", "new_email": "bob@example.com"}
+    db.commit()
+    assert [c.id for c in cc.email_changes_in_window(db, bob.id)] == [made.id]
+    destination, note = api._self_service_reset_destination(db, bob)
+    assert destination == "old@example.com" and "changed this account's email address" in note
+    # Held for a second administrator: the lists and the notices name it as what it is.
+    dan = _user(db, "dan")
+    _patch(db, ada, dan, password="Admin-Chosen-8x!")
+    _patch(db, ada, dan, confirm_email="dan@example.com")
+    (waiting,) = [c for c in db.query(CredentialChange).all() if c.status == cc.HELD]
+    assert api._credential_request_dict(waiting, "dan")["label"] == "Confirm the email address"
+    said = []
+    api_notify, api_account = api._notify_users, api._notify_account_change
+    try:
+        api._notify_users = lambda ids, ntype, title=None, body=None, **kw: said.append(body)
+        api._notify_account_change = lambda db, user, **kw: said.append(kw["change"])
+        api._announce_held_change(db, waiting, dan)
+    finally:
+        api._notify_users, api._notify_account_change = api_notify, api_account
+    assert len(said) == 3 and all("confirm the email address for" in text for text in said), said
+    assert not any("change the email address" in text for text in said)
+    assert eve.id != ada.id
+
+
+def test_a_held_confirmation_is_judged_again_when_it_is_applied(db, world, monkeypatch):
+    """A confirmation is refused for an administrator's account and for a holder of the auditor right: neither is
+    ever linked by its address, and the change would still hold its keys and suspend an auditor's right. Asked
+    for while the account was an ordinary one and approved after it became one of those, it is refused the same
+    way when it is applied, and so is a request that makes the account an administrator in the same breath."""
+    from app.core import privileged_accounts
+    ada, bob = _user(db, "ada", RoleEnum.ADMIN), _user(db, "bob")
+    asked = {"email": "bob@example.com", "confirm": True}
+    as_it_is = privileged_accounts.kind
+    for became in ("an administrator", "a holder of the auditor right"):
+        if became == "an administrator":
+            bob.role = RoleEnum.ADMIN
+        else:
+            bob.role = RoleEnum.USER
+            monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: "auditor_right" if user.id == bob.id else None)
+        with pytest.raises(HTTPException) as refused:
+            api._make_credential_change(db, cc.EMAIL, bob, dict(asked), actor_id=ada.id, actor_name="ada")
+        assert refused.value.status_code == 409 and "nothing was confirmed" in refused.value.detail, became
+        assert "never linked to a provider" in refused.value.detail
+        assert email_confirmation.confirmed(bob) is False
+    monkeypatch.setattr(privileged_accounts, "kind", as_it_is)
+    # One request that confirms the address and makes the account an administrator: nothing of it is done.
+    carol = _user(db, "carol")
+    with pytest.raises(HTTPException) as refused:
+        _patch(db, ada, carol, confirm_email="carol@example.com", role=RoleEnum.ADMIN)
+    assert refused.value.status_code == 400 and "never linked to a provider" in refused.value.detail
+    db.refresh(carol)
+    assert carol.role == RoleEnum.USER and email_confirmation.confirmed(carol) is False
+    assert db.query(CredentialChange).count() == 0
+
+
+def test_each_refusal_of_a_confirmation_has_its_own_answer(db, world):
+    """The refusals of the request, one by one, in the order they are judged."""
+    bob = _user(db, "bob")
+
+    def refusal(**kw):
+        told = dict(is_self=False, is_admin=True, named="bob@example.com")
+        told.update(kw)
+        return api._confirmation_refusal(db, bob, **told)
+
+    assert refusal() is None
+    assert refusal(is_self=True).status_code == 400 and "your own email address" in refusal(is_self=True).detail
+    assert refusal(is_admin=False).status_code == 403
+    assert refusal(is_admin=False).detail == "Only an administrator confirms someone's email address."
+    assert refusal(named="other@example.com").status_code == 409
+    assert refusal(becomes_administrator=True).status_code == 400
+    assert refusal(is_self=True, is_admin=False).status_code == 400            # one's own comes first
+    bob.email = None
+    assert refusal().status_code == 400 and "no email address" in refusal().detail
     assert api._request_summary(cc.EMAIL, new_email="bob@example.com", confirm=True) == (
         "The address stays bob@example.com: it is confirmed as theirs")
     assert api._request_summary(cc.EMAIL, new_email="bob@example.com") == "New address: bob@example.com"

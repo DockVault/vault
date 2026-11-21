@@ -861,7 +861,10 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
     """Confirming an address matters for one thing: a provider that links by email finding the account. The
     account page and the Users page offer it exactly then: the address is there and not confirmed, a provider
     that is on links by email and the account is not linked to it yet, and the account is one such a link may
-    reach (not an administrator, no second factor of its own)."""
+    reach (not an administrator, no second factor of its own). "A second factor of its own" is the link's own
+    question on both pages: a passkey kept while passkeys are switched off keeps a link out, so no confirmation
+    is offered for its account either (it would count as a change to the account and change nothing)."""
+    from app.core import webauthn_settings
     from app.services import sso_sign_in as sso
     open_, done = _user("open", email_confirmed_at=None), _user("done")
     bare = _user("bare", email=None, email_confirmed_at=None)
@@ -872,19 +875,30 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
     resetting = _user("resetting", email_confirmed_at=None, second_factor_reset_at=datetime.utcnow())
     links = _provider(name="links", label="Links", policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
     plain = _provider(name="plain", label="Plain")
-    people = [open_, done, bare, root, guarded, linked, resetting]
+    keyed, retired = _user("keyed", email_confirmed_at=None), _user("retired", email_confirmed_at=None)
+    people = [open_, done, bare, root, guarded, linked, resetting, keyed, retired]
     h = Resolving(monkeypatch, people, [links, plain],
                   identities=[_identity(linked, links, subject="s-linked"), _identity(open_, plain, subject="s-open")])
     _factor(h, guarded, "authenticator")
+    _factor(h, keyed, "passkey")
+    _factor(h, retired, "passkey retired")
     monkeypatch.setattr(h.S, "_smtp_configured", lambda db: True)
 
     def wanted():
         one_by_one = {u.username for u in people if sso.confirmed_address_wanted(h.db, u)}
-        together = sso.confirmed_address_wanted_among(h.db, people, with_a_factor={guarded.id})
+        together = sso.confirmed_address_wanted_among(h.db, people)
         assert {u.username for u in people if u.id in together} == one_by_one
         return one_by_one
 
-    assert wanted() == {"open"}
+    assert wanted() == {"open", "retired"}
+    # With passkeys switched off the kept key is no factor for a sign-in, and still keeps a link by email out.
+    switched_on = webauthn_settings.enabled
+    monkeypatch.setattr(webauthn_settings, "enabled", lambda: False)
+    assert h.S._passkey_counts(h.db, [keyed.id]) == {} and sso.set_up_its_own_factor(h.db, keyed) is True
+    assert wanted() == {"open", "retired"}
+    assert sso.accounts_that_set_up_a_factor(h.db, people) == {guarded.id, resetting.id, keyed.id}
+    assert sso.accounts_that_set_up_a_factor(h.db, []) == set()
+    monkeypatch.setattr(webauthn_settings, "enabled", switched_on)
     # The account page is told the same, with whether a code can be sent.
     h.current_user = open_
     status, out, _ = _call(h.S, "GET", "/users/me/identities")

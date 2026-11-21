@@ -98,8 +98,18 @@ def test_where_the_vault_sends_no_email_your_account_says_who_can_confirm(page: 
     _open_account(page)
     box = page.locator("#us-email-confirm")
     expect(box).to_be_visible(timeout=10000)
-    expect(box).to_contain_text("Ask an administrator to confirm your address")
+    # What an administrator's confirmation costs here is said with it; no provider can be linked from this page,
+    # so nothing points to one.
+    expect(page.locator("#us-email-confirm-by-admin")).to_contain_text("An administrator can confirm your address")
+    expect(page.locator("#us-email-confirm-by-admin")).to_contain_text("held for up to 14 days")
+    expect(box).not_to_contain_text("Link your organisation")
     expect(page.locator("#us-email-confirm-send")).to_have_count(0)
+    # Where a provider can be linked from this page, that way comes first: it needs no confirmed address.
+    state["providers"] = [{"id": "11111111-1111-4111-8111-111111111111", "label": "Sign in with Contoso",
+                           "name": "Contoso", "sso_only": False}]
+    page.evaluate("() => window.Sso && Sso.renderAccount && Sso.renderAccount()")
+    expect(box).to_contain_text("Link your organisation's sign-in above instead", timeout=10000)
+    state["providers"] = []
     # And with nothing to say of the address, the section says nothing of it.
     state["email"] = None
     page.reload()

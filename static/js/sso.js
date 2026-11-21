@@ -308,20 +308,27 @@
             });
             body.appendChild(link);
         });
-        if (email) body.appendChild(emailConfirmation(email));
+        if (email) body.appendChild(emailConfirmation(email, linkable.length > 0));
     }
 
     // The address an account holds is its owner's own claim until the vault confirmed it, and the organisation's
     // sign-in finds an account by a confirmed address only. The owner confirms it here with a code the vault
     // sends to that address; where the vault sends no email, an administrator confirms it.
-    function emailConfirmation(email) {
+    // canLink: a provider can be linked from this page, which needs no confirmed address and costs nothing.
+    function emailConfirmation(email, canLink) {
         const box = _el('div', 'identity-email-confirm mt-sm');
         box.id = 'us-email-confirm';
         box.appendChild(_el('p', 'text-secondary text-sm mb-sm', 'Your email address (' + email.address + ') is not '
             + 'confirmed yet. Your organisation\'s sign-in finds your account by a confirmed address only.'));
         if (!email.can_send_code) {
             box.appendChild(_el('p', 'text-secondary text-sm', 'This vault sends no email, so it cannot send you a '
-                + 'code. Ask an administrator to confirm your address.'));
+                + 'code.' + (canLink ? ' Link your organisation\'s sign-in above instead: it then finds your account '
+                    + 'without your address.' : '')));
+            const cost = _el('p', 'text-secondary text-sm', 'An administrator can confirm your address. That counts as '
+                + 'a change to your sign-in details: your zero-knowledge vaults are then held for up to 14 days, and on '
+                + 'this vault only the person who runs the server can lift that.');
+            cost.id = 'us-email-confirm-by-admin';
+            box.appendChild(cost);
             return box;
         }
         const send = _el('button', 'btn btn-secondary btn-sm', 'Send me a code');
