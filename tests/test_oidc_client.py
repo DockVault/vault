@@ -792,6 +792,35 @@ def test_userinfo_must_speak_of_the_same_person():
     assert e.value.code == "endpoint_refused"
 
 
+@pytest.mark.parametrize("private_network", [False, True])
+def test_every_call_to_a_provider_holds_its_connection_to_public_addresses_unless_it_is_inside(private_network):
+    """Each of the four calls the vault makes to a provider (the discovery document, the keys, the code exchange,
+    userinfo) is made with the connection's own rule set: public addresses only, unless the provider is marked
+    as inside. The rule is set for the call and gone after it."""
+    oc = _oc()
+    signer = Signer()
+    held = []
+
+    def fetch(url, **kw):
+        held.append((url.rsplit("/", 1)[-1], oc._PUBLIC_ONLY.get()))
+        if url.endswith("openid-configuration"):
+            return signer.discovery()
+        if url.endswith("/certs"):
+            return signer.jwks()
+        if url.endswith("/token"):
+            return {"token_type": "bearer", "id_token": "x.y.z", "access_token": "at"}
+        return {"sub": "user-1"}
+
+    provider = _provider(oc, private_network=private_network)
+    d = oc.discover(provider, fetch=fetch, cache=oc.Cache(), resolve=_PUBLIC, now=NOW)
+    oc.signing_keys(provider, d, fetch=fetch, cache=oc.Cache(), resolve=_PUBLIC, now=NOW)
+    oc.exchange_code(provider, d, code="c", redirect_uri="https://v/cb", code_verifier="v" * 43, fetch=fetch,
+                     resolve=_PUBLIC)
+    oc.userinfo(provider, d, "at", expected_sub="user-1", fetch=fetch, resolve=_PUBLIC)
+    assert held == [(name, not private_network) for name in ("openid-configuration", "certs", "token", "userinfo")]
+    assert oc._PUBLIC_ONLY.get() is False
+
+
 def test_every_address_the_vault_calls_or_sends_a_browser_to_is_vetted_at_use():
     oc = _oc()
     signer = Signer()

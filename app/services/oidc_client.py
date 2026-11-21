@@ -20,6 +20,7 @@ name, which an attacker who merely controls that name cannot place inside the ne
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import http.client
 import io
@@ -286,6 +287,40 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirects are not followed", headers, fp)
 
 
+class _NotPublic(OSError):
+    """The name answered no public address where the connection was made."""
+
+
+# Whether the connections made now may take only public addresses: set around each call to a provider that is not
+# marked as inside (:func:`_reach`), read where the connection looks the name up (:class:`_DeadlineConnection`).
+_PUBLIC_ONLY: contextvars.ContextVar = contextvars.ContextVar("oidc_public_addresses_only", default=False)
+
+
+def _reach(provider: "ProviderConfig", fetch: Callable, url: str, **kw) -> dict:
+    """``fetch(url)`` for ``provider``. The endpoint rule looked the name up a moment ago; the connection looks it
+    up again. Whoever answers for the name could say a public address to the first and one inside to the second
+    (a lookup that lives no time at all), and the vault would open a connection to a host inside. So unless the
+    provider is marked as inside, the connection made here takes no address that is not public."""
+    token = _PUBLIC_ONLY.set(not provider.private_network)
+    try:
+        return fetch(url, **kw)
+    finally:
+        _PUBLIC_ONLY.reset(token)
+
+
+def _addresses_allowed(addresses: list, *, through_a_proxy: bool) -> list:
+    """The addresses a connection may try, of those its name answered (``getaddrinfo``'s entries): all of them,
+    or only the public ones while a call is held to public addresses (:func:`_reach`); none left is
+    :class:`_NotPublic`. Through a proxy the connection is to the proxy, which looks the provider's name up
+    itself: nothing is judged here."""
+    if through_a_proxy or not _PUBLIC_ONLY.get():
+        return addresses
+    public = [found for found in addresses if not _address_is_private(found[4][0])]
+    if not public:
+        raise _NotPublic("the name answers no public address")
+    return public
+
+
 def _time_left(deadline: float) -> float:
     """The seconds a call has left, or TimeoutError once it has none."""
     left = deadline - time.monotonic()
@@ -352,7 +387,9 @@ class _DeadlineConnection(http.client.HTTPSConnection):
 
     def _connect_by_the_deadline(self, address, timeout=None, source_address=None):
         host, port = address
-        addresses = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        # Judged where the connection is made (see _reach), not only where the name was looked up before.
+        addresses = _addresses_allowed(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM),
+                                       through_a_proxy=bool(self._tunnel_host))
         failure: Optional[OSError] = None
         for tried, (family, kind, proto, _name, where) in enumerate(addresses):
             # Each address gets an even share of what is left. One that never answers (a route that drops IPv6,
@@ -421,6 +458,8 @@ def fetch_json(url: str, *, method: str = "GET", data: Optional[bytes] = None, h
             raise OidcError(PROVIDER_ERROR, f"token endpoint answered {exc.code}") from exc
         raise OidcError(TEMPORARILY_UNAVAILABLE, f"HTTP {exc.code}") from exc
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+        if isinstance(exc, _NotPublic) or isinstance(getattr(exc, "reason", None), _NotPublic):
+            raise OidcError(ENDPOINT_REFUSED, "the endpoint resolves to a private address") from exc
         raise OidcError(TEMPORARILY_UNAVAILABLE, type(exc).__name__) from exc
     if len(raw) > MAX_BODY_BYTES:
         raise OidcError(TEMPORARILY_UNAVAILABLE, "answer over the size cap")
@@ -503,7 +542,7 @@ def _discovery_document(provider: ProviderConfig, url: str, *, fetch: Callable, 
     """Fetch the discovery document and check it: the issuer exactly as configured, the required endpoints, an
     allowed signing algorithm, ``S256`` when the document lists methods, every endpoint under the endpoint rule."""
     check_endpoint(url, private_network=provider.private_network, resolve=resolve)
-    doc = fetch(url)
+    doc = _reach(provider, fetch, url)
     issuer = doc.get("issuer")
     if not isinstance(issuer, str) or issuer != provider.issuer:
         raise OidcError(ISSUER_MISMATCH, "the discovery document's issuer is not the configured one")
@@ -591,7 +630,7 @@ def signing_keys(provider: ProviderConfig, discovery: Discovery, *, kid: Optiona
         raise OidcError(TEMPORARILY_UNAVAILABLE, "the provider's keys were fetched moments ago without that key")
     try:
         check_endpoint(discovery.jwks_uri, private_network=provider.private_network, resolve=resolve)
-        keys = _usable_keys(fetch(discovery.jwks_uri))
+        keys = _usable_keys(_reach(provider, fetch, discovery.jwks_uri))
     except OidcError as exc:
         _remember_failure(cache, failed_key, exc, now)          # any failure: a refetch cannot be forced per request
         good = _good_copy(cache, good_key, now, kid=kid) if stale_ok else None
@@ -663,8 +702,8 @@ def exchange_code(provider: ProviderConfig, discovery: Discovery, *, code: str, 
     else:
         credentials = f"{urllib.parse.quote(provider.client_id, safe='')}:{urllib.parse.quote(provider.client_secret, safe='')}"
         headers["Authorization"] = "Basic " + base64.b64encode(credentials.encode("utf-8")).decode("ascii")
-    body = fetch(discovery.token_endpoint, method="POST", data=urllib.parse.urlencode(form).encode("ascii"),
-                 headers=headers)
+    body = _reach(provider, fetch, discovery.token_endpoint, method="POST",
+                  data=urllib.parse.urlencode(form).encode("ascii"), headers=headers)
     if "error" in body:
         code = body.get("error")
         raise OidcError(PROVIDER_ERROR, "token endpoint error " + (code if code in _TOKEN_ERROR_CODES else "(other)"))
@@ -840,7 +879,7 @@ def userinfo(provider: ProviderConfig, discovery: Discovery, access_token: str, 
     if not discovery.userinfo_endpoint:
         raise OidcError(DISCOVERY_INVALID, "no userinfo endpoint")
     check_endpoint(discovery.userinfo_endpoint, private_network=provider.private_network, resolve=resolve)
-    body = fetch(discovery.userinfo_endpoint, headers={"Authorization": f"Bearer {access_token}"})
+    body = _reach(provider, fetch, discovery.userinfo_endpoint, headers={"Authorization": f"Bearer {access_token}"})
     if body.get("sub") != expected_sub:
         raise OidcError(TOKEN_INVALID, "userinfo sub is not the ID token's")
     return body

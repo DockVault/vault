@@ -91,6 +91,7 @@ class _Server:
         self.elsewhere.listen(8)
         self.elsewhere_port = self.elsewhere.getsockname()[1]
         self.reached_elsewhere = []
+        self.accepted = 0
         self.open = True
         threading.Thread(target=self._serve, daemon=True).start()
         threading.Thread(target=self._serve_elsewhere, daemon=True).start()
@@ -123,6 +124,7 @@ class _Server:
                 plain, _ = self.listener.accept()
             except OSError:
                 return
+            self.accepted += 1
             threading.Thread(target=self._answer, args=(plain,), daemon=True).start()
 
     def _answer(self, plain):
@@ -201,6 +203,62 @@ def test_an_answer_that_points_elsewhere_is_refused_and_the_clients_credentials_
     with pytest.raises(oc.OidcError):
         oc.fetch_json(url, opener=server.opener(oc))
     assert server.reached_elsewhere == []
+
+
+def test_a_name_that_answers_inside_where_the_connection_is_made_reaches_nothing(server):
+    """The endpoint rule looks a provider's name up before a call, and the connection looks it up again. Whoever
+    answers for the name can say a public address first and one inside a moment later. The connection judges
+    what it is given: for a provider not marked as inside it connects to nothing that is not public (this
+    machine's own address here), and the call is refused as the rule refuses it; for one marked as inside, and
+    through a proxy (which looks the name up itself), it connects as before."""
+    import types
+    oc = _oc()
+    url = f"https://127.0.0.1:{server.port}/ok"
+
+    def fetch(address, **kw):
+        return oc.fetch_json(address, opener=server.opener(oc), **kw)
+
+    inside, outside = types.SimpleNamespace(private_network=True), types.SimpleNamespace(private_network=False)
+    assert oc._reach(inside, fetch, url) == {"a": 1} and server.accepted == 1
+    with pytest.raises(oc.OidcError) as refused:
+        oc._reach(outside, fetch, url)
+    assert refused.value.code == oc.ENDPOINT_REFUSED and "private address" in refused.value.detail
+    assert server.accepted == 1                                  # no connection was opened
+    assert oc._PUBLIC_ONLY.get() is False                        # the rule ends with the call, failed or not
+    assert oc._reach(inside, fetch, url) == {"a": 1} and server.accepted == 2
+    # Through a proxy the connection is the proxy's to make: this one reaches the proxy as before.
+    connection = oc._DeadlineConnection("127.0.0.1", server.port, timeout=5)
+    token = oc._PUBLIC_ONLY.set(True)
+    try:
+        with pytest.raises(oc._NotPublic):
+            connection._connect_by_the_deadline(("127.0.0.1", server.port))
+        connection.set_tunnel("idp.example.com", 443)
+        connection._connect_by_the_deadline(("127.0.0.1", server.port)).close()
+    finally:
+        oc._PUBLIC_ONLY.reset(token)
+    waited = time.monotonic() + 5
+    while server.accepted < 3 and time.monotonic() < waited:      # the server counts a moment after the connect
+        time.sleep(0.01)
+    assert server.accepted == 3
+    # A name that answers both: only what is public is tried, in the order it was given.
+    def entry(address):
+        return (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))
+
+    answered = [entry("10.0.0.5"), entry("8.8.8.8"), entry("127.0.0.1"), entry("169.254.169.254"), entry("1.1.1.1"),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 443, 0, 0)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700:4700::1111", 443, 0, 0))]
+    assert oc._addresses_allowed(answered, through_a_proxy=False) == answered        # no call is held: all of them
+    token = oc._PUBLIC_ONLY.set(True)
+    try:
+        assert [found[4][0] for found in oc._addresses_allowed(answered, through_a_proxy=False)] == [
+            "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"]
+        assert oc._addresses_allowed(answered, through_a_proxy=True) == answered
+        with pytest.raises(oc._NotPublic):
+            oc._addresses_allowed([entry("10.0.0.5"), entry("192.168.1.1")], through_a_proxy=False)
+        with pytest.raises(oc._NotPublic):
+            oc._addresses_allowed([], through_a_proxy=False)
+    finally:
+        oc._PUBLIC_ONLY.reset(token)
 
 
 def test_a_whole_call_ends_at_its_timeout_however_slowly_the_provider_sends_its_headers(server):
