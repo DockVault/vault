@@ -465,3 +465,17 @@ def test_every_sign_in_the_application_builds_says_what_its_first_proof_read():
                 if "sessions_ended" not in said and "is_temporary" not in said:
                     missing.append(f"{path.relative_to(ROOT).as_posix()}:{node.lineno}")
     assert missing == [], missing
+
+
+def test_a_deletion_takes_the_accounts_turn_after_the_vault_rows_and_before_the_account_goes():
+    """The order inside the deletion: the vault rows it locks, the account's turn at its sessions, the
+    administrators' rows, the withdrawal of the account's requests, the row itself. (The meeting with a sign-in
+    that is being written is forced on PostgreSQL in tests/test_sign_in_lock_order_live.py.)"""
+    import inspect
+    from app.api import api_server as api
+    source = inspect.getsource(api.delete_user)
+    steps = ("record_rotations_owed_by(db, user.id)", "_sessions_turn(db, user.id)", "removes_last_admin(db, user)",
+             "_account_lost_standing(db, user", "db.delete(user)")
+    assert all(source.count(step) == 1 for step in steps), [(step, source.count(step)) for step in steps]
+    order = [source.index(step) for step in steps]
+    assert order == sorted(order), order

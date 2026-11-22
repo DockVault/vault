@@ -12319,6 +12319,15 @@ async def delete_user(
     from app.api.ecc_router import record_rotations_owed_by
     record_rotations_owed_by(db, user.id)
 
+    # The account's turn at its sessions (the order of the locks, app/services/sign_in.py). A sign-in of the
+    # account that is being written holds it: the deletion waits for that sign-in's commit and then removes what
+    # it wrote, or comes first, and the sign-in finds no account. Without the turn, the database's own removal
+    # of the account's held sign-ins waited for the row a sign-in had just spent while that sign-in's next write
+    # waited for the account's row, and the database ended one of the two, usually the deletion: the account
+    # stayed, with a new session. After the vault rows above, which are always locked first, and before the
+    # administrators' rows below.
+    _sessions_turn(db, user.id)
+
     # Never delete the last administrator who can act (see app/core/last_admin.py).
     if user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=LAST_ADMIN_DETAIL)

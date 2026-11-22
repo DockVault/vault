@@ -93,7 +93,9 @@ EXPIRED = "This login attempt has expired; start again."
 # What is written in the account's turn at its sessions: a session, a sign-in held for a further step, and a
 # factor set up at a held sign-in, each in one transaction with a check that its proof still stands
 # (in_the_accounts_turn), committed once. What ends an account's sessions takes the same turn, so each of the two
-# comes wholly before the other.
+# comes wholly before the other. The deletion of an account is one of them: it takes the turn after the vault rows
+# it locks and before it removes the account's row (the database then removes the account's held sign-ins and
+# sessions, which a sign-in under way would otherwise be writing).
 
 
 @dataclass

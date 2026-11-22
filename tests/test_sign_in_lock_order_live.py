@@ -12,6 +12,10 @@ application's own functions, the meeting forced with events.
   while the password was changed checks the password that stands, and is refused.
 - A sign-in, and a sign-in held for a further step, read before the account's sessions were ended and written
   after: refused, with nothing written.
+- A held sign-in that goes on (to a session, or to a further hold) and an administrator's deletion of the account
+  at that moment: the sign-in has spent its held row and holds the account's turn; the deletion's removal of the
+  account's held sign-ins and the sign-in's next write waited for each other, and the database ended one of the
+  two. The deletion takes the turn now: both finish, and the account is gone with what the sign-in wrote.
 
 test_sign_in_in_the_accounts_turn.py holds the same rules offline, where the turn is stood in for.
 """
@@ -196,6 +200,56 @@ def a_lock(admin_id, uid):
     return run
 
 
+# A held sign-in that goes on: the writer spends it and then stays for a while, with the account's turn and the
+# spent row held, before it writes what the held sign-in becomes.
+_spend, spent = sign_in.consume_pending, threading.Event()
+
+
+def spend_and_stay(db, pending, *, commit=True):
+    _spend(db, pending, commit=commit)
+    pause = getattr(here, "stay_spent", 0)
+    if pause:
+        here.stay_spent = 0
+        spent.set()
+        time.sleep(pause)
+sign_in.consume_pending = spend_and_stay
+
+
+def a_held_sign_in(uid):
+    with SessionLocal() as s:
+        held = PendingLogin(user_id=uid, client_ip=IP, expires_at=datetime.utcnow() + timedelta(minutes=5))
+        s.add(held)
+        s.commit()
+        return held.id
+
+
+def held_writer(uid, held_id, becomes):
+    def run():
+        s = SessionLocal()
+        try:
+            user = s.get(User, uid)
+            result = sign_in.SignInResult(user, [sign_in.PASSWORD], IP, pending=s.get(PendingLogin, held_id),
+                                          sessions_ended=sign_in.as_read(user))
+            here.stay_spent = 1.6
+            if becomes == "a session":
+                sign_in.complete_sign_in(s, result)
+            else:
+                sign_in.begin_pending(s, result, sign_in.STAGE_SECOND_FACTOR)
+            return "written"
+        finally:
+            s.close()
+    return run
+
+
+def a_deletion(admin_id, uid):
+    def run():
+        spent.wait(15)
+        with SessionLocal() as s:
+            asyncio.run(api.delete_user(user_id=uid, current_user=s.get(User, admin_id), db=s, request=REQUEST))
+            return "deleted"
+    return run
+
+
 pair, out = os.environ["PAIR"], {}
 ada, _ = account("ada", RoleEnum.ADMIN)
 bea, _ = account("bea", RoleEnum.ADMIN)
@@ -262,6 +316,13 @@ elif pair == "an attempt that waited for its turn":
             changed.set()
     out = together(door=attempt, ender=change)
     out["sessions"] = sessions(alice)
+elif pair in ("a deletion and a held sign-in that becomes a session", "a deletion and a held sign-in held again"):
+    held = a_held_sign_in(alice)
+    becomes = "a session" if pair.endswith("a session") else "held again"
+    out = together(writer=held_writer(alice, held, becomes), ender=a_deletion(ada, alice))
+    with SessionLocal() as s:
+        out["the account is there"] = s.get(User, alice) is not None
+    out["sessions"], out["held"], out["the sign-in stayed"] = sessions(alice), held_open(alice), spent.is_set()
 elif pair in ("a session read before", "a held sign-in read before"):
     with SessionLocal() as s:
         user = s.get(User, alice)
@@ -314,3 +375,13 @@ def test_a_sign_in_read_before_the_sessions_were_ended_is_not_written_after(db_n
     out = run_in(db_name, SCENARIO, env={"PAIR": f"{written} read before"})
     assert out["writer"][:3] == ["error", "HTTPException", "401"], out
     assert out["sessions"] == [] and out["held"] == 0, out
+
+
+@pytest.mark.parametrize("becomes", ["a held sign-in that becomes a session", "a held sign-in held again"])
+def test_a_deletion_and_a_held_sign_in_that_goes_on_both_finish(db_name, becomes):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "a deletion and " + becomes})
+    assert out["the sign-in stayed"] is True, out            # with its held row spent and the account's turn held
+    assert out["writer"] == ["ok", "written"], out
+    assert out["ender"] == ["ok", "deleted"], out            # not ended by the database as one of a ring of waiters
+    assert out["ender seconds"] >= 1.0, out                  # it waited for the turn the sign-in held
+    assert out["the account is there"] is False and out["sessions"] == [] and out["held"] == 0, out
