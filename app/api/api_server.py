@@ -7193,7 +7193,15 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
             raise HTTPException(status_code=409, detail=(
                 f"{user.username} signs in only through its organisation's provider and holds no password, which an "
                 "administrator needs; allow password sign-in on the provider first."))
-        sso_only.allow_password_sign_in(db, user)
+        # The account's turn at its sessions before the account is changed (the order of the locks: the turn,
+        # then the account's row; the take-back that follows takes the turn it then already holds), and the flag
+        # read again in it: a change of the provider's setting may have ended it a moment ago.
+        _sessions_turn(db, user.id)
+        refresh = getattr(db, "refresh", None)
+        if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
+            refresh(user, attribute_names=["sso_only"])
+        if getattr(user, "sso_only", False):
+            sso_only.allow_password_sign_in(db, user)
     # The account's sessions, and its sign-ins under way, end with the promotion. Each was made with what a user
     # owes: a passkey by itself, where the role lets one in alone, or a password with no second factor. An
     # administrator always gives the password and whatever the administrators' policy asks, and a session from

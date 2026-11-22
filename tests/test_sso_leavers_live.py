@@ -306,8 +306,9 @@ def _link(account_id, *, days_ago, **policy):
     """A provider row of the test's own, on (so the person is told to use it) with no button on the sign-in page,
     and an identity of the account on it whose last sign-in there was ``days_ago`` days ago. Its id and name."""
     pid, name = str(uuid.uuid4()), "leavers-" + uuid.uuid4().hex[:8]
-    psql("INSERT INTO sso_providers (id, kind, state, name, label, policy) VALUES "
-         f"('{pid}', 'oidc', 'enabled', '{name}', 'Sign in with {name}', '{json.dumps(policy)}')")
+    psql("INSERT INTO sso_providers (id, kind, state, name, label, policy, created_at, updated_at) VALUES "
+         f"('{pid}', 'oidc', 'enabled', '{name}', 'Sign in with {name}', '{json.dumps(policy)}', {UTC_NOW}, "
+         f"{UTC_NOW})")
     psql("INSERT INTO external_identities (id, user_id, provider_id, issuer, subject, subject_source, linked_at, "
          "linked_by, last_sign_in_at) VALUES "
          f"('{uuid.uuid4()}', '{account_id}', '{pid}', 'https://idp.example', 'subject-{name}', 'oidc:sub', "

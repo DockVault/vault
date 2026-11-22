@@ -544,8 +544,9 @@ def test_an_account_made_at_a_first_sign_in_is_promoted_and_then_chooses_a_passw
     monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: None)
     monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
     monkeypatch.setattr(S, "hash_password", lambda secret: "argon2:" + secret, raising=False)
-    recorded, revoked = [], []
+    recorded, revoked, turns = [], [], []
     monkeypatch.setattr(admin_grants, "record", lambda db, user_id, **kw: recorded.append(user_id))
+    monkeypatch.setattr(S, "_sessions_turn", lambda db, user_id: turns.append((user_id, users[user_id].sso_only)))
     monkeypatch.setattr(S, "_revoke_reset_links_outranked_by", lambda db, user, actor: None)
     monkeypatch.setattr(S, "_revoke_sessions", lambda db, **kw: revoked.append(kw["user_id"]) or 1)
     monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db, user_id: 0)
@@ -560,17 +561,26 @@ def test_an_account_made_at_a_first_sign_in_is_promoted_and_then_chooses_a_passw
     monkeypatch.setattr(S, "AuditLogger", _Audit)
     root = _user("root", role="admin")
     alice, p, i, db = _world(linked_by="jit", sso_only=True, password_set_by=None, password_set_by_other_at=None)
+    users = {alice.id: alice}
     monkeypatch.setattr(db, "add", lambda row: None)
     S._record_admin_grant(db, alice, by=root)
     assert recorded == [alice.id] and alice.sso_only is False
+    assert turns == [(alice.id, True)]                  # the account's turn, before the account was changed
     assert password_origin.nobody_knows(alice) and password_origin.is_set_by_other(alice)
     assert S._take_back_password_at_promotion(db, alice, by=root) == {"user_id": alice.id} and revoked == [alice.id]
     # Held by a provider whose people hold no password: an administrator needs one, so the setting changes first.
     bob, q, j, db2 = _world(policy={"sso_password_login": "disabled"}, username="bob", sso_only=True)
+    users[bob.id] = bob
     with pytest.raises(HTTPException) as refused:
         S._record_admin_grant(db2, bob, by=root)
     assert refused.value.status_code == 409 and "allow password sign-in on the provider first" in refused.value.detail
-    assert bob.sso_only is True and recorded == [alice.id]
+    assert bob.sso_only is True and recorded == [alice.id] and len(turns) == 1
+    # An account that is not flagged takes no turn here and is changed in nothing.
+    carol, r, k, db3 = _world(username="carol")
+    users[carol.id] = carol
+    before = carol.password_hash
+    S._record_admin_grant(db3, carol, by=root)
+    assert recorded == [alice.id, carol.id] and len(turns) == 1 and carol.password_hash == before
 
 
 def test_the_provider_page_sends_both_settings():
