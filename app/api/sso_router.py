@@ -959,6 +959,12 @@ async def finish_link(
     code came back to the tab and session that started the link."""
     api = _api()
     _refuse_temp(current_user)
+    # An account held to its provider's sign-in adds no other way in: from a session a password made before the
+    # hold, a link to another provider would let the person back in without the provider that asks for them.
+    due = sso_freshness.held_to_a_provider(db, current_user)
+    if due is not None:
+        raise HTTPException(status_code=409, detail={"reason": "sso_sign_in_due",
+                                                     "message": sso_freshness.way_in_text(db, due)})
     client_ip = api.get_client_ip(request)
     record = _claim_handover(db, request, current_user, body, purpose=sso_state.LINK)
     try:
@@ -1187,6 +1193,12 @@ async def start_link(
     under the account.second_factor step-up: a provider identity is a new way into the account."""
     api = _api()
     _refuse_temp(current_user)
+    # An account held to its provider's sign-in adds no other way in: from a session a password made before the
+    # hold, a link to another provider would let the person back in without the provider that asks for them.
+    due = sso_freshness.held_to_a_provider(db, current_user)
+    if due is not None:
+        raise HTTPException(status_code=409, detail={"reason": "sso_sign_in_due",
+                                                     "message": sso_freshness.way_in_text(db, due)})
     client_ip = api.get_client_ip(request)
     _limit_start(client_ip)
     claims = _session_claims(request)
@@ -1269,6 +1281,16 @@ async def unlink_my_identity(
                 "you in now: without this one nothing would sign you in. Set a password first (\"Forgot password\" "
                 "on the sign-in page, or ask an administrator for a reset link), then unlink."))
     row = _provider(db, identity.provider_id)
+    # The identity the account was made with at its first sign-in, while that provider holds such accounts to no
+    # password: only an administrator's act ends that hold (the provider's setting, a promotion). Unlinked by its
+    # owner, who had linked another provider meanwhile, the account could set itself the password the provider
+    # that made it says it may not have.
+    if row is not None and sso_only.holds_to_no_password(row, account, getattr(identity, "linked_by", None)) \
+            and getattr(identity, "linked_by", None) == sso_only.MADE_AT_A_FIRST_SIGN_IN:
+        label = (row.label or row.name)
+        raise HTTPException(status_code=409, detail=(
+            f"Your account was made at its first sign-in through {label}, which stays its way in: it is not "
+            "unlinked here. Ask an administrator."))
     # An identity whose provider refused the person, or whose freshness has lapsed, is not unlinked by its owner:
     # unlinking would end the provider's say over the account's keys and credentials.
     standing = sso_freshness.deadline_of(identity, row)

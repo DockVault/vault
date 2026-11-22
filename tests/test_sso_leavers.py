@@ -67,6 +67,9 @@ def test_a_missed_deadline_closes_the_other_ways_in_where_the_provider_says_so()
     alice, p, i, db = _world()
     held = F.held_to_a_provider(db, alice)
     assert held is not None and held.identity_id == str(i.id) and held.ends_sign_in is True and not held.refused
+    # From the moment the days have run out, and not a second before.
+    assert F.held_to_a_provider(db, alice, now=held.due) is not None
+    assert F.held_to_a_provider(db, alice, now=held.due - timedelta(seconds=1)) is None
     # Inside the days: nothing is closed.
     i.last_sign_in_at = datetime.utcnow() - timedelta(days=29)
     assert F.held_to_a_provider(db, alice) is None
@@ -161,6 +164,12 @@ def test_the_provider_that_holds_the_account_is_the_one_it_is_told_about():
     held = F.held_to_a_provider(db, alice)
     assert held.provider_id == str(q.id) and held.provider_name == "Fabrikam"
     assert F.way_in_text(db, held).startswith("Sign in through Fabrikam: ")
+    # Of two that hold the account, the one whose days ran out first is named.
+    r = _provider(name="Northwind", label="Sign in with Northwind")
+    k = _identity(alice, r, subject="subject-3", last_sign_in_at=datetime.utcnow() - timedelta(days=31))
+    db.tables[SsoProvider].append(r)
+    db.tables[ExternalIdentity].append(k)
+    assert F.held_to_a_provider(db, alice).provider_id == str(q.id)
 
 
 def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
@@ -182,6 +191,8 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     # A provider that is off sends nobody to a button that is not there (an account held before it went off).
     p.state = "disabled"
     assert F.way_in_text(db, held) == NOT_AVAILABLE and F.way_in_text(db, refused) == NOT_AVAILABLE
+    p.state = "draft"                                    # nor one that is not finished
+    assert F.way_in_text(db, refused) == NOT_AVAILABLE
     db.tables[SsoProvider].clear()
     assert F.way_in_text(db, held) == NOT_AVAILABLE
 

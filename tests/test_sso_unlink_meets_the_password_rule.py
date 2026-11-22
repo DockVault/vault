@@ -170,3 +170,72 @@ def test_a_promotion_made_while_the_settling_waits_for_its_turn_is_what_it_decid
     saving.close()
     assert outcome is None and turns == [str(alice.id)], (outcome, turns)
     assert _as_left(db, alice) == (False, 1)
+
+
+def _quiet(monkeypatch):
+    from app.api import sso_router
+    monkeypatch.setattr(sso_router, "_tell_owner", lambda *a, **k: None)
+    monkeypatch.setattr(sso_router, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_sessions_turn", lambda session, owner: None)
+    return sso_router
+
+
+def test_the_identity_an_account_was_made_with_is_not_unlinked_by_its_owner_while_its_provider_holds_it(
+        db, world, monkeypatch):
+    """An account made at its first sign-in holds no password while the provider that made it says so. Its owner,
+    who has linked another provider meanwhile, does not unlink the one that made it: the account would then be
+    held by nothing, and could set itself a password. Once that provider lets such accounts set a password (the
+    save settles them), the identity is unlinked as any other."""
+    from app.core import password_origin
+    from app.core.models import ExternalIdentity, SsoProvider, User
+    sso_router = _quiet(monkeypatch)
+    provider, alice, identity = _linked(db)
+    identity.linked_by, alice.sso_only = "jit", True
+    password_origin.set_by_other(alice, None)
+    password_origin.mark_nobody_knows(alice)
+    other = SsoProvider(id=uuid.uuid4(), state="enabled", kind="oidc", name="fabrikam", label="Fabrikam",
+                        issuer="https://idp2.example/", client_id="c", client_secret_enc="e", policy=None)
+    db.add(other)
+    db.add(ExternalIdentity(user_id=alice.id, provider_id=other.id, issuer="https://idp2.example/", subject="s-2",
+                            subject_source="oidc:sub", linked_by="email"))
+    db.commit()
+    me = db.query(User).filter(User.id == alice.id).first()
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(sso_router.unlink_my_identity(identity_id=identity.id, request=_request(),
+                                                    current_user=me, db=db))
+    assert refused.value.status_code == 409, refused.value.detail
+    assert refused.value.detail.startswith("Your account was made at its first sign-in through Contoso, which stays")
+    db.rollback()
+    assert _as_left(db, alice) == (True, 2)
+    # The provider lets the accounts it makes set a password, and its save has settled this one.
+    provider.policy, me.sso_only = {"sso_jit_password": True}, None
+    db.commit()
+    run_coroutine(sso_router.unlink_my_identity(identity_id=identity.id, request=_request(), current_user=me, db=db))
+    assert _as_left(db, alice) == (False, 1)
+
+
+def test_an_account_held_to_its_providers_sign_in_adds_no_other_way_in(db, world, monkeypatch):
+    """From a session its password made before the days ran out, a held account starts no link to another
+    provider and finishes none: that provider's sign-in would let the person back in without the one that asks."""
+    from datetime import datetime, timedelta
+    from app.core.models import User
+    from app.services import sso_freshness
+    sso_router = _quiet(monkeypatch)
+    provider, alice, identity = _linked(db)
+    identity.last_sign_in_at = datetime.utcnow() - timedelta(days=40)
+    db.commit()
+    me = db.query(User).filter(User.id == alice.id).first()
+    assert sso_freshness.held_to_a_provider(db, me) is not None
+    for route, how in ((sso_router.start_link, {"provider_id": str(provider.id)}), (sso_router.finish_link, {})):
+        with pytest.raises(HTTPException) as refused:
+            run_coroutine(route(body=None, request=_request(), current_user=me, db=db, **how))
+        assert refused.value.status_code == 409, (route.__name__, refused.value.detail)
+        assert refused.value.detail["reason"] == "sso_sign_in_due"
+        assert refused.value.detail["message"].startswith("Sign in through contoso: ")
+    # Inside its days the account is not refused for that (the link then meets its own checks).
+    identity.last_sign_in_at = datetime.utcnow()
+    db.commit()
+    for route, how in ((sso_router.start_link, {"provider_id": str(provider.id)}), (sso_router.finish_link, {})):
+        with pytest.raises(Exception) as other:                   # noqa: PT011 -- whatever the link asks next
+            run_coroutine(route(body=None, request=_request(), current_user=me, db=db, **how))
+        assert "sso_sign_in_due" not in str(getattr(other.value, "detail", other.value)), route.__name__
