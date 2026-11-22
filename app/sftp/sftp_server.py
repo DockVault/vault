@@ -309,9 +309,15 @@ def _mfa_sftp_requires_temp_cred(db, user, *, fail_closed: bool = False) -> bool
     through a temporary credential — direct password / SSH-key auth is refused, so SFTP cannot become a
     single-factor back door around MFA. Reuses the exact per-group temp-cred mechanism. Reads the admin
     Settings store. If it cannot be evaluated, _policy_unreadable decides: the sign-in is refused, a
-    live session's re-check answers "not required"."""
+    live session's re-check answers "not required".
+
+    Enrolled means an authenticator that is active, or a passkey: the web asks an account that holds a passkey
+    for it at the second step, so its password or its SSH key alone must not open SFTP. Every passkey that is
+    not retired counts here, whatever the passkey switch and the vault's address say (the web judges those;
+    this process cannot, and refuses rather than guess). An account whose factor an administrator reset, and
+    that has not set the next one up, is held to the rule as the web holds it to setting one up."""
     try:
-        from app.core.models import SystemSetting, SecondFactorEnrollment, user_groups
+        from app.core.models import SystemSetting, SecondFactorEnrollment, WebAuthnCredential, user_groups
         from app.core import second_factor_policy as pol
         from sqlalchemy import select
         row = db.query(SystemSetting).filter(SystemSetting.key == "global").first()
@@ -322,6 +328,11 @@ def _mfa_sftp_requires_temp_cred(db, user, *, fail_closed: bool = False) -> bool
         has_active = db.query(SecondFactorEnrollment.id).filter(
             SecondFactorEnrollment.user_id == user.id,
             SecondFactorEnrollment.status == "active").first() is not None
+        if not has_active:
+            has_active = db.query(WebAuthnCredential.id).filter(
+                WebAuthnCredential.user_id == user.id,
+                WebAuthnCredential.retired_at.is_(None)).first() is not None
+        reset = not has_active and getattr(user, "second_factor_reset_at", None) is not None
         user_gids = [
             str(r[0]) for r in db.execute(
                 select(user_groups.c.group_id).where(user_groups.c.user_id == user.id)
@@ -330,7 +341,7 @@ def _mfa_sftp_requires_temp_cred(db, user, *, fail_closed: bool = False) -> bool
         eff = pol.effective_second_factor(
             mode=p["mfa_mode"], required_group_ids=p["mfa_required_group_ids"],
             required_user_ids=p["mfa_required_user_ids"], user_group_ids=user_gids,
-            user_id=user.id, has_active_enrollment=has_active)
+            user_id=user.id, has_active_enrollment=has_active, reset_by_admin=reset)
         return bool(eff["in_effect"])
     except Exception as e:  # noqa: BLE001
         return _policy_unreadable(db, user, e, fail_closed)
