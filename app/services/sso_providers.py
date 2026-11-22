@@ -241,6 +241,24 @@ def hold_lapsed(db, row, *, now=None) -> int:
     return held
 
 
+def due_at_turn_on(db, row, *, now=None) -> int:
+    """How many accounts linked to ``row`` (which is on) its days hold to a provider's sign-in right now: what an
+    administrator is told when a provider is turned on after a time in which nobody could sign in through it."""
+    from datetime import datetime
+    from app.core.models import ExternalIdentity, User
+    from app.services import sso_freshness
+    now = now or datetime.utcnow()
+    due = 0
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
+        standing = sso_freshness.deadline_of(identity, row)
+        if standing is None or standing.refused or not sso_freshness.closes_now(standing, now):
+            continue
+        user = db.query(User).filter(User.id == identity.user_id).first()
+        if user is not None and sso_freshness.closes_the_other_ways_in(db, user, standing):
+            due += 1
+    return due
+
+
 def fingerprint(row) -> str:
     """The connection settings of ``row`` as one short value: equal while a test sign-in still speaks for them.
     The secret enters as a digest of its stored form, never as itself."""

@@ -89,11 +89,18 @@ def test_a_missed_deadline_closes_the_other_ways_in_where_the_provider_says_so()
     p.policy, i.last_sign_in_at = None, datetime.utcnow() - timedelta(days=1)
     held = F.held_to_a_provider(db, alice)
     assert held is not None and held.refused and held.due > datetime.utcnow()
-    # A provider that is turned off goes on counting, and goes on holding.
+    # While the provider is turned off its days close nothing (nobody can sign in through it); the keys still pause.
     i.last_sign_in_at, i.refused_at, p.policy = datetime.utcnow() - LONG_AGO, None, None
     for state in ("disabled", "draft"):
         p.state = state
-        assert F.held_to_a_provider(db, alice) is not None, state
+        assert F.held_to_a_provider(db, alice) is None and F.lapsed(db, alice.id) is not None, state
+        assert F.deadlines(db, alice.id)[0].provider_on is False
+        assert F.closes_a_connection(db, alice, by_password=True) is False
+        assert F.closes_a_connection(db, alice, by_password=False) is True
+        assert F.closes_the_other_ways_in(db, alice, F.deadlines(db, alice.id)[0]) is False
+    # Turned on again, the days count as they stand.
+    p.state = "enabled"
+    assert F.held_to_a_provider(db, alice) is not None and F.deadlines(db, alice.id)[0].provider_on is True
     # Nobody, and an account linked to nothing.
     assert F.held_to_a_provider(db, None) is None and F.held_to_a_provider(db, _user("bob")) is None
 
@@ -111,6 +118,36 @@ def test_an_account_that_keeps_a_password_of_its_own_is_never_held(monkeypatch, 
     assert F.held_to_a_provider(db, alice) is None and F.closes_the_other_ways_in(db, alice, found) is False
     assert F.closes_a_connection(db, alice, by_password=True) is False
     assert F.closes_a_connection(db, alice, by_password=False) is True
+
+
+def test_turning_a_provider_off_hands_nobody_a_password_back():
+    """What held an account before the turn-off goes on holding it: a refusal, and days that had already run out,
+    which the turn-off records as one (hold_lapsed). An account inside its days when the provider went off is not
+    held however long it stays off, and is held by its days again from the moment it is turned on."""
+    from app.services import sso_providers as providers
+    lapsed, p, i, db = _world()
+    fresh_one = _user("bob")
+    j = _identity(fresh_one, p, subject="subject-2", last_sign_in_at=datetime.utcnow() - timedelta(days=20))
+    refused_one = _user("carol")
+    k = _identity(refused_one, p, subject="subject-3", last_sign_in_at=datetime.utcnow() - timedelta(days=2),
+                  refused_at=datetime.utcnow() - timedelta(days=1))
+    db.tables[User] += [fresh_one, refused_one]
+    db.tables[ExternalIdentity] += [j, k]
+    assert providers.hold_lapsed(db, p) == 1 and i.refused_at is not None
+    assert getattr(j, "refused_at", None) is None
+    p.state = "disabled"
+    assert F.held_to_a_provider(db, lapsed).refused and F.held_to_a_provider(db, refused_one).refused
+    assert F.way_in_text(db, F.held_to_a_provider(db, lapsed)) == NOT_AVAILABLE
+    assert F.held_to_a_provider(db, fresh_one) is None
+    # Sixty days off: the account that was inside its days is still not held, though its keys have paused.
+    later = datetime.utcnow() + timedelta(days=60)
+    assert F.held_to_a_provider(db, fresh_one, now=later) is None and F.lapsed(db, fresh_one.id, now=later) is not None
+    # Turned on then: its days count as they stand, and the administrator is told how many that is.
+    p.state = "enabled"
+    assert F.held_to_a_provider(db, fresh_one, now=later) is not None
+    assert providers.due_at_turn_on(db, p, now=later) == 1 and providers.due_at_turn_on(db, p) == 0
+    p.policy = {"sso_lapse_ends_sign_in": False}
+    assert providers.due_at_turn_on(db, p, now=later) == 0
 
 
 def test_the_provider_that_holds_the_account_is_the_one_it_is_told_about():
@@ -142,7 +179,7 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     assert refused.refused and F.way_in_text(db, refused) == (
         "Contoso did not admit your account when it last signed in there, so its password and passkeys do not sign "
         "it in. Sign in through Contoso once it admits you, or ask your administrator.")
-    # A provider that is off sends nobody to a button that is not there.
+    # A provider that is off sends nobody to a button that is not there (an account held before it went off).
     p.state = "disabled"
     assert F.way_in_text(db, held) == NOT_AVAILABLE and F.way_in_text(db, refused) == NOT_AVAILABLE
     db.tables[SsoProvider].clear()

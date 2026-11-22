@@ -20,6 +20,14 @@ session no provider made; an SFTP connection that is open goes no further (:func
 it a person who has left keeps signing in with a password the vault still holds, for as long as nobody removes the
 account. An account that must keep a password of its own (an administrator, a holder of the auditor right) is never
 held: its password is the way in while the provider cannot be reached.
+
+While a provider is turned off here, its days close no other way in: nobody can sign in through it then, so not
+having signed in there says nothing about a person, and every linked account would lose its password a window
+after an administrator's turn-off. (The keys go on pausing on their day, as above.) What held an account before
+the turn-off goes on holding it: a refusal by the provider, and days that had already run out, which the turn-off
+records as one (app/services/sso_providers.py hold_lapsed). So turning a provider off, during an incident say,
+hands nobody a password back; an administrator lifts each such account under Identities. Turned on again, the
+days count as they stand: an account that did not sign in there within them signs in through the provider.
 """
 from __future__ import annotations
 
@@ -49,6 +57,7 @@ class Deadline:
     refused: bool               # the provider refused the person after their last sign-in through it
     window_days: int = 0        # the provider's freshness window (0: off, a refusal alone)
     ends_sign_in: bool = False  # missed, it also closes the account's ways in that go through no provider
+    provider_on: bool = True    # the provider is turned on here (its days close the other ways in only then)
 
 
 def warning_lead(window_days: int) -> timedelta:
@@ -92,7 +101,8 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
     name = (getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
     return Deadline(identity_id=str(identity.id), user_id=str(identity.user_id), provider_id=str(identity.provider_id),
                     provider_name=name or "your identity provider", due=due, refused=refused, window_days=days,
-                    ends_sign_in=bool(policy["sso_lapse_ends_sign_in"]))
+                    ends_sign_in=bool(policy["sso_lapse_ends_sign_in"]),
+                    provider_on=getattr(provider, "state", None) == "enabled")
 
 
 def deadlines(db, user_id) -> List[Deadline]:
@@ -123,13 +133,15 @@ def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[
     """The missed deadline that leaves ``user`` no way in but a provider's sign-in, or None.
 
     Missed (the days ran out, or the provider refused the person) on a provider that closes the other ways in
-    then. A sign-in through any provider the account is linked to is still let in, and one through the provider
-    that asks restores everything; what is refused is what goes through none. Never an account that must keep a
-    password of its own (an administrator, a holder of the auditor right)."""
+    then. The days count for this only while the provider is turned on; a refusal holds whatever the provider's
+    state, and so do days that had run out before it was turned off (recorded as a refusal then). A sign-in
+    through any provider the account is linked to is still let in, and one through the provider that asks
+    restores everything; what is refused is what goes through none. Never an account that must keep a password
+    of its own (an administrator, a holder of the auditor right)."""
     if user is None or getattr(user, "id", None) is None:
         return None
     now = now or datetime.utcnow()
-    missed = [found for found in deadlines(db, user.id) if found.ends_sign_in and (found.refused or found.due <= now)]
+    missed = [found for found in deadlines(db, user.id) if closes_now(found, now)]
     if not missed:
         return None
     from app.core import privileged_accounts
@@ -138,11 +150,20 @@ def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[
     return missed[0]
 
 
+def closes_now(found: Deadline, now: datetime) -> bool:
+    """Whether ``found`` closes the ways in that go through no provider at ``now``, for an account that can be
+    held at all: the provider says so, and either it refused the person, or its days have run out while it is
+    turned on."""
+    return bool(found.ends_sign_in) and (found.refused or (found.provider_on and found.due <= now))
+
+
 def closes_the_other_ways_in(db, user, found: Deadline) -> bool:
     """Whether ``found``, once missed, also closes ``user``'s ways in that go through no provider: what the
-    warning and the notices say to that person."""
+    warning and the notices say to that person. Not while the provider is turned off: its days close nothing
+    then, and the person is told of their keys alone."""
     from app.core import privileged_accounts
-    return bool(found.ends_sign_in) and privileged_accounts.kind(db, user) is None
+    return (bool(found.ends_sign_in) and (found.refused or found.provider_on)
+            and privileged_accounts.kind(db, user) is None)
 
 
 def closes_a_connection(db, user, *, by_password: bool) -> bool:

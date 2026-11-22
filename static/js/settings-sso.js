@@ -445,8 +445,10 @@
         const lapse = tick('sso-lapse', 'After those days, or a refusal, the account signs in only through a provider', policy.sso_lapse_ends_sign_in,
             'Its password, a passkey by itself and SFTP with a password are refused, and the person is told to sign in '
             + 'through the provider; that sign-in restores everything. An administrator or an auditor keeps their '
-            + 'password as the way in while the provider cannot be reached. Off: the password goes on signing the '
-            + 'person in after the provider has stopped vouching for them.');
+            + 'password as the way in while the provider cannot be reached. While this provider is turned off '
+            + 'here, the days stop no password (nobody could sign in through it); an account already held when it '
+            + 'was turned off stays held. Off: the password goes on signing the person in after the provider has '
+            + 'stopped vouching for them.');
         box.appendChild(lapse.group);
         const said = _el('span', 'text-sm ml-sm sso-said');
         box.appendChild(saveBar(() => {

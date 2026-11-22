@@ -148,6 +148,20 @@ out["keys only"] = every_door(uid, name)
 uid, name = account("refused", closing, signed_in=now - timedelta(days=1), refused=now - timedelta(hours=1))
 out["refused"] = {"web": password(name), "passkey": passkey(uid)}
 
+# 3b. A provider that is turned off: its days close nothing, a refusal goes on holding.
+turned_off = provider("Tailspin")
+uid, name = account("off-days", turned_off)
+rid, rname = account("off-refused", turned_off, signed_in=now - timedelta(days=1), refused=now - timedelta(hours=1))
+with SessionLocal() as s:
+    s.get(SsoProvider, turned_off).state = "disabled"
+    s.commit()
+out["turned off"] = {"days ran out": {"web": password(name), "open connection": open_connection(uid)},
+                     "refused before": {"web": password(rname)}}
+with SessionLocal() as s:
+    s.get(SsoProvider, turned_off).state = "enabled"
+    s.commit()
+out["turned off"]["on again"] = {"web": password(name)}
+
 # 4. An administrator keeps the password as the way in; the keys pause as anybody's.
 uid, name = account("root", closing, role=RoleEnum.ADMIN)
 out["administrator"] = {"web": password(name), "open connection": open_connection(uid)}
@@ -248,6 +262,15 @@ def test_a_refusal_holds_at_once_and_says_so(out):
     assert refused["web"][:2] == ["refused", "SignInThroughProviderError"]
     assert refused["web"][3].startswith("Contoso did not admit your account")
     assert refused["passkey"][:3] == ["refused", "ProviderOnly", 403]
+
+
+def test_while_a_provider_is_turned_off_its_days_close_nothing_and_a_refusal_goes_on_holding(out):
+    off = out["turned off"]
+    assert off["days ran out"]["web"] == ["ok", "signed in"]
+    assert off["days ran out"]["open connection"] == {"a password's": False, "a key's": True}
+    assert off["refused before"]["web"][:2] == ["refused", "SignInThroughProviderError"]
+    assert "is not available on this vault right now. Ask your administrator." in off["refused before"]["web"][3]
+    assert off["on again"]["web"][:2] == ["refused", "SignInThroughProviderError"]
 
 
 def test_an_administrator_is_never_held(out):

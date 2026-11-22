@@ -358,6 +358,9 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     said = f"{current_user.username} turned the single sign-on provider {row.name} {turned}."
     if off and ended:
         said += f" {ended} session(s) that came through it were ended."
+    if off and providers.sso_policy.effective(row.policy)["sso_lapse_ends_sign_in"]:
+        said += (" While it is off, its days stop no password: only an account that was held before (a refusal, or "
+                 "days already run out) stays held to this provider's sign-in, until it is lifted under Identities.")
     shown = providers.public(db, row)
     if off and shown["only_way_in_accounts"]:
         said += (f" {shown['only_way_in_accounts']} account(s) linked to it have no other way to sign in: nothing "
@@ -365,10 +368,16 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     if off and held:
         said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each under Identities when it "
                  "should have its keys back.")
+    due = providers.due_at_turn_on(db, row) if not off else 0
+    if due:
+        said += (f" {due} linked account(s) have not signed in through it within its days: their password and "
+                 "passkeys do not sign them in until they have.")
     _tell_administrators(current_user.username, f"A single sign-on provider was turned {turned}", said)
     answer = {"provider": providers.public(db, row), "changed": True}
     if off:
         answer.update(sessions_ended=ended, held=held)
+    else:
+        answer.update(due=due)
     return answer
 
 

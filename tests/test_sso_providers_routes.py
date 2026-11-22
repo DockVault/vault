@@ -155,6 +155,35 @@ def test_a_change_is_judged_then_stepped_up_then_written_and_recorded_by_field_n
     assert status == 200 and out["changed"] == [] and len(h.audit("sso_provider_updated")) == 1 and len(h.told) == 1
 
 
+def test_turning_a_provider_off_and_on_says_what_its_days_do_to_passwords(monkeypatch):
+    """Off: the administrators are told that the days stop no password while it is off, and that what was held
+    before stays held. On again: how many linked accounts its days hold to the provider's sign-in from now."""
+    from datetime import datetime, timedelta
+    row = _provider(created_at=None, updated_at=None)
+    alice, bob = _user("alice"), _user("bob")
+    long_ago = datetime.utcnow() - timedelta(days=40)
+    bobs = _identity(bob, row, subject="s-2", last_sign_in_at=datetime.utcnow())
+    h = Admin(monkeypatch, [row], users=[alice, bob],
+              identities=[_identity(alice, row, last_sign_in_at=datetime.utcnow()), bobs])
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "disabled"})
+    assert status == 200 and out["held"] == 0 and "due" not in out, out
+    assert "While it is off, its days stop no password: only an account that was held before" in h.told[-1][2]
+    # Nobody could sign in through it meanwhile: bob's days ran out while it was off.
+    bobs.last_sign_in_at = long_ago
+    from app.services import sso_providers as providers
+    monkeypatch.setattr(providers, "enable_refusal", lambda db, row: None)
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "enabled"})
+    assert status == 200 and out["due"] == 1, out
+    assert h.told[-1][2].endswith("1 linked account(s) have not signed in through it within its days: their "
+                                  "password and passkeys do not sign them in until they have.")
+    # A provider that only pauses keys says neither.
+    row.policy = {"sso_lapse_ends_sign_in": False}
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "disabled"})
+    assert status == 200 and "its days stop no password" not in h.told[-1][2]
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "enabled"})
+    assert status == 200 and out["due"] == 0 and "have not signed in through it" not in h.told[-1][2]
+
+
 def test_the_setting_for_accounts_made_at_a_first_sign_in_tells_them_in_its_own_words(monkeypatch):
     """A save that changes only what an account made at a first sign-in may hold settles those accounts, and tells
     each what changed for it: not that password sign-in was turned off for the provider, which it was not."""
