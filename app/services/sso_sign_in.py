@@ -486,7 +486,9 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     if username is None:
         raise Refusal(USERNAME_UNAVAILABLE, "no_username")
     role = RoleEnum(policy["sso_default_role"])
-    sso_only = policy["sso_password_login"] == "disabled"
+    # Made here, with a password nobody knows: the account signs in only through its provider, whatever the
+    # provider's password setting, unless the provider lets such accounts set one (app/core/sso_only.py).
+    sso_only = made_here_is_provider_only(row)
     now = datetime.utcnow()
     user = User(id=_uuid.uuid4(), username=username, email=email, password_hash=hash_password(secrets.token_urlsafe(32)),
                 role=role, created_by=None, created_at=now, updated_at=now, is_active=True, is_locked=False,
@@ -770,6 +772,13 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
                       inviter_name=inviter_name)
 
 
+def made_here_is_provider_only(row) -> bool:
+    """Whether an account made at its first sign-in through ``row`` signs in only through its provider: the
+    provider's people hold no password, or it does not let the accounts it makes set one."""
+    from app.core import sso_only
+    return sso_only.password_less(row) or sso_only.made_here_holds_no_password(row)
+
+
 def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
     """For a test sign-in: the restriction's verdict and, in words, what a sign-in would do with this identity;
     nothing is written."""
@@ -788,7 +797,9 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
         if sso_policy.is_restricted(policy, _api()._account_policy(db)):
             name = username_for(db, row, answer)
             return {"restriction": "passes",
-                    "would": (f"create the account {name} at the first sign-in and sign it in" if name
+                    "would": (f"create the account {name} at the first sign-in and sign it in"
+                              + (" (it signs in only through this provider)" if made_here_is_provider_only(row)
+                                 else "") if name
                               else "refuse: no usable username could be made from the provider's answer")}
         return {"restriction": "passes", "would": "refuse: account creation at the first sign-in needs a restricted provider"}
     try:
@@ -848,7 +859,7 @@ def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str, keep
                                 last_sign_in_at=None)
     db.add(identity)
     from app.core import sso_only
-    sso_only.settle(db, user, also=row, keep_session=keep_session)
+    sso_only.settle(db, user, also=row, also_by=linked_by, keep_session=keep_session)
     return identity
 
 

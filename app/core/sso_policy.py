@@ -35,11 +35,17 @@ DEFAULTS = {
     "sso_freshness_days": 30,             # an account linked here keeps its SSH keys and temporary credentials only
                                           # while its last sign-in here is younger than this; 0 = off
     "sso_refusal_ends_access": True,      # a verified token that excludes a known identity ends the account's access
+    "sso_jit_password": False,            # an account made at its first sign-in here may set a password of its own;
+                                          # off, it signs in only through its provider (app/core/sso_only.py)
+    "sso_lapse_ends_sign_in": True,       # once the days above have run out, or the provider refused the person,
+                                          # the account signs in through a provider only: no password, no passkey
+                                          # by itself, no SFTP password (app/services/sso_freshness.py)
 }
 _ENUMS = {"sso_account_creation": ACCOUNT_CREATION_VALUES, "sso_default_role": DEFAULT_ROLE_VALUES,
           "sso_password_login": PASSWORD_LOGIN_VALUES}
 _BOOLS = ("sso_link_by_email", "sso_admin_mapping", "sso_use_signup_domains", "sso_trust_idp_mfa",
-          "sso_backchannel_logout", "sso_idp_logout", "sso_refusal_ends_access")
+          "sso_backchannel_logout", "sso_idp_logout", "sso_refusal_ends_access", "sso_jit_password",
+          "sso_lapse_ends_sign_in")
 FRESHNESS_DAYS_MAX = 365
 _INTS = {"sso_freshness_days": (0, FRESHNESS_DAYS_MAX)}
 _LISTS = ("sso_allowed_tenants", "sso_allowed_domains", "sso_required_groups", "sso_accepted_amr", "sso_accepted_acr")

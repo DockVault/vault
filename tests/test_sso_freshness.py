@@ -182,7 +182,8 @@ def test_the_sweep_warns_five_days_before_once_and_tells_once_when_keys_pause(to
     told.admins.append(admin)
     alice, bob, carol, dave, erin, frank = (_user(n) for n in ("alice", "bob", "carol", "dave", "erin", "frank"))
     erin.is_active = False
-    p, off = _provider(30), _provider(0, name="fabrikam")
+    # A provider that pauses the keys and leaves the password as it is (the other state has its own test).
+    p, off = _provider(30, sso_lapse_ends_sign_in=False), _provider(0, name="fabrikam")
     ia = _identity(alice, p, signed_in=NOW - 27 * DAY)                 # due in 3 days: warned
     ib = _identity(bob, p, signed_in=NOW - 20 * DAY)                   # due in 10 days: nothing yet
     ic = _identity(carol, p, signed_in=NOW - 31 * DAY)                 # lapsed a day ago
@@ -203,7 +204,7 @@ def test_the_sweep_warns_five_days_before_once_and_tells_once_when_keys_pause(to
     assert len(told.notices) == 3
     assert [(a, u) for a, u, _ in told.audits] == [(F.WARNED, "alice"), (F.EXPIRED, "carol")]
     assert told.audits[0][2] == {"provider_id": str(p.id), "identity_id": str(ia.id),
-                                 "expires_at": (NOW + 3 * DAY).isoformat() + "Z"}
+                                 "expires_at": (NOW + 3 * DAY).isoformat() + "Z", "ends_sign_in": False}
     # The next pass, an hour later: nothing new to tell, nothing recorded again.
     assert F.sweep(db, NOW + timedelta(hours=1)) == {"warned": 0, "lapsed": 0}
     assert len(told.notices) == 3 and len(told.emails) == 1 and len(told.audits) == 2

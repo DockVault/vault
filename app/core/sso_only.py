@@ -11,11 +11,20 @@ administrator's for that one account), so no change of a provider's setting hand
 every link stays under the rules of the route that makes it. Nothing here commits.
 
 The flag follows the providers, and is never set on its own: an account signs in only through its providers exactly
-while it is linked to at least one provider whose people hold no password (:func:`should_be_sso_only`), whatever
+while it is linked to at least one provider that holds it to no password (:func:`should_be_sso_only`), whatever
 that provider's state. :func:`settle` brings one account in line and is called wherever the answer can change: a
 link (by the person, by email, at a first sign-in, through an invitation), an unlink, a change of a provider's
 setting and a provider's removal. So a provider set to "no password" also covers the accounts linked after the
 setting was saved, and an account that unlinked the provider that made it password-less is not left without one.
+
+A provider holds an account to no password in two ways (:func:`holds_to_no_password`). Its people hold none
+(``sso_password_login`` is ``disabled``): every account linked to it. Or the account was made at its first sign-in
+through the provider and has never had a password of its own, and the provider does not let such accounts set one
+(``sso_jit_password``, off unless an administrator turns it on): nobody at the vault ever met that person, so the
+provider stays the one way in, and a person the provider has stopped vouching for cannot make themselves a
+password with a reset link and stay. Such an account gets a password of its own only by an administrator's act:
+the option turned on, or the account made an administrator (the promotion ends the flag and sends the person a
+link to choose a password). A password it has once set is its own from then on, whatever the option says later.
 """
 from __future__ import annotations
 
@@ -117,11 +126,44 @@ def password_less(provider) -> bool:
     return sso_policy.effective(getattr(provider, "policy", None))["sso_password_login"] == "disabled"
 
 
-def should_be_sso_only(db, user, *, also=None, without=None) -> bool:
-    """The rule the flag follows: linked to at least one provider whose people hold no password, and not an
-    account that must keep a password of its own (an administrator, a holder of the auditor right), whatever it
-    is linked to. ``also`` is a provider being linked in this transaction, ``without`` an identity being removed
-    in it.
+MADE_AT_A_FIRST_SIGN_IN = "jit"       # external_identities.linked_by of the identity such an account was made with
+
+
+def made_here_holds_no_password(provider) -> bool:
+    """Whether an account made at its first sign-in through ``provider`` is held to no password (the provider's
+    ``sso_jit_password`` is off, as it is unless an administrator turned it on)."""
+    from app.core import sso_policy
+    return not sso_policy.effective(getattr(provider, "policy", None))["sso_jit_password"]
+
+
+def holds_to_no_password(provider, user, linked_by) -> bool:
+    """Whether ``provider`` holds ``user``, linked to it in the way ``linked_by`` says, to no password: its people
+    hold none; or the account was made at its first sign-in there, the provider does not let such accounts set a
+    password, and the account's password is still the one nobody knows it was made with."""
+    if password_less(provider):
+        return True
+    if linked_by != MADE_AT_A_FIRST_SIGN_IN or not made_here_holds_no_password(provider):
+        return False
+    from app.core import password_origin
+    return password_origin.nobody_knows(user)
+
+
+def held_by_a_password_less_provider(db, user) -> bool:
+    """Whether ``user`` is linked to a provider whose people hold no password at all: the one case in which an
+    account that signs in only through its provider cannot be given a standing that needs a password."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
+        provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+        if provider is not None and password_less(provider):
+            return True
+    return False
+
+
+def should_be_sso_only(db, user, *, also=None, also_by=None, without=None) -> bool:
+    """The rule the flag follows: linked to at least one provider that holds the account to no password
+    (:func:`holds_to_no_password`), and not an account that must keep a password of its own (an administrator, a
+    holder of the auditor right), whatever it is linked to. ``also`` is a provider being linked in this
+    transaction (``also_by``: how), ``without`` an identity being removed in it.
 
     The links and settings that would put a privileged account on such a provider are refused where they are
     made. The state exists all the same: an account that signs in only through its provider was made an
@@ -131,13 +173,13 @@ def should_be_sso_only(db, user, *, also=None, without=None) -> bool:
     from app.core.models import ExternalIdentity, SsoProvider
     if privileged_accounts.kind(db, user) is not None:
         return False
-    if also is not None and password_less(also):
+    if also is not None and holds_to_no_password(also, user, also_by):
         return True
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
         if without is not None and identity.id == without.id:
             continue
         provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
-        if provider is not None and password_less(provider):
+        if provider is not None and holds_to_no_password(provider, user, getattr(identity, "linked_by", None)):
             return True
     return False
 
@@ -145,13 +187,13 @@ def should_be_sso_only(db, user, *, also=None, without=None) -> bool:
 MADE, RESTORED = "made_sso_only", "restored"
 
 
-def settle(db, user, *, also=None, without=None, keep_session=None) -> Optional[str]:
+def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None) -> Optional[str]:
     """Bring ``user``'s flag in line with the providers it is linked to, in the caller's transaction: ``MADE`` when
     the account now signs in only through its providers (its password replaced, SFTP password sign-in off),
     ``RESTORED`` when it may hold a password again (nothing is minted), None when nothing changed. An account
     that must keep a password of its own is never made provider-only and is given its password back when it is
     met flagged (:func:`should_be_sso_only`); nothing is raised for it."""
-    should = should_be_sso_only(db, user, also=also, without=without)
+    should = should_be_sso_only(db, user, also=also, also_by=also_by, without=without)
     flagged = bool(getattr(user, "sso_only", False))
     if should == flagged:
         return None                 # nothing to change: no turn is taken (a save settles every linked account)
@@ -160,13 +202,15 @@ def settle(db, user, *, also=None, without=None, keep_session=None) -> Optional[
         # unlinks an identity, and what links one, take the turn too, so the change is decided on the links, the
         # flag and the role as they are, not as they were a moment before a change that is being made (decided on
         # the old ones, it left an account held to no password with no provider). Only what is read again is
-        # read again: nothing else the caller set on the account is touched.
+        # read again: nothing else the caller set on the account is touched. The password is among it: whether
+        # it is still the one nobody knows decides for an account made at a first sign-in, and a password set a
+        # moment ago (a reset link used) is written in this same turn.
         from app.api import api_server as api
         api._sessions_turn(db, user.id)
         refresh = getattr(db, "refresh", None)
         if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
-            refresh(user, attribute_names=["sso_only", "role"])
-        should = should_be_sso_only(db, user, also=also, without=without)
+            refresh(user, attribute_names=["sso_only", "role", "password_hash", "password_nobody_knows"])
+        should = should_be_sso_only(db, user, also=also, also_by=also_by, without=without)
         flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:
         make_sso_only(db, user, keep_session=keep_session)
@@ -306,10 +350,12 @@ def disabled_refusal(db, provider) -> Optional[str]:
 
 
 def apply_password_login(db, provider) -> dict:
-    """After ``provider``'s ``sso_password_login`` was written: settle each account linked to it. ``disabled`` makes
-    each SSO-only; ``allowed`` lets each hold a password again unless another provider it is linked to still holds
-    its people to none (no link is minted). Returns the usernames changed: ``{"made_sso_only": [...], "restored":
-    [...]}``, each sorted. Call :func:`disabled_refusal` first for ``disabled``."""
+    """After ``provider``'s ``sso_password_login`` or ``sso_jit_password`` was written: settle each account linked
+    to it. ``disabled`` makes each SSO-only; ``allowed`` lets each hold a password again unless a provider it is
+    linked to still holds it to none (no link is minted); the second setting does the same for the accounts made
+    at a first sign-in through the provider that have no password of their own. Returns the usernames changed:
+    ``{"made_sso_only": [...], "restored": [...]}``, each sorted. Call :func:`disabled_refusal` first for
+    ``disabled``."""
     changed = {MADE: [], RESTORED: []}
     for user in linked_accounts(db, provider):
         outcome = settle(db, user)

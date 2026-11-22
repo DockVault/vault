@@ -64,6 +64,8 @@ LABELS = {
     "policy.sso_allowed_tenants": "Tenants", "policy.sso_allowed_domains": "Domains",
     "policy.sso_required_groups": "Required groups", "policy.sso_freshness_days": "Days without signing in",
     "policy.sso_refusal_ends_access": "A refusal ends access",
+    "policy.sso_jit_password": "Password for accounts made at a first sign-in",
+    "policy.sso_lapse_ends_sign_in": "Other ways in after the days run out",
 }
 
 
@@ -306,6 +308,22 @@ def _counts(db, row) -> dict:
             "refusals": sum(1 for i in identities if sso_freshness.refusal_in_force(i))}
 
 
+def made_here_and_held(db, row) -> int:
+    """How many accounts sign in only through a provider because ``row`` made them at a first sign-in and does not
+    let such accounts set a password (not because its people hold none)."""
+    from app.core import sso_only
+    from app.core.models import ExternalIdentity, User
+    if sso_only.password_less(row):
+        return 0
+    held = 0
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
+        user = db.query(User).filter(User.id == identity.user_id).first()
+        if (user is not None and getattr(user, "sso_only", False)
+                and sso_only.holds_to_no_password(row, user, getattr(identity, "linked_by", None))):
+            held += 1
+    return held
+
+
 def public(db, row) -> dict:
     """``row`` as an administrator's page is shown it. Never the client secret, in any form: only whether one is
     stored."""
@@ -429,8 +447,9 @@ def apply(db, row, changes: dict, stored_policy) -> dict:
         if keys:
             row.policy = stored_policy
             changed.extend("policy." + key for key in keys)
-        if now["sso_password_login"] != was["sso_password_login"]:
-            accounts = sso_only.apply_password_login(db, row)       # the row holds the new setting
+        if (now["sso_password_login"] != was["sso_password_login"]
+                or now["sso_jit_password"] != was["sso_jit_password"]):
+            accounts = sso_only.apply_password_login(db, row)       # the row holds the new settings
     return {"changed": changed, "connection_changed": fingerprint(row) != before, "secret_cleared": secret_cleared,
             **accounts}
 
@@ -469,6 +488,13 @@ def remove_refusal(db, row) -> Optional[Conflict]:
         return Conflict(ONLY_WAY_IN, (
             f"{n} account{'s' if n != 1 else ''} linked to this provider hold{'s' if n == 1 else ''} no password "
             "because of it. Allow password sign-in for this provider first (Access), so they can set one."))
+    made_here = made_here_and_held(db, row)
+    if made_here:
+        # The same for the accounts this provider made at a first sign-in and holds to no password by that rule.
+        n = made_here
+        return Conflict(ONLY_WAY_IN, (
+            f"{n} account{'s' if n != 1 else ''} made at a first sign-in through this provider hold{'s' if n == 1 else ''} "
+            "no password because of it. Let such accounts set a password first (Access), so they can set one."))
     if counts["refusals"]:
         n = counts["refusals"]
         return Conflict(REFUSALS_IN_FORCE, (

@@ -67,6 +67,7 @@ from app.config.branding import branding
 # login throttle's `except` would bind the wrong class and a throttled login would surface
 # as a 500 instead of a 429.
 from app.services.auth_service import AuthService, InvalidCredentialsError, AccountLockedError, SessionLimitExceededError, RateLimitExceededError as AuthRateLimitExceededError
+from app.services.auth_service import SignInThroughProviderError
 from app.core.authorization import PermissionService, PermissionDeniedError, ResourceNotFoundError, AuthorizationError
 from app.services.vault_service import VaultService, PasswordRequiredError, InvalidPasswordError, FileTooLargeError, StorageLimitExceeded, RateLimitExceededError, FileNotFoundError, FileServiceError, VaultNotFoundError, FolderNotFoundError, DuplicateNameError, DestinationGoneError, _name_match_filter, is_refundable_serve_failure
 from app.services.vault_service import require_file_scope, require_folder_scope, require_item_scope, require_download_scope, require_preview_scope, folder_ancestry, filter_listing_for_scope
@@ -7163,9 +7164,16 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
 
     Refused (409) while COMPLIANCE_AUDITOR_NOT_ADMIN is on and the account holds the auditor right or a
     proposal for it (app/core/auditor_rights.py, promotion_refusal): the right is revoked first. Refused (409) too
-    for an account that signs in only through its identity provider (app/core/sso_only.py): an administrator needs
-    a password for the fixed step-ups, so the provider's password sign-in is allowed first. Both raised in the
-    caller's transaction, before anything of the promotion is committed; every promotion passes here."""
+    for an account that a provider whose people hold no password holds to none (app/core/sso_only.py): an
+    administrator needs a password for the fixed step-ups, so the provider's password sign-in is allowed first.
+    Both raised in the caller's transaction, before anything of the promotion is committed; every promotion
+    passes here.
+
+    An account that signs in only through its provider because it was made at its first sign-in there is
+    promoted: the promotion is an administrator's word for the person, which is what such an account lacked.
+    Its flag ends here, in the caller's transaction, and its password stays the one nobody knows, marked as set
+    by somebody else: _take_back_password_at_promotion, which every caller runs next, ends its sessions and
+    sends the person a link to choose a password."""
     from app.core import admin_grants, auditor_rights
     from app.core import credential_changes as cc
     # The account's turn at its sessions first, before anything below reads or writes the account (the order of
@@ -7180,9 +7188,12 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     if refusal is not None:
         raise HTTPException(status_code=409, detail=refusal)
     if getattr(user, "sso_only", False):
-        raise HTTPException(status_code=409, detail=(
-            f"{user.username} signs in only through its organisation's provider and holds no password, which an "
-            "administrator needs; allow password sign-in on the provider first."))
+        from app.core import sso_only
+        if sso_only.held_by_a_password_less_provider(db, user):
+            raise HTTPException(status_code=409, detail=(
+                f"{user.username} signs in only through its organisation's provider and holds no password, which an "
+                "administrator needs; allow password sign-in on the provider first."))
+        sso_only.allow_password_sign_in(db, user)
     # The account's sessions, and its sign-ins under way, end with the promotion. Each was made with what a user
     # owes: a passkey by itself, where the role lets one in alone, or a password with no second factor. An
     # administrator always gives the password and whatever the administrators' policy asks, and a session from
@@ -9112,6 +9123,8 @@ async def login(
                 login_request.password,
                 client_ip,
                 login_identifier=login_identifier,
+                # A password owed after a provider's sign-in is a step of that sign-in, not a way round it.
+                through_provider=bool(sign_in.provider_of(pending)),
             )
             result = sign_in.SignInResult(user, sign_in.methods_so_far(pending) + [sign_in.PASSWORD], client_ip,
                                           session_token=session_token, pending=pending,
@@ -9173,6 +9186,14 @@ async def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password"
         )
+
+    except SignInThroughProviderError as due:
+        # The password was right and the account signs in only through its identity provider until it has signed
+        # in there again: not a failed guess (nothing is counted, against the account or a held sign-in), no
+        # session, and the person is told what to use.
+        audit_logger.log_login_failure(login_request.username, client_ip, sign_in.PROVIDER_DUE_REASON,
+                                       account=due.account, login_identifier=login_identifier)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=due.message)
 
     except AuthRateLimitExceededError as e:
         # Log the rate limit event

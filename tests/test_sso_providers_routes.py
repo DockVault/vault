@@ -155,6 +155,36 @@ def test_a_change_is_judged_then_stepped_up_then_written_and_recorded_by_field_n
     assert status == 200 and out["changed"] == [] and len(h.audit("sso_provider_updated")) == 1 and len(h.told) == 1
 
 
+def test_the_setting_for_accounts_made_at_a_first_sign_in_tells_them_in_its_own_words(monkeypatch):
+    """A save that changes only what an account made at a first sign-in may hold settles those accounts, and tells
+    each what changed for it: not that password sign-in was turned off for the provider, which it was not."""
+    from app.core import password_origin, security
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    row = _provider(created_at=None, updated_at=None)
+    made, linked = _user("made", sso_only=True, password_hash="r1"), _user("linked")
+    made.password_set_by, made.password_set_by_other_at = None, None
+    password_origin.mark_nobody_knows(made)
+    h = Admin(monkeypatch, [row], users=[made, linked],
+              identities=[_identity(made, row, linked_by="jit"), _identity(linked, row, subject="s-2")])
+    label = row.label or row.name
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_jit_password": True}})
+    assert status == 200 and out["restored"] == ["made"] and out["made_sso_only"] == [] and made.sso_only is False, out
+    assert out["changed"] == ["policy.sso_jit_password"]
+    assert h.accounts_told == [(["made"], "You can set a password", h.accounts_told[0][2])]
+    assert h.accounts_told[0][2].startswith(
+        f"An administrator now lets accounts made at their first sign-in through {label} set a password. ")
+    assert "Forgot password" in h.accounts_told[0][2]
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_jit_password": False}})
+    assert status == 200 and out["made_sso_only"] == ["made"] and made.sso_only is True and linked.sso_only is False
+    assert h.accounts_told[1][:2] == (["made"], f"Your account signs in only through {label}")
+    assert h.accounts_told[1][2].startswith(
+        f"An administrator no longer lets accounts made at their first sign-in through {label} set a password. ")
+    assert "turned password sign-in off" not in str(h.accounts_told)
+    # The other setting settles nobody and tells no account anything.
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": False}})
+    assert status == 200 and out["changed"] == ["policy.sso_lapse_ends_sign_in"] and len(h.accounts_told) == 2
+
+
 def test_turning_password_sign_in_off_names_the_accounts_and_says_so_to_the_administrators(monkeypatch):
     row = _provider(created_at=None, updated_at=None)
     alice, bob = _user("alice"), _user("bob")

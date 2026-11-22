@@ -366,6 +366,10 @@
             + 'second factor: its owner links the provider under Your account.');
         const password = choice('sso-password', [['allowed', 'Linked accounts keep their password'],
             ['disabled', 'Linked accounts sign in only through this provider']], policy.sso_password_login);
+        const madeHere = tick('sso-jit-password', 'An account made at a first sign-in may set a password', policy.sso_jit_password,
+            'Off: an account this provider makes signs in only through it, whatever is chosen above, so a person the '
+            + 'provider no longer signs in cannot give themselves a password and stay. Making such an account an '
+            + 'administrator ends that for it: it is sent a link to choose a password.');
         box.appendChild(_el('p', 'text-secondary text-sm mb-sm', 'Who may sign in through this provider. With none of the '
             + 'three lists, anyone the provider signs in may try; accounts are then made only by invitation.'));
         box.appendChild(field('Tenants', tenants, 'Microsoft Entra ID: the tenant ids whose accounts may sign in.'));
@@ -378,6 +382,7 @@
         box.appendChild(field('Password sign-in', password,
             `${provider.sso_only_accounts} of ${provider.identities} linked account(s) sign in only through a provider now. `
             + 'An administrator or an auditor always keeps a password.'));
+        box.appendChild(madeHere.group);
         const said = _el('span', 'text-sm ml-sm sso-said');
         box.appendChild(saveBar(() => {
             const now = {
@@ -385,6 +390,7 @@
                 sso_required_groups: lines(groups.value), sso_use_signup_domains: signup.box.checked,
                 sso_account_creation: creation.value, sso_default_role: role.value,
                 sso_link_by_email: byEmail.box.checked, sso_password_login: password.value,
+                sso_jit_password: madeHere.box.checked,
             };
             const part = changed(now, policy);
             return Object.keys(part).length ? { policy: part } : {};
@@ -436,10 +442,17 @@
             'After that their SSH keys, temporary credentials and devices pause until they sign in again. The days go '
             + 'on counting while the provider is turned off. 0: no limit.'));
         box.appendChild(ends.group);
+        const lapse = tick('sso-lapse', 'After those days, or a refusal, the account signs in only through a provider', policy.sso_lapse_ends_sign_in,
+            'Its password, a passkey by itself and SFTP with a password are refused, and the person is told to sign in '
+            + 'through the provider; that sign-in restores everything. An administrator or an auditor keeps their '
+            + 'password as the way in while the provider cannot be reached. Off: the password goes on signing the '
+            + 'person in after the provider has stopped vouching for them.');
+        box.appendChild(lapse.group);
         const said = _el('span', 'text-sm ml-sm sso-said');
         box.appendChild(saveBar(() => {
             const part = changed({ sso_backchannel_logout: back.box.checked, sso_idp_logout: out.box.checked,
-                sso_freshness_days: Number(fresh.value), sso_refusal_ends_access: ends.box.checked }, policy);
+                sso_freshness_days: Number(fresh.value), sso_refusal_ends_access: ends.box.checked,
+                sso_lapse_ends_sign_in: lapse.box.checked }, policy);
             return Object.keys(part).length ? { policy: part } : {};
         }, said));
         return box;

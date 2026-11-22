@@ -235,7 +235,9 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     Pointing the provider somewhere else (the issuer, the discovery address, the private-network switch) without
     a new client secret drops the stored one: it is never sent to an address it was not entered for.
     Turning password sign-in off for the provider makes its linked accounts sign in only through it (refused while
-    one of them must keep a password); allowing it again lets each hold a password again, and mints nothing."""
+    one of them must keep a password); allowing it again lets each hold a password again, and mints nothing. The
+    setting for the accounts the provider made at a first sign-in does the same for those of them that have no
+    password of their own."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
@@ -279,12 +281,21 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     # Said as it is for the account that reads it: a provider that is off signs nobody in.
     is_on = row.state == providers.ENABLED
     while_off = f" {label} is turned off at the moment: ask an administrator."
-    _tell_accounts(made, "Your password no longer works on this vault", (
-        f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
-        "its password and its SFTP password sign-in no longer work." + ("" if is_on else while_off)))
-    _tell_accounts(restored, "You can set a password again", (
-        f"An administrator allowed password sign-in again for accounts linked to {label}. {SET_A_PASSWORD}"
-        + (f" You can still sign in through {label}." if is_on else while_off)))
+    if "policy.sso_password_login" in outcome["changed"]:
+        _tell_accounts(made, "Your password no longer works on this vault", (
+            f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
+            "its password and its SFTP password sign-in no longer work." + ("" if is_on else while_off)))
+        _tell_accounts(restored, "You can set a password again", (
+            f"An administrator allowed password sign-in again for accounts linked to {label}. {SET_A_PASSWORD}"
+            + (f" You can still sign in through {label}." if is_on else while_off)))
+    else:
+        # The rule for the accounts the provider made at a first sign-in changed, and nothing else that settles.
+        _tell_accounts(made, f"Your account signs in only through {label}", (
+            f"An administrator no longer lets accounts made at their first sign-in through {label} set a password. "
+            f"Your account has none of its own, and signs in only through {label}." + ("" if is_on else while_off)))
+        _tell_accounts(restored, "You can set a password", (
+            f"An administrator now lets accounts made at their first sign-in through {label} set a password. "
+            f"{SET_A_PASSWORD}" + (f" You can still sign in through {label}." if is_on else while_off)))
     if outcome["changed"]:
         _audit(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
                details={"provider_id": str(row.id), "name": row.name, "changed": outcome["changed"],

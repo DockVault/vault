@@ -312,6 +312,18 @@ class FreshnessLapsedError(InvalidCredentialsError):
     pass
 
 
+class SignInThroughProviderError(AuthenticationError):
+    """The password was right, and the account signs in only through its identity provider until it has signed in
+    there again (app/services/sso_freshness.py held_to_a_provider). Not a wrong credential: nothing is counted
+    for it, no session is made, and the person is told what to do (``message``). ``account`` is the account, for
+    the record of the refusal."""
+
+    def __init__(self, message: str, account=None):
+        super().__init__(message)
+        self.message = message
+        self.account = account
+
+
 class AccountLockedError(AuthenticationError):
     """Raised when a sign-in is refused by a lock. Carries locked_until (None = no end) and scope:
     "administrator" (an administrator's lock), "timed" (a timed lock on the account row, from before
@@ -521,6 +533,7 @@ class AuthService:
         *,
         login_identifier: str = "username",
         channel: str = "web",
+        through_provider: bool = False,
     ) -> Tuple[User, str]:
         """
         Authenticate a user with an identifier and password.
@@ -535,6 +548,8 @@ class AuthService:
                 then email). Defaulted so the SFTP caller and existing tests are unaffected.
             channel: Where the sign-in happens, WEB (the default) or SFTP. A web sign-in marks the
                 account's earlier web sessions inactive; an SFTP sign-in ends no other session.
+            through_provider: The password is a further step of a sign-in that came through an identity
+                provider (the held sign-in names it). Such a sign-in is not refused for want of one.
 
         Returns:
             Tuple of (User object, session_token)
@@ -544,6 +559,8 @@ class AuthService:
             AccountLockedError: If account is locked
             RateLimitExceededError: If rate limit exceeded
             SessionLimitExceededError: If max sessions reached
+            SignInThroughProviderError: The password is right and the account signs in through its
+                provider only, until it has signed in there again
         """
         # Check rate limit. Keyed on the RAW submitted identifier (login_user:{identifier}), NOT the
         # resolved username — the limiter must throttle a junk/never-resolving identifier too, and
@@ -600,7 +617,13 @@ class AuthService:
         except sign_in_lockout.Busy as busy:
             raise RateLimitExceededError(str(busy), retry_after=busy.retry_after)
         try:
-            signed_in = self._authenticate_in_turn(user, username, password, ip_address, channel=channel)
+            signed_in = self._authenticate_in_turn(user, username, password, ip_address, channel=channel,
+                                                   through_provider=through_provider)
+        except SignInThroughProviderError:
+            # The right password: not a guess, so the throttle gives the attempt back, as for a sign-in.
+            self.db.rollback()
+            self._give_back(throttle)
+            raise
         except Exception:
             # Whatever ended the attempt early ends its turn too, and keeps nothing it had not
             # committed: a failure is committed with its count, a refusal with its releases.
@@ -611,7 +634,8 @@ class AuthService:
         return signed_in
 
     def _authenticate_in_turn(self, user: User, username: str, password: str,
-                              ip_address: str, channel: str = "web") -> Tuple[User, str]:
+                              ip_address: str, channel: str = "web",
+                              through_provider: bool = False) -> Tuple[User, str]:
         """authenticate_user for an account, in the account's turn (take_turn), which the transaction's
         end lets go: a refusal commits the releases it made and raises, a wrong password commits its
         count, a right one commits its session.
@@ -681,6 +705,17 @@ class AuthService:
         if not user.is_active:
             self.db.commit()
             raise InvalidCredentialsError("Account is not active")
+        if not through_provider:
+            # Single sign-on: the account's sign-in through its provider has lapsed, or the provider refused the
+            # person, and that provider closes the other ways in then (app/services/sso_freshness.py). Judged
+            # after the password, in the account's turn, before a session is written. The caller has shown
+            # the password, so being told to use the provider tells nobody anything about an account.
+            from app.services import sso_freshness
+            due = sso_freshness.held_to_a_provider(self.db, user)
+            if due is not None:
+                message = sso_freshness.way_in_text(self.db, due)
+                self.db.commit()
+                raise SignInThroughProviderError(message, account=user)
 
         # Reset failed login attempts: the total, and this address's count toward its lock. Set before
         # the sessions below are written, so they commit with the first of them, in this turn.

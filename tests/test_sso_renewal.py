@@ -650,13 +650,23 @@ def test_an_account_no_provider_vouches_for_is_told_of_the_reset_link_not_of_an_
     assert "not available on this vault right now" in sso_only.provider_only_message(db, lone)
 
 
-def test_an_account_with_a_password_keeps_its_own_session_whatever_its_provider_says(db):
-    """A session made with the password, of an account that is not provider-only, is not the provider's: a refusal
-    or a lapse pauses the account's keys and temporary credentials, and the password still signs it in."""
-    p = _provider(db, sso_freshness_days=1)
+def test_a_session_the_password_made_is_kept_going_only_while_the_password_would_still_sign_in(db):
+    """A session made with the password, of an account that is not provider-only, is not the provider's. Where the
+    provider only pauses the keys when it refuses a person or its days run out, the password still signs the
+    account in, and its session is kept going. Where the provider closes the other ways in then (as it does unless
+    an administrator turns that off), signing in again with the password would be refused, and so is the renewal,
+    with what to use instead."""
+    from fastapi import HTTPException
     signed_in = datetime.utcnow() - timedelta(days=3)
+    p = _provider(db, sso_freshness_days=1)
     user, identity, old = _through(db, p, signed_in=signed_in, refused=signed_in + timedelta(hours=1), record=False)
     without = {**{k: v for k, v in old.items() if k != "idp"}, "amr": ["pwd"]}
+    with pytest.raises(HTTPException) as refused:
+        sign_in.renew(db, user, without, client_ip="127.0.0.1")
+    assert refused.value.status_code == 403 and "Contoso did not admit your account" in refused.value.detail
+    # Refused before anything changed: the session stands, and is kept going once the provider only pauses keys.
+    p.policy = {"sso_freshness_days": 1, "sso_lapse_ends_sign_in": False}
+    db.commit()
     assert sign_in.renew(db, user, without, client_ip="127.0.0.1").access_token
 
 

@@ -1,0 +1,544 @@
+"""A person who has left: what stops working when the identity provider no longer vouches for them.
+
+Two rules. An account made at its first sign-in through a provider signs in only through its provider, whatever the
+provider's password setting, unless the provider lets such accounts set a password (app/core/sso_only.py). And an
+account whose sign-in through its provider has lapsed, or that the provider refused, is refused every way in that
+goes through no provider, where the provider says so, as it does unless an administrator turns that off
+(app/services/sso_freshness.py): the password on the web and over SFTP, a passkey by itself, "Stay signed in" on a
+session no provider made, and an SFTP connection that is already open. Never an account that keeps a password of
+its own (an administrator, a holder of the auditor right). Offline."""
+import types
+import uuid
+from datetime import datetime, timedelta
+
+import pytest
+
+from _bare_api_env import set_bare_api_env
+
+set_bare_api_env()
+
+import test_sso_freshness as fresh  # noqa: E402
+from app.core import sso_policy  # noqa: E402
+from app.core.models import ActiveSession, ExternalIdentity, SsoProvider, User  # noqa: E402
+from app.services import sso_freshness as F  # noqa: E402
+from test_sftp_policy_fails_closed import world  # noqa: E402,F401  (a fixture)
+from test_sso_freshness import DAY, NOW, told  # noqa: E402,F401  (told: a fixture)
+from test_sso_resolution import JIT, Resolving, _sign_in  # noqa: E402
+from test_sso_sign_in import DB, _identity, _provider, _user  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+LONG_AGO = timedelta(days=40)          # past the thirty days a provider asks for unless it says otherwise
+NOT_AVAILABLE = ("Your account signs in only through Contoso until it has signed in there again, and Contoso is not "
+                 "available on this vault right now. Ask your administrator.")
+
+
+def _world(*, policy=None, role="user", signed_in=None, refused=None, state="enabled", linked_by="self", **account):
+    """One account linked to one provider, its last sign-in there forty days ago unless the test says otherwise."""
+    alice = _user(role=role, **account)
+    p = _provider(policy=policy, state=state, name="Contoso")
+    i = _identity(alice, p, linked_by=linked_by, refused_at=refused,
+                  last_sign_in_at=signed_in if signed_in is not None else datetime.utcnow() - LONG_AGO)
+    return alice, p, i, DB({User: [alice], SsoProvider: [p], ExternalIdentity: [i], ActiveSession: []})
+
+
+# --------------------------------------------------------------------------- the two settings
+
+def test_the_two_settings_as_they_stand_when_nothing_is_stored_and_what_a_save_may_hold():
+    assert sso_policy.DEFAULTS["sso_jit_password"] is False and sso_policy.DEFAULTS["sso_lapse_ends_sign_in"] is True
+    for stored in (None, {}, {"sso_jit_password": "yes", "sso_lapse_ends_sign_in": 0}):
+        policy = sso_policy.effective(stored)
+        assert policy["sso_jit_password"] is False and policy["sso_lapse_ends_sign_in"] is True, stored
+    turned = sso_policy.effective({"sso_jit_password": True, "sso_lapse_ends_sign_in": False})
+    assert turned["sso_jit_password"] is True and turned["sso_lapse_ends_sign_in"] is False
+    assert sso_policy.validate({"sso_jit_password": True, "sso_lapse_ends_sign_in": False}) == {
+        "sso_jit_password": True, "sso_lapse_ends_sign_in": False}
+    for key in ("sso_jit_password", "sso_lapse_ends_sign_in"):
+        with pytest.raises(sso_policy.PolicyInvalid) as refused:
+            sso_policy.validate({key: "on"})
+        assert refused.value.key == key
+    from app.services import sso_providers
+    assert sso_providers.LABELS["policy.sso_jit_password"] and sso_providers.LABELS["policy.sso_lapse_ends_sign_in"]
+
+
+# --------------------------------------------------------------------------- an account whose provider sign-in lapsed
+
+def test_a_missed_deadline_closes_the_other_ways_in_where_the_provider_says_so():
+    alice, p, i, db = _world()
+    held = F.held_to_a_provider(db, alice)
+    assert held is not None and held.identity_id == str(i.id) and held.ends_sign_in is True and not held.refused
+    # Inside the days: nothing is closed.
+    i.last_sign_in_at = datetime.utcnow() - timedelta(days=29)
+    assert F.held_to_a_provider(db, alice) is None
+    i.last_sign_in_at = datetime.utcnow() - LONG_AGO
+    # A provider that only pauses the keys: they pause, and the account is not held.
+    p.policy = {"sso_lapse_ends_sign_in": False}
+    assert F.held_to_a_provider(db, alice) is None and F.lapsed(db, alice.id) is not None
+    assert F.deadlines(db, alice.id)[0].ends_sign_in is False
+    # A stored value that is no switch is read as the setting stands by itself: on.
+    p.policy = {"sso_lapse_ends_sign_in": "no"}
+    assert F.held_to_a_provider(db, alice) is not None
+    # The days turned off: only a refusal holds, at once, and a sign-in the provider admits answers it.
+    p.policy = {"sso_freshness_days": 0}
+    assert F.held_to_a_provider(db, alice) is None
+    i.refused_at = datetime.utcnow() - timedelta(hours=1)
+    assert F.held_to_a_provider(db, alice).refused is True
+    i.last_sign_in_at = datetime.utcnow()
+    assert F.held_to_a_provider(db, alice) is None
+    # A refusal holds at once, also well inside the days.
+    p.policy, i.last_sign_in_at = None, datetime.utcnow() - timedelta(days=1)
+    held = F.held_to_a_provider(db, alice)
+    assert held is not None and held.refused and held.due > datetime.utcnow()
+    # A provider that is turned off goes on counting, and goes on holding.
+    i.last_sign_in_at, i.refused_at, p.policy = datetime.utcnow() - LONG_AGO, None, None
+    for state in ("disabled", "draft"):
+        p.state = state
+        assert F.held_to_a_provider(db, alice) is not None, state
+    # Nobody, and an account linked to nothing.
+    assert F.held_to_a_provider(db, None) is None and F.held_to_a_provider(db, _user("bob")) is None
+
+
+@pytest.mark.parametrize("who", ["an administrator", "a holder of the auditor right"])
+def test_an_account_that_keeps_a_password_of_its_own_is_never_held(monkeypatch, who):
+    """Its keys pause as anybody's do; its password stays the way in while the provider cannot be reached."""
+    from app.core import auditor_rights
+    alice, p, i, db = _world(role="admin" if who == "an administrator" else "user")
+    monkeypatch.setattr(auditor_rights, "_has_grants", lambda db: True)
+    monkeypatch.setattr(auditor_rights, "open_grant",
+                        lambda db, user_id, **kw: object() if who == "a holder of the auditor right" else None)
+    found = F.lapsed(db, alice.id)
+    assert found is not None and found.ends_sign_in is True
+    assert F.held_to_a_provider(db, alice) is None and F.closes_the_other_ways_in(db, alice, found) is False
+    assert F.closes_a_connection(db, alice, by_password=True) is False
+    assert F.closes_a_connection(db, alice, by_password=False) is True
+
+
+def test_the_provider_that_holds_the_account_is_the_one_it_is_told_about():
+    """Each provider asks on its own. One that only pauses keys holds nobody, though its deadline was missed first."""
+    alice, p, i, db = _world(policy={"sso_lapse_ends_sign_in": False})
+    q = _provider(name="Fabrikam", label="Sign in with Fabrikam")
+    j = _identity(alice, q, subject="subject-2", last_sign_in_at=datetime.utcnow() - timedelta(days=35))
+    db.tables[SsoProvider].append(q)
+    db.tables[ExternalIdentity].append(j)
+    assert F.lapsed(db, alice.id).provider_id == str(p.id)
+    held = F.held_to_a_provider(db, alice)
+    assert held.provider_id == str(q.id) and held.provider_name == "Fabrikam"
+    assert F.way_in_text(db, held).startswith("Sign in through Fabrikam: ")
+
+
+def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
+    alice, p, i, db = _world()
+    held = F.held_to_a_provider(db, alice)
+    assert F.way_in_text(db, held) == (
+        "Sign in through Contoso: your account has not signed in there within the time your organisation allows, so "
+        "its password and passkeys do not sign it in until it does. Use the “Sign in with Contoso” button on the "
+        "sign-in page.")
+    p.show_on_sign_in = False
+    assert F.way_in_text(db, held).endswith("until it does. Use the sign-in link your organisation gave you.")
+    p.show_on_sign_in, p.label = True, ""
+    assert F.way_in_text(db, held).endswith("Use the “Contoso” button on the sign-in page.")
+    i.refused_at = datetime.utcnow()
+    refused = F.held_to_a_provider(db, alice)
+    assert refused.refused and F.way_in_text(db, refused) == (
+        "Contoso did not admit your account when it last signed in there, so its password and passkeys do not sign "
+        "it in. Sign in through Contoso once it admits you, or ask your administrator.")
+    # A provider that is off sends nobody to a button that is not there.
+    p.state = "disabled"
+    assert F.way_in_text(db, held) == NOT_AVAILABLE and F.way_in_text(db, refused) == NOT_AVAILABLE
+    db.tables[SsoProvider].clear()
+    assert F.way_in_text(db, held) == NOT_AVAILABLE
+
+
+# --------------------------------------------------------------------------- the password door
+
+def _door(monkeypatch, db):
+    from app.core import sign_in_lockout
+    from app.services import auth_service as A
+    monkeypatch.setattr(A, "verify_password", lambda plain, hashed: plain == "pw")
+    monkeypatch.setattr(A, "account_locked", lambda user: False)
+    for name in ("release_expired", "lock_in_force", "count_at_limit", "clear_after_success"):
+        monkeypatch.setattr(sign_in_lockout, name, lambda *a, **k: None)
+    svc = A.AuthService(db)
+    counted, made = [], []
+    monkeypatch.setattr(svc, "_record_failed_login", lambda name, ip, user=None: counted.append(name))
+    monkeypatch.setattr(svc, "_terminate_existing_sessions", lambda user_id, commit=True: None)
+    monkeypatch.setattr(svc, "_create_session", lambda user, *a, **k: made.append(k.get("channel")) or "session-token")
+    return A, svc, counted, made
+
+
+def test_the_password_door_refuses_a_held_account_after_the_password_and_writes_no_session(monkeypatch):
+    alice, p, i, db = _world()
+    A, svc, counted, made = _door(monkeypatch, db)
+    with pytest.raises(A.SignInThroughProviderError) as due:
+        svc._authenticate_in_turn(alice, "alice", "pw", "203.0.113.9")
+    assert due.value.message == F.way_in_text(db, F.held_to_a_provider(db, alice)) and due.value.account is alice
+    assert not isinstance(due.value, A.InvalidCredentialsError)          # no wrong credential: nothing counts it
+    assert made == [] and counted == [] and ("commit",) in db.log
+    # Before the password is right the door says what it says to anybody, and counts the guess.
+    with pytest.raises(A.InvalidCredentialsError) as wrong:
+        svc._authenticate_in_turn(alice, "alice", "nope", "203.0.113.9")
+    assert str(wrong.value) == "Invalid username or password" and counted == ["alice"] and made == []
+    # Over SFTP the same door.
+    with pytest.raises(A.SignInThroughProviderError):
+        svc._authenticate_in_turn(alice, "alice", "pw", "203.0.113.9", channel=A.AuthService.SFTP)
+    assert made == []
+    # The password as a step of a provider's own sign-in is that sign-in, the way back.
+    assert svc._authenticate_in_turn(alice, "alice", "pw", "203.0.113.9", through_provider=True) == (alice, "session-token")
+    assert made == [A.AuthService.WEB]
+    # A provider that only pauses the keys leaves the password as it is.
+    p.policy = {"sso_lapse_ends_sign_in": False}
+    assert svc._authenticate_in_turn(alice, "alice", "pw", "203.0.113.9")[1] == "session-token"
+    # An account that is turned off is answered as one: its state comes first.
+    p.policy, alice.is_active = None, False
+    with pytest.raises(A.InvalidCredentialsError) as inactive:
+        svc._authenticate_in_turn(alice, "alice", "pw", "203.0.113.9")
+    assert str(inactive.value) == "Account is not active"
+
+
+def test_the_right_password_of_a_held_account_is_no_guess_for_the_throttle(monkeypatch):
+    from app.core import sign_in_lockout
+    alice, p, i, db = _world()
+    A, svc, counted, made = _door(monkeypatch, db)
+    given = []
+    monkeypatch.setattr(svc, "_check_rate_limit", lambda name, ip: "the-charge")
+    monkeypatch.setattr(svc, "_give_back", lambda charge: given.append(charge))
+    monkeypatch.setattr(sign_in_lockout, "take_turn", lambda db, user_id: None)
+    with pytest.raises(A.SignInThroughProviderError):
+        svc.authenticate_user("alice", "pw", "203.0.113.9")
+    assert given == ["the-charge"] and db.log[-1] == ("rollback",)
+    with pytest.raises(A.InvalidCredentialsError):
+        svc.authenticate_user("alice", "nope", "203.0.113.9")
+    assert given == ["the-charge"]                                       # a wrong password keeps its charge
+
+
+# --------------------------------------------------------------------------- every other proof without a provider
+
+def test_a_passkey_by_itself_and_any_proof_that_came_through_no_provider_is_refused(monkeypatch):
+    """Where a sign-in is finished, held for a step, written in the account's turn and where a factor is set up at
+    a held sign-in, one rule is asked (refuse_without_the_provider): the passkey door and every held step meet it."""
+    from app.api import api_server as api
+    from app.services import sign_in
+    alice, p, i, db = _world()
+    seen, dropped = [], []
+
+    class _Audit:
+        def __init__(self, db):
+            pass
+
+        def log_login_failure(self, username, ip, reason, *, account=None, login_identifier="username"):
+            seen.append((username, reason, login_identifier, account))
+
+    monkeypatch.setattr(api, "AuditLogger", _Audit)
+    monkeypatch.setattr(sign_in, "delete_session_by_token", lambda db, token: dropped.append(token))
+    text = F.way_in_text(db, F.held_to_a_provider(db, alice))
+    key = sign_in.SignInResult(alice, [sign_in.HARDWARE_KEY], "203.0.113.9", user_verified=True,
+                               passwordless_allowed=True)
+    with pytest.raises(sign_in.ProviderOnly) as refused:
+        sign_in.refuse_without_the_provider(db, key)
+    assert refused.value.status_code == 403 and refused.value.detail == text
+    assert seen == [("alice", sign_in.PROVIDER_DUE_REASON, "passkey", alice)] and dropped == []
+    # A session the proof made (the password door's own) goes with the refusal.
+    form = sign_in.SignInResult(alice, [sign_in.PASSWORD], "203.0.113.9", session_token="made-by-the-door")
+    with pytest.raises(sign_in.ProviderOnly):
+        sign_in.refuse_without_the_provider(db, form)
+    assert dropped == ["made-by-the-door"] and form.session_token is None
+    assert seen[-1][1:3] == (sign_in.PROVIDER_DUE_REASON, "username")
+    # What came through a provider is the provider's sign-in; a temporary credential has its own rule.
+    through = sign_in.SignInResult(alice, [], "203.0.113.9", provider_id=str(p.id))
+    temporary = sign_in.SignInResult(alice, [sign_in.PASSWORD], "203.0.113.9", is_temporary=True)
+    assert sign_in.refuse_without_the_provider(db, through) is None
+    assert sign_in.refuse_without_the_provider(db, temporary) is None
+    # A provider that only pauses the keys refuses no proof.
+    p.policy = {"sso_lapse_ends_sign_in": False}
+    assert sign_in.refuse_without_the_provider(db, key) is None and len(seen) == 2
+    assert sign_in.PROVIDER_DUE_REASON != sign_in.PROVIDER_ONLY_REASON
+
+
+# --------------------------------------------------------------------------- SFTP
+
+def test_sftp_refuses_the_right_password_of_a_held_account_and_records_why(world, monkeypatch):  # noqa: F811
+    import paramiko
+    import test_sftp_policy_fails_closed as sftp_tests
+    from app.services import sign_in
+    from app.services.auth_service import SignInThroughProviderError
+    S = sftp_tests.S
+    world({"mfa_sftp_policy": "allow"})
+    account = types.SimpleNamespace(username="alice")
+
+    class _Refusing:
+        def __init__(self, db):
+            pass
+
+        def authenticate_user(self, username, password, ip, **kw):
+            raise SignInThroughProviderError("Sign in through Contoso.", account=account)
+
+    monkeypatch.setattr(S, "AuthService", _Refusing)
+    server = S.SFTPServer("203.0.113.9")
+    assert server.check_auth_password("alice", "right-password") == paramiko.AUTH_FAILED
+    assert server.user is None and server.session_token is None
+    assert sftp_tests._Audit.calls[-1] == ("failure", "alice", sign_in.PROVIDER_DUE_REASON)
+
+
+def test_an_open_sftp_connection_goes_no_further_once_what_made_it_would_be_refused(monkeypatch):
+    """Asked on every operation, where the account's state is: a password's connection stops when the account is
+    held to its provider, a key's and a temporary credential's when the account's keys pause."""
+    from app.sftp import sftp_server as S
+    alice, p, i, db = _world()
+    monkeypatch.setattr(S, "_user_requires_temp_cred_for_sftp", lambda db, user, **kw: False)
+
+    def principal(*, key=None, temporary=False):
+        made_by = types.SimpleNamespace(_is_temp_session=temporary)
+        server = types.SimpleNamespace(user_id=alice.id, user=made_by, _key_id=key, client_address="203.0.113.9")
+        handler = types.SimpleNamespace(server=server, _SCOPE_ATTRS=("_is_temp_session",))
+        return S.SFTPServerInterface._load_principal(handler, db)
+
+    a_key = uuid.uuid4()
+    assert principal() is None and principal(key=a_key) is None and principal(temporary=True) is None
+    # The provider only pauses keys: the password's connection goes on, the other two do not.
+    p.policy = {"sso_lapse_ends_sign_in": False}
+    assert principal() is alice and principal(key=a_key) is None and principal(temporary=True) is None
+    # Signed in through the provider again: everything goes on.
+    p.policy, i.last_sign_in_at = None, datetime.utcnow()
+    assert principal() is alice and principal(key=a_key) is alice and principal(temporary=True) is alice
+
+
+def test_which_rule_an_open_connection_follows():
+    alice, p, i, db = _world()
+    assert F.closes_a_connection(db, alice, by_password=True) and F.closes_a_connection(db, alice, by_password=False)
+    p.policy = {"sso_lapse_ends_sign_in": False}
+    assert not F.closes_a_connection(db, alice, by_password=True) and F.closes_a_connection(db, alice, by_password=False)
+    i.last_sign_in_at = datetime.utcnow()
+    assert not F.closes_a_connection(db, alice, by_password=True)
+    assert not F.closes_a_connection(db, alice, by_password=False)
+
+
+# --------------------------------------------------------------------------- what people are told
+
+def test_the_warning_and_the_notices_say_that_the_password_stops_too_where_it_does(told):  # noqa: F811
+    admin = fresh._user("root")
+    told.admins.append(admin)
+    alice, carol = fresh._user("alice"), fresh._user("carol")
+    p = fresh._provider(30)
+    ia, ic = fresh._identity(alice, p, signed_in=NOW - 27 * DAY), fresh._identity(carol, p, signed_in=NOW - 31 * DAY)
+    db = fresh._db([admin, alice, carol], [p], [ia, ic])
+    assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 1}
+    due = (NOW + 3 * DAY).strftime("%d %B %Y, %H:%M UTC")
+    warning, paused, wave = told.notices
+    assert warning[3].startswith(f"Your password and passkeys stop signing you in on {due}, and your SSH keys")
+    assert told.emails[0][2]["change"] == F.warning_text(F.deadlines(db, alice.id)[0], due, sign_in_too=True)
+    assert "your password and passkeys stop signing you in then" in told.emails[0][2]["change"]
+    assert paused[2] == "Sign in through contoso: nothing else signs you in now"
+    assert paused[3] == F.LAPSE_MESSAGE_ALL.format(provider="contoso") and "your password" in paused[3]
+    assert "For 1 of them the password and passkeys no longer sign in either" in wave[3]
+    assert [details["ends_sign_in"] for _, _, details in told.audits] == [True, True]
+    # The two texts differ, so a person is never told the wrong one.
+    found = F.deadlines(db, alice.id)[0]
+    assert F.refusal_text(found) == F.LAPSE_MESSAGE.format(provider="contoso") != F.refusal_text(found, sign_in_too=True)
+    assert F.warning_text(found, due) != F.warning_text(found, due, sign_in_too=True)
+
+
+def test_what_the_administrators_are_told_about_the_password_when_a_provider_refuses_a_person(monkeypatch):
+    from app.core import auditor_rights
+    refused_at = datetime.utcnow() - timedelta(hours=1)
+    alice, p, i, db = _world(refused=refused_at)
+    assert F.password_after_a_refusal(db, alice).startswith(" Their password and passkeys no longer sign them in either")
+    p.policy = {"sso_lapse_ends_sign_in": False}
+    said = F.password_after_a_refusal(db, alice)
+    assert said.startswith(" Their password still signs them in to the web app: this provider does not close")
+    p.policy = None
+    alice.sso_only = True
+    assert F.password_after_a_refusal(db, alice) == ""
+    root, q, j, db2 = _world(role="admin", refused=refused_at)
+    monkeypatch.setattr(auditor_rights, "_has_grants", lambda db: False)
+    assert "an administrator or an auditor keeps a password of their own" in F.password_after_a_refusal(db2, root)
+
+
+# --------------------------------------------------------------------------- an account made at a first sign-in
+
+@pytest.mark.parametrize("policy, provider_only", [
+    ({}, True),
+    ({"sso_jit_password": True}, False),
+    ({"sso_jit_password": True, "sso_password_login": "disabled"}, True),
+])
+def test_an_account_made_at_a_first_sign_in_signs_in_only_through_its_provider_unless_the_provider_says_otherwise(
+        monkeypatch, policy, provider_only):
+    root = _user("root", role="admin")
+    p = _provider(policy={**JIT, **policy})
+    h = Resolving(monkeypatch, [root], [p])
+    location, _ = _sign_in(h, p, preferred_username="alice.e")
+    assert location.startswith("/#sso="), location
+    (user,) = h.users_named("alice.e")
+    (identity,) = h.identities()
+    assert identity.linked_by == "jit"
+    assert user.sso_only is provider_only and user.sftp_password_auth is (not provider_only)
+    # The sign-in it was made at finishes, and the next one finds it as it was made.
+    status, _body = h.finish(location)
+    assert status == 200
+    _sign_in(h, p, preferred_username="alice.e")
+    assert user.sso_only is provider_only
+
+
+def test_which_accounts_a_provider_holds_to_no_password():
+    from app.core import password_origin, sso_only
+    alice, p = _user(password_hash="random-bytes"), _provider()
+    password_origin.mark_nobody_knows(alice)
+    assert sso_only.MADE_AT_A_FIRST_SIGN_IN == "jit"
+    assert sso_only.holds_to_no_password(p, alice, "jit") is True
+    for by in ("self", "email", "invitation", "admin", None):
+        assert sso_only.holds_to_no_password(p, alice, by) is False, by
+    p.policy = {"sso_jit_password": True}
+    assert sso_only.holds_to_no_password(p, alice, "jit") is False and not sso_only.made_here_holds_no_password(p)
+    p.policy = {"sso_jit_password": "yes"}                  # no switch: read as the setting stands by itself
+    assert sso_only.holds_to_no_password(p, alice, "jit") is True
+    # A password of its own, once it has one: the account is no longer held, whatever the setting says.
+    alice.password_hash = "chosen-by-its-owner"
+    assert sso_only.holds_to_no_password(p, alice, "jit") is False
+    # A provider whose people hold no password holds everybody linked to it.
+    p.policy = {"sso_password_login": "disabled", "sso_jit_password": True}
+    assert sso_only.holds_to_no_password(p, alice, "self") is True
+
+
+def test_a_link_tells_the_rule_how_the_account_came_to_the_provider(monkeypatch):
+    """The identity being linked is not yet in the database when the rule is asked (nothing is flushed for it), so
+    the rule is told of it, and of how it came: without that an account made at a first sign-in would be judged as
+    linked to nothing."""
+    from app.core import password_origin, privileged_accounts, sso_only
+    from app.services import sso_sign_in as sso
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: None)
+    alice, p = _user(password_hash="random-bytes"), _provider()
+    password_origin.mark_nobody_knows(alice)
+    nothing_linked = DB({User: [alice], SsoProvider: [p], ExternalIdentity: []})
+    assert sso_only.should_be_sso_only(nothing_linked, alice) is False
+    assert sso_only.should_be_sso_only(nothing_linked, alice, also=p, also_by="jit") is True
+    assert sso_only.should_be_sso_only(nothing_linked, alice, also=p, also_by="self") is False
+    assert sso_only.should_be_sso_only(nothing_linked, alice, also=p) is False
+    seen = []
+    monkeypatch.setattr(sso_only, "settle", lambda db, user, **kw: seen.append(kw))
+    monkeypatch.setattr(sso, "subject_owner", lambda db, row, answer: None)
+    answer = types.SimpleNamespace(issuer="https://idp.example", subject="s", tenant_id=None, email=None,
+                                   display_name=None)
+    sso.link_identity(nothing_linked, p, alice, answer, linked_by="jit")
+    assert seen == [{"also": p, "also_by": "jit", "keep_session": None}]
+
+
+def _made_and_linked(monkeypatch):
+    """Three accounts on one provider: one made at a first sign-in that never had a password, one made there that
+    has set its own since, one that linked itself."""
+    from app.api import api_server as api
+    from app.core import password_origin, privileged_accounts, security
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: None)
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    monkeypatch.setattr(api, "_sessions_turn", lambda db, user_id: None)
+    made, own, linked = (_user("made", sso_only=True, password_hash="r1"), _user("own", password_hash="r2"),
+                         _user("linked"))
+    for user in (made, own):
+        user.password_set_by, user.password_set_by_other_at = None, None
+        password_origin.mark_nobody_knows(user)
+    own.password_hash = "chosen-by-its-owner"
+    p = _provider(state="disabled")
+    rows = [_identity(made, p, subject="s1", linked_by="jit"), _identity(own, p, subject="s2", linked_by="jit"),
+            _identity(linked, p, subject="s3")]
+    db = DB({User: [made, own, linked], SsoProvider: [p], ExternalIdentity: rows, ActiveSession: []})
+    return made, own, linked, p, db
+
+
+def test_the_setting_settles_the_accounts_the_provider_made_both_ways(monkeypatch):
+    from app.core import password_origin, sso_only
+    made, own, linked, p, db = _made_and_linked(monkeypatch)
+    assert sso_only.apply_password_login(db, p) == {"made_sso_only": [], "restored": []}
+    p.policy = {"sso_jit_password": True}
+    assert sso_only.apply_password_login(db, p) == {"made_sso_only": [], "restored": ["made"]}
+    assert made.sso_only is False and password_origin.nobody_knows(made)          # nothing is minted
+    p.policy = {"sso_jit_password": False}
+    assert sso_only.apply_password_login(db, p) == {"made_sso_only": ["made"], "restored": []}
+    assert made.sso_only is True and made.sftp_password_auth is False
+    # A password a person set is theirs: turning the setting off again takes nothing from them.
+    assert own.sso_only is False and own.password_hash == "chosen-by-its-owner" and linked.sso_only is False
+
+
+def test_a_save_of_the_setting_settles_the_linked_accounts(monkeypatch):
+    from app.core import sso_only
+    from app.services import sso_providers as providers
+    made, own, linked, p, db = _made_and_linked(monkeypatch)
+    settled = []
+    monkeypatch.setattr(sso_only, "apply_password_login",
+                        lambda db, row: settled.append(dict(row.policy)) or {"made_sso_only": [], "restored": ["made"]})
+    monkeypatch.setattr(providers, "fingerprint", lambda row: "same")
+    changes = {"policy": {"sso_jit_password": True}}
+    outcome = providers.apply(db, p, changes, providers.check(db, p, changes, account_policy={}))
+    assert settled == [{"sso_jit_password": True}]                 # asked with the row as it now stands
+    assert outcome["restored"] == ["made"] and outcome["changed"] == ["policy.sso_jit_password"]
+    # A setting that settles nobody asks nothing.
+    changes = {"policy": {"sso_lapse_ends_sign_in": False}}
+    outcome = providers.apply(db, p, changes, providers.check(db, p, changes, account_policy={}))
+    assert len(settled) == 1 and outcome["changed"] == ["policy.sso_lapse_ends_sign_in"]
+
+
+def test_a_provider_is_not_removed_over_accounts_it_made_and_holds_to_no_password(monkeypatch):
+    from app.services import sso_providers as providers
+    made, own, linked, p, db = _made_and_linked(monkeypatch)
+    assert providers.made_here_and_held(db, p) == 1
+    made.sso_only = False                      # not held in fact (promoted, say): not counted
+    assert providers.made_here_and_held(db, p) == 0
+    made.sso_only = True
+    refusal = providers.remove_refusal(db, p)
+    assert refusal.reason == providers.ONLY_WAY_IN
+    assert str(refusal) == ("1 account made at a first sign-in through this provider holds no password because of "
+                            "it. Let such accounts set a password first (Access), so they can set one.")
+    # Once the provider lets them set one (the save settles them), nothing is in the way.
+    p.policy = {"sso_jit_password": True}
+    made.sso_only = False
+    assert providers.made_here_and_held(db, p) == 0 and providers.remove_refusal(db, p) is None
+    # A provider whose people hold no password is refused in its own words.
+    p.policy = {"sso_password_login": "disabled"}
+    made.sso_only = True
+    assert providers.made_here_and_held(db, p) == 0
+    assert "Allow password sign-in for this provider first" in str(providers.remove_refusal(db, p))
+
+
+def test_an_account_made_at_a_first_sign_in_is_promoted_and_then_chooses_a_password(monkeypatch):
+    """The promotion is an administrator's word for the person. The flag ends with it; the password stays the one
+    nobody knows, marked as set by somebody else, which is what makes the promotion take it back: the sessions end
+    and the person is sent a link to choose one. An account a provider holds to no password at all is refused."""
+    import app.api.api_server as S
+    from fastapi import HTTPException
+    from app.core import admin_grants, auditor_rights, password_origin, security
+    from app.services import sign_in
+    monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: None)
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    monkeypatch.setattr(S, "hash_password", lambda secret: "argon2:" + secret, raising=False)
+    recorded, revoked = [], []
+    monkeypatch.setattr(admin_grants, "record", lambda db, user_id, **kw: recorded.append(user_id))
+    monkeypatch.setattr(S, "_revoke_reset_links_outranked_by", lambda db, user, actor: None)
+    monkeypatch.setattr(S, "_revoke_sessions", lambda db, **kw: revoked.append(kw["user_id"]) or 1)
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db, user_id: 0)
+
+    class _Audit:
+        def __init__(self, db):
+            pass
+
+        def build_row(self, **kw):
+            return types.SimpleNamespace(**kw)
+
+    monkeypatch.setattr(S, "AuditLogger", _Audit)
+    root = _user("root", role="admin")
+    alice, p, i, db = _world(linked_by="jit", sso_only=True, password_set_by=None, password_set_by_other_at=None)
+    monkeypatch.setattr(db, "add", lambda row: None)
+    S._record_admin_grant(db, alice, by=root)
+    assert recorded == [alice.id] and alice.sso_only is False
+    assert password_origin.nobody_knows(alice) and password_origin.is_set_by_other(alice)
+    assert S._take_back_password_at_promotion(db, alice, by=root) == {"user_id": alice.id} and revoked == [alice.id]
+    # Held by a provider whose people hold no password: an administrator needs one, so the setting changes first.
+    bob, q, j, db2 = _world(policy={"sso_password_login": "disabled"}, username="bob", sso_only=True)
+    with pytest.raises(HTTPException) as refused:
+        S._record_admin_grant(db2, bob, by=root)
+    assert refused.value.status_code == 409 and "allow password sign-in on the provider first" in refused.value.detail
+    assert bob.sso_only is True and recorded == [alice.id]
+
+
+def test_the_provider_page_sends_both_settings():
+    import pathlib
+    page = (pathlib.Path(__file__).resolve().parent.parent / "static" / "js" / "settings-sso.js").read_text("utf-8")
+    assert "sso_jit_password: madeHere.box.checked" in page and "tick('sso-jit-password'" in page
+    assert "sso_lapse_ends_sign_in: lapse.box.checked" in page and "tick('sso-lapse'" in page
+    assert "policy.sso_jit_password" in page and "policy.sso_lapse_ends_sign_in" in page

@@ -212,9 +212,11 @@ def test_no_reset_link_and_no_password_change_for_an_sso_only_account(monkeypatc
 
 def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(monkeypatch):
     """A password set by an administrator would go live the moment the flag clears; the administrator role needs a
-    password for the fixed step-ups. Both are refused while the account signs in only through its provider: at the
-    credential change a held approval applies as well as at the route, and the auditor right's preconditions name
-    it. Letting the account hold a password again clears the flag, sets a hash nobody knows and mints no link."""
+    password for the fixed step-ups. Both are refused while a provider whose people hold no password holds the
+    account to none: at the credential change a held approval applies as well as at the route, and the auditor
+    right's preconditions name it. (An account held only because it was made at a first sign-in is promoted:
+    tests/test_sso_leavers.py.) Letting the account hold a password again clears the flag, sets a hash nobody
+    knows and mints no link."""
     privileged_accounts, sso_only = _mod()
     from fastapi import HTTPException
     from app.core import credential_changes as cc
@@ -230,9 +232,14 @@ def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(mon
     monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: None)
     recorded = []
     monkeypatch.setattr(admin_grants, "record", lambda db, user_id, **kw: recorded.append(user_id))
+    from _memory_db import MemoryDB
+    from app.core.models import ExternalIdentity, SsoProvider
+    holding = _provider(policy={"sso_password_login": "disabled"})
+    linked = MemoryDB({SsoProvider: [holding], ExternalIdentity: [_identity(alice, holding)]})
     with pytest.raises(HTTPException) as refused:
-        S._record_admin_grant(types.SimpleNamespace(), alice, by=_user("root", role="admin"))
+        S._record_admin_grant(linked, alice, by=_user("root", role="admin"))
     assert refused.value.status_code == 409 and "allow password sign-in" in refused.value.detail and recorded == []
+    assert alice.sso_only is True
     alice.sso_only = False
     monkeypatch.setattr(S, "_revoke_reset_links_outranked_by", lambda db, user, actor: None)
     S._record_admin_grant(types.SimpleNamespace(), alice, by=_user("root", role="admin"))

@@ -604,7 +604,8 @@ def test_a_test_sign_in_says_what_account_it_would_make(monkeypatch):
     status, location, _ = h.callback(p, state)
     status, body = h.finish_test(p, location)
     assert status == 200, body
-    assert p.last_test["would"] == "create the account alice.e at the first sign-in and sign it in"
+    assert p.last_test["would"] == ("create the account alice.e at the first sign-in and sign it in "
+                                    "(it signs in only through this provider)")
     assert h.users_named("alice.e") == [] and h.identities() == []        # a test makes nothing
 
 

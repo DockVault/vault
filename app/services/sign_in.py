@@ -636,6 +636,9 @@ PROVIDER_LOGGED_OUT_REASON = "The identity provider logged the person out before
 # The audit's reason for a passkey used by itself on an account whose password nobody knows: the key was set up on
 # the provider's sign-in alone and confirms the person after it.
 KEY_AFTER_THE_PROVIDER_REASON = "Passkey of an account without a password of its own, used without its identity provider"
+# The audit's reason for a good proof refused because the account's sign-in through its provider has lapsed, or the
+# provider refused the person, and the provider closes the other ways in then (app/services/sso_freshness.py).
+PROVIDER_DUE_REASON = "A sign-in through the identity provider is due; nothing else signs the account in until then"
 
 
 def refuse_without_the_provider(db, result: SignInResult) -> None:
@@ -644,8 +647,10 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
     carries it in ``provider_id`` (also at the second step, from the pending login), so the account's passkey still
     serves as its second factor there.
 
-    Two kinds of account. One that signs in only through its provider (``users.sso_only``): whatever the proof.
-    And one whose password nobody knows (made at a first provider sign-in, say: app/core/password_origin.py), when
+    Three kinds of account. One that signs in only through its provider (``users.sso_only``): whatever the proof.
+    One whose sign-in through its provider has lapsed, or that the provider refused, where the provider closes the
+    other ways in then (app/services/sso_freshness.py held_to_a_provider): whatever the proof, until it has signed
+    in through the provider again. And one whose password nobody knows (made at a first provider sign-in, say: app/core/password_origin.py), when
     a passkey is the proof (no password can be among its proofs). Such an account can type no password, so nothing
     but its provider's sign-in stood behind the key when it was set up (Your account asks it for a fresh sign-in
     there, and so does the enrollment at a sign-in). A key set up on the provider's word alone does not outlive
@@ -661,18 +666,28 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
     passkey = bool(methods & PASSKEYS)
     provider_only = bool(getattr(user, "sso_only", False))
     key_alone = passkey and password_origin.nobody_knows(user)
+    due = None
     if not (provider_only or key_alone):
-        return
+        from app.services import sso_freshness
+        due = sso_freshness.held_to_a_provider(db, user)
+        if due is None:
+            return
     from app.api import api_server as api
     from app.core import sso_only
-    message = (sso_only.provider_only_message(db, user) if provider_only
-               else sso_only.passkey_after_the_provider_message(db, user))
+    if due is not None:
+        message, reason = sso_freshness.way_in_text(db, due), PROVIDER_DUE_REASON
+    elif provider_only:
+        message, reason = sso_only.provider_only_message(db, user), PROVIDER_ONLY_REASON
+    else:
+        message, reason = sso_only.passkey_after_the_provider_message(db, user), KEY_AFTER_THE_PROVIDER_REASON
     try:
         api.AuditLogger(db).log_login_failure(
-            user.username, result.client_ip, PROVIDER_ONLY_REASON if provider_only else KEY_AFTER_THE_PROVIDER_REASON,
+            user.username, result.client_ip, reason,
             account=user, login_identifier="passkey" if passkey else "username")
     except Exception:  # noqa: BLE001 -- the refusal stands without its row
         db.rollback()
+    # A session the proof made (the password door writes its own) does not outlive the refusal.
+    drop_the_session_the_proof_made(db, result)
     raise ProviderOnly(message)
 
 
@@ -1323,7 +1338,11 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
     (made before the account became provider-only): refused, with what to use instead. A session that came through
     a provider (the token's ``idp``) is renewed only while that sign-in could be made again: the identity still
     linked, the provider turned on, no refusal by the provider in force and its freshness window not run out
-    (``sso_sign_in.renewal_refusal``)."""
+    (``sso_sign_in.renewal_refusal``).
+
+    An account whose sign-in through its provider has lapsed, where the provider closes the other ways in then
+    (``sso_freshness.held_to_a_provider``), with a session that came through no provider: refused, with what to
+    use instead. Signing in again now would be refused the same way."""
     from app.api import api_server as api
     proofs = old.get("amr")
     methods = ({PASSWORD} if proofs is None
@@ -1347,6 +1366,10 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
         if getattr(user, "sso_only", False):
             from app.core import sso_only
             raise HTTPException(status_code=403, detail=sso_only.provider_only_message(db, user))
+        from app.services import sso_freshness
+        due = sso_freshness.held_to_a_provider(db, user)
+        if due is not None:
+            raise HTTPException(status_code=403, detail=sso_freshness.way_in_text(db, due))
         return
     from app.services import sso_sign_in
     sentence = sso_sign_in.renewal_refusal(db, user, provider_id, methods=old.get("amr") or (),

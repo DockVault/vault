@@ -410,8 +410,9 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "revoked, suspended, ended, reconfirmed, or lapses or expires -- says what, when and by whom.", SYSTEM),
     ("sso_freshness_warning", "Sign in through your organisation",
      "Sent to a person whose account is linked to an identity provider five days before their SSH keys, temporary "
-     "credentials and devices pause for want of a sign-in through it -- names the provider and the date. Its wording "
-     "is fixed: it cannot be changed or turned off.", LOCKED),
+     "credentials and devices pause for want of a sign-in through it (and, where the provider says so, their password "
+     "and passkeys stop signing them in) -- names the provider and the date. Its wording is fixed: it cannot be "
+     "changed or turned off.", LOCKED),
     ("compliance_access_notice", "Access to your vaults",
      "Sent to a vault's owner when an investigation may open their vaults, is extended, narrowed, ends or is "
      "closed, when a legal hold on their vaults is placed, confirmed, released, restored or lapses, and when files "

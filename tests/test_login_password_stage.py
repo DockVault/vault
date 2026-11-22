@@ -101,13 +101,17 @@ def stage(monkeypatch):
 
     alice, bob = _user(), _user(username="bob")
     db = MemoryDB({User: [alice, bob], PendingLogin: [], ActiveSession: [], SystemSetting: []})
-    calls = {"authenticate": [], "failures": [], "audit": []}
+    calls = {"authenticate": [], "failures": [], "audit": [], "through_provider": [], "reasons": []}
 
     def _fake_db():
         yield db
 
-    def _authenticate(self, username, password, client_ip, *, login_identifier="username", channel="web"):
+    def _authenticate(self, username, password, client_ip, *, login_identifier="username", channel="web", through_provider=False):
         calls["authenticate"].append((username, login_identifier))
+        calls["through_provider"].append(through_provider)
+        if calls.get("due"):
+            from app.services.auth_service import SignInThroughProviderError
+            raise SignInThroughProviderError(calls["due"], account=alice)
         who = next((u for u in (alice, bob) if u.username == username), None)
         if who is None or password != "right":
             raise InvalidCredentialsError("Invalid username or password")
@@ -122,6 +126,7 @@ def stage(monkeypatch):
 
         def log_login_failure(self, username, ip, reason, **kw):
             calls["failures"].append(username)
+            calls["reasons"].append((reason, kw.get("account")))
             return None
 
         def log_action(self, **kw):
@@ -252,7 +257,7 @@ def test_a_trusted_provider_mfa_carried_by_the_stage_finishes_an_administrator_w
     stage.S  # the stub password check knows alice and bob only; teach it root
     from app.services.auth_service import AuthService, InvalidCredentialsError
 
-    def _authenticate(self, username, password, client_ip, *, login_identifier="username", channel="web"):
+    def _authenticate(self, username, password, client_ip, *, login_identifier="username", channel="web", through_provider=False):
         if username == "root" and password == "right":
             return admin, "sess-root"
         raise InvalidCredentialsError("Invalid username or password")
@@ -287,7 +292,7 @@ def test_the_form_sign_in_is_handed_on_with_what_the_door_read_of_the_account(st
     S, alice = stage.S, stage.alice
     alice.sessions_ended = 4
 
-    def door(self, username, password, client_ip, *, login_identifier="username", channel="web"):
+    def door(self, username, password, client_ip, *, login_identifier="username", channel="web", through_provider=False):
         self.sessions_ended_as_read = 4            # what the door read in its turn
         alice.sessions_ended = 5                   # the sessions ended again, after the door's commit
         return alice, "sess-alice"
@@ -297,3 +302,41 @@ def test_the_form_sign_in_is_handed_on_with_what_the_door_read_of_the_account(st
     status, body = _post_login(S, {"username": "alice", "password": "right"})
     assert handed == [4]
     assert status == 401 and body["detail"] == sign_in.EXPIRED, body
+
+
+# --------------------------------------------------------------------------- an account held to its provider's sign-in
+
+def test_a_password_owed_after_a_providers_sign_in_is_a_step_of_it_and_the_form_is_not(stage):
+    """The password check is told whether the sign-in it continues came through an identity provider (the held
+    sign-in names it): an account whose sign-in through its provider has lapsed is refused its password at the
+    form, and never at the step a provider's own sign-in holds for it, which is the way back."""
+    S = stage.S
+    status, _ = _post_login(S, {"username": "alice", "password": "right"})
+    assert status == 200 and stage.calls["through_provider"] == [False]
+    # A held sign-in that a passkey began: no provider, so the same as the form.
+    pending = _pending(stage.alice)
+    stage.db.tables[stage.PendingLogin].append(pending)
+    status, _ = _post_login(S, {"username": "alice", "password": "right"}, _stage_token(S, stage.alice, pending))
+    assert status == 200 and stage.calls["through_provider"] == [False, False]
+    # One that came through a provider.
+    pending = _pending(stage.alice)
+    stage.db.tables[stage.PendingLogin].append(pending)
+    token = _stage_token(S, stage.alice, pending, methods=(), idp=str(uuid.uuid4()))
+    _post_login(S, {"username": "alice", "password": "right"}, token)
+    assert stage.calls["through_provider"] == [False, False, True]
+
+
+def test_the_right_password_of_an_account_held_to_its_provider_is_answered_with_what_to_use(stage):
+    """The door's refusal reaches the person as it is: 403 with the sentence, recorded with its own reason and the
+    account, and not counted against a held sign-in (the password was right)."""
+    from app.services import sign_in
+    S = stage.S
+    stage.calls["due"] = "Sign in through Contoso: your account has not signed in there."
+    status, body = _post_login(S, {"username": "alice", "password": "right"})
+    assert status == 403 and body["detail"] == stage.calls["due"], body
+    assert stage.calls["reasons"] == [(sign_in.PROVIDER_DUE_REASON, stage.alice)]
+    pending = _pending(stage.alice)
+    stage.db.tables[stage.PendingLogin].append(pending)
+    status, body = _post_login(S, {"username": "alice", "password": "right"}, _stage_token(S, stage.alice, pending))
+    assert status == 403 and body["detail"] == stage.calls["due"]
+    assert pending.attempts == 0 and pending.consumed_at is None

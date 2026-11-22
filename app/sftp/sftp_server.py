@@ -57,7 +57,7 @@ if __name__ == "__main__":
 
 from app.core.database import get_db_context
 from app.core.models import User, ActiveSession, Vault, Folder, File
-from app.services.auth_service import SFTP_CHANNEL, AuthService
+from app.services.auth_service import SFTP_CHANNEL, AuthService, SignInThroughProviderError
 from app.core.authorization import PermissionService, PermissionDeniedError
 from app.services.vault_service import (
     VaultService,
@@ -1176,6 +1176,16 @@ class SFTPServerInterface(paramiko.SFTPServerInterface):
         # moment must not sever every open session, and this one passed the fail-closed check at
         # sign-in. See _policy_unreadable.
         if not getattr(user, "_is_temp_session", False) and _user_requires_temp_cred_for_sftp(db, user):
+            return None
+        # Single sign-on: a connection goes no further once what made it would be refused. A key's and a
+        # temporary credential's stop when the account's sign-in through its provider has lapsed (their own
+        # sign-in is refused then), a password's when that provider closes the other ways in as well
+        # (app/services/sso_freshness.py). Checked here on every operation, as the account's state above is,
+        # so an open connection does not outlive the rule.
+        from app.services import sso_freshness
+        by_password = (not getattr(user, "_is_temp_session", False)
+                       and getattr(self.server, "_key_id", None) is None)
+        if sso_freshness.closes_a_connection(db, user, by_password=by_password):
             return None
         # Carry the connection's client address on the principal so a scope-denial audit (which fires
         # deep in the data layer, with no ASGI request and thus no ClientIPMiddleware contextvar) can
@@ -2457,6 +2467,15 @@ class SFTPServer(paramiko.ServerInterface):
                         )
 
                         return paramiko.AUTH_SUCCESSFUL
+
+                except SignInThroughProviderError as due:
+                    # The password was right; the account signs in through its identity provider only until it
+                    # has signed in there again. No session was made. The protocol carries no sentence to the
+                    # person here: the record says why, and the vault told them when the rule took hold.
+                    from app.services.sign_in import PROVIDER_DUE_REASON
+                    audit_logger.log_login_failure(username, self.client_address, PROVIDER_DUE_REASON,
+                                                   account=due.account)
+                    return paramiko.AUTH_FAILED
 
                 except Exception as e:
                     # The exception CLASS, not its text. This lands in the audit row's reason and

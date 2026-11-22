@@ -12,6 +12,14 @@ when the provider is disabled afterwards; an administrator may clear it (app/api
 
 The daily sweep warns the person :data:`WARNING_DAYS` days before, in the app and by email, and the administrators'
 user list shows the due date. Device credentials of the desktop app join the same check when they exist.
+
+The other ways in. A provider that says so (``sso_lapse_ends_sign_in``, on unless an administrator turns it off)
+closes, from the same moment, every way in to the account that does not go through a provider
+(:func:`held_to_a_provider`): its password on the web and over SFTP, a passkey by itself, and "Stay signed in" on a
+session no provider made; an SFTP connection that is open goes no further (:func:`closes_a_connection`). Without
+it a person who has left keeps signing in with a password the vault still holds, for as long as nobody removes the
+account. An account that must keep a password of its own (an administrator, a holder of the auditor right) is never
+held: its password is the way in while the provider cannot be reached.
 """
 from __future__ import annotations
 
@@ -25,6 +33,9 @@ from app.core import sso_policy
 WARNING_DAYS = 5
 LAPSE_MESSAGE = ("Sign in through {provider} again: your SSH keys and temporary credentials are paused until you "
                  "do.")
+# For an account the provider holds to its own sign-in from then on (:func:`held_to_a_provider`).
+LAPSE_MESSAGE_ALL = ("Sign in through {provider} again: your password, your passkeys, your SSH keys and your "
+                     "temporary credentials do not work until you do.")
 
 
 @dataclass(frozen=True)
@@ -37,6 +48,7 @@ class Deadline:
     due: datetime               # naive UTC, like the columns
     refused: bool               # the provider refused the person after their last sign-in through it
     window_days: int = 0        # the provider's freshness window (0: off, a refusal alone)
+    ends_sign_in: bool = False  # missed, it also closes the account's ways in that go through no provider
 
 
 def warning_lead(window_days: int) -> timedelta:
@@ -68,17 +80,19 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
     off (nobody can sign in through it then, so the keys pause on the day they would have), or a person who
     stopped signing in would keep their keys for as long as the provider stayed off. Turning the days to 0 ends
     the rule."""
-    last = identity.last_sign_in_at
+    last = getattr(identity, "last_sign_in_at", None)
     refused_at = getattr(identity, "refused_at", None)
     refused = refusal_in_force(identity)
-    days = sso_policy.effective(getattr(provider, "policy", None))["sso_freshness_days"] if provider is not None else 0
+    policy = sso_policy.effective(getattr(provider, "policy", None))
+    days = policy["sso_freshness_days"] if provider is not None else 0
     if not refused and days <= 0:
         return None
-    since = last or identity.linked_at or datetime.utcnow()
+    since = last or getattr(identity, "linked_at", None) or datetime.utcnow()
     due = since + timedelta(days=days) if days > 0 else refused_at
     name = (getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
     return Deadline(identity_id=str(identity.id), user_id=str(identity.user_id), provider_id=str(identity.provider_id),
-                    provider_name=name or "your identity provider", due=due, refused=refused, window_days=days)
+                    provider_name=name or "your identity provider", due=due, refused=refused, window_days=days,
+                    ends_sign_in=bool(policy["sso_lapse_ends_sign_in"]))
 
 
 def deadlines(db, user_id) -> List[Deadline]:
@@ -105,17 +119,83 @@ def lapsed(db, user_id, *, now: Optional[datetime] = None) -> Optional[Deadline]
     return None
 
 
+def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[Deadline]:
+    """The missed deadline that leaves ``user`` no way in but a provider's sign-in, or None.
+
+    Missed (the days ran out, or the provider refused the person) on a provider that closes the other ways in
+    then. A sign-in through any provider the account is linked to is still let in, and one through the provider
+    that asks restores everything; what is refused is what goes through none. Never an account that must keep a
+    password of its own (an administrator, a holder of the auditor right)."""
+    if user is None or getattr(user, "id", None) is None:
+        return None
+    now = now or datetime.utcnow()
+    missed = [found for found in deadlines(db, user.id) if found.ends_sign_in and (found.refused or found.due <= now)]
+    if not missed:
+        return None
+    from app.core import privileged_accounts
+    if privileged_accounts.kind(db, user) is not None:
+        return None
+    return missed[0]
+
+
+def closes_the_other_ways_in(db, user, found: Deadline) -> bool:
+    """Whether ``found``, once missed, also closes ``user``'s ways in that go through no provider: what the
+    warning and the notices say to that person."""
+    from app.core import privileged_accounts
+    return bool(found.ends_sign_in) and privileged_accounts.kind(db, user) is None
+
+
+def closes_a_connection(db, user, *, by_password: bool) -> bool:
+    """Whether an SFTP connection of ``user`` that is already open goes no further: what made it would be refused
+    now. A key's connection and a temporary credential's follow the rule their sign-in follows (any deadline
+    missed: :func:`lapsed`), a password's the password's (:func:`held_to_a_provider`). Asked on every operation,
+    as whether the account is still active is."""
+    if by_password:
+        return held_to_a_provider(db, user) is not None
+    return lapsed(db, getattr(user, "id", None)) is not None
+
+
+def way_in_text(db, found: Deadline) -> str:
+    """What a person is told at a door that goes through no provider while :func:`held_to_a_provider` holds their
+    account: the provider by name and how to reach it, or to ask an administrator where it cannot be reached or
+    has refused them. Said only after the proof at that door was good."""
+    from app.core.models import SsoProvider
+    name = found.provider_name
+    row = None
+    try:
+        row = db.query(SsoProvider).filter(SsoProvider.id == uuid.UUID(found.provider_id)).first()
+    except ValueError:
+        row = None
+    if row is None or getattr(row, "state", None) != "enabled":
+        return (f"Your account signs in only through {name} until it has signed in there again, and {name} is not "
+                "available on this vault right now. Ask your administrator.")
+    if found.refused:
+        return (f"{name} did not admit your account when it last signed in there, so its password and passkeys do "
+                f"not sign it in. Sign in through {name} once it admits you, or ask your administrator.")
+    label = (getattr(row, "label", None) or "").strip() or name
+    how = (f"Use the “{label}” button on the sign-in page." if getattr(row, "show_on_sign_in", True)
+           else "Use the sign-in link your organisation gave you.")
+    return (f"Sign in through {name}: your account has not signed in there within the time your organisation "
+            f"allows, so its password and passkeys do not sign it in until it does. {how}")
+
+
 def due_date(db, user_id) -> Optional[datetime]:
     """The earliest deadline, what the administrators' user list shows; None when no provider asks."""
     found = deadlines(db, user_id)
     return found[0].due if found else None
 
 
-def refusal_text(found: Deadline) -> str:
-    return LAPSE_MESSAGE.format(provider=found.provider_name)
+def refusal_text(found: Deadline, *, sign_in_too: bool = False) -> str:
+    """What a person whose deadline is missed is told; ``sign_in_too`` for one whose other ways in closed with it
+    (:func:`closes_the_other_ways_in`)."""
+    return (LAPSE_MESSAGE_ALL if sign_in_too else LAPSE_MESSAGE).format(provider=found.provider_name)
 
 
-def warning_text(found: Deadline, when: str) -> str:
+def warning_text(found: Deadline, when: str, *, sign_in_too: bool = False) -> str:
+    if sign_in_too:
+        return (f"Sign in through {found.provider_name} by {when}. If you do not, your password and passkeys stop "
+                "signing you in then, your SSH keys, temporary credentials and devices pause, and a sign-in "
+                f"through {found.provider_name} restores them.")
     return (f"Sign in through {found.provider_name} by {when}. If you do not, your SSH keys, temporary credentials "
             f"and devices pause then, and a sign-in through {found.provider_name} restores them.")
 
@@ -177,7 +257,7 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
     from app.api import api_server as api
     from app.core.models import User
     now = now or datetime.utcnow()
-    warned, paused = 0, []
+    warned, paused, held = 0, [], 0
     for identity, found in _identities_with_deadlines(db):
         if found.refused:
             continue
@@ -192,26 +272,36 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
             continue
         due_day = found.due.strftime("%Y-%m-%d")
         when = found.due.strftime("%d %B %Y, %H:%M UTC")
+        # Whether this deadline closes the person's password and passkeys too: said in the same words wherever
+        # the person is told.
+        too = closes_the_other_ways_in(db, user, found)
         details = {"provider_id": found.provider_id, "identity_id": found.identity_id,
-                   "expires_at": found.due.isoformat() + "Z"}
+                   "expires_at": found.due.isoformat() + "Z", "ends_sign_in": too}
         if found.due > now:
             told = api._notify_users(
                 [found.user_id], WARNED, title=f"Sign in through {found.provider_name} by {when}",
-                body=(f"Your SSH keys, temporary credentials and devices pause on {when} unless you sign in through "
-                      f"{found.provider_name} before then. Signing in restores them at any time."),
+                body=((f"Your password and passkeys stop signing you in on {when}, and your SSH keys, temporary "
+                       f"credentials and devices pause, unless you sign in through {found.provider_name} before "
+                       "then. Signing in there restores them at any time.") if too else
+                      (f"Your SSH keys, temporary credentials and devices pause on {when} unless you sign in through "
+                       f"{found.provider_name} before then. Signing in restores them at any time.")),
                 target=NOTICE_TARGET, dedup_prefix=f"{WARNED}:{found.identity_id}:{due_day}")
             warned += 1
             identity.freshness_warned_for = found.due
             _audit(db, WARNED, user=user, details=details)
             if told and user.email:
                 api._fire_action_email(db, "sso_freshness_warning", email=user.email, username=user.username,
-                                       action_context={"change": warning_text(found, when), "when": when})
+                                       action_context={"change": warning_text(found, when, sign_in_too=too),
+                                                       "when": when})
         else:
             api._notify_users(
-                [found.user_id], EXPIRED, title="Your SSH keys and temporary credentials are paused",
-                body=refusal_text(found), target=NOTICE_TARGET,
+                [found.user_id], EXPIRED,
+                title=(f"Sign in through {found.provider_name}: nothing else signs you in now" if too
+                       else "Your SSH keys and temporary credentials are paused"),
+                body=refusal_text(found, sign_in_too=too), target=NOTICE_TARGET,
                 dedup_prefix=f"{EXPIRED}:{found.identity_id}:{due_day}")
             paused.append(user.username)
+            held += 1 if too else 0
             identity.freshness_paused_for = found.due
             _audit(db, EXPIRED, user=user, details=details)
     if paused:
@@ -220,9 +310,29 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         api._notify_users(admins, EXPIRED, title=f"{len(paused)} account(s) paused for want of a provider sign-in",
                           body=(f"The SSH keys, temporary credentials and devices of {shown} paused: they have not "
                                 "signed in through their identity provider within its freshness window. A sign-in "
-                                "through the provider restores them."),
+                                "through the provider restores them."
+                                + (f" For {held} of them the password and passkeys no longer sign in either, until "
+                                   "then (the provider's rule; an administrator or an auditor keeps the password)."
+                                   if held else "")),
                           target="#users", dedup_prefix=f"{EXPIRED}:wave:{now:%Y-%m-%d-%H%M%S}")
     return {"warned": warned, "lapsed": len(paused)}
+
+
+def password_after_a_refusal(db, user) -> str:
+    """What the administrators are told about the account's password when its provider refused the person: nothing
+    for an account that holds none; that it no longer signs in, where the provider closes the other ways in; else
+    that it still does, and why."""
+    if getattr(user, "sso_only", False):
+        return ""
+    if held_to_a_provider(db, user) is not None:
+        return (" Their password and passkeys no longer sign them in either, until the provider admits them again "
+                "or the refusal is cleared.")
+    from app.core import privileged_accounts
+    if privileged_accounts.kind(db, user) is not None:
+        return (" Their password still signs them in: an administrator or an auditor keeps a password of their own. "
+                "Lock or deactivate the account if it should not.")
+    return (" Their password still signs them in to the web app: this provider does not close the other ways in "
+            "when it refuses a person (Sessions). Lock or deactivate the account if it should not.")
 
 
 # --------------------------------------------------------------------------- refusal at the provider ends access
@@ -262,8 +372,7 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
     label = (getattr(row, "name", None) or "").strip() or (getattr(row, "label", None) or "the identity provider")
     try:
         admins = [str(a.id) for a in api._active_admins(db)]
-        password_too = "" if getattr(user, "sso_only", False) else (
-            " Their password still signs them in to the web app unless the account signs in only through the provider.")
+        password_too = password_after_a_refusal(db, user)
         api._notify_users(admins, ENDED, title=f"{label} refused {user.username}: sessions ended, keys paused",
                           body=(f"{label} signed {user.username} in with a token its restriction excludes (a tenant, "
                                 "a domain or a required group), so their sessions ended and their SSH keys, temporary "
