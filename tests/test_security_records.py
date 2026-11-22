@@ -288,7 +288,10 @@ def test_every_place_that_audits_a_failed_sign_in_writes_the_record():
     # The authenticator code's two sites, and the passkey's two (the sign-in's second step, the step-up).
     assert src.count("log_second_factor_failure(") == 4
     assert '"second_factor_failed"' not in src and "action=\"second_factor_failed\"" not in src
-    assert inspect.getsource(sftp_server).count("audit_logger.log_login_failure(") == 2
+    # The SFTP password door's three: a sign-in the account's own switches or the policy refuse, one of an
+    # account that signs in through its identity provider only until it has signed in there again, and every
+    # other failure.
+    assert inspect.getsource(sftp_server).count("audit_logger.log_login_failure(") == 3
     # Nothing else writes those rows except through the two methods that write the record with them.
     tree = ast.parse((ROOT / "app" / "services" / "audit_logger.py").read_text(encoding="utf-8"))
     writers = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)

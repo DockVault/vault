@@ -2471,7 +2471,8 @@ class SFTPServer(paramiko.ServerInterface):
                 except SignInThroughProviderError as due:
                     # The password was right; the account signs in through its identity provider only until it
                     # has signed in there again. No session was made. The protocol carries no sentence to the
-                    # person here: the record says why, and the vault told them when the rule took hold.
+                    # person here: the record says why, in the vault's own fixed words, and the vault told
+                    # them when the rule took hold.
                     from app.services.sign_in import PROVIDER_DUE_REASON
                     audit_logger.log_login_failure(username, self.client_address, PROVIDER_DUE_REASON,
                                                    account=due.account)

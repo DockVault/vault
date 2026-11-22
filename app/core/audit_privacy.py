@@ -176,7 +176,7 @@ _IDENTIFIER_KEYS = (
     # a passkey: its row id, and whether it was registered soon after an administrator changed the account
     "passkey_id", "provisional",
     # single sign-on: the provider and identity rows, what the sign-in was for, how an identity was linked
-    "provider_id", "identity_id", "purpose", "linked_by",
+    "provider_id", "identity_id", "purpose", "linked_by", "ends_sign_in",
     # a provider an administrator changed: the preset it was made from, the names of the fields that changed (never
     # a value), its state, and how many linked accounts and links the change touched
     "preset", "changed", "state", "made_sso_only", "restored", "identities",
