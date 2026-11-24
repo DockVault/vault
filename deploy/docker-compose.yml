@@ -35,7 +35,7 @@ services:
     # makes 18 refuse to start. Beyond the mount, every existing vault_pg_data volume holds 15
     # data files that 18 cannot read without a pg_upgrade — so a major bump is a migration with a
     # documented upgrade path in dockvault.py, not a digest change. 15 is supported to Nov 2027.
-    image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+    image: postgres:15-alpine@sha256:e18480a22d6e48f4d816a6696769b1ec09ac73a824c5649e49c7d8b684913f3d
     container_name: vault-db
     # Leak-ONLY backstop for a forgotten commit/rollback: Postgres aborts a session left
     # idle-in-transaction longer than this, releasing its locks. Set high (10 min) ON PURPOSE --
