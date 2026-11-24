@@ -12,6 +12,9 @@ application's own functions, the meeting forced with events.
   while the password was changed checks the password that stands, and is refused.
 - A sign-in, and a sign-in held for a further step, read before the account's sessions were ended and written
   after: refused, with nothing written.
+- A promotion sent with a switch of the account's SFTP access, of an account whose password somebody else set:
+  recording the grant writes the account's row, and the take-back of the password then asks for the turn the
+  sign-in holds, while the sign-in goes on to write that row. The promotion takes the turn first now.
 - A held sign-in that goes on (to a session, or to a further hold) and an administrator's deletion of the account
   at that moment: the sign-in has spent its held row and holds the account's turn; the deletion's removal of the
   account's held sign-ins and the sign-in's next write waited for each other, and the database ended one of the
@@ -191,6 +194,23 @@ def a_reset_link_used(uid, maker_id):
     return run
 
 
+def a_promotion_with_an_sftp_switch(admin_id, uid):
+    """The account is made an administrator and its SFTP password sign-in is switched off in one request; its
+    password was set by somebody else, so the promotion takes it back and ends the account's sessions."""
+    from app.core import password_origin
+    with SessionLocal() as s:
+        password_origin.set_by_other(s.get(User, uid), admin_id)
+        s.commit()
+
+    def run():
+        with SessionLocal() as s:
+            asyncio.run(api.update_user(user_id=uid,
+                                        user_update=api.UserUpdate(role=RoleEnum.ADMIN, sftp_password_auth=False),
+                                        current_user=s.get(User, admin_id), db=s, request=REQUEST))
+            return "promoted"
+    return run
+
+
 def a_lock(admin_id, uid):
     def run():
         with SessionLocal() as s:
@@ -255,7 +275,8 @@ ada, _ = account("ada", RoleEnum.ADMIN)
 bea, _ = account("bea", RoleEnum.ADMIN)
 alice, alice_name = account("alice")
 
-if pair in ("a change made at once", "an approval", "a reset link used", "the lock of an administrator"):
+if pair in ("a change made at once", "an approval", "a reset link used", "the lock of an administrator",
+            "a promotion with an SFTP switch"):
     target = alice
     if pair == "a change made at once":
         ender = a_change_made_at_once(ada, alice)
@@ -266,6 +287,8 @@ if pair in ("a change made at once", "an approval", "a reset link used", "the lo
         ender = an_approval(ada, bea, alice)
     elif pair == "a reset link used":
         ender = a_reset_link_used(alice, ada)
+    elif pair == "a promotion with an SFTP switch":
+        ender = a_promotion_with_an_sftp_switch(ada, alice)
     else:
         target, _ = account("cora", RoleEnum.ADMIN)
         ender = a_lock(ada, target)
@@ -343,7 +366,7 @@ print(json.dumps(out))
 
 
 @pytest.mark.parametrize("ender", ["a change made at once", "an approval", "a reset link used",
-                                   "the lock of an administrator"])
+                                   "the lock of an administrator", "a promotion with an SFTP switch"])
 def test_a_sign_in_writing_in_its_turn_and_what_ends_the_sessions_both_finish(db_name, ender):
     out = run_in(db_name, SCENARIO, env={"PAIR": ender})
     assert out["writer"] == ["ok", "signed in"], out

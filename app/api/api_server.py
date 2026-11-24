@@ -6892,6 +6892,14 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     caller's transaction, before anything of the promotion is committed."""
     from app.core import admin_grants, auditor_rights
     from app.core import credential_changes as cc
+    # The account's turn at its sessions first, before anything below reads or writes the account (the order of
+    # the locks, app/services/sign_in.py). Recording the grant flushes what the caller has already changed on the
+    # account (a switch of its SFTP access sent with the role, say), which locks the account's row; a password
+    # somebody else set is then taken back, which ends the account's sessions and takes this turn. Taken only
+    # there, the row came before the turn: a sign-in of the account, which holds the turn and goes on to write
+    # the row, waited for the promotion while the promotion waited for it, and the database ended one of the
+    # two, in practice the promotion.
+    _sessions_turn(db, user.id)
     refusal = auditor_rights.promotion_refusal(db, user)
     if refusal is not None:
         raise HTTPException(status_code=409, detail=refusal)

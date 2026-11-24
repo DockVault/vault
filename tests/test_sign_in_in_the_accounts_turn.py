@@ -479,3 +479,27 @@ def test_a_deletion_takes_the_accounts_turn_after_the_vault_rows_and_before_the_
     assert all(source.count(step) == 1 for step in steps), [(step, source.count(step)) for step in steps]
     order = [source.index(step) for step in steps]
     assert order == sorted(order), order
+
+
+def test_a_promotion_takes_the_accounts_turn_before_it_reads_or_writes_the_account(monkeypatch):
+    """Recording the grant flushes what the caller changed on the account, which locks its row, and the take-back
+    that follows takes the account's turn: the turn comes first, also for a promotion that is then refused.
+    (The meeting with a sign-in is forced on PostgreSQL in tests/test_sign_in_lock_order_live.py.)"""
+    import types
+    import uuid
+    from fastapi import HTTPException
+    from app.api import api_server as api
+    from app.core import admin_grants, auditor_rights
+    order, answer = [], [None]
+    monkeypatch.setattr(api, "_sessions_turn", lambda db, user_id: order.append(("the turn", user_id)))
+    monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: order.append("asked") or answer[0])
+    monkeypatch.setattr(admin_grants, "record", lambda db, user_id, **kw: order.append("recorded"))
+    monkeypatch.setattr(api, "_revoke_reset_links_outranked_by", lambda db, user, actor: order.append("links"))
+    alice = types.SimpleNamespace(id=uuid.uuid4(), username="alice")
+    api._record_admin_grant(types.SimpleNamespace(), alice, by=None)
+    assert order == [("the turn", alice.id), "asked", "recorded", "links"]
+    del order[:]
+    answer[0] = "the account holds the auditor right"
+    with pytest.raises(HTTPException) as refused:
+        api._record_admin_grant(types.SimpleNamespace(), alice, by=None)
+    assert refused.value.status_code == 409 and order == [("the turn", alice.id), "asked"]
