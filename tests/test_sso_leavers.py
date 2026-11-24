@@ -585,13 +585,15 @@ def test_an_account_made_at_a_first_sign_in_is_promoted_and_then_chooses_a_passw
     with pytest.raises(HTTPException) as refused:
         S._record_admin_grant(db2, bob, by=root)
     assert refused.value.status_code == 409 and "allow password sign-in on the provider first" in refused.value.detail
-    assert bob.sso_only is True and recorded == [alice.id] and len(turns) == 1
-    # An account that is not flagged takes no turn here and is changed in nothing.
+    assert bob.sso_only is True and recorded == [alice.id]
+    assert turns == [(alice.id, True), (bob.id, True)]        # the turn comes first, also where it is refused
+    # An account that is not flagged takes the turn as every promotion does, and is changed in nothing.
     carol, r, k, db3 = _world(username="carol")
     users[carol.id] = carol
     before = carol.password_hash
     S._record_admin_grant(db3, carol, by=root)
-    assert recorded == [alice.id, carol.id] and len(turns) == 1 and carol.password_hash == before
+    assert recorded == [alice.id, carol.id] and turns[-1] == (carol.id, False) and len(turns) == 3
+    assert carol.password_hash == before
 
 
 def test_the_provider_page_sends_both_settings():

@@ -239,3 +239,26 @@ def test_an_account_held_to_its_providers_sign_in_adds_no_other_way_in(db, world
         with pytest.raises(Exception) as other:                   # noqa: PT011 -- whatever the link asks next
             run_coroutine(route(body=None, request=_request(), current_user=me, db=db, **how))
         assert "sso_sign_in_due" not in str(getattr(other.value, "detail", other.value)), route.__name__
+
+
+def test_a_promotion_decides_on_the_flag_as_it_is_committed_when_its_turn_comes(db, world, monkeypatch):
+    """An account made at a first sign-in is loaded while its provider lets such accounts set a password: not
+    flagged. A save of that setting flags it and commits before the promotion's turn comes. The promotion reads
+    the flag again in its turn and ends it. Decided on what was loaded, it wrote nothing to the flag, and left an
+    administrator who signs in only through a provider, with a password nobody knows."""
+    from app.core import password_origin
+    from app.core.models import User
+    provider, alice, identity = _linked(db)
+    identity.linked_by = "jit"
+    password_origin.set_by_other(alice, None)
+    password_origin.mark_nobody_knows(alice)
+    db.commit()
+    me = db.query(User).filter(User.id == alice.id).first()
+    assert not me.sso_only
+    other = _another(db)
+    other.get(User, alice.id).sso_only = True              # the save of the provider's setting, settled
+    other.commit()
+    other.close()
+    api._record_admin_grant(db, me, by=None)
+    db.commit()
+    assert _as_left(db, alice) == (False, 1)

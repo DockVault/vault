@@ -7184,6 +7184,14 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     # the row, waited for the promotion while the promotion waited for it, and the database ended one of the
     # two, in practice the promotion.
     _sessions_turn(db, user.id)
+    # The account's flag and role as they are committed, read again in the turn. A save of a provider's setting
+    # may have made the account sign in only through its provider a moment ago, or ended that. Decided on what
+    # was loaded before the turn, the promotion left an administrator flagged, with a password nobody knows and
+    # a reset link that was refused. Only these two are read again: what the caller has changed on the account
+    # stays as it is.
+    refresh = getattr(db, "refresh", None)
+    if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
+        refresh(user, attribute_names=["sso_only", "role"])
     refusal = auditor_rights.promotion_refusal(db, user)
     if refusal is not None:
         raise HTTPException(status_code=409, detail=refusal)
@@ -7193,15 +7201,9 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
             raise HTTPException(status_code=409, detail=(
                 f"{user.username} signs in only through its organisation's provider and holds no password, which an "
                 "administrator needs; allow password sign-in on the provider first."))
-        # The account's turn at its sessions before the account is changed (the order of the locks: the turn,
-        # then the account's row; the take-back that follows takes the turn it then already holds), and the flag
-        # read again in it: a change of the provider's setting may have ended it a moment ago.
-        _sessions_turn(db, user.id)
-        refresh = getattr(db, "refresh", None)
-        if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
-            refresh(user, attribute_names=["sso_only"])
-        if getattr(user, "sso_only", False):
-            sso_only.allow_password_sign_in(db, user)
+        # Held only because it was made at its first sign-in: the flag ends with the promotion (the turn is
+        # held, and the flag was read again in it, above).
+        sso_only.allow_password_sign_in(db, user)
     # The account's sessions, and its sign-ins under way, end with the promotion. Each was made with what a user
     # owes: a passkey by itself, where the role lets one in alone, or a password with no second factor. An
     # administrator always gives the password and whatever the administrators' policy asks, and a session from
