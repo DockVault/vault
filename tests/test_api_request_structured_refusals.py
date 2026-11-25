@@ -117,3 +117,17 @@ def test_a_404_with_a_structured_detail_is_its_sentence_with_its_reason():
     assert bare["message"] == "Resource not found" and bare["reason"] is None and bare["status"] == 404
     beside = _refused(404, {"detail": "No such vault", "reason": "gone"})
     assert beside["message"] == "No such vault" and beside["reason"] == "gone"
+
+
+def test_a_refused_code_claim_is_its_sentence_and_the_person_stays_signed_in():
+    """A link, a test sign-in or a confirmation whose code is refused when the page claims it (the session was
+    renewed while the person was at the provider, or the code ran out on a slow load) is answered 409 with its
+    reason. The page shows the sentence and keeps the session: a 401 for the same thing ended it."""
+    message = "This did not come back to the tab and session that started it. Start again."
+    out = _refused(409, {"detail": {"reason": "code_refused", "message": message}}, silent=True)
+    assert out["settled"] == "rejected" and out["kind"] == "Error", out
+    assert out["message"] == message and out["reason"] == "code_refused" and out["status"] == 409
+    assert out["signed_out"] == 0 and out["held"] is True
+    # What the server answered before: the same refusal as a 401 signed the person out.
+    before = _refused(401, {"detail": "This code is not valid for this tab; start again."}, silent=True)
+    assert before["signed_out"] == 1 and before["held"] is False

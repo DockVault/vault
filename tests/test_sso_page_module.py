@@ -251,7 +251,7 @@ fetched['/api/auth/sso/reasons'] = { ok: true, json: { reasons: { already_linked
 results.push(await window.Sso.resume(arrive('#sso-error=already_linked')));
 // The claim itself refused: the server's sentence.
 await window.Sso.startLink('p-1');
-answers['/users/me/identities/finish'] = new Error('This code is not valid for this tab; start again.');
+answers['/users/me/identities/finish'] = new Error('This did not come back to the tab and session that started it. Start again.');
 results.push(await window.Sso.resume(arrive('#sso-linked=c1')));
 out({ results, claims: asked.filter((a) => /finish$/.test(a.path)).length });
 """)
@@ -259,7 +259,7 @@ out({ results, claims: asked.filter((a) => /finish$/.test(a.path)).length });
     assert got["results"] == [
         wrong_tab, wrong_tab, wrong_tab, None, None,
         {"kind": "error", "message": "That identity is linked to another account."},
-        {"kind": "error", "message": "This code is not valid for this tab; start again."}]
+        {"kind": "error", "message": "This did not come back to the tab and session that started it. Start again."}]
     assert got["claims"] == 1                          # only the last one reached the server
 
 

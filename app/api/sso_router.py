@@ -959,7 +959,7 @@ async def finish_reauth(
     record = _claim_handover(db, request, current_user, body, purpose=sso_state.STEP_UP)
     action = record.get("step_up_action")
     if not isinstance(action, str) or not action:
-        raise HTTPException(status_code=401, detail="This code is not valid for this tab; start again.")
+        raise _code_refused()
     if action != sso.UNLINK_CONFIRMATION and not sso.reauth_permitted(db, current_user, action):
         raise HTTPException(status_code=403, detail={"reason": "password_required", "message": sso.REAUTH_NOT_FOR_THIS})
     if not sso.reauth_stands(db, current_user, record["provider_id"], record.get("subject")):
@@ -1031,10 +1031,22 @@ PASSWORD_STOPPED = (" {label} signs its people in without a vault password, so y
                     "sign-in no longer work: you sign in through {label} from now on.")
 
 
+CODE_REFUSED = "code_refused"
+CODE_REFUSED_WORDS = "This did not come back to the tab and session that started it. Start again."
+
+
+def _code_refused() -> HTTPException:
+    """The one refusal of a code a signed-in page claims (a link, a test sign-in, a confirmation). Answered 409
+    with its reason, never 401: the page takes a 401 for the end of its session and signs the person out, and
+    this says nothing about the session. A session renewed while the person was at the provider, or a code that
+    ran out on a slow load, is refused here, and the person, who is signed in, starts the link again."""
+    return HTTPException(status_code=409, detail={"reason": CODE_REFUSED, "message": CODE_REFUSED_WORDS})
+
+
 def _claim_handover(db, request, current_user, body: SsoHandoverFinishRequest, *, purpose: str):
     """The record a handover code stands for, when this tab and session may claim it: the code is spent whatever
     follows; the verifier must hash to the one the start kept; the account and the session must be the ones
-    that started it. One refusal for every miss."""
+    that started it. One refusal for every miss (:func:`_code_refused`)."""
     api = _api()
     client_ip = api.get_client_ip(request)
     from app.core import sign_in_lockout
@@ -1053,7 +1065,7 @@ def _claim_handover(db, request, current_user, body: SsoHandoverFinishRequest, *
         raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
     import hashlib
     import hmac
-    refused = HTTPException(status_code=401, detail="This code is not valid for this tab; start again.")
+    refused = _code_refused()
     if record is None or record.get("purpose") != purpose or not sso.account_usable(current_user):
         raise refused
     if not hmac.compare_digest(hashlib.sha256(body.verifier.encode("utf-8")).hexdigest(), record["verifier_hash"]):

@@ -519,16 +519,21 @@ def test_a_link_is_claimed_only_by_the_tab_and_session_that_started_it(monkeypat
     # The callback linked nothing: the identity waits under a code.
     assert h.identities() == [] and all(a[0] != "sso_identity_linked" for a in h.audits)
     # Another tab's verifier, another session, another account: refused, and the code is spent by the first try.
-    assert h.finish_link(location, verifier="other-tab")[0] == 401
+    status, body = h.finish_link(location, verifier="other-tab")
+    # Refused as a matter of this code, with its reason, and never as 401: the page takes a 401 for the end of
+    # its session and would sign out a person who is signed in.
+    assert status == 409 and body["detail"] == {
+        "reason": "code_refused",
+        "message": "This did not come back to the tab and session that started it. Start again."}, body
     assert h.identities() == []
     status, location2, _ = h.callback(p, h.state_of(h.start_link(p)[1]["authorization_url"])[0])
     h.session_hash = "another-session"
-    assert h.finish_link(location2)[0] == 401
+    assert h.finish_link(location2)[0] == 409
     h.session_hash = "sess-hash"
     status, location3, _ = h.callback(p, h.state_of(h.start_link(p)[1]["authorization_url"])[0])
     h.current_user = _user("mallory")
     h.db.rows_of(type(alice)).append(h.current_user)
-    assert h.finish_link(location3)[0] == 401 and h.identities() == []
+    assert h.finish_link(location3)[0] == 409 and h.identities() == []
     h.current_user = alice
     # The right tab and session: linked, told, listed; the code is spent.
     status, location4, _ = h.callback(p, h.state_of(h.start_link(p)[1]["authorization_url"])[0])
@@ -539,7 +544,7 @@ def test_a_link_is_claimed_only_by_the_tab_and_session_that_started_it(monkeypat
     assert identity.email_at_link == "alice@example.test" and identity.display_name == "Alice Example"
     assert any(a[0] == "sso_identity_linked" for a in h.audits)
     assert h.notices[-1][1] == "A sign-in method was added to your account" and h.emails[-1][0] == "sign_in_method_changed"
-    assert h.finish_link(location4)[0] == 401
+    assert h.finish_link(location4)[0] == 409
     status, out, _ = _call(h.S, "GET", "/users/me/identities")
     assert status == 200 and out["identities"][0]["provider"] == "Sign in with Contoso"
     # The same provider again: already linked; and the identity now signs the person in.
@@ -561,11 +566,11 @@ def test_login_csrf_through_the_link_callback_links_nothing(monkeypatch):
     assert location.startswith("/#sso-linked=")
     # The victim's tab has no verifier for this code and another session: nothing is linked to anyone.
     h.current_user, h.session_hash = victim, "victim-session"
-    assert h.finish_link(location, verifier="victim-tab")[0] == 401
+    assert h.finish_link(location, verifier="victim-tab")[0] == 409
     assert h.identities() == []
     # Mallory, who knows the verifier, cannot claim it from another session either (the code is spent).
     h.current_user, h.session_hash = mallory, "sess-hash"
-    assert h.finish_link(location, verifier="mallory-tab")[0] == 401 and h.identities() == []
+    assert h.finish_link(location, verifier="mallory-tab")[0] == 409 and h.identities() == []
 
 
 def test_a_link_needs_a_session_that_proved_the_password_and_the_factor(monkeypatch):
@@ -631,7 +636,7 @@ def test_an_identity_already_on_another_account_is_not_linked_twice(monkeypatch)
     status, location, _ = h.callback(p, state)
     assert location.startswith("/#sso-linked=")
     alice.is_active = False
-    assert h.finish_link(location)[0] == 401 and len(h.identities()) == 1
+    assert h.finish_link(location)[0] == 409 and len(h.identities()) == 1
 
 
 def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_account(monkeypatch):
@@ -689,7 +694,7 @@ def test_a_test_sign_in_is_claimed_by_the_administrators_tab_and_changes_nothing
     status, location, _ = h.callback(p, state)
     assert location.startswith("/#sso-test="), location
     assert p.last_test is None                                    # nothing written at the callback
-    assert h.finish_test(p, location, verifier="other")[0] == 401 and p.last_test is None
+    assert h.finish_test(p, location, verifier="other")[0] == 409 and p.last_test is None
     # Claimed from the right tab (a fresh test: the first claim spent the code).
     url = sso.start(p, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
                     user_id=root.id, session_hash="sess-hash")
@@ -711,7 +716,7 @@ def test_a_test_sign_in_is_claimed_by_the_administrators_tab_and_changes_nothing
     state, _ = h.state_of(url)
     status, location, _ = h.callback(p, state)
     code = parse_qs(location.split("#", 1)[1])["sso-test"][0]
-    assert _call(h.S, "POST", "/users/me/identities/finish", {"code": code, "verifier": "test-tab"})[0] == 401
+    assert _call(h.S, "POST", "/users/me/identities/finish", {"code": code, "verifier": "test-tab"})[0] == 409
 
 
 def test_a_link_or_test_state_without_its_tab_and_session_cannot_be_claimed(monkeypatch):

@@ -68,7 +68,26 @@ def test_a_fresh_provider_sign_in_meets_the_password_part_once(monkeypatch):
     assert status == 302 and location.startswith("/#sso-stepup="), location
     # Nothing is staged until the tab claims the code with its verifier.
     assert not [k for k in h.redis.rows if k.startswith("sso:reauth:")]
-    assert h.finish_reauth(location, verifier="other-tab")[0] == 401
+    status, body = h.finish_reauth(location, verifier="other-tab")
+    assert status == 409 and body["detail"]["reason"] == "code_refused", body         # never 401: the session stands
+    # A staged answer that names no action is refused the same way.
+    from app.core import sso_state
+    status, location, _ = _stepped_up_url(h, p, auth_time=int(time.time()) - 5)
+    take = sso_state.take_handover
+
+    def nameless(code):
+        record = take(code)
+        record.pop("step_up_action", None)
+        return record
+    sso_state.take_handover = nameless
+    try:
+        status, body = h.finish_reauth(location)
+    finally:
+        sso_state.take_handover = take
+    assert status == 409 and body["detail"] == {
+        "reason": "code_refused",
+        "message": "This did not come back to the tab and session that started it. Start again."}, body
+    assert not [k for k in h.redis.rows if k.startswith("sso:reauth:")]
     status, location, _ = _stepped_up_url(h, p, auth_time=int(time.time()) - 5)
     status, body = h.finish_reauth(location)
     assert status == 200 and body == {"staged": True, "action": "admin.retention.write", "expires_in": 120}, body
