@@ -913,14 +913,26 @@
     }
 
     // What removing a mapping changes, and what it does not, said before it is done (DELETE .../group-mappings/{id}).
-    function removeMappingSays(mapping) {
+    // What removing `mapping` does, said before it is done; `mappings` are the provider's mappings as listed. A
+    // sign-in judges a department by every group still mapped to it (app/services/sso_groups.py, apply): where
+    // another mapping names the same department, a person in none of its groups leaves it at their next sign-in.
+    // Only a department no mapping names any more is left alone.
+    function removeMappingSays(mapping, mappings) {
         const keeps = [];
-        if (mapping.department) {
-            keeps.push(`people who joined ${mapping.department.name} through it stay until an administrator takes them out`);
+        const department = mapping.department;
+        const others = department ? (Array.isArray(mappings) ? mappings : []).filter((m) => m && m.id !== mapping.id
+            && m.department && m.department.id === department.id) : [];
+        if (department && !others.length) {
+            keeps.push(`people who joined ${department.name} through it stay until an administrator takes them out`);
         }
         if (mapping.role === 'user' || mapping.role === 'external') keeps.push('a role it gave stays');
+        const who = others.length === 1 ? 'not in that group' : 'in none of those groups';
+        const still = others.length
+            ? ` ${department.name} stays mapped to ${others.map((m) => m.provider_group).join(', ')}: at their next `
+                + `sign-in through this provider, people ${who} leave ${department.name}.`
+            : '';
         return `Remove the mapping of the group ${mapping.provider_group}? Nobody's department or role changes`
-            + (keeps.length ? ': ' + keeps.join(', and ') : '') + '.'
+            + (others.length ? ' now' : '') + (keeps.length ? ': ' + keeps.join(', and ') : '') + '.' + still
             + (mapping.role === 'admin' ? ' A request for the administrator role it opened can no longer be approved.' : '')
             + ' The other administrators are told.';
     }
@@ -1027,7 +1039,8 @@
         remove.setAttribute('aria-label', `Remove the mapping of ${mapping.provider_group}`);
         remove.addEventListener('click', async () => {
             if (ctx.locked) return;
-            const ok = await showConfirm(removeMappingSays(mapping), 'Remove the mapping', null, 'Remove');
+            const ok = await showConfirm(removeMappingSays(mapping, ctx.read && ctx.read.mappings),
+                'Remove the mapping', null, 'Remove');
             if (!ok) return;
             remove.disabled = true;
             try {

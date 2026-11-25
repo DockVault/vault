@@ -366,6 +366,39 @@ out({ declined, confirm: confirms[0], deletes: sent('DELETE').map((d) => d[0]), 
     assert got["reads"] == 2 and got["listed"] == 2
 
 
+def test_removing_one_of_two_mappings_of_a_department_says_who_leaves_it_at_their_next_sign_in():
+    """A sign-in judges a department by every group still mapped to it (app/services/sso_groups.py, apply). Where
+    another mapping names the same department, the one removed no longer counts: a person who was in its group
+    alone leaves the department at their next sign-in through the provider. Only a department no mapping names
+    any more is left alone."""
+    got = _node(r"""
+const more = [
+    { id: 'm-5', provider_group: 'Finance EU', department: { id: 'd-fin', name: 'Finance' }, role: null, does_nothing: null },
+    { id: 'm-6', provider_group: 'Finance US', department: { id: 'd-fin', name: 'Finance' }, role: null, does_nothing: null }];
+const said = async (mappings, id) => {
+    answers[MAPS] = LISTING({ mappings });
+    await openGroups();
+    confirms.length = 0;
+    confirmAnswer = false;
+    button(id, 'Remove').click();
+    await settle();
+    return confirms[0][0];
+};
+out({ one: await said(MAPPINGS.concat(more.slice(0, 1)), 'm-2'), two: await said(MAPPINGS.concat(more), 'm-2'),
+      last: await said([MAPPINGS[0], more[0]], 'm-5') });
+""")
+    assert got["one"] == ("Remove the mapping of the group Finance? Nobody's department or role changes now: a role it "
+                          "gave stays. Finance stays mapped to Finance EU: at their next sign-in through this "
+                          "provider, people not in that group leave Finance. The other administrators are told.")
+    assert got["two"] == ("Remove the mapping of the group Finance? Nobody's department or role changes now: a role it "
+                          "gave stays. Finance stays mapped to Finance EU, Finance US: at their next sign-in through "
+                          "this provider, people in none of those groups leave Finance. The other administrators are "
+                          "told.")
+    assert got["last"] == ("Remove the mapping of the group Finance EU? Nobody's department or role changes: people who "
+                           "joined Finance through it stay until an administrator takes them out. The other "
+                           "administrators are told.")
+
+
 def test_add_is_offered_below_the_limit_only():
     got = _node(r"""
 answers[MAPS] = LISTING({ limit: 3 });
