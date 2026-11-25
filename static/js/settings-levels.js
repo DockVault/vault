@@ -226,7 +226,8 @@
         button.id = 'settings-advanced-switch';
         button.setAttribute('role', 'switch');
         button.setAttribute('aria-checked', 'false');
-        button.setAttribute('aria-label', 'Show advanced settings on every page');
+        // The name starts with the visible label, so a voice command that says "Advanced" finds it.
+        button.setAttribute('aria-label', 'Advanced: show advanced settings on every page');
         button.title = 'Show advanced settings on every page';
         button.appendChild(el('span', 'settings-advanced-thumb'));
         button.addEventListener('click', () => setAdvanced(!S.advanced));
@@ -238,9 +239,10 @@
         return box;
     }
 
-    // Another tab of this browser turned the switch: follow it.
+    // Another tab of this browser turned the switch, or cleared this site's storage (the event's key is null
+    // then): follow it.
     window.addEventListener('storage', (e) => {
-        if (e.key !== ADVANCED_KEY) return;
+        if (e.key !== ADVANCED_KEY && e.key !== null) return;
         S.advanced = readAdvanced();
         syncSwitch();
         schedule();

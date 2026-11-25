@@ -45,6 +45,9 @@ BRAND_ASSET_FIELDS = {
     "favicon": "favicon_url",
 }
 
+# The slots above that hold a logo (the name may stand beside these; the favicon is not one).
+BRAND_LOGO_SLOTS = frozenset({"logo", "logo_dark", "logo_small"})
+
 # The upload slots of the Branding page (api_server ``_BRAND_ASSET_SLOTS``) and the field each one is
 # checked by: one logo upload drives all three logo fields.
 BRAND_UPLOAD_SLOT_FIELDS = {"logo": "logo_url", "favicon": "favicon_url"}
@@ -59,6 +62,14 @@ def brand_asset_dir() -> str:
     return os.environ.get("BRAND_ASSET_DIR", str(PROJECT_ROOT / "brand"))
 
 
+def _is_safe_asset_name(name: str) -> bool:
+    """A name the asset route serves: a plain single-segment filename, no traversal, made only of
+    alphanumerics and ``._-``. The same rule as api_server ``_is_safe_asset_name``, kept here so this
+    module does not import the API server."""
+    return bool(name) and ".." not in name and "/" not in name and "\\" not in name \
+        and all(c.isalnum() or c in "._-" for c in name)
+
+
 def brand_asset_missing(url: Any, asset_dir: Optional[str] = None) -> bool:
     """True when ``url`` names an uploaded asset (under /brand-assets/) whose file is not there.
 
@@ -68,7 +79,7 @@ def brand_asset_missing(url: Any, asset_dir: Optional[str] = None) -> bool:
     if not isinstance(url, str) or not url.startswith(BRAND_ASSET_PREFIX):
         return False
     name = url[len(BRAND_ASSET_PREFIX):].split("?", 1)[0].split("#", 1)[0]
-    if not name or "/" in name or "\\" in name or ".." in name:
+    if not _is_safe_asset_name(name):
         return True
     base = os.path.realpath(asset_dir or brand_asset_dir())
     real = os.path.realpath(os.path.join(base, name))
@@ -94,18 +105,26 @@ def _note_missing_asset(slot: str) -> None:
     logger.warning("brand asset for the %s slot is missing; the built-in default is served instead", slot)
 
 
-def brand_asset_urls(cfg: BrandingConfig, asset_dir: Optional[str] = None) -> Dict[str, Any]:
-    """The asset URLs of ``cfg``, with each uploaded asset whose file is gone replaced by the built-in
-    default of its slot, so a lost brand volume shows the stock logo rather than a broken image."""
+def _brand_asset_urls_and_fallbacks(cfg: BrandingConfig, asset_dir: Optional[str] = None):
+    """The asset URLs of ``cfg`` (as :func:`brand_asset_urls`) and the set of slots that fell back
+    to their built-in default."""
     folder = asset_dir or brand_asset_dir()
     urls = {}
+    fell_back = set()
     for slot, field in BRAND_ASSET_FIELDS.items():
         url = getattr(cfg, field)
         if brand_asset_missing(url, folder):
             _note_missing_asset(slot)
             url = _field_default(field)
+            fell_back.add(slot)
         urls[slot] = url
-    return urls
+    return urls, fell_back
+
+
+def brand_asset_urls(cfg: BrandingConfig, asset_dir: Optional[str] = None) -> Dict[str, Any]:
+    """The asset URLs of ``cfg``, with each uploaded asset whose file is gone replaced by the built-in
+    default of its slot, so a lost brand volume shows the stock logo rather than a broken image."""
+    return _brand_asset_urls_and_fallbacks(cfg, asset_dir)[0]
 
 
 def missing_brand_uploads(overrides: Dict[str, Any], asset_dir: Optional[str] = None) -> List[str]:
@@ -227,12 +246,14 @@ def branding_public_payload(cfg: BrandingConfig, asset_dir: Optional[str] = None
 
     An uploaded asset whose file is gone from the brand volume is replaced by the built-in
     default of its slot (:func:`brand_asset_urls`). ``show_name_beside_logo`` tells the shell
-    whether the name stands beside the logo or the logo shows alone.
+    whether the name stands beside the logo or the logo shows alone. It is always true while a
+    logo slot fell back to the built-in default: the stock logo does not carry the brand's name,
+    so the name must show beside it.
     """
     payload = dict(cfg.to_public_dict())
-    payload["show_name_beside_logo"] = bool(cfg.show_name_beside_logo)
+    urls, fell_back = _brand_asset_urls_and_fallbacks(cfg, asset_dir)
+    payload["show_name_beside_logo"] = bool(cfg.show_name_beside_logo) or bool(fell_back & BRAND_LOGO_SLOTS)
     payload["colors"] = cfg.get_theme_css_vars()
-    urls = brand_asset_urls(cfg, asset_dir)
     payload["logo_url"] = urls["logo"]
     payload["assets"] = {
         "logo": urls["logo"],

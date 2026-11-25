@@ -23,8 +23,12 @@
  * The name beside the logo: a [data-brand-name] in the same parent as a [data-brand-logo] (the
  * top bar, the sign-in card, the public pages' header). When show_name_beside_logo is false and
  * that logo has loaded, the name is hidden and the image's alt is the name. While the name shows,
- * the alt is "" so screen readers do not read the name twice. If the logo cannot be loaded, the
- * name shows. A logo on its own (the boot screen) has the name as its alt.
+ * the alt is "" so screen readers do not read the name twice. If the logo cannot be loaded, or the
+ * image is the built-in logo, the name shows. A logo on its own (the boot screen) has the name as
+ * its alt.
+ *
+ * The tab title is "<app_name> - <app_full_name>", except on a page whose <html> carries
+ * data-brand-title="keep": that page keeps its own title.
  *
  * Security: branding values are admin-editable and could be hostile. Text is set
  * via textContent only (never innerHTML — also hook-enforced). Asset URLs are
@@ -75,10 +79,16 @@
         });
     }
 
+    // A page whose <html> carries data-brand-title="keep" keeps its own tab title
+    // (the public pages name what they show: "Privacy", "Shared files", ...).
+    function keepsOwnTitle() {
+        return document.documentElement.getAttribute('data-brand-title') === 'keep';
+    }
+
     // <head>-safe pieces (elements that exist before <body> parses).
     function applyHead(b) {
         if (!b || typeof b !== 'object') return;
-        if (b.app_name) {
+        if (b.app_name && !keepsOwnTitle()) {
             document.title = b.app_full_name
                 ? (b.app_name + ' - ' + b.app_full_name)
                 : b.app_name;
@@ -100,8 +110,11 @@
 
     // The brand's own logo is on screen: its image loaded (an SVG may report no natural width, so the
     // load event counts too), and it is neither the built-in fallback nor hidden after two failures.
+    // The built-in logo counts as the fallback however it got there: the server also sends it when
+    // an uploaded logo is gone, and then the name must show.
     function logoLoaded(img) {
         if (img.hasAttribute('data-brand-fallback') || img.hasAttribute('data-brand-logo-hidden')) return false;
+        if ((img.getAttribute('src') || '') === FALLBACK_LOGO) return false;
         return img.hasAttribute('data-brand-logo-loaded') || (img.complete && img.naturalWidth > 0);
     }
 

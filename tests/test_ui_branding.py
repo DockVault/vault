@@ -97,15 +97,56 @@ def test_shell_reflects_brand_override(page: Page):
         expect(page.locator("#login-screen [data-brand-name]")).not_to_have_text("DockVault")
 
 
+def test_a_public_page_keeps_its_own_tab_title(page: Page):
+    """The Privacy page names what it shows: brand.js paints the brand's name on the page but leaves the
+    tab title alone (the page's <html> carries data-brand-title="keep")."""
+    with brand_override({"app_name": "AcmeBrand", "app_full_name": "Acme Secure"}):
+        page.goto("/recording")
+        expect(page.locator(".pp-brand [data-brand-name]")).to_have_text("AcmeBrand", timeout=10000)
+        page.wait_for_function("() => !!window.localStorage.getItem('dv_branding')", timeout=10000)
+        expect(page).to_have_title("Privacy")
+
+
 def test_the_logo_shows_alone_when_the_name_switch_is_off(page: Page):
-    """show_name_beside_logo false: once the logo has loaded, the name beside it is hidden and the image
-    carries the name as its alt text."""
-    with brand_override({"app_name": "AcmeBrand", "show_name_beside_logo": False}):
+    """show_name_beside_logo false: once the brand's own logo has loaded, the name beside it is hidden and
+    the image carries the name as its alt text. The large built-in logo stands in for the brand's own one:
+    it is a real image that is not the small built-in logo every logo falls back to."""
+    own = "/static/assets/logo.png"
+    with brand_override({"app_name": "AcmeBrand", "show_name_beside_logo": False,
+                         "logo_url": own, "logo_small_url": own}):
         page.goto("/")
         logo = page.locator("#login-screen [data-brand-logo]")
+        expect(logo).to_have_attribute("src", own, timeout=10000)
         expect(logo).to_have_attribute("alt", "AcmeBrand", timeout=10000)
         expect(page.locator("#login-screen [data-brand-name]")).to_be_hidden()
         expect(logo).to_be_visible()
+
+
+def test_the_built_in_logo_never_hides_the_name(page: Page):
+    """With the switch off and no logo of the brand's own, the built-in logo is not the brand's: the name
+    shows beside it, and the image is not named twice."""
+    with brand_override({"app_name": "AcmeBrand", "show_name_beside_logo": False}):
+        page.goto("/")
+        expect(page.locator("#login-screen [data-brand-name]")).to_have_text("AcmeBrand", timeout=10000)
+        expect(page.locator("#login-screen [data-brand-name]")).to_be_visible()
+        expect(page.locator("#login-screen [data-brand-logo]")).to_have_attribute("alt", "")
+
+
+def test_a_lost_upload_with_the_name_switch_off_shows_the_name(page: Page):
+    """A brand row that names an uploaded logo whose file is gone, with the switch off: the server sends the
+    built-in logo and the name, and the page shows the name beside it."""
+    gone = "/brand-assets/logo.00000000deadbeef.png"
+    with brand_override({"app_name": "AcmeBrand", "show_name_beside_logo": False,
+                         "logo_url": gone, "logo_dark_url": gone, "logo_small_url": gone}):
+        b = page.request.get("/branding").json()
+        assert b["assets"]["logo_small"] == "/static/assets/logo-small.png", b["assets"]
+        assert b["show_name_beside_logo"] is True, b
+        page.goto("/")
+        logo = page.locator("#login-screen [data-brand-logo]")
+        expect(page.locator("#login-screen [data-brand-name]")).to_have_text("AcmeBrand", timeout=10000)
+        expect(page.locator("#login-screen [data-brand-name]")).to_be_visible()
+        expect(logo).to_have_attribute("src", "/static/assets/logo-small.png")
+        expect(logo).to_have_attribute("alt", "")
 
 
 def test_a_logo_that_cannot_load_falls_back_and_the_name_shows(page: Page):

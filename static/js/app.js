@@ -26315,10 +26315,16 @@ document.addEventListener('DOMContentLoaded', () => {
     let savedCollapsed = false;
     try { savedCollapsed = localStorage.getItem('sidebarCollapsed') === 'true'; } catch (_) {}
     if (sidebar && savedCollapsed) sidebar.classList.add('collapsed');
+    // While Settings is open on a wide screen the rail stays expanded (static/js/settings-menu.js): its pages
+    // have no icons. The button has nothing to do then, so it is disabled and hidden in place (components.css),
+    // and a click never changes the saved 'sidebarCollapsed'. On a phone it still opens the drawer.
+    const navToggleIdle = () => !mobileNavQuery.matches && document.body.classList.contains('settings-mode');
     // What the button says follows what it does at this width: the drawer open or closed on a phone, the
     // rail expanded or collapsed on a wide screen.
     const syncNavToggle = () => {
         if (!mobileNavToggle || !sidebar) return;
+        const idle = navToggleIdle();
+        if (mobileNavToggle.disabled !== idle) mobileNavToggle.disabled = idle;
         const phone = mobileNavQuery.matches;
         const open = phone ? sidebar.classList.contains('mobile-open') : !sidebar.classList.contains('collapsed');
         const label = phone ? (open ? 'Close menu' : 'Open menu') : (open ? 'Collapse menu' : 'Expand menu');
@@ -26349,12 +26355,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 setMobileNav(!sidebar.classList.contains('mobile-open'));
                 return;
             }
+            if (navToggleIdle()) return;
             const collapsed = sidebar.classList.toggle('collapsed');
             try { localStorage.setItem('sidebarCollapsed', String(collapsed)); } catch (_) {}
             syncNavToggle();
         });
-        // The rail is also expanded and collapsed by the Settings menu (entering and leaving Settings).
+        // The rail is also expanded and collapsed by the Settings menu (entering and leaving Settings), which
+        // marks the page with body.settings-mode while it is open.
         new MutationObserver(syncNavToggle).observe(sidebar, { attributes: true, attributeFilter: ['class'] });
+        new MutationObserver(syncNavToggle).observe(document.body, { attributes: true, attributeFilter: ['class'] });
         syncNavToggle();
         if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', () => setMobileNav(false));
         document.addEventListener('keydown', (e) => {

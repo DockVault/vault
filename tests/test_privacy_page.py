@@ -80,9 +80,22 @@ def test_the_address_is_read_from_the_public_legal_route():
     policy = _function(SCRIPT, "async function loadPolicy()")
     assert policy.count("fetch(") == 1 and "fetch('/legal'" in policy
     assert "url = safeUrl(j && j.privacy_policy);" in policy
-    # The name it gives: the company's, else the app's, from /branding (fetched once for the page).
-    assert "const name = (b && (b.company_name || b.app_name)) || '';" in policy
+    # The name it gives comes from /branding (fetched once for the page).
+    assert "const name = policyOwner(b);" in policy
     assert SCRIPT.count("fetch('/branding'") == 1
+
+
+def test_the_policy_names_the_company_only_when_the_vault_named_one():
+    """company_name defaults to the product's own name. A vault that renamed only its app must not credit the
+    product with its policy: the company's name counts only when it is set and is not the built-in default."""
+    owner = _function(SCRIPT, "function policyOwner(b)")
+    assert "if (company && company !== DEFAULT_COMPANY_NAME) return company;" in owner
+    assert "return typeof b.app_name === 'string' ? b.app_name.trim() : '';" in owner
+    assert owner.index("return company;") < owner.index("b.app_name")
+    default = re.search(r"const DEFAULT_COMPANY_NAME = '([^']*)';", SCRIPT).group(1)
+    branding = _read(ROOT / "app" / "config" / "branding.py")
+    built_in = re.search(r'company_name: str = Field\(\s*default="([^"]*)"', branding).group(1)
+    assert default == built_in == "DockVault"
 
 
 # --------------------------------------------------------------------------- the address check

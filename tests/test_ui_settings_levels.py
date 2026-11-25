@@ -143,7 +143,8 @@ def test_one_switch_shows_the_advanced_settings_on_every_page(page: Page, levels
     # One switch, in the settings menu's head; no button on the pages.
     expect(switch).to_have_attribute("role", "switch")
     expect(switch).to_have_attribute("aria-checked", "false")        # off by default
-    expect(switch).to_have_accessible_name("Show advanced settings on every page")
+    # Its accessible name starts with its visible label.
+    expect(switch).to_have_accessible_name("Advanced: show advanced settings on every page")
     expect(page.locator("#sidebar .sidebar-settings-head .settings-advanced-label")).to_have_text("Advanced")
     expect(page.locator("#settings-section .settings-advanced-toggle")).to_have_count(0)
     for key in ("app_name", "max_file_size"):
@@ -681,7 +682,11 @@ def test_the_search_follows_what_the_app_shows_or_hides_after_the_catalogue(page
     _open(page)
     page.wait_for_function("() => document.getElementById('update-controls').style.display !== 'none'",
                            timeout=10000)
+    # With the switch on, what the page shows is settings-levels' own count: every advanced setting the app has
+    # not hidden, and nothing else.
+    _advanced(page, True)
     shown = _present_count(page, "general")
+    assert page.evaluate(_VISIBLE_ADVANCED, "general") == shown
     box = page.locator("#settings-search")
     results = page.locator("#settings-search-results")
     hit = results.locator('.settings-search-hit[data-key="update_check_interval"]')
@@ -690,13 +695,18 @@ def test_the_search_follows_what_the_app_shows_or_hides_after_the_catalogue(page
     box.press("Escape")
     page.evaluate("us => renderUpdateStatus(us)", _update_status(False))
     expect(page.locator("#update-controls")).to_be_hidden()
-    assert _present_count(page, "general") == shown - 1
+    present = _present_count(page, "general")
+    assert present < shown
+    assert page.evaluate(_VISIBLE_ADVANCED, "general") == present
     box.fill("update checks")
     expect(results).to_contain_text("No setting matches.")
     expect(hit).to_have_count(0)
     box.press("Escape")
     page.evaluate("us => renderUpdateStatus(us)", _update_status(True))
-    assert _present_count(page, "general") == shown
+    expect(page.locator("#update-controls")).to_be_visible()
+    present = _present_count(page, "general")
+    assert present == shown
+    assert page.evaluate(_VISIBLE_ADVANCED, "general") == present
     box.fill("update checks")
     expect(hit).to_be_visible()
 

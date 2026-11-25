@@ -10,7 +10,8 @@
  * groups change.
  *
  * The pages have no icons, so a rail saved collapsed opens in full while Settings is open; leaving Settings
- * puts back what is saved ('sidebarCollapsed', app.js).
+ * puts back what is saved ('sidebarCollapsed', app.js). Settings never writes that value: on a wide screen
+ * the top-bar menu button is disabled while Settings is open (app.js).
  *
  * Every way into Settings (its sidebar item, a link or a restored view, a dashboard action) ends with the
  * Settings section marked active, so the sections are watched rather than each way in.
@@ -164,10 +165,12 @@
 
     // ------------------------------------------------------------------ entering and leaving
 
-    function focusInRailOrLost() {
+    // Focus follows the menu only when it was in the rail already. A reload that restores Settings leaves
+    // focus on the page (the body), where it stays.
+    function focusInRail() {
         const active = document.activeElement;
         const sidebar = rail();
-        return !active || active === document.body || !!(sidebar && sidebar.contains(active));
+        return !!(active && active !== document.body && sidebar && sidebar.contains(active));
     }
 
     function sync() {
@@ -176,7 +179,7 @@
         const on = root.classList.contains('active');
         if (on === S.on) return;
         S.on = on;
-        const moveFocus = focusInRailOrLost() && !PHONE.matches;
+        const moveFocus = focusInRail() && !PHONE.matches;
         const sidebar = rail();
         S.nav.hidden = !on;
         document.body.classList.toggle('settings-mode', on);

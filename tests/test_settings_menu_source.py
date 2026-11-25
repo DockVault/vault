@@ -6,6 +6,8 @@ button in the top bar, and the one Advanced switch.
 - the page's own list is hidden once the menu exists, and #settings-section is no longer a grid;
 - the rail's own toggle (#sidebar-toggle) and the room it needed above the menu are gone; #mobile-nav-toggle shows
   at every width and app.js sets its aria-expanded and aria-label for both uses, keeping 'sidebarCollapsed';
+  on a wide screen it is disabled and hidden in place while Settings is open;
+- a reload that restores Settings moves focus into the rail only when focus was already there;
 - static/js/settings-levels.js has no per-page "Show advanced settings (N)" button: one role="switch" with its
   label, kept in localStorage inside try/catch, and the page note says how to see the advanced settings;
 - index.html loads settings-menu.js after app.js with a cache-buster like the other scripts.
@@ -91,6 +93,50 @@ def test_the_menu_button_says_what_it_does_at_each_width():
                      r"item\.addEventListener\('click'", code)
 
 
+def test_the_menu_button_rests_while_settings_is_open_on_a_wide_screen():
+    """Inside Settings the rail stays expanded on a wide screen, so collapsing it would leave no way to switch
+    pages: the button is disabled there and hidden in place, and Settings never writes 'sidebarCollapsed'."""
+    code = _code(_read("js", "app.js"))
+    assert ("const navToggleIdle = () => !mobileNavQuery.matches && "
+            "document.body.classList.contains('settings-mode');") in code
+    sync = code[code.index("const syncNavToggle = () => {"):]
+    sync = sync[:sync.index("\n    };\n")]
+    assert "const idle = navToggleIdle();" in sync
+    assert "if (mobileNavToggle.disabled !== idle) mobileNavToggle.disabled = idle;" in sync
+    # The click: the phone's drawer first, then nothing at all while idle, before anything is saved.
+    click = code[code.index("mobileNavToggle.addEventListener('click', () => {"):]
+    click = click[:click.index("\n        });\n")]
+    assert click.index("setMobileNav(") < click.index("if (navToggleIdle()) return;") \
+        < click.index("localStorage.setItem('sidebarCollapsed'")
+    # It follows body.settings-mode as well as the rail's own class.
+    assert ("new MutationObserver(syncNavToggle).observe(document.body, "
+            "{ attributes: true, attributeFilter: ['class'] });") in code
+    # Hidden in place: the logo beside it keeps its position.
+    assert ".mobile-nav-toggle[disabled] { visibility: hidden; }" in _read("css", "components.css")
+    # The settings menu reads the saved value and never writes it.
+    menu = _code(_read("js", "settings-menu.js"))
+    assert "localStorage.setItem" not in menu and "localStorage.removeItem" not in menu
+
+
+def test_restoring_settings_moves_focus_only_from_the_rail():
+    """A reload that restores Settings leaves focus on the page: the menu takes focus only from the rail."""
+    code = _code(_read("js", "settings-menu.js"))
+    in_rail = code[code.index("function focusInRail() {"):]
+    in_rail = in_rail[:in_rail.index("\n    }\n")]
+    assert "return !!(active && active !== document.body && sidebar && sidebar.contains(active));" in in_rail
+    assert "focusInRailOrLost" not in code
+    assert "const moveFocus = focusInRail() && !PHONE.matches;" in code
+
+
+def test_the_switch_follows_another_tab_even_when_it_clears_the_storage():
+    """localStorage.clear() in another tab fires a storage event whose key is null: the switch reads again."""
+    code = _code(_read("js", "settings-levels.js"))
+    listener = code[code.index("window.addEventListener('storage', (e) => {"):]
+    listener = listener[:listener.index("\n    });\n")]
+    assert "if (e.key !== ADVANCED_KEY && e.key !== null) return;" in listener
+    assert "S.advanced = readAdvanced();" in listener
+
+
 def test_the_page_list_is_hidden_and_the_section_is_not_a_grid():
     css = _read("css", "components.css")
     assert "body.has-settings-menu #settings-section > .settings-nav { display: none; }" in css
@@ -104,7 +150,8 @@ def test_one_advanced_switch_replaces_the_per_page_button():
     assert "Show advanced settings (" not in code and "Hide advanced settings" not in code
     assert "button.setAttribute('role', 'switch')" in code
     assert "button.setAttribute('aria-checked'" in code
-    assert "'Show advanced settings on every page'" in code
+    # Its accessible name starts with its visible label.
+    assert "button.setAttribute('aria-label', 'Advanced: show advanced settings on every page');" in code
     assert "'Advanced'" in code
     assert "'Every setting on this page is advanced. Turn on Advanced to see them.'" in code
     # Kept per browser, every access guarded; off unless this browser kept it on.

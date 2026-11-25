@@ -116,6 +116,86 @@ def test_a_rail_saved_collapsed_opens_in_full_in_settings(page: Page, admin_cred
     page.evaluate("() => localStorage.removeItem('sidebarCollapsed')")
 
 
+def test_the_menu_button_rests_while_settings_is_open_on_a_wide_screen(page: Page, admin_creds):
+    """On a wide screen the Settings menu keeps the rail open: the top-bar menu button is disabled and hidden in
+    place (the logo beside it does not move), and the saved 'sidebarCollapsed' is not touched. It comes back on
+    leaving Settings. On a phone it still opens the drawer."""
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto("/")
+    page.evaluate("() => localStorage.removeItem('sidebarCollapsed')")
+    _login(page, admin_creds)
+    toggle = page.locator("#mobile-nav-toggle")
+    sidebar = page.locator("#sidebar")
+    logo = page.locator(".navbar-brand [data-brand-logo]")
+    expect(toggle).to_be_disabled()
+    leave_settings(page)
+    expect(toggle).to_be_enabled()
+    expect(toggle).to_be_visible()
+    expect(toggle).to_have_attribute("aria-label", "Collapse menu")
+    before = logo.bounding_box()
+    page.click('.sidebar-item[data-section="settings"]')
+    expect(page.locator(MENU)).to_be_visible()
+    expect(toggle).to_be_disabled()
+    expect(toggle).to_be_hidden()
+    assert page.evaluate("() => getComputedStyle(document.getElementById('mobile-nav-toggle')).visibility") == "hidden"
+    after = logo.bounding_box()
+    assert before and after and abs(before["x"] - after["x"]) < 1, (before, after)
+    # A click that reaches it anyway does nothing: the menu stays whole and nothing is saved.
+    page.evaluate("() => document.getElementById('mobile-nav-toggle').click()")
+    expect(sidebar).not_to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(settings_item(page, "general")).to_be_visible()
+    assert page.evaluate("() => localStorage.getItem('sidebarCollapsed')") is None
+    leave_settings(page)
+    expect(toggle).to_be_enabled()
+    expect(toggle).to_be_visible()
+    # On a phone, inside Settings, it opens the drawer with the settings menu.
+    page.set_viewport_size({"width": 390, "height": 844})
+    open_drawer(page)
+    page.click('.sidebar-item[data-section="settings"]')
+    expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
+    close_drawer(page)
+    expect(toggle).to_be_enabled()
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    expect(settings_item(page, "general")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    # Widening the screen inside Settings rests it again.
+    page.set_viewport_size({"width": 1280, "height": 900})
+    expect(toggle).to_be_disabled()
+    assert page.evaluate("() => localStorage.getItem('sidebarCollapsed')") is None
+
+
+def test_a_reload_inside_settings_restores_the_settings_menu(page: Page, admin_creds):
+    """A reload while Settings is open comes back to Settings with the settings menu in the rail, the open page
+    marked, and focus left where the page put it (not moved into the rail). Back then goes to the dashboard."""
+    page.set_viewport_size({"width": 1280, "height": 900})
+    _login(page, admin_creds)
+    settings_item(page, "email").click()
+    expect(page.locator("#settings-tab-email")).to_be_visible()
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    expect(page.locator("#settings-section")).to_be_visible(timeout=15000)
+    expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
+    menu = page.locator(MENU)
+    expect(menu).to_be_visible()
+    expect(page.locator("body")).to_have_class(re.compile(r"\bsettings-mode\b"))
+    expect(page.locator('.sidebar-item[data-section="dashboard"]')).to_be_hidden()
+    expect(page.locator("#mobile-nav-toggle")).to_be_disabled()
+    # The menu marks the page the page list has open, and only that one.
+    open_tab = page.locator("#settings-section .settings-nav .tab-btn.active").first.get_attribute("data-tab")
+    assert open_tab, "no Settings page is open after the reload"
+    expect(settings_item(page, open_tab)).to_have_class(re.compile(r"\bactive\b"))
+    expect(settings_item(page, open_tab)).to_have_attribute("aria-current", "page")
+    expect(menu.locator(".sidebar-settings-item[aria-current=page]")).to_have_count(1)
+    # Focus was on the page, not in the rail, so it is not moved there.
+    assert page.evaluate("() => !document.getElementById('sidebar').contains(document.activeElement)")
+    page.click("#sidebar-settings-back")
+    expect(page.locator("#dashboard-section")).to_be_visible(timeout=10000)
+    expect(menu).to_be_hidden()
+    expect(page.locator('.sidebar-item[data-section="dashboard"]')).to_be_visible()
+
+
 def test_a_phone_shows_the_same_menu_in_the_drawer(page: Page, admin_creds):
     page.set_viewport_size({"width": 390, "height": 844})
     page.goto("/")

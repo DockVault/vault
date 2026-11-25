@@ -1201,6 +1201,9 @@ body.settings-mode .sidebar > .sidebar-nav:not(.sidebar-settings-nav) { display:
 .mobile-nav-toggle:hover { background: var(--hover-overlay, var(--surface-2)); color: var(--text-primary); }
 .mobile-nav-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .mobile-nav-toggle .icon { width: 18px; height: 18px; }
+/* On a wide screen the Settings menu keeps the rail open, so the button has nothing to do there and is
+   disabled (app.js). It keeps its space, so the logo beside it does not move. */
+.mobile-nav-toggle[disabled] { visibility: hidden; }
 
 .sidebar-nav {
     padding: var(--space-xs) var(--space-sm) var(--space-lg);

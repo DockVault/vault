@@ -5,7 +5,10 @@
   the path. GET /settings says which upload (logo, favicon) is missing, and the Branding page says so beside it.
 - show_name_beside_logo: a brand setting, on by default, kept in the brand override store (False included), carried
   by /branding, and edited on the Branding page as a switch. brand.js hides the name beside a logo that loaded when it
-  is off, and shows it again when the logo cannot be loaded.
+  is off, and shows it again when the logo cannot be loaded or is the built-in logo. /branding sends it true while a
+  logo slot fell back to the built-in default.
+- An uploaded asset counts as missing when its name breaks the asset route's rule (alphanumerics and ._- only).
+- brand.js leaves the tab title alone on a page whose <html> carries data-brand-title="keep" (the public pages).
 - privacy_policy_url: empty by default, edited on the Branding page under Links with the other links' address check,
   and GET /legal reports null while it is empty.
 - brand.js: every [data-brand-logo] falls back once to the built-in logo and is hidden if that fails too.
@@ -116,6 +119,62 @@ def test_present_files_and_built_in_or_outside_addresses_are_served_as_they_are(
                                  "/brand-assets/..\\x.png"])
 def test_a_name_the_asset_route_would_refuse_counts_as_missing(tmp_path, url):
     assert effective.brand_asset_missing(url, str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("name", ["logo 1.png", "logo%2E.png", "logo+1.png", "logo:1.png", "logo;1.png"])
+def test_a_name_outside_the_routes_characters_counts_as_missing_even_when_the_file_is_there(tmp_path, name):
+    """The asset route serves only names made of alphanumerics and ._-; a stored name with anything else would
+    get a 404, so it counts as missing and the built-in default is served."""
+    try:
+        (tmp_path / name).write_bytes(b"\x89PNG\r\n\x1a\n")
+    except OSError:
+        pass  # a name this file system refuses: the check does not depend on the file
+    assert effective.brand_asset_missing("/brand-assets/" + name, str(tmp_path)) is True
+    (tmp_path / "logo.0a1b2c3d_x-y.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert effective.brand_asset_missing("/brand-assets/logo.0a1b2c3d_x-y.png", str(tmp_path)) is False
+
+
+def test_the_payload_and_the_asset_route_share_one_name_rule():
+    """effective.py keeps its own copy of the route's rule (it must not import the API server); the two agree."""
+    rule = ('return bool(name) and ".." not in name and "/" not in name and "\\\\" not in name \\\n'
+            '        and all(c.isalnum() or c in "._-" for c in name)')
+    assert rule in _read(ROOT / "app" / "config" / "effective.py")
+    assert rule in _read(ROOT / "app" / "api" / "api_server.py")
+    assert not re.search(r"^\s*(from app\.api\b|import app\.api\b)", _read(ROOT / "app" / "config" / "effective.py"),
+                         flags=re.M)
+    assert "if not _is_safe_asset_name(name):" in _read(ROOT / "app" / "config" / "effective.py")
+    for name in ("logo.0a1b2c3d.png", "a", "logo 1.png", "x%2E", "..", "a/b", "a\\b", "", "é.png"):
+        assert effective._is_safe_asset_name(name) == S._is_safe_asset_name(name), name
+
+
+# --------------------------------------------------------------------------- a lost logo and the name switch
+
+def test_a_lost_logo_upload_with_the_switch_off_still_shows_the_name(tmp_path, warnings):
+    """A brand row that names an uploaded logo whose file is gone, with the name switch off: the stock logo does
+    not carry the brand's name, so /branding sends the name beside it."""
+    cfg = effective.merge_branding(_base(), {**UPLOADS, "show_name_beside_logo": False})
+    assert cfg.show_name_beside_logo is False
+    payload = effective.branding_public_payload(cfg, str(tmp_path))
+    assert payload["assets"]["logo_small"] == "/static/assets/logo-small.png"
+    assert payload["show_name_beside_logo"] is True
+    # The file comes back: the switch counts again.
+    (tmp_path / "logo.0a1b2c3d.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (tmp_path / "favicon.4e5f6a7b.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert effective.branding_public_payload(cfg, str(tmp_path))["show_name_beside_logo"] is False
+
+
+def test_only_a_logo_slot_falling_back_forces_the_name(tmp_path, warnings):
+    """A lost favicon is not a logo: with the logo present and the switch off, the logo still shows alone."""
+    (tmp_path / "logo.0a1b2c3d.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    cfg = effective.merge_branding(_base(), {**UPLOADS, "show_name_beside_logo": False})
+    payload = effective.branding_public_payload(cfg, str(tmp_path))
+    assert payload["assets"]["favicon"] == _default("favicon_url")
+    assert payload["show_name_beside_logo"] is False
+    # Any one logo slot that fell back is enough.
+    cfg = effective.merge_branding(_base(), {**UPLOADS, "logo_dark_url": "/brand-assets/logo-dark.99999999.png",
+                                             "show_name_beside_logo": False})
+    assert effective.branding_public_payload(cfg, str(tmp_path))["show_name_beside_logo"] is True
+    assert effective.BRAND_LOGO_SLOTS == {"logo", "logo_dark", "logo_small"}
 
 
 def test_the_public_payload_checks_the_brand_asset_folder_by_default(tmp_path, monkeypatch, warnings):
@@ -325,7 +384,11 @@ def test_the_name_hides_only_beside_a_brand_logo_that_loaded():
     # The built-in fallback or a hidden image is not the brand's logo: the name shows.
     assert ("if (img.hasAttribute('data-brand-fallback') || img.hasAttribute('data-brand-logo-hidden')) "
             "return false;") in loaded
-    sync = _function(BRAND_CODE, "function syncLogo(img)")
+    # The built-in logo is never the brand's own, however it got there: the server sends it when an uploaded
+    # logo is gone, and the markup ships it. The name shows beside it.
+    assert "if ((img.getAttribute('src') || '') === FALLBACK_LOGO) return false;" in loaded
+    assert loaded.index("=== FALLBACK_LOGO) return false;") < loaded.index("data-brand-logo-loaded")
+    sync =_function(BRAND_CODE, "function syncLogo(img)")
     assert "var logoOnly = !showName && logoLoaded(img);" in sync
     assert "name.style.display = logoOnly ? 'none' : '';" in sync
     # The image carries the name only when the name is hidden; alt="" while it shows.
@@ -353,8 +416,28 @@ def test_every_page_loads_the_same_brand_js():
         found = re.findall(r'<script src="/static/js/brand\.js\?v=(\d{8}[a-z])"></script>', _read(STATIC / page))
         assert len(found) == 1, page
         versions[page] = found[0]
-    assert versions["index.html"] == "20261125a"
+    assert versions["index.html"] == "20261126a"
     assert len(set(versions.values())) == 1, versions
+
+
+PUBLIC_PAGES = ("upload-link.html", "public-link.html", "note-link.html", "recording.html")
+
+
+def test_the_public_pages_keep_their_own_tab_title():
+    """brand.js names the app shell's tab after the brand, but a public page names what it shows ("Privacy",
+    "Shared files", ...): its <html> carries data-brand-title="keep" and applyHead leaves the title alone."""
+    assert ("function keepsOwnTitle() {\n"
+            "        return document.documentElement.getAttribute('data-brand-title') === 'keep';") in BRAND_CODE
+    head = _function(BRAND_CODE, "function applyHead(b)")
+    assert "if (b.app_name && !keepsOwnTitle()) {" in head
+    assert head.count("document.title") == 1
+    assert BRAND_CODE.count("document.title") == 1
+    for page in PUBLIC_PAGES:
+        html_tag = re.search(r"<html\b[^>]*>", _read(STATIC / page)).group(0)
+        assert 'data-brand-title="keep"' in html_tag, (page, html_tag)
+    # The app shell takes the brand's title.
+    assert "data-brand-title" not in re.search(r"<html\b[^>]*>", _read(STATIC / "index.html")).group(0)
+    assert "<title>Privacy</title>" in _read(STATIC / "recording.html")
 
 
 # --------------------------------------------------------------------------- the Privacy links

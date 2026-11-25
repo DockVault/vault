@@ -46,6 +46,19 @@
         return null;
     }
 
+    // The built-in company name. A vault that kept it has not named its operator, so the policy line uses the
+    // app's name instead.
+    const DEFAULT_COMPANY_NAME = 'DockVault';
+
+    // The name the policy line gives: the company's, when one is set and is not the built-in default; else
+    // the app's.
+    function policyOwner(b) {
+        if (!b) return '';
+        const company = typeof b.company_name === 'string' ? b.company_name.trim() : '';
+        if (company && company !== DEFAULT_COMPANY_NAME) return company;
+        return typeof b.app_name === 'string' ? b.app_name.trim() : '';
+    }
+
     // The operator's privacy policy, as one line under the title: "<name>'s privacy policy: <link>". With no
     // address set, or one that is not safe to link, the line stays hidden.
     async function loadPolicy() {
@@ -58,7 +71,7 @@
         } catch (_) { return; }
         if (!url) return;
         const b = await branding();
-        const name = (b && (b.company_name || b.app_name)) || '';
+        const name = policyOwner(b);
         const link = el('a', null, url.replace(/^https?:\/\//i, '').replace(/\/$/, '') || url);
         link.href = url;
         link.target = '_blank';
