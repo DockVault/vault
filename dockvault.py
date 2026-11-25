@@ -1492,6 +1492,38 @@ def cert_key_match(cert_path, key_path, run=subprocess.run):
     return cpub == kpub
 
 
+def cert_self_issued(cert_path, run=subprocess.run):
+    """True when the certificate at ``cert_path`` names itself as its issuer (a self-signed one, as setup's
+    selfsigned mode makes), False when another certificate issued it (Let's Encrypt, or a private authority), via
+    openssl. None when that cannot be told: no file, no host openssl, or an answer that names neither."""
+    if not os.path.isfile(cert_path) or shutil.which("openssl") is None:
+        return None
+    try:
+        r = run(["openssl", "x509", "-in", cert_path, "-noout", "-subject", "-issuer", "-nameopt", "RFC2253"],
+                capture_output=True, text=True, timeout=30)
+    except Exception:  # noqa: BLE001 -- a check for a warning: anything that goes wrong is "not known"
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    names = {}
+    for line in (getattr(r, "stdout", "") or "").splitlines():
+        label, sep, value = line.partition("=")
+        if sep and label.strip().lower() in ("subject", "issuer"):
+            names.setdefault(label.strip().lower(), value.strip())
+    if "subject" not in names or "issuer" not in names:
+        return None
+    return names["subject"] == names["issuer"]
+
+
+# Said by setup when it makes a self-signed pair, and by status while the certificate in certs/ is one, wherever
+# passkeys could otherwise be made.
+SELF_SIGNED_PASSKEY_NOTE = (
+    "Passkeys need a certificate the browser trusts: Chrome and Edge make no passkey on a page whose certificate they "
+    "do not trust, and say nothing when they refuse. Use Let's Encrypt or your own certificate (delete "
+    "certs/cert.pem and certs/key.pem, then run python dockvault.py setup --cert-mode letsencrypt or byo), or first "
+    "trust this certificate on every device that opens the vault.")
+
+
 def install_byo_cert(cert_dir, cert_path, key_path, run=subprocess.run):
     """Install a bring-your-own fullchain cert + key into cert_dir/{cert,key}.pem. Rejects a
     passphrase-encrypted key and a mismatched pair. Returns (ok, message)."""
@@ -5579,8 +5611,8 @@ class DockVault:
 
     def _print_sign_in_lines(self, env):
         """What `status` says about signing in at this deployment, and a healthy update says after it: only the lines
-        that say something needs doing (an address no passkey can be made at, passkeys made at another address, a first
-        address on another port than the web UI's).
+        that say something needs doing (an address no passkey can be made at, passkeys made at another address, a
+        self-signed certificate where passkeys could be made, a first address on another port than the web UI's).
         ``env`` is the parsed .env; with none, nothing is said. The running deployment is asked for a warning only,
         so nothing here fails the command that prints it."""
         if not env:
@@ -5591,9 +5623,13 @@ class DockVault:
         if passkey_note:
             # The note says itself what stays hidden or off (passkeys alone, or single sign-on too).
             print(pal.paint("  Sign-in: %s" % passkey_note, "yellow"))
-        elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(allowed))
+        host = passkey_host(allowed)
+        elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), host)
         if elsewhere:
             print(pal.paint("  Passkeys: %s" % elsewhere, "yellow"))
+        # Only a certificate that issued itself: one from a private authority the devices trust says nothing here.
+        if host and cert_self_issued(os.path.join(self._certs_dir(), "cert.pem")) is True:
+            print(pal.paint("  Passkeys: " + SELF_SIGNED_PASSKEY_NOTE, "yellow"))
         port_note = allowed_hosts_port_note(allowed, env.get("WEB_HOST_PORT"))
         if port_note:
             print(pal.paint("  Address: " + port_note, "yellow"))
@@ -5700,6 +5736,8 @@ class DockVault:
             if not ok:
                 self._fail(msg)
             print(pal.paint("  " + msg + ".", "green"))
+            if mode == "selfsigned":
+                print(pal.paint("  Note: " + SELF_SIGNED_PASSKEY_NOTE, "yellow"))
         # Lock the key file (icacls/chmod), then make it readable by the container uid (POSIX chown;
         # repairs a reused or root-owned pair too).
         key = os.path.join(cert_dir, "key.pem")
@@ -6035,7 +6073,7 @@ class DockVault:
         kpath = getattr(args, "key_path", None) if args else None
         if interactive and not mode:
             print(pal.paint("\n  Certificate source:", "cyan"))
-            print("    1) Self-signed   (works immediately; browsers warn until trusted)")
+            print("    1) Self-signed   (works immediately; browsers warn until trusted; passkeys need it trusted)")
             print("    2) Let's Encrypt (real cert; needs a public DNS name + port 80; Linux only)")
             print("    3) Bring your own (a fullchain cert + key you already have)")
             mode = {"2": "letsencrypt", "3": "byo"}.get(ask("Choose 1/2/3", pal, "1").strip(), "selfsigned")

@@ -142,6 +142,8 @@ def test_status_says_passkeys_are_hidden_at_an_ip(monkeypatch, tmp_path):
     monkeypatch.setattr(tool, "_env_archives", lambda: [])
     monkeypatch.setattr(tool, "_env_path", lambda: str(tmp_path / ".env"))
     (tmp_path / ".env").write_text("ALLOWED_HOSTS='https://203.0.113.9:8443'\n", encoding="utf-8")
+    tool.root = str(tmp_path)
+    monkeypatch.setattr(dv, "cert_self_issued", lambda path: False)
     monkeypatch.setattr(tool, "_load_env", lambda: {"ALLOWED_HOSTS": "https://203.0.113.9:8443"})
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: None)
     monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
@@ -258,6 +260,8 @@ def test_status_says_which_passkeys_were_made_at_another_address(monkeypatch, tm
     monkeypatch.setattr(tool, "_env_archives", lambda: [])
     monkeypatch.setattr(tool, "_env_path", lambda: str(tmp_path / ".env"))
     (tmp_path / ".env").write_text("ALLOWED_HOSTS='https://vault.example.com'\n", encoding="utf-8")
+    tool.root = str(tmp_path)
+    monkeypatch.setattr(dv, "cert_self_issued", lambda path: False)
     monkeypatch.setattr(tool, "_load_env", lambda: {"ALLOWED_HOSTS": "https://vault.example.com"})
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: None)
     monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
@@ -482,3 +486,139 @@ def test_status_says_when_the_first_address_names_another_port(monkeypatch, tmp_
         monkeypatch.setattr(tool, "_load_env", lambda env=quiet: env)
         tool._print_status("combined")
         assert not [line for line in printed if "Address:" in line], (quiet, printed)
+
+
+# --- a certificate the browser does not trust -------------------------------------------------------
+
+def _openssl_says(subject, issuer, returncode=0):
+    def run(cmd, **kw):
+        run.cmds.append(cmd)
+        return types.SimpleNamespace(returncode=returncode, stdout="subject=%s\nissuer=%s\n" % (subject, issuer),
+                                     stderr="")
+    run.cmds = []
+    return run
+
+
+def test_a_certificate_is_self_issued_when_its_subject_is_its_issuer(tmp_path, monkeypatch):
+    cert = tmp_path / "cert.pem"
+    cert.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    monkeypatch.setattr(dv.shutil, "which", lambda name: "/usr/bin/openssl")
+    run = _openssl_says("CN=vault.example.com", "CN=vault.example.com")
+    assert dv.cert_self_issued(str(cert), run=run) is True
+    assert run.cmds == [["openssl", "x509", "-in", str(cert), "-noout", "-subject", "-issuer", "-nameopt", "RFC2253"]]
+    issued = _openssl_says("CN=vault.example.com", "CN=Example Issuing CA,O=Example,C=US")
+    assert dv.cert_self_issued(str(cert), run=issued) is False
+    # Not known: openssl failed, said neither name, or could not be run; no file; no openssl on this host.
+    assert dv.cert_self_issued(str(cert), run=_openssl_says("CN=a", "CN=a", returncode=1)) is None
+    silent = lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="")      # noqa: E731
+    assert dv.cert_self_issued(str(cert), run=silent) is None
+
+    def gone(*a, **k):
+        raise OSError("no such program")
+    assert dv.cert_self_issued(str(cert), run=gone) is None
+    assert dv.cert_self_issued(str(tmp_path / "none.pem"), run=run) is None
+    monkeypatch.setattr(dv.shutil, "which", lambda name: None)
+    assert dv.cert_self_issued(str(cert), run=run) is None
+
+
+@pytest.mark.skipif(dv.shutil.which("openssl") is None, reason="needs host openssl")
+def test_the_self_issued_check_reads_what_openssl_prints(tmp_path):
+    import os
+    import subprocess
+    env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
+    ec = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"]
+    for name, cn in (("ca", "Test Root"), ("self", "vault.example.com")):
+        subprocess.run(["openssl", "req", "-x509"] + ec + ["-days", "2", "-subj", "/CN=%s" % cn,
+                                                           "-keyout", name + ".key", "-out", name + ".pem"],
+                       cwd=tmp_path, env=env, capture_output=True, check=True, timeout=60)
+    subprocess.run(["openssl", "req", "-new"] + ec + ["-subj", "/CN=vault.example.com", "-keyout", "leaf.key",
+                                                      "-out", "leaf.csr"],
+                   cwd=tmp_path, env=env, capture_output=True, check=True, timeout=60)
+    subprocess.run(["openssl", "x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+                    "-CAcreateserial", "-days", "2", "-out", "leaf.pem"],
+                   cwd=tmp_path, env=env, capture_output=True, check=True, timeout=60)
+    assert dv.cert_self_issued(str(tmp_path / "self.pem")) is True
+    assert dv.cert_self_issued(str(tmp_path / "leaf.pem")) is False
+
+
+@pytest.mark.parametrize("allowed, self_issued, said", [
+    ("vault.example.com", True, True),
+    ("https://vault.example.com:8443", True, True),
+    # Issued by a certificate authority, a private one the devices trust among them: nothing to say.
+    ("vault.example.com", False, False),
+    ("vault.example.com", None, False),
+    # No passkey is made at an address reached by IP or over plain http, whatever the certificate: the address
+    # line says why.
+    ("203.0.113.9", True, False),
+    ("http://vault.lan:8080", True, False),
+])
+def test_status_says_passkeys_need_a_trusted_certificate_for_a_self_issued_one(monkeypatch, tmp_path, allowed,
+                                                                               self_issued, said):
+    tool, printed = _status_tool(monkeypatch, tmp_path, {"ALLOWED_HOSTS": allowed, "WEB_HOST_PORT": "8443"})
+    asked = []
+    monkeypatch.setattr(dv, "cert_self_issued", lambda path: asked.append(path) or self_issued)
+    tool._print_status("combined")
+    assert printed.count("  Passkeys: " + dv.SELF_SIGNED_PASSKEY_NOTE) == said, printed
+    assert asked == ([str(tmp_path / "certs" / "cert.pem")] if dv.passkey_host(allowed) else [])
+
+
+def test_the_note_on_a_self_signed_certificate_says_what_to_do():
+    note = dv.SELF_SIGNED_PASSKEY_NOTE
+    assert note.startswith("Passkeys need a certificate the browser trusts: Chrome and Edge make no passkey on a page "
+                           "whose certificate they do not trust, and say nothing when they refuse.")
+    # Setup keeps a pair it finds, so the way to another certificate goes through removing this one.
+    assert ("delete certs/cert.pem and certs/key.pem, then run python dockvault.py setup --cert-mode letsencrypt "
+            "or byo") in note
+    assert note.endswith("or first trust this certificate on every device that opens the vault.")
+
+
+def _reusable_env(tmp_path):
+    cfg = {"server_name": "vault.example.com", "encryption_key": dv.gen_fernet_key(), "jwt_secret_key": dv.gen_hex(32),
+           "vault_db_password": dv.gen_hex(16), "redis_password": dv.gen_hex(24), "admin_username": "admin",
+           "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined"}
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", ["selfsigned", "letsencrypt", "byo"])
+def test_setup_says_passkeys_need_a_self_signed_certificate_trusted(tmp_path, monkeypatch, capsys, mode):
+    import argparse
+    import os
+    _reusable_env(tmp_path)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+
+    def made(cert_dir, *a, **k):
+        os.makedirs(cert_dir, exist_ok=True)
+        for name in ("cert.pem", "key.pem"):
+            with open(os.path.join(cert_dir, name), "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+        return True, "made the pair"
+    for maker in ("generate_self_signed_cert", "obtain_letsencrypt_cert", "install_byo_cert"):
+        monkeypatch.setattr(dv, maker, made)
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _p: True)
+    monkeypatch.setattr(dv, "refresh_renewal_hook", lambda *a, **k: (None, ""))
+    tool.setup(argparse.Namespace(no_start=True, non_interactive=True, cert_mode=mode, cert_path="c.pem",
+                                  key_path="k.pem", le_email="a@example.com"))
+    out = capsys.readouterr().out
+    assert out.count("  Note: " + dv.SELF_SIGNED_PASSKEY_NOTE) == (mode == "selfsigned"), out
+    if mode == "selfsigned":
+        assert out.index("made the pair") < out.index(dv.SELF_SIGNED_PASSKEY_NOTE)
+    # A pair setup finds is kept, and nothing is said of it here: status judges the certificate there.
+    tool.setup(argparse.Namespace(no_start=True, non_interactive=True, cert_mode=mode))
+    out = capsys.readouterr().out
+    assert "keeping them" in out and dv.SELF_SIGNED_PASSKEY_NOTE not in out
+
+
+def test_the_certificate_menu_says_passkeys_need_a_self_signed_one_trusted(monkeypatch, capsys):
+    tool = dv.DockVault.__new__(dv.DockVault)
+    tool.pal = dv.Palette(False)
+    monkeypatch.setattr(dv, "ask", lambda *a, **k: "1")
+    assert tool._resolve_cert_cfg(None)[0] == "selfsigned"
+    assert ("    1) Self-signed   (works immediately; browsers warn until trusted; passkeys need it trusted)\n"
+            in capsys.readouterr().out)
+
+
+def test_the_readme_says_passkeys_need_a_certificate_the_browser_trusts():
+    readme = " ".join(io.open(ROOT / "README.md", encoding="utf-8").read().split())
+    assert ("HTTPS with a real (or self-signed) TLS certificate, and for passkeys one the browser trusts (Chrome and "
+            "Edge make no passkey on a self-signed certificate until it is trusted on each device),") in readme
