@@ -280,3 +280,28 @@ def test_what_0_36_0_adds_to_the_users_row_is_marked_as_new_in_it():
     for name in ("email_confirmed_at", "email_confirmed_for", "passkey_required_since",
                  "passkey_requirement_cleared_at", "sso_only", "password_nobody_knows", "sessions_ended"):
         assert f"`users.{name}`" in release, name
+
+
+def _release_headings(text):
+    return re.findall(r"^## What (\d+\.\d+\.\d+) added$", text, re.M)
+
+
+def test_the_opening_names_the_release_the_inventory_ends_with():
+    # The opening says which version the inventory describes and which releases its marks run over; both end at the
+    # release whose list closes the file, so a release that adds its list and forgets the opening fails here.
+    text = _text()
+    releases = _release_headings(text)
+    assert releases and releases[0] == "0.33.0", releases
+    described = re.findall(r"It describes\s+version (\d+\.\d+\.\d+)\.", text)
+    assert described == [releases[-1]], (described, releases[-1])
+    marked_range = re.findall(r"\*\*New in\*\* a release\s+\((\d+\.\d+\.\d+) to (\d+\.\d+\.\d+)\)", text)
+    assert marked_range == [(releases[0], releases[-1])], marked_range
+    # Each release an entry is marked with has its own list at the end.
+    marked = set(re.findall(r"\b(?:new|changed) in (\d+\.\d+\.\d+)\b", text, re.I))
+    assert marked and not marked - set(releases), sorted(marked - set(releases))
+
+
+def test_each_release_list_is_headed_in_the_same_words():
+    # "What <release> added", in the past, for every release: an operator looks one up by the same words.
+    assert not re.findall(r"^## What [0-9.]+ adds$", _text(), re.M)
+    assert len(_release_headings(_text())) >= 7

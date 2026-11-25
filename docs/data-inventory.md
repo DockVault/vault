@@ -3,8 +3,9 @@
 What a DockVault deployment stores about people: where, which fields, why, for how long, and how it
 is erased. It is written for the operator of a deployment (in GDPR terms, the controller) filling in
 a record of processing activities (Art. 30) or a privacy notice (Art. 13 and 14). It describes
-version 0.33.2. Entries marked **New in 0.33.0**, **New in 0.33.1** or **New in 0.33.2** are what that
-release started storing; each release's list is repeated at the end.
+version 0.36.0. An entry marked **New in** a release (0.33.0 to 0.36.0) is what that release started
+storing, and one marked **Changed in** a release is what it changed; each release's list is repeated at
+the end, under a heading such as "What 0.36.0 added".
 
 DockVault is software you run. Nothing described here leaves your deployment unless you configure it
 to: email goes through the SMTP server you set, the optional update check sends no personal data
@@ -641,7 +642,7 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
   and release (`zk_envelope_release_code_sent`, `zk_envelope_release_failed`, `zk_envelope_released`). The
   pruner deletes expired key registration and envelope challenges, whose one-time keys are kept sealed.
 
-## What 0.35.0 adds
+## What 0.35.0 added
 
 - Links and notices: an owner's message on a public link, a note link and an upload link (`message` on
   `public_links`, `note_public_links` and `receivers`); a notice to an upload link's owner when a file arrives,
@@ -657,7 +658,7 @@ How long records are kept, the audit log's integrity, its archive and erasing a 
   for the administrator's password, and their second factor when they have one, as a fixed step-up
   (`admin.session_limits.write`); the step-up and the save are recorded in the audit log as any other.
 
-## What 0.35.1 adds
+## What 0.35.1 added
 
 - Wrong file passwords are counted per file and account (`rate_limit:file:*` in the cache, `rate_limit_records`
   while it is down), under the vault password's limit and window. No route checks a folder's own password today,
