@@ -1248,7 +1248,7 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     assert status == 200 and body == {"cleared": True} and steps == ["root"]
     assert identity.refused_at is None and F.lapsed(h.db, alice.id) is None
     # Lifting it hands a person their keys back: the other administrators are told, once, and only when it was lifted.
-    assert len(told) == 1 and told[0][:2] == ("root", "A single sign-on refusal was lifted")
+    assert len(told) == 1 and told[0][:2] == ("root", "A single sign-on refusal or hold was lifted")
     assert "alice" in told[0][2] and "work again" in told[0][2]
     assert told[0][2].endswith("its SSH keys, temporary credentials and devices work again. Its password signs it in "
                                "again.")
@@ -1670,14 +1670,19 @@ def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, sta
         identities.append(_identity(alice, q, subject="s-fabrikam", last_sign_in_at=long_ago))
     h = Harness(monkeypatch, [root, alice], providers, identities=identities)
     monkeypatch.setattr(A, "_step_up", lambda db, user, request: None)
-    told, noticed = [], []
+    told, noticed, titles = [], [], []
     monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append(body))
     monkeypatch.setattr(owner_notices, "notify_in_transaction",
-                        lambda db, ids, *, title, body, ntype, target: noticed.append(body))
+                        lambda db, ids, *, title, body, ntype, target: noticed.append(body) or titles.append(title))
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
     assert status == 200 and body == {"cleared": True} and identity.refused_at is None
-    assert noticed == ["root lifted the refusal Contoso recorded for your account: " + said.format(**_TO_THE_PERSON)]
-    assert told == ["root lifted the refusal contoso recorded for alice: " + said.format(**_TO_THE_ADMINISTRATORS)]
+    # The vault keeps the date of a refusal or a hold, not which of the two it was (a hold is the vault's own, written
+    # when the provider was turned off or was to be removed after the days had run out): neither notice says the
+    # provider refused the person.
+    assert titles == ["An administrator lifted a sign-in refusal or hold"]
+    assert noticed == ["root lifted the refusal or hold Contoso had on your account: " + said.format(**_TO_THE_PERSON)]
+    assert told == ["root lifted the refusal or hold contoso had on alice: " + said.format(**_TO_THE_ADMINISTRATORS)]
+    assert "recorded" not in noticed[0] and "recorded" not in told[0]
     # What the sentence says is what holds: the keys are paused exactly where it says they stay paused.
     assert (F.lapsed(h.db, alice.id) is not None) is ("stay paused" in noticed[0])
     assert (F.held_to_a_provider(h.db, alice) is not None) is ("in to nothing" in noticed[0])

@@ -272,11 +272,13 @@ def _identity_or_404(db, identity_id, *, lock: bool = False):
 @router.post("/admin/sso/identities/{identity_id}/clear-refusal")
 def clear_identity_refusal(identity_id: str, request: Request, current_user: User = Depends(require_interactive_admin),
                            db: Session = Depends(get_db)):
-    """Lift a refusal the identity's provider recorded (its verified token excluded the person, so their SSH keys,
-    temporary credentials and devices paused): for a refusal that was a mistake the provider cannot answer, such as
-    one recorded before the provider was disabled. Never an administrator's own: another administrator clears that.
-    Under the administrators' sign-in policy step-up, recorded, and the person is told. The provider's freshness
-    window, when it asks one, still applies."""
+    """Lift the refusal or hold on record for the identity (the provider's verified token excluded the person, or
+    the vault held them when the provider was turned off or was to be removed after their days had run out; either
+    paused their SSH keys, temporary credentials and devices): for a refusal that was a mistake the provider cannot
+    answer, such as one recorded before the provider was disabled. Never an administrator's own: another
+    administrator clears that. Under the administrators' sign-in policy step-up, recorded, and the person is told.
+    The vault keeps the date, not which of the two it was, so neither notice says the provider refused the person.
+    The provider's freshness window, when it asks one, still applies."""
     api = _api()
     client_ip = api.get_client_ip(request)
     identity = _identity_or_404(db, identity_id)
@@ -318,8 +320,8 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
         from app.core import owner_notices
         if user is not None:
             owner_notices.notify_in_transaction(
-                db, [user.id], title="An administrator lifted a sign-in refusal",
-                body=(f"{current_user.username} lifted the refusal {person_label} recorded for your account: "
+                db, [user.id], title="An administrator lifted a sign-in refusal or hold",
+                body=(f"{current_user.username} lifted the refusal or hold {person_label} had on your account: "
                       + to_the_person),
                 ntype="sso_refusal_cleared", target="#profile")
     except Exception as exc:  # noqa: BLE001 -- the clearing stands without its notice
@@ -334,8 +336,8 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     try:
         from app.api import sso_providers_router
         sso_providers_router._tell_administrators(
-            current_user.username, "A single sign-on refusal was lifted",
-            f"{current_user.username} lifted the refusal {label} recorded for "
+            current_user.username, "A single sign-on refusal or hold was lifted",
+            f"{current_user.username} lifted the refusal or hold {label} had on "
             f"{user.username if user is not None else 'an account'}: " + to_the_administrators)
     except Exception as exc:  # noqa: BLE001 -- the clearing stands without its notice
         log.info("sso refusal-cleared notice to administrators skipped: %s", type(exc).__name__)
