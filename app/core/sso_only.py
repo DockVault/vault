@@ -281,6 +281,10 @@ def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None
         # the flag as committed. Known, and left: two saves that let two providers' people hold a password again
         # at one moment each still see the other provider holding an account linked to both, and both leave it
         # held. It signs in through either meanwhile, and the next settling of the account lets it go.
+        # Known too: an auditor grant's end is settled right after its commit, in a transaction of its own
+        # (:func:`after_a_grant_ended`). For the moment between the two the account is neither privileged nor
+        # flagged. What is written for it in that moment stands: the settling that follows decides on the
+        # account as it then is, ends the sessions a password made and leaves those that came through a provider.
         return None
     if getattr(user, "id", None) is not None:
         # A change is to be made: the account's turn at its sessions, and the decision made again in it. What

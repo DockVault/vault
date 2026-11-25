@@ -244,3 +244,37 @@ def test_a_database_without_the_identity_tables_settles_nothing(monkeypatch):
     assert sso_only.settle_when_a_privilege_ends(SimpleNamespace(info={}), SimpleNamespace(),
                                                  standing=sso_only.WAS_AN_ADMINISTRATOR) is None
 
+
+def test_what_signs_in_between_a_grants_end_and_its_settling_is_settled_with_the_account(db, world, monkeypatch,
+                                                                                         settled_after):
+    """The grant's end commits, and the account's rule is settled a moment later, in a transaction of its own. A
+    sign-in written in between meets an account that is neither privileged nor flagged yet. The settling that
+    follows still flags the account, ends the session a password made and leaves the one that came through the
+    provider."""
+    from app.core import after_commit, sso_only
+    from app.core import auditor_rights as rights
+    from app.core.models import ActiveSession, RoleEnum, SsoSession, User
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.USER)
+    grant = _grant(db, jay, "active", approved_at=datetime.utcnow())
+    waiting = []
+    monkeypatch.setitem(after_commit._HANDLERS, sso_only._GRANT_ENDED, lambda ids: waiting.extend(ids))
+    rights.revoke(db, grant, actor=None)
+    db.commit()
+    assert waiting == [str(jay.id)] and _as_it_stands(db, jay.id)[:2] == ("user", False)       # the moment between
+    # In that moment: a session through the provider, and one a password made.
+    other = _another(db)
+    through, by_password = (ActiveSession(id=uuid.uuid4(), session_token=uuid.uuid4().hex, user_id=jay.id,
+                                          ip_address="192.0.2.9", is_active=True, revoked=False) for _ in range(2))
+    other.add_all([through, by_password])
+    other.flush()
+    other.add(SsoSession(session_id=through.id, provider_id=provider.id, idp_sid="s-1", idp_sub="s-1"))
+    other.commit()
+    ids = {"through the provider": through.id, "by a password": by_password.id}
+    other.close()
+    ended = []
+    monkeypatch.setattr(api, "_revoke_sessions", lambda session, **kw: ended.extend(kw.get("session_ids") or []) or 0)
+    sso_only._settle_after_a_grant_ended(waiting)
+    assert _as_it_stands(db, jay.id) == ("user", True, True, False)
+    assert ended == [ids["by a password"]]
+    assert [title for _users, title, _change in told] == ["Your account signs in only through contoso"]
