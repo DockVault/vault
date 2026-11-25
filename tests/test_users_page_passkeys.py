@@ -29,7 +29,8 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parent.parent
 APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("_el", "parseServerTime", "formatDayMonth", "_changedBy", "pendingApproval", "confirmCredentialChange",
-            "_passkeysShownFor", "loadUserPasskeys", "renderUserPasskeys", "removeUserPasskey", "renderUserDetail")
+            "_passkeysShownFor", "loadUserPasskeys", "renderUserPasskeys", "removeUserPasskey", "_passkeysHeld",
+            "renderUserDetail")
 
 
 def _function(js, name):
@@ -89,11 +90,11 @@ const out = (value) => console.log(JSON.stringify(value));
 """
 
 
-def _node(scenario):
+def _node(scenario, more=()):
     node = shutil.which("node")
     assert node, "Node is required: the page's own code must not be skipped"
     js = APP_JS.read_text(encoding="utf-8")
-    script = (PRELUDE + "".join(_function(js, n) for n in _SHIPPED) + "(async () => {\n" + scenario
+    script = (PRELUDE + "".join(_function(js, n) for n in _SHIPPED + tuple(more)) + "(async () => {\n" + scenario
               + "\n})().catch((e) => { console.error(e); process.exit(1); });\n")
     done = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60,
                           cwd=str(ROOT), env=dict(os.environ, TZ="UTC"))
@@ -201,6 +202,74 @@ out({ toasts, reloads: reloads.length, disabled: host.querySelector('.user-passk
                    "disabled": False}
 
 
+
+# --------------------------------------------------------------------------- a reset of the second factor
+
+# A reset retires every passkey the account holds, whether it can sign in with it now or not, as well as the
+# authenticator app and its recovery codes; the row, the button, the confirmation and the toast say so.
+_RESET = ("signInMethods", "signInMethodBadges", "_holdsAFactor", "_resetEnds", "renderUserRow", "resetUserSecondFactor")
+
+
+def test_a_passkey_is_a_second_factor_in_the_row_and_any_held_passkey_can_be_reset():
+    got = _node(r"""
+People.placeholder = () => '';
+const row = (extra) => Object.assign({ id: 'u-dave', username: 'dave', role: 'user', groups: [], is_active: true,
+                                       second_factor_enabled: false, passkey_count: 0, passkey_unusable_count: 0 }, extra);
+const seen = (u) => { const html = renderUserRow(u);
+    return { on: html.includes(' On</span>'), off: html.includes('Off</span>'),
+             reset: html.includes('reset-second-factor-btn') }; };
+out({ passkey: seen(row({ passkey_count: 1 })), app: seen(row({ second_factor_enabled: true })),
+      unusable: seen(row({ passkey_unusable_count: 1 })), none: seen(row({})),
+      own: seen(row({ id: 'me', username: 'alice', role: 'admin', passkey_count: 2 })) });
+""", _RESET)
+    assert got["passkey"] == {"on": True, "off": False, "reset": True}
+    assert got["app"] == {"on": True, "off": False, "reset": True}
+    # A key that is no factor now is not a way in, yet the reset retires it: the button is offered.
+    assert got["unusable"] == {"on": False, "off": True, "reset": True}
+    assert got["none"] == {"on": False, "off": True, "reset": False}
+    assert got["own"]["on"] is True and got["own"]["reset"] is False
+
+
+def test_the_reset_says_what_stops_working_and_how_the_person_sets_a_new_factor_up():
+    got = _node(r"""
+const path = '/users/u-carol/second-factor/reset';
+const reset = async (extra, answer) => {
+    Object.assign(carol, { second_factor_enabled: false, passkey_count: 0, passkey_unusable_count: 0,
+                           password_to_type: true }, extra);
+    answers[path] = answer;
+    confirms.length = 0; toasts.length = 0;
+    await resetUserSecondFactor('u-carol');
+    return { confirm: confirms[0], toasts: toasts.slice() };
+};
+out({
+    both: await reset({ second_factor_enabled: true, passkey_count: 2, password_to_type: false },
+                      { reset: true, passkeys_retired: 2, own_password: false }),
+    app: await reset({ second_factor_enabled: true }, { reset: true, passkeys_retired: 0, own_password: true }),
+    one: await reset({ passkey_unusable_count: 1 }, { reset: true, passkeys_retired: 1, own_password: true }),
+    keys: await reset({ passkey_count: 1, passkey_unusable_count: 2 }, { reset: true }),
+    posted: asked.filter((a) => a.method === 'POST').map((a) => a.path),
+});
+""", _RESET)
+    message, title, label = got["both"]["confirm"]
+    assert (title, label) == ("Reset the second factor?", None)
+    assert message == ("carol will be signed out everywhere. Their authenticator app, its recovery codes and their 2 "
+                       "passkeys stop working. They set up a new second factor at their next sign-in through your "
+                       "organisation.")
+    assert got["both"]["toasts"] == [["success", "Second factor reset and 2 passkeys retired. carol sets one up "
+                                                 "again at the next sign-in."]]
+    assert got["app"]["confirm"][0] == ("carol will be signed out everywhere. Their authenticator app and its "
+                                        "recovery codes stop working. They set up a new second factor at their next "
+                                        "sign-in, with their own password.")
+    assert got["app"]["toasts"] == [["success", "Second factor reset. carol sets one up again at the next sign-in."]]
+    assert got["one"]["confirm"][0] == ("carol will be signed out everywhere. Their passkey stops working. They set "
+                                        "up a new second factor at their next sign-in, with their own password.")
+    assert got["one"]["toasts"] == [["success", "Second factor reset and 1 passkey retired. carol sets one up again "
+                                                "at the next sign-in."]]
+    assert got["keys"]["confirm"][0].startswith("carol will be signed out everywhere. Their 3 passkeys stop working.")
+    assert got["keys"]["toasts"] == [["success", "Second factor reset. carol sets one up again at the next sign-in."]]
+    assert got["posted"] == ["/users/u-carol/second-factor/reset"] * 4
+
+
 # --------------------------------------------------------------------------- the routes the page uses
 
 def _world(monkeypatch, viewer):
@@ -256,3 +325,37 @@ def test_the_removal_asks_the_step_up_of_managing_users(monkeypatch):
     assert status == 403 and out["detail"]["action"] == "admin.user.manage" and asked == ["admin.user.manage"]
     assert key.retired_at is None
     assert "admin.user.manage" in h.S.GUARDED_STEP_UP_ACTIONS
+
+
+def test_a_reset_answers_how_many_passkeys_it_retired_and_whether_the_account_has_a_password_to_type(monkeypatch):
+    """An account made at its first sign-in through a provider holds a password nobody knows; its passkey is its
+    only factor. The reset retires the passkey and says so, and that the account has no password anybody can type,
+    so the page can tell the administrator how the person sets a new factor up."""
+    from app.core import password_origin
+    from app.core.models import User
+    admin = _user("root", role="admin")
+    h = Harness(monkeypatch, admin)
+    target = _user("carol", password_hash="random-bytes", had_a_password_at=None)
+    password_origin.mark_nobody_knows(target)
+    h.db.rows_of(User).append(target)
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, credential_id=b"c", retired_at=None,
+                                uv_initialized=True, cose_alg=-7)
+    h.rows().append(key)
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: None)
+    from app.core import auditor_rights, legal_holds
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    status, out = _call(h.S, "POST", f"/users/{target.id}/second-factor/reset", headers={"X-Second-Factor": "ok"})
+    assert status == 200, out
+    assert out == {"reset": True, "passkeys_retired": 1, "own_password": False}
+    assert key.retired_at is not None and target.second_factor_reset_at is not None
+
+
+def test_the_users_list_says_whether_each_account_has_a_password_somebody_can_type():
+    source = (ROOT / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    answer = source[source.index("class UserResponse("):]
+    answer = answer[:answer.index("\nclass ")]
+    assert "password_to_type: bool = False" in answer
+    listing = source[source.index("async def list_users("):]
+    listing = listing[:listing.index("\n@app.")]
+    assert "item.password_to_type = sign_in.has_a_password_it_can_type(user)" in listing

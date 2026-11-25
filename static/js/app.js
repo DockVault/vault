@@ -7490,17 +7490,51 @@ async function confirmUserEmail(userId, btn) {
     }
 }
 
+// A reset retires every passkey the account holds, the ones it signs in with and the ones that are no factor now.
+function _passkeysHeld(u) {
+    return (Number(u && u.passkey_count) || 0) + (Number(u && u.passkey_unusable_count) || 0);
+}
+
+// Whether the account has a second factor it can use now: an authenticator app, or a passkey it signs in with
+// (passkey_count counts only those).
+function _holdsAFactor(u) {
+    return !!(u && u.second_factor_enabled) || (Number(u && u.passkey_count) || 0) > 0;
+}
+
+// What a reset ends, as the confirmation says it: "Their authenticator app and its recovery codes stop working."
+function _resetEnds(u) {
+    const keys = _passkeysHeld(u);
+    const passkeys = keys === 1 ? 'their passkey' : 'their ' + keys + ' passkeys';
+    let ends = '';
+    if (u && u.second_factor_enabled) {
+        ends = keys > 0 ? 'their authenticator app, its recovery codes and ' + passkeys + ' stop working.'
+            : 'their authenticator app and its recovery codes stop working.';
+    } else if (keys > 0) {
+        ends = passkeys + (keys === 1 ? ' stops working.' : ' stop working.');
+    }
+    return ends ? ' ' + ends.charAt(0).toUpperCase() + ends.slice(1) : '';
+}
+
 async function resetUserSecondFactor(userId, btn) {
     const u = (usersView.users || []).find(x => x.id === userId);
     const name = u ? u.username : 'this user';
+    // How the person sets a new factor up, as their own notice says it: with a password they can type, else at a
+    // sign-in through their provider.
+    const how = (u && u.password_to_type === false)
+        ? ' They set up a new second factor at their next sign-in through your organisation.'
+        : ' They set up a new second factor at their next sign-in, with their own password.';
     if (!await confirmCredentialChange(u, 'The second factor is reset',
-        name + ' will be signed out everywhere and asked to set up a new second factor, with their own password, at their next sign-in.',
+        name + ' will be signed out everywhere.' + _resetEnds(u) + how,
         'Reset the second factor?')) return;
     if (btn) btn.disabled = true;
     try {
         const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/second-factor/reset', { method: 'POST' });
         if (r && r.held) showHeldChange(r);
-        else showSuccess('Second factor reset. ' + name + ' sets it up again at the next sign-in.');
+        else {
+            const n = Number(r && r.passkeys_retired) || 0;
+            showSuccess('Second factor reset' + (n > 0 ? ' and ' + n + (n === 1 ? ' passkey' : ' passkeys') + ' retired' : '')
+                + '. ' + name + ' sets one up again at the next sign-in.');
+        }
         await loadUsers();
     } catch (e) {
         showError('Could not reset the second factor: ' + (e.message || ''));
@@ -7728,7 +7762,7 @@ function renderUserRow(u) {
                 ${u.is_locked ? `<span class="badge badge-warning">${iconSvg('lock', 'icon-sm')} Locked</span>` : ''}
                 ${!u.is_locked && u.sign_in_block ? `<span class="badge badge-warning sign-in-block-badge" data-user-id="${u.id}">${iconSvg('clock', 'icon-sm')} Sign-ins paused</span>` : ''}
             </div></td>
-            <td>${u.second_factor_enabled
+            <td>${_holdsAFactor(u)
                     ? `<span class="badge badge-success">${iconSvg('shield', 'icon-sm')} On</span>`
                     : `<span class="text-tertiary text-xs">Off</span>`}</td>
             <td class="col-time">${People.whenPlaceholder(u.last_login, { fallback: 'Never' })}</td>
@@ -7800,7 +7834,7 @@ function renderUserDetail(u) {
                 <button class="btn btn-sm btn-secondary change-password-btn" data-user-id="${u.id}">${iconSvg('key', 'icon-sm')} Change Password</button>
                 ${u.email ? `<button class="btn btn-sm btn-secondary send-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('key', 'icon-sm')} Send reset link</button>` : ''}
                 <button class="btn btn-sm btn-secondary copy-reset-link-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('link', 'icon-sm')} Copy reset link</button>
-                ${u.second_factor_enabled && u.username !== currentUser.username ? `<button class="btn btn-sm btn-secondary reset-second-factor-btn" data-user-id="${u.id}">${iconSvg('shield', 'icon-sm')} Reset second factor</button>` : ''}
+                ${(u.second_factor_enabled || _passkeysHeld(u) > 0) && u.username !== currentUser.username ? `<button class="btn btn-sm btn-secondary reset-second-factor-btn" data-user-id="${u.id}">${iconSvg('shield', 'icon-sm')} Reset second factor</button>` : ''}
                 ${currentUser.role === 'admin' && u.email_confirm_wanted && u.username !== currentUser.username ? `<button class="btn btn-sm btn-secondary confirm-email-btn" data-user-id="${u.id}">${iconSvg('check', 'icon-sm')} Confirm address</button>` : ''}
                 ${currentUser.role === 'admin' && u.role !== 'admin' ? `<button class="btn btn-sm btn-secondary manage-perms-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}">${iconSvg('shield', 'icon-sm')} Permissions</button>` : ''}
                 ${currentUser.role === 'admin' && u.username !== currentUser.username ? `<button class="btn btn-sm btn-warning terminate-user-sessions-btn" data-user-id="${u.id}">${iconSvg('alert-triangle', 'icon-sm')} Terminate Sessions</button>` : ''}

@@ -1137,6 +1137,10 @@ class UserResponse(BaseModel):
     # Whether the account has an active second factor (TOTP) enrolled. Not an ORM column — the
     # admin users list fills it in from a batched enrollment query; elsewhere it stays False.
     second_factor_enabled: bool = False
+    # Whether somebody can type the account's password (app/services/sign_in.py, has_a_password_it_can_type): a
+    # reset of the second factor is set up again with it, else through the account's provider. Filled in by the
+    # admin users list.
+    password_to_type: bool = False
     # An administrator reset the second factor and the user has not set it up again yet: the next
     # sign-in asks them to. Filled in by the admin users list.
     second_factor_reset_pending: bool = False
@@ -11249,6 +11253,7 @@ async def list_users(
         item.password_set_note = password_notes.get(user.id)
         item.sso_freshness = freshness.get(str(user.id))
         item.second_factor_enabled = user.id in mfa_user_ids
+        item.password_to_type = sign_in.has_a_password_it_can_type(user)
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
         item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))
         item.email_confirmed = email_confirmation.confirmed(user)
@@ -14244,7 +14249,10 @@ async def admin_reset_second_factor(
         pass
     if target.id != current_user.id:
         _notify_credential_change(db, "second_factor", target, outcome.result, by_name=current_user.username)
-    return {"reset": True}
+    # What the page tells the administrator: the passkeys the reset retired, and whether the person sets a new
+    # factor up with a password of their own or through their provider.
+    return {"reset": True, "passkeys_retired": int((outcome.result or {}).get("passkeys_retired", 0)),
+            "own_password": sign_in.has_a_password_it_can_type(target)}
 
 
 # --- Held credential changes: the list, and approving or denying one ------------------------------
