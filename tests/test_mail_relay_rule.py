@@ -9,7 +9,6 @@ the change is recorded. A request that changes none of these keeps the stored pa
 The step-up these routes also ask for is passed here; test_mail_relay_step_up.py holds it.
 """
 import tempfile
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
