@@ -348,3 +348,13 @@ def test_the_rows_0_36_0_widened_say_so():
     assert changed.count("**New in 0.36.0:**") == 1 and "passkey" in changed.split("**New in 0.36.0:**")[1]
     (notices,) = [line for line in _text().splitlines() if line.startswith("| `notifications` |")]
     assert notices.count("**New in 0.36.0:**") == 1 and "single sign-on" in notices.split("**New in 0.36.0:**")[1]
+
+
+def test_the_providers_row_says_whom_the_last_test_can_name_and_what_an_erase_does_there():
+    # The summary of a test sign-in names who ran it, and its "would" line can name the account a sign-in of the
+    # tested identity would link or create: an erase replaces such a username with its placeholder, as elsewhere, and
+    # leaves the rest of the summary.
+    row = _row_of("sso_providers")
+    assert "own account only" not in row
+    assert "which can name the account a sign-in of the tested identity would link or create" in row
+    assert "replaced by the erase's placeholder" in row and "when the tester is erased" not in row
