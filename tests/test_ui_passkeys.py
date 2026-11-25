@@ -373,6 +373,39 @@ def test_the_users_page_lists_how_each_account_signs_in(page: Page, no_offer, au
     assert detail.get_attribute("colspan") == str(len(titles))
 
 
+def test_an_administrator_removes_someones_passkey_from_the_users_page(page: Page, no_offer, authenticator, fresh_user,
+                                                                       admin_creds):
+    """The account's details list its passkeys; "Remove" says what a removal does (it signs the person out everywhere
+    and counts as a change to their sign-in details) before it is sent, under the step-up of managing users when one
+    is asked, and the list is read again."""
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    _add_first_passkey(page, fresh_user["_password"], "Laptop")
+    _sign_out(page)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"users\"]').click()")
+    table = page.locator("#users-list table")
+    expect(table).to_be_visible(timeout=10000)
+    page.fill("#users-search", fresh_user["_username"])
+    row = table.locator("tbody tr", has_text=fresh_user["_username"]).first
+    row.locator(".exp-toggle").click()
+    passkeys = table.locator(".user-passkeys-list .user-passkey-item")
+    expect(passkeys).to_have_count(1, timeout=10000)
+    expect(passkeys.first).to_contain_text("Laptop")
+    passkeys.first.get_by_role("button", name="Remove the passkey Laptop").click()
+    message = page.locator("#confirm-modal-message")
+    expect(message).to_contain_text("sessions end, everywhere", timeout=8000)
+    expect(message).to_contain_text("It counts as a change to their sign-in details")
+    page.click("#confirm-modal-confirm-btn")
+    stepup = page.locator("#stepup-modal.active")
+    removed = table.locator(".user-passkeys-list", has_text="No passkeys.")
+    expect(stepup.or_(removed)).to_be_visible(timeout=10000)
+    if stepup.is_visible():
+        page.fill("#stepup-password-input", admin_creds["password"])
+        page.locator("#stepup-modal-body .btn-primary").click()
+    expect(removed).to_be_visible(timeout=10000)
+    expect(row.locator("td.col-methods .badge")).to_have_text(["Password"])
+
+
 def test_the_questions_asked_around_a_passkey_are_the_pages_ordinary_dialogs(page: Page, no_offer, authenticator,
                                                                            fresh_user):
     """Removing and naming a passkey ask through the page's own dialogs: named for assistive technology, closed by

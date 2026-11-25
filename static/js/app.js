@@ -7473,7 +7473,7 @@ async function resetUserSecondFactor(userId, btn) {
 // What the last change to someone's sign-in details was, as done: "Password reset link created".
 const _CHANGE_MADE = {
     password: 'New password set', reset_link: 'Password reset link created', second_factor: 'Second factor reset',
-    email: 'Email address changed', ssh_key: 'SSH key added',
+    email: 'Email address changed', ssh_key: 'SSH key added', passkey: 'Passkey removed',
 };
 
 // "Password reset link created by admin on 28 Sep. Until 12 Oct, another change ..." in the viewer's
@@ -7746,6 +7746,11 @@ function renderUserDetail(u) {
                     <button type="button" class="btn btn-sm btn-secondary ssh-key-add-btn" data-user-id="${u.id}">${iconSvg('plus', 'icon-sm')} Add key</button>
                 </div>
             </div>
+            ${_passkeysShownFor(u) ? `
+            <div class="detail-block">
+                <div class="detail-label">Passkeys</div>
+                <div class="user-passkeys-list" data-user-id="${u.id}"><span class="text-tertiary text-sm">Loading…</span></div>
+            </div>` : ''}
             <div class="credential-change-note" data-user-id="${u.id}" hidden></div>
             <div class="entity-actions">
                 <button class="btn btn-sm btn-secondary edit-user-btn" data-user-id="${u.id}">${iconSvg('edit', 'icon-sm')} Edit</button>
@@ -7775,6 +7780,7 @@ function toggleUserRow(id) {
     if (row) row.classList.toggle('open', !open);
     if (det) det.classList.toggle('is-open', !open);
     if (!open) loadUserSshKeys(id);  // newly opened -> fetch this user's SSH keys
+    if (!open) loadUserPasskeys(id);
 }
 
 async function addUserToGroup(userId, groupId) {
@@ -7912,6 +7918,90 @@ async function deleteSshKey(userId, keyId, keyName, root = document) {
     } catch (e) {
         showError('Failed to remove SSH key: ' + e.message);
     }
+}
+
+// ---- An account's passkeys, for an administrator (inside the expandable user detail) ----
+// GET /users/{id}/passkeys lists them; DELETE /users/{id}/passkeys/{passkey_id} removes one, under the step-up of
+// managing users. A removal is a change to the account's sign-in details (it may wait for a second administrator)
+// and ends all the account's sessions. An administrator's own passkeys are managed under Your account, and the
+// server refuses them here.
+
+function _passkeysShownFor(u) {
+    return !!(u && currentUser && currentUser.role === 'admin' && !isScopedTemp && u.id !== currentUser.id);
+}
+
+async function loadUserPasskeys(userId, root = document) {
+    const host = root.querySelector(`.user-passkeys-list[data-user-id="${userId}"]`);
+    if (!host) return;
+    let data;
+    try { data = await apiRequest(`/users/${encodeURIComponent(userId)}/passkeys`, { silent: true }); }
+    catch (_) {
+        host.replaceChildren(_el('span', 'text-tertiary text-sm', 'Could not load the passkeys.'));
+        return;
+    }
+    renderUserPasskeys(userId, (data && Array.isArray(data.passkeys)) ? data.passkeys : [], root);
+}
+
+function renderUserPasskeys(userId, keys, root = document) {
+    const host = root.querySelector(`.user-passkeys-list[data-user-id="${userId}"]`);
+    if (!host) return;
+    host.replaceChildren();
+    if (!keys.length) {
+        host.appendChild(_el('span', 'text-tertiary text-sm', 'No passkeys.'));
+        return;
+    }
+    const day = (value) => {
+        const d = parseServerTime(value);
+        return d ? d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+    };
+    keys.forEach((key) => {
+        const item = _el('div', 'user-passkey-item ssh-key-item');
+        item.dataset.passkeyId = String(key.id);
+        const meta = _el('span', 'ssh-key-meta');
+        meta.appendChild(svgUseIcon('key', 'icon-sm'));
+        meta.appendChild(_el('span', 'ssh-key-name-text', key.label || 'Unnamed passkey'));
+        const bits = [];
+        if (day(key.created_at)) bits.push('added ' + day(key.created_at));
+        bits.push(key.last_used_at ? 'last used ' + day(key.last_used_at) : 'never used');
+        bits.push(key.synced ? 'synced between devices' : 'bound to one device');
+        if (key.provisional && day(key.provisional_until)) bits.push('provisional until ' + day(key.provisional_until));
+        meta.appendChild(_el('span', 'ssh-key-by text-tertiary text-xs', bits.join(' · ')));
+        item.appendChild(meta);
+        const remove = _el('button', 'btn btn-sm btn-danger user-passkey-remove-btn', 'Remove');
+        remove.type = 'button';
+        remove.setAttribute('aria-label', 'Remove the passkey ' + (key.label || 'with no name'));
+        remove.addEventListener('click', () => removeUserPasskey(userId, key, remove));
+        item.appendChild(remove);
+        host.appendChild(item);
+    });
+}
+
+async function removeUserPasskey(userId, key, btn) {
+    const u = (usersView.users || []).find(x => x.id === userId);
+    const name = u ? u.username : 'this user';
+    const which = key.label ? 'the passkey “' + key.label + '”' : 'this passkey';
+    if (!await confirmCredentialChange(u, 'The passkey is removed',
+        'Remove ' + which + ' from ' + name + '’s account? It no longer signs them in or confirms it is them. All of '
+        + name + '’s sessions end, everywhere, and they sign in again with what their account still has; if it was '
+        + 'the last second factor it held, they set one up again at their next sign-in. It counts as a change to their '
+        + 'sign-in details: for 14 days another change needs a second administrator, and their zero-knowledge vaults '
+        + 'ask for a code sent to their email address for as long as this vault holds keys after such a change, 14 '
+        + 'days at most.',
+        'Remove the passkey?')) return;
+    if (btn) btn.disabled = true;
+    try {
+        const r = await apiRequest(`/users/${encodeURIComponent(userId)}/passkeys/${encodeURIComponent(key.id)}`,
+            { method: 'DELETE' });
+        if (r && r.held) showHeldChange(r);
+        else showSuccess('Passkey removed. ' + name + ' was signed out everywhere.');
+    } catch (e) {
+        showError('Could not remove the passkey: ' + (e.message || ''));
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+    // The list as it stands now: the table (its sign-in methods, the note of the change) and, in it, the passkeys of
+    // each account whose details are open.
+    await loadUsers();
 }
 
 // ---- Self-service "Your account" modal --------------------------------------------------------
@@ -8515,6 +8605,7 @@ function attachUserListeners() {
 
     // Re-hydrate SSH-key lists for rows that are still expanded after a re-render.
     usersView.expanded.forEach(id => loadUserSshKeys(id));
+    usersView.expanded.forEach(id => loadUserPasskeys(id));
 }
 
 // ---- Admin: per-user permission management --------------------------------
