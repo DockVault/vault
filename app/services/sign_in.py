@@ -429,6 +429,16 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
     write_the_passkey_grace(result)
 
 
+def proofs_of(claims) -> set:
+    """The proofs a session's token names, as a set. A token that names none at all (no ``amr``) was made by a
+    release in which every session began with the password, and is carried on by the renewals of that session:
+    it is a password's. One that names them is what it names."""
+    proofs = (claims or {}).get("amr")
+    if proofs is None:
+        return {PASSWORD}
+    return {m for m in proofs if isinstance(m, str)} if isinstance(proofs, (list, tuple)) else set()
+
+
 def a_passkey_alone(result: "SignInResult") -> bool:
     """Whether ``result`` is a sign-in that a passkey made by itself: no password, no provider, and the account's
     role let a user-verified passkey be the whole of it when the passkey was taken."""
@@ -1347,9 +1357,7 @@ def refuse_renewal_by_the_sign_in_rules(db, user, old: dict) -> None:
     (``sso_freshness.held_to_a_provider``), with a session that came through no provider: refused, with what to
     use instead. Signing in again now would be refused the same way."""
     from app.api import api_server as api
-    proofs = old.get("amr")
-    methods = ({PASSWORD} if proofs is None
-               else {m for m in proofs if isinstance(m, str)} if isinstance(proofs, (list, tuple)) else set())
+    methods = proofs_of(old)
     if PASSWORD not in methods:
         if getattr(user, "role", None) == RoleEnum.ADMIN:
             raise HTTPException(status_code=403, detail="Administrators sign in with their password. Sign in again.")

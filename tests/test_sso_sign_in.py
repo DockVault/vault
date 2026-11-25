@@ -581,11 +581,42 @@ def test_a_link_needs_a_session_that_proved_the_password_and_the_factor(monkeypa
     assert status == 403 and out["detail"]["reason"] == "password_proof_required"
     from app.core.models import SecondFactorEnrollment
     h.db.rows_of(SecondFactorEnrollment).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, method="totp", status="active"))
+    # The account holds a factor its session did not give. Where neither the step-up of the link nor a sign-in...
+    from app.core.models import SecondFactorAction
+    toggles = h.db.rows_of(SecondFactorAction)
+
+    def asked(**rows):
+        del toggles[:]
+        toggles.extend(types.SimpleNamespace(key=key, require_otp=otp, require_password=False)
+                       for key, otp in rows.items())
     h.session_claims = {"amr": ["pwd"]}
+    # ...the step-up does not ask for the factor and a sign-in would: refused, and signing in again gives it.
+    asked(**{"account.second_factor": False, "login": True})
     status, out = h.start_link(p)
     assert status == 403 and out["detail"]["reason"] == "second_factor_proof_required"
+    assert out["detail"]["message"] == "Sign in with your second factor before adding a sign-in method."
+    # The step-up asks for it (as it does unless an administrator turned that off): its receipt is the proof.
+    del h.step_ups[:]
+    for rows in ({}, {"login": False}, {"account.second_factor": True, "login": False}):
+        asked(**rows)
+        assert h.start_link(p)[0] == 200, rows
+    assert h.step_ups == ["account.second_factor"] * 3
+    # No sign-in asks for the factor, nor does the step-up: no session could have given it, and the link goes on.
+    asked(**{"account.second_factor": False, "login": False})
+    assert h.start_link(p)[0] == 200
+    asked(**{"account.second_factor": False, "login": True})
     h.session_claims = {"amr": ["pwd", "totp"], "mfa_at": 1}
     assert h.start_link(p)[0] == 200
+    del toggles[:]
+    # A session from before tokens named their proofs began with the password, and is carried on by renewals.
+    h.session_claims = {"sub": str(alice.id), "exp": 1}
+    assert h.start_link(p)[0] == 200
+    # No token read at all is no proof, and neither is a list of proofs that is no list.
+    for claims in ({}, {"sub": str(alice.id), "amr": "pwd"}, {"sub": str(alice.id), "amr": ["hwk"]}):
+        h.session_claims = claims
+        status, out = h.start_link(p)
+        assert status == 403 and out["detail"]["reason"] == "password_proof_required", claims
+    h.session_claims = {"amr": ["pwd", "totp"], "mfa_at": 1}
     assert _call(h.S, "POST", f"/users/me/identities/{p.id}/start", {})[0] == 422          # the tab verifier is required
     alice._is_temp_session = True
     assert h.start_link(p)[0] == 403 and _call(h.S, "GET", "/users/me/identities")[0] == 403

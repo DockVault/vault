@@ -1358,8 +1358,10 @@ async def start_link(
     db: Session = Depends(get_db),
 ):
     """Start linking the caller's account to a provider. The session must have proved the password (its ``amr``
-    carries ``pwd``) and, when the account has a factor, the second factor (``mfa_at`` set), and the link is made
-    under the account.second_factor step-up: a provider identity is a new way into the account."""
+    carries ``pwd``; a session from before tokens named their proofs began with the password) and, when the
+    account has a factor, the second factor: at its sign-in (``mfa_at`` set) or afresh in the
+    account.second_factor step-up the link is made under (:func:`_the_factor_is_given_for_a_link`). A provider
+    identity is a new way into the account."""
     api = _api()
     _refuse_temp(current_user)
     # An account held to its provider's sign-in adds no other way in: from a session a password made before the
@@ -1371,12 +1373,15 @@ async def start_link(
     client_ip = api.get_client_ip(request)
     _limit_start(client_ip)
     claims = _session_claims(request)
-    if "pwd" not in (claims.get("amr") or []):
+    from app.services import sign_in
+    # No token read is no proof; a token that names no proofs is from before they were named, and a password's.
+    if not claims or sign_in.PASSWORD not in sign_in.proofs_of(claims):
         raise HTTPException(status_code=403, detail={
             "reason": "password_proof_required",
             "message": "Sign in with your password before adding a sign-in method."})
     from app.core.active_factors import active_factors
-    if active_factors(db, current_user.id).any and not claims.get("mfa_at"):
+    if (active_factors(db, current_user.id).any and not claims.get("mfa_at")
+            and not _the_factor_is_given_for_a_link(api, db, current_user)):
         raise HTTPException(status_code=403, detail={
             "reason": "second_factor_proof_required",
             "message": "Sign in with your second factor before adding a sign-in method."})
@@ -1401,6 +1406,22 @@ async def start_link(
     except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
         raise _refused_start(exc)
     return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
+
+
+def _the_factor_is_given_for_a_link(api, db, user) -> bool:
+    """For an account that holds a second factor and whose session did not give it: whether the link may go on
+    all the same.
+
+    It may where the step-up the link is made under asks for the factor: its receipt is a fresh proof of it,
+    given for this very act. And it may where no sign-in asks for the factor either (the administrator turned
+    the sign-in's second step off): no session could then have given it, and telling the person to sign in with
+    it asked for what nothing would let them do. The link is refused only where the step-up does not ask for the
+    factor and a sign-in would: signing in again gives it."""
+    requirement, _has_one = api._sf_requirement_for(db, user, "account.second_factor")
+    if requirement.get("otp"):
+        return True
+    sign_in_asks, _password = api._sf_action_toggles(db, "login")
+    return not sign_in_asks
 
 
 def _session_claims(request) -> dict:
