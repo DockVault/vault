@@ -2303,3 +2303,6 @@ details summary:hover {
 .sso-unsaved { font-weight: normal; }
 .identity-link { margin-right: var(--space-sm); }
 .identity-text, .identity-link-refused { min-width: 0; overflow-wrap: anywhere; }
+/* A provider's group mappings: a long group name (a distinguished name holds no space) wraps instead of widening the
+   dialog on a phone. */
+.sso-group-text { min-width: 0; overflow-wrap: anywhere; }

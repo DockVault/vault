@@ -29,6 +29,7 @@ await _apiRequestNow('/auth/temp-credentials', { method: 'POST', body: '{}', sil
     .then(() => { got = { settled: 'resolved' }; },
           (e) => { got = { settled: 'rejected', message: e.message, kind: e.constructor.name,
                            reason: e.reason === undefined ? null : e.reason,
+                           field: e.field === undefined ? null : e.field,
                            status: e.status === undefined ? null : e.status }; });
 await settle();
 out({ ...got, shown, signed_out: logouts, held: authToken === mine });
@@ -146,3 +147,15 @@ def test_a_busy_answer_is_its_sentence_with_its_reason_and_never_signs_out():
     out = _refused(503, {"detail": plain})
     assert out["status"] == 503 and out["reason"] is None and out["message"] == plain
     assert out["signed_out"] == 0 and out["held"] is True
+
+
+def test_a_refusal_that_names_a_field_carries_it_beside_its_sentence_and_reason():
+    """A form's refusal of one value ({reason, field, message}): the page draws the sentence under the field named."""
+    detail = {"reason": "invalid", "field": "provider_group", "message": "Name the provider's group."}
+    out = _refused(400, {"detail": detail}, silent=True)
+    assert out["settled"] == "rejected" and out["status"] == 400, out
+    assert out["message"] == "Name the provider's group." and out["reason"] == "invalid"
+    assert out["field"] == "provider_group"
+    # A refusal that names no field carries none.
+    other = _refused(409, {"detail": {"reason": "group_mapped", "message": "This group is mapped already."}}, silent=True)
+    assert other["field"] is None and other["reason"] == "group_mapped" and other["status"] == 409

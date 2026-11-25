@@ -1046,9 +1046,11 @@ async function _apiRequestNow(endpoint, options = {}) {
             if (err.reason === undefined && detail && typeof detail === 'object' && typeof detail.reason === 'string') {
                 err.reason = detail.reason;
             }
+            // A form's refusal of one value names it: the caller draws the sentence under that field.
+            if (detail && typeof detail === 'object' && typeof detail.field === 'string') err.field = detail.field;
             throw err;
         }
-        
+
         // Handle 204 No Content
         if (response.status === 204) {
             return null;

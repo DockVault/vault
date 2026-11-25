@@ -7,9 +7,11 @@
  * ALLOWED_HOSTS entry, set in .env: nothing here can change it). "Add a provider" asks for a name and a kind and
  * makes a draft, so the two addresses the provider's own console asks for exist before anything else is typed. A
  * provider opens in a dialog with its pages: Connection (with the addresses to copy and the test sign-in), Access,
- * Second factor, Sessions. Each page is saved on its own and sends only what changed; a change asks for the
+ * Groups, Second factor, Sessions. Each page is saved on its own and sends only what changed; a change asks for the
  * administrator's password (and their second factor when they have one), and what the server refuses is shown in
- * its own words. The client secret is typed, sent, and never shown again. A fifth page, Identities, lists the
+ * its own words. The client secret is typed, sent, and never shown again. The Groups page maps the provider's groups
+ * to departments and roles (GET/POST /admin/sso/providers/{id}/group-mappings, PATCH and DELETE .../{mapping_id}),
+ * each mapping added, changed or removed on its own under the same step-up. The last page, Identities, lists the
  * accounts linked to the provider (GET /admin/sso/providers/{id}/identities) and where each stands, lifts a
  * refusal or a hold (POST /admin/sso/identities/{id}/clear-refusal) and unlinks an account (DELETE
  * /admin/sso/identities/{id}), each under the same step-up as a change. A save, a turn-on or a turn-off says what
@@ -18,7 +20,8 @@
  *
  * When the deployment locks single sign-on (SETTINGS_LOCKED_KEYS naming sso or *), the server refuses every change
  * to a provider, and the card and the dialog say so in the server's words (`locked_message`) and offer none: no "Add
- * a provider", Turn on or off, Turn off again, Remove or Save, and a provider's fields are read-only. Open, the test
+ * a provider", Turn on or off, Turn off again, Remove or Save, no Add, Change or Remove on the Groups page, and a
+ * provider's fields are read-only. Open, the test
  * sign-in, the addresses to copy and the Identities page's Lift and Unlink stay, as their routes do.
  *
  * Uses app.js's apiRequest, openModal, closeModal, showConfirm, showToast and _el, and sso.js's Sso.startTest.
@@ -38,10 +41,11 @@
     let identityReads = 0;      // only the latest read of that list draws it
     let identitiesNote = null;  // a refused removal's sentence, said once at the top of the Identities page
     let standing = {};          // by provider: sessions a turn-off could not end (a number; null: not counted)
+    let mappingReads = 0;       // only the latest read of the provider's group mappings draws them
 
     const ICON_NAMES = { generic: 'Plain', microsoft: 'Microsoft', google: 'Google', okta: 'Okta', keycloak: 'Keycloak', authentik: 'Authentik' };
-    const PAGES = [['connection', 'Connection'], ['access', 'Access'], ['factor', 'Second factor'], ['sessions', 'Sessions'],
-        ['identities', 'Identities']];
+    const PAGES = [['connection', 'Connection'], ['access', 'Access'], ['groups', 'Groups'], ['factor', 'Second factor'],
+        ['sessions', 'Sessions'], ['identities', 'Identities']];
 
     function status(provider) {
         if (provider.state === 'enabled') return ['On', 'badge-success'];
@@ -111,6 +115,7 @@
         const bits = [provider.name];
         if (provider.issuer) bits.push(provider.issuer);
         bits.push(provider.identities === 1 ? '1 linked account' : `${provider.identities} linked accounts`);
+        if (provider.group_mappings > 0) bits.push(`${provider.group_mappings} group mapping(s)`);
         if (provider.state === 'enabled' && !provider.tested) bits.push('changed since its last test');
         text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
         row.appendChild(text);
@@ -768,6 +773,358 @@
         return row;
     }
 
+    // ---------------------------------------------------------------- the provider's group mappings
+
+    // What a sign-in does with the mappings (app/services/sso_groups.py, apply), said once at the top of the page.
+    const GROUPS_ABOUT = 'Groups the provider sends, each given a department, a role, or both. At each sign-in through '
+        + 'this provider, a person in a mapped group joins its department, and leaves it at the first sign-in whose '
+        + 'token names no group mapped to it; departments no mapping names are never touched, and a token without the '
+        + 'groups claim changes nothing. The role User or External is given at the sign-in (with both, User), and '
+        + 'never lowers an administrator. The administrator role is never given by a sign-in: with “Administrator '
+        + 'group” on (Access), it raises a request another administrator decides within 7 days; an administrator made '
+        + 'so who leaves the group loses the role at their next sign-in through it, unless they are the last '
+        + 'administrator able to act. A change here applies from each person\'s next sign-in; removing a mapping '
+        + 'moves nobody.';
+    const MAPPING_ROLES = [['', 'No role'], ['user', 'User'], ['external', 'External'],
+        ['admin', 'Administrator (a request another administrator decides)']];
+    const ROLE_GIVES = { user: 'the role User', external: 'the role External',
+        admin: 'a request for the administrator role, which another administrator decides' };
+
+    const mappingsPath = (providerId) => `/admin/sso/providers/${encodeURIComponent(providerId)}/group-mappings`;
+
+    function mappingGives(mapping) {
+        const gives = [];
+        if (mapping.department) gives.push('the department ' + mapping.department.name);
+        if (ROLE_GIVES[mapping.role]) gives.push(ROLE_GIVES[mapping.role]);
+        return gives.join(' and ') || 'nothing';
+    }
+
+    // What the last test sign-in showed of the groups (`seen`: its groups; [] for none; null when none passed).
+    function seenSays(seen, claim) {
+        if (!Array.isArray(seen)) {
+            return 'The last test sign-in did not pass, or none has run: run one on the Connection page to see the '
+                + 'groups the provider sends.';
+        }
+        if (!seen.length) {
+            return `The last test sign-in's token named no group in "${claim}": check that the provider sends groups, `
+                + 'or the claim\'s name on the Connection page.';
+        }
+        return 'The last test sign-in carried: ' + seen.join(', ') + '.';
+    }
+
+    // The departments to choose from, by name; two of one name are told apart by the department each is in.
+    function departmentChoices(departments, mapping) {
+        const known = {};
+        const named = {};
+        departments.forEach((d) => { known[d.id] = d; named[d.name] = (named[d.name] || 0) + 1; });
+        const choices = [['', 'No department']].concat(departments.map((d) => {
+            if (named[d.name] < 2) return [d.id, d.name];
+            const parent = d.parent_id ? known[d.parent_id] : null;
+            return [d.id, d.name + (parent ? ` (in ${parent.name})` : ' (top level)')];
+        }));
+        // A mapping's own department is offered even when the list read does not hold it, so a change keeps it.
+        if (mapping && mapping.department && !known[mapping.department.id]) {
+            choices.push([mapping.department.id, mapping.department.name]);
+        }
+        return choices;
+    }
+
+    // One field of a mapping's form, with a line under it for the server's refusal of that field.
+    function mappingField(labelText, control, help) {
+        const group = field(labelText, control, help);
+        const refused = _el('p', 'text-error text-sm mt-xs sso-group-error');
+        refused.id = control.id + '-error';
+        refused.hidden = true;
+        refused.setAttribute('role', 'alert');
+        group.appendChild(refused);
+        return { group, refused, control };
+    }
+
+    // The three fields of a mapping: the group as the provider sends it, the department, the role. `mapping`: the
+    // one being changed (its values filled in), or none for a new one. The administrator role is offered while the
+    // provider allows it, and kept on a mapping that has it already (a change of its department is allowed).
+    function mappingForm(read, mapping, ids, classPrefix) {
+        const name = input(ids.name, mapping ? mapping.provider_group : '');
+        name.maxLength = 255;
+        name.autocomplete = 'off';
+        const department = choice(ids.department, departmentChoices(read.departments || [], mapping),
+            mapping && mapping.department ? mapping.department.id : '');
+        const role = choice(ids.role, MAPPING_ROLES, mapping && mapping.role ? mapping.role : '');
+        if (classPrefix) {
+            name.classList.add(classPrefix + '-name');
+            department.classList.add(classPrefix + '-department');
+            role.classList.add(classPrefix + '-role');
+        }
+        const adminRole = read.admin_role || {};
+        const keepsAdmin = !!mapping && mapping.role === 'admin';
+        const adminChoice = Array.from(role.options).find((o) => o.value === 'admin');
+        if (adminChoice && !adminRole.allowed && !keepsAdmin) adminChoice.disabled = true;
+        const why = !adminRole.allowed && adminRole.why_not ? adminRole.why_not.message : null;
+        const parts = {
+            provider_group: mappingField('Group, as the provider sends it', name),
+            department_id: mappingField('Department', department),
+            role: mappingField('Role', role, why),
+        };
+        return { name, department, role, parts };
+    }
+
+    // Before a write: no refusal of an earlier one is left under the fields, and the status beside the button says
+    // `text`.
+    function mappingSaying(form, said, text) {
+        Object.keys(form.parts).forEach((key) => { form.parts[key].refused.textContent = ''; form.parts[key].refused.hidden = true; });
+        said.className = 'text-sm ml-sm sso-said';
+        said.setAttribute('role', 'status');
+        said.textContent = text;
+    }
+
+    // A refused write: under the field it names (a 400 names it), else beside the button.
+    function mappingRefused(e, form, said, fallback) {
+        mappingSaying(form, said, '');
+        const part = e && e.status === 400 && e.field ? form.parts[e.field] : null;
+        if (part) {
+            part.refused.textContent = e.message || fallback;
+            part.refused.hidden = false;
+            try { part.control.focus(); } catch (_) {}
+            return;
+        }
+        said.className = 'text-sm ml-sm sso-said text-error';
+        said.setAttribute('role', 'alert');
+        said.textContent = (e && e.message) || fallback;
+    }
+
+    // What removing a mapping changes, and what it does not, said before it is done (DELETE .../group-mappings/{id}).
+    function removeMappingSays(mapping) {
+        const keeps = [];
+        if (mapping.department) {
+            keeps.push(`people who joined ${mapping.department.name} through it stay until an administrator takes them out`);
+        }
+        if (mapping.role === 'user' || mapping.role === 'external') keeps.push('a role it gave stays');
+        return `Remove the mapping of the group ${mapping.provider_group}? Nobody's department or role changes`
+            + (keeps.length ? ': ' + keeps.join(', and ') : '') + '.'
+            + (mapping.role === 'admin' ? ' A request for the administrator role it opened can no longer be approved.' : '')
+            + ' The other administrators are told.';
+    }
+
+    // The provider's group mappings, read when the page is shown: what a sign-in does with them, the groups the last
+    // test sign-in carried, each mapping with what it gives, and a form to add one.
+    function groupsPage(provider) {
+        const box = _el('div');
+        const about = _el('p', 'text-secondary text-sm mb-sm', GROUPS_ABOUT);
+        about.id = 'sso-groups-about';
+        box.appendChild(about);
+        const list = _el('div', 'sso-group-mappings');
+        list.id = 'sso-group-mappings';
+        list.appendChild(_el('p', 'text-secondary text-sm', 'Reading the group mappings…'));
+        box.appendChild(list);
+        readMappings(provider.id, list);
+        return box;
+    }
+
+    // `focus`: after a write, the keyboard goes back to the add form's group, so it stays in the dialog.
+    async function readMappings(providerId, list, focus) {
+        const mine = ++mappingReads;
+        let read;
+        try { read = await apiRequest(mappingsPath(providerId), { silent: true }); }
+        catch (e) {
+            if (mine === mappingReads) {
+                list.replaceChildren(_el('p', 'text-error text-sm', e.message || 'The group mappings could not be read.'));
+            }
+            return;
+        }
+        // A later read draws the list (the list read again after a change, the page shown again): this answer
+        // draws nothing.
+        if (mine !== mappingReads) return;
+        drawMappings({ providerId, list, read: read || {}, locked: !!(read && read.locked) || lockedNow() });
+        if (focus && byId('sso-group-mappings') === list) {          // the page is still the one on screen
+            const to = byId('sso-group-name');
+            const back = to && !to.disabled ? to : byId('sso-tab-groups');
+            try { if (back) back.focus(); } catch (_) {}
+        }
+    }
+
+    // After a write the server accepted: say so, read the list again, and the card's counts.
+    function mappingWritten(ctx, said, kind) {
+        showToast(said, kind || 'success');
+        readMappings(ctx.providerId, ctx.list, true);
+        load();
+    }
+
+    function drawMappings(ctx) {
+        const { list, read, locked } = ctx;
+        const mappings = Array.isArray(read.mappings) ? read.mappings : [];
+        const limit = Number(read.limit) || 200;
+        const claim = read.groups_claim || 'groups';
+        list.replaceChildren();
+        if (locked && !byId('sso-locked-line')) {
+            const line = _el('div', 'alert alert-info mb-md', (data && data.locked_message) || LOCKED_FALLBACK);
+            line.id = 'sso-groups-locked';
+            list.appendChild(line);
+        }
+        const claimLine = _el('p', 'text-secondary text-sm mb-sm', `Groups are read from the token's "${claim}" claim. `
+            + 'Write each group exactly as the provider sends it, letter for letter and case included.');
+        claimLine.id = 'sso-groups-claim';
+        list.appendChild(claimLine);
+        const seen = Array.isArray(read.seen_at_last_test) ? read.seen_at_last_test : null;
+        const seenLine = _el('p', 'text-secondary text-sm mb-sm', seenSays(seen, claim));
+        seenLine.id = 'sso-groups-seen';
+        list.appendChild(seenLine);
+        mappings.forEach((mapping) => list.appendChild(mappingRow(ctx, mapping)));
+        const count = _el('p', 'text-secondary text-sm mb-sm', `${mappings.length} of at most ${limit} mappings.`);
+        count.id = 'sso-groups-count';
+        list.appendChild(count);
+        list.appendChild(addMapping(ctx, mappings, seen, limit));
+        // The form's fields, drawn after the dialog opened, count as the dialog's: what is typed in them keeps a
+        // click beside it from closing it.
+        const modal = byId('sso-provider-modal');
+        if (modal && window.Dialogs && typeof Dialogs.retake === 'function') Dialogs.retake(modal);
+    }
+
+    function mappingRow(ctx, mapping) {
+        const row = _el('div', 'sso-group-row flex flex-wrap items-center gap-sm mb-sm');
+        row.dataset.mapping = mapping.id;
+        const text = _el('div', 'flex-1 sso-group-text');
+        const title = _el('div', 'text-sm');
+        title.appendChild(_el('span', 'font-bold sso-group-name', mapping.provider_group));
+        if (mapping.does_nothing) title.appendChild(_el('span', 'badge badge-warning ml-sm sso-group-idle', 'Does nothing now'));
+        text.appendChild(title);
+        text.appendChild(_el('div', 'text-secondary text-xs sso-group-gives', 'Gives ' + mappingGives(mapping) + '.'));
+        if (mapping.does_nothing) text.appendChild(_el('div', 'text-warning text-xs sso-group-why', mapping.does_nothing.message));
+        row.appendChild(text);
+        const change = _el('button', 'btn btn-secondary btn-sm', 'Change');
+        change.type = 'button';
+        change.disabled = ctx.locked;
+        change.setAttribute('aria-label', `Change the mapping of ${mapping.provider_group}`);
+        change.addEventListener('click', () => {
+            if (ctx.locked) return;
+            const editor = mappingEditor(ctx, mapping);
+            row.replaceWith(editor);
+            const first = editor.querySelector('input');
+            try { if (first) first.focus(); } catch (_) {}
+        });
+        const remove = _el('button', 'btn btn-danger btn-sm', 'Remove');
+        remove.type = 'button';
+        remove.disabled = ctx.locked;
+        remove.setAttribute('aria-label', `Remove the mapping of ${mapping.provider_group}`);
+        remove.addEventListener('click', async () => {
+            if (ctx.locked) return;
+            const ok = await showConfirm(removeMappingSays(mapping), 'Remove the mapping', null, 'Remove');
+            if (!ok) return;
+            remove.disabled = true;
+            try {
+                await apiRequest(`${mappingsPath(ctx.providerId)}/${encodeURIComponent(mapping.id)}`,
+                    { method: 'DELETE', silent: true });
+                mappingWritten(ctx, `The mapping of the group ${mapping.provider_group} was removed.`);
+            } catch (e) {
+                showToast(e.message || 'The mapping was not removed.', 'error');
+                // Read again whatever the answer: the list says how the mappings stand now.
+                readMappings(ctx.providerId, ctx.list);
+            }
+        });
+        row.append(change, remove);
+        return row;
+    }
+
+    // A mapping's Change: its three fields in its row, filled in. Save sends only what differs; a department or a
+    // role taken away is sent as null. Cancel puts the row back as it was.
+    function mappingEditor(ctx, mapping) {
+        const row = _el('div', 'sso-group-row sso-group-editing mb-md');
+        row.dataset.mapping = mapping.id;
+        row.appendChild(_el('div', 'text-sm font-bold mb-sm', `Change the mapping of ${mapping.provider_group}`));
+        const at = mapping.id;
+        const form = mappingForm(ctx.read, mapping, { name: 'sso-group-edit-name-' + at,
+            department: 'sso-group-edit-department-' + at, role: 'sso-group-edit-role-' + at }, 'sso-group-edit');
+        Object.keys(form.parts).forEach((key) => row.appendChild(form.parts[key].group));
+        const bar = _el('div', 'flex flex-wrap items-center gap-sm');
+        const save = _el('button', 'btn btn-primary btn-sm', 'Save');
+        save.type = 'button';
+        save.setAttribute('aria-label', `Save the mapping of ${mapping.provider_group}`);
+        const cancel = _el('button', 'btn btn-secondary btn-sm', 'Cancel');
+        cancel.type = 'button';
+        const said = _el('span', 'text-sm ml-sm sso-said');
+        said.setAttribute('role', 'status');
+        bar.append(save, cancel, said);
+        row.appendChild(bar);
+        cancel.addEventListener('click', () => {
+            const back = mappingRow(ctx, mapping);
+            row.replaceWith(back);
+            const again = back.querySelector('button');
+            try { if (again) again.focus(); } catch (_) {}
+        });
+        save.addEventListener('click', async () => {
+            if (ctx.locked) return;
+            const before = { provider_group: mapping.provider_group,
+                department_id: mapping.department ? mapping.department.id : null, role: mapping.role || null };
+            const now = { provider_group: form.name.value.trim(), department_id: form.department.value || null,
+                role: form.role.value || null };
+            const body = changed(now, before);
+            if (!Object.keys(body).length) { mappingSaying(form, said, 'Nothing was changed.'); return; }
+            save.disabled = true;
+            mappingSaying(form, said, 'Saving...');
+            try {
+                const out = await apiRequest(`${mappingsPath(ctx.providerId)}/${encodeURIComponent(mapping.id)}`,
+                    { method: 'PATCH', body: JSON.stringify(body), silent: true });
+                const name = (out && out.mapping && out.mapping.provider_group) || now.provider_group;
+                if (out && Array.isArray(out.changed) && !out.changed.length) mappingWritten(ctx, 'Nothing was changed.', 'info');
+                else mappingWritten(ctx, `The mapping of the group ${name} was changed. It applies from each person's `
+                    + 'next sign-in through this provider.');
+            } catch (e) {
+                save.disabled = false;
+                mappingRefused(e, form, said, 'The mapping was not changed.');
+            }
+        });
+        return row;
+    }
+
+    // The form that adds a mapping; the groups the last test sign-in carried that no mapping names are offered as
+    // the group is typed.
+    function addMapping(ctx, mappings, seen, limit) {
+        const box = _el('div', 'sso-group-add mt-md');
+        box.appendChild(_el('div', 'text-sm font-bold mb-sm', 'Add a mapping'));
+        const form = mappingForm(ctx.read, null, { name: 'sso-group-name', department: 'sso-group-department',
+            role: 'sso-group-role' });
+        const unmapped = (seen || []).filter((group) => !mappings.some((m) => m.provider_group === group));
+        if (unmapped.length) {
+            const offered = _el('datalist');
+            offered.id = 'sso-group-seen';
+            unmapped.forEach((group) => { const o = _el('option'); o.value = group; offered.appendChild(o); });
+            form.name.setAttribute('list', offered.id);
+            form.parts.provider_group.group.appendChild(offered);
+        }
+        Object.keys(form.parts).forEach((key) => box.appendChild(form.parts[key].group));
+        const bar = _el('div', 'flex flex-wrap items-center gap-sm');
+        const add = _el('button', 'btn btn-primary btn-sm', 'Add mapping');
+        add.type = 'button';
+        add.id = 'sso-group-add';
+        const said = _el('span', 'text-sm ml-sm sso-said');
+        said.id = 'sso-group-said';
+        said.setAttribute('role', 'status');
+        bar.append(add, said);
+        box.appendChild(bar);
+        const full = mappings.length >= limit;
+        add.disabled = ctx.locked || full;
+        if (ctx.locked) [form.name, form.department, form.role].forEach((node) => { node.disabled = true; });
+        if (full && !ctx.locked) said.textContent = `A provider holds at most ${limit} group mappings. Remove one first.`;
+        add.addEventListener('click', async () => {
+            if (ctx.locked || full) return;
+            const body = { provider_group: form.name.value.trim() };
+            if (form.department.value) body.department_id = form.department.value;
+            if (form.role.value) body.role = form.role.value;
+            add.disabled = true;
+            mappingSaying(form, said, 'Adding...');
+            try {
+                const out = await apiRequest(mappingsPath(ctx.providerId), { method: 'POST', body: JSON.stringify(body), silent: true });
+                const name = (out && out.mapping && out.mapping.provider_group) || body.provider_group;
+                said.textContent = '';
+                mappingWritten(ctx, `The group ${name} is mapped. It applies from each person's next sign-in through `
+                    + 'this provider.');
+            } catch (e) {
+                add.disabled = false;
+                mappingRefused(e, form, said, 'The mapping was not added.');
+            }
+        });
+        return box;
+    }
+
     // ---------------------------------------------------------------- the dialog
 
     // Sessions that came through a provider and could not be ended when it was turned off stand until they run out.
@@ -1043,8 +1400,8 @@
             tabs.appendChild(tab);
         });
         body.appendChild(tabs);
-        const draws = { connection: connectionPage, access: accessPage, factor: factorPage, sessions: sessionsPage,
-            identities: identitiesPage };
+        const draws = { connection: connectionPage, access: accessPage, groups: groupsPage, factor: factorPage,
+            sessions: sessionsPage, identities: identitiesPage };
         const shown = draws[page](open);
         shown.id = 'sso-page-' + page;
         shown.dataset.ssoShown = page;
@@ -1154,6 +1511,7 @@
     function reset() {
         loads += 1;
         identityReads += 1;
+        mappingReads += 1;
         identitiesFrom = 0;
         identitiesNote = null;
         standing = {};
