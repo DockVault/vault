@@ -19,6 +19,10 @@ before it, and the sign-in is refused:
   session to the new session in the account's turn. The record refers to the provider; the save took the
   provider's row with its key, and then the account's turn.
 
+- a provider's row held for longer than a sign-in waits where it is written (a save that settles many accounts):
+  the sign-in is answered as busy after its own short wait, with nothing written. The routes that finish a
+  sign-in are answered on the server's one loop, where the connection's five seconds would be everybody's.
+
 test_sso_sessions.py holds the same rules offline, where the row and the turn are stood in for.
 """
 import pytest
@@ -263,6 +267,15 @@ elif pair == "saved while a renewal moves the provider's session":
             s.commit()
             return len(changed["made_sso_only"])
     out = together(writer=renewal, ender=after_the_turn_is_held(save))
+elif pair == "a row held for longer than a sign-in waits":
+    def hold_the_row():
+        with SessionLocal() as s:
+            R._row_or_404(s, contoso, lock=True)
+            in_turn.set()
+            time.sleep(2.5)
+            s.rollback()
+            return "let go"
+    out = together(holder=hold_the_row, writer=after_the_turn_is_held(through_the_provider(alice, contoso, "s-1")))
 out["after"], out["the turn was held"] = state(alice, contoso), in_turn.is_set()
 print(json.dumps(out))
 '''
@@ -316,3 +329,11 @@ def test_a_provider_saved_while_a_renewal_moves_the_providers_session_waits_and_
     assert out["the turn was held"] is True, out
     assert out["ender seconds"] >= 1.0, out                  # the save waited for the turn; nothing waited in a ring
     assert out["after"]["sso only"] is True and out["after"]["provider sessions"] == 2, out
+
+
+def test_a_sign_in_waits_a_short_time_for_a_providers_row_that_is_held_and_is_answered_as_busy(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "a row held for longer than a sign-in waits"})
+    assert out["holder"] == ["ok", "let go"], out
+    assert out["writer"][:3] == ["error", "HTTPException", "503"] and "busy" in out["writer"][3], out
+    assert 0.3 <= out["writer seconds"] < 1.5, out           # its own short wait: not the 2.5 s, nor the connection's 5
+    assert out["after"]["sessions"] == [] and out["after"]["provider sessions"] == 0, out

@@ -694,8 +694,9 @@ def refuse_without_the_provider(db, result: SignInResult) -> None:
 def hold_the_providers_row(db, result: "SignInResult") -> None:
     """Read the row of the provider ``result`` came through again, under a share lock kept until the transaction
     ends: the second of the locks in their order, before the account's turn at its sessions. Nothing for a
-    sign-in that came through none. A row another transaction holds for itself longer than the connection waits
-    (a save that settles many accounts) refuses the sign-in as busy, with nothing written."""
+    sign-in that came through none. A row another transaction holds for itself longer than a sign-in waits where
+    it is written (:func:`with_a_short_wait`; a save that settles many accounts) refuses the sign-in as busy, with
+    nothing written."""
     if result.is_temporary or not result.provider_id:
         return
     import uuid
@@ -709,7 +710,8 @@ def hold_the_providers_row(db, result: "SignInResult") -> None:
     if not has_table(db, SsoProvider.__tablename__):
         return
     try:
-        db.query(SsoProvider).filter(SsoProvider.id == provider_id).populate_existing().with_for_update(read=True).first()
+        with_a_short_wait(db, lambda: db.query(SsoProvider).filter(SsoProvider.id == provider_id)
+                          .populate_existing().with_for_update(read=True).first())
     except OperationalError as held:
         if getattr(getattr(held, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
             raise

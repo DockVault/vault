@@ -922,6 +922,38 @@ def test_a_sign_in_through_a_provider_holds_the_providers_row_before_the_account
     assert len(h.active_sessions()) == before
 
 
+def test_a_sign_in_waits_a_short_time_for_its_providers_row(monkeypatch):
+    """The routes that finish a sign-in are answered on the server's one loop: the wait for the provider's row is
+    the short one of where a sign-in is written, not the connection's own."""
+    from app.core.models import SsoProvider
+    from app.services import sign_in
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    order = []
+    through = h.db.query
+
+    def query(*entities):
+        made = through(*entities)
+        lock = made.with_for_update
+
+        def with_for_update(**kw):
+            order.append(("row", getattr(entities[0], "__tablename__", None)))
+            return lock(**kw)
+        made.with_for_update = with_for_update
+        return made
+    monkeypatch.setattr(h.db, "query", query)
+
+    def short(db, take):
+        order.append("a short wait begins")
+        taken = take()
+        order.append("a short wait ends")
+        return taken
+    monkeypatch.setattr(sign_in, "with_a_short_wait", short)
+    result = sign_in.SignInResult(alice, [], "192.0.2.1", provider_id=str(p.id))
+    sign_in.hold_the_providers_row(h.db, result)
+    assert order == ["a short wait begins", ("row", SsoProvider.__tablename__), "a short wait ends"], order
+
+
 def test_the_providers_row_is_not_asked_for_by_a_sign_in_that_came_through_none():
     import types as _types
     from app.services import sign_in
