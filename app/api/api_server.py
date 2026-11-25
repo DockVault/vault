@@ -1103,6 +1103,8 @@ class UserResponse(BaseModel):
     # sign-in asks them to. Filled in by the admin users list.
     second_factor_reset_pending: bool = False
     passkey_count: int = 0             # the passkeys the account holds (retired ones not counted)
+    # When the server's operator lifted the role's passkey requirement for this account (None: it applies).
+    passkey_requirement_cleared_at: Optional[datetime] = None
     # New sign-ins to this account are paused by failed ones ({scope: "address" | "account",
     # addresses, until}), or None. Sessions carry on; an administrator's unlock clears it. Filled in
     # by the admin users list.
@@ -6978,6 +6980,15 @@ def _set_role(db, user, new_role, *, actor) -> list:
     user.role = new_role
     if old_role == getattr(new_role, "value", new_role):
         return []
+    # A passkey requirement the server's operator lifted for the account was its old role's: it ends with the
+    # role (a user made an administrator is not exempt from what administrators must hold).
+    from app.core import webauthn_settings
+    if webauthn_settings.end_lifting(user):
+        db.add(AuditLogger(db).build_row(
+            action="passkey_requirement_restored", status="success", user=actor,
+            resource_type="user", resource_id=str(user.id),
+            details={"target_username": user.username, "reason": "role_changed", "old_role": old_role,
+                     "new_role": getattr(new_role, "value", new_role)}))
     change = reset_to_role_defaults(user.id, new_role, db)
     if change["removed"] or change["added"]:
         db.add(AuditLogger(db).build_row(
@@ -11926,6 +11937,9 @@ async def passkey_register_verify(
         user.second_factor_reset_at = None
     if getattr(user, "passkey_required_since", None) is not None:
         user.passkey_required_since = None
+    # ...and a requirement the server's operator lifted for the account (its browser could make no passkey) is
+    # no longer needed: the account meets the requirement like anyone, and owes it again should the key go.
+    webauthn_settings.end_lifting(user)
     db.commit()
     shown = _passkey_public(row, now)
     _passkey_audit(db, user, request, "passkey_registered",

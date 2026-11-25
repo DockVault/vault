@@ -85,7 +85,8 @@ def test_an_account_whose_only_second_factor_was_a_passkey_sets_one_up_again_whi
 def test_the_sign_in_page_is_told_who_holds_only_a_passkey_and_they_are_told_when_passkeys_go_off(monkeypatch):
     registry, wss = _mod()
     from app.core.models import SecondFactorEnrollment, User, WebAuthnCredential
-    root, alice, bob, carol = _user("root", role="admin"), _user("alice"), _user("bob"), _user("carol")
+    root, alice, bob, carol = (_user(name, role="admin" if name == "root" else "user",
+                                     passkey_requirement_cleared_at=None) for name in ("root", "alice", "bob", "carol"))
     keys = [_key(root, verified=True),                                          # an administrator, only a passkey
             _key(alice, verified=True), _key(alice, verified=True),             # two keys, one account
             _key(bob, verified=True),                                           # ...and an authenticator app

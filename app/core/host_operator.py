@@ -46,7 +46,7 @@ import uuid
 
 ACTIONS = ("lookup", "list", "reset-password", "reset-second-factor", "approve", "user-managers",
            "regranted-defaults", "unlock", "zk-status", "downgrade-blockers", "release-key-hold",
-           "clear-passkey-requirement", "passkey-addresses")
+           "clear-passkey-requirement", "restore-passkey-requirement", "passkey-addresses")
 
 # The permissions an administrator has by default and a user does not: to view and to manage users.
 USER_MANAGEMENT_GROUPS = ("USER_MANAGE", "USER_VIEW")
@@ -118,6 +118,8 @@ def _describe(db, user):
         "second_factor": has_factor,
         "passkeys": passkeys,
         "passkey_requirement_cleared": getattr(user, "passkey_requirement_cleared_at", None) is not None,
+        "passkey_requirement_cleared_at": (user.passkey_requirement_cleared_at.isoformat() + "Z"
+                                           if getattr(user, "passkey_requirement_cleared_at", None) else None),
     }
 
 
@@ -468,15 +470,31 @@ def _run(args, api) -> int:
         if args.action == "clear-passkey-requirement":
             # The break-glass for a person whose browser cannot make a passkey: the role's requirement no longer
             # applies to this account. Not a credential change (nothing about how the account proves itself is
-            # set by someone else); recorded as the operator's action.
-            from datetime import datetime as _dt
-            user.passkey_requirement_cleared_at = _dt.utcnow()
+            # set by someone else); recorded as the operator's action. It ends when the account adds a passkey
+            # or its role changes, and restore-passkey-requirement puts it back (app/core/webauthn_settings.py).
+            from app.core import webauthn_settings
+            why = webauthn_settings.lifting_refusal(user)
+            if why:
+                return _refuse(why)
+            webauthn_settings.lift_requirement(user)
             db.commit()
             AuditLogger(db).log_action(
                 action="passkey_requirement_cleared", status="success", username=cc.HOST_OPERATOR,
                 resource_type="user", resource_id=str(user.id),
                 details={"target_username": user.username, "by": "host operator"})
+            webauthn_settings.tell_of_a_lifting(db, user, webauthn_settings.LIFTED, by="The server's operator")
             return _answer({"ok": True, "account": user.username})
+        if args.action == "restore-passkey-requirement":
+            from app.core import webauthn_settings
+            was_lifted = webauthn_settings.end_lifting(user)
+            db.commit()
+            if was_lifted:
+                AuditLogger(db).log_action(
+                    action="passkey_requirement_restored", status="success", username=cc.HOST_OPERATOR,
+                    resource_type="user", resource_id=str(user.id),
+                    details={"target_username": user.username, "by": "host operator"})
+                webauthn_settings.tell_of_a_lifting(db, user, webauthn_settings.PUT_BACK, by="The server's operator")
+            return _answer({"ok": True, "account": user.username, "was_lifted": was_lifted})
         if args.action == "reset-second-factor":
             outcome = api._credential_change(db, None, user, cc.SECOND_FACTOR,
                                              summary="Second factor reset by the host operator", payload={})

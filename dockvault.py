@@ -4508,6 +4508,7 @@ ACCOUNT_ACTIONS = (
     ("reset-second-factor", "Reset a second factor (set up again at the next sign-in)"),
     ("clear-passkey-requirement", "Let an account sign in without the passkey its role requires (a browser that "
                                   "cannot make one)"),
+    ("restore-passkey-requirement", "Put the passkey requirement of its role back on an account"),
     ("approve", "Approve a change waiting for a second administrator"),
     ("list", "List the changes waiting for approval"),
     ("user-managers", "List who may manage users without being an administrator"),
@@ -9035,6 +9036,11 @@ class DockVault:
         print("  role:          %s%s" % (server_text(account.get("role")), "" if account.get("active") else "  (deactivated)"))
         print("  last sign-in:  %s" % (server_text(account.get("last_login")) or "never"))
         print("  second factor: %s" % ("set up" if account.get("second_factor") else "not set up"))
+        if account.get("passkeys") is not None:
+            lifted = account.get("passkey_requirement_cleared_at") or (
+                "yes" if account.get("passkey_requirement_cleared") else "")
+            print("  passkeys:      %s%s" % (server_text(str(account.get("passkeys"))), (
+                "  (the role's requirement lifted by the host operator: %s)" % server_text(lifted)) if lifted else ""))
 
     def audit(self, args=None):
         """Verify the audit log's integrity chain in the running web container, and print every finding and
@@ -9702,7 +9708,7 @@ class DockVault:
             return
 
         if action not in ("reset-password", "reset-second-factor", "unlock", "release-key-hold",
-                          "clear-passkey-requirement"):
+                          "clear-passkey-requirement", "restore-passkey-requirement"):
             self._fail("unknown action: %s" % action)
         username = (getattr(args, "username", None) if args else None) or (
             ask("Username", pal) if interactive else None)
@@ -9740,8 +9746,18 @@ class DockVault:
                             "with their own password, at the next sign-in." % username, "green"))
             return
         if action == "clear-passkey-requirement":
-            print(pal.paint("  Passkey requirement cleared for %s: the role's requirement no longer applies to this "
-                            "account. Recorded as the host operator's action." % username, "green"))
+            print(pal.paint("  Passkey requirement lifted for %s: the role's requirement no longer applies to this "
+                            "account. It applies again when the account adds a passkey or its role changes, or "
+                            "with restore-passkey-requirement. The person and the administrators were told, and "
+                            "it is recorded as the host operator's action." % username, "green"))
+            return
+        if action == "restore-passkey-requirement":
+            if answer.get("was_lifted"):
+                print(pal.paint("  The passkey requirement applies to %s again. The person and the administrators "
+                                "were told, and it is recorded as the host operator's action." % username, "green"))
+            else:
+                print(pal.paint("  The passkey requirement was not lifted for %s: nothing to put back." % username,
+                                "yellow"))
             return
         if answer.get("secret_kind") == "temporary_password":
             heading = "TEMPORARY PASSWORD (shown once)"
@@ -10136,8 +10152,9 @@ def build_parser():
 
     ac = parsers["accounts"]
     ac.add_argument("--action", dest="account_action", choices=[k for k, _ in ACCOUNT_ACTIONS],
-                    help="reset-password | reset-second-factor | clear-passkey-requirement | approve | list | "
-                         "user-managers | regranted-defaults | unlock | release-key-hold")
+                    help="reset-password | reset-second-factor | clear-passkey-requirement | "
+                         "restore-passkey-requirement | approve | list | user-managers | regranted-defaults | "
+                         "unlock | release-key-hold")
     ac.add_argument("--username", dest="username", help="the account to act on")
     ac.add_argument("--confirm-username", dest="confirm_username",
                     help="the account's username typed again; nothing changes unless it matches")

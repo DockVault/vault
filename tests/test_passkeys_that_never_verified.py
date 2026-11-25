@@ -209,7 +209,8 @@ def test_the_sign_in_page_is_told_how_many_keys_never_verified_and_their_owners_
         monkeypatch):
     registry, wss = _mod()
     from app.core.models import User, WebAuthnCredential
-    root, alice, bob, carol = _user("root", role="admin"), _user("alice"), _user("bob"), _user("carol")
+    root, alice, bob, carol = (_user(name, role="admin" if name == "root" else "user",
+                                     passkey_requirement_cleared_at=None) for name in ("root", "alice", "bob", "carol"))
     keys = [_key(alice, verified=False), _key(alice, verified=False),           # alice: two, none that did
             _key(bob, verified=False), _key(bob, verified=True),                # bob: one of each
             _key(carol, verified=True),                                         # carol: one that did

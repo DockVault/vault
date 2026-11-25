@@ -252,6 +252,8 @@ EXPECTED_CALLS = {
                             [["lookup", "--username", "alice"], ["reset-second-factor", *NAMED]]),
     "clear-passkey-requirement": (NAMED, ["alice", "alice"],
                                   [["lookup", "--username", "alice"], ["clear-passkey-requirement", *NAMED]]),
+    "restore-passkey-requirement": (NAMED, ["alice", "alice"],
+                                    [["lookup", "--username", "alice"], ["restore-passkey-requirement", *NAMED]]),
     "unlock": (NAMED, ["alice", "alice"], [["lookup", "--username", "alice"], ["unlock", *NAMED]]),
     "approve": (["--request-id", "r1", "--confirm-username", "alice"], ["r1", "alice"],
                 [["approve", "--request-id", "r1", "--confirm-username", "alice"]]),
@@ -267,6 +269,7 @@ ANSWERS = {
                        "expires_in_minutes": 5},
     "reset-second-factor": {"ok": True, "account": "alice", "had_second_factor": True},
     "clear-passkey-requirement": {"ok": True, "account": "alice"},
+    "restore-passkey-requirement": {"ok": True, "account": "alice", "was_lifted": True},
     "unlock": {"ok": True, "account": "alice", "was_locked": True, "sign_in_locks_cleared": 2},
     "approve": {"ok": True, "approved": {"label": "Password reset link", "target_username": "alice",
                                          "requested_by": "bob"}},
@@ -307,3 +310,44 @@ def test_each_entry_by_its_number_in_the_menu_sends_its_arguments(app, monkeypat
     app.accounts(None)
     assert tool.calls == calls
     assert next(answers, None) is None, "every answer was asked for"
+
+
+def test_the_passkey_requirement_lifted_is_shown_said_and_put_back(app, monkeypatch, capsys):
+    """What the operator reads: the account's passkeys and whether its role's requirement is lifted, before the
+    username is typed again; what lifting it does and when it ends; and what putting it back did."""
+    lifted = {"ok": True, "account": dict(ACCOUNT["account"], passkeys=0, passkey_requirement_cleared=True,
+                                          passkey_requirement_cleared_at="2026-11-20T09:30:00Z")}
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(dict(ANSWERS, lookup=lifted)))
+    app.accounts(_args("--action", "restore-passkey-requirement", *NAMED, "--non-interactive"))
+    out = capsys.readouterr().out
+    assert "passkeys:      0  (the role's requirement lifted by the host operator: 2026-11-20T09:30:00Z)" in out
+    assert "The passkey requirement applies to alice again. The person and the administrators were told" in out
+    # Nothing was lifted: said, and nothing claimed.
+    answers = dict(ANSWERS, lookup={"ok": True, "account": dict(ACCOUNT["account"], passkeys=2,
+                                                                passkey_requirement_cleared=False,
+                                                                passkey_requirement_cleared_at=None)})
+    answers["restore-passkey-requirement"] = {"ok": True, "account": "alice", "was_lifted": False}
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(answers))
+    app.accounts(_args("--action", "restore-passkey-requirement", *NAMED, "--non-interactive"))
+    out = capsys.readouterr().out
+    assert "passkeys:      2\n" in out and "requirement lifted" not in out
+    assert "The passkey requirement was not lifted for alice: nothing to put back." in out
+    # Lifting it says when it ends and who was told.
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(answers))
+    app.accounts(_args("--action", "clear-passkey-requirement", *NAMED, "--non-interactive"))
+    out = capsys.readouterr().out
+    assert ("It applies again when the account adds a passkey or its role changes, or with "
+            "restore-passkey-requirement. The person and the administrators were told") in out
+    # An answer from a tool that does not say how many passkeys there are prints no such line.
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(ANSWERS))
+    app.accounts(_args("--action", "unlock", *NAMED, "--non-interactive"))
+    assert "passkeys:" not in capsys.readouterr().out
+    # The refusal of the tool in the container (no requirement names the role) is what the operator reads.
+    refused = dict(ANSWERS)
+    refused["clear-passkey-requirement"] = {"ok": False, "error": "This account's role is not required to hold a "
+                                                                   "passkey: there is nothing to lift."}
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(refused))
+    with pytest.raises(SystemExit):
+        app.accounts(_args("--action", "clear-passkey-requirement", *NAMED, "--non-interactive"))
+    said = capsys.readouterr()
+    assert "there is nothing to lift" in said.err + said.out

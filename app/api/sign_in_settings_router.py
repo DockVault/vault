@@ -49,7 +49,8 @@ def get_sign_in_settings(current_user: User = Depends(require_interactive_admin)
     never verified the person, and how many accounts hold no other (with the rule on, the ones that no longer
     count; with it off, the ones that would stop counting if it were turned on); how many accounts, and how many
     administrators among them, hold a passkey as their only second factor (the ones that set an authenticator app
-    up at their next sign-in if passkeys are turned off)."""
+    up at their next sign-in if passkeys are turned off); and the accounts the server's operator lifted a role's
+    requirement for."""
     from app.core.public_url import readiness, why_no_passkeys
     never = ws_settings.never_verified(db)
     only = ws_settings.only_a_passkey(db)
@@ -58,6 +59,7 @@ def get_sign_in_settings(current_user: User = Depends(require_interactive_admin)
             "unattested_passkeys": ws_settings.unattested_count(db),
             "passkeys_without_verification": never["passkeys"],
             "accounts_with_only_such_passkeys": never["accounts_with_no_other"],
+            "requirement_lifted_for": ws_settings.lifted_for(db),
             "accounts_with_only_a_passkey": only["accounts"],
             "administrators_with_only_a_passkey": only["administrators"],
             "trust_anchors": len(ws_settings.trust_anchors()), "step_up": ws_settings.STEP_UP_ACTION}

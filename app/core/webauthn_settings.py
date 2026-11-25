@@ -457,6 +457,89 @@ def must_hold(user) -> bool:
     return passkeys_can_be_made()
 
 
+# --------------------------------------------------------------------------- the requirement lifted for one account
+
+# The server's operator may lift a role's requirement for one account (a person whose browser cannot make a
+# passkey): ``passkey_requirement_cleared_at``. It is for that account as it stands: it ends when the account adds
+# a passkey (it then meets the requirement like anyone) and when its role changes (what was lifted was that
+# role's requirement; a user later made an administrator is not exempt from what administrators owe). The
+# operator can put it back. The person and the administrators are told of each, and administrators see who is
+# exempt on the Sign-in page and on the Users page.
+
+def lifting_refusal(user) -> Optional[str]:
+    """Why the requirement cannot be lifted for ``user`` now, in words, or None. Only a requirement that names
+    the account's role is lifted: lifted for an account no requirement names, it would exempt the account from
+    whatever is required later, unseen."""
+    if getattr(user, "passkey_requirement_cleared_at", None) is not None:
+        return "The passkey requirement is already lifted for this account."
+    if mode() != REQUIRED_FOR_ROLES or role_name(user) not in required_roles():
+        return ("This account's role is not required to hold a passkey: there is nothing to lift. (Settings, "
+                "Sign-in names the roles that are.)")
+    return None
+
+
+def lift_requirement(user, *, now: Optional[datetime] = None) -> None:
+    """Lift the role's requirement for ``user``, in the caller's transaction."""
+    user.passkey_requirement_cleared_at = now or datetime.utcnow()
+
+
+def end_lifting(user) -> bool:
+    """The requirement applies to ``user`` again, in the caller's transaction; whether anything changed."""
+    if getattr(user, "passkey_requirement_cleared_at", None) is None:
+        return False
+    user.passkey_requirement_cleared_at = None
+    return True
+
+
+def lifted_for(db, limit: int = 500) -> list:
+    """The accounts a requirement was lifted for, for the Sign-in page: ``[{username, role, lifted_at}]`` by
+    username, the first ``limit`` of them."""
+    from app.core.models import User
+    rows = db.query(User).filter(User.passkey_requirement_cleared_at.isnot(None)).all()
+    rows = sorted(rows, key=lambda u: (u.username or "").lower())[:limit]
+    return [{"username": u.username, "role": role_name(u),
+             "lifted_at": u.passkey_requirement_cleared_at.isoformat() + "Z"} for u in rows]
+
+
+LIFTED, PUT_BACK = "lifted", "put_back"
+
+
+def tell_of_a_lifting(db, user, what: str, *, by: str) -> None:
+    """Tell the person and every other active administrator that the requirement was lifted for the account, or
+    put back. After the commit; best effort (it never undoes the change)."""
+    try:
+        from app.api import api_server as api
+        from app.core.models import RoleEnum, User
+        day = datetime.utcnow().date().isoformat()
+        if what == LIFTED:
+            mine = ("The passkey requirement was lifted for your account",
+                    f"{by} lifted the requirement that your role hold a passkey, for your account. You sign in "
+                    "without one. It applies again when you add a passkey or your role changes, or when it is "
+                    "put back.")
+            theirs = (f"The passkey requirement was lifted for {user.username}",
+                      f"{by} lifted the requirement that the role {role_name(user)} hold a passkey, for "
+                      f"{user.username}. It applies again when the account adds a passkey or its role changes, "
+                      "or when the server's operator puts it back (dockvault.py accounts, "
+                      "restore-passkey-requirement). Settings, Sign-in lists the accounts it is lifted for.")
+        else:
+            mine = ("The passkey requirement applies to your account again",
+                    f"{by} put back the requirement that your role hold a passkey. You are given the usual time "
+                    "to add one, from your next sign-in.")
+            theirs = (f"The passkey requirement applies to {user.username} again",
+                      f"{by} put back the requirement that the role {role_name(user)} hold a passkey, for "
+                      f"{user.username}.")
+        api._notify_users([str(user.id)], "security", title=mine[0], body=mine[1], target="#profile",
+                          dedup_prefix=f"passkey_requirement_{what}:{day}")
+        admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
+                  if a.id != user.id]
+        if admins:
+            api._notify_users(admins, "security", title=theirs[0], body=theirs[1], target="#settings",
+                              dedup_prefix=f"passkey_requirement_{what}:{user.id}:{day}")
+    except Exception as exc:  # noqa: BLE001 -- the change is made; nothing here may undo it
+        import logging
+        logging.getLogger(__name__).warning("a change of a passkey requirement was not told: %s", type(exc).__name__)
+
+
 def passkeys_can_be_made() -> bool:
     """Whether a browser can make a passkey at the vault's address as it is configured now."""
     from app.core.public_url import readiness
