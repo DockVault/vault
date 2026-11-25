@@ -33,10 +33,10 @@ def P(monkeypatch):
 
 @pytest.fixture
 def db(P):
-    from app.core.models import ExternalIdentity, SsoProvider, User
+    from app.core.models import ExternalIdentity, Group, SsoGroupMapping, SsoProvider, User
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         engine = sa.create_engine(f"sqlite:///{Path(tmp) / 'sso.db'}")
-        for model in (User, SsoProvider, ExternalIdentity):
+        for model in (User, SsoProvider, ExternalIdentity, Group, SsoGroupMapping):
             model.__table__.create(engine)
         session = sessionmaker(bind=engine, autocommit=False, autoflush=True)()
         yield session
@@ -557,3 +557,18 @@ def test_the_entra_preset_says_what_keeps_guests_out():
     assert "keeps nobody out" in entra["restriction_help"] and "guests" in entra["restriction_help"]
     assert "“Assignment required” to Yes" in entra["console"]
     assert "only your organisation's accounts sign in" not in str(entra)
+
+
+def test_a_providers_shape_counts_the_groups_it_maps(P, db):
+    """How many of its groups are mapped to a department or a role, for the list of providers: its own, counted
+    by the database."""
+    import types
+    from app.core.models import SsoGroupMapping
+    by = types.SimpleNamespace(id=None, username="root")
+    row, other = P.create(db, name="Contoso", preset_id=None, by=by), P.create(db, name="Fabrikam", preset_id=None, by=by)
+    db.flush()
+    assert P.public(db, row)["group_mappings"] == 0
+    for provider, group in ((row, "staff"), (row, "finance"), (other, "staff")):
+        db.add(SsoGroupMapping(id=uuid.uuid4(), provider_id=provider.id, provider_group=group, role="user"))
+    db.flush()
+    assert P.public(db, row)["group_mappings"] == 2 and P.public(db, other)["group_mappings"] == 1
