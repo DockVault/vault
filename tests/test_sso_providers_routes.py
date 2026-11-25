@@ -551,7 +551,7 @@ def test_a_removal_that_is_refused_ends_nobodys_password(monkeypatch):
         "1 account has not signed in through this provider within its days, so its SSH keys, temporary credentials "
         "and devices are paused. Removing the provider would lift that unseen. The ways on: turn the provider on so "
         "that it signs in through it again; unlink it on the provider's Identities page; or delete the account. Or "
-        "turn off “After those days, or a refusal, the account signs in only through a provider” for it (Access) "
+        "turn off “After those days, or a refusal, the account signs in only through a provider” for it (Sessions) "
         "and remove it again: it is then held, to be lifted on its Identities page, and nobody's password stops.")
     # For several accounts it is said in the plural.
     from app.services import sso_providers

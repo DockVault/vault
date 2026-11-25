@@ -657,7 +657,7 @@ def remove_refusal(db, row) -> Optional[Conflict]:
             "provider would lift that unseen. The ways on: turn the provider on so that "
             f"{'they sign' if many else 'it signs'} in through it again; unlink {'each' if many else 'it'} on the "
             f"provider's Identities page; or delete the account{'s' if many else ''}. Or turn off “After those days, or a "
-            "refusal, the account signs in only through a provider” for it (Access) and remove it again: "
+            "refusal, the account signs in only through a provider” for it (Sessions) and remove it again: "
             f"{'they are' if many else 'it is'} then held, to be lifted on its Identities page, and nobody's password "
             "stops."))
     return None
