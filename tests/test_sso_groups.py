@@ -913,3 +913,38 @@ def test_one_group_sent_as_a_text_is_that_group(monkeypatch):
     assert not any(a[0] == "sso_groups_missing" for a in h.audits)
     _sign_in(h, p, groups="")
     assert _names(alice.groups) == ["Finance"] and any(a[0] == "sso_groups_missing" for a in h.audits)
+
+
+def test_who_keeps_the_role_when_a_group_is_mapped_to_it_no_more(monkeypatch):
+    """Bob was approved through vault-admins and is an administrator by that approval. While the group is mapped
+    to the role, leaving it demotes him. Once it is not (the mapping removed, or given another group or role), he
+    keeps the role and no sign-in takes it from him: counted, so that the change can say it. Not counted: Carol,
+    approved through another group; Dan, approved through it and a user since; Eve, approved through it and an
+    administrator by a later grant made by hand; Root, never approved."""
+    from app.core.models import SsoGroupMapping
+    from app.services import sso_groups
+    bob, carol, eve, root = (_user(name, role="admin") for name in ("bob", "carol", "eve", "root"))
+    dan = _user("dan")
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, carol, dan, eve, root], [p], identities=[_identity(bob, p)])
+    through = h.mapping(p, "vault-admins", role="admin")
+    h.mapping(p, "it-admins", role="admin")
+    _approved_administrator(h, p, bob, root, "vault-admins")
+    _approved_administrator(h, p, carol, root, "it-admins")
+    _approved_administrator(h, p, dan, root, "vault-admins")
+    decided = datetime.utcnow() - timedelta(days=10)
+    _request_for(h, p, eve, state="approved", decided_by=root.id, decided_at=decided, provider_group="vault-admins")
+    _grant(h, eve, decided + timedelta(days=3), granted_by_id=root.id)          # made again by hand, days later
+    kept = sso_groups.kept_by_the_end_of_a_mapping
+    assert kept(h.db, p, "vault-admins") == 0                  # still mapped to the role: leaving it still demotes
+    h.db.rows_of(SsoGroupMapping).remove(through)
+    assert kept(h.db, p, "vault-admins") == 1                  # Bob alone
+    assert kept(h.db, p, "it-admins") == 0 and kept(h.db, p, "a-group-nobody-had") == 0
+    # The same group mapped to another role only: the administrator role is not the group's any more.
+    h.mapping(p, "vault-admins", role="user")
+    assert kept(h.db, p, "vault-admins") == 1
+    # A count that cannot be made says nothing.
+    def down(db, user, row):
+        raise RuntimeError("down")
+    monkeypatch.setattr(sso_groups, "approved_through", down)
+    assert kept(h.db, p, "vault-admins") == 0

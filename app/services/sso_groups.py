@@ -315,6 +315,36 @@ def approved_through(db, user, row) -> Optional[str]:
     return None
 
 
+def kept_by_the_end_of_a_mapping(db, row, group: str) -> int:
+    """How many administrators hold the role by an approval that came through ``group`` of ``row``, now that no
+    mapping of the provider gives that group the role. Each keeps the role, and from here on no sign-in through
+    the provider takes it from them: :func:`apply` demotes only through a group that is still mapped to it. Until
+    the mapping changed, leaving the group at the provider demoted them at their next sign-in. 0 while a mapping
+    still gives the group the role.
+
+    Said to the administrators with the change, because nothing else shows it: an organisation that renames its
+    administrators' group and renames the mapping to match has, from that save on, administrators the provider's
+    groups no longer govern. A count that cannot be made says nothing, and holds up nothing."""
+    from app.core.models import RoleEnum, SsoAdminRequest, User
+    try:
+        from app.services import sso_group_mappings
+        if any(m.role == "admin" and m.provider_group == group for m in sso_group_mappings.of(db, row, fresh=True)):
+            return 0
+        approved = {r.user_id for r in db.query(SsoAdminRequest).filter(
+            SsoAdminRequest.provider_id == row.id, SsoAdminRequest.provider_group == group,
+            SsoAdminRequest.state == APPROVED).all()}
+        kept = 0
+        for user_id in approved:
+            user = db.query(User).filter(User.id == user_id).first()
+            if (user is not None and getattr(user, "role", None) == RoleEnum.ADMIN
+                    and approved_through(db, user, row) == group):
+                kept += 1
+        return kept
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        return 0
+
+
 def made_administrator_through(db, user, row) -> bool:
     """Whether ``user``'s administrator role is the one an approved request of this provider's mapping granted."""
     return approved_through(db, user, row) is not None

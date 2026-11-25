@@ -784,6 +784,16 @@ def _tell_of_requests_ended(ended: list, row) -> str:
             "decided, and the people told.")
 
 
+def _said_of_administrators_kept(kept: int, group: str, row) -> str:
+    """The sentence of a mapping's notice for the administrators who keep a role the provider's groups no longer
+    govern, or ""."""
+    if not kept:
+        return ""
+    return (f" {kept} administrator(s) were approved through the group {group} and keep the role. Leaving that "
+            f"group no longer takes it from them at a sign-in through {row.name}: where an account should lose the "
+            "role, take it under Users.")
+
+
 def _said_of_who_may_leave(leaving: list, row) -> str:
     """The sentence of a mapping's notice for the people a sign-in may now take out of a department, or ""."""
     said = ""
@@ -867,7 +877,9 @@ def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any]
     applies the mappings as they are then. A linked account in a department that a mapping still names leaves it
     at that sign-in unless the token names a group mapped to it; the answer (``may_leave``) and the notice say how
     many such accounts there are, for the department the mapping had and for the one it has now. An administrator
-    approved through the group the mapping had keeps the role."""
+    approved through the group the mapping had keeps the role, and where the change takes the role from that group
+    no sign-in through the provider takes it from them afterwards: the answer (``administrators_kept``) and the
+    notice say how many such administrators there are."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
@@ -903,13 +915,19 @@ def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any]
         db.rollback()
         raise _refused(exc)
     leaving = sso_groups.may_leave(db, row, touched)
+    # The group it had gave the administrator role and gives it no more: who was approved through it keeps the
+    # role, ungoverned by the provider's groups from here on.
+    kept = (sso_groups.kept_by_the_end_of_a_mapping(db, row, was_group)
+            if changes and was_role == "admin" and (shown["role"] != "admin" or shown["provider_group"] != was_group)
+            else 0)
     if changes:
         _tell_administrators(current_user.username, "A single sign-on group mapping was changed", (
             f"{current_user.username} changed how the group {shown['provider_group']} of the single sign-on provider "
             f"{row.name} is mapped: it now gives {_mapping_words(shown)}. It applies from each person's next "
             "sign-in through the provider." + _said_of_who_may_leave(leaving, row)
-            + _tell_of_requests_ended(ended, row)))
-    return {"mapping": shown, "changed": sorted(changes), "may_leave": leaving, "requests_ended": len(ended)}
+            + _tell_of_requests_ended(ended, row) + _said_of_administrators_kept(kept, was_group, row)))
+    return {"mapping": shown, "changed": sorted(changes), "may_leave": leaving, "requests_ended": len(ended),
+            "administrators_kept": kept}
 
 
 @router.delete("/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}")
@@ -922,7 +940,9 @@ def remove_group_mapping(provider_id: str, mapping_id: str, request: Request,
     unless the token names a group still mapped to it, and the answer (``may_leave``) and the notice say how many
     such accounts there are. The requests for the administrator role its group opened are ended with it
     (``requests_ended``), each with its record, and the people told: a request nobody could approve any more
-    stood in the list, and kept the person from asking again through a group that is still mapped."""
+    stood in the list, and kept the person from asking again through a group that is still mapped. How many
+    administrators keep a role that no sign-in through the provider takes from them any more is in the answer
+    (``administrators_kept``) and the notice."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
@@ -942,10 +962,13 @@ def remove_group_mapping(provider_id: str, mapping_id: str, request: Request,
     db.delete(mapping)
     db.commit()
     leaving = sso_groups.may_leave(db, row, touched)
+    kept = (sso_groups.kept_by_the_end_of_a_mapping(db, row, shown["provider_group"])
+            if shown["role"] == "admin" else 0)
     _tell_administrators(current_user.username, "A single sign-on group mapping was removed", (
         f"{current_user.username} removed the mapping of the group {shown['provider_group']} of the single sign-on "
         f"provider {row.name} (it gave {_mapping_words(shown)}). Nobody's department or role was changed by that."
-        + _tell_of_requests_ended(ended, row)
+        + _tell_of_requests_ended(ended, row) + _said_of_administrators_kept(kept, shown["provider_group"], row)
         + (" Another group is still mapped to the department." + _said_of_who_may_leave(leaving, row)
            if leaving else "")))
-    return {"removed": True, "mapping": shown, "may_leave": leaving, "requests_ended": len(ended)}
+    return {"removed": True, "mapping": shown, "may_leave": leaving, "requests_ended": len(ended),
+            "administrators_kept": kept}

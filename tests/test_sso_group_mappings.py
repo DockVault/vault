@@ -660,3 +660,78 @@ def test_a_groups_name_is_kept_letter_for_letter_as_the_sign_in_compares_it(monk
         assert status == 400 and out["detail"]["field"] == "provider_group", (refused, out)
     # The same name with and without the space are two groups, as they are two to the provider.
     assert h.add(provider_group="vault-users", department_id=str(finance.id))[0] == 201
+
+
+KEPT = ("administrator(s) were approved through the group vault-admins and keep the role. Leaving that group no "
+        "longer takes it from them at a sign-in through contoso: where an account should lose the role, take it "
+        "under Users.")
+
+
+@pytest.mark.parametrize("change, taken", [
+    ({"provider_group": "dv-admins"}, True),          # the group is renamed
+    ({"role": "user"}, True),                         # the role is taken from the mapping
+    ({"role": None, "department_id": "FINANCE"}, True),
+    ({"department_id": "FINANCE"}, False),            # the role and the group stay
+])
+def test_a_change_that_takes_the_role_from_a_group_says_who_keeps_it(monkeypatch, change, taken):
+    """The organisation renames its administrators' group and an administrator renames the mapping to match. The
+    people approved through the old name keep the role, and from that save on leaving the group at the provider
+    takes it from none of them: until then it did, at their next sign-in. Nothing told the administrator who
+    made the change. The answer and the notice say how many such administrators there are, asked of the group the
+    mapping had."""
+    from app.services import sso_groups
+    h = Mappings(monkeypatch, _provider(created_at=None, updated_at=None, policy=dict(ADMIN_ON)))
+    finance = h.department("Finance")
+    mapping = h.add(provider_group="vault-admins", role="admin")[1]["mapping"]["id"]
+    asked = []
+    monkeypatch.setattr(sso_groups, "kept_by_the_end_of_a_mapping",
+                        lambda db, row, group: asked.append((row.id, group)) or 2)
+    body = {k: (str(finance.id) if v == "FINANCE" else v) for k, v in change.items()}
+    status, out = h.call("PATCH", f"{h.path}/{mapping}", body)
+    assert status == 200 and out["administrators_kept"] == (2 if taken else 0), out
+    assert asked == ([(h.provider.id, "vault-admins")] if taken else [])
+    assert h.told[-1][2].endswith(" 2 " + KEPT) is taken and (KEPT in h.told[-1][2]) is taken
+
+
+def test_removing_an_administrator_mapping_says_who_keeps_the_role(monkeypatch):
+    """The removal says that nobody's role was changed by it. It did not say that the administrators approved
+    through the group are, from then on, administrators no sign-in demotes."""
+    from app.services import sso_groups
+    h = Mappings(monkeypatch, _provider(created_at=None, updated_at=None, policy=dict(ADMIN_ON)))
+    first = h.add(provider_group="vault-admins", role="admin")[1]["mapping"]["id"]
+    second = h.add(provider_group="staff", role="user")[1]["mapping"]["id"]
+    asked = []
+    monkeypatch.setattr(sso_groups, "kept_by_the_end_of_a_mapping",
+                        lambda db, row, group: asked.append((row.id, group)) or 3)
+    status, out = h.call("DELETE", f"{h.path}/{first}")
+    assert status == 200 and out["administrators_kept"] == 3 and asked == [(h.provider.id, "vault-admins")], out
+    assert h.told[-1][2].endswith("Nobody's department or role was changed by that. 3 " + KEPT)
+    # A mapping that gave another role: nobody is asked about, and nothing is said.
+    status, out = h.call("DELETE", f"{h.path}/{second}")
+    assert status == 200 and out["administrators_kept"] == 0 and len(asked) == 1, out
+    assert "keep the role" not in h.told[-1][2]
+    # None approved through the group: the count is given, and no sentence.
+    third = h.add(provider_group="vault-admins", role="admin")[1]["mapping"]["id"]
+    monkeypatch.setattr(sso_groups, "kept_by_the_end_of_a_mapping", lambda db, row, group: 0)
+    status, out = h.call("DELETE", f"{h.path}/{third}")
+    assert status == 200 and out["administrators_kept"] == 0 and "keep the role" not in h.told[-1][2]
+
+
+def test_the_count_of_who_keeps_the_role_is_read_once_the_mapping_is_gone(monkeypatch):
+    """Through the route with the count itself: read after the removal is committed, so the group it asks about is
+    mapped to the role no more, and the administrator approved through it is counted."""
+    from app.core.models import SsoAdminRequest, User
+    from app.services import sso_groups
+    from test_sso_sign_in import _user
+    bob = _user("bob", role="admin")
+    h = Mappings(monkeypatch, _provider(created_at=None, updated_at=None, policy=dict(ADMIN_ON)))
+    h.db.rows_of(User).append(bob)
+    mapping = h.add(provider_group="vault-admins", role="admin")[1]["mapping"]["id"]
+    approval = _held_request(h, "vault-admins", state="approved")
+    approval.user_id = bob.id
+    assert approval in h.db.rows_of(SsoAdminRequest)
+    monkeypatch.setattr(sso_groups, "approved_through", lambda db, user, row: "vault-admins")
+    assert sso_groups.kept_by_the_end_of_a_mapping(h.db, h.provider, "vault-admins") == 0     # while it is mapped
+    status, out = h.call("DELETE", f"{h.path}/{mapping}")
+    assert status == 200 and out["administrators_kept"] == 1, out
+    assert h.told[-1][2].endswith("Nobody's department or role was changed by that. 1 " + KEPT)
