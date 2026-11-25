@@ -1167,7 +1167,8 @@ class UserResponse(BaseModel):
     # users list.
     credential_change: Optional[Dict[str, Any]] = None
     # Single sign-on freshness, for an account a provider asks to sign in again: when its SSH keys, temporary
-    # credentials and devices pause (or paused), through which provider, and whether the provider refused it.
+    # credentials and devices pause (or paused), through which provider, and whether the provider refused it
+    # ({due, provider, lapsed, refused, held}; held: its password and passkeys are held to that provider too).
     sso_freshness: Optional[Dict[str, Any]] = None
     # The account's current password was set by someone else ({by: their username or None, at}), or None
     # (app/core/password_origin.py). Filled in by the admin users list, for the promote dialog's warning.
@@ -11252,7 +11253,13 @@ async def list_users(
     for user in users:
         item = UserResponse.model_validate(user)
         item.password_set_note = password_notes.get(user.id)
-        item.sso_freshness = freshness.get(str(user.id))
+        standing = freshness.get(str(user.id))
+        if standing is not None:
+            # Whether the account's password and passkeys are held to the provider shown too: asked of a lapsed
+            # account alone (a query for it), and only a hold by that provider counts, since it is lifted there.
+            found = sso_freshness.held_to_a_provider(db, user) if standing.get("lapsed") else None
+            standing = {**standing, "held": found is not None and found.provider_name == standing.get("provider")}
+        item.sso_freshness = standing
         item.second_factor_enabled = user.id in mfa_user_ids
         item.password_to_type = sign_in.has_a_password_it_can_type(user)
         item.second_factor_reset_pending = user.second_factor_reset_at is not None

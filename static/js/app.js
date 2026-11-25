@@ -7582,8 +7582,51 @@ function fillCredentialChangeNotes() {
             const until = b.until ? ' until ' + formatServerTime(b.until) : ' until an administrator clears it';
             lines.push('New sign-ins are paused ' + where + until + '. Anyone already signed in stays signed in. Unlock clears it now.');
         }
+        const standing = _ssoStandingNote(u);
+        if (standing) lines.push(standing);
         note.replaceChildren(...lines.map(t => _el('div', null, t)));
         note.hidden = lines.length === 0;
+    });
+}
+
+// Where the account stands with a provider that asks it to sign in again (GET /users sso_freshness: {due, provider,
+// lapsed, refused, held}), or null.
+function _ssoStanding(u) {
+    return (u && u.sso_freshness) || null;
+}
+
+// The line in the account's details about that standing: what paused its keys, since or until when, and what
+// restores them. A refusal on record is the provider's, or a hold the vault wrote after the days had run out
+// (when the provider was turned off or was to be removed); the line is true of both.
+function _ssoStandingNote(u) {
+    const f = _ssoStanding(u);
+    if (!f) return '';
+    const p = f.provider;
+    if (f.refused) {
+        const who = (currentUser && u.id === currentUser.id) ? 'Another administrator can also' : 'You can also';
+        return p + ' refused this person at a sign-in, or the vault held them after their days without a sign-in '
+            + 'there had run out. Their SSH keys, temporary credentials and devices are paused'
+            + (f.held ? ', and their password and passkeys do not sign them in,' : '')
+            + ' until they sign in through ' + p + ' again. ' + who + ' lift it with Lift refusal on ' + p
+            + '’s Identities page (Settings, Sign-in methods), which says what lifting it gives.';
+    }
+    if (f.lapsed) {
+        return 'Their SSH keys, temporary credentials and devices paused on ' + formatDayMonth(f.due)
+            + ': they have not signed in through ' + p + ' within its days.'
+            + (f.held ? ' Their password and passkeys do not sign them in either. A sign-in through ' + p
+                + ' restores all of it.' : ' A sign-in through ' + p + ' restores them.');
+    }
+    return 'Their SSH keys, temporary credentials and devices pause on ' + formatDayMonth(f.due)
+        + ' unless they sign in through ' + p + ' before then.';
+}
+
+// The badge in the status of an account whose keys a provider paused: put in the row with no text, and named here.
+function fillSsoStandingBadges() {
+    document.querySelectorAll('.sso-standing-badge').forEach(badge => {
+        const f = _ssoStanding((usersView.users || []).find(x => x.id === badge.getAttribute('data-user-id')));
+        badge.textContent = !f ? '' : (f.refused ? 'Refused or held (' + f.provider + ')'
+            : (f.lapsed ? 'Keys paused (' + f.provider + ')' : ''));
+        badge.style.display = badge.textContent ? '' : 'none';
     });
 }
 
@@ -7763,6 +7806,7 @@ function renderUserRow(u) {
                 <span class="badge badge-${u.is_active ? 'success' : 'secondary'}">${u.is_active ? 'Active' : 'Inactive'}</span>
                 ${u.is_locked ? `<span class="badge badge-warning">${iconSvg('lock', 'icon-sm')} Locked</span>` : ''}
                 ${!u.is_locked && u.sign_in_block ? `<span class="badge badge-warning sign-in-block-badge" data-user-id="${u.id}">${iconSvg('clock', 'icon-sm')} Sign-ins paused</span>` : ''}
+                ${_ssoStanding(u) && (_ssoStanding(u).lapsed || _ssoStanding(u).refused) ? `<span class="badge badge-warning sso-standing-badge" data-user-id="${u.id}"></span>` : ''}
             </div></td>
             <td>${_holdsAFactor(u)
                     ? `<span class="badge badge-success">${iconSvg('shield', 'icon-sm')} On</span>`
@@ -8629,6 +8673,8 @@ function attachUserListeners() {
     document.querySelectorAll('.sign-in-block-badge').forEach(badge => {
         badge.title = 'Failed sign-ins paused new sign-ins to this account. Sessions already signed in carry on.';
     });
+    // Whose keys a provider paused, and by which provider (the details say more)
+    fillSsoStandingBadges();
 
     // Lock user buttons
     document.querySelectorAll('.lock-user-btn').forEach(btn => {

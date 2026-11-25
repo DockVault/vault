@@ -207,7 +207,8 @@ out({ toasts, reloads: reloads.length, disabled: host.querySelector('.user-passk
 
 # A reset retires every passkey the account holds, whether it can sign in with it now or not, as well as the
 # authenticator app and its recovery codes; the row, the button, the confirmation and the toast say so.
-_RESET = ("signInMethods", "signInMethodBadges", "_holdsAFactor", "_resetEnds", "renderUserRow", "resetUserSecondFactor")
+_RESET = ("signInMethods", "signInMethodBadges", "_holdsAFactor", "_resetEnds", "_ssoStanding", "renderUserRow",
+          "resetUserSecondFactor")
 
 
 def test_a_passkey_is_a_second_factor_in_the_row_and_any_held_passkey_can_be_reset():

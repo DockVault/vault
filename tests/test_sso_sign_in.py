@@ -1210,7 +1210,8 @@ def test_the_administrators_user_list_shows_when_keys_pause(monkeypatch):
     rows = [r.model_dump() for r in run_coroutine(h.S.list_users(current_user=root, db=h.db))]
     by_name = {r["username"]: r for r in rows}
     assert by_name["alice"]["sso_freshness"] == {"due": (signed_in + timedelta(days=30)).isoformat() + "Z",
-                                                 "provider": "contoso", "lapsed": False, "refused": False}
+                                                 "provider": "contoso", "lapsed": False, "refused": False,
+                                                 "held": False}
     assert by_name["bob"]["sso_freshness"] is None and by_name["root"]["sso_freshness"] is None
 
 
