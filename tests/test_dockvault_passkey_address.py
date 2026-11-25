@@ -46,7 +46,7 @@ def test_the_note_judges_the_address_as_setup_writes_it(cfg, hidden):
 
 # What the vault says of an address (app/core/public_url.readiness), for what the tool says of it.
 AS_THE_VAULT_SAYS = {None: "ok", "none": "no_public_host", "http": "address_not_usable", "script": "address_not_usable",
-                     "ip": "ip_address"}
+                     "dot": "address_not_usable", "ip": "ip_address"}
 
 
 @pytest.mark.parametrize("written, reason", [
@@ -57,6 +57,10 @@ AS_THE_VAULT_SAYS = {None: "ok", "none": "no_public_host", "http": "address_not_
     ("http://[::1]:8080", "ip"), ("https://[2001:db8::1]:8443", "ip"),
     ("", "none"), ("*.example.com", "none"), (None, "none"),
     ("https://b\u00fccher.example", "script"), ("stra\u00dfe.example", "script"),
+    # An address with two faults is refused for one of them, the same one on both sides: another script before
+    # the dot, the dot before plain http and before an address reached by IP.
+    ("http://vault.lan.", "dot"), ("https://b\u00fccher.example.", "script"), ("http://b\u00fccher.example", "script"),
+    ("https://203.0.113.9.", "dot"), ("http://203.0.113.9.:8080", "dot"), ("vault.example.com.", "dot"),
 ])
 def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypatch):
     """Setup and status speak before the vault runs, so the tool has the rule in its own words; this holds the two
@@ -69,9 +73,18 @@ def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypa
     assert ready["usable"] is (reason is None)
     note = dv.sign_in_address_note(written)
     assert (note is None) is (reason is None)
-    if note:
+    if reason == "dot":
+        assert "written with a dot at its end" in note and "ALLOWED_HOSTS" in note     # its own words, held below
+    elif note:
         assert note.startswith("passkeys stay hidden") and "waits meanwhile, and locks nobody out" in note
         assert "ALLOWED_HOSTS" in note
+    # Where the vault refuses the address in words, they are the words for the tool's reason and no other: the
+    # operator who mends what one of the two says does not meet the other's different answer next.
+    said = {"script": "another script", "dot": "a dot at its end", "http": "must use https"}
+    if reason in said:
+        why = public_url.problem(allowed_hosts.link_base(written or ""))
+        assert why and said[reason] in why, (written, why)
+        assert not [other for other in said.values() if other != said[reason] and other in why], (written, why)
 
 
 def test_each_reason_says_what_to_change():
@@ -246,3 +259,13 @@ def test_the_deployment_that_cannot_be_asked_about_its_passkeys_answers_nothing(
     assert tool._passkey_addresses() is None
     said[0] = '{"ok": true, "here": "vault.example.com", "made_at": []}'
     assert tool._passkey_addresses() == {"ok": True, "here": "vault.example.com", "made_at": []}
+
+
+def test_the_example_file_says_every_part_of_the_rule_for_the_sign_in_address():
+    """An operator who writes ALLOWED_HOSTS by hand reads the rule there: https, a host name, its xn-- form for
+    another script, and no dot at its end. Without the last, only status and the pages said so afterwards."""
+    from pathlib import Path
+    example = (Path(dv.__file__).resolve().parent / ".env.example").read_text(encoding="utf-8")
+    said = " ".join(line.lstrip("#").strip() for line in example.splitlines())
+    assert ("first entry is an https host name (in its xn-- form when it is written in another script, and without "
+            "a dot at its end)") in said
