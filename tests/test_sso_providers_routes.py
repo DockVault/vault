@@ -351,9 +351,37 @@ def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_
     inside = _identity(bob, row, last_sign_in_at=now - timedelta(days=1), linked_at=now - timedelta(days=60),
                        refused_at=None)
     h = Admin(monkeypatch, [row], users=[alice, bob], identities=[lapsed, inside])
+    # A step-up that does not pass: no account is changed by a click that goes no further.
+    from fastapi import HTTPException
+
+    def no_step_up(db, user, request):
+        raise HTTPException(status_code=403, detail="step-up required")
+    monkeypatch.setattr(h.R, "_step_up", no_step_up)
+    assert h.call("DELETE", f"/admin/sso/providers/{row.id}")[0] == 403
+    assert lapsed.refused_at is None and ("commit",) not in h.db.log and h.audits == [] and h.told == []
+    monkeypatch.setattr(h.R, "_step_up", lambda db, user, request: h.order.append("step_up"))
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 409 and out["detail"]["reason"] == "refusals_in_force", out
-    assert lapsed.refused_at is not None and inside.refused_at is None and h.rows() == [row] and h.order == []
+    assert out["detail"]["message"] == (
+        "1 account has not signed in through this provider within its days. It is held now, so that removing the "
+        "provider does not give it its SSH keys, temporary credentials and devices back unseen. Clear it under "
+        "Identities when it should have them back, then remove the provider again.")
+    assert lapsed.refused_at is not None and inside.refused_at is None and h.rows() == [row]
+    assert h.order == ["step_up"]                               # held after the step-up, and not before
+    # Recorded in the transaction that wrote the hold, and told: the administrators and the person held.
+    assert h.audit("sso_provider_updated") == [("sso_provider_updated", "success", {
+        "provider_id": str(row.id), "name": row.name, "changed": [], "identities": 1, "reason": "held_before_removal"})]
+    recorded = next(i for i, step in enumerate(h.db.log) if step[0] == "add")
+    assert recorded < h.db.log.index(("commit",))
+    assert h.told[0][1] == "Accounts were held before a provider's removal" and "1 account(s)" in h.told[0][2]
+    assert h.accounts_told == [(["alice"], "Your keys stay paused on this vault", (
+        f"You have not signed in through {row.label or row.name} within the time your organisation allows, and "
+        f"{row.label or row.name} is being removed from this vault. Your SSH keys, temporary credentials and devices "
+        "stay paused until an administrator lifts that. Your password signs you in as before."))]
+    # Tried again while she is held: the recorded refusal stands in the way, and nothing is held or told twice.
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["reason"] == "refusals_in_force" and "Clear it under Identities first" in out["detail"]["message"]
+    assert len(h.audit("sso_provider_updated")) == 1 and len(h.accounts_told) == 1
     lapsed.refused_at = None                                    # cleared, and signed in since
     lapsed.last_sign_in_at = now
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
@@ -394,6 +422,7 @@ def test_a_removal_that_is_refused_ends_nobodys_password(monkeypatch):
     row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 409 and out["detail"]["reason"] == "refusals_in_force", out
+    assert h.order == ["step_up"]
     held = F.held_to_a_provider(h.db, alice)
     assert lapsed.refused_at is not None and (held is None or not F.closes_now(held, now))
     # The first way on, instead: turned on, she signs in through it, and it is turned off and removed.

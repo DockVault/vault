@@ -221,7 +221,7 @@ def clean(body: dict, *, row=None) -> dict:
 WHERE_IT_IS = ("issuer", "discovery_url", "private_network")
 
 
-def hold_lapsed(db, row, *, now=None) -> int:
+def hold_lapsed(db, row, *, now=None, into=None) -> int:
     """Before ``row`` is turned off, and again before it is removed, in the caller's transaction: every identity
     of it whose freshness window has already run out is recorded as held (``refused_at``). The window goes on
     counting while a provider is off, but a removed provider has no identities left to count for: without this
@@ -234,7 +234,9 @@ def hold_lapsed(db, row, *, now=None) -> int:
     (``sso_lapse_ends_sign_in``). There a hold also ends the person's password, and while a provider is off its
     days end no password: nobody could sign in through it. A removal that was then refused had ended the
     password of everybody whose days ran out while the provider was off, and told nobody. Such a provider is not
-    removed while days have run out (:func:`remove_refusal` says how it can be)."""
+    removed while days have run out (:func:`remove_refusal` says how it can be).
+
+    ``into``: a list the held accounts' ids are added to, for the caller to tell them after its commit."""
     from datetime import datetime
     from app.core.models import ExternalIdentity
     from app.services import sso_freshness
@@ -247,7 +249,20 @@ def hold_lapsed(db, row, *, now=None) -> int:
         if standing is not None and not standing.refused and standing.due <= now:
             identity.refused_at = now
             held += 1
+            if into is not None:
+                into.append(identity.user_id)
     return held
+
+
+def held_by_the_removal(n: int) -> Conflict:
+    """What a removal answers when it has just held ``n`` accounts whose days had run out (:func:`hold_lapsed`):
+    the removal waits until an administrator has cleared each, knowingly."""
+    return Conflict(REFUSALS_IN_FORCE, (
+        f"{n} account{'s have' if n != 1 else ' has'} not signed in through this provider within its days. "
+        f"{'They are' if n != 1 else 'It is'} held now, so that removing the provider does not give "
+        f"{'them their' if n != 1 else 'it its'} SSH keys, temporary credentials and devices back unseen. Clear "
+        f"{'each' if n != 1 else 'it'} under Identities when {'they' if n != 1 else 'it'} should have them back, "
+        "then remove the provider again."))
 
 
 def days_ran_out(db, row, *, now=None) -> int:
@@ -543,11 +558,13 @@ def remove_refusal(db, row) -> Optional[Conflict]:
             f"{n} account{'s are' if n != 1 else ' is'} held by a refusal this provider recorded. Clear "
             f"{'each' if n != 1 else 'it'} under Identities first: removing the provider would lift "
             f"{'them' if n != 1 else 'it'} unseen."))
-    lapsed = days_ran_out(db, row)
+    lapsed = (days_ran_out(db, row)
+              if sso_policy.effective(getattr(row, "policy", None))["sso_lapse_ends_sign_in"] else 0)
     if lapsed:
         # Past their days, and not held: this provider closes the other ways in after its days, so a hold written
         # now, while it is off, would end these people's passwords (hold_lapsed writes none). Removed, the provider
-        # would give them their paused keys back unseen. The sentence names the two ways on.
+        # would give them their paused keys back unseen. The sentence names the two ways on. (Where the days only
+        # pause keys, the removal itself holds them, once its step-up has passed: held_by_the_removal.)
         n = lapsed
         return Conflict(DAYS_RAN_OUT, (
             f"{n} account{'s have' if n != 1 else ' has'} not signed in through this provider within its days, so "

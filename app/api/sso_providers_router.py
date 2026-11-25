@@ -393,14 +393,7 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
-    if row.state != providers.ENABLED and providers.hold_lapsed(db, row):
-        # People whose days ran out while the provider was off: held now, so the removal does not lift the pause
-        # unseen. The holds stand whatever becomes of this request. None is written where a hold would also end
-        # the person's password (a provider that closes the other ways in after its days): the removal is then
-        # refused with the ways on, and nobody's sign-in changes because somebody tried to remove a provider.
-        db.commit()
-        row = _row_or_404(db, provider_id)
-    refusal = providers.remove_refusal(db, row)
+    refusal = providers.remove_refusal(db, row)            # reads only: nothing is changed before the step-up
     if refusal is not None:
         raise _refused(refusal)
     _step_up(db, current_user, request)        # may commit (a receipt is used once)
@@ -413,6 +406,33 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     if refusal is not None:
         db.rollback()
         raise _refused(refusal)
+    # People whose days ran out while the provider was off: held now, so the removal does not lift the pause
+    # unseen. After the step-up, never before it: a click that goes no further changes no account. The hold is
+    # recorded in the transaction that writes it, the administrators and the people it holds are told, and the
+    # removal waits until each is cleared. None is written where a hold would also end the person's password (a
+    # provider that closes the other ways in after its days: remove_refusal answered above).
+    held_ids = []
+    if row.state != providers.ENABLED and providers.hold_lapsed(db, row, into=held_ids):
+        held = len(held_ids)
+        from app.services.audit_logger import AuditLogger
+        db.add(AuditLogger(db).build_row(
+            action="sso_provider_updated", status="success", user=current_user, ip_address=api.get_client_ip(request),
+            resource_type="sso_provider", resource_id=str(row.id),
+            details={"provider_id": str(row.id), "name": row.name, "changed": [], "identities": held,
+                     "reason": "held_before_removal"}))
+        people = [(u.id, u.username, u.email) for u in db.query(User).filter(User.id.in_(held_ids)).all()]
+        name, shown = row.name, row.label or row.name
+        db.commit()
+        _tell_administrators(current_user.username, "Accounts were held before a provider's removal", (
+            f"{current_user.username} began to remove the single sign-on provider {name}. {held} account(s) had not "
+            "signed in through it within its days and are held now, so that the removal does not give them their "
+            "SSH keys, temporary credentials and devices back unseen. Lift each under Identities when it should "
+            "have them back; the provider can be removed then."))
+        _tell_accounts(people, "Your keys stay paused on this vault", (
+            f"You have not signed in through {shown} within the time your organisation allows, and {shown} is being "
+            "removed from this vault. Your SSH keys, temporary credentials and devices stay paused until an "
+            "administrator lifts that. Your password signs you in as before."))
+        raise _refused(providers.held_by_the_removal(held))
     gone = {"provider_id": str(row.id), "name": row.name, "identities": providers.public(db, row)["identities"]}
     label = row.label or row.name
     # Each account linked to it loses a way to sign in, and its flag follows the providers it is still linked to
