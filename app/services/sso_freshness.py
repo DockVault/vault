@@ -44,8 +44,8 @@ WARNING_DAYS = 5
 LAPSE_MESSAGE = ("Sign in through {provider} again: your SSH keys, temporary credentials and devices are paused until "
                  "you do.")
 # For an account the provider holds to its own sign-in from then on (:func:`held_to_a_provider`); ``stops`` is what
-# of its own ways in that stops (:func:`what_stops`).
-LAPSE_MESSAGE_ALL = ("Sign in through {provider} again: {stops} do not sign you in, and your SSH keys, temporary "
+# of its own ways in that stops (:func:`what_stops`), and ``do`` its verb ("do", or "does" for one thing).
+LAPSE_MESSAGE_ALL = ("Sign in through {provider} again: {stops} {do} not sign you in, and your SSH keys, temporary "
                      "credentials and devices are paused until you do.")
 ALL_THAT_STOPS = "your password and your passkeys"
 
@@ -375,6 +375,11 @@ def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Opt
     def named(found: Deadline) -> str:
         return found.provider_label if person else found.provider_name
 
+    # What of the account's own ways in a hold stops, named as the account has them (:func:`what_stops`).
+    stops = what_stops(db, user) if user is not None else ""
+    if not person:
+        stops = stops.replace("your ", "its ")
+    one = names_one(stops)
     standing = deadline_of(identity, provider)
     if standing is None or standing.refused or standing.due > now:
         still = lapsed(db, getattr(user, "id", None), now=now) if user is not None else None
@@ -392,19 +397,18 @@ def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Opt
                       ", which is turned off: turn it on, or unlink the identity, to end the pause")
         said = (f"{whose} time to sign in through {named(standing)} has run out as well, so {whose} SSH keys, "
                 "temporary credentials and devices stay paused"
-                + (f", and {whose} password and passkeys sign in to nothing," if closed else "") + until + ".")
+                + (f", and {stops} {'signs' if one else 'sign'} in to nothing," if closed and stops else "")
+                + until + ".")
     if held_before is None or user is None:
         return said
-    stops = what_stops(user)
-    if not person:
-        stops = stops.replace("your ", "its ")
     held_now = held_to_a_provider(db, user, now=now)
     if not stops:
         return said                    # nothing of its own that a hold stops: its keys alone were said
     if held_now is None:
-        return said + f" {_capitalised(stops)} sign {you} in again."
+        return said + f" {_capitalised(stops)} {'signs' if one else 'sign'} {you} in again."
     if held_now.identity_id != str(identity.id):
-        return said + f" {_capitalised(stops)} still sign in to nothing: {named(held_now)} holds the account."
+        return said + (f" {_capitalised(stops)} still {'signs' if one else 'sign'} in to nothing: "
+                       f"{named(held_now)} holds the account.")
     return said
 
 
@@ -414,16 +418,28 @@ def due_date(db, user_id) -> Optional[datetime]:
     return found[0].due if found else None
 
 
-def what_stops(user) -> str:
+def what_stops(db, user) -> str:
     """What of ``user``'s own ways in a provider's hold stops, as the person is told it: "your password" where the
-    account has one somebody can type, and "your passkeys" unless the account signs in only through its provider
-    (its passkeys confirm the person after the provider's sign-in and never sign in alone). Empty when neither:
-    such an account loses its SSH keys, temporary credentials and devices alone, and is told of those alone."""
+    account has one somebody can type, and "your passkeys" ("your passkey" for one) where it holds passkeys it can
+    sign in with now (passkeys are on, and the key is one this vault accepts: webauthn_settings.usable_passkeys)
+    and does not sign in only through its provider (its passkeys confirm the person after the provider's sign-in
+    and never sign in alone). Empty when neither: such an account loses its SSH keys, temporary credentials and
+    devices alone, and is told of those alone. Told of passkeys it never added, or of keys that sign nobody in, a
+    person read of something they do not have."""
+    from app.core import webauthn_settings
     from app.services import sign_in
     parts = ["your password"] if sign_in.has_a_password_it_can_type(user) else []
     if not getattr(user, "sso_only", False):
-        parts.append("your passkeys")
+        keys = webauthn_settings.usable_passkeys(db, getattr(user, "id", None))
+        if keys:
+            parts.append("your passkey" if keys == 1 else "your passkeys")
     return " and ".join(parts)
+
+
+def names_one(stops: str) -> bool:
+    """Whether ``stops`` (:func:`what_stops`) names one thing, so that its verb is said in the singular: "your
+    password stops", "your password and your passkeys stop"."""
+    return bool(stops) and " and " not in stops and not stops.endswith("passkeys")
 
 
 def _capitalised(text: str) -> str:
@@ -435,7 +451,8 @@ def refusal_text(found: Deadline, *, sign_in_too: bool = False, stops: str = ALL
     (:func:`closes_the_other_ways_in`), naming ``stops`` (:func:`what_stops`): with nothing to name, the keys
     alone."""
     if sign_in_too and stops:
-        return LAPSE_MESSAGE_ALL.format(provider=found.provider_label, stops=stops)
+        return LAPSE_MESSAGE_ALL.format(provider=found.provider_label, stops=stops,
+                                        do="does" if names_one(stops) else "do")
     return LAPSE_MESSAGE.format(provider=found.provider_label)
 
 
@@ -460,7 +477,7 @@ def warning_text(found: Deadline, when: str, *, sign_in_too: bool = False, stops
     where the other ways in close too: :func:`what_stops`), and how."""
     name = found.provider_label
     if sign_in_too and stops:
-        return (f"Sign in through {name} by {when}. If you do not, {stops} stop "
+        return (f"Sign in through {name} by {when}. If you do not, {stops} {'stops' if names_one(stops) else 'stop'} "
                 "signing you in then, your SSH keys, temporary credentials and devices pause, and a sign-in "
                 f"through {name} restores them. {how_to_sign_in(found)}")
     return (f"Sign in through {name} by {when}. If you do not, your SSH keys, temporary credentials "
@@ -547,7 +564,7 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         # Whether this deadline closes the person's other ways in too, and which of them the account has: said in
         # the same words wherever the person is told. An account with none of them is told of its keys alone.
         too = closes_the_other_ways_in(db, user, found)
-        stops = what_stops(user) if too else ""
+        stops = what_stops(db, user) if too else ""
         details = {"provider_id": found.provider_id, "identity_id": found.identity_id,
                    "expires_at": found.due.isoformat() + "Z", "ends_sign_in": too}
         name = found.provider_label         # the person knows the provider by its button
@@ -555,7 +572,8 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         if found.due > now:
             told = api._notify_users(
                 [found.user_id], WARNED, title=f"Sign in through {name} by {when}",
-                body=((f"{_capitalised(stops)} stop signing you in on {when}, and your SSH keys, temporary "
+                body=((f"{_capitalised(stops)} {'stops' if names_one(stops) else 'stop'} signing you in on "
+                       f"{when}, and your SSH keys, temporary "
                        f"credentials and devices pause, unless you sign in through {name} before "
                        f"then. Signing in there restores them at any time. {how}") if stops else
                       (f"Your SSH keys, temporary credentials and devices pause on {when} unless you sign in through "
@@ -660,13 +678,13 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
     try:
         named = _button_name(row) or "your identity provider"
         found = deadline_of(identity, row)
-        stops = what_stops(user) if found is not None and closes_the_other_ways_in(db, user, found) else ""
+        stops = what_stops(db, user) if found is not None and closes_the_other_ways_in(db, user, found) else ""
         api._notify_users([str(user.id)], ENDED, title=f"{named} no longer admits your account here",
                           body=(f"{named} left your account out at your last sign-in there (a tenant, a domain or a "
                                 "required group). Your sessions here ended, and your SSH keys, temporary credentials "
                                 f"and devices are paused until {named} admits you again or an administrator lifts the "
-                                "refusal." + (f" {_capitalised(stops)} do not sign you in either until then."
-                                              if stops else "")),
+                                "refusal." + (f" {_capitalised(stops)} {'does' if names_one(stops) else 'do'} not "
+                                              "sign you in either until then." if stops else "")),
                           target=NOTICE_TARGET,
                           dedup_prefix=f"{ENDED}:{identity.id}:{identity.refused_at:%Y-%m-%d}:owner")
     except Exception:  # noqa: BLE001 -- the ending and its row stand without the notice

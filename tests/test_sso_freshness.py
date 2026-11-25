@@ -323,39 +323,79 @@ def test_the_warning_says_how_to_sign_in_through_the_provider(told, monkeypatch)
     assert "button" not in said and "link" not in said and "administrator" in said
 
 
-def test_the_warning_names_only_what_the_account_has_and_the_day_as_it_is_written(told):
-    """Alice has a password of her own. Sam signs in only through the provider: nobody can type his password, and
-    his passkeys confirm him after the provider's sign-in and never sign him in by themselves. Told that "your
-    password and passkeys stop signing you in", Sam read of two things he does not have. Each is told what stops
-    for them, the day without a leading zero, and the pause names the devices with the keys."""
-    alice, sam = _user(), _user("sam", sso_only=True)
+def _usable_passkeys_here(monkeypatch):
+    """Passkeys a person can sign in with: the vault has an address a passkey is made for, and the keys below are
+    made there, of an algorithm allowed, and verified the person."""
+    from app.core import webauthn_settings as wss
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(
+        rp_id="vault.example.test", origin="https://vault.example.test", name=name or "DockVault"))
+    monkeypatch.setattr(wss, "require_uv", lambda: True)
+    monkeypatch.setattr(wss, "allowed_alg_codes", lambda: (-7,))
+    return wss
+
+
+def _passkey(user, **extra):
+    fields = dict(id=uuid.uuid4(), user_id=user.id, retired_at=None, rp_id="vault.example.test", cose_alg=-7,
+                  uv_initialized=True)
+    fields.update(extra)
+    return types.SimpleNamespace(**fields)
+
+
+def test_the_warning_names_only_what_the_account_has_and_the_day_as_it_is_written(told, monkeypatch):
+    """Alice has a password of her own and no passkey. Pat has a password and two passkeys. Kim has no password
+    anybody can type and one passkey. Sam signs in only through the provider: nobody can type his password, and his
+    passkeys confirm him after the provider's sign-in and never sign him in by themselves. Told that "your password
+    and your passkeys stop signing you in", Sam read of two things he does not have, and Alice of passkeys she
+    never added. Each is told what stops for them, the day without a leading zero, and the pause names the devices
+    with the keys. A passkey that is retired, or that no longer signs anybody in, is not named; nor is any while
+    passkeys are turned off."""
+    from app.core.models import WebAuthnCredential
+    wss = _usable_passkeys_here(monkeypatch)
+    alice, pat, kim, sam = _user(), _user("pat"), _user("kim", password_hash=None), _user("sam", sso_only=True)
     p = _provider(30)
     due = datetime(2026, 12, 5, 9, 30)
-    db = _db([alice, sam], [p], [_identity(alice, p, signed_in=due - 30 * DAY),
-                                 _identity(sam, p, signed_in=due - 30 * DAY)])
-    assert F.what_stops(alice) == "your password and your passkeys" and F.what_stops(sam) == ""
-    assert F.sweep(db, due - 3 * DAY) == {"warned": 2, "lapsed": 0}
+    keys = [_passkey(pat), _passkey(pat), _passkey(kim), _passkey(sam),
+            _passkey(alice, retired_at=NOW), _passkey(alice, rp_id="old.example.test")]
+    db = MemoryDB({User: [alice, pat, kim, sam], SsoProvider: [p], WebAuthnCredential: keys,
+                   ExternalIdentity: [_identity(who, p, signed_in=due - 30 * DAY) for who in (alice, pat, kim, sam)]})
+    assert F.what_stops(db, alice) == "your password"
+    assert F.what_stops(db, pat) == "your password and your passkeys"
+    assert F.what_stops(db, kim) == "your passkey"
+    assert F.what_stops(db, sam) == ""
+    assert F.sweep(db, due - 3 * DAY) == {"warned": 4, "lapsed": 0}
     warned = {n[0]: n for n in told.notices}
     emails = {e[1]: e[2] for e in told.emails}
     assert warned[str(alice.id)][2] == "Sign in through contoso by 5 December 2026, 09:30 UTC"
     assert emails["alice@example.test"]["when"] == "5 December 2026, 09:30 UTC"
-    assert "your password and your passkeys stop signing you in then" in emails["alice@example.test"]["change"]
-    assert warned[str(alice.id)][3].startswith("Your password and your passkeys stop signing you in on 5 December")
+    assert "If you do not, your password stops signing you in then" in emails["alice@example.test"]["change"]
+    assert warned[str(alice.id)][3].startswith("Your password stops signing you in on 5 December")
+    assert "your password and your passkeys stop signing you in then" in emails["pat@example.test"]["change"]
+    assert warned[str(pat.id)][3].startswith("Your password and your passkeys stop signing you in on 5 December")
+    assert "If you do not, your passkey stops signing you in then" in emails["kim@example.test"]["change"]
+    assert warned[str(kim.id)][3].startswith("Your passkey stops signing you in on 5 December")
+    for said in (emails["alice@example.test"]["change"], warned[str(alice.id)][3]):
+        assert "passkey" not in said, said
     for said in (emails["sam@example.test"]["change"], warned[str(sam.id)][3]):
         assert "password" not in said and "passkey" not in said and "devices" in said, said
     # The pause: devices with the keys, and what stops for each.
     del told.notices[:]
-    assert F.sweep(db, due + DAY) == {"warned": 0, "lapsed": 2}
+    assert F.sweep(db, due + DAY) == {"warned": 0, "lapsed": 4}
     paused = {n[0]: n for n in told.notices}
     assert paused[str(alice.id)][2] == "Sign in through contoso: nothing else signs you in now"
     assert paused[str(sam.id)][2] == "Your SSH keys, temporary credentials and devices are paused"
-    assert "your password and your passkeys do not sign you in" in paused[str(alice.id)][3]
-    for who in (alice, sam):
+    assert "again: your password does not sign you in, and" in paused[str(alice.id)][3]
+    assert "again: your password and your passkeys do not sign you in, and" in paused[str(pat.id)][3]
+    assert "again: your passkey does not sign you in, and" in paused[str(kim.id)][3]
+    for who in (alice, pat, kim, sam):
         assert "devices" in paused[str(who.id)][3]
     assert "password" not in paused[str(sam.id)][3] and "passkey" not in paused[str(sam.id)][3]
     found = F.deadlines(db, sam.id)[0]
     assert F.refusal_text(found) == ("Sign in through contoso again: your SSH keys, temporary credentials and devices "
                                      "are paused until you do.")
+    # Passkeys turned off: no passkey signs anybody in, and none is named.
+    monkeypatch.setattr(wss, "enabled", lambda: False)
+    assert F.what_stops(db, pat) == "your password" and F.what_stops(db, kim) == ""
     # The email itself: a link to the vault, and the date once, in the sentence.
     from app.core import email_actions
     body = email_actions.DEFAULT_TEMPLATES["sso_freshness_warning"]["body_html"]

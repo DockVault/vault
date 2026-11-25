@@ -1152,14 +1152,13 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
     assert ("sso_sign_in_refused", "failure",
             {"provider_id": str(p.id), "purpose": "sign_in", "reason": "restricted"}) in h.audits
     assert ([str(root.id)], "contoso refused alice: sessions ended, keys paused") in h.notices
-    # Alice is told too, once, of what ended and what is paused, and that her password and passkeys do not sign
-    # her in either (the provider closes the other ways in).
+    # Alice is told too, once, of what ended and what is paused, and that her password does not sign her in
+    # either (the provider closes the other ways in). She holds no passkey, and none is named.
     to_alice = [(title, body) for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
     assert to_alice == [("Contoso no longer admits your account here", (
         "Contoso left your account out at your last sign-in there (a tenant, a domain or a required group). Your "
         "sessions here ended, and your SSH keys, temporary credentials and devices are paused until Contoso admits "
-        "you again or an administrator lifts the refusal. Your password and your passkeys do not sign you in either "
-        "until then."))]
+        "you again or an administrator lifts the refusal. Your password does not sign you in either until then."))]
     # A sign-in already under way for alice ends with the refusal; another account's does not.
     assert pending.consumed_at is not None and others.consumed_at is None
     assert F.lapsed(h.db, alice.id) is not None
@@ -1251,8 +1250,8 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     # Lifting it hands a person their keys back: the other administrators are told, once, and only when it was lifted.
     assert len(told) == 1 and told[0][:2] == ("root", "A single sign-on refusal was lifted")
     assert "alice" in told[0][2] and "work again" in told[0][2]
-    assert told[0][2].endswith("its SSH keys, temporary credentials and devices work again. Its password and its "
-                               "passkeys sign it in again.")
+    assert told[0][2].endswith("its SSH keys, temporary credentials and devices work again. Its password signs it in "
+                               "again.")
     assert ("sso_refusal_cleared", "success", {"user_id": str(alice.id), "provider_id": str(p.id),
                                                "identity_id": str(identity.id), "target_username": "alice"}) in h.audits
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
@@ -1616,30 +1615,31 @@ def test_a_link_from_the_profile_that_meets_the_identity_linked_by_address_makes
 
 
 # What each reads: the person ("your") the provider as its button names it, the administrators ("its") by its name.
-_TO_THE_PERSON = dict(whose="your", Stops="Your password and your passkeys", you="you", who="Contoso",
+# Alice holds a password and no passkey: the password alone is named.
+_TO_THE_PERSON = dict(whose="your", Stops="Your password", you="you", who="Contoso",
                       other="Fabrikam", off=", which is turned off on this vault now: ask your administrator")
-_TO_THE_ADMINISTRATORS = dict(whose="its", Stops="Its password and its passkeys", you="it", who="contoso",
+_TO_THE_ADMINISTRATORS = dict(whose="its", Stops="Its password", you="it", who="contoso",
                               other="fabrikam",
                               off=", which is turned off: turn it on, or unlink the identity, to end the pause")
 
 
 @pytest.mark.parametrize("state, said", [
     ("signed in yesterday",
-     "{whose} SSH keys, temporary credentials and devices work again. {Stops} sign {you} in again."),
+     "{whose} SSH keys, temporary credentials and devices work again. {Stops} signs {you} in again."),
     ("days run out, the provider on and closing the other ways in",
      "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
-     "devices stay paused, and {whose} password and passkeys sign in to nothing, until a sign-in through {who}."),
+     "devices stay paused, and {whose} password signs in to nothing, until a sign-in through {who}."),
     ("days run out, the provider off",
      "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
-     "devices stay paused until a sign-in through {who}{off}. {Stops} sign {you} in again."),
+     "devices stay paused until a sign-in through {who}{off}. {Stops} signs {you} in again."),
     ("days run out, the provider pausing keys only",
      "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
      "devices stay paused until a sign-in through {who}."),
     ("no days asked",
-     "{whose} SSH keys, temporary credentials and devices work again. {Stops} sign {you} in again."),
+     "{whose} SSH keys, temporary credentials and devices work again. {Stops} signs {you} in again."),
     ("another provider's days run out",
      "{whose} SSH keys, temporary credentials and devices stay paused all the same: {other} still holds them, "
-     "until a sign-in through it. {Stops} still sign in to nothing: {other} holds the account."),
+     "until a sign-in through it. {Stops} still signs in to nothing: {other} holds the account."),
 ])
 def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, state, said):
     """An administrator lifts a hold. The provider's days went on counting under it, and lifting it does not
@@ -1680,7 +1680,7 @@ def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, sta
     assert told == ["root lifted the refusal contoso recorded for alice: " + said.format(**_TO_THE_ADMINISTRATORS)]
     # What the sentence says is what holds: the keys are paused exactly where it says they stay paused.
     assert (F.lapsed(h.db, alice.id) is not None) is ("stay paused" in noticed[0])
-    assert (F.held_to_a_provider(h.db, alice) is not None) is ("sign in to nothing" in noticed[0])
+    assert (F.held_to_a_provider(h.db, alice) is not None) is ("in to nothing" in noticed[0])
 
 
 def test_a_failed_test_on_a_provider_that_is_on_keeps_what_the_last_passing_test_established(monkeypatch):

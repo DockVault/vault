@@ -1501,8 +1501,8 @@ def test_a_save_that_shortens_a_providers_days_says_whom_it_holds_and_tells_them
     assert out["held_by_a_refusal"] == 1                                                # dee, before and after
     (told,) = h.accounts_told
     assert told[0] == ["ben"] and told[1].startswith("Sign in through ")
-    assert ("your password and your passkeys do not sign you in to this vault until you have signed in through"
-            in told[2])
+    # Ben holds a password and no passkey: the password alone is named.
+    assert "your password does not sign you in to this vault until you have signed in through" in told[2]
     said = h.told[-1][2]
     assert ("1 more linked account(s) have not signed in through it within its days as they are now: their password "
             "and passkeys do not sign them in until they have. They were told. 3 account(s) are held so in all.") in said
@@ -1548,6 +1548,9 @@ def test_an_account_the_days_hold_is_told_only_of_what_it_has(monkeypatch):
     that his keys paused, which they did; Ben, who has both, is told of both."""
     h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 40, 50], policy={"sso_lapse_ends_sign_in": False})
     cy.sso_only = True
+    from app.core import webauthn_settings
+    monkeypatch.setattr(webauthn_settings, "usable_passkeys",
+                        lambda db, user_id, **kw: 2 if user_id in (ben.id, cy.id) else 0)
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
     assert status == 200 and out["newly_held"] == 2, out
     told = {tuple(users): (title, text) for users, title, text in h.accounts_told}
@@ -1692,7 +1695,7 @@ def test_a_save_that_makes_a_missed_sign_in_end_the_password_counts_whom_a_refus
     label = row.label or row.name
     assert h.accounts_told == [(["cy"], f"Sign in through {label} to keep signing in here", (
         f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
-        f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
+        f"sign-in through {label}: its password does not sign it in to this vault until {label} has "
         "admitted it again. If it does not, ask your administrator."))]
     count = [a for a in h.audit("sso_provider_updated") if a[2].get("reason") == "held_by_its_days"]
     assert count[0][2] == {"provider_id": str(row.id), "name": row.name, "changed": [], "reason": "held_by_its_days",
@@ -1755,7 +1758,7 @@ def test_the_newly_held_are_told_what_was_changed(monkeypatch):
     assert told[0] == ["ben", "cy"] and told[2] == (
         f"An administrator changed what stops when {label} has not seen you within its days: your password and "
         f"passkeys now stop as well as your keys. Your last sign-in through {label} is older than that: your "
-        f"password and your passkeys do not sign you in to this vault until you have signed in through {label} again.")
+        f"password does not sign you in to this vault until you have signed in through {label} again.")
     del h.accounts_told[:]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 0}})
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 20}})

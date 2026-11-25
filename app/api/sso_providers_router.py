@@ -528,13 +528,14 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     # provider's row is taken, so of two saves made at about the same time the second counts the people the
     # first has just held as its own, and told them again, in the app and by email.
     today = f"sso_newly_held:{row.id}:{datetime.utcnow():%Y-%m-%d}"
-    stops_of = {u.id: sso_freshness.what_stops(u) for u in held_now if u.id not in held_before}
+    stops_of = {u.id: sso_freshness.what_stops(db, u) for u in held_now if u.id not in held_before}
     for stops in sorted(set(stops_of[one[0]] for one in newly_by_days)):
         whom = [one for one in newly_by_days if stops_of[one[0]] == stops]
         if stops:
             _tell_accounts(whom, f"Sign in through {label} to keep signing in here", (
-                f"{what_changed} Your last sign-in through {label} is older than that: {stops} do not sign you in "
-                f"to this vault until you have signed in through {label} again."), once_for=today)
+                f"{what_changed} Your last sign-in through {label} is older than that: {stops} "
+                f"{'does' if sso_freshness.names_one(stops) else 'do'} not sign you in to this vault until you have "
+                f"signed in through {label} again."), once_for=today)
         else:
             # Nothing of theirs but their keys pauses: they are told of those alone, and not of a password or
             # passkeys they do not have.
@@ -551,7 +552,8 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
                "your passkeys": "its passkeys"}.get(stops, stops)
         _tell_accounts(whom, f"Sign in through {label} to keep signing in here", (
             f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
-            f"sign-in through {label}: {its} do not sign it in to this vault until {label} has admitted it again. "
+            f"sign-in through {label}: {its} {'does' if sso_freshness.names_one(stops) else 'do'} not sign it in "
+            f"to this vault until {label} has admitted it again. "
             "If it does not, ask your administrator."), once_for=today)
     _tell_those_a_turn_off_held(db, held_ids, held_before, row.id, label)
     _tell_accounts(owners, f"{label} was pointed somewhere else", (

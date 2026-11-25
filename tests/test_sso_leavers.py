@@ -501,12 +501,14 @@ def test_the_warning_and_the_notices_say_that_the_password_stops_too_where_it_do
     assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 1}
     due = (NOW + 3 * DAY).strftime("%d %B %Y, %H:%M UTC")
     warning, paused, wave = told.notices
-    assert warning[3].startswith(f"Your password and your passkeys stop signing you in on {due}, and your SSH keys")
-    assert told.emails[0][2]["change"] == F.warning_text(F.deadlines(db, alice.id)[0], due, sign_in_too=True)
-    assert "your password and your passkeys stop signing you in then" in told.emails[0][2]["change"]
+    # Neither holds a passkey: the password alone is named.
+    assert warning[3].startswith(f"Your password stops signing you in on {due}, and your SSH keys")
+    assert told.emails[0][2]["change"] == F.warning_text(F.deadlines(db, alice.id)[0], due, sign_in_too=True,
+                                                         stops="your password")
+    assert "your password stops signing you in then" in told.emails[0][2]["change"]
     assert paused[2] == "Sign in through contoso: nothing else signs you in now"
     how = F.how_to_sign_in(F.deadlines(db, carol.id)[0])
-    assert paused[3] == F.LAPSE_MESSAGE_ALL.format(provider="contoso", stops=F.ALL_THAT_STOPS) + " " + how
+    assert paused[3] == F.LAPSE_MESSAGE_ALL.format(provider="contoso", stops="your password", do="does") + " " + how
     assert "your password" in paused[3]
     assert "For 1 of them the password and passkeys no longer sign in either" in wave[3]
     assert [details["ends_sign_in"] for _, _, details in told.audits] == [True, True]
