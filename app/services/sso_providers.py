@@ -264,7 +264,10 @@ def hold_lapsed(db, row, *, now=None, into=None) -> int:
     later sign-in the provider admits, or by another administrator; and a provider is not removed while it holds
     one. Returns how many were held. An identity whose hold an administrator lifted is not held again for the
     deadline that lift answered (app/services/sso_freshness.py, lift_the_hold): the removal that asked for the
-    lift then goes through.
+    lift then goes through. That lift was of a hold that paused keys alone, and spares the identity such a hold
+    only. Where the hold written here also keeps the password closed (a provider that is on and whose days end
+    sign-in, being turned off), the identity is held as every other past its days is: spared, that one person's
+    password, closed by the days while the provider was on, opened when it was turned off.
 
     Nothing is written for a provider that is off and closes the other ways in after its days
     (``sso_lapse_ends_sign_in``). There a hold also ends the person's password, and while a provider is off its
@@ -282,7 +285,7 @@ def hold_lapsed(db, row, *, now=None, into=None) -> int:
     held = 0
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
         standing = sso_freshness.deadline_of(identity, row)
-        if sso_freshness.lift_answers(identity, standing):
+        if sso_freshness.lift_answers(identity, standing) and not standing.ends_sign_in:
             continue
         if standing is not None and not standing.refused and standing.due <= now:
             identity.refused_at = now

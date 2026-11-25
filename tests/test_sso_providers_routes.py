@@ -1967,3 +1967,44 @@ def test_a_lifted_refusal_of_the_provider_does_not_let_a_removal_give_keys_back_
     assert h.told[-1][2].endswith("with the links of 2 account(s) to it. 1 of them had not signed in through it "
                                   "within its days, and an administrator had lifted the hold on each: their SSH "
                                   "keys, temporary credentials and devices wait for a sign-in through it no more.")
+
+
+def test_a_lift_on_record_spares_an_identity_only_a_hold_that_pauses_keys_alone():
+    """A provider's days paused keys alone when it was turned off; Alice was held and an administrator lifted
+    that. The provider was turned on again, and later made to close the password after its days as well: Alice,
+    still past them, signs in only through it, as everyone past them does. Then it is turned off. The lift on
+    record spared her the hold a turn-off writes, and with the provider off the days close no password: hers
+    alone opened. She is held as the others are. Where the hold pauses keys alone, the lift spares her as
+    before."""
+    from datetime import datetime, timedelta
+    from app.services import sso_freshness as F
+    from app.services import sso_providers
+    now = datetime.utcnow()
+    last = now - timedelta(days=30)
+    row = _provider(state="enabled", created_at=None, updated_at=None)        # a turn-off holds while it reads as on
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": True}
+    alice = _user("alice")
+    identity = _identity(alice, row, last_sign_in_at=last, linked_at=now - timedelta(days=60), refused_at=None,
+                         hold_lifted_for=last + timedelta(days=7), keys_only_hold_at=None)
+    assert F.lift_answers(identity, F.deadline_of(identity, row)) is True
+
+    class DB:
+        def query(self, model):
+            return self
+
+        def filter(self, *a):
+            return self
+
+        def all(self):
+            return [identity]
+    held = []
+    assert sso_providers.hold_lapsed(DB(), row, into=held) == 1 and held == [alice.id]
+    assert identity.refused_at is not None and identity.keys_only_hold_at is None
+    row.state = "disabled"
+    assert F.a_hold_closes(F.deadline_of(identity, row)) is True              # her password stays closed while it is off
+    # The days pause keys alone: the lift spares her the hold, at a turn-off as before a removal.
+    identity.refused_at = None
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    for state in ("enabled", "disabled"):
+        row.state = state
+        assert sso_providers.hold_lapsed(DB(), row) == 0 and identity.refused_at is None, state
