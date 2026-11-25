@@ -313,8 +313,10 @@ def test_a_mapping_is_removed_after_the_step_up_and_recorded_as_it_was(monkeypat
         "Finance). Nobody's department or role was changed by that."))]
     status, out = h.call("DELETE", f"{h.path}/{second}")
     assert status == 200 and h.stored() == []
-    assert h.told[-1][2].endswith("Nobody's department or role was changed by that. A request for the "
-                                  "administrator role it opened can no longer be approved.")
+    # No request was waiting through the group: nothing more is said.
+    assert out["requests_ended"] == 0
+    assert h.told[-1][2].endswith("(it gave a request for the administrator role, which another administrator "
+                                  "decides). Nobody's department or role was changed by that.")
     assert h.call("DELETE", f"{h.path}/{second}")[0] == 404
 
 
@@ -568,3 +570,71 @@ def test_a_count_that_cannot_be_made_holds_up_no_change(monkeypatch):
     monkeypatch.setattr(sso_groups, "linked_members", down)
     status, out = h.add(provider_group="fin", department_id=str(finance.id))
     assert status == 201 and out["may_leave"] == [] and len(h.stored()) == 1
+
+
+def _held_request(h, group, username="bob", state="held"):
+    from datetime import datetime, timedelta
+    from app.core.models import SsoAdminRequest
+    now = datetime.utcnow()
+    row = types.SimpleNamespace(id=uuid.uuid4(), user_id=uuid.uuid4(), provider_id=h.provider.id, provider_group=group,
+                                requested_at=now, expires_at=now + timedelta(days=7), state=state, decided_by=None,
+                                decided_by_name=None, decided_at=None)
+    h.db.rows_of(SsoAdminRequest).append(row)
+    return row
+
+
+def _notices(h, monkeypatch):
+    sent = []
+    monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, *, title, body, target=None, dedup_prefix=None:
+                        sent.append((list(ids), title, body, dedup_prefix)), raising=False)
+    return sent
+
+
+def test_removing_an_administrator_mapping_ends_the_requests_its_group_opened(monkeypatch):
+    """Bob's request for the administrator role waits, opened through the group vault-admins. The mapping is
+    removed. The request could no longer be approved, nor denied, and for seven days it kept Bob from asking again
+    through another group. It is ended with the mapping, in the same transaction, with its record, and Bob is
+    told; a request another group opened is left as it is."""
+    h = Mappings(monkeypatch, _provider(created_at=None, updated_at=None, policy=dict(ADMIN_ON)))
+    sent = _notices(h, monkeypatch)
+    first = h.add(provider_group="vault-admins", role="admin")[1]["mapping"]["id"]
+    h.add(provider_group="it-admins", role="admin")
+    waiting, other = _held_request(h, "vault-admins"), _held_request(h, "it-admins")
+    decided = _held_request(h, "vault-admins", state="denied")
+    h.told.clear()
+    status, out = h.call("DELETE", f"{h.path}/{first}")
+    assert status == 200 and out["requests_ended"] == 1, out
+    assert waiting.state == "expired" and waiting.decided_at is not None
+    assert other.state == "held" and decided.state == "denied"
+    assert h.audit("sso_admin_expired") == [("sso_admin_expired", "success", {
+        "provider_id": str(h.provider.id), "user_id": str(waiting.user_id), "reason": "mapping_gone"})]
+    assert h.told[-1][2].endswith(
+        "Nobody's department or role was changed by that. 1 request(s) for the administrator role that the group "
+        "had opened were ended with nothing decided, and the people told.")
+    (to, title, body, dedup), = sent
+    assert to == [str(waiting.user_id)] and title == "Your request for the administrator role ended"
+    assert "is no longer mapped to the administrator role" in body and "Your account is unchanged" in body
+    assert dedup == f"sso_admin_ended:{waiting.id}"
+
+
+@pytest.mark.parametrize("change, ends", [
+    ({"provider_group": "dv-admins"}, True),          # the group is renamed
+    ({"role": "user"}, True),                         # the role is taken from the mapping
+    ({"role": None, "department_id": "FINANCE"}, True),
+    ({"department_id": "FINANCE"}, False),            # the role and the group stay: the request stands
+])
+def test_a_change_that_takes_the_role_from_a_group_ends_its_requests(monkeypatch, change, ends):
+    """The organisation renames its administrators' group, and an administrator renames the mapping to match.
+    Bob's request, opened through the old name, could be neither approved nor denied afterwards, and no new one
+    was opened for seven days: he could not be made an administrator through the provider at all."""
+    h = Mappings(monkeypatch, _provider(created_at=None, updated_at=None, policy=dict(ADMIN_ON)))
+    sent = _notices(h, monkeypatch)
+    finance = h.department("Finance")
+    mapping = h.add(provider_group="vault-admins", role="admin")[1]["mapping"]["id"]
+    waiting = _held_request(h, "vault-admins")
+    body = {k: (str(finance.id) if v == "FINANCE" else v) for k, v in change.items()}
+    status, out = h.call("PATCH", f"{h.path}/{mapping}", body)
+    assert status == 200 and out["requests_ended"] == (1 if ends else 0), out
+    assert waiting.state == ("expired" if ends else "held")
+    assert len(h.audit("sso_admin_expired")) == (1 if ends else 0) and len(sent) == (1 if ends else 0)
+    assert ("were ended with nothing decided" in h.told[-1][2]) is ends

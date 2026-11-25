@@ -749,3 +749,109 @@ def test_how_many_linked_accounts_are_in_a_department_is_one_count_of_active_acc
         assert sso_groups.linked_members(db, row, legal) == 1            # ben
         assert sso_groups.linked_members(db, types.SimpleNamespace(id=q), finance) == 1     # cy
         assert sso_groups.linked_members(db, row, uuid.uuid4()) == 0
+
+
+def test_a_request_through_a_group_mapped_no_more_is_ended_and_a_new_one_is_opened(monkeypatch):
+    """A request waits, opened through vault-admins. That name is mapped to the role no more (the mapping was
+    renamed to dv-admins before requests were ended with their mapping). Bob signs in with the new group. The old
+    request can never be approved; it stopped a new one for seven days. It is ended, with its record, and the
+    sign-in opens a request through the group that is mapped."""
+    bob, root = _user("bob"), _user("root", role="admin")
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p], identities=[_identity(bob, p)])
+    h.mapping(p, "dv-admins", role="admin")
+    stuck = _request_for(h, p, bob, provider_group="vault-admins")
+    _sign_in(h, p, groups=["dv-admins"])
+    assert stuck.state == "expired" and stuck.decided_at is not None
+    held = [r for r in h.requests() if r.state == "held"]
+    assert [r.provider_group for r in held] == ["dv-admins"]
+    assert ("sso_admin_expired", "success", {"provider_id": str(p.id), "user_id": str(bob.id),
+                                             "reason": "mapping_gone"}) in h.audits
+    # While that one waits, nothing more is opened, whatever else the token names.
+    h.mapping(p, "it-admins", role="admin")
+    _sign_in(h, p, groups=["dv-admins", "it-admins"])
+    assert len([r for r in h.requests() if r.state == "held"]) == 1
+
+
+def test_a_denial_holds_off_a_new_request_through_the_group_it_denied_and_no_other(monkeypatch):
+    bob, root = _user("bob"), _user("root", role="admin")
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p], identities=[_identity(bob, p)])
+    h.mapping(p, "vault-admins", role="admin")
+    _request_for(h, p, bob, provider_group="vault-admins", state="denied", decided_at=datetime.utcnow() - timedelta(days=1))
+    _sign_in(h, p, groups=["vault-admins"])
+    assert [r.state for r in h.requests()] == ["denied"]              # denied yesterday: not asked again
+    # In another group that is mapped to the role too: that is another group's word, and it asks.
+    h.mapping(p, "it-admins", role="admin")
+    _sign_in(h, p, groups=["vault-admins", "it-admins"])
+    assert sorted((r.provider_group, r.state) for r in h.requests()) == [("it-admins", "held"), ("vault-admins", "denied")]
+    # A denial older than a request would have waited holds off nothing.
+    h.requests().clear()
+    _request_for(h, p, bob, provider_group="vault-admins", state="denied", decided_at=datetime.utcnow() - timedelta(days=8))
+    _sign_in(h, p, groups=["vault-admins"])
+    assert sorted((r.provider_group, r.state) for r in h.requests()) == [("vault-admins", "denied"), ("vault-admins", "held")]
+    # Which of two mapped groups a request names does not depend on the order they were read in.
+    h.requests().clear()
+    _sign_in(h, p, groups=["vault-admins", "it-admins"])
+    assert [r.provider_group for r in h.requests()] == ["it-admins"]
+
+
+@pytest.mark.parametrize("why", ["mapping_gone", "mapping_off", "provider_gone"])
+def test_a_request_that_can_no_longer_be_approved_can_still_be_denied(monkeypatch, why):
+    """The group's mapping is gone, the provider raises no requests any more, or it is off. The request cannot be
+    approved. It could not be denied either: both answered 409, and the list showed a row nobody could act on
+    until its seven days were over."""
+    from app.core.models import SsoGroupMapping
+    from app.services import sso_groups
+    bob = _user("bob", password_set_by_other_at=None)
+    root = _user("root", role="admin", password_set_by_other_at=None)
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p])
+    h.current_user = root
+    mapping = h.mapping(p, "admins", role="admin")
+    request = _request_for(h, p, bob)
+    if why == "mapping_gone":
+        h.db.rows_of(SsoGroupMapping).remove(mapping)
+    elif why == "mapping_off":
+        p.policy = {"sso_admin_mapping": False}
+    else:
+        p.state = "disabled"
+    S = h.S
+    assert sso_groups.decision_refusal(h.db, request, root).code == why
+    assert sso_groups.denial_refusal(h.db, request, root) is None
+    status, body, _ = _call(S, "GET", "/admin/sso/admin-requests")
+    (held,) = body["held"]
+    assert held["you_may_decide"] is False and held["you_may_deny"] is True and held["refusal"]
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == why and request.state == "held" and h.step_ups == []
+    # An administrator who may not decide the request may not deny it either.
+    root.is_locked = True
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/deny")
+    assert status == 409 and body["detail"]["reason"] == "cannot_act" and request.state == "held"
+    assert sso_groups.denial_refusal(h.db, request, root).code == "cannot_act"
+    root.is_locked = False
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/deny")
+    assert status == 200 and request.state == "denied" and request.decided_by == root.id, body
+    assert h.step_ups == ["root"]
+    assert body["request"]["you_may_deny"] is False and body["request"]["you_may_decide"] is False
+
+
+def test_a_denial_of_a_request_that_can_be_approved_is_judged_as_before(monkeypatch):
+    """Every other refusal stands for a denial too: decided already, past its time, about one's own account."""
+    from app.services import sso_groups
+    bob = _user("bob", password_set_by_other_at=None)
+    root = _user("root", role="admin", password_set_by_other_at=None)
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p])
+    h.mapping(p, "admins", role="admin")
+    request = _request_for(h, p, bob)
+    assert sso_groups.denial_refusal(h.db, request, root) is None
+    bob.is_active = False
+    assert sso_groups.denial_refusal(h.db, request, root).code == "account_unusable"
+    bob.is_active = True
+    request.expires_at = datetime.utcnow() - timedelta(minutes=1)
+    assert sso_groups.denial_refusal(h.db, request, root).code == "expired"
+    request.expires_at = datetime.utcnow() + timedelta(days=1)
+    request.state = "approved"
+    assert sso_groups.denial_refusal(h.db, request, root).code == "decided"
+    assert sso_groups.NO_LONGER_GRANTABLE == frozenset({"provider_gone", "mapping_off", "mapping_gone"})

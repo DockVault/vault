@@ -30,6 +30,11 @@ log = logging.getLogger("dockvault.sso")
 REQUEST_DAYS = 7
 GRANT_MATCH_SECONDS = 2              # an approval's grant record is written with the decision, at its moment
 HELD, APPROVED, DENIED, EXPIRED, DEMOTED = "held", "approved", "denied", "expired", "demoted"
+# Why a held request can no longer be approved that is neither the person's doing nor the approver's: the provider
+# is gone or off, it raises no requests any more, or its group is mapped to the role no more. Such a request can
+# still be denied (a denial asks nothing the mapping vouches for), so the list never holds a row nobody can act on.
+NO_LONGER_GRANTABLE = frozenset({"provider_gone", "mapping_off", "mapping_gone"})
+MAPPING_GONE = "mapping_gone"
 
 # What the owners of vaults a department reaches are told about a join made by a sign-in (the access notices
 # want a granter with an id and a name; nobody's own account made this change).
@@ -71,6 +76,7 @@ class Applied:
     role_change: Optional[tuple] = None                    # (old, new) when the role changed
     permissions_removed: list = field(default_factory=list)
     request: object = None                                 # the held administrator request opened now
+    ended_requests: list = field(default_factory=list)     # held ones whose group is mapped to the role no more
     demoted: bool = False
     kept_last_admin: bool = False                          # a demotion the last-administrator rule stopped
     lost: object = None                                    # what _account_lost_standing did, told after the commit
@@ -115,7 +121,10 @@ def apply(db, row, user, answer) -> Applied:
         _leave(db, user, leaves, applied)
     roles = {m.role for m in mappings if m.role and m.provider_group in present}
     admin_groups = {m.provider_group for m in mappings if m.role == "admin"}
-    admin_group = next((m.provider_group for m in mappings if m.role == "admin" and m.provider_group in present), None)
+    # The groups of the token that are mapped to the role, in one order always: which of them a request names does
+    # not depend on the order the mappings were read in.
+    admin_present = sorted(m.provider_group for m in mappings if m.role == "admin" and m.provider_group in present)
+    admin_group = admin_present[0] if admin_present else None
     if getattr(user, "role", None) == RoleEnum.ADMIN:
         # Demoted only through the group the person was approved through, while it is still mapped to the role.
         # Asked of any administrator mapping at all, removing one of two mappings demoted the people approved
@@ -130,7 +139,7 @@ def apply(db, row, user, answer) -> Applied:
         # sign-in comes first). An account that signs in only through its provider because it was made at its
         # first sign-in is another matter: the approval is an administrator's word for the person, ends that for
         # the account and hands over a link to choose a password (app/api/api_server.py, _record_admin_grant).
-        applied.request = _request_admin(db, user, row, admin_group)
+        applied.request = _request_admin(db, user, row, admin_present, admin_groups, applied)
     lesser = "user" if "user" in roles else ("external" if "external" in roles else None)
     if lesser is not None and getattr(user.role, "value", user.role) != lesser:
         old = getattr(user.role, "value", user.role)
@@ -229,22 +238,52 @@ def _demote(db, row, user, roles, applied: Applied) -> None:
         request.state = DEMOTED                 # the approval is spent: a later role is somebody else's doing
 
 
-def _request_admin(db, user, row, group: str):
-    """The held request for ``user`` on this provider: the one still held, or a new one (seven days)."""
+def _request_admin(db, user, row, groups, admin_groups, applied: Applied):
+    """The request for ``user`` on this provider: None while one is waiting, else a new one (seven days) for the
+    first of ``groups`` (the token's groups that are mapped to the role) that was not denied lately.
+
+    A held request whose group is mapped to the role no more (``admin_groups`` are the groups that are) can never
+    be approved. It waited for nothing while it stopped a new request for seven days: after a mapping's group was
+    renamed, the person could not be made an administrator through the provider at all. It is ended here, and
+    the sign-in goes on to a request for a group that is mapped.
+
+    A denial holds off a new request through the group it denied, for as long as a request would have waited. It
+    says nothing of another group: one whose mapping was removed since is in no token's ``groups``."""
     from app.core.models import SsoAdminRequest
     now = datetime.utcnow()
-    for r in db.query(SsoAdminRequest).filter(SsoAdminRequest.user_id == user.id,
-                                              SsoAdminRequest.provider_id == row.id).all():
+    rows = db.query(SsoAdminRequest).filter(SsoAdminRequest.user_id == user.id,
+                                            SsoAdminRequest.provider_id == row.id).all()
+    for r in rows:
         if r.state == HELD and r.expires_at > now:
-            return None                      # already waiting: nothing new to tell
-    for r in db.query(SsoAdminRequest).filter(SsoAdminRequest.user_id == user.id,
-                                              SsoAdminRequest.provider_id == row.id).all():
-        if r.state == DENIED and r.decided_at is not None and r.decided_at > now - timedelta(days=REQUEST_DAYS):
-            return None                      # a denial holds for as long as a request would have waited
-    request = SsoAdminRequest(id=uuid.uuid4(), user_id=user.id, provider_id=row.id, provider_group=str(group)[:255],
-                              requested_at=now, expires_at=now + timedelta(days=REQUEST_DAYS), state=HELD)
-    db.add(request)
-    return request
+            if r.provider_group in admin_groups:
+                return None                  # already waiting: nothing new to tell
+            r.state, r.decided_at = EXPIRED, now
+            applied.ended_requests.append(r)
+    denied_lately = {r.provider_group for r in rows if r.state == DENIED and r.decided_at is not None
+                     and r.decided_at > now - timedelta(days=REQUEST_DAYS)}
+    for group in groups:
+        if group in denied_lately:
+            continue                         # a denial holds for as long as a request would have waited
+        request = SsoAdminRequest(id=uuid.uuid4(), user_id=user.id, provider_id=row.id, provider_group=str(group)[:255],
+                                  requested_at=now, expires_at=now + timedelta(days=REQUEST_DAYS), state=HELD)
+        db.add(request)
+        return request
+    return None
+
+
+def end_requests_of_group(db, row, group: str, *, now: Optional[datetime] = None) -> list:
+    """End the held requests ``group`` of ``row`` opened, because the group is mapped to the administrator role no
+    more (its mapping was removed, or given another group or role): marked expired, in the caller's transaction.
+    Each is read locked and as it stands, so a decision landing this second is not overwritten. Returns them, for
+    the caller's records and notices."""
+    from app.core.models import SsoAdminRequest
+    now = now or datetime.utcnow()
+    held = (db.query(SsoAdminRequest).filter(SsoAdminRequest.provider_id == row.id,
+                                            SsoAdminRequest.provider_group == group, SsoAdminRequest.state == HELD)
+            .populate_existing().with_for_update().all())
+    for request in held:
+        request.state, request.decided_at = EXPIRED, now
+    return held
 
 
 def _approvals_of(db, user, row) -> list:
@@ -374,6 +413,9 @@ def tell(db, row, user, applied: Applied, *, client_ip) -> None:
                               target="#users", dedup_prefix=f"sso_role_kept:{user.id}:{datetime.utcnow():%Y-%m-%d}")
         except Exception as exc:  # noqa: BLE001
             log.info("sso last-administrator notice skipped: %s", type(exc).__name__)
+    for ended in applied.ended_requests:
+        _audit(db, "sso_admin_expired", ip=None, resource_type="sso_admin_request", resource_id=str(ended.id),
+               details={"provider_id": pid, "user_id": str(user.id), "reason": MAPPING_GONE})
     if applied.request is not None:
         _audit(db, "sso_admin_requested", user=user, ip=client_ip, resource_type="sso_admin_request",
                resource_id=str(applied.request.id), details={"provider_id": pid, "provider_group": applied.request.provider_group})
@@ -476,6 +518,17 @@ def decision_refusal(db, request, approver, *, now: Optional[datetime] = None) -
     if why is not None:
         return Conflict(why, REFUSAL_TEXTS.get(why, "You may not decide this request."))
     return None
+
+
+def denial_refusal(db, request, approver, *, now: Optional[datetime] = None) -> Optional[Conflict]:
+    """Why ``request`` cannot be denied by ``approver`` now, or None. As for an approval, except that a request
+    which can no longer be approved (:data:`NO_LONGER_GRANTABLE`) can still be denied by an administrator who may
+    decide it: refused for both, it stayed in the list for its seven days with nothing anybody could do to it."""
+    conflict = decision_refusal(db, request, approver, now=now)
+    if conflict is None or conflict.code not in NO_LONGER_GRANTABLE:
+        return conflict
+    why = approver_refusal(db, approver, request)
+    return Conflict(why, REFUSAL_TEXTS.get(why, "You may not decide this request.")) if why is not None else None
 
 
 def approve(db, request, approver, *, http_request=None) -> dict:

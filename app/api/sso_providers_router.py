@@ -56,7 +56,7 @@ def _api():
     return api_server
 
 
-def _record(db, action: str, *, user, ip, row_id, details: dict) -> None:
+def _record(db, action: str, *, user, ip, row_id, details: dict, resource_type: str = "sso_provider") -> None:
     """Add the record of a change to the transaction that makes it, before its commit: the two are written
     together or not at all. Written after the commit, a record that failed left a provider added, changed or
     removed with nothing in the audit log to say who did it. A record that cannot be built refuses the change."""
@@ -64,7 +64,7 @@ def _record(db, action: str, *, user, ip, row_id, details: dict) -> None:
     try:
         from app.services.audit_logger import AuditLogger
         db.add(AuditLogger(db).build_row(action=action, status="success", user=user, ip_address=ip, details=details,
-                                         resource_type="sso_provider", resource_id=str(row_id)))
+                                         resource_type=resource_type, resource_id=str(row_id)))
     except Exception as exc:      # noqa: BLE001 -- no change without its record
         db.rollback()
         error_id = log_failure("a change of a single sign-on provider was not saved", exc)
@@ -627,6 +627,38 @@ def _mapping_record(row, shown: dict, **more) -> dict:
             "department": department.get("name"), "role": shown["role"], **more}
 
 
+def _end_the_requests_of(db, row, group, *, user, ip) -> list:
+    """End the held requests for the administrator role that ``group`` of ``row`` opened, in the transaction of
+    the change that takes the role from the group's mapping, each with its record. Returns (request id, account
+    id) for each, for what is told after the commit."""
+    ended = sso_groups.end_requests_of_group(db, row, group)
+    for one in ended:
+        _record(db, "sso_admin_expired", user=user, ip=ip, row_id=one.id, resource_type="sso_admin_request",
+                details={"provider_id": str(row.id), "user_id": str(one.user_id), "reason": sso_groups.MAPPING_GONE})
+    return [(str(one.id), str(one.user_id)) for one in ended]
+
+
+def _tell_of_requests_ended(ended: list, row) -> str:
+    """Tell each person whose request ended with its group's mapping, and give the sentence of the administrators'
+    notice for them ("" for none). Best effort."""
+    if not ended:
+        return ""
+    label = row.label or row.name
+    try:
+        api = _api()
+        for request_id, account_id in ended:
+            api._notify_users([account_id], "sso_admin_request", title="Your request for the administrator role ended",
+                              body=(f"The group of {label} your request came through is no longer mapped to the "
+                                    "administrator role, so the request was ended with nothing decided. Your "
+                                    "account is unchanged. If another group of yours is mapped to the role, your "
+                                    "next sign-in through it asks again."),
+                              target="#profile", dedup_prefix=f"sso_admin_ended:{request_id}")
+    except Exception as exc:  # noqa: BLE001
+        log.info("sso request-ended notice skipped: %s", type(exc).__name__)
+    return (f" {len(ended)} request(s) for the administrator role that the group had opened were ended with nothing "
+            "decided, and the people told.")
+
+
 def _said_of_who_may_leave(leaving: list, row) -> str:
     """The sentence of a mapping's notice for the people a sign-in may now take out of a department, or ""."""
     said = ""
@@ -730,12 +762,17 @@ def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any]
         raise HTTPException(status_code=404, detail="Unknown group mapping.")
     try:
         touched = [mapping.department_id]
+        was_group, was_role = mapping.provider_group, mapping.role
         changes = mappings.change(db, row, mapping, fields, fresh=True)
         touched.append(mapping.department_id)
         shown = mappings.public(db, row, mapping)
+        ended = []
         if changes:
             _record(db, "sso_group_mapping_changed", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
                     details=_mapping_record(row, shown, changed=sorted(changes), changes=changes))
+            # The group it had is mapped to the administrator role no more: the requests that group opened end.
+            if was_role == "admin" and (mapping.role != "admin" or mapping.provider_group != was_group):
+                ended = _end_the_requests_of(db, row, was_group, user=current_user, ip=api.get_client_ip(request))
         db.commit()
     except (providers.Invalid, providers.Conflict) as exc:
         db.rollback()
@@ -745,8 +782,9 @@ def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any]
         _tell_administrators(current_user.username, "A single sign-on group mapping was changed", (
             f"{current_user.username} changed how the group {shown['provider_group']} of the single sign-on provider "
             f"{row.name} is mapped: it now gives {_mapping_words(shown)}. It applies from each person's next "
-            "sign-in through the provider." + _said_of_who_may_leave(leaving, row)))
-    return {"mapping": shown, "changed": sorted(changes), "may_leave": leaving}
+            "sign-in through the provider." + _said_of_who_may_leave(leaving, row)
+            + _tell_of_requests_ended(ended, row)))
+    return {"mapping": shown, "changed": sorted(changes), "may_leave": leaving, "requests_ended": len(ended)}
 
 
 @router.delete("/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}")
@@ -757,7 +795,9 @@ def remove_group_mapping(provider_id: str, mapping_id: str, request: Request,
     touched by a sign-in, and its members stay until an administrator takes them out. One that another mapping
     still names goes on following the provider's groups: a linked account in it leaves it at its next sign-in
     unless the token names a group still mapped to it, and the answer (``may_leave``) and the notice say how many
-    such accounts there are. A request for the administrator role it opened can no longer be approved."""
+    such accounts there are. The requests for the administrator role its group opened are ended with it
+    (``requests_ended``), each with its record, and the people told: a request nobody could approve any more
+    stood in the list, and kept the person from asking again through a group that is still mapped."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
@@ -772,14 +812,15 @@ def remove_group_mapping(provider_id: str, mapping_id: str, request: Request,
     _record(db, "sso_group_mapping_removed", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
             details=_mapping_record(row, shown))
     touched = [mapping.department_id]
+    ended = (_end_the_requests_of(db, row, mapping.provider_group, user=current_user, ip=api.get_client_ip(request))
+             if mapping.role == "admin" else [])
     db.delete(mapping)
     db.commit()
     leaving = sso_groups.may_leave(db, row, touched)
     _tell_administrators(current_user.username, "A single sign-on group mapping was removed", (
         f"{current_user.username} removed the mapping of the group {shown['provider_group']} of the single sign-on "
         f"provider {row.name} (it gave {_mapping_words(shown)}). Nobody's department or role was changed by that."
-        + (" A request for the administrator role it opened can no longer be approved."
-           if shown["role"] == "admin" else "")
+        + _tell_of_requests_ended(ended, row)
         + (" Another group is still mapped to the department." + _said_of_who_may_leave(leaving, row)
            if leaving else "")))
-    return {"removed": True, "mapping": shown, "may_leave": leaving}
+    return {"removed": True, "mapping": shown, "may_leave": leaving, "requests_ended": len(ended)}

@@ -20,8 +20,9 @@ sign-ins through the provider name one of those groups, and leaves it at the fir
 mapping names it, a sign-in no longer touches it, and its members stay until an administrator takes them out. The
 same holds when a mapping is added to a department that has members already, and when a mapping's group or
 department is changed. Each of the three writes says how many accounts linked to the provider are in such a
-department (app/services/sso_groups.py, may_leave). A request an administrator mapping opened can no longer be approved once the
-mapping is gone (app/services/sso_groups.py, decision_refusal).
+department (app/services/sso_groups.py, may_leave). A request for the administrator role that a mapping's group
+opened is ended with the mapping: when it is removed, and when its group or its role is changed
+(app/services/sso_groups.py, end_requests_of_group).
 
 A route judges a write twice: before it asks the administrator for anything, and again once it holds the provider's
 row. The second time it passes ``fresh=True``: the mappings are read again as they are committed, not as this

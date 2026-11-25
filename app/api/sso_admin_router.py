@@ -70,7 +70,10 @@ def _public(db, row: SsoAdminRequest, approver) -> dict:
             "provider": (provider.label or provider.name) if provider is not None else "a removed provider",
             "provider_group": row.provider_group, "requested_at": _t(row.requested_at), "expires_at": _t(row.expires_at),
             "state": row.state, "decided_by": row.decided_by_name, "decided_at": _t(row.decided_at),
-            "you_may_decide": row.state == sso_groups.HELD and refusal is None, "refusal": refusal}
+            "you_may_decide": row.state == sso_groups.HELD and refusal is None, "refusal": refusal,
+            # A request that can no longer be approved (its provider off, its group mapped to the role no more)
+            # can still be denied by an administrator who may decide it.
+            "you_may_deny": row.state == sso_groups.HELD and sso_groups.denial_refusal(db, row, approver) is None}
 
 
 @router.get("/admin/sso/admin-requests")
@@ -87,14 +90,15 @@ def _decide(db, request_id, current_user, request: Request, *, approve: bool):
     api = _api()
     client_ip = api.get_client_ip(request)
     row = _request_or_404(db, request_id)
-    conflict = sso_groups.decision_refusal(db, row, current_user)
+    refusal = sso_groups.decision_refusal if approve else sso_groups.denial_refusal
+    conflict = refusal(db, row, current_user)
     if conflict is not None:
         _decision_audit(db, approve, user=current_user, ip=client_ip, status_="failure", row=row,
                         details={"user_id": str(row.user_id), "reason": conflict.code})
         raise HTTPException(status_code=409, detail={"reason": conflict.code, "message": conflict.message})
     _step_up(db, current_user, request)       # may commit (a receipt is used once)
     row = _request_or_404(db, request_id, lock=True)
-    if sso_groups.decision_refusal(db, row, current_user) is not None:
+    if refusal(db, row, current_user) is not None:
         raise HTTPException(status_code=409, detail={"reason": "changed", "message": "The request changed meanwhile; look again."})
     if approve:
         outcome = sso_groups.approve(db, row, current_user, http_request=request)
