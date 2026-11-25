@@ -1,5 +1,6 @@
 """Settings -> Sign-in as an administrator reads it (static/js/settings-signin.js): what the counts the server reads
-mean under the rows they concern, and that a save which applies reads the page again for them.
+mean under the rows they concern, and that a save which applies reads the page again for them; the alert while
+direct attestation has no trust anchors; and the note while 'Required for roles' names no role.
 
 Driven in Node against the shipped script, on the small document of tests/js/mini_dom.js, with the server's answer
 built from the passkey settings as they are registered (app/core/webauthn_settings.py).
@@ -201,3 +202,37 @@ def test_the_anchors_alert_stays_away_while_there_are_anchors_or_attestation_is_
         got = _loaded(answer, ANCHORS)
         assert not got["shown"]
         assert got["readiness"].startswith("Passkeys can be made at https://vault.example.test")
+
+
+ROLES_NOTE = r"""
+const notes = rowOf('webauthn_mode').querySelectorAll('.signin-roles-note');
+out({ notes: notes.length, text: notes.length ? notes[0].textContent : null,
+      kind: notes.length ? notes[0].className : null });
+"""
+
+
+def test_required_for_roles_with_no_role_chosen_says_that_nobody_is_required():
+    got = _loaded(_answer({"webauthn_mode": "required_for_roles", "webauthn_required_roles": []}), ROLES_NOTE)
+    assert got["notes"] == 1 and "alert-warning" in got["kind"]
+    assert got["text"] == ("No role is chosen under “Roles that must have a passkey”: nobody is required to "
+                           "hold a passkey.")
+    for values in ({"webauthn_mode": "required_for_roles", "webauthn_required_roles": ["user"]},
+                   {"webauthn_mode": "optional", "webauthn_required_roles": []}):
+        assert _loaded(_answer(values), ROLES_NOTE)["notes"] == 0
+
+
+def test_the_note_on_no_role_and_the_counts_are_drawn_apart():
+    """The counts under the switch are drawn again on each read; the note on the roles is its own, and neither
+    takes the other away."""
+    got = _loaded(_answer({"webauthn_mode": "required_for_roles", "webauthn_required_roles": []},
+                          accounts_with_only_a_passkey=2), r"""
+answers['/settings/sign-in/webauthn_enrollment_grace_days'] = { status: 'applied', setting: %s };
+const grace = rowOf('webauthn_enrollment_grace_days');
+grace.querySelector('input').value = '20';
+grace.dispatch('input');
+grace.querySelector('button').click();
+for (let i = 0; i < 10; i += 1) await tick();
+out({ roles: rowOf('webauthn_mode').querySelectorAll('.signin-roles-note').length,
+      counts: rowOf('webauthn_mode').querySelectorAll('.signin-setting-note').length });
+""" % json.dumps(next(row for row in _answer()["settings"] if row["key"] == "webauthn_enrollment_grace_days")))
+    assert got == {"roles": 1, "counts": 1}

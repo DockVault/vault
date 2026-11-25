@@ -83,14 +83,14 @@ def _spec(key: str, kind: str, default, label: str, help: str = "", level: str =
 _spec(MODE, "enum", OPTIONAL, "Passkeys", choices=(OFF, OPTIONAL, REQUIRED_FOR_ROLES), env=MODE,
       help="Off keeps every registered passkey but accepts none: an account whose only second factor is a "
            "passkey sets an authenticator app up at its next sign-in, and its passkeys count again when passkeys "
-           "are turned back on. Optional lets people add one. Required for roles makes the roles below set one "
-           "up, after a grace period.")
-_spec(REQUIRED_ROLES, "list", [], "Roles that must have a passkey", choices=ROLES, level=registry.ADVANCED,
-      env=REQUIRED_ROLES,
+           "are turned back on. Optional lets people add one. Required for roles makes the roles chosen under "
+           "'Roles that must have a passkey' set one up, within 'Days to set a required passkey up'.")
+_spec(REQUIRED_ROLES, "list", [], "Roles that must have a passkey", choices=ROLES, env=REQUIRED_ROLES,
       help="Applies with the mode 'required for roles'. No save-time check can know whether every person's "
-           "browser can make a passkey: the grace period and the host tool are the safety net.")
+           "browser can make a passkey: the grace period and the host tool (python dockvault.py accounts --action "
+           "clear-passkey-requirement) are the safety net.")
 _spec(GRACE_DAYS, "int", 14, "Days to set a required passkey up", minimum=1, maximum=90, unit="days",
-      level=registry.ADVANCED, env=GRACE_DAYS,
+      env=GRACE_DAYS,
       help="From the first sign-in under the requirement; the person is warned with the date until then.")
 _spec(SIGN_IN_ROLES, "list", ["user", "external"], "Roles a passkey signs in alone", choices=SIGN_IN_CHOICES,
       env=SIGN_IN_ROLES,

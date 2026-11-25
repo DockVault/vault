@@ -54,9 +54,12 @@ def test_the_page_says_where_passkeys_are_made_and_lists_the_settings(page: Page
     box = page.locator("#signin-passkey-settings")
     expect(box.locator('[data-setting="webauthn_mode"] select')).to_have_value("optional")
     expect(box.locator('[data-setting="webauthn_sign_in"]')).to_be_visible()
-    expect(box.locator('[data-setting="webauthn_enrollment_grace_days"]')).to_be_hidden()
-    show_advanced(page, "signin")
+    # 'Required for roles' needs its roles and their days: they show with it.
+    expect(box.locator('[data-setting="webauthn_required_roles"]')).to_be_visible()
     expect(box.locator('[data-setting="webauthn_enrollment_grace_days"]')).to_be_visible()
+    expect(box.locator('[data-setting="webauthn_allowed_algs"]')).to_be_hidden()
+    show_advanced(page, "signin")
+    expect(box.locator('[data-setting="webauthn_allowed_algs"]')).to_be_visible()
     assert box.locator("[data-setting]").count() == 9
     # Nothing to save until something is changed.
     expect(page.locator(VERIFY).get_by_role("button", name="Save")).to_be_disabled()
@@ -261,3 +264,25 @@ def test_the_page_says_when_direct_attestation_has_no_trust_anchors(page: Page, 
     page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
     expect(page.locator(ATTESTATION + " select")).to_have_value("none", timeout=10000)
     expect(alert).to_be_hidden()
+
+
+def test_required_for_roles_with_no_role_chosen_says_nobody_is_required(page: Page, admin_creds):
+    def no_role(body):
+        _value(body, "webauthn_mode", "required_for_roles")
+        _value(body, "webauthn_required_roles", [])
+    _with_the_answer_changed(page, no_role)
+    _open(page, admin_creds)
+    note = page.locator(MODE + " .signin-roles-note")
+    expect(note).to_have_text("No role is chosen under “Roles that must have a passkey”: nobody is required "
+                              "to hold a passkey.")
+    # The roles are there to choose, without "Show advanced settings".
+    expect(page.locator('#signin-passkey-settings [data-setting="webauthn_required_roles"]')).to_be_visible()
+    page.unroute_all(behavior="ignoreErrors")
+
+    def a_role(body):
+        _value(body, "webauthn_mode", "required_for_roles")
+        _value(body, "webauthn_required_roles", ["user"])
+    _with_the_answer_changed(page, a_role)
+    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    expect(page.locator(MODE + " .signin-roles-note")).to_have_count(0, timeout=10000)
+    page.unroute_all(behavior="ignoreErrors")

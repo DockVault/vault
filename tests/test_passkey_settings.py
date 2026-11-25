@@ -65,6 +65,14 @@ def test_the_nine_settings_live_on_the_sign_in_page_with_their_defaults():
     # Who types the password after a passkey whatever the list says: administrators, and a holder of the auditor
     # right (in force or suspended), as the sign-in decides it.
     assert "auditor right" in specs[wss.SIGN_IN_ROLES].help and "not only proposed" in specs[wss.SIGN_IN_ROLES].help
+    # 'Required for roles' needs the roles and their days: shown with it, named by their labels, and the way out for
+    # one person named by its command.
+    assert specs[wss.REQUIRED_ROLES].level == registry.ESSENTIAL and specs[wss.GRACE_DAYS].level == registry.ESSENTIAL
+    assert "'Roles that must have a passkey'" in specs[wss.MODE].help and "the roles below" not in specs[wss.MODE].help
+    assert "'Days to set a required passkey up'" in specs[wss.MODE].help
+    assert specs[wss.REQUIRED_ROLES].label == "Roles that must have a passkey"
+    assert specs[wss.GRACE_DAYS].label == "Days to set a required passkey up"
+    assert "python dockvault.py accounts --action clear-passkey-requirement" in specs[wss.REQUIRED_ROLES].help
 
 
 def test_the_policy_is_built_from_the_settings(monkeypatch):

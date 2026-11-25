@@ -305,12 +305,27 @@
         }
     }
 
+    // 'Required for roles' with no role chosen requires nobody (the requirement asks only the roles listed): said on
+    // the Passkeys row, in a note of its own that the counts leave in place.
+    function drawRolesNote(data) {
+        document.querySelectorAll('#signin-passkey-settings .signin-roles-note').forEach((note) => note.remove());
+        const roles = valueOf(data, 'webauthn_required_roles');
+        if (valueOf(data, 'webauthn_mode') !== 'required_for_roles' || (Array.isArray(roles) && roles.length)) return;
+        const row = rowOf('webauthn_mode');
+        if (!row) return;
+        const listed = ((data && data.settings) || []).find((one) => one.key === 'webauthn_required_roles');
+        const label = (listed && listed.label) || 'Roles that must have a passkey';
+        row.appendChild(el('p', 'alert alert-warning mt-xs signin-roles-note',
+            `No role is chosen under “${label}”: nobody is required to hold a passkey.`));
+    }
+
     // Everything said around the rows, from one read of the page.
     function drawAround(data) {
         drawReadiness(data);
         drawAnchors(data);
         drawOlder(data);
         drawCounts(data);
+        drawRolesNote(data);
     }
 
     async function load() {
