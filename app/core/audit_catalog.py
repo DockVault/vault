@@ -95,9 +95,10 @@ ACTIONS: Tuple[AuditAction, ...] = (
                 automatic=True),
     AuditAction("sso_access_ended_by_refusal", "sign_in", "Access ended: the provider refused the person", "warning"),
     AuditAction("sso_refusal_cleared", "sign_in", "A provider's refusal lifted by an administrator", "notice"),
-    AuditAction("sso_password_sign_in_restored", "sign_in",
-                "A privileged account that signed in only through a provider may hold a password again", "warning",
-                automatic=True),
+    # An account that signed in only through a provider and is privileged (an administrator, an auditor) may hold
+    # a password again; the row's details name the account and why.
+    AuditAction("sso_password_sign_in_restored", "sign_in", "Password allowed again for a privileged account",
+                "warning", automatic=True),
     # Written when the tab stages the provider's answer, for a step-up, an unlink or a first passkey: what spends it
     # may still refuse it, so the label says only what was given. The row's step_up names the action it was for.
     AuditAction("step_up_idp_reauth", "sign_in", "Fresh provider sign-in given to confirm an action", "notice"),
@@ -139,8 +140,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("email_change_confirmed", "accounts", "Email address changed", "notice"),
     AuditAction("email_change_requested", "accounts", "Email change requested", "info"),
     AuditAction("email_confirmation_requested", "accounts", "A code to confirm the account's own address requested", "info"),
-    AuditAction("email_confirmed", "accounts",
-                "Email address confirmed (by its owner with a code, or by an administrator)", "notice"),
+    # By its owner with a code, or by an administrator: the row's method says which.
+    AuditAction("email_confirmed", "accounts", "Email address confirmed", "notice"),
     # An account whose password someone else set was made an administrator: the password was made
     # unusable and its sessions ended, and the person sets a new one with a reset link.
     AuditAction("password_reset_at_promotion", "accounts", "Password taken back at promotion", "notice"),

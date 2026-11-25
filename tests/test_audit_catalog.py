@@ -253,3 +253,13 @@ def test_a_fresh_provider_sign_in_is_not_called_a_confirmed_step_up():
     label = catalog.lookup("step_up_idp_reauth").label
     assert "confirmed" not in label.lower(), label
     assert label == "Fresh provider sign-in given to confirm an action"
+
+
+def test_every_label_fits_a_phones_row():
+    # A phone shows a row's label on one line beside its time, cut short with an ellipsis. The row's details
+    # say the rest (who confirmed an address, why a password was allowed again), so a label is kept short.
+    labels = [a.label for a in catalog.ACTIONS] + [v for by in catalog.ROW_LABELS.values() for v in by.values()]
+    too_long = sorted((len(label), label) for label in labels if len(label) > 66)
+    assert not too_long, too_long
+    assert catalog.label_for("email_confirmed") == "Email address confirmed"
+    assert catalog.label_for("sso_password_sign_in_restored") == "Password allowed again for a privileged account"
