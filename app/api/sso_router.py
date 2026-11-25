@@ -1392,7 +1392,7 @@ def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime]
             "you in now: without this one nothing would sign you in. Set a password first (\"Forgot password\" "
             "on the sign-in page, or ask an administrator for a reset link), then unlink."))
     linked_by = getattr(identity, "linked_by", None)
-    if row is not None and linked_by == sso_only.MADE_AT_A_FIRST_SIGN_IN \
+    if row is not None and linked_by in sso_only.MADE_THROUGH_THE_PROVIDER \
             and sso_only.holds_to_no_password(row, account, linked_by):
         return (UNLINK_MADE_HERE, (
             f"Your account was made at its first sign-in through {row.label or row.name}, which stays its way in: "

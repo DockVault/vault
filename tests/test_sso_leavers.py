@@ -555,17 +555,24 @@ def test_which_accounts_a_provider_holds_to_no_password():
     from app.core import password_origin, sso_only
     alice, p = _user(password_hash="random-bytes"), _provider()
     password_origin.mark_nobody_knows(alice)
-    assert sso_only.MADE_AT_A_FIRST_SIGN_IN == "jit"
-    assert sso_only.holds_to_no_password(p, alice, "jit") is True
-    for by in ("self", "email", "invitation", "admin", None):
+    assert sso_only.MADE_AT_A_FIRST_SIGN_IN == "jit" and sso_only.MADE_BY_AN_INVITATION == "invitation"
+    assert sso_only.MADE_THROUGH_THE_PROVIDER == ("jit", "invitation")
+    # The accounts the provider made: at a first sign-in, or when an invitation was accepted through it. The
+    # vault met their person through the provider alone, and their password is one nobody knows.
+    for made in ("jit", "invitation"):
+        assert sso_only.holds_to_no_password(p, alice, made) is True, made
+    for by in ("self", "email", "admin", None):
         assert sso_only.holds_to_no_password(p, alice, by) is False, by
     p.policy = {"sso_jit_password": True}
-    assert sso_only.holds_to_no_password(p, alice, "jit") is False and not sso_only.made_here_holds_no_password(p)
+    for made in ("jit", "invitation"):
+        assert sso_only.holds_to_no_password(p, alice, made) is False and not sso_only.made_here_holds_no_password(p)
     p.policy = {"sso_jit_password": "yes"}                  # no switch: read as the setting stands by itself
-    assert sso_only.holds_to_no_password(p, alice, "jit") is True
+    for made in ("jit", "invitation"):
+        assert sso_only.holds_to_no_password(p, alice, made) is True, made
     # A password of its own, once it has one: the account is no longer held, whatever the setting says.
     alice.password_hash = "chosen-by-its-owner"
-    assert sso_only.holds_to_no_password(p, alice, "jit") is False
+    for made in ("jit", "invitation"):
+        assert sso_only.holds_to_no_password(p, alice, made) is False, made
     # A provider whose people hold no password holds everybody linked to it.
     p.policy = {"sso_password_login": "disabled", "sso_jit_password": True}
     assert sso_only.holds_to_no_password(p, alice, "self") is True
@@ -583,8 +590,21 @@ def test_a_link_tells_the_rule_how_the_account_came_to_the_provider(monkeypatch)
     nothing_linked = DB({User: [alice], SsoProvider: [p], ExternalIdentity: []})
     assert sso_only.should_be_sso_only(nothing_linked, alice) is False
     assert sso_only.should_be_sso_only(nothing_linked, alice, also=p, also_by="jit") is True
+    assert sso_only.should_be_sso_only(nothing_linked, alice, also=p, also_by="invitation") is True
     assert sso_only.should_be_sso_only(nothing_linked, alice, also=p, also_by="self") is False
     assert sso_only.should_be_sso_only(nothing_linked, alice, also=p) is False
+    # An account that must keep a password of its own is never held, however it came to the provider.
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: "administrator")
+    for came_by in ("jit", "invitation"):
+        assert sso_only.should_be_sso_only(nothing_linked, alice, also=p, also_by=came_by) is False, came_by
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: None)
+    # ...and one already linked by an invitation is found held by the rule when its provider is saved.
+    invited = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, provider_id=p.id, linked_by="invitation")
+    linked = DB({User: [alice], SsoProvider: [p], ExternalIdentity: [invited]})
+    assert sso_only.should_be_sso_only(linked, alice) is True
+    p.policy = {"sso_jit_password": True}
+    assert sso_only.should_be_sso_only(linked, alice) is False
+    p.policy = None
     seen = []
     monkeypatch.setattr(sso_only, "settle", lambda db, user, **kw: seen.append(kw))
     monkeypatch.setattr(sso, "subject_owner", lambda db, row, answer: None)

@@ -145,22 +145,26 @@ def test_the_list_says_what_a_password_means_for_an_account_made_at_a_first_sign
     from app.core import password_origin, sso_only
     from app.core.models import ExternalIdentity
     made, own, had, held, linked, plain = (_user(db, n) for n in ("made", "own", "had", "held", "linked", "plain"))
+    invited = _user(db, "invited")
     entra = _provider(db, "entra", "Company sign-in")
     for user in (made, own, had, held):
         db.add(ExternalIdentity(user_id=user.id, provider_id=entra.id, issuer="https://idp.example.test",
                                 subject=uuid.uuid4().hex, subject_source="oidc:sub", linked_by="jit"))
+    # Made when an invitation was accepted through the provider: an account the provider made, like the others.
+    db.add(ExternalIdentity(user_id=invited.id, provider_id=entra.id, issuer="https://idp.example.test",
+                            subject=uuid.uuid4().hex, subject_source="oidc:sub", linked_by="invitation"))
     _link(db, linked, entra)
-    for user in (made, had, held, linked):
+    for user in (made, had, held, linked, invited):
         user.password_hash = "random-bytes"
         password_origin.mark_nobody_knows(user)
     had.had_a_password_at = entra.created_at or __import__("datetime").datetime(2026, 11, 1)
     held.sso_only = True
     db.commit()
-    notes = sso_only.password_set_notes(db, [made, own, had, held, linked, plain])
-    assert notes == {made.id: (
-        "made was made at its first sign-in through Company sign-in and has never had a password. With one, this "
-        "account keeps a password from now on, also if Company sign-in later stops letting the accounts it makes "
-        "set one.")}
+    notes = sso_only.password_set_notes(db, [made, own, had, held, linked, plain, invited])
+    assert notes == {name.id: (
+        f"{name.username} was made at its first sign-in through Company sign-in and has never had a password. "
+        "With one, this account keeps a password from now on, also if Company sign-in later stops letting the "
+        "accounts it makes set one.") for name in (made, invited)}
     # The list's rows carry it, and nothing for anybody else.
     assert S.UserResponse.model_fields["password_set_note"].default is None
     import inspect

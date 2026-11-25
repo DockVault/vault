@@ -691,6 +691,12 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
         "Ask an administrator.")}
     status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{made_with.id}")
     assert status == 409 and body["detail"] == said[str(made.id)]["message"], body
+    # The same for an account made when an invitation was accepted through that provider.
+    made_with.linked_by = "invitation"
+    assert told()[str(made.id)] == said[str(made.id)]
+    status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{made_with.id}")
+    assert status == 409 and body["detail"] == said[str(made.id)]["message"], body
+    made_with.linked_by = "jit"
     # The last way in of an account with no password anybody can type.
     for row in list(h.identities()):
         if row is not rows["fine"]:

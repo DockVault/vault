@@ -892,6 +892,11 @@ def accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolut
     from app.core.security import hash_password
     api = _api()
     inv, email, role, policy, now = judge_invitation(db, row, answer, invitation_id, lock=True)
+    # Whether the account signs in only through the provider is the one rule's to say, where the identity is
+    # linked below (link_identity settles the account, told that it came by an invitation): a provider whose
+    # people hold no password, or one that does not let the accounts it makes set one, holds it; an account
+    # that must keep a password of its own (an administrator) is never held. Written here first for the provider
+    # whose people hold none, as the row is made.
     sso_only = policy["sso_password_login"] == "disabled"
     user = User(id=_uuid.uuid4(), username=inv.username, email=email,
                 password_hash=hash_password(secrets.token_urlsafe(32)),

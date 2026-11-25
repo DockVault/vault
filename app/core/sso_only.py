@@ -148,6 +148,12 @@ def password_less(provider) -> bool:
 
 
 MADE_AT_A_FIRST_SIGN_IN = "jit"       # external_identities.linked_by of the identity such an account was made with
+MADE_BY_AN_INVITATION = "invitation"  # ...and of one made when an invitation was accepted through the provider
+# The accounts a provider made: the vault never met their person but through that provider. One made at a first
+# sign-in with nobody's word, and one made when an administrator's invitation was accepted there: the invitation
+# chose a name and a role, and the person who took it up is known by the provider's word alone, with a password
+# nobody knows. Both follow the provider's rule for the accounts it makes.
+MADE_THROUGH_THE_PROVIDER = (MADE_AT_A_FIRST_SIGN_IN, MADE_BY_AN_INVITATION)
 
 
 def made_here_holds_no_password(provider) -> bool:
@@ -159,12 +165,13 @@ def made_here_holds_no_password(provider) -> bool:
 
 def holds_to_no_password(provider, user, linked_by) -> bool:
     """Whether ``provider`` holds ``user``, linked to it in the way ``linked_by`` says, to no password: its people
-    hold none; or the account was made at its first sign-in there, the provider does not let such accounts set a
-    password, and the account has never had a password somebody could type: the one it holds is one nobody knows,
-    and none was replaced by such a one before (app/core/password_origin.py)."""
+    hold none; or the account was made through it (at its first sign-in there, or when an invitation was accepted
+    there: :data:`MADE_THROUGH_THE_PROVIDER`), the provider does not let such accounts set a password, and the
+    account has never had a password somebody could type: the one it holds is one nobody knows, and none was
+    replaced by such a one before (app/core/password_origin.py)."""
     if password_less(provider):
         return True
-    if linked_by != MADE_AT_A_FIRST_SIGN_IN or not made_here_holds_no_password(provider):
+    if linked_by not in MADE_THROUGH_THE_PROVIDER or not made_here_holds_no_password(provider):
         return False
     from app.core import password_origin
     return password_origin.nobody_knows(user) and not password_origin.has_had_one(user)
@@ -185,7 +192,8 @@ def password_set_notes(db, users) -> dict:
     if not never or not has_table(db, ExternalIdentity.__tablename__):
         return {}
     made = (db.query(ExternalIdentity.user_id, ExternalIdentity.provider_id)
-            .filter(ExternalIdentity.user_id.in_(list(never)), ExternalIdentity.linked_by == MADE_AT_A_FIRST_SIGN_IN).all())
+            .filter(ExternalIdentity.user_id.in_(list(never)),
+                    ExternalIdentity.linked_by.in_(MADE_THROUGH_THE_PROVIDER)).all())
     if not made:
         return {}
     shown = {p.id: ((p.label or "").strip() or (p.name or "").strip() or "its provider")

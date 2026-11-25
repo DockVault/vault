@@ -112,7 +112,9 @@ def test_an_invitation_is_accepted_through_the_provider(monkeypatch):
     (user,) = h.users_named("newbie")
     from app.core.models import RoleEnum
     assert user.role == RoleEnum.USER and user.email == "alice@example.test" and user.created_by == root.id
-    assert user.password_hash.startswith("argon2:") and user.sso_only is False and user.sftp_password_auth is True
+    # Made through the provider, with a password nobody knows: it signs in only through the provider, as the
+    # accounts made at a first sign-in do, unless the provider lets the accounts it makes set a password.
+    assert user.password_hash.startswith("argon2:") and user.sso_only is True and user.sftp_password_auth is False
     (identity,) = h.identities()
     assert identity.user_id == user.id and identity.linked_by == "invitation" and identity.subject == "subject-1"
     assert inv.accepted_at is not None and inv.accepted_user_id == user.id
@@ -121,6 +123,8 @@ def test_an_invitation_is_accepted_through_the_provider(monkeypatch):
             {"username": "newbie", "role": str(user.role), "token_prefix": inv.token_prefix, "method": "sso",
              "provider_id": str(p.id)}) in h.audits, h.audits
     (identity,) = h.identities()
+    # ("made_sso_only" in this record says that a password the account had was stopped by the link: this account
+    # is new and had none, as one made at a first sign-in.)
     assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "invitation",
                                                "identity_id": str(identity.id), "made_sso_only": False}) in h.audits
     assert ("account_welcome", "alice@example.test", None) in h.emails
@@ -702,14 +706,25 @@ def test_a_code_store_that_fails_costs_one_more_sign_in_and_never_half_an_accoun
     assert location.startswith("/#sso=") and len(h.users_named("first")) == 1 and h.finish(location)[0] == 200
 
 
-@pytest.mark.parametrize("password_login, sso_only", [("allowed", False), ("disabled", True)])
-def test_a_user_made_by_an_invitation_is_sso_only_when_the_provider_says_so(monkeypatch, password_login, sso_only):
-    root, p = _user("root", role="admin"), _provider(policy={"sso_password_login": password_login})
+@pytest.mark.parametrize("policy, sso_only", [
+    ({"sso_password_login": "allowed"}, True),                                 # as a provider stands by itself
+    ({"sso_password_login": "allowed", "sso_jit_password": True}, False),      # it lets the accounts it makes set one
+    ({"sso_password_login": "disabled"}, True),
+    ({"sso_password_login": "disabled", "sso_jit_password": True}, True),      # its people hold no password at all
+])
+def test_a_user_made_by_an_invitation_is_sso_only_when_the_provider_says_so(monkeypatch, policy, sso_only):
+    """An invitation accepted through the provider makes an account whose person the vault met through the
+    provider alone, with a password nobody knows. It follows the rule for the accounts a provider makes: held
+    to no password unless the provider lets them set one. (It could set a password with "Forgot password" at any
+    time before, also after the provider stopped vouching for it, until its days ran out.)"""
+    root, p = _user("root", role="admin"), _provider(policy=policy)
     h = Resolving(monkeypatch, [root], [p])
     token, _ = h.invite(created_by=root.id)
     _accept(h, p, token)
     (user,) = h.users_named("newbie")
     assert user.sso_only is sso_only and user.sftp_password_auth is (not sso_only)
+    from app.core import password_origin
+    assert password_origin.nobody_knows(user)
 
 
 def test_a_known_identity_signs_in_and_leaves_the_invitation_it_carried_untouched(monkeypatch):
