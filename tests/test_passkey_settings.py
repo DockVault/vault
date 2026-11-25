@@ -241,6 +241,12 @@ def test_a_removed_algorithm_keeps_existing_keys_for_thirty_days(monkeypatch):
     assert wss.algorithm_usable(db, -257, now=now + timedelta(days=31)) == (False, False)
     assert wss.algorithm_usable(db, -7, now=now) == (True, False)
     assert wss.algorithm_usable(db, -999, now=now) == (False, False)
+    # Until when a key of it is accepted, while the days run: shown beside the key.
+    assert wss.algorithm_accepted_until(db, -257, now=now) == now + timedelta(days=30)
+    assert wss.algorithm_accepted_until(db, -257, now=now + timedelta(days=29, hours=23)) == now + timedelta(days=30)
+    assert wss.algorithm_accepted_until(db, -257, now=now + timedelta(days=30)) is None        # over: refused already
+    assert wss.algorithm_accepted_until(db, -7, now=now) is None                              # allowed: no end
+    assert wss.algorithm_accepted_until(db, -999, now=now) is None
     # Allowed again: the record of its removal is forgotten.
     wss.record_algorithm_change(db, ["ES256"], ["ES256", "RS256"], now=now + timedelta(days=1))
     _resolving(monkeypatch, registry, {wss.ALLOWED_ALGS: ["ES256", "RS256"]})
@@ -307,9 +313,17 @@ def test_the_settings_route_lists_and_writes_under_the_step_up(monkeypatch):
     assert status == 200, body
     assert stepped == ["root"] and requested == [("webauthn_require_uv", False, "root")] and refreshed and announced == [("applied", "root")]
     assert body["status"] == "applied" and body["setting"]["key"] == "webauthn_require_uv"
-    # Removing an algorithm is remembered for the 30-day grace.
+    # Removing an algorithm is remembered for the 30-day grace, and the owners of keys of it are told at once.
+    told = []
+    monkeypatch.setattr(router, "_tell_the_owners_of_keys_of_a_removed_algorithm",
+                        lambda db, removed: told.append(sorted(removed)))
     status, body = _call(S, "PUT", "/settings/sign-in/webauthn_allowed_algs", {"value": ["ES256"]})
     assert status == 200 and recorded == [(("ES256", "RS256", "EdDSA"), ("ES256",))]
+    assert told == [["EdDSA", "RS256"]]
+    # Adding one back, or saving the list as it is, removes none: nobody is told.
+    del told[:]
+    status, body = _call(S, "PUT", "/settings/sign-in/webauthn_allowed_algs", {"value": ["ES256", "RS256", "EdDSA"]})
+    assert status == 200 and told == []
     # Back to the deployment's value is allowed too.
     assert _call(S, "PUT", "/settings/sign-in/webauthn_require_uv", {"value": None})[0] == 200
 
@@ -507,3 +521,41 @@ def test_a_make_saved_in_another_spelling_of_its_uuid_is_that_make(monkeypatch):
     from app.services import webauthn_service as ws
     assert str(ws._aaguid(uuid.UUID(make).bytes)) == make
     assert str(ws._aaguid(uuid.UUID(make).bytes)) in {a.lower() for a in wss.allowed_aaguids()}
+
+
+def test_the_owners_of_keys_of_a_removed_algorithm_are_told_when_it_is_removed(monkeypatch):
+    """The setting promised a notice to the owners of keys of a removed algorithm. It was sent only where such a
+    key was used within its 30 days: an owner who signed in with a password and an authenticator code meanwhile
+    met the refusal on the day after with no word before it. Each owner is told at the removal, once, with the
+    day the key stops; an owner of no such key, and of a retired one, is not."""
+    registry, wss = _mod()
+    set_bare_api_env()
+    from app.api import api_server as S
+    from app.api import sign_in_settings_router as router
+    from app.core.models import WebAuthnCredential
+    ann, ben, cy, dee = (uuid.uuid4() for _ in range(4))
+    keys = [types.SimpleNamespace(user_id=owner, cose_alg=alg, retired_at=retired) for owner, alg, retired in (
+        (ann, -257, None), (ann, -257, None), (ann, -7, None),          # two keys of the removed algorithm: told once
+        (ben, -8, None), (cy, -7, None), (dee, -257, datetime(2026, 11, 1)))]
+    db = DB({WebAuthnCredential: keys})
+    assert wss.owners_of_keys_of(db, ["RS256"]) == [ann]
+    assert wss.owners_of_keys_of(db, ["RS256", "EdDSA"]) == [ann, ben]
+    assert wss.owners_of_keys_of(db, []) == [] and wss.owners_of_keys_of(db, ["not-an-algorithm"]) == []
+    notices = []
+    monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
+        notices.append((list(ids), ntype, title, body, dedup_prefix)) or list(ids)))
+    router._tell_the_owners_of_keys_of_a_removed_algorithm(db, ["RS256"])
+    (ids, kind, title, said, dedup), = notices
+    until = (datetime.utcnow() + timedelta(days=30)).date().isoformat()
+    assert ids == [str(ann)] and kind == "security" and title == "One of your passkeys needs replacing"
+    assert f"That passkey still works until {until}; register a new passkey before then." in said
+    assert dedup == f"passkey_alg_removed:RS256:{until}"
+    # Nobody holds such a key: nobody is told. And a failure to tell undoes nothing.
+    del notices[:]
+    router._tell_the_owners_of_keys_of_a_removed_algorithm(DB({WebAuthnCredential: []}), ["RS256"])
+    assert notices == []
+
+    def broken(*a, **k):
+        raise RuntimeError("down")
+    monkeypatch.setattr(S, "_notify_users", broken)
+    router._tell_the_owners_of_keys_of_a_removed_algorithm(db, ["RS256"])            # logged, not raised

@@ -3,7 +3,7 @@
 and nothing asked of the database for an empty list. Offline, against a throwaway SQLite database."""
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -407,6 +407,15 @@ def test_a_shown_passkey_says_whether_it_is_a_factor_now_and_why_not(S, db, monk
         alone = _user(db, "alone-" + reason)
         _key(db, alone, rp_id=row.rp_id, cose_alg=row.cose_alg, uv_initialized=row.uv_initialized)
         assert wss.why_none_can_be_used(db, alone.id) == reason == wss.why_a_key_is_no_factor(db, row)
+    # A key of an algorithm removed less than 30 days ago is still a factor, and says until when.
+    removed_on = datetime.utcnow() - timedelta(days=10)
+    monkeypatch.setattr(wss, "_removed", lambda db: {"RS256": removed_on.isoformat()})
+    leaving = _key(db, owner, cose_alg=-257)
+    public = S._passkey_public(db, leaving)
+    assert public["usable"] is True and public["not_usable_because"] is None
+    assert public["accepted_until"] == S._passkey_time(removed_on + timedelta(days=30))
+    assert S._passkey_public(db, fine)["accepted_until"] is None               # its algorithm is allowed: no end
+    assert S._passkey_public(db, lapsed)["accepted_until"] is None             # refused already
     # Turned off, no passkey is a factor whatever the key is.
     monkeypatch.setattr(wss, "enabled", lambda: False)
     for row in (fine, elsewhere, lapsed, unverified):

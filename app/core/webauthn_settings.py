@@ -101,7 +101,8 @@ _spec(REQUIRE_UV, "bool", True, "The authenticator must verify the person",
 _spec(ALLOWED_ALGS, "list", ["ES256", "RS256", "EdDSA"], "Signature algorithms", choices=tuple(ALG_CODES),
       level=registry.ADVANCED,
       validate=lambda v: f"{ALLOWED_ALGS} needs at least one algorithm" if not v else None,
-      help="Removing one leaves existing keys of it usable for 30 days, with a notice to their owners.")
+      help="Removing one leaves existing keys of it usable for 30 days. Their owners are told when it is removed, "
+           "and again when they use such a key; their list of passkeys shows the date.")
 _spec(ATTESTATION, "enum", NONE, "Attestation", choices=(NONE, DIRECT), level=registry.ADVANCED,
       help="Direct asks the authenticator to prove its make, checked against the trust anchors in "
            "WEBAUTHN_ATTESTATION_ROOTS; without anchors it cannot be turned on. It applies to passkeys added from "
@@ -689,6 +690,37 @@ def algorithm_usable(db, cose_alg: int, *, now: Optional[datetime] = None) -> Tu
         return False, False
     in_grace = now - removed < timedelta(days=ALG_GRACE_DAYS)
     return in_grace, in_grace
+
+
+def algorithm_accepted_until(db, cose_alg: int, *, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Until when a stored key of this algorithm is still accepted: 30 days from the algorithm's removal, while
+    those days run. None for an algorithm that is allowed (no end is set), and for one whose days are over or
+    that was never allowed (the key is refused already)."""
+    now = now or datetime.utcnow()
+    if cose_alg in allowed_alg_codes():
+        return None
+    name = next((n for n, c in ALG_CODES.items() if c == cose_alg), None)
+    removed_at = _removed(db).get(name) if name is not None else None
+    try:
+        removed = datetime.fromisoformat(removed_at) if removed_at else None
+    except ValueError:
+        removed = None
+    if removed is None:
+        return None
+    until = removed + timedelta(days=ALG_GRACE_DAYS)
+    return until if now < until else None
+
+
+def owners_of_keys_of(db, alg_names) -> list:
+    """The accounts that hold a passkey in use of one of ``alg_names``, each once: whom a removal of those
+    algorithms concerns."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    codes = {ALG_CODES[name] for name in alg_names or () if name in ALG_CODES}
+    if not codes or not has_table(db, WebAuthnCredential.__tablename__):
+        return []
+    held = db.query(WebAuthnCredential).filter(WebAuthnCredential.retired_at.is_(None)).all()
+    return list(dict.fromkeys(key.user_id for key in held if getattr(key, "cose_alg", None) in codes))
 
 
 # --------------------------------------------------------------------------- the guards at save

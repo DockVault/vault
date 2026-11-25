@@ -86,11 +86,13 @@ def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
     old_algs = ws_settings.allowed_alg_names() if key == ws_settings.ALLOWED_ALGS else None
     verified_before = ws_settings.require_uv()
     passkeys_before = ws_settings.enabled()
+    removed_algs = []
     try:
         outcome = setting_changes.request(db, key, body.value, actor=current_user)
         if key == ws_settings.ALLOWED_ALGS and outcome.status == "applied":
             new_algs = body.value if body.value is not None else spec.default
             ws_settings.record_algorithm_change(db, old_algs, new_algs)
+            removed_algs = [name for name in old_algs or () if name not in set(new_algs or ())]
         db.commit()
     except HTTPException:
         raise
@@ -108,8 +110,32 @@ def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
             _tell_the_owners_of_keys_that_never_verified(db)
         if key == ws_settings.MODE and passkeys_before and not ws_settings.enabled():
             _tell_the_accounts_with_only_a_passkey(db)
+        if removed_algs:
+            _tell_the_owners_of_keys_of_a_removed_algorithm(db, removed_algs)
     setting_changes.announce_outcome(outcome, current_user.username)
     return {"status": outcome.status, "setting": registry.describe([key])[0]}
+
+
+def _tell_the_owners_of_keys_of_a_removed_algorithm(db, removed_algs) -> None:
+    """A signature algorithm was just removed: whoever holds a passkey of it is told now that the key is accepted
+    for 30 more days and until when. The setting promised a notice to the owners; it was sent only where the key
+    was used within those days, so an owner who signed in with a password and an authenticator code meanwhile met
+    the refusal on the day after with no word before it. Best effort: the change is saved, and the key says the
+    same when it is used."""
+    try:
+        from datetime import datetime, timedelta
+        from app.api import api_server as api
+        owners = [str(owner) for owner in ws_settings.owners_of_keys_of(db, removed_algs)]
+        if owners:
+            until = (datetime.utcnow() + timedelta(days=ws_settings.ALG_GRACE_DAYS)).date().isoformat()
+            api._notify_users(owners, "security", title="One of your passkeys needs replacing",
+                              body=("The signature algorithm one of your passkeys uses is no longer accepted by "
+                                    f"this vault. That passkey still works until {until}; register a new passkey "
+                                    "before then. Your list of passkeys shows which one."),
+                              target="#profile",
+                              dedup_prefix=f"passkey_alg_removed:{','.join(sorted(removed_algs))}:{until}")
+    except Exception as exc:  # noqa: BLE001 -- the change is saved; nothing here may undo it
+        log_failure("owners of passkeys of a removed algorithm were not told", exc)
 
 
 def _tell_the_accounts_with_only_a_passkey(db) -> None:

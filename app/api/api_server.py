@@ -11670,8 +11670,11 @@ def _passkey_public(db, row, now=None) -> dict:
     provisional = bool(row.provisional_until and row.provisional_until > now)
     why_not = (webauthn_settings.PASSKEYS_TURNED_OFF if not webauthn_settings.enabled()
                else webauthn_settings.why_a_key_is_no_factor(db, row, now=now))
+    # A key of an algorithm that was removed is accepted for 30 more days: the day it stops, while they run.
+    accepted_until = webauthn_settings.algorithm_accepted_until(db, row.cose_alg, now=now)
     return {"id": str(row.id), "label": row.label or "", "created_at": _passkey_time(row.created_at),
             "usable": why_not is None, "not_usable_because": why_not,
+            "accepted_until": _passkey_time(accepted_until) if accepted_until else None,
             "last_used_at": _passkey_time(row.last_used_at), "synced": bool(row.backup_eligible),
             "transports": list(row.transports or []), "algorithm": _PASSKEY_ALG_NAMES.get(row.cose_alg, str(row.cose_alg)),
             "attested": bool(getattr(row, "attested", False)),
