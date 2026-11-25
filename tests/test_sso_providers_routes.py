@@ -1154,8 +1154,10 @@ def test_a_providers_records_are_kept_with_the_other_settings_records():
         assert category == "administration" and category in audit_retention.PROTECTED_CATEGORIES, name
 
 
-def _sessions_through(h, row, *, standing=2, ended=1, others=1):
-    """Sessions recorded for ``row``: some in use, some ended already, and some of another provider."""
+def _sessions_through(h, row, *, standing=2, ended=1, others=1, idle=0, over=0):
+    """Sessions recorded for ``row``: some in use, some ended already, some of another provider, some that sat
+    idle (marked inactive, never ended: their token works) and some whose time is over."""
+    from datetime import datetime, timedelta
     from app.core.models import ActiveSession, SsoSession
     made = []
 
@@ -1168,7 +1170,11 @@ def _sessions_through(h, row, *, standing=2, ended=1, others=1):
     for _ in range(standing):
         add(row.id)
     for index in range(ended):
-        add(row.id, **({"is_active": False} if index % 2 == 0 else {"revoked": True}))
+        add(row.id, is_active=index % 2 == 1, revoked=True)
+    for _ in range(idle):
+        add(row.id, is_active=False, expires_at=datetime.utcnow() + timedelta(days=30))
+    for _ in range(over):
+        add(row.id, expires_at=datetime.utcnow() - timedelta(minutes=1))
     for _ in range(others):
         add(uuid.uuid4())
     return made
@@ -1181,6 +1187,20 @@ def test_the_sessions_of_a_provider_that_still_stand_are_counted(monkeypatch):
     _sessions_through(h, row, standing=2, ended=3, others=2)
     assert h.R._sessions_standing(h.db, row.id) == 2                     # in use and not ended, of this provider
     assert h.R._sessions_standing(h.db, uuid.uuid4()) == 0
+    # A session that sat idle is marked inactive and its token works all the same: it stands. One whose time is
+    # over does not, whatever its marks say.
+    _sessions_through(h, row, standing=0, ended=0, others=0, idle=3, over=2)
+    assert h.R._sessions_standing(h.db, row.id) == 5
+    from datetime import datetime, timedelta, timezone
+    now = datetime.utcnow()
+    ticking = types.SimpleNamespace(revoked=False, is_active=False, expires_at=now + timedelta(seconds=30))
+    assert h.R._still_works(ticking, now) is True
+    assert h.R._still_works(types.SimpleNamespace(revoked=False, expires_at=now), now) is False     # over at its time
+    assert h.R._still_works(types.SimpleNamespace(revoked=False, expires_at=None), now) is True     # no time on record
+    assert h.R._still_works(types.SimpleNamespace(revoked=True, is_active=True, expires_at=None), now) is False
+    # A time read with its zone is compared as the same moment.
+    aware = types.SimpleNamespace(revoked=False, expires_at=(now + timedelta(seconds=30)).replace(tzinfo=timezone.utc))
+    assert h.R._still_works(aware, now) is True
     # It could not be counted: said as that, never as "none".
     rolled = []
 
@@ -1242,6 +1262,37 @@ def test_a_turn_off_that_could_not_end_the_sessions_says_so_and_asked_again_ends
     assert status == 200 and out == {"provider": out["provider"], "changed": False} and h.order == []
 
 
+def test_a_turn_off_that_could_not_end_sessions_that_sat_idle_says_so_and_asked_again_ends_them(monkeypatch):
+    """Every session through the provider is older than an hour: the cleanup marked each inactive, and each
+    token works until its session is ended. The turn-off's ending failed. Counted as the sessions in use lately,
+    none stood: the answer and the notice said nothing, and turning the provider off again was "no change" and
+    ended nothing, while every one of them went on working."""
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row])
+    sessions = _sessions_through(h, row, standing=0, ended=1, others=1, idle=2)
+    idle = [s for s in sessions if not s.is_active and not s.revoked]
+    assert len(idle) == 2
+    path = f"/admin/sso/providers/{row.id}/state"
+    works = [False]
+
+    def end(db, provider_id, **record):
+        if not works[0]:
+            return 0
+        for session in idle:
+            session.revoked = True
+        return 2
+    monkeypatch.setattr(h.R, "_end_sessions_of", end)
+    status, out = h.call("POST", path, {"state": "disabled"})
+    assert status == 200 and out["changed"] is True and out["sessions_ended"] == 0, out
+    assert out["sessions_not_ended"] == 2
+    assert "2 session(s) that came through it could not be ended and stand until they run out" in h.told[-1][2]
+    del h.order[:], h.told[:]
+    works[0] = True
+    status, out = h.call("POST", path, {"state": "disabled"})
+    assert status == 200 and out["changed"] is False and out["sessions_ended"] == 2 and out["sessions_not_ended"] == 0
+    assert h.order == ["step_up"] and all(s.revoked for s in idle)
+
+
 def test_a_turn_off_that_ended_every_session_says_nothing_of_sessions_left(monkeypatch):
     row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
     h = Admin(monkeypatch, [row])
@@ -1249,7 +1300,7 @@ def test_a_turn_off_that_ended_every_session_says_nothing_of_sessions_left(monke
 
     def end(db, provider_id, **record):
         for session in sessions[:2]:
-            session.is_active = False
+            session.is_active, session.revoked = False, True
         return 2
     monkeypatch.setattr(h.R, "_end_sessions_of", end)
     status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "disabled"})

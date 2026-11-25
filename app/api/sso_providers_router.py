@@ -168,19 +168,35 @@ def _end_sessions_of(db, provider_id, *, by=None, ip=None, name=None) -> int:
         return 0
 
 
+def _still_works(session, now) -> bool:
+    """Whether a session's token is still taken: it is until the session is ended (``revoked``) or its time is
+    over. Not whether it was used lately: the periodic cleanup marks a session inactive once it sat idle, a new
+    password sign-in does the same to the account's earlier ones, and neither refuses the token (ending the
+    account's sessions ends those rows too, for that reason)."""
+    if getattr(session, "revoked", False):
+        return False
+    over = getattr(session, "expires_at", None)
+    return over is None or over.replace(tzinfo=None) > now
+
+
 def _sessions_standing(db, provider_id) -> Optional[int]:
-    """How many sessions that came through the provider still stand (in use, not ended), or None when that could
-    not be counted. Asked after a provider is turned off: its sessions are ended in a transaction of their own,
-    after the one that turned it off, and a failure there (an owner's turn held for longer than the wait) ended
-    none and was told to nobody. Turned off in an incident, the provider then signed nobody in while every
-    session through it stood until it ran out."""
+    """How many sessions that came through the provider still stand (their token still works), or None when
+    that could not be counted. Asked after a provider is turned off: its sessions are ended in a transaction of
+    their own, after the one that turned it off, and a failure there (an owner's turn held for longer than the
+    wait) ended none and was told to nobody. Turned off in an incident, the provider then signed nobody in while
+    every session through it stood until it ran out.
+
+    Counted as the sessions in use lately, the ones older than about an hour were left out, though they work as
+    long: a turn-off that ended none said nothing of them, and asked again it found nothing to end."""
+    from datetime import datetime
     from app.core.models import ActiveSession, SsoSession
     try:
         named = [s.session_id for s in db.query(SsoSession).filter(SsoSession.provider_id == provider_id).all()]
         if not named:
             return 0
+        now = datetime.utcnow()
         rows = db.query(ActiveSession).filter(ActiveSession.id.in_(named)).all()
-        return sum(1 for row in rows if getattr(row, "is_active", True) and not getattr(row, "revoked", False))
+        return sum(1 for row in rows if _still_works(row, now))
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         log.warning("sso sessions of a provider turned off were not counted: %s", type(exc).__name__)
