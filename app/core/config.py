@@ -407,6 +407,10 @@ class Settings(BaseSettings):
     # client-supplied XFF).
     trusted_proxies: str = Field(default="")
     trust_all_proxies: bool = Field(default=False)
+    # A PEM file of the certificate authorities a single sign-on provider inside the network uses
+    # (app/services/oidc_client._default_opener): trusted for the calls to providers only, beside the image's own
+    # store. Empty (the default): only the image's store. A file that cannot be read stops every provider call.
+    sso_ca_bundle: str = Field(default="")
     # Optional Host-header allowlist (comma-separated hostnames; TrustedHostMiddleware supports
     # a leading '*.' wildcard). EMPTY (the default) => permissive ('*', no Host validation), since a
     # self-hosted vault's served hostname is deployment-specific and unknown at build time. Set it to

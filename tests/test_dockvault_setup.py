@@ -94,3 +94,33 @@ def test_a_fresh_volume_set_keeps_the_passkey_settings_the_old_env_gave():
     assert one["WEBAUTHN_MODE"] == "off" and not [k for k in one if k.startswith("WEBAUTHN_") and k != "WEBAUTHN_MODE"]
     plain = _lines(dv.new_set_config({}, "prefix-1", "dep-1"))
     assert not [line for line in plain if line.startswith("WEBAUTHN_")], plain
+
+
+# --------------------------------------------------------------------------- the certificate authorities of a provider
+
+def test_the_example_file_says_where_a_providers_private_authority_goes_and_that_a_proxy_is_honoured():
+    text = _example()
+    assert re.search(r"^# SSO_CA_BUNDLE=/app/certs/", text, re.M)
+    block = text[text.index("# Single sign-on: the certificate authorities"):text.index("# SSO_CA_BUNDLE=")]
+    said = " ".join(" ".join(line.lstrip("#").strip() for line in block.splitlines()).split())
+    assert "added to the image's trust store for the calls to providers only" in said
+    assert "Put the file in certs/ (the HTTPS compose mounts that folder, read-only, at /app/certs)" in said
+    assert "While the file named here cannot be read, no provider can be reached, and the container log says why." in said
+    assert "HTTPS_PROXY and NO_PROXY in .env are honoured for the calls to providers." in said
+
+
+def test_a_fresh_volume_set_keeps_the_providers_authorities_and_status_says_when_the_file_is_not_in_certs(
+        tmp_path, monkeypatch):
+    lines = _lines(dv.new_set_config({"SSO_CA_BUNDLE": "/app/certs/sso-ca.pem"}, "prefix-1", "dep-1"))
+    assert "SSO_CA_BUNDLE=/app/certs/sso-ca.pem" in lines
+    assert not [line for line in _lines(dv.new_set_config({}, "prefix-1", "dep-1")) if line.startswith("SSO_CA")]
+    # A backup does not carry certs/: status and a restore say when the file .env names is not there.
+    assert "SSO_CA_BUNDLE" in [key for key, _label, _follows in dv.CERTS_FILE_SETTINGS]
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr(tool, "_passkey_addresses", lambda: None)
+    monkeypatch.setattr(dv, "cert_self_issued", lambda path: None)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    tool._print_sign_in_lines({"ALLOWED_HOSTS": "vault.example.com", "SSO_CA_BUNDLE": "/app/certs/sso-ca.pem"})
+    assert ("  Single sign-on: SSO_CA_BUNDLE names /app/certs/sso-ca.pem, and certs/sso-ca.pem does not exist (a "
+            "backup does not carry certs/): copy the file there.") in printed, printed

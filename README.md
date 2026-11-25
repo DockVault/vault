@@ -707,9 +707,9 @@ recreates the volumes, and installs the paired `.env`; it refuses a bundle whose
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
 `certs/` is not in a backup: keep your own copy of the TLS pair and of the attestation roots file,
-and put them back in `certs/` after a restore on another machine. A restore, and
-`python dockvault.py status`, say when `.env` names an attestation roots file
-(`WEBAUTHN_ATTESTATION_ROOTS`) that is not in `certs/`.
+and put them back in `certs/` after a restore on another machine. The same goes for the file of a
+single sign-on provider's certificate authorities. A restore, and `python dockvault.py status`, say
+when a file `.env` names there (`WEBAUTHN_ATTESTATION_ROOTS` or `SSO_CA_BUNDLE`) is not in `certs/`.
 
 Each backup is a folder of its own that only you can open: mode `0700` on Linux and macOS, and on
 Windows an ACL for your user, SYSTEM and Administrators only, set before anything is written into it

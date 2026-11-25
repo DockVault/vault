@@ -31,8 +31,11 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import secrets
 import socket
+import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -430,7 +433,8 @@ class _Https(urllib.request.HTTPSHandler):
 
 
 def _build_opener(context=None):
-    """The opener every call of this module is made with (``context``: a test's own trust store). Every
+    """The opener every call of this module is made with (``context``: the trust store of the deployment's
+    SSO_CA_BUNDLE, from :func:`_default_opener`, or a test's own; without one, the image's). Every
     connection is held to the call's deadline, and no redirect is followed: the address a redirect names was
     never judged under the endpoint rule, and urllib would replay the request there with its headers, the
     client's credentials among them."""
@@ -439,16 +443,62 @@ def _build_opener(context=None):
 
 _opener = _build_opener()
 
+# The opener made with the deployment's own certificate authorities (SSO_CA_BUNDLE), for the file as it was when the
+# opener was made ((path, modification time) -> opener), and the failure to read it that the log has already named.
+_bundle_lock = threading.Lock()
+_bundle_opener: dict = {"file": None, "opener": None}
+_bundle_failure_logged: dict = {"failure": None}
+
+
+def _default_opener():
+    """The opener a call that brings none is made with: the module's own (the image's trust store) when the
+    deployment names no SSO_CA_BUNDLE, else one that trusts that file's certificate authorities as well as the
+    image's store, made once for the file as it is (a changed file makes a new one). A file that cannot be read is
+    no reason to fall back to the image's store alone: the call is ``temporarily_unavailable``, and the log names
+    the failure once."""
+    from app.core.config import settings
+    path = str(getattr(settings, "sso_ca_bundle", "") or "").strip()
+    if not path:
+        return _opener
+    with _bundle_lock:
+        try:
+            file = (path, os.path.getmtime(path))
+            if _bundle_opener["file"] == file:
+                return _bundle_opener["opener"]
+            context = ssl.create_default_context()
+            context.load_verify_locations(cafile=path)
+        except (OSError, ssl.SSLError) as exc:
+            failure = (path, type(exc).__name__)
+            if _bundle_failure_logged["failure"] != failure:
+                _bundle_failure_logged["failure"] = failure
+                log.warning("sso: SSO_CA_BUNDLE cannot be read (%s)", type(exc).__name__)
+            raise OidcError(TEMPORARILY_UNAVAILABLE, "SSO_CA_BUNDLE cannot be read") from None
+        opener = _build_opener(context)
+        _bundle_opener.update(file=file, opener=opener)
+        _bundle_failure_logged["failure"] = None
+        return opener
+
+
+def _certificate_refused(exc) -> Optional[ssl.SSLCertVerificationError]:
+    """The certificate check that failed, when ``exc`` is one or urllib's wrapping of one; else None."""
+    for candidate in (exc, getattr(exc, "reason", None)):
+        if isinstance(candidate, ssl.SSLCertVerificationError):
+            return candidate
+    return None
+
 
 def fetch_json(url: str, *, method: str = "GET", data: Optional[bytes] = None, headers: Optional[dict] = None,
                timeout: int = HTTP_TIMEOUT_SECONDS, opener=None) -> dict:
-    """GET or POST ``url`` and return its JSON object: TLS verified against the image's trust store, a short
-    timeout, a body cap, no redirects, a fixed user agent. ``timeout`` is the whole call's: connecting, the TLS
-    handshake, the request, the status line, the headers and the body together, however slowly a provider sends
+    """GET or POST ``url`` and return its JSON object: TLS verified against the image's trust store (and the
+    deployment's SSO_CA_BUNDLE, :func:`_default_opener`), a short timeout, a body cap, no redirects, the fixed
+    ``USER_AGENT`` header. ``timeout`` is the whole call's: connecting, the TLS handshake, the request, the status
+    line, the headers and the body together, however slowly a provider sends
     any of them. Any failure is ``temporarily_unavailable`` (the provider's answer is logged, never shown) except
-    a non-JSON or non-object body, which is ``provider_error``."""
+    a non-JSON or non-object body, which is ``provider_error``. A certificate that did not verify is logged with
+    the reason the check gave, as the cause an administrator looks for."""
     if urllib.parse.urlsplit(url).scheme.lower() != "https":
         raise OidcError(ENDPOINT_REFUSED, "the endpoint must use https")
+    opener = opener or _default_opener()
     request = urllib.request.Request(url, data=data, method=method)
     request.add_header("Accept", "application/json")
     request.add_header("User-Agent", USER_AGENT)
@@ -456,7 +506,7 @@ def fetch_json(url: str, *, method: str = "GET", data: Optional[bytes] = None, h
         request.add_header(name, value)
     deadline = time.monotonic() + timeout
     try:
-        with (opener or _opener).open(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             raw = _read_capped(response, deadline)
     except urllib.error.HTTPError as exc:
         if exc.code in (400, 401) and method == "POST":
@@ -466,6 +516,11 @@ def fetch_json(url: str, *, method: str = "GET", data: Optional[bytes] = None, h
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         if isinstance(exc, _NotPublic) or isinstance(getattr(exc, "reason", None), _NotPublic):
             raise OidcError(ENDPOINT_REFUSED, "the endpoint resolves to a private address") from exc
+        refused = _certificate_refused(exc)
+        if refused is not None:
+            log.warning("sso provider certificate not verified: %s",
+                        getattr(refused, "verify_message", None) or refused)
+            raise OidcError(TEMPORARILY_UNAVAILABLE, "certificate not verified") from exc
         raise OidcError(TEMPORARILY_UNAVAILABLE, type(exc).__name__) from exc
     if len(raw) > MAX_BODY_BYTES:
         raise OidcError(TEMPORARILY_UNAVAILABLE, "answer over the size cap")

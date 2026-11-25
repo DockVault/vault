@@ -1125,3 +1125,130 @@ def test_a_key_one_bit_under_the_floor_is_too_short_and_one_at_it_is_not(monkeyp
     assert refused.value.code == oc.SIGNING_KEY_TOO_SHORT and refused.value.detail == "an RSA key of 2048 bits"
     # An elliptic-curve key has a size too (256), and is no RSA key: the floor is not asked of it.
     assert _verify(oc, signer, signer.token(signer.id_claims(), alg="ES256", kid="ec1"))["sub"] == "user-1"
+
+
+# --------------------------------------------------------------------------- a provider's private certificate authority
+
+class _TlsProvider:
+    """An https server on this machine whose certificate a test authority issued; it answers a JSON object."""
+
+    def __init__(self, tmp_path):
+        import socket
+        import ssl
+        import threading
+        import _mail_tls_server as certs
+        self.authority = certs.authority("Test Provider Authority")
+        cert, key = certs.server_certificate(["127.0.0.1"], issuer=self.authority)
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(certs.write_chain(str(tmp_path), key, cert))
+        self.ca_file = tmp_path / "provider-ca.pem"
+        self.ca_file.write_bytes(certs.certificate_pem(self.authority[0]))
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.listener.settimeout(0.2)
+        self.port = self.listener.getsockname()[1]
+        self.open = True
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        import ssl
+        while self.open:
+            try:
+                plain, _ = self.listener.accept()
+            except OSError:
+                continue
+            try:
+                plain.settimeout(5)
+                with self.context.wrap_socket(plain, server_side=True) as conn:
+                    asked = b""
+                    while b"\r\n\r\n" not in asked:
+                        more = conn.recv(4096)
+                        if not more:
+                            break
+                        asked += more
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\n"
+                                 b"Connection: close\r\n\r\n{\"a\": 1}")
+            except (OSError, ssl.SSLError):
+                pass                                   # the client refused the certificate: what a test is about
+
+    def close(self):
+        self.open = False
+        self._thread.join(timeout=5)
+        self.listener.close()
+
+
+@pytest.fixture
+def tls_provider(tmp_path, monkeypatch):
+    """The server, reached as a provider inside the network is (oidc_client._reach), with no proxy in the way, and the
+    deployment's SSO_CA_BUNDLE unset."""
+    from app.core.config import settings
+    oc = _oc()
+    for name in ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    monkeypatch.setattr(settings, "sso_ca_bundle", "")
+    token = oc._PUBLIC_ONLY.set(False)
+    made = _TlsProvider(tmp_path)
+    yield made
+    made.close()
+    oc._PUBLIC_ONLY.reset(token)
+
+
+def test_the_deployments_certificate_authorities_are_trusted_for_provider_calls_beside_the_images(tls_provider,
+                                                                                                    monkeypatch, caplog):
+    """A provider inside the network presents a certificate from the organisation's own authority, which the image
+    does not trust. SSO_CA_BUNDLE names a PEM file of such authorities: provider calls trust it as well as the image's
+    own store, and without it the call is refused for the certificate, which the log names (the person and the
+    administrator see the provider as unavailable, and the administrator's sentence says where to look)."""
+    from app.core.config import settings
+    from app.services import sso_sign_in as sso
+    oc = _oc()
+    url = "https://127.0.0.1:%d/ok" % tls_provider.port
+    caplog.set_level("INFO", logger="dockvault.sso")
+    with pytest.raises(oc.OidcError) as refused:
+        oc.fetch_json(url)
+    assert (refused.value.code, refused.value.detail) == (oc.TEMPORARILY_UNAVAILABLE, "certificate not verified")
+    logged = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("sso provider certificate not verified: ") and "issuer" in m for m in logged), logged
+    said = sso.test_failure_text(oc.TEMPORARILY_UNAVAILABLE)
+    assert said == ("The provider could not be reached or gave no usable answer, or its certificate could not be "
+                    "verified. Check that the vault's server can reach the issuer's address and trusts the authority "
+                    "that issued the provider's certificate (SSO_CA_BUNDLE in .env for a private one; the container "
+                    "log says which), then run the test again.")
+    monkeypatch.setattr(settings, "sso_ca_bundle", str(tls_provider.ca_file))
+    assert oc.fetch_json(url) == {"a": 1}
+    # The image's own store is still trusted: the bundle is added to it, not put in its place, and the names and
+    # the chain are checked as for any provider.
+    import ssl
+    bundled = oc._default_opener()
+    context = [h for h in bundled.handlers if isinstance(h, oc._Https)][0]._context
+    assert context.cert_store_stats()["x509_ca"] == ssl.create_default_context().cert_store_stats()["x509_ca"] + 1
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True
+    # One opener while the file is the same; the module's own opener where none is named.
+    assert oc._default_opener() is bundled
+    monkeypatch.setattr(settings, "sso_ca_bundle", "")
+    assert oc._default_opener() is oc._opener
+
+
+def test_a_bundle_that_cannot_be_read_stops_every_provider_call_and_the_log_says_why_once(tls_provider, tmp_path,
+                                                                                         monkeypatch, caplog):
+    from app.core.config import settings
+    oc = _oc()
+    url = "https://127.0.0.1:%d/ok" % tls_provider.port
+    caplog.set_level("INFO", logger="dockvault.sso")
+    not_pem = tmp_path / "not-pem.pem"
+    not_pem.write_text("not a certificate\n", encoding="utf-8")
+    for named, error in ((str(tmp_path / "missing.pem"), "FileNotFoundError"), (str(not_pem), "SSLError")):
+        caplog.clear()
+        monkeypatch.setattr(settings, "sso_ca_bundle", named)
+        for _ in range(2):
+            with pytest.raises(oc.OidcError) as refused:
+                oc.fetch_json(url)
+            assert (refused.value.code, refused.value.detail) == (oc.TEMPORARILY_UNAVAILABLE,
+                                                                  "SSO_CA_BUNDLE cannot be read")
+        logged = [r.getMessage() for r in caplog.records if "SSO_CA_BUNDLE" in r.getMessage()]
+        assert logged == ["sso: SSO_CA_BUNDLE cannot be read (%s)" % error], logged
+    # A call made with an opener of its own is not the default's: the bundle plays no part in it.
+    import ssl
+    trusting = ssl.create_default_context(cafile=str(tls_provider.ca_file))
+    assert oc.fetch_json(url, opener=oc._build_opener(trusting)) == {"a": 1}

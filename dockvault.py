@@ -1229,6 +1229,11 @@ def build_env_lines(cfg):
         if value is not None:
             value = str(value).strip()
             bare(name, "'%s'" % value if re.search(r"\s", value) else value)
+    # The certificate authorities of a single sign-on provider inside the network: written only when the operator
+    # named a file, so a fresh volume set keeps it. The file goes in certs/, as the attestation roots do.
+    sso_ca = str(cfg.get("sso_ca_bundle") or "").strip()
+    if sso_ca:
+        bare("SSO_CA_BUNDLE", sso_ca)
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -1572,6 +1577,8 @@ SELF_SIGNED_PASSKEY_NOTE = (
 CERTS_FILE_SETTINGS = (
     ("WEBAUTHN_ATTESTATION_ROOTS", "Passkeys",
      "Until the server can read it, every new passkey is refused while attestation is direct."),
+    ("SSO_CA_BUNDLE", "Single sign-on",
+     "Until the server can read it, no single sign-on provider can be reached."),
 )
 
 
@@ -2541,6 +2548,8 @@ def new_set_config(current_env, new_prefix, new_id):
         "webauthn_attestation_roots": (current_env.get("WEBAUTHN_ATTESTATION_ROOTS") or "").strip() or None,
         # And the passkey settings' deployment values, each one the current .env sets (an empty one too).
         **{name.lower(): str(current_env[name]).strip() for name in WEBAUTHN_ENV_KEYS if name in current_env},
+        # And the certificate authorities of a single sign-on provider inside the network.
+        "sso_ca_bundle": (current_env.get("SSO_CA_BUNDLE") or "").strip() or None,
     }
     return cfg
 

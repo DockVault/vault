@@ -1215,8 +1215,10 @@ TEST_FAILED_TEXTS = {
     oc.NONCE_MISMATCH: "The provider's token did not belong to this test. Run the test again.",
     oc.ENDPOINT_REFUSED: ("An address of the provider is not one the vault may call: it is inside the network, or "
                           "not https. Turn on “Inside the network” for a provider there, or correct the address."),
-    oc.TEMPORARILY_UNAVAILABLE: ("The provider did not answer in time. Check that the vault's server can reach the "
-                                 "issuer's address, then run the test again."),
+    oc.TEMPORARILY_UNAVAILABLE: ("The provider could not be reached or gave no usable answer, or its certificate "
+                                 "could not be verified. Check that the vault's server can reach the issuer's address "
+                                 "and trusts the authority that issued the provider's certificate (SSO_CA_BUNDLE in "
+                                 ".env for a private one; the container log says which), then run the test again."),
     oc.DISCOVERY_INVALID: ("The provider's discovery document could not be read at the issuer's address. Check the "
                            "issuer, or enter the discovery address itself."),
 }
