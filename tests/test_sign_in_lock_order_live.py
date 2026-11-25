@@ -447,6 +447,17 @@ elif pair.startswith("the Users page and "):
 elif pair == "a turn held for longer than a sign-in waits":
     out = together(holder=a_turn_held(alice, 2.5), writer=a_sign_in_that_comes_meanwhile(alice))
     out["sessions"], out["the sign-in waited"] = sessions(alice), waited
+elif pair == "the wait a transaction had":
+    from sqlalchemy import text
+    with SessionLocal() as s:
+        usual = s.execute(text("SELECT current_setting('lock_timeout')")).scalar()
+        s.execute(text("SET LOCAL lock_timeout = '7s'"))
+        inside = []
+        sign_in.with_a_short_wait(s, lambda: inside.append(s.execute(text("SELECT current_setting('lock_timeout')")).scalar()))
+        after = s.execute(text("SELECT current_setting('lock_timeout')")).scalar()
+        s.rollback()
+        out = {"usual": usual, "inside": inside, "after": after,
+               "next transaction": s.execute(text("SELECT current_setting('lock_timeout')")).scalar()}
 elif pair in ("a session read before", "a held sign-in read before"):
     with SessionLocal() as s:
         user = s.get(User, alice)
@@ -518,6 +529,14 @@ def test_a_sign_in_waits_a_short_time_for_a_turn_that_is_held_and_is_answered_as
     (waited,) = out["the sign-in waited"]
     assert 0.3 <= waited < 1.5, out                          # its own short wait: not the 2.5 s, nor the connection's 5
     assert out["sessions"] == [], out
+
+
+def test_the_short_wait_gives_a_transaction_the_wait_it_had_back(db_name):
+    """A transaction that had set a wait of its own gets that wait back after the short one, not the
+    connection's usual one; and nothing of it outlives the transaction."""
+    out = run_in(db_name, SCENARIO, env={"PAIR": "the wait a transaction had"})
+    assert out["usual"] == "5s" and out["inside"] == ["500ms"], out
+    assert out["after"] == "7s" and out["next transaction"] == "5s", out
 
 
 @pytest.mark.parametrize("other", ["the switch that locks", "the switch that turns off",

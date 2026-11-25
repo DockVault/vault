@@ -301,16 +301,17 @@ def _on_postgres(db) -> bool:
 
 def with_a_short_wait(db, take):
     """Run ``take``, which takes a lock, with the wait for it bounded by :data:`WRITE_WAIT_MS`, and give the
-    transaction its own wait back afterwards. A lock still held raises what the database raises
+    transaction its own wait back afterwards: the one it had, read before, not the connection's usual one (a
+    caller that had set a wait of its own keeps it). A lock still held raises what the database raises
     (lock_not_available), with the transaction as the database leaves it: the caller rolls back and answers."""
     from sqlalchemy import text
-    from app.core import database
     bounded = _on_postgres(db)
     if bounded:
-        db.execute(text(f"SET LOCAL lock_timeout = {int(WRITE_WAIT_MS)}"))
+        own = db.execute(text("SELECT current_setting('lock_timeout')")).scalar()
+        db.execute(text("SELECT set_config('lock_timeout', :wait, true)"), {"wait": f"{int(WRITE_WAIT_MS)}ms"})
     taken = take()
     if bounded:
-        db.execute(text(f"SET LOCAL lock_timeout = {int(database._LOCK_TIMEOUT_MS)}"))
+        db.execute(text("SELECT set_config('lock_timeout', :own, true)"), {"own": own})
     return taken
 
 

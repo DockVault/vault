@@ -525,8 +525,9 @@ def test_a_change_of_somebody_elses_account_takes_that_accounts_turn_before_it_t
 
 def test_a_sign_in_waits_a_short_time_for_its_turn_and_the_transaction_gets_its_own_wait_back(monkeypatch):
     """Where a sign-in is written it runs on the server's one loop: the wait for the account's turn is bounded
-    for that one statement, and the transaction's own wait is put back for what follows. Elsewhere than on
-    PostgreSQL nothing is set (there is no such wait there)."""
+    for that one statement, and the transaction's own wait is put back for what follows: the one it had (read
+    before), whatever it was, not the connection's usual one. Elsewhere than on PostgreSQL nothing is set (there
+    is no such wait there)."""
     import types
     import uuid
     from app.api import api_server as api
@@ -541,15 +542,20 @@ def test_a_sign_in_waits_a_short_time_for_its_turn_and_the_transaction_gets_its_
             return types.SimpleNamespace(dialect=types.SimpleNamespace(name=self.dialect))
 
         def execute(self, statement, params=None):
-            self.said.append(str(statement))
+            self.said.append(str(statement) if params is None else (str(statement), dict(params)))
+            return types.SimpleNamespace(scalar=lambda: self.own)
 
     assert sign_in.WRITE_WAIT_MS == 500 < database._LOCK_TIMEOUT_MS
     alice = uuid.uuid4()
     monkeypatch.setattr(api, "_sessions_turn", lambda db, user_id: db.said.append(("the turn", user_id)))
-    pg = Session("postgresql")
-    assert sign_in.with_a_short_wait(pg, lambda: api._sessions_turn(pg, alice) or "taken") == "taken"
-    assert pg.said == ["SET LOCAL lock_timeout = 500", ("the turn", alice),
-                       f"SET LOCAL lock_timeout = {database._LOCK_TIMEOUT_MS}"]
+    for own in ("5s", "7s", "0"):                    # the connection's usual wait, a longer one, none at all
+        pg = Session("postgresql")
+        pg.own = own
+        assert sign_in.with_a_short_wait(pg, lambda: api._sessions_turn(pg, alice) or "taken") == "taken"
+        assert pg.said == ["SELECT current_setting('lock_timeout')",
+                           ("SELECT set_config('lock_timeout', :wait, true)", {"wait": "500ms"}),
+                           ("the turn", alice),
+                           ("SELECT set_config('lock_timeout', :own, true)", {"own": own})], own
     other = Session("sqlite")
     sign_in.with_a_short_wait(other, lambda: api._sessions_turn(other, alice))
     assert other.said == [("the turn", alice)]
