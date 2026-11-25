@@ -6513,6 +6513,16 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     return result
 
 
+def _signs_in_only_through_its_provider_now(db, account) -> bool:
+    """Whether ``account`` signs in only through its provider, read again as it is committed. For what sets a
+    password, asked once it holds the account's turn: nothing the caller set on the account is touched but the
+    flag, which no caller changes."""
+    refresh = getattr(db, "refresh", None)
+    if refresh is not None and getattr(account, "_sa_instance_state", None) is not None:
+        refresh(account, attribute_names=["sso_only"])
+    return bool(getattr(account, "sso_only", False))
+
+
 def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, request=None,
                             for_someone_else=True, link_maker_id=_LINK_MAKER_IS_ACTOR) -> dict:
     """The change itself, for _apply_credential_change, which every caller uses."""
@@ -6526,7 +6536,9 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         # takes the turn again and waits for nothing.
         _sessions_turn(db, target.id)
     if kind == cc.PASSWORD:
-        if getattr(target, "sso_only", False):
+        # The flag as it is committed, now that the turn is held: what holds an account to its provider takes the
+        # same turn, and the caller read the account before it.
+        if _signs_in_only_through_its_provider_now(db, target):
             # Held and approved later, or made at once: a password is never set on an account that signs in only
             # through its provider (app/core/sso_only.py); the provider's setting changes first.
             raise HTTPException(status_code=409, detail=(
@@ -7866,6 +7878,12 @@ async def do_reset(token: str, body: ResetPasswordRequest, request: Request, db:
     # password is, so a refused link answers as an unknown one whatever password comes with it. The account's turn
     # at its sessions comes before the rows (the reset ends the sessions, in that turn).
     _sessions_turn(db, user.id)
+    if _signs_in_only_through_its_provider_now(db, user):
+        # Held to its provider while this request waited for the turn (a provider's save settles its accounts in
+        # their turns): refused as above. Decided on the flag read before the turn, the reset wrote a password
+        # onto an account that holds none, and the account's next settling took that for a password of its own.
+        _refuse_reset_link(db, r, user, "sso_only", ip=ip)
+        raise HTTPException(status_code=404, detail="This reset link is invalid or has expired.")
     reason = _reset_link_refusal(db, r, user, lock=True)
     if reason is not None:
         _refuse_reset_link(db, r, user, reason, ip=ip)

@@ -26,6 +26,12 @@ before it, and the sign-in is refused:
   flag the save was changing, and left the account linked to such a provider with a password it could set again.
   A turn held for longer than a link waits refuses the link as busy, with nothing linked.
 
+- a reset link the person asked for, used while a save holds the accounts the provider made to the provider
+  (the account was made at a first sign-in and its password is still the one nobody knows). Both take the
+  account's turn. The save first: the reset reads the flag again in its turn and is refused as an unknown
+  link; decided on the flag read before, it wrote the chosen password onto an account that holds none. The
+  reset first: the save finds an account with a password of its own and leaves it.
+
 - a provider's row held for longer than a sign-in waits where it is written (a save that settles many accounts):
   the sign-in is answered as busy after its own short wait, with nothing written. The routes that finish a
   sign-in are answered on the server's one loop, where the connection's five seconds would be everybody's.
@@ -49,15 +55,20 @@ import asyncio, threading, time, types
 from app.api import api_server as api
 from app.api import sso_providers_router as R
 from app.api import sso_router
-from app.core import sign_in_lockout, sso_only
-from app.core.models import (ActiveSession, ExternalIdentity, PendingLogin, RoleEnum, SsoProvider, SsoSession, User)
+from app.core import password_origin, password_reset, sign_in_lockout, sso_only
+from app.core.models import (ActiveSession, ExternalIdentity, PasswordResetToken, PendingLogin, RoleEnum,
+                             SsoProvider, SsoSession, User)
 from app.core.rate_limiter import rate_limiter
-from app.core.security import hash_password
+from app.core.security import hash_password, verify_password
 from app.services import oidc_client as oc
 from app.services import sign_in, sso_sign_in
 from app.services.auth_service import AuthService
 
-IP, SUBJECT = "192.0.2.44", "subject-1"
+IP, SUBJECT, CHOSEN = "192.0.2.44", "subject-1", "Chosen-With-A-Link-1!"
+REQUEST = types.SimpleNamespace(headers={}, client=types.SimpleNamespace(host=IP), state=types.SimpleNamespace(),
+                                base_url="https://vault.example.com/", url=types.SimpleNamespace(path="/"))
+api._notify_account_change = lambda *a, **k: None
+api._fire_action_email = lambda *a, **k: None
 api._force_close_after_commit = lambda *a, **k: None
 sign_in._record = lambda *a, **k: None
 sso_router._audit = lambda *a, **k: None
@@ -250,6 +261,66 @@ def link_to(uid, pid, pause=0.0):
     return run
 
 
+def made_at_a_first_sign_in():
+    """An account a provider made at a first sign-in while it let such accounts set a password: not flagged, its
+    password still the one nobody knows."""
+    with SessionLocal() as s:
+        row = SsoProvider(id=uuid.uuid4(), state="enabled", kind="oidc", name="made-" + uuid.uuid4().hex[:6],
+                          label="Made", issuer="https://idp3.example/", client_id="c", client_secret_enc="e",
+                          policy={"sso_jit_password": True})
+        s.add(row)
+        u = User(username="jay-" + uuid.uuid4().hex[:6], email=None, password_hash=sso_only.a_password_nobody_knows(),
+                 role=RoleEnum.USER, is_active=True, is_locked=False)
+        s.add(u)
+        s.flush()
+        password_origin.mark_nobody_knows(u)
+        s.add(ExternalIdentity(user_id=u.id, provider_id=row.id, issuer="https://idp3.example/", subject="subject-j",
+                               subject_source="oidc:sub", linked_by="jit"))
+        s.commit()
+        return u.id, row.id
+
+
+def the_made_here_rule_saved(pid, pause=0.0):
+    """The provider stops letting the accounts it made set a password: saved as the route saves it."""
+    def run():
+        ready = sso_only.a_password_nobody_knows()
+        with SessionLocal() as s:
+            row = R._row_or_404(s, pid, lock=True)
+            row.policy = {"sso_jit_password": False}
+            here.stay = pause
+            changed = sso_only.apply_password_login(s, row, unknown_hash=ready)
+            s.commit()
+            return "held" if changed["made_sso_only"] else "left as it was"
+    return run
+
+
+def a_reset_link_of_its_own(uid, pause=0.0):
+    """A reset link the person asked for, used."""
+    token, prefix = password_reset.mint_reset_token()
+    with SessionLocal() as s:
+        s.add(PasswordResetToken(user_id=uid, token_prefix=prefix,
+                                 token_hash=password_reset.hash_reset_token(token, api._reset_pepper()),
+                                 expires_at=datetime.utcnow() + timedelta(minutes=5), created_by=None,
+                                 made_by_other=False))
+        s.commit()
+
+    def run():
+        with SessionLocal() as s:
+            here.stay = pause
+            asyncio.run(api.do_reset(token=token, body=api.ResetPasswordRequest(new_password=CHOSEN), request=REQUEST,
+                                     db=s))
+            return "reset"
+    return run
+
+
+def password_of(uid):
+    with SessionLocal() as s:
+        u = s.get(User, uid)
+        return {"sso only": bool(u.sso_only), "nobody knows": password_origin.nobody_knows(u),
+                "the chosen one": bool(verify_password(CHOSEN, u.password_hash)),
+                "links left": s.query(PasswordResetToken).filter(PasswordResetToken.user_id == uid).count()}
+
+
 pair, out = os.environ["PAIR"], {}
 alice = account("alice")
 contoso = provider_with(alice)
@@ -324,6 +395,18 @@ elif pair == "saved while a renewal moves the provider's session":
             s.commit()
             return len(changed["made_sso_only"])
     out = together(writer=renewal, ender=after_the_turn_is_held(save))
+elif pair == "a reset link used while a save holds the account to its provider":
+    jay, made = made_at_a_first_sign_in()
+    # The save holds the turn for less than the connection waits, and longer than a ring of waiters takes to
+    # be found: the reset is to wait for it, and to decide on what it left.
+    out = together(ender=the_made_here_rule_saved(made, pause=1.6),
+                   writer=after_the_turn_is_held(a_reset_link_of_its_own(jay)))
+    out["the account"] = password_of(jay)
+elif pair == "the rule saved while a reset link is used":
+    jay, made = made_at_a_first_sign_in()
+    out = together(writer=a_reset_link_of_its_own(jay, pause=1.6),
+                   ender=after_the_turn_is_held(the_made_here_rule_saved(made)))
+    out["the account"] = password_of(jay)
 elif pair == "linked while a save lets the account hold a password again":
     fabrikam = second_provider()
     held_to(alice, contoso)
@@ -440,3 +523,20 @@ def test_a_link_waits_a_short_time_for_a_turn_that_is_held_and_is_refused_as_bus
     assert out["writer"] == ["error", "Refusal", "", "account_busy"], out
     assert 0.3 <= out["writer seconds"] < 1.5, out           # its own short wait: not the 2.5 s, nor the connection's 5
     assert out["after"]["links"] == 1 and out["after"]["sso only"] is False, out
+
+
+def test_a_reset_link_used_while_a_save_holds_the_account_to_its_provider_waits_and_sets_no_password(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "a reset link used while a save holds the account to its provider"})
+    assert out["ender"] == ["ok", "held"], out
+    assert out["writer"][:3] == ["error", "HTTPException", "404"], out
+    assert out["the turn was held"] is True and out["writer seconds"] >= 1.0, out    # it waited for the turn
+    assert out["the account"] == {"sso only": True, "nobody knows": True, "the chosen one": False,
+                                  "links left": 0}, out
+
+
+def test_a_save_that_comes_while_a_reset_link_is_used_waits_and_leaves_the_password_the_person_chose(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "the rule saved while a reset link is used"})
+    assert out["writer"] == ["ok", "reset"] and out["ender"] == ["ok", "left as it was"], out
+    assert out["the turn was held"] is True and out["ender seconds"] >= 1.0, out     # the save waited for the turn
+    assert out["the account"] == {"sso only": False, "nobody knows": False, "the chosen one": True,
+                                  "links left": 1}, out
