@@ -137,6 +137,12 @@ def test_only_a_kept_stored_password_pointed_at_a_new_server_is_refused(stored, 
     assert bool(moved) is refused
 
 
+def test_a_refusal_is_listed_with_the_security_warnings():
+    from app.core import audit_catalog
+    entry = audit_catalog.lookup(mail_relay.REFUSED_ACTION)
+    assert entry is not None and (entry.category, entry.severity) == ("security", "warning")
+
+
 def test_a_profile_request_keeps_the_stored_password_with_none_or_an_empty_one():
     assert mail_relay.keeps_profile_password(None) and mail_relay.keeps_profile_password("")
     assert not mail_relay.keeps_profile_password("x")
