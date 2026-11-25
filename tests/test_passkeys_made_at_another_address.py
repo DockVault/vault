@@ -257,6 +257,34 @@ def test_an_administrators_removal_that_leaves_only_keys_made_elsewhere_leaves_n
     assert result["left_without_a_factor"] is True and carol.second_factor_reset_at is not None
 
 
+def test_the_removal_notices_promise_of_a_set_up_holds_with_passkeys_turned_off_too(monkeypatch):
+    """The owner is told "It was your account's last second factor: you will set up a new one at your next
+    sign-in" wherever a removal leaves the account without one. With passkeys turned off, a key made elsewhere
+    kept and no mark written, that set-up has to come all the same: an account that holds passkeys and can use
+    none of them sets a factor up again, whatever keeps it from using them."""
+    registry, wss = _mod()
+    from _memory_db import MemoryDB
+    from app.core import auditor_rights, credential_changes as cc, legal_holds
+    from app.core.models import SecondFactorEnrollment, User, WebAuthnCredential
+    from app.services import sign_in
+    S = _api()
+    _address(monkeypatch, RP_ID)
+    _resolving(monkeypatch, registry, {wss.MODE: "off"})
+    admin, carol = _user("root", role="admin"), _user("carol")
+    lost, old = _key(carol, RP_ID, label="phone"), _key(carol, ELSEWHERE, label="old")
+    db = MemoryDB({User: [admin, carol], WebAuthnCredential: [lost, old], SecondFactorEnrollment: []})
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    monkeypatch.setattr(S, "_revoke_sessions", lambda db_, **kw: 0)
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db_, user_id: 0)
+    result = S._apply_credential_change(db, cc.PASSKEY, carol, {"passkey_id": str(lost.id)}, actor_id=admin.id,
+                                        actor_name="root")
+    assert result["left_without_a_factor"] is True and old.retired_at is None
+    assert carol.second_factor_reset_at is None                      # the kept key says it, no mark does
+    assert wss.why_none_can_be_used(db, carol.id) == wss.PASSKEYS_TURNED_OFF
+    assert S._second_factor_to_set_up_again(db, carol) is True
+
+
 HERE = "vault.example.test"
 OLDER = "older.example.test"
 
