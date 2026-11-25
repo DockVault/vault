@@ -149,3 +149,65 @@ out({ before, lines: lines(), badge: renderUserRow(carol).includes('Passkey requ
                             "signs in without a passkey although its role must hold one. That ends when the account "
                             "adds a passkey, when its role changes, or when the server’s operator puts it back."]
     assert got["badge"] is True
+
+
+# --------------------------------------------------------------------------- a password for an account that never had one
+
+NEVER = ("carol was made at its first sign-in through Okta and has never had a password. With one, this account "
+         "keeps a password from now on, also if Okta later stops letting the accounts it makes set one.")
+
+_DIALOG = r"""
+for (const id of ['change-password-user-id', 'change-password-new', 'change-password-confirm', 'change-password-modal',
+                  'change-password-note']) {
+    const el = document.createElement(id === 'change-password-note' ? 'p' : 'input');
+    el.id = id;
+    document.body.appendChild(el);
+}
+const shown = () => { const n = document.getElementById('change-password-note');
+    return { text: n.textContent, hidden: n.hidden, display: n.style.display || '' }; };
+"""
+
+
+def test_the_change_password_dialog_says_what_a_password_means_for_an_account_that_never_had_one():
+    got = _node(_DIALOG + r"""
+const dave = { id: 'u-dave', username: 'dave', role: 'user', groups: [] };
+usersView.users.push(dave);
+carol.password_set_note = '""" + NEVER + r"""';
+showChangePasswordModal('u-carol');
+const withNote = shown();
+showChangePasswordModal('u-dave');
+out({ withNote, without: shown(), open: document.getElementById('change-password-modal').classList.contains('active') });
+""", ("showChangePasswordModal",))
+    assert got["withNote"] == {"text": NEVER, "hidden": False, "display": ""}
+    assert got["without"] == {"text": "", "hidden": True, "display": "none"}
+    assert got["open"] is True
+
+
+def test_a_reset_link_for_an_account_that_never_had_a_password_says_what_the_password_it_sets_means():
+    got = _node(r"""
+carol.password_set_note = '""" + NEVER + r"""';
+for (const cls of ['copy-reset-link-btn', 'send-reset-link-btn']) {
+    const b = document.createElement('button');
+    b.className = cls;
+    b.setAttribute('data-user-id', 'u-carol');
+    b.setAttribute('data-username', 'carol');
+    document.body.appendChild(b);
+}
+attachUserListeners();
+document.querySelector('.copy-reset-link-btn').click();
+await tick();
+document.querySelector('.send-reset-link-btn').click();
+await tick();
+// A change that will wait for another administrator says it too.
+carol.credential_change = { by: 'bob', at: '2026-06-13T10:00:00Z', window_ends: '2026-06-27T10:00:00Z' };
+document.querySelector('.copy-reset-link-btn').click();
+await tick();
+out({ confirms, asked: asked.map((a) => a.path) });
+""", ("_changedBy", "pendingApproval", "confirmCredentialChange", "fillSsoStandingBadges", "attachUserListeners"))
+    copy, send, held = got["confirms"]
+    assert copy[0].startswith("Create a one-time password-reset link for carol? Anyone with the link can set a new "
+                              "password for this account.")
+    assert copy[0].endswith(" " + NEVER) and copy[1:] == ["Create reset link", None]
+    assert send[0] == "Email a password-reset link to carol? " + NEVER
+    assert held[0].endswith("This link is created only when another administrator approves it. " + NEVER)
+    assert got["asked"] == []            # each confirmation was declined: nothing was sent

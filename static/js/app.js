@@ -8644,8 +8644,11 @@ function attachUserListeners() {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
             const u = (usersView.users || []).find(x => x.id === userId);
+            // A password set through the link means for an account that never had one what any other does.
+            const note = (u && u.password_set_note) || '';
             if (!await confirmCredentialChange(u, 'The link is emailed',
-                'Email a password-reset link to ' + username + '?', 'Send reset link')) return;
+                'Email a password-reset link to ' + username + '?' + (note ? ' ' + note : ''), 'Send reset link',
+                note || undefined)) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/send-reset-link', { method: 'POST' });
@@ -8664,9 +8667,11 @@ function attachUserListeners() {
             const userId = btn.getAttribute('data-user-id');
             const username = btn.getAttribute('data-username') || 'this user';
             const u = (usersView.users || []).find(x => x.id === userId);
+            const note = (u && u.password_set_note) || '';
             if (!await confirmCredentialChange(u, 'This link is created',
-                'Create a one-time password-reset link for ' + username + '? Anyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.',
-                'Create reset link')) return;
+                'Create a one-time password-reset link for ' + username + '? Anyone with the link can set a new password for this account. It is shown once, expires, and can be used only once; using it signs the account out everywhere.'
+                    + (note ? ' ' + note : ''),
+                'Create reset link', note || undefined)) return;
             btn.disabled = true;
             try {
                 const r = await apiRequest('/users/' + encodeURIComponent(userId) + '/reset-link', { method: 'POST' });
@@ -8940,6 +8945,16 @@ function showChangePasswordModal(userId) {
     document.getElementById('change-password-user-id').value = userId;
     document.getElementById('change-password-new').value = '';
     document.getElementById('change-password-confirm').value = '';
+    // An account made at its first sign-in through a provider, that never had a password: the server's sentence
+    // on what a password means for it from now on (GET /users password_set_note).
+    const note = document.getElementById('change-password-note');
+    if (note) {
+        const u = (usersView.users || []).find(x => x.id === userId);
+        const said = (u && u.password_set_note) || '';
+        note.textContent = said;
+        note.hidden = !said;
+        note.style.display = said ? '' : 'none';
+    }
     document.getElementById('change-password-modal').classList.add('active');
     // The password rule is the deployment's, read when the dialog opens (static/js/password-policy.js).
     if (window.PasswordPolicy) {

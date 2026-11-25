@@ -3829,6 +3829,8 @@
                         <form id="change-password-form" method="post">
                             <div class="modal-body">
                                 <input type="hidden" id="change-password-user-id">
+                                <!-- What a password means for an account made at a provider's sign-in that never had one (GET /users password_set_note); filled when the dialog opens. -->
+                                <p id="change-password-note" class="form-help text-warning" style="display: none;" hidden></p>
                                 <div class="form-group">
                                     <label for="change-password-new">New Password</label>
                                     <input type="password" id="change-password-new" class="form-control" required minlength="8" autocomplete="new-password">
