@@ -1584,6 +1584,11 @@ async def list_my_identities(
         # settles the account with (sso_only.settle): the page says so before the unlink.
         out["restores_password"] = (bool(getattr(current_user, "sso_only", False))
                                     and not sso_only.should_be_sso_only(db, current_user, without=identity))
+        # The day a sign-in through it is due, while the provider is on and has not refused the person: the notices
+        # that the day is near or has passed open this page (sso_freshness.NOTICE_TARGET), which says it.
+        found = sso_freshness.deadline_of(identity, row)
+        out["due_at"] = (found.due.isoformat() + "Z"
+                         if found is not None and found.due and found.provider_on and not found.refused else None)
         return out
     from app.core import privileged_accounts
     # An administrator's or auditor's account keeps a password of its own: a provider whose people hold none never

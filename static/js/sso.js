@@ -323,6 +323,12 @@
             // Who the identity is at the provider, as the provider said when it was linked: a wrong one shows.
             const who = [identity.display_name, identity.email].filter((v) => typeof v === 'string' && v);
             if (who.length) bits.unshift('as ' + who.join(', '));
+            // The day a sign-in through it is due (the notices that it is near or has passed open this page).
+            const due = typeof identity.due_at === 'string' ? Date.parse(identity.due_at) : NaN;
+            if (!isNaN(due)) {
+                bits.push(due > Date.now() ? 'sign in through it by ' + when(identity.due_at)
+                    : 'its time ran out on ' + when(identity.due_at) + ': sign out and sign in through it');
+            }
             text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
             row.appendChild(text);
             const refusal = identity.unlink_refusal;

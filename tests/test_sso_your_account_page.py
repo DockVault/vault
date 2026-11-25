@@ -299,3 +299,21 @@ out(page());
     first, second = got["rows"]
     assert "as alice@corp.example · Linked " in first["text"]
     assert "as Alice Corp · Linked " in second["text"]
+
+
+def test_an_identity_with_a_sign_in_due_says_by_when_and_one_whose_day_has_passed_says_so():
+    """The notices that a sign-in through a provider is due open Your account: the row says by when, or that the day
+    has passed and what to do."""
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+await window.Sso.renderAccount();
+out(page());
+""".replace("LISTED", _list(
+        _identity(due_at="2026-12-01T09:30:00Z"),
+        _identity(id="i-2", provider_id="p-2", provider="Fabrikam", due_at="2026-11-01T09:30:00Z"),
+        _identity(id="i-3", provider_id="p-3", provider="Northwind"))))
+    due, passed, none = got["rows"]
+    assert due["text"].endswith("last signed in Nov 19, 2026 · sign in through it by Dec 1, 2026Unlink"), due
+    assert "its time ran out on Nov 1, 2026: sign out and sign in through it" in passed["text"]
+    assert "sign in through it by" not in passed["text"]
+    assert "sign in through it by" not in none["text"] and "ran out" not in none["text"]

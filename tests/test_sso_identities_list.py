@@ -187,3 +187,25 @@ def test_the_identity_whose_unlink_gives_the_account_its_password_back_is_marked
     # An account that holds a password of its own gets nothing back from any unlink.
     alice.sso_only = False
     assert {i["restores_password"] for i in _listed(h)["identities"]} == {False}
+
+
+def test_an_identity_whose_provider_asks_for_a_sign_in_by_a_date_carries_that_date(monkeypatch):
+    """The notice that a sign-in through a provider is due opens Your account: the list gives the date there, while the
+    provider is on and has not refused the person (a refusal is said by the unlink's refusal instead)."""
+    from datetime import datetime, timedelta
+    alice = _user()
+    last = datetime(2026, 11, 1, 9, 30)
+    p = _provider(name="contoso", label="Contoso", policy={"sso_freshness_days": 14, **ONE_STEP})
+    q = _provider(name="fabrikam", label="Fabrikam", policy={"sso_freshness_days": 0, **ONE_STEP})       # asks nothing
+    on_p = _identity(alice, p, subject="s-p", last_sign_in_at=last)
+    on_q = _identity(alice, q, subject="s-q", last_sign_in_at=last)
+    h = Harness(monkeypatch, [alice], [p, q], identities=[on_p, on_q])
+
+    def due():
+        return {i["provider_id"]: i["due_at"] for i in _listed(h)["identities"]}
+    assert due() == {str(p.id): (last + timedelta(days=14)).isoformat() + "Z", str(q.id): None}
+    p.state = "disabled"                                     # nobody can sign in through it now
+    assert due()[str(p.id)] is None
+    p.state = "enabled"
+    on_p.refused_at = last + timedelta(hours=1)              # refused after the last sign-in
+    assert due()[str(p.id)] is None
