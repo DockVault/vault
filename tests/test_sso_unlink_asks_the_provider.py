@@ -199,12 +199,13 @@ def test_an_administrator_unlinks_an_identity_for_somebody_under_the_step_up_and
     steps, told, owners = [], [], []
     monkeypatch.setattr(A, "_step_up", lambda db, user, request: steps.append(user.username))
     monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append((by, title, body)))
-    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change: owners.append((user.username, change)))
+    monkeypatch.setattr(sso_router, "_tell_owner",
+                        lambda db, user, row, title, change, advice=None: owners.append((user.username, change, advice)))
     assert F.held_to_a_provider(h.db, alice) is not None
     status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{own.id}")
     assert status == 409 and body["detail"]["reason"] == "own_identity" and steps == []
     status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{held.id}")
-    assert status == 200 and body == {"removed": True, "sessions_ended": 0, "held": True}, body
+    assert status == 200 and body == {"removed": True, "sessions_ended": 0, "held": True, "keys_paused": False}, body
     assert steps == ["root"] and held not in h.identities() and F.held_to_a_provider(h.db, alice) is None
     # The record says what the unlink did: the hold it ended, and no password given back. The provider's refusal
     # ended with the identity, and is recorded as a refusal lifted, by way of the unlink.
@@ -215,6 +216,10 @@ def test_an_administrator_unlinks_an_identity_for_somebody_under_the_step_up_and
                        "via": "unlink"}]
     assert told[-1][1] == "An identity was unlinked by an administrator" and "the hold ended with the identity" in told[-1][2]
     assert owners[-1][0] == "alice" and owners[-1][1].startswith("root unlinked your account from ")
+    # The owner did not do it, and has nothing to remove: the advice is the one for an administrator's change.
+    assert owners[-1][2] == sso_router.BY_AN_ADMINISTRATOR == "If you did not expect this, ask an administrator."
+    assert unlinked["unlinked_by"] == "administrator" and unlinked["keys_paused"] is False
+    assert unlinked["due"] == held.refused_at.isoformat() + "Z" or unlinked["due"].endswith("Z")
     status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{made_with.id}")
     assert status == 200 and body["may_set_password"] is True and body["held"] is False, body
     assert made.sso_only is False and "The account may hold a password again." in told[-1][2]
@@ -257,7 +262,8 @@ def test_an_administrators_unlink_that_would_leave_no_way_in_is_refused_with_wha
     told, owners = [], []
     monkeypatch.setattr(A, "_step_up", lambda db, user, request: None)
     monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append((by, title, body)))
-    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change: owners.append((user.username, change)))
+    monkeypatch.setattr(sso_router, "_tell_owner",
+                        lambda db, user, row, title, change, advice=None: owners.append((user.username, change, advice)))
     ended = []
     monkeypatch.setattr(sso_router, "_end_what_came_through", lambda db, user, identity: ended.append(identity.id) or 0)
     del h.db.log[:]
@@ -313,7 +319,7 @@ def test_an_administrators_unlink_takes_the_turn_locks_the_identity_and_ends_wha
     monkeypatch.setattr(A, "_step_up", lambda db, user, request: order.append("step up"))
     monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: order.append(("the turn", str(owner))))
     monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append(body))
-    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change: None)
+    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change, advice=None: None)
 
     def ended(db, user, linked):
         # By now the identity is held: the lock was taken after the turn, and before anything is ended.
@@ -323,7 +329,7 @@ def test_an_administrators_unlink_takes_the_turn_locks_the_identity_and_ends_wha
     monkeypatch.setattr(sso_router, "_end_what_came_through", ended)
     del h.db.log[:]
     status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{identity.id}")
-    assert status == 200 and body == {"removed": True, "sessions_ended": 2, "held": False}, body
+    assert status == 200 and body == {"removed": True, "sessions_ended": 2, "held": False, "keys_paused": False}, body
     assert order == ["step up", ("the turn", str(alice.id)), ("ended", "alice", str(identity.id))]
     locks = [i for i, step in enumerate(h.db.log) if step[:2] == ("lock", ExternalIdentity)]
     assert len(locks) == 1 and locks[0] < h.db.log.index(("commit",))
@@ -370,3 +376,183 @@ def test_an_administrator_who_unlinks_their_own_identity_is_not_told_of_it_as_an
     assert status == 200 and out["removed"] is True, out
     to_administrators = [ids for ids, title in h.notices if title == "ada unlinked " + (p.label or p.name)]
     assert to_administrators == [[str(root.id)]], h.notices
+
+
+@pytest.mark.parametrize("case", ["a provider that only pauses keys", "days that ran out while the provider was off",
+                                  "an account a hold does not reach"])
+def test_an_administrators_unlink_says_a_pause_of_the_keys_where_nothing_was_held(monkeypatch, case):
+    """'Held to its own sign-in' is said only where the hold applied. Where the provider only pauses keys, where
+    its days ran out while it was off (they hold nothing then), and for an account a hold never reaches, what
+    ended with the identity was a pause of the keys, and the record, the answer and the notice say that."""
+    from app.api import sso_admin_router as A
+    from app.api import sso_providers_router as R
+    from app.api import sso_router
+    from app.services import sso_freshness as F
+    root = _user("root", role="admin")
+    alice = _user(role="admin" if case == "an account a hold does not reach" else "user")
+    p = _provider(state="disabled" if case.startswith("days") else "enabled",
+                  policy={"sso_lapse_ends_sign_in": False} if case.startswith("a provider") else {})
+    lapsed = _identity(alice, p, last_sign_in_at=datetime.utcnow() - timedelta(days=40))
+    h = Harness(monkeypatch, [root, alice], [p], identities=[lapsed])
+    told = []
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: None)
+    monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append(body))
+    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change, advice=None: None)
+    assert F.lapsed(h.db, alice.id) is not None and F.held_to_a_provider(h.db, alice) is None
+    status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{lapsed.id}")
+    assert status == 200 and (body["held"], body["keys_paused"]) == (False, True), body
+    record = [a[2] for a in h.audits if a[0] == "sso_identity_unlinked"][-1]
+    assert (record["held"], record["keys_paused"], record["unlinked_by"]) == (False, True, "administrator")
+    assert record["due"].endswith("Z") and record["due"][:10] <= datetime.utcnow().strftime("%Y-%m-%d")
+    assert "had paused that account's SSH keys, temporary credentials and devices" in told[-1]
+    assert "held that account to its own sign-in" not in told[-1]
+
+
+def test_an_identity_with_nothing_missed_is_unlinked_by_an_administrator_with_neither_said(monkeypatch):
+    from app.api import sso_admin_router as A
+    from app.api import sso_providers_router as R
+    from app.api import sso_router
+    root, alice, p = _user("root", role="admin"), _user(), _provider()
+    fresh = _identity(alice, p, last_sign_in_at=datetime.utcnow())
+    h = Harness(monkeypatch, [root, alice], [p], identities=[fresh])
+    told = []
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: None)
+    monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append(body))
+    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change, advice=None: None)
+    status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{fresh.id}")
+    assert status == 200 and (body["held"], body["keys_paused"]) == (False, False), body
+    assert "paused" not in told[-1] and "held that account" not in told[-1]
+
+
+def test_an_identity_that_goes_while_the_administrator_gives_the_step_up_is_answered_as_not_found(monkeypatch):
+    """The step-up may commit, and what was loaded before it is read again afterwards. An identity its owner
+    unlinked in that moment has no row to read again: asked for the account it belonged to then, the route
+    answered an error. Whose account it is, is kept before the step-up."""
+    from app.api import sso_admin_router as A
+    class Gone(Exception):
+        pass
+
+    class Identity:
+        """An identity row whose columns can no longer be read once it is deleted, as a session's object is."""
+        deleted = False
+
+        def __init__(self, source):
+            self._user_id = source.user_id
+            self.__dict__.update({k: v for k, v in vars(source).items() if k != "user_id"})
+
+        @property
+        def user_id(self):
+            if self.deleted:
+                raise Gone("the row was deleted: nothing to read again")
+            return self._user_id
+
+    root, alice, p = _user("root", role="admin"), _user(), _provider()
+    identity = Identity(_identity(alice, p, last_sign_in_at=datetime.utcnow()))
+    h = Harness(monkeypatch, [root, alice], [p], identities=[identity])
+    turns = []
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: turns.append(str(owner)))
+
+    def the_owner_unlinks_meanwhile(db, user, request):
+        from app.core.models import ExternalIdentity
+        h.db.rows_of(ExternalIdentity).remove(identity)
+        identity.deleted = True
+    monkeypatch.setattr(A, "_step_up", the_owner_unlinks_meanwhile)
+    status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{identity.id}")
+    assert status == 404, body
+    assert turns == [str(alice.id)]                    # the turn of the account it belonged to, kept beforehand
+
+
+def test_what_the_administrators_are_told_of_an_owners_unlink():
+    """Whether the provider confirmed it, and if not, why none was asked; the day a sign-in there was due and
+    whether the account had been warned; and what really stops waiting for the provider, by its own rules."""
+    from app.api import sso_router
+    from app.core import sso_policy
+    from app.services import sso_freshness as F
+    now = datetime(2026, 11, 25, 12, 0, 0)
+    closes = sso_policy.effective(None)
+    pauses = sso_policy.effective({"sso_lapse_ends_sign_in": False})
+    nothing = sso_policy.effective({"sso_freshness_days": 0, "sso_refusal_ends_access": False})
+
+    def standing(days_left, window=30):
+        return F.Deadline(identity_id="i", user_id="u", provider_id="p", provider_name="Contoso",
+                          due=now + timedelta(days=days_left), refused=False, window_days=window, ends_sign_in=True,
+                          provider_on=True)
+
+    def told(**kw):
+        base = dict(asked=False, linked_by="self", standing=None, policy=closes, reached=True, now=now)
+        base.update(kw)
+        return sso_router.owners_unlink_text("alice", "Contoso", **base)
+    tail = " Check the Users page if you did not expect this."
+    closing = (" From now on Contoso says nothing about this account: what signs it in without Contoso (a password, "
+               "passkeys) and its SSH keys no longer wait for a sign-in there.")
+    assert told(asked=True) == ("alice removed Contoso from the ways their account signs in, after a fresh sign-in "
+                                "through Contoso." + closing + tail)
+    # The one unlink that stays one step: the record's reader must be able to find it, three days before it is due.
+    assert told(linked_by="email", standing=standing(3)) == (
+        "alice removed Contoso from the ways their account signs in. Contoso had put the identity on the account "
+        "by its email address, so no fresh sign-in through Contoso was asked. A sign-in through Contoso was due by "
+        "2026-11-28, and the account had been warned of it." + closing + tail)
+    # Before the warning days, the day alone.
+    assert "was due by 2026-12-15." in told(asked=True, standing=standing(20))
+    assert "had been warned" not in told(asked=True, standing=standing(20))
+    assert "had been warned" in told(asked=True, standing=standing(5)) and "had been warned" not in told(
+        asked=True, standing=standing(5, window=2))                # a window of two days warns one day before
+    # A provider that only pauses keys never held the password; an account a hold does not reach neither.
+    keys_only = (" From now on Contoso says nothing about this account: its SSH keys, temporary credentials and "
+                 "devices no longer wait for a sign-in there.")
+    assert told(policy=pauses).endswith("signs in." + keys_only + tail)
+    assert told(reached=False).endswith("signs in." + keys_only + tail)
+    # A provider that asks nothing of the account's other ways in.
+    assert told(policy=nothing) == ("alice removed Contoso from the ways their account signs in. Contoso asked "
+                                    "nothing of this account's other ways in, so nothing else changes." + tail)
+    assert told(policy=None).endswith("so nothing else changes." + tail)
+    # A refusal has no day to name.
+    import dataclasses
+    assert "was due by" not in told(standing=dataclasses.replace(standing(-1), refused=True))
+
+
+def test_the_owners_unlink_records_how_the_identity_was_linked_and_tells_the_administrators_by_email_too(monkeypatch):
+    """The record says how the identity was linked as it was (not 'self' for every one), that its owner unlinked
+    it, and the day a sign-in there was due. The administrators are told in the app and by email, as they are of
+    an administrator's own unlink; the owner who is an administrator gets neither."""
+    ada, root, alice, p = _user("ada", role="admin"), _user("root", role="admin"), _user(), _provider()
+    identity = _identity(alice, p, linked_by="email", last_sign_in_at=datetime.utcnow() - timedelta(days=27))
+    h = Harness(monkeypatch, [alice, ada, root], [p], identities=[identity])
+    h.current_user = alice
+    monkeypatch.setattr(h.S, "_active_admins", lambda db: [ada, root])
+    mailed = []
+    monkeypatch.setattr(h.S, "_fire_action_email_bulk",
+                        lambda db, key, recipients, context=None: mailed.append((key, sorted(r[1] for r in recipients), context)))
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+    assert status == 200 and out["removed"] is True, out
+    record = [a[2] for a in h.audits if a[0] == "sso_identity_unlinked"][-1]
+    assert (record["linked_by"], record["unlinked_by"], record["confirmed_at_provider"]) == ("email", "owner", False)
+    assert record["due"].endswith("Z") and record["due"][:10] == (
+        identity.last_sign_in_at + timedelta(days=30)).strftime("%Y-%m-%d")
+    (ids, title), = [(ids, title) for ids, title in h.notices if title == "alice unlinked " + (p.label or p.name)]
+    assert sorted(ids) == sorted([str(ada.id), str(root.id)])
+    from app.core import setting_changes
+    (key, names, context), = [m for m in mailed if m[0] == setting_changes.EMAIL_ACTION]
+    assert names == ["ada", "root"] and context["by"] == "alice"
+    assert "by its email address, so no fresh sign-in" in context["change"]
+    assert "and the account had been warned of it" in context["change"]
+
+
+def test_the_owner_is_advised_by_who_made_the_change(monkeypatch):
+    """A change made from the owner's own account ends with what to do if it was not them. One an administrator
+    made ends with the advice for that: the owner did not do it, and has nothing to remove."""
+    from app.api import sso_router
+    said = []
+    api = types.SimpleNamespace(
+        _notify_users=lambda ids, kind, title, body, target: said.append(body),
+        _fire_action_email=lambda *a, **k: None, _change_time_text=lambda: "now")
+    monkeypatch.setattr(sso_router, "_api", lambda: api)
+    alice = _user()
+    sso_router._tell_owner(None, alice, None, "t", "You unlinked your account from Contoso.")
+    sso_router._tell_owner(None, alice, None, "t", "root unlinked your account from Contoso.",
+                           advice=sso_router.BY_AN_ADMINISTRATOR)
+    alice.sso_only = True
+    sso_router._tell_owner(None, alice, None, "t", "You linked Contoso.")
+    assert said == ["You unlinked your account from Contoso. If you did not do this, remove it and change your password.",
+                    "root unlinked your account from Contoso. If you did not expect this, ask an administrator.",
+                    "You linked Contoso. If you did not do this, tell an administrator at once."]

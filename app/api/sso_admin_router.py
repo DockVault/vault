@@ -252,13 +252,17 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
     if str(identity.user_id) == str(current_user.id):
         raise HTTPException(status_code=409, detail={"reason": "own_identity", "message": (
             "Unlink your own identity under Your account.")})
+    # Whose account it is, kept before the step-up: that may commit, and what was loaded is read again
+    # afterwards. An identity its owner unlinked, or its provider's removal took, in that moment has no row to
+    # read again; asked of the loaded one then, the answer was an error and not "no such identity".
+    target_id = identity.user_id
     _step_up(db, current_user, request)       # may commit (a receipt is used once)
     from app.api import sso_router
     from app.core import sso_only
     from app.services import sso_freshness
     # The account's turn at its sessions before any of its rows (the order of the locks), then the identity as it
     # stands, locked: one unlink at a time.
-    api._sessions_turn(db, identity.user_id)
+    api._sessions_turn(db, target_id)
     identity = _identity_or_404(db, identity_id, lock=True)
     user = db.query(User).filter(User.id == identity.user_id).populate_existing().first()
     if user is None:
@@ -266,7 +270,14 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
     provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
     label = ((provider.label or provider.name) if provider is not None else None) or "an identity provider"
     standing = sso_freshness.deadline_of(identity, provider)
-    held = standing is not None and (standing.refused or standing.due <= datetime.utcnow())
+    now = datetime.utcnow()
+    # What the provider had on the account, said as it was. Missed (a refusal, or days run out), its keys were
+    # paused. Held to the provider's own sign-in only where the hold applied: the provider closes the other
+    # ways in, was turned on when the days ran out (or refused the person), and the account is one a hold
+    # reaches (sso_freshness.closes_now, may_be_held: the hold's own rules).
+    missed = standing is not None and (standing.refused or standing.due <= now)
+    held = bool(missed and sso_freshness.closes_now(standing, now) and sso_freshness.may_be_held(db, user))
+    paused = bool(missed and not held)
     settled = sso_only.settle(db, user, without=identity)
     why_not = no_way_in_left(db, user, identity, settled)
     if why_not is not None:
@@ -274,8 +285,10 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
         raise HTTPException(status_code=409, detail={"reason": NO_WAY_IN_LEFT, "message": why_not})
     ended = sso_router._end_what_came_through(db, user, identity)
     details = {"user_id": str(identity.user_id), "provider_id": str(identity.provider_id),
-               "identity_id": str(identity.id), "linked_by": identity.linked_by, "sessions": ended,
-               "held": bool(held), "restored": settled == sso_only.RESTORED}
+               "identity_id": str(identity.id), "linked_by": identity.linked_by, "unlinked_by": "administrator",
+               "sessions": ended, "held": held, "keys_paused": paused,
+               "due": standing.due.isoformat() + "Z" if standing is not None and standing.due else None,
+               "restored": settled == sso_only.RESTORED}
     refused_by_the_provider = bool(standing is not None and standing.refused)
     db.delete(identity)
     db.commit()
@@ -294,18 +307,21 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
         sso_router._tell_owner(
             db, user, provider, "A sign-in method was removed from your account",
             f"{current_user.username} unlinked your account from {label}: it can no longer sign in through it."
-            + (" " + sso_providers_router.SET_A_PASSWORD if may_set_password else ""))
+            + (" " + sso_providers_router.SET_A_PASSWORD if may_set_password else ""),
+            advice=sso_router.BY_AN_ADMINISTRATOR)
         sso_providers_router._tell_administrators(
             current_user.username, "An identity was unlinked by an administrator",
             f"{current_user.username} unlinked {user.username} from {label}."
             + (f" {label} held that account to its own sign-in (a refusal, or days without a sign-in there): "
                "the hold ended with the identity." if held else "")
+            + (f" {label} had paused that account's SSH keys, temporary credentials and devices (a refusal, or "
+               "days without a sign-in there): the pause ended with the identity." if paused else "")
             + (" The account may hold a password again. It has none anybody can type until it sets one: it "
                "asks for a reset link on the sign-in page, or you make one for it (Users)." if may_set_password
                else ""))
     except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notices
         log.info("sso unlink notices skipped: %s", type(exc).__name__)
-    answer = {"removed": True, "sessions_ended": ended, "held": bool(held)}
+    answer = {"removed": True, "sessions_ended": ended, "held": held, "keys_paused": paused}
     if may_set_password:
         answer["may_set_password"] = True
     return answer

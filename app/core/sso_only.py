@@ -23,8 +23,9 @@ through the provider and has never had a password of its own, and the provider d
 (``sso_jit_password``, off unless an administrator turns it on): nobody at the vault ever met that person, so the
 provider stays the one way in, and a person the provider has stopped vouching for cannot make themselves a
 password with a reset link and stay. Such an account gets a password of its own only by an administrator's act:
-the option turned on, or the account made an administrator (the promotion ends the flag and sends the person a
-link to choose a password). A password it has once set is its own from then on, whatever the option says later,
+the option turned on, the account made an administrator (the promotion ends the flag and sends the person a
+link to choose a password), or the identity unlinked by an administrator (the account may hold a password again
+and sets one with a reset link; nothing is minted by the unlink). A password it has once set is its own from then on, whatever the option says later,
 and the rule is over for the account for good: also when that password is replaced later by one nobody knows (a
 provider whose people hold no password, linked for a while or set so for a while), the account is let go with
 the others when that ends. The account remembers that it has had a password (``users.had_a_password_at``,

@@ -1321,11 +1321,50 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
         log.info("sso kept-out notice skipped: %s", type(exc).__name__)
 
 
-def _tell_owner(db, user, row, title: str, change: str) -> None:
+def owners_unlink_text(username: str, label: str, *, asked: bool, linked_by, standing, policy, reached: bool,
+                       now: datetime) -> str:
+    """What the administrators are told when an owner unlinks an identity: whether the provider confirmed it, and
+    if not, why none was asked; the day a sign-in there was due, when one was; and what really stops waiting for
+    the provider, by the provider's own rules. ``standing``: the identity's deadline (or None); ``policy``: the
+    provider's; ``reached``: whether the provider's hold reaches this account (sso_freshness.may_be_held)."""
+    said = f"{username} removed {label} from the ways their account signs in"
+    if asked:
+        said += f", after a fresh sign-in through {label}."
+    elif linked_by == sso.LINKED_BY_EMAIL:
+        said += (f". {label} had put the identity on the account by its email address, so no fresh sign-in "
+                 f"through {label} was asked.")
+    else:
+        said += "."
+    if standing is not None and standing.due is not None and not standing.refused:
+        said += f" A sign-in through {label} was due by {standing.due:%Y-%m-%d}"
+        if now >= standing.due - sso_freshness.warning_lead(standing.window_days):
+            said += ", and the account had been warned of it"
+        said += "."
+    watches = bool(policy) and (policy["sso_freshness_days"] > 0 or policy["sso_refusal_ends_access"])
+    if watches and policy["sso_lapse_ends_sign_in"] and reached:
+        said += (f" From now on {label} says nothing about this account: what signs it in without {label} (a "
+                 "password, passkeys) and its SSH keys no longer wait for a sign-in there.")
+    elif watches:
+        said += (f" From now on {label} says nothing about this account: its SSH keys, temporary credentials and "
+                 "devices no longer wait for a sign-in there.")
+    else:
+        said += f" {label} asked nothing of this account's other ways in, so nothing else changes."
+    return said + " Check the Users page if you did not expect this."
+
+
+# What an account's owner is advised when an administrator, not the owner, changed how the account signs in.
+BY_AN_ADMINISTRATOR = "If you did not expect this, ask an administrator."
+
+
+def _tell_owner(db, user, row, title: str, change: str, *, advice: Optional[str] = None) -> None:
+    """Tell ``user`` of a change to how their account signs in, in the app and by email. ``advice``: what to do
+    about it, when the change was not the owner's own (the default speaks to the one who may have been
+    impersonated: it was done from their own account)."""
     api = _api()
     try:
-        advice = ("If you did not do this, tell an administrator at once." if getattr(user, "sso_only", False)
-                  else "If you did not do this, remove it and change your password.")
+        if advice is None:
+            advice = ("If you did not do this, tell an administrator at once." if getattr(user, "sso_only", False)
+                      else "If you did not do this, remove it and change your password.")
         api._notify_users([str(user.id)], "account_changed", title=title, body=f"{change} {advice}", target="#profile")
     except Exception as exc:  # noqa: BLE001
         log.info("sso owner notice skipped: %s", type(exc).__name__)
@@ -1546,6 +1585,13 @@ async def unlink_my_identity(
                 "reason": "provider_cannot_confirm", "provider": {"id": str(row.id), "label": label},
                 "message": f"{label} cannot confirm you right now, so it is not unlinked here. Ask an administrator."})
     provider_id = str(identity.provider_id)
+    # Kept for the record and the notice, before the identity goes: how it was linked, and what its provider
+    # still asked of the account (a deadline that was running).
+    linked_by = getattr(identity, "linked_by", None)
+    told = owners_unlink_text(current_user.username, (row.label or row.name) if row is not None else
+                              "an organisation provider", asked=bool(asked), linked_by=linked_by,
+                              standing=standing, policy=sso.policy_of(row) if row is not None else None,
+                              reached=sso_freshness.may_be_held(db, account), now=datetime.utcnow())
     # The flag follows the providers the account is still linked to: unlinking the one that held it to no password
     # lets it hold one again (nothing is minted), in the same transaction as the unlink.
     settled = sso_only.settle(db, account, without=identity)
@@ -1556,23 +1602,26 @@ async def unlink_my_identity(
     ended = _end_what_came_through(db, account, identity)
     db.delete(identity)
     db.commit()
+    # How the identity was linked is recorded as it was (an identity its provider put on the account by an
+    # address is unlinked in one step: the record must tell it from one the owner linked), with who unlinked it
+    # and the day a sign-in there was due.
     _audit(db, "sso_identity_unlinked", user=current_user, ip=api.get_client_ip(request),
-           details={"provider_id": provider_id, "identity_id": str(identity_id), "linked_by": "self",
-                    "sessions": ended, "confirmed_at_provider": bool(asked),
+           details={"provider_id": provider_id, "identity_id": str(identity_id), "linked_by": linked_by,
+                    "unlinked_by": "owner", "sessions": ended, "confirmed_at_provider": bool(asked),
+                    "due": standing.due.isoformat() + "Z" if standing is not None and standing.due else None,
                     "restored": settled == sso_only.RESTORED})
     label = (row.label or row.name) if row is not None else "an organisation provider"
     may_set_password = settled == sso_only.RESTORED
-    # Every unlink by its owner is told to the administrators: from now on the provider says nothing about the
-    # account, and nothing of the account waits for a sign-in there any more.
+    # Every unlink by its owner is told to the administrators, in the app and by email as an administrator's own
+    # unlink is: from now on the provider says nothing about the account. The owner who is an administrator
+    # reads their own notice as the owner, and not a second one that says somebody unlinked.
     try:
-        admins = [str(a.id) for a in api._active_admins(db) if str(a.id) != str(current_user.id)]
-        api._notify_users(admins, "account_changed", title=f"{current_user.username} unlinked {label}",
-                          body=(f"{current_user.username} removed {label} from the ways their account signs in"
-                                + (f", after a fresh sign-in through {label}" if asked else "")
-                                + f". From now on {label} says nothing about this account: its password, its passkeys "
-                                "and its SSH keys no longer wait for a sign-in there. Check the Users page if you "
-                                "did not expect this."),
-                          target="#users")
+        admins = [a for a in api._active_admins(db) if str(a.id) != str(current_user.id)]
+        api._notify_users([str(a.id) for a in admins], "account_changed",
+                          title=f"{current_user.username} unlinked {label}", body=told, target="#users")
+        from app.core import setting_changes
+        api._fire_action_email_bulk(db, setting_changes.EMAIL_ACTION, [(a.email, a.username) for a in admins],
+                                    {"change": told, "by": current_user.username, "when": api._change_time_text()})
     except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notice
         log.info("sso unlink notice to administrators skipped: %s", type(exc).__name__)
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",

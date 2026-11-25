@@ -185,6 +185,10 @@ _IDENTIFIER_KEYS = (
     # a sign-in through a provider: whether the provider's own second factor stood in for the vault's; an unlink:
     # whether the identity's provider held the account (a refusal, days run out) when it was removed
     "provider_mfa", "held",
+    # an unlink: who made it (the owner or an administrator), and whether the provider had only paused the
+    # account's keys (it does not close the other ways in, was off when the days ran out, or the account is
+    # one a hold does not reach)
+    "unlinked_by", "keys_paused",
     # a provider's group mapped to a department or a role by an administrator: the mapping's row, and the
     # department by the name administrators gave it (its id is under "group_id")
     "mapping_id", "department",
@@ -239,6 +243,7 @@ _IDENTIFIER_KEYS = (
     "unclassified_rows_deleted", "wraps", "vaults", "epoch", "key_version", "team_key_version",
     "from_version", "to_version", "retired_below_version", "retired_dek_below", "retired_team_below",
     "expires_at", "locked_until", "effective_at", "requested_at", "oldest", "newest", "timestamp",
+    "due",
     "repeat_count", "last_repeat", "change",
     "password_set_at", "sign_in_locks_cleared", "from_revision", "to_revision", "dek_epoch", "team_epoch",
     "proof_rows_deleted",
