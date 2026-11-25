@@ -112,6 +112,14 @@ def changes(before: Relay, after: Relay) -> dict:
     return out
 
 
+def keeps_profile_password(password) -> bool:
+    """Whether a sending profile's save or test send keeps the profile's stored password: it carries none, or an
+    empty one, as the form sends a password field left blank. The rule, the save and the test send each ask this,
+    so they never disagree on whether a request carries a password. (A save of the general settings that sends an
+    empty password removes the stored one instead.)"""
+    return not password
+
+
 def refused(before: Relay, after: Relay, *, password_stored: bool, password_kept: bool) -> dict:
     """The changes that refuse the request: changes(before, after) when the relay holds a stored password and the
     request keeps it (it neither carries a password nor removes the stored one) and the relay still has a server

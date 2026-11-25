@@ -224,7 +224,7 @@ def _relay_save_refusal(p: EmailProfile, after: mail_relay.Relay, payload: Profi
     its stored password goes without carrying the password): the save is refused when the second is not empty."""
     before = mail_relay.of_profile(p)
     return before, mail_relay.refused(before, after, password_stored=bool(p.smtp_password),
-                                      password_kept=not payload.smtp_password)
+                                      password_kept=mail_relay.keeps_profile_password(payload.smtp_password))
 
 
 def _rate_limit(admin_id, *, limit: int, window: int, prefix: str, detail: str) -> None:
@@ -319,7 +319,8 @@ async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Req
     if moved:
         _refuse_relay_change(db, request, admin, "profile_update", moved, profile_id=p.id)
     relay_changes = mail_relay.changes(before, after)
-    if payload.smtp_password:
+    replaces_password = not mail_relay.keeps_profile_password(payload.smtp_password)
+    if replaces_password:
         relay_changes[mail_relay.PASSWORD] = {"old": "(set)" if p.smtp_password else None, "new": "(set)"}
     p.name = payload.name.strip()
     p.description = (payload.description or "").strip() or None
@@ -330,7 +331,7 @@ async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Req
     p.from_name = (payload.from_name or "").strip() or None
     p.smtp_allow_insecure_tls = bool(payload.smtp_allow_insecure_tls)
     # Write-only password: overwrite (encrypted at rest) ONLY when a non-empty value is supplied.
-    if payload.smtp_password:
+    if replaces_password:
         p.smtp_password = encrypt_secret(payload.smtp_password)
     if payload.is_default is True and not p.is_default:
         db.query(EmailProfile).filter(EmailProfile.is_default.is_(True),
@@ -415,7 +416,8 @@ async def test_profile(payload: ProfileTestIn, request: Request,
             cfg[field] = val
     if payload.smtp_allow_insecure_tls is not None:
         cfg["smtp_allow_insecure_tls"] = bool(payload.smtp_allow_insecure_tls)
-    if payload.smtp_password:
+    password_kept = mail_relay.keeps_profile_password(payload.smtp_password)
+    if not password_kept:
         cfg["smtp_password"] = payload.smtp_password
 
     # Never pair the STORED (write-only) SMTP password with a target the caller changed, or with the certificate
@@ -424,8 +426,7 @@ async def test_profile(payload: ProfileTestIn, request: Request,
     used = mail_relay.of(cfg)
     relay_changes = mail_relay.changes(stored, used) if stored is not None else {}
     if stored is not None:
-        moved = mail_relay.refused(stored, used, password_stored=stored_has_password,
-                                   password_kept=not payload.smtp_password)
+        moved = mail_relay.refused(stored, used, password_stored=stored_has_password, password_kept=password_kept)
         if moved:
             _refuse_relay_change(db, request, admin, "profile_test", moved, profile_id=payload.profile_id)
 

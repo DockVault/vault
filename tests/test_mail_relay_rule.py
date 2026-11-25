@@ -137,6 +137,11 @@ def test_only_a_kept_stored_password_pointed_at_a_new_server_is_refused(stored, 
     assert bool(moved) is refused
 
 
+def test_a_profile_request_keeps_the_stored_password_with_none_or_an_empty_one():
+    assert mail_relay.keeps_profile_password(None) and mail_relay.keeps_profile_password("")
+    assert not mail_relay.keeps_profile_password("x")
+
+
 def test_a_settings_save_changes_the_relay_only_when_a_relay_field_or_a_password_changes():
     stored = {**RELAY, "smtp_password": STORED, "app_name": "Vault"}
     assert not mail_relay.settings_change(stored, {"app_name": "Other"})
@@ -173,13 +178,19 @@ def _reloaded(db, p):
     return db.get(EmailProfile, p.id)
 
 
+# A sending profile's save or test send keeps its stored password when it carries none, or an empty one (the form
+# sends a blank field): both are asked for the password alike.
+KEPT = pytest.mark.parametrize("kept", [{}, {"smtp_password": ""}], ids=["no-password", "empty-password"])
+
+
+@KEPT
 @pytest.mark.parametrize("over", [{"smtp_server": "elsewhere.example"}, {"smtp_port": 2525},
                                   {"smtp_username": "someone-else"}, {"smtp_allow_insecure_tls": True}],
                          ids=["server", "port", "username", "certificate-check"])
-def test_a_profile_save_that_moves_the_stored_password_without_it_is_refused(db, admin, over):
+def test_a_profile_save_that_moves_the_stored_password_without_it_is_refused(db, admin, over, kept):
     p = _profile(db)
     with pytest.raises(HTTPException) as refused:
-        _update(db, admin, p, name="Renamed", **over)
+        _update(db, admin, p, name="Renamed", **over, **kept)
     assert refused.value.status_code == 400 and refused.value.detail == REFUSAL
     kept = _reloaded(db, p)
     assert (kept.name, kept.smtp_server, kept.smtp_port, kept.smtp_username, kept.smtp_allow_insecure_tls) == (
@@ -205,11 +216,12 @@ def test_a_profile_save_with_the_password_moves_it_and_records_the_change(db, ad
     assert FRESH not in str(row.details) and _refusals(db) == []
 
 
-def test_a_profile_save_that_moves_nothing_keeps_the_stored_password(db, admin):
+@KEPT
+def test_a_profile_save_that_moves_nothing_keeps_the_stored_password(db, admin, kept):
     p = _profile(db, smtp_allow_insecure_tls=True)
     # A rename, another From, the server's case, and the certificate check turned back on: no password asked.
     out = _update(db, admin, p, name="Renamed", from_email="other@example.test",
-                  smtp_server="MAIL.example.test", smtp_allow_insecure_tls=False)
+                  smtp_server="MAIL.example.test", smtp_allow_insecure_tls=False, **kept)
     assert out["name"] == "Renamed" and out["has_password"] is True
     assert decrypt_secret(_reloaded(db, p).smtp_password) == STORED
     [row] = _rows(db, "email_profile_updated")
@@ -232,13 +244,14 @@ def _test(db, admin, **fields):
                                              request=_request(), admin=admin, db=db))
 
 
+@KEPT
 @pytest.mark.parametrize("overlay", [{"smtp_server": "elsewhere.example"}, {"smtp_port": 2525},
                                      {"smtp_username": "someone-else"}, {"smtp_allow_insecure_tls": True}],
                          ids=["server", "port", "username", "certificate-check"])
-def test_a_test_send_over_a_stored_profile_without_the_password_is_refused(db, admin, sent, overlay):
+def test_a_test_send_over_a_stored_profile_without_the_password_is_refused(db, admin, sent, overlay, kept):
     p = _profile(db)
     with pytest.raises(HTTPException) as refused:
-        _test(db, admin, profile_id=p.id, **overlay)
+        _test(db, admin, profile_id=p.id, **overlay, **kept)
     assert refused.value.status_code == 400 and refused.value.detail == REFUSAL
     assert sent == []
     [row] = _refusals(db)
@@ -258,10 +271,11 @@ def test_a_test_send_with_the_password_goes_where_it_is_pointed(db, admin, sent)
     assert decrypt_secret(_reloaded(db, p).smtp_password) == STORED      # a test saves nothing
 
 
-def test_a_test_send_that_moves_nothing_uses_the_stored_password(db, admin, sent):
+@KEPT
+def test_a_test_send_that_moves_nothing_uses_the_stored_password(db, admin, sent, kept):
     p = _profile(db)
     _test(db, admin, profile_id=p.id, smtp_server=" Mail.example.test", smtp_port=587, smtp_username="relay-user",
-          from_email="other@example.test")
+          from_email="other@example.test", **kept)
     [used] = sent
     assert used["smtp_password"] == STORED and _refusals(db) == []
 

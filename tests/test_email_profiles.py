@@ -116,6 +116,10 @@ def test_test_send_wont_pair_stored_password_with_a_new_host(admin, clean_profil
     assert r.status_code == 400, r.text
     assert r.json()["detail"]["reason"] == "smtp_password_required", r.text
     assert "re-enter" in r.json()["detail"]["message"].lower()
+    # An empty password keeps the stored one, as none does: refused the same way.
+    r = admin.post("/email/profiles/test", json={
+        "profile_id": p["id"], "smtp_server": "attacker.example", "smtp_password": "", "to_addr": "x@example.com"})
+    assert r.status_code == 400 and r.json()["detail"]["reason"] == "smtp_password_required", r.text
     # Turning the certificate check off over the stored password is refused the same way.
     r = admin.post("/email/profiles/test", json={
         "profile_id": p["id"], "smtp_allow_insecure_tls": True, "to_addr": "x@example.com"})
@@ -135,6 +139,9 @@ def test_a_save_wont_point_the_stored_password_at_a_new_host(admin, clean_profil
         smtp_server="smtp.example.com", smtp_username="u@example.com", smtp_password="Stored-SMTP-Pw-99")).json()
     r = admin.put(f"/email/profiles/{p['id']}", json=_valid_profile(
         name=p["name"], smtp_server="attacker.example", smtp_username="u@example.com"))
+    assert r.status_code == 400 and r.json()["detail"]["reason"] == "smtp_password_required", r.text
+    r = admin.put(f"/email/profiles/{p['id']}", json=_valid_profile(        # an empty password keeps it too
+        name=p["name"], smtp_server="attacker.example", smtp_username="u@example.com", smtp_password=""))
     assert r.status_code == 400 and r.json()["detail"]["reason"] == "smtp_password_required", r.text
     kept = next(x for x in admin.get("/email/profiles").json()["profiles"] if x["id"] == p["id"])
     assert kept["smtp_server"] == "smtp.example.com"
