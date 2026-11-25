@@ -205,6 +205,27 @@ def test_the_backup_flag_is_pinned_at_registration():
     assert e.value.code == "backup_flag_changed"
 
 
+def test_a_key_that_says_it_is_backed_up_while_it_cannot_be_is_refused():
+    """The standard's step for the backup flags, at a registration and at a use: backed up without being backup
+    eligible is a key that contradicts itself. It was taken and stored as backed up and not eligible."""
+    ws = _svc()
+    with pytest.raises(ws.Refused) as e:
+        _register(ws, SoftAuthenticator(ES256), flags=FLAG.UP | FLAG.UV | FLAG.BS)
+    assert e.value.code == "malformed" and str(e.value) == "malformed: backed up but not backup eligible"
+    # Eligible, with or without a backup made: taken, and stored as it says.
+    for flags, backed_up in ((FLAG.UP | FLAG.UV | FLAG.BE, False), (FLAG.UP | FLAG.UV | FLAG.BE | FLAG.BS, True)):
+        registered, _, _ = _register(ws, SoftAuthenticator(ES256), flags=flags)
+        assert registered.backup_eligible is True and registered.backup_state is backed_up
+    # At a use: a key registered as not eligible that now says it is backed up.
+    auth = SoftAuthenticator(ES256)
+    registered, _, _ = _register(ws, auth)
+    key = _key(ws, registered)
+    with pytest.raises(ws.Refused) as e:
+        _assert(ws, auth, key, flags=FLAG.UP | FLAG.UV | FLAG.BS)
+    assert e.value.code == "malformed" and str(e.value) == "malformed: backed up but not backup eligible"
+    assert _assert(ws, auth, key, flags=FLAG.UP | FLAG.UV).bs is False
+
+
 def test_the_credential_must_be_one_the_ceremony_offered_or_the_handle_must_name_its_owner():
     ws = _svc()
     auth, other = SoftAuthenticator(ES256), SoftAuthenticator(ES256)

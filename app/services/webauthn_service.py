@@ -290,6 +290,7 @@ def verify_registration(rp: RelyingParty, policy: PasskeyPolicy, *, challenge: b
     uv = bool(flags & AuthenticatorData.FLAG.UV)
     if policy.require_uv and not uv:
         raise Refused("user_not_verified")
+    _refuse_backed_up_but_not_eligible(flags)
     alg = cred.public_key.ALGORITHM
     if alg not in policy.allowed_algs:
         raise Refused("algorithm_not_allowed", ALG_NAMES.get(alg, str(alg)))
@@ -383,6 +384,7 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
         raise Refused("user_not_present")
     if policy.require_uv and not uv:
         raise Refused("user_not_verified")
+    _refuse_backed_up_but_not_eligible(flags)
     if stored.public_key.ALGORITHM != key.cose_alg:
         raise Refused("algorithm_mismatch")
     new_count = int(auth_data.counter)
@@ -395,6 +397,16 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
 
 
 # --------------------------------------------------------------------------- helpers
+
+def _refuse_backed_up_but_not_eligible(flags) -> None:
+    """The standard's step for the two backup flags, at a registration and at every use: a key that says it is
+    backed up (BS) while it says it cannot be (BE not set) contradicts itself, and is refused as malformed.
+    Whether a key may be copied to other devices is what a role held to device-bound keys is judged by, and that
+    reads BE alone; a key that sets BS without it was stored as one that is backed up and is not eligible."""
+    backed_up = bool(flags & AuthenticatorData.FLAG.BS)
+    if backed_up and not (flags & AuthenticatorData.FLAG.BE):
+        raise Refused("malformed", "backed up but not backup eligible")
+
 
 def _refused_for(exc: Exception) -> Refused:
     """The refusal for whatever else a browser's answer made the parser or the verifier raise. The answer is the
