@@ -1032,6 +1032,35 @@ def allowed_hosts_port_note(allowed_hosts, web_host_port):
             "first address is the proxy's, and this note does not apply." % (base, published, opened))
 
 
+# The key exchange an SFTP connection uses, as the vault takes SFTP_KEX_POLICY (app/core/config.py,
+# app/sftp/kex_policy.py): each policy with what status says of it and the colour it is said in.
+SFTP_KEX_POLICIES = {
+    "pq-preferred": ("pq-preferred - the hybrid post-quantum exchange with every client that offers it; others still "
+                     "connect with a classical one.", "grey"),
+    "pq-required": ("pq-required - only the hybrid post-quantum exchange (mlkem768x25519-sha256): a client without it "
+                    "(OpenSSH before 9.9, many older SFTP programs) cannot connect.", "yellow"),
+    "default": ("default - the SSH library's own order (today the same as pq-preferred).", "grey"),
+}
+
+
+def sftp_kex_status_line(env, profiles):
+    """What status says about SFTP_KEX_POLICY, as (text, colour), or None. A value the vault does not take (an empty
+    one among them) is refused when any part of the vault starts, the web side too, so it is said wherever SFTP
+    runs or not. Otherwise the policy in force is said where SFTP runs (RUN_SFTP, or the split layout): unset is
+    pq-preferred. Pure: ``env`` is the parsed .env."""
+    env = env or {}
+    if "SFTP_KEX_POLICY" in env:
+        raw = str(env.get("SFTP_KEX_POLICY") or "").strip()
+        if raw.lower() not in SFTP_KEX_POLICIES:
+            return ("SFTP_KEX_POLICY=%s in .env is not pq-preferred, pq-required or default: the vault refuses to "
+                    "start with it." % raw, "red")
+    sftp_runs = (str(env.get("RUN_SFTP") or "").strip().lower() in ("1", "true", "yes", "on")
+                 or profiles == "split")
+    if not sftp_runs:
+        return None
+    return SFTP_KEX_POLICIES[str(env.get("SFTP_KEX_POLICY") or "pq-preferred").strip().lower()]
+
+
 def build_env_lines(cfg):
     """Build the .env content (list of lines) from a collected-config dict — deterministic + pure
     (it does NOT generate secrets; the caller passes them in). Values are single-quoted, matching
@@ -5643,6 +5672,9 @@ class DockVault:
             return
         env = self._load_env()
         self._print_sign_in_lines(env)
+        kex = sftp_kex_status_line(env, profiles)
+        if kex:
+            print(pal.paint("  SFTP key exchange: " + kex[0], kex[1]))
         try:
             self._run_dc("ps", capture=False, timeout=30)
         except (OSError, subprocess.SubprocessError):
