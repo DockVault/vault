@@ -229,6 +229,20 @@ def test_a_profile_save_that_moves_nothing_keeps_the_stored_password(db, admin, 
     assert _refusals(db) == []
 
 
+def test_a_profile_that_skips_the_certificate_check_keeps_its_stored_password_while_it_still_does(db, admin, sent):
+    # A relay with a certificate of its own, saved with the check off: saved and tested again with the box still
+    # ticked and no password, it keeps and uses the stored password. Nothing moved, so nothing is refused.
+    p = _profile(db, smtp_allow_insecure_tls=True)
+    out = _update(db, admin, p, name="Renamed", smtp_allow_insecure_tls=True)
+    assert out["name"] == "Renamed" and out["has_password"] is True
+    kept = _reloaded(db, p)
+    assert kept.smtp_allow_insecure_tls is True and decrypt_secret(kept.smtp_password) == STORED
+    _test(db, admin, profile_id=p.id, smtp_allow_insecure_tls=True)
+    [used] = sent
+    assert used["smtp_password"] == STORED and used["smtp_allow_insecure_tls"] is True
+    assert _refusals(db) == []
+
+
 def test_a_profile_with_no_stored_password_may_be_pointed_anywhere(db, admin):
     p = _profile(db, password=None)
     out = _update(db, admin, p, smtp_server="elsewhere.example")
@@ -316,6 +330,7 @@ def test_a_settings_save_that_moves_the_stored_password_without_it_is_refused(db
     assert refused.value.status_code == 400 and refused.value.detail == REFUSAL
     assert _stored(db) == before
     [row] = _refusals(db)
+    assert row.status == "failure"
     assert row.details["surface"] == "settings" and set(row.details["changes"]) == set(change)
     assert STORED not in str(row.details)
     assert _rows(db, "settings_updated") == []

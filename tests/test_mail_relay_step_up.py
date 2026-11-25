@@ -203,6 +203,19 @@ def test_a_profile_save_refused_by_the_relay_rule_spends_no_receipt(db, admin):
     assert out["name"] == "Renamed"
 
 
+def test_a_profile_test_send_refused_by_the_relay_rule_spends_no_receipt(db, admin, sent):
+    p = _profile(db)
+    receipt = _receipt(db, admin)
+    moved = studio.ProfileTestIn(to_addr="someone@example.test", profile_id=p.id, smtp_server="elsewhere.example")
+    with pytest.raises(HTTPException) as refused:
+        run_coroutine(studio.test_profile(payload=moved, request=_request(receipt), admin=admin, db=db))
+    assert refused.value.status_code == 400 and refused.value.detail["reason"] == mail_relay.REASON
+    assert sent == []
+    as_stored = studio.ProfileTestIn(to_addr="someone@example.test", profile_id=p.id)
+    run_coroutine(studio.test_profile(payload=as_stored, request=_request(receipt), admin=admin, db=db))
+    assert sent == ["mail.example.test"]
+
+
 def test_deleting_a_profile_needs_the_step_up(db, admin):
     p = _profile(db)
     with pytest.raises(HTTPException) as refused:
@@ -281,6 +294,33 @@ def test_a_settings_save_that_changes_the_smtp_settings_needs_the_step_up(db, ad
     _save(db, admin, change, receipt=_receipt(db, admin))
     after = _stored(db)
     assert all(after[k] == v for k, v in change.items())
+
+
+def test_a_settings_save_refused_by_the_relay_rule_spends_no_receipt(db, admin):
+    _store(db)
+    receipt = _receipt(db, admin)
+    with pytest.raises(HTTPException) as refused:
+        _save(db, admin, {"smtp_server": "elsewhere.example"}, receipt=receipt)
+    assert refused.value.status_code == 400 and refused.value.detail["reason"] == mail_relay.REASON
+    _save(db, admin, {"smtp_server": "elsewhere.example", "smtp_password": "a-new-one"}, receipt=receipt)
+    assert _stored(db)["smtp_server"] == "elsewhere.example"
+
+
+def test_a_save_that_changes_the_smtp_settings_still_meets_the_matrix_rule_for_an_ordinary_save(db, admin):
+    # The save may hold other settings too. When the matrix asks for a second factor on settings saves and this
+    # administrator has none, it is refused enroll_required, even with the mail server step-up answered.
+    _store(db)
+    before = _stored(db)
+    receipt = _receipt(db, admin)
+    db.add(SecondFactorAction(key="admin.settings.write", require_otp=True, require_password=False))
+    db.commit()
+    with pytest.raises(HTTPException) as refused:
+        _save(db, admin, {"smtp_server": "elsewhere.example", "smtp_password": "a-new-one", "app_name": "Bundled"},
+              receipt=receipt)
+    assert refused.value.status_code == 403
+    assert refused.value.detail["reason"] == "enroll_required", refused.value.detail
+    assert refused.value.detail["action"] == "admin.settings.write", refused.value.detail
+    assert _stored(db) == before
 
 
 @pytest.mark.parametrize("payload", [
