@@ -201,6 +201,35 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     return {"cleared": True}
 
 
+NO_WAY_IN_LEFT = "no_way_in_left"
+
+
+def no_way_in_left(db, user, identity, settled=None) -> Optional[str]:
+    """Why an administrator's unlink of ``identity`` would leave ``user`` with no way in, in words that say what
+    to do first, or None. Asked after the account's flag was settled for the unlink (``settled``), in its
+    transaction: no password anybody can type, and no other identity on a provider that is on and has not
+    refused the person.
+
+    Not refused where the unlink itself is what lets the account hold a password again (this identity alone held
+    it to none): nothing could be done first, since no reset link is made for an account held to no password.
+    The person and the administrators are told that it sets one now."""
+    from app.core import sso_only
+    from app.services import sign_in
+    if settled == sso_only.RESTORED:
+        return None
+    if sign_in.has_a_password_it_can_type(user) or sso_only.another_way_in(db, user, without=identity):
+        return None
+    if getattr(user, "sso_only", False):
+        # Another provider still holds the account to no password, and is not a way in now (off, or it refused
+        # the person): a reset link would be refused for it.
+        return (f"This is the only way {user.username} can sign in now: the account signs in only through its "
+                "providers, and no other provider it is linked to is on. Turn that provider on, or allow password "
+                "sign-in for it, first. To take the account's access away, turn the account off or delete it.")
+    return (f"This is the only way {user.username} can sign in: the account has no password anybody can type. "
+            "Make a reset link for it first (Users), so that it can set a password, then unlink. To take the "
+            "account's access away, turn the account off or delete it.")
+
+
 @router.delete("/admin/sso/identities/{identity_id}")
 def unlink_identity(identity_id: str, request: Request, current_user: User = Depends(require_interactive_admin),
                     db: Session = Depends(get_db)):
@@ -212,7 +241,11 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
     What the owner's unlink does, it does: the account's flag follows the providers it is still linked to (one
     held to no password by this identity alone may hold a password again, and nothing is minted), and the
     sessions that came through the identity end with it. A hold the identity's provider had on the account (a
-    refusal, days run out) ends with the identity: that is this administrator's decision, and is said so."""
+    refusal, days run out) ends with the identity: that is this administrator's decision, and is said so.
+
+    Refused, as the owner's own unlink is, where it would leave the account with no way in: no password anybody
+    can type and no other identity on a provider that is on. The sentence says what to do first. An account that
+    is to have no way in is turned off or deleted, which says so; an unlink that did it said nothing."""
     api = _api()
     client_ip = api.get_client_ip(request)
     identity = _identity_or_404(db, identity_id)
@@ -235,13 +268,26 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
     standing = sso_freshness.deadline_of(identity, provider)
     held = standing is not None and (standing.refused or standing.due <= datetime.utcnow())
     settled = sso_only.settle(db, user, without=identity)
+    why_not = no_way_in_left(db, user, identity, settled)
+    if why_not is not None:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"reason": NO_WAY_IN_LEFT, "message": why_not})
     ended = sso_router._end_what_came_through(db, user, identity)
     details = {"user_id": str(identity.user_id), "provider_id": str(identity.provider_id),
-               "identity_id": str(identity.id), "linked_by": identity.linked_by, "sessions": ended}
+               "identity_id": str(identity.id), "linked_by": identity.linked_by, "sessions": ended,
+               "held": bool(held), "restored": settled == sso_only.RESTORED}
+    refused_by_the_provider = bool(standing is not None and standing.refused)
     db.delete(identity)
     db.commit()
     _audit(db, "sso_identity_unlinked", user=current_user, ip=client_ip, resource_type="user",
            resource_id=details["user_id"], details=details)
+    if refused_by_the_provider:
+        # The provider's refusal ended with the identity: recorded as a refusal lifted, by way of the unlink,
+        # so that whoever looks for the refusals an administrator lifted finds this one too.
+        _audit(db, "sso_refusal_cleared", user=current_user, ip=client_ip, resource_type="user",
+               resource_id=details["user_id"],
+               details={"user_id": details["user_id"], "provider_id": details["provider_id"],
+                        "identity_id": details["identity_id"], "via": "unlink"})
     may_set_password = settled == sso_only.RESTORED
     try:
         from app.api import sso_providers_router
@@ -254,7 +300,9 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
             f"{current_user.username} unlinked {user.username} from {label}."
             + (f" {label} held that account to its own sign-in (a refusal, or days without a sign-in there): "
                "the hold ended with the identity." if held else "")
-            + (" The account may hold a password again." if may_set_password else ""))
+            + (" The account may hold a password again. It has none anybody can type until it sets one: it "
+               "asks for a reset link on the sign-in page, or you make one for it (Users)." if may_set_password
+               else ""))
     except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notices
         log.info("sso unlink notices skipped: %s", type(exc).__name__)
     answer = {"removed": True, "sessions_ended": ended, "held": bool(held)}

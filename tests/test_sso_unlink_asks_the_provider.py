@@ -190,11 +190,92 @@ def test_an_administrator_unlinks_an_identity_for_somebody_under_the_step_up_and
     status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{held.id}")
     assert status == 200 and body == {"removed": True, "sessions_ended": 0, "held": True}, body
     assert steps == ["root"] and held not in h.identities() and F.held_to_a_provider(h.db, alice) is None
+    # The record says what the unlink did: the hold it ended, and no password given back. The provider's refusal
+    # ended with the identity, and is recorded as a refusal lifted, by way of the unlink.
+    unlinked = [a[2] for a in h.audits if a[0] == "sso_identity_unlinked"][-1]
+    assert unlinked["held"] is True and unlinked["restored"] is False and unlinked["identity_id"] == str(held.id)
+    lifted = [a[2] for a in h.audits if a[0] == "sso_refusal_cleared"]
+    assert lifted == [{"user_id": str(alice.id), "provider_id": str(p.id), "identity_id": str(held.id),
+                       "via": "unlink"}]
     assert told[-1][1] == "An identity was unlinked by an administrator" and "the hold ended with the identity" in told[-1][2]
     assert owners[-1][0] == "alice" and owners[-1][1].startswith("root unlinked your account from ")
     status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{made_with.id}")
     assert status == 200 and body["may_set_password"] is True and body["held"] is False, body
     assert made.sso_only is False and "The account may hold a password again." in told[-1][2]
+    # This identity alone held the account to no password: the unlink is what lets it set one, so it goes
+    # through, and the administrators read that the account has none anybody can type until it does.
+    assert "It has none anybody can type until it sets one" in told[-1][2] and "you make one for it (Users)" in told[-1][2]
     assert "Forgot password" in owners[-1][1]
+    unlinked = [a[2] for a in h.audits if a[0] == "sso_identity_unlinked"][-1]
+    assert unlinked["held"] is False and unlinked["restored"] is True
+    assert len([a for a in h.audits if a[0] == "sso_refusal_cleared"]) == 1          # no refusal held this one
     assert [a[2]["linked_by"] for a in h.audits if a[0] == "sso_identity_unlinked"] == ["self", "jit"]
     assert _call(h.S, "DELETE", f"/admin/sso/identities/{held.id}")[0] == 404
+
+
+@pytest.mark.parametrize("case", ["a password nobody knows", "held to no password by another provider that is off",
+                                  "another provider that is on", "a password of its own"])
+def test_an_administrators_unlink_that_would_leave_no_way_in_is_refused_with_what_to_do_first(monkeypatch, case):
+    """The owner's own unlink refuses to remove the account's last way in. An administrator's did it without a
+    word: the account was left with no password anybody can type and no provider that is on, and nobody was
+    told. Refused the same way, in words that say what to do first; an account that is to have no access is
+    turned off or deleted."""
+    from app.api import sso_admin_router as A
+    from app.api import sso_providers_router as R
+    from app.api import sso_router
+    from app.core import password_origin
+    root, dana = _user("root", role="admin"), _user("dana", password_hash="r1")
+    dana.password_set_by, dana.password_set_by_other_at = None, None
+    p = _provider()                                             # on
+    other = _provider(name="fabrikam", label="Sign in with Fabrikam",
+                      state="enabled" if case == "another provider that is on" else "disabled",
+                      policy={"sso_password_login": "disabled"} if case.startswith("held to no password") else {})
+    identities = [_identity(dana, p, subject="subject-dana", linked_by="invitation", last_sign_in_at=datetime.utcnow())]
+    if case != "a password of its own":
+        password_origin.mark_nobody_knows(dana)
+    if case in ("held to no password by another provider that is off", "another provider that is on"):
+        identities.append(_identity(dana, other, subject="subject-dana-2", last_sign_in_at=datetime.utcnow()))
+    if case.startswith("held to no password"):
+        dana.sso_only = True
+    h = Harness(monkeypatch, [root, dana], [p, other], identities=identities)
+    told, owners = [], []
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: None)
+    monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append((by, title, body)))
+    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change: owners.append((user.username, change)))
+    ended = []
+    monkeypatch.setattr(sso_router, "_end_what_came_through", lambda db, user, identity: ended.append(identity.id) or 0)
+    del h.db.log[:]
+    status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{identities[0].id}")
+    if case in ("another provider that is on", "a password of its own"):
+        assert status == 200 and body["removed"] is True, body
+        assert identities[0] not in h.identities() and len(told) == 1 and len(owners) == 1
+        return
+    assert status == 409 and body["detail"]["reason"] == "no_way_in_left", body
+    said = body["detail"]["message"]
+    if case == "a password nobody knows":
+        assert said == ("This is the only way dana can sign in: the account has no password anybody can type. Make "
+                        "a reset link for it first (Users), so that it can set a password, then unlink. To take "
+                        "the account's access away, turn the account off or delete it.")
+    else:
+        assert said == ("This is the only way dana can sign in now: the account signs in only through its "
+                        "providers, and no other provider it is linked to is on. Turn that provider on, or allow "
+                        "password sign-in for it, first. To take the account's access away, turn the account off "
+                        "or delete it.")
+    # Nothing was done: the identity is there, no session was ended, nothing was committed, recorded or told.
+    assert identities[0] in h.identities() and ended == [] and ("commit",) not in h.db.log
+    assert ("rollback",) in h.db.log and told == [] and owners == []
+    assert not [a for a in h.audits if a[0] == "sso_identity_unlinked"]
+
+
+def test_the_owners_own_link_and_unlink_record_what_they_did_to_the_password(monkeypatch):
+    """A link to a provider whose people hold no password ends the account's password, and an unlink of it gives
+    the password back: each record says so, as the provider's own save does for the accounts it touches."""
+    import inspect
+    from app.api import sso_router
+    linked = inspect.getsource(sso_router.finish_link)
+    assert '"linked_by": "self", "made_sso_only": bool(password_stopped)' in linked
+    unlinked = inspect.getsource(sso_router.unlink_my_identity)
+    assert '"restored": settled == sso_only.RESTORED' in unlinked
+    at_sign_in = inspect.getsource(sso_router._record_resolution)
+    assert '"identity_id": str(getattr(found.identity, "id", "") or "")' in at_sign_in
+    assert '"made_sso_only": bool(found.password_stopped)' in at_sign_in

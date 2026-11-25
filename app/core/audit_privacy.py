@@ -182,6 +182,9 @@ _IDENTIFIER_KEYS = (
     # linked accounts and links the change touched, whether the stored secret was dropped, and how many linked
     # people were told
     "preset", "changed", "state", "made_sso_only", "restored", "identities", "secret_cleared", "owners_told",
+    # a sign-in through a provider: whether the provider's own second factor stood in for the vault's; an unlink:
+    # whether the identity's provider held the account (a refusal, days run out) when it was removed
+    "provider_mfa", "held",
     # legal holds: the case's number, a hold's dates, and what it kept and why (never a name)
     "case_number", "confirm_by", "hold_only", "purge_after", "by_release", "kept_reason", "kept_at", "held_by_case",
     # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes
