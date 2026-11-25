@@ -466,8 +466,9 @@ def test_a_removal_goes_through_once_an_administrator_has_lifted_the_holds_it_ma
     assert lapsed.last_sign_in_at == last                       # the lift gives no sign-in
     # The administrators are told that the keys stay paused until a sign-in there, and what ends that wait.
     assert h.told[-1][1] == "A single sign-on refusal was lifted" and h.told[-1][2].endswith(
-        f"stay paused until a sign-in through {row.name}. A removal of {row.name} no longer waits for this "
-        f"account: once {row.name} is removed, its keys wait for a sign-in there no more.")
+        f"A removal of {row.name} no longer waits for this account: once {row.name} is removed, its keys wait for "
+        "a sign-in there no more.")
+    assert f"stay paused until a sign-in through {row.name}, which is turned off" in h.told[-1][2]
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 409 and "Lift it on this provider's Identities page first" in out["detail"]["message"], out
     assert lapsed.refused_at is None and len(h.accounts_told) == told and len(h.audit("sso_provider_updated")) == recorded
@@ -1982,7 +1983,7 @@ def test_a_lifted_refusal_of_the_provider_does_not_let_a_removal_give_keys_back_
     assert h.call("POST", f"/admin/sso/identities/{hers.id}/clear-refusal")[0] == 200
     assert hers.refused_at is None and hers.hold_lifted_for is None
     lifted = h.told[-1][2]
-    assert lifted.endswith(f"stay paused until a sign-in through {row.name}.") and "A removal of" not in lifted
+    assert f"stay paused until a sign-in through {row.name}, which is turned off" in lifted and "A removal of" not in lifted
     # The removal holds both, as it holds anyone past the days.
     status, out = h.call("DELETE", path)
     assert status == 409 and "2 accounts have not signed in through this provider within its days" in out["detail"]["message"]

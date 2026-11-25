@@ -353,23 +353,59 @@ def lift_answers(identity, standing: Optional[Deadline]) -> bool:
     return standing is not None and lifted_for is not None and lifted_for == standing.due
 
 
-def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Optional[datetime] = None) -> str:
+def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Optional[datetime] = None,
+                           held_before: Optional[Deadline] = None) -> str:
     """What is said of an account's keys once an administrator lifted the hold on record for ``identity``
-    (``whose``: "your" to the person, "its" to the administrators). They work again, unless the provider's days
-    have run out as well: the days went on counting under the hold, and lifting it does not start them again.
-    Then the keys stay paused until a sign-in through the provider, and where the provider closes the other ways
-    in, and is on, the password and passkeys do too. Told "they work again" in that state, the person found that
-    nothing did. The person reads the provider as its button names it, the administrators by its name."""
+    (``whose``: "your" to the person, "its" to the administrators), said after the lift is made in ``db``. They
+    work again, unless the provider's days have run out as well: the days went on counting under the hold, and
+    lifting it does not start them again. Then the keys stay paused until a sign-in through the provider, and
+    where the provider closes the other ways in, and is on, the password and passkeys do too; a provider that is
+    turned off signs nobody in, so that sign-in is one nobody can make until it is turned on. Told "they work
+    again" in that state, the person found that nothing did. Nor do they while another identity of the account
+    is refused or past its days (:func:`lapsed`).
+
+    ``held_before``: :func:`held_to_a_provider` before the lift. Where it held the account, what of the password
+    and passkeys the account has (:func:`what_stops`) is said to sign in again, or to sign in to nothing still,
+    and which provider holds it then. The person reads a provider as its button names it, the administrators by
+    its name."""
     now = now or datetime.utcnow()
+    person = whose == "your"
+    you = "you" if person else "it"
+
+    def named(found: Deadline) -> str:
+        return found.provider_label if person else found.provider_name
+
     standing = deadline_of(identity, provider)
     if standing is None or standing.refused or standing.due > now:
-        return (f"{whose} SSH keys, temporary credentials and devices work again unless another rule pauses them.")
-    closed = closes_now(standing, now) and user is not None and closes_the_other_ways_in(db, user, standing)
-    named = standing.provider_label if whose == "your" else standing.provider_name
-    return (f"{whose} time to sign in through {named} has run out as well, so {whose} SSH keys, "
-            "temporary credentials and devices stay paused"
-            + (f", and {whose} password and passkeys sign in to nothing," if closed else "")
-            + f" until a sign-in through {named}.")
+        still = lapsed(db, getattr(user, "id", None), now=now) if user is not None else None
+        if still is None:
+            said = f"{whose} SSH keys, temporary credentials and devices work again."
+        else:
+            said = (f"{whose} SSH keys, temporary credentials and devices stay paused all the same: {named(still)} "
+                    "still holds them, until a sign-in through it"
+                    + (" or an administrator lifts its refusal" if still.refused else "") + ".")
+    else:
+        closed = closes_now(standing, now) and user is not None and closes_the_other_ways_in(db, user, standing)
+        until = f" until a sign-in through {named(standing)}"
+        if not standing.provider_on:
+            until += (", which is turned off on this vault now: ask your administrator" if person else
+                      ", which is turned off: turn it on, or unlink the identity, to end the pause")
+        said = (f"{whose} time to sign in through {named(standing)} has run out as well, so {whose} SSH keys, "
+                "temporary credentials and devices stay paused"
+                + (f", and {whose} password and passkeys sign in to nothing," if closed else "") + until + ".")
+    if held_before is None or user is None:
+        return said
+    stops = what_stops(user)
+    if not person:
+        stops = stops.replace("your ", "its ")
+    held_now = held_to_a_provider(db, user, now=now)
+    if not stops:
+        return said                    # nothing of its own that a hold stops: its keys alone were said
+    if held_now is None:
+        return said + f" {_capitalised(stops)} sign {you} in again."
+    if held_now.identity_id != str(identity.id):
+        return said + f" {_capitalised(stops)} still sign in to nothing: {named(held_now)} holds the account."
+    return said
 
 
 def due_date(db, user_id) -> Optional[datetime]:

@@ -1250,8 +1250,8 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     # Lifting it hands a person their keys back: the other administrators are told, once, and only when it was lifted.
     assert len(told) == 1 and told[0][:2] == ("root", "A single sign-on refusal was lifted")
     assert "alice" in told[0][2] and "work again" in told[0][2]
-    assert told[0][2].endswith("its SSH keys, temporary credentials and devices work again unless another rule "
-                               "pauses them.")
+    assert told[0][2].endswith("its SSH keys, temporary credentials and devices work again. Its password and its "
+                               "passkeys sign it in again.")
     assert ("sso_refusal_cleared", "success", {"user_id": str(alice.id), "provider_id": str(p.id),
                                                "identity_id": str(identity.id)}) in h.audits
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
@@ -1578,25 +1578,40 @@ def test_a_link_from_the_profile_that_meets_the_identity_linked_by_address_makes
         assert by_address.linked_by == becomes, (was, by)
 
 
+# What each reads: the person ("your") the provider as its button names it, the administrators ("its") by its name.
+_TO_THE_PERSON = dict(whose="your", Stops="Your password and your passkeys", you="you", who="Contoso",
+                      other="Fabrikam", off=", which is turned off on this vault now: ask your administrator")
+_TO_THE_ADMINISTRATORS = dict(whose="its", Stops="Its password and its passkeys", you="it", who="contoso",
+                              other="fabrikam",
+                              off=", which is turned off: turn it on, or unlink the identity, to end the pause")
+
+
 @pytest.mark.parametrize("state, said", [
-    ("signed in yesterday", "{whose} SSH keys, temporary credentials and devices work again unless another rule pauses them."),
+    ("signed in yesterday",
+     "{whose} SSH keys, temporary credentials and devices work again. {Stops} sign {you} in again."),
     ("days run out, the provider on and closing the other ways in",
      "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
      "devices stay paused, and {whose} password and passkeys sign in to nothing, until a sign-in through {who}."),
     ("days run out, the provider off",
      "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
-     "devices stay paused until a sign-in through {who}."),
+     "devices stay paused until a sign-in through {who}{off}. {Stops} sign {you} in again."),
     ("days run out, the provider pausing keys only",
      "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
      "devices stay paused until a sign-in through {who}."),
-    ("no days asked", "{whose} SSH keys, temporary credentials and devices work again unless another rule pauses them."),
+    ("no days asked",
+     "{whose} SSH keys, temporary credentials and devices work again. {Stops} sign {you} in again."),
+    ("another provider's days run out",
+     "{whose} SSH keys, temporary credentials and devices stay paused all the same: {other} still holds them, "
+     "until a sign-in through it. {Stops} still sign in to nothing: {other} holds the account."),
 ])
 def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, state, said):
     """An administrator lifts a hold. The provider's days went on counting under it, and lifting it does not
     start them again: where they have run out, the keys stay paused until a sign-in through the provider (and
     the password too, where the provider closes the other ways in and is on). The person and the administrators
-    were told "they work again" all the same, and nothing did. The person reads the provider as its button names
-    it ("Contoso"), the administrators by its name ("contoso")."""
+    were told "they work again" all the same, and nothing did. Nor do they work again while another provider of
+    the account holds them; and a sign-in through a provider that is turned off is one nobody can make. Where
+    the hold kept the password and passkeys from signing in, the notice says whether they do again. The person
+    reads the provider as its button names it ("Contoso"), the administrators by its name ("contoso")."""
     from app.api import sso_admin_router as A
     from app.api import sso_providers_router as R
     from app.core import owner_notices
@@ -1606,12 +1621,17 @@ def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, sta
     policy = {"signed in yesterday": {}, "days run out, the provider on and closing the other ways in": {},
               "days run out, the provider off": {},
               "days run out, the provider pausing keys only": {"sso_lapse_ends_sign_in": False},
-              "no days asked": {"sso_freshness_days": 0}}[state]
+              "no days asked": {"sso_freshness_days": 0}, "another provider's days run out": {}}[state]
     p = _provider(state="disabled" if state == "days run out, the provider off" else "enabled", policy=policy,
                   label="Contoso")
-    signed_in = yesterday if state == "signed in yesterday" else long_ago
+    signed_in = yesterday if state in ("signed in yesterday", "another provider's days run out") else long_ago
     identity = _identity(alice, p, last_sign_in_at=signed_in, refused_at=datetime.utcnow())
-    h = Harness(monkeypatch, [root, alice], [p], identities=[identity])
+    providers, identities = [p], [identity]
+    if state == "another provider's days run out":
+        q = _provider(name="fabrikam", label="Fabrikam")
+        providers.append(q)
+        identities.append(_identity(alice, q, subject="s-fabrikam", last_sign_in_at=long_ago))
+    h = Harness(monkeypatch, [root, alice], providers, identities=identities)
     monkeypatch.setattr(A, "_step_up", lambda db, user, request: None)
     told, noticed = [], []
     monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append(body))
@@ -1619,9 +1639,8 @@ def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, sta
                         lambda db, ids, *, title, body, ntype, target: noticed.append(body))
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
     assert status == 200 and body == {"cleared": True} and identity.refused_at is None
-    assert noticed == ["root lifted the refusal Contoso recorded for your account: "
-                       + said.format(whose="your", who="Contoso")]
-    assert told == ["root lifted the refusal contoso recorded for alice: " + said.format(whose="its", who="contoso")]
+    assert noticed == ["root lifted the refusal Contoso recorded for your account: " + said.format(**_TO_THE_PERSON)]
+    assert told == ["root lifted the refusal contoso recorded for alice: " + said.format(**_TO_THE_ADMINISTRATORS)]
     # What the sentence says is what holds: the keys are paused exactly where it says they stay paused.
     assert (F.lapsed(h.db, alice.id) is not None) is ("stay paused" in noticed[0])
     assert (F.held_to_a_provider(h.db, alice) is not None) is ("sign in to nothing" in noticed[0])

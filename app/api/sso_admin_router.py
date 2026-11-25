@@ -282,6 +282,9 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     if not sso_freshness.refusal_in_force(identity):
         raise HTTPException(status_code=409, detail={"reason": "changed", "message": "The identity changed meanwhile."})
     user = db.query(User).filter(User.id == identity.user_id).first()
+    # Whether a provider held the account to its sign-in before the lift (its password and passkeys signed in to
+    # nothing): what the notices say of them afterwards turns on it.
+    held_before = sso_freshness.held_to_a_provider(db, user) if user is not None else None
     provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
     # Of the vault's own hold for days that ran out, the lift counts for a removal of the provider; of the
     # provider's own refusal it does not.
@@ -289,9 +292,12 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     label = ((provider.name or provider.label) if provider is not None else None) or "an identity provider"
     # The person knows the provider by its button; the name is the administrators'.
     person_label = ((provider.label or provider.name) if provider is not None else None) or "an identity provider"
-    # What the lifting gives back, said as it is: the provider's days may have run out under the hold.
-    to_the_person = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="your")
-    to_the_administrators = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="its")
+    # What the lifting gives back, said as it is: the provider's days may have run out under the hold, another
+    # provider of the account may hold it still, and a provider that is turned off signs nobody in.
+    to_the_person = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="your",
+                                                         held_before=held_before)
+    to_the_administrators = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="its",
+                                                                 held_before=held_before)
     if counts_for_a_removal:
         # Said where it is so: the sentence before it says the keys stay paused until a sign-in through the
         # provider, and a removal of the provider now ends that wait.
