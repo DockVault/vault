@@ -3747,6 +3747,23 @@ def settings_locked_tokens(raw):
     return frozenset(t.strip().lower() for t in text.replace(";", ",").replace(" ", ",").split(",") if t.strip())
 
 
+# The SETTINGS_LOCKED_KEYS entries that lock Attestation (app/core/settings_registry.is_locked): everything, the
+# passkey settings' group, or the setting by its key.
+ATTESTATION_LOCK_TOKENS = frozenset({"*", "webauthn", "webauthn_attestation"})
+
+
+def attestation_roots_note(locked):
+    """What setup says once it has copied a file of attestation roots into certs/, as (held, sentence): the file alone
+    turns nothing on, since only an administrator chooses Direct for Attestation in the panel; and where
+    SETTINGS_LOCKED_KEYS (``locked``, the raw .env value) locks Attestation, it is held at its default, None (it has
+    no .env value), so nobody can choose Direct while the lock stays. Pure."""
+    if settings_locked_tokens(locked) & ATTESTATION_LOCK_TOKENS:
+        return True, ("SETTINGS_LOCKED_KEYS in .env holds Attestation at None, so direct attestation cannot be turned "
+                      "on until the lock names neither *, the group webauthn nor webauthn_attestation.")
+    return False, ("The file alone turns nothing on: an administrator chooses Direct for Attestation (an advanced "
+                   "setting) in Settings -> Sign-in methods.")
+
+
 # Where Docker puts compose networks by default (its default address pools), for when the deployment's
 # own network cannot be inspected.
 DOCKER_DEFAULT_POOLS = ("172.16.0.0/12", "192.168.0.0/16")
@@ -5798,7 +5815,7 @@ class DockVault:
         existing = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
         # A file of attestation roots given on the command line is checked and copied into certs/ before .env is
         # written or changed: a file setup cannot use stops it with nothing changed.
-        attestation_roots = self._take_attestation_roots(args)
+        attestation_roots = self._take_attestation_roots(args, existing.get("SETTINGS_LOCKED_KEYS"))
         reusing = False
         summary = {}
         tracker.show()
@@ -6262,12 +6279,13 @@ class DockVault:
             self._fail("unknown --cert-mode %r (one of %s)" % (mode, ", ".join(CERT_MODES)))
         return (mode or "selfsigned", email, cpath, kpath)
 
-    def _take_attestation_roots(self, args):
+    def _take_attestation_roots(self, args, locked=None):
         """The file --webauthn-attestation-roots names, checked and copied into certs/ (mode 644; setup then hands it
         to the container's user with the TLS pair): the path the container reads it at (/app/certs/<its name>), for
         WEBAUTHN_ATTESTATION_ROOTS. None when the flag is not given. A file that is not there, holds no PEM
         certificate, has the name of the TLS pair's certificate or key, or a name a .env line cannot carry plainly,
-        stops setup before anything is written."""
+        stops setup before anything is written. ``locked`` is the .env's SETTINGS_LOCKED_KEYS, for what it says after
+        the copy (attestation_roots_note)."""
         source = getattr(args, "webauthn_attestation_roots", None) if args else None
         if not source:
             return None
@@ -6299,8 +6317,8 @@ class DockVault:
         except OSError as exc:
             self._fail("%s: could not copy %s into certs/ (%s). Copy it there yourself and set "
                        "WEBAUTHN_ATTESTATION_ROOTS=/app/certs/%s in .env." % (flag, source, type(exc).__name__, name))
-        print(self.pal.paint("  Copied %s to certs/%s. Direct attestation is turned on in Settings -> Sign-in "
-                             "methods." % (source, name), "green"))
+        held, note = attestation_roots_note(locked)
+        print(self.pal.paint("  Copied %s to certs/%s. %s" % (source, name, note), "yellow" if held else "green"))
         return "/app/certs/" + name
 
     @staticmethod

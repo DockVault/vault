@@ -198,6 +198,34 @@ def test_setup_copies_the_attestation_roots_into_certs_and_names_them_in_env(tmp
             "file.") in said
 
 
+@pytest.mark.parametrize("locked, said, held", [
+    (None, "Copied {src} to certs/roots.pem. The file alone turns nothing on: an administrator chooses Direct for "
+           "Attestation (an advanced setting) in Settings -> Sign-in methods.", False),
+    ("webauthn", "Copied {src} to certs/roots.pem. SETTINGS_LOCKED_KEYS in .env holds Attestation at None, so "
+                 "direct attestation cannot be turned on until the lock names neither *, the group webauthn nor "
+                 "webauthn_attestation.", True),
+    ("audit_levels;*", "SETTINGS_LOCKED_KEYS in .env holds Attestation at None", True),
+    ("WEBAUTHN_ATTESTATION", "SETTINGS_LOCKED_KEYS in .env holds Attestation at None", True),
+    ("webauthn_mode,audit_levels", "The file alone turns nothing on: an administrator chooses Direct", False),
+], ids=["unlocked", "group", "all", "key", "other-keys"])
+def test_setup_says_the_attestation_roots_turn_nothing_on_and_when_a_lock_holds_attestation_at_none(
+        tmp_path, monkeypatch, capsys, locked, said, held):
+    source = tmp_path / "roots.pem"
+    source.write_bytes(PEM)
+    _quiet_certificate_step(monkeypatch)
+    root = tmp_path / "deployment"
+    root.mkdir()
+    _reusable_env(root, **({"settings_locked_keys": locked} if locked else {}))
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    tool.setup(_setup_args(webauthn_attestation_roots=str(source)))
+    out = " ".join(capsys.readouterr().out.split())
+    assert said.format(src=source) in out, out
+    # The file alone turns nothing on: setup never says that direct attestation is on.
+    assert "Direct attestation is turned on" not in out
+    assert ("holds Attestation at None" in out) is held
+    assert ("an administrator chooses Direct" in out) is not held
+
+
 @pytest.mark.parametrize("name, body, said", [
     ("missing.pem", None, "is not a file"),
     ("roots.pem", b"not a certificate\n", "holds no PEM certificate"),
