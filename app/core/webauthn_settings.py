@@ -170,9 +170,13 @@ def canonical_aaguid(value) -> Optional[str]:
 
 
 def allowed_aaguids() -> Tuple[str, ...]:
-    """The makes of authenticator the setting allows, each in the one spelling they are compared in and once."""
-    makes = (canonical_aaguid(a) for a in (registry.resolve(ALLOWED_AAGUIDS) or ()))
-    return tuple(dict.fromkeys(make for make in makes if make))
+    """The makes of authenticator the setting allows, each in the one spelling they are compared in and once.
+
+    An entry that is no UUID stays, as it was written (the save refuses one; a value the deployment gave was
+    never held to that). It matches no authenticator, and the list stays a list. Left out, a list of nothing
+    but such entries read as no list: the restriction was gone, and every make was allowed."""
+    makes = (canonical_aaguid(a) or str(a) for a in (registry.resolve(ALLOWED_AAGUIDS) or ()))
+    return tuple(dict.fromkeys(makes))
 
 
 def device_bound_roles() -> Tuple[str, ...]:

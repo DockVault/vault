@@ -513,7 +513,7 @@ def test_a_make_saved_in_another_spelling_of_its_uuid_is_that_make(monkeypatch):
     for nothing in (None, "", "not-a-uuid", 7, [], "cb69481e"):
         assert wss.canonical_aaguid(nothing) is None, nothing
     other = "2fc0579f-8113-47ea-b116-bb5a8db9202a"
-    _resolving(monkeypatch, registry, {wss.ALLOWED_AAGUIDS: spellings + [other.upper(), "not-a-uuid"]})
+    _resolving(monkeypatch, registry, {wss.ALLOWED_AAGUIDS: spellings + [other.upper()]})
     assert wss.allowed_aaguids() == (make, other)
     # What the ceremony compares a key's make against is what the setting gives: the one spelling.
     from _bare_api_env import set_bare_api_env
@@ -521,6 +521,27 @@ def test_a_make_saved_in_another_spelling_of_its_uuid_is_that_make(monkeypatch):
     from app.services import webauthn_service as ws
     assert str(ws._aaguid(uuid.UUID(make).bytes)) == make
     assert str(ws._aaguid(uuid.UUID(make).bytes)) in {a.lower() for a in wss.allowed_aaguids()}
+
+
+def test_a_list_of_makes_with_nothing_readable_in_it_allows_no_make(monkeypatch):
+    """The deployment gives the list of makes with a typing error in every entry. The save through the panel
+    refuses such an entry; a value the deployment gave was never held to that. An entry that is no UUID matches
+    no authenticator, so the list allowed none. Read back without such entries, the list was empty, an empty
+    list is no restriction, and every make was allowed where the deployment had meant to allow two."""
+    registry, wss = _mod()
+    make = "cb69481e-8ff7-4039-93ec-0a2729a154a8"
+    monkeypatch.setattr(wss, "trust_anchors", lambda: (b"der",))
+    _resolving(monkeypatch, registry, {wss.ATTESTATION: "direct",
+                                       wss.ALLOWED_AAGUIDS: ["cb69481e-8ff7-4039-93ec", "", "yubikey 5"]})
+    assert wss.allowed_aaguids() == ("cb69481e-8ff7-4039-93ec", "", "yubikey 5")
+    # What the ceremony reads: a list (so the restriction applies) that holds no make of any authenticator.
+    assert wss.policy().allowed_aaguids and make not in {a.lower() for a in wss.policy().allowed_aaguids}
+    # Beside makes that can be read, such an entry changes nothing: it is kept, once, and matches nothing.
+    _resolving(monkeypatch, registry, {wss.ALLOWED_AAGUIDS: ["not-a-uuid", make.upper(), "not-a-uuid"]})
+    assert wss.allowed_aaguids() == ("not-a-uuid", make)
+    # No list is no restriction, as it always was.
+    _resolving(monkeypatch, registry, {wss.ALLOWED_AAGUIDS: []})
+    assert wss.allowed_aaguids() == ()
 
 
 def test_the_owners_of_keys_of_a_removed_algorithm_are_told_when_it_is_removed(monkeypatch):
