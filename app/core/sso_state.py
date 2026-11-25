@@ -357,9 +357,11 @@ def forget_logout_jti(jti, *, scope: str, redis=None) -> None:
 
 
 LOGGED_OUT_PREFIX = "sso:logged-out:"
-# Longer than a sign-in can last from the moment it counts from, its start at the vault (:func:`began_at`), to
-# the end of a held step: the state's ten minutes, the handover code's one and a held step's five (960 seconds).
-# Each step that follows another is judged where it is written.
+# Longer than the longest wait between a logout and the next step of a sign-in that is judged against it: from
+# the sign-in's start at the vault (:func:`began_at`) through the state's ten minutes and the handover code's
+# one to the end of one held step's five (960 seconds). A sign-in as a whole can last longer (one held step may
+# follow another), and that is covered: each step is judged where it is written, so a note needs to outlive
+# only the wait up to the next of them.
 LOGGED_OUT_TTL_SECONDS = 1200
 
 

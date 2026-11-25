@@ -1165,7 +1165,7 @@ def _group_names(row, answer: ProviderAnswer) -> list:
 
 
 def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str],
-                    identity=None, began_at=None):
+                    began_at, identity=None):
     """The pipeline's result for a provider sign-in: the provider is the first proof (``amr`` carries what the
     vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
     provider's policy trusts the values the token carried, and never for an identity that stands on the provider's
@@ -1190,11 +1190,13 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     sign-in counts from for the provider's logouts. Not the moment the provider's answer was taken: the exchange
     of the code and the account's resolution take their time, and a browser may hold the provider's redirect for
     as long as the state lives. A logout the vault took in between found no session to end, and a moment stamped
-    here, after it, let the sign-in finish with the session the provider had logged out. Without it (a caller
-    that began nothing), now."""
+    here, after it, let the sign-in finish with the session the provider had logged out. It is required, and a
+    caller that cannot say when the sign-in was begun is refused as an unknown sign-in (the person starts
+    again): taken as now, a missing moment brought that back for whoever called without one."""
     from app.services.sign_in import SignInResult
-    counted_from = (float(began_at) if isinstance(began_at, (int, float)) and not isinstance(began_at, bool)
-                    else time.time())
+    if not isinstance(began_at, (int, float)) or isinstance(began_at, bool):
+        raise Refusal(STATE_UNKNOWN, "the sign-in does not say when it was begun")
+    counted_from = float(began_at)
     policy = policy_of(row)
     on_the_providers_word = linked_on_the_providers_word(db, user, identity)
     return SignInResult(user, [], client_ip, provider_id=provider_id, sessions_ended=sign_in_as_read(user),

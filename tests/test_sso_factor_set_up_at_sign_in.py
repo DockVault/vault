@@ -7,6 +7,7 @@ an authenticator, or a passkey where one can be made, on that sign-in; an accoun
 first. The cases: a factor required by the policy, an administrator's reset, an identity linked by email that is
 between two factors. And the key such an account sets up serves after its provider, never around it. Offline:
 the routes through the ASGI app, an in-memory database, a real provider row and identity."""
+import time
 import types
 import uuid
 from datetime import datetime
@@ -81,7 +82,7 @@ class World:
             claims={}, subject=identity.subject, issuer="https://idp.example", tenant_id=None, email=None,
             email_verified=False, display_name=None, auth_time=None, amr=["mfa"] if with_its_mfa else [])
         result = sso_sign_in.pipeline_result(self.db, self.provider, user, answer, provider_id=str(self.provider.id),
-                                             client_ip=IP, identity=identity)
+                                             client_ip=IP, identity=identity, began_at=time.time())
         return sign_in.finish(self.db, result)
 
     def held(self, user, **kw):
@@ -544,7 +545,7 @@ def test_the_providers_mfa_of_an_identity_linked_by_email_is_judged_again_where_
             claims={}, subject=identity.subject, issuer="https://idp.example", tenant_id=None, email=None,
             email_verified=False, display_name=None, auth_time=None, amr=["mfa"])
         return sso_sign_in.pipeline_result(w.db, w.provider, carol, answer, provider_id=str(w.provider.id),
-                                           client_ip=IP, identity=identity)
+                                           client_ip=IP, identity=identity, began_at=time.time())
     result = answered()
     assert result.provider_mfa_trusted is True               # as she stood when the provider answered
     if came_to_hold == "an authenticator":

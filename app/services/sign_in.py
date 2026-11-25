@@ -277,6 +277,8 @@ def read_pre_auth(payload: dict, pending: PendingLogin) -> None:
     sid, sub = payload.get("idp_sid"), payload.get("idp_sub")
     pending._provider_sid = sid if isinstance(sid, str) else None
     pending._provider_sub = sub if isinstance(sub, str) else None
+    # When the vault began the sign-in at the provider (the field keeps an older name: it is not the moment of
+    # the provider's answer).
     answered = payload.get("idp_at")
     pending._provider_answered_at = (float(answered) if isinstance(answered, (int, float))
                                      and not isinstance(answered, bool) else None)
@@ -641,7 +643,7 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
 # provider: the password door (app/services/auth_service.py) and every other first proof here record the same text.
 PROVIDER_ONLY_REASON = "Account signs in only through its identity provider"
 # The audit's reason for a provider sign-in that was not finished because its provider was turned off, or the
-# account unlinked from it, after the provider answered.
+# account unlinked from it, while the sign-in was under way.
 PROVIDER_GONE_REASON = "The identity provider was turned off or unlinked before the sign-in finished"
 PROVIDER_LOGGED_OUT_REASON = "The identity provider logged the person out before the sign-in finished"
 LOGOUT_MEMORY_REASON = ("The sign-in began before the vault's memory of the provider's logouts does (the store was "

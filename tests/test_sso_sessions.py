@@ -977,7 +977,8 @@ def test_a_sign_in_counts_from_when_the_vault_began_it(monkeypatch):
     assert sso_state.LoginState.from_payload(whole).asked_at is None
     for odd in ("12.5", True, [1]):
         assert sso_state.LoginState.from_payload({**whole, "asked_at": odd}) is None, odd
-    # The result carries the moment it is given, and now for a caller that began nothing.
+    # The result carries the moment it is given. A caller that cannot say when the sign-in was begun is refused
+    # as an unknown sign-in: taken as now, a missing moment let a sign-in finish that a logout had ended.
     alice, p = _user(), _provider()
     answer = types.SimpleNamespace(auth_time=None, sid="s-1", subject="subject-1", id_token="t", amr=[], acr=None)
     monkeypatch.setattr(sso, "linked_on_the_providers_word", lambda db, user, identity: False)
@@ -985,8 +986,13 @@ def test_a_sign_in_counts_from_when_the_vault_began_it(monkeypatch):
     given = sso.pipeline_result(None, p, alice, answer, provider_id=str(p.id), client_ip=None, began_at=1000.75)
     assert given.provider_answered_at == 1000.75
     for nothing in (None, True, "1000"):
-        result = sso.pipeline_result(None, p, alice, answer, provider_id=str(p.id), client_ip=None, began_at=nothing)
-        assert abs(result.provider_answered_at - time.time()) < 5, nothing
+        with pytest.raises(sso.Refusal) as refused:
+            sso.pipeline_result(None, p, alice, answer, provider_id=str(p.id), client_ip=None, began_at=nothing)
+        assert refused.value.code == sso.STATE_UNKNOWN, nothing
+    with pytest.raises(TypeError):                           # and it cannot be left out
+        sso.pipeline_result(None, p, alice, answer, provider_id=str(p.id), client_ip=None)
+    assert sso.pipeline_result(None, p, alice, answer, provider_id=str(p.id), client_ip=None,
+                               began_at=0).provider_answered_at == 0.0
 
 
 def test_a_logout_by_the_subject_ends_the_persons_sign_ins_under_way_through_the_provider_and_no_others(monkeypatch):
@@ -1013,8 +1019,9 @@ def test_a_logout_by_the_subject_ends_the_persons_sign_ins_under_way_through_the
 
 
 def test_a_held_sign_in_carries_when_the_provider_answered_and_one_that_does_not_say_is_taken_as_before(monkeypatch):
-    """The moment the vault took the provider's answer rides with the sign-in: in the handover record, and in the
-    token of a step that holds it. A sign-in that carries none is taken as answered before any logout."""
+    """The moment the vault began the sign-in rides with it: in the handover record, and in the token of a step
+    that holds it. A sign-in that carries none is taken as begun before any logout. (The name of this test and of
+    the field keep an older wording: the moment is the sign-in's start, not the provider's answer.)"""
     import types as _types
     from app.core import sso_state
     from app.services import sign_in
