@@ -236,6 +236,62 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     assert F.way_in_text(db, held) == NOT_AVAILABLE
 
 
+def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
+    """Dana is linked to Contoso, which refused her (or is off), and to Fabrikam, which is on. The door said "ask
+    your administrator", though a sign-in through Fabrikam lets her in: a sign-in through any provider the account
+    is linked to does. The sentence names that way. Not a provider that is off, one that refused her too, or one
+    she is not linked to; and where the holding provider itself can be reached, it alone is named."""
+    alice, p, i, db = _world()
+    fabrikam = _provider(name="Fabrikam", label="Staff sign-in")
+    adatum = _provider(name="Adatum", label="")
+    fabrikam.id, adatum.id = uuid.uuid4(), uuid.uuid4()
+    db.tables[SsoProvider].extend([fabrikam, adatum])
+    hers = _identity(alice, fabrikam, subject="s-fab", last_sign_in_at=datetime.utcnow())
+    db.tables[ExternalIdentity].append(hers)
+    i.refused_at = datetime.utcnow()
+    refused = F.held_to_a_provider(db, alice)
+    assert refused.refused and refused.provider_id == str(p.id)
+    assert F.way_in_text(db, refused) == (
+        "Contoso did not admit your account when it last signed in there, so its password and passkeys do not sign "
+        "it in. You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the sign-in page.")
+    assert F.another_way_in(db, refused) == (
+        "You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the sign-in page.")
+    fabrikam.show_on_sign_in = False
+    assert F.way_in_text(db, refused).endswith(
+        "You can sign in through Fabrikam instead: Use the sign-in link your organisation gave you.")
+    fabrikam.show_on_sign_in = True
+    # The holding provider off: the same way is named in the place of the administrator.
+    p.state = "disabled"
+    assert F.way_in_text(db, refused) == (
+        "Your account signs in only through Contoso until it has signed in there again, and Contoso is not "
+        "available on this vault right now. You can sign in through Fabrikam instead: Use the “Staff sign-in” "
+        "button on the sign-in page.")
+    p.state = "enabled"
+    # A provider she is not linked to is no way in, whatever its state and whoever else is linked to it.
+    bob = _user(username="bob")
+    db.tables[User].append(bob)
+    db.tables[ExternalIdentity].append(_identity(bob, adatum, subject="s-bob", last_sign_in_at=datetime.utcnow()))
+    assert "Adatum" not in F.way_in_text(db, refused)
+    # Two ways: the first by name, the same each time.
+    also = _identity(alice, adatum, subject="s-ada", last_sign_in_at=datetime.utcnow())
+    db.tables[ExternalIdentity].append(also)
+    assert F.another_way_in(db, refused) == (
+        "You can sign in through Adatum instead: Use the “Adatum” button on the sign-in page.")
+    # One that is off, or that refused her too, is none.
+    adatum.state = "disabled"
+    assert F.another_way_in(db, refused).startswith("You can sign in through Fabrikam instead")
+    hers.refused_at = datetime.utcnow()
+    assert F.another_way_in(db, refused) is None
+    assert F.way_in_text(db, refused).endswith("Sign in through Contoso once it admits you, or ask your administrator.")
+    adatum.state, hers.refused_at = "enabled", None
+    # Where the provider that holds the account can be reached, it is the one named, and no other.
+    i.refused_at = None
+    lapsed = F.held_to_a_provider(db, alice)
+    assert lapsed is not None and not lapsed.refused
+    said = F.way_in_text(db, lapsed)
+    assert said.startswith("Sign in through Contoso: ") and "Fabrikam" not in said and "Adatum" not in said
+
+
 # --------------------------------------------------------------------------- the password door
 
 def _door(monkeypatch, db):

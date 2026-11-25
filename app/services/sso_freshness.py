@@ -200,10 +200,44 @@ def closes_a_connection(db, user, *, by_password: bool) -> bool:
     return lapsed(db, getattr(user, "id", None)) is not None
 
 
+def _how_to_reach(row, name: str) -> str:
+    label = (getattr(row, "label", None) or "").strip() or name
+    return (f"Use the “{label}” button on the sign-in page." if getattr(row, "show_on_sign_in", True)
+            else "Use the sign-in link your organisation gave you.")
+
+
+def another_way_in(db, found: Deadline) -> Optional[str]:
+    """Where the provider that holds the account cannot let the person in now (it is off, or it refused them):
+    another provider the account is linked to that is on and has not refused it, as "You can sign in through X
+    instead: ...", or None when there is none. A sign-in through any provider the account is linked to is let in
+    (:func:`held_to_a_provider`), so the person is not sent to an administrator while such a way stands. The
+    first by name, so the sentence is the same each time."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    try:
+        owner = uuid.UUID(str(found.user_id))
+    except ValueError:
+        return None
+    others = []
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == owner).all():
+        if getattr(identity, "refused_at", None) is not None:
+            continue                   # (the provider that holds the account is asked about only when it refused
+                                       # the account or is off: it is left out by one of the two)
+        other = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+        if other is not None and getattr(other, "state", None) == "enabled":
+            name = (getattr(other, "name", None) or "").strip() or (getattr(other, "label", None) or "").strip()
+            if name:
+                others.append((name.lower(), name, other))
+    if not others:
+        return None
+    _key, name, other = sorted(others, key=lambda entry: entry[0])[0]
+    return f"You can sign in through {name} instead: {_how_to_reach(other, name)}"
+
+
 def way_in_text(db, found: Deadline) -> str:
     """What a person is told at a door that goes through no provider while :func:`held_to_a_provider` holds their
-    account: the provider by name and how to reach it, or to ask an administrator where it cannot be reached or
-    has refused them. Said only after the proof at that door was good."""
+    account: the provider by name and how to reach it; where it cannot be reached or has refused them, another
+    provider of theirs that lets them in (:func:`another_way_in`), or to ask an administrator when there is none.
+    Said only after the proof at that door was good."""
     from app.core.models import SsoProvider
     name = found.provider_name
     row = None
@@ -212,16 +246,15 @@ def way_in_text(db, found: Deadline) -> str:
     except ValueError:
         row = None
     if row is None or getattr(row, "state", None) != "enabled":
+        other = another_way_in(db, found)
         return (f"Your account signs in only through {name} until it has signed in there again, and {name} is not "
-                "available on this vault right now. Ask your administrator.")
+                "available on this vault right now. " + (other or "Ask your administrator."))
     if found.refused:
+        other = another_way_in(db, found)
         return (f"{name} did not admit your account when it last signed in there, so its password and passkeys do "
-                f"not sign it in. Sign in through {name} once it admits you, or ask your administrator.")
-    label = (getattr(row, "label", None) or "").strip() or name
-    how = (f"Use the “{label}” button on the sign-in page." if getattr(row, "show_on_sign_in", True)
-           else "Use the sign-in link your organisation gave you.")
+                f"not sign it in. " + (other or f"Sign in through {name} once it admits you, or ask your administrator."))
     return (f"Sign in through {name}: your account has not signed in there within the time your organisation "
-            f"allows, so its password and passkeys do not sign it in until it does. {how}")
+            f"allows, so its password and passkeys do not sign it in until it does. {_how_to_reach(row, name)}")
 
 
 def due_date(db, user_id) -> Optional[datetime]:
