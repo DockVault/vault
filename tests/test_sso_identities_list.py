@@ -166,3 +166,24 @@ def test_the_identity_this_session_came_through_is_marked_and_its_unlink_says_it
     assert status == 200 and out["ended_this_session"] is False and revoked == [], out
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{through.id}")
     assert status == 200 and out["ended_this_session"] is True and revoked == [[session_id]], out
+
+
+def test_the_identity_whose_unlink_gives_the_account_its_password_back_is_marked(monkeypatch):
+    """An account that signs in only through its providers is held to no password by the provider whose people hold
+    none. Unlinking that one lets it hold a password again, though it has none yet: the list says so for that
+    identity, by the rule the unlink settles the account with, so the page can say it before the unlink."""
+    alice = _user(sso_only=True)
+    holds = _provider(name="holds", label="Holds", policy={"sso_password_login": "disabled", **ONE_STEP})
+    keeps = _provider(name="keeps", label="Keeps", policy=ONE_STEP)
+    on_holds, on_keeps = _identity(alice, holds, subject="s-holds"), _identity(alice, keeps, subject="s-keeps")
+    h = Harness(monkeypatch, [alice], [holds, keeps], identities=[on_holds, on_keeps])
+    h.session_claims = {"amr": []}
+    marked = {i["provider_id"]: i["restores_password"] for i in _listed(h)["identities"]}
+    assert marked == {str(holds.id): True, str(keeps.id): False}
+    # What the unlink answers agrees.
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: None)
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_holds.id}")
+    assert status == 200 and out.get("may_set_password") is True, out
+    # An account that holds a password of its own gets nothing back from any unlink.
+    alice.sso_only = False
+    assert {i["restores_password"] for i in _listed(h)["identities"]} == {False}

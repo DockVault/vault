@@ -261,7 +261,11 @@
                 + 'Sign in again another way.');
             return;
         }
-        showSuccess('Unlinked.');
+        // The provider that held the account to no password is gone: the account may hold one again, and has none.
+        showSuccess(answer && answer.may_set_password === true
+            ? 'Unlinked. Your account may hold a password again and has none yet: ask an administrator for a reset '
+                + 'link, or use "Forgot your password?" on the sign-in page where it is shown.'
+            : 'Unlinked.');
         renderAccount();
     }
 
@@ -323,9 +327,14 @@
             unlink.setAttribute('aria-label', 'Unlink ' + (identity.provider || 'this provider'));
             unlink.addEventListener('click', async () => {
                 const name = identity.provider || 'this provider';
-                // The unlink ends every session made through the identity, this one too when it came through it.
-                const signsOut = identity.this_session === true ? ' You signed in this time through ' + name
-                    + ', so unlinking it also signs you out here and wherever you signed in through it.' : '';
+                // What else the unlink does, said before it: the provider held the account to no password (it may
+                // hold one again, and has none yet), and it ends every session made through the identity, this one
+                // too when it came through it.
+                const alsoSaid = (identity.restores_password === true ? ' Your account may then hold a password '
+                    + 'again, but has none yet: ask an administrator for a reset link, or use "Forgot your password?" '
+                    + 'on the sign-in page where it is shown.' : '')
+                    + (identity.this_session === true ? ' You signed in this time through ' + name
+                        + ', so unlinking it also signs you out here and wherever you signed in through it.' : '');
                 if (identity.unlink_asks_provider) {
                     // The provider confirms the unlink with a fresh sign-in there: the page goes to the provider
                     // and unlinks once it is back (app.js, resume).
@@ -334,7 +343,7 @@
                         return;
                     }
                     const go = await showConfirm('Unlink ' + name + '? You will no longer sign in through it. To '
-                        + 'confirm it is you, ' + name + ' asks you to sign in there once more first.' + signsOut,
+                        + 'confirm it is you, ' + name + ' asks you to sign in there once more first.' + alsoSaid,
                         'Unlink single sign-on', null, 'Continue');
                     if (!go) return;
                     unlink.disabled = true;
@@ -343,7 +352,7 @@
                     return;
                 }
                 const ok = await showConfirm('Unlink ' + name + '? You will no longer '
-                    + 'sign in through it.' + signsOut, 'Unlink single sign-on', null, 'Unlink');
+                    + 'sign in through it.' + alsoSaid, 'Unlink single sign-on', null, 'Unlink');
                 if (!ok) return;
                 let answer;
                 try {

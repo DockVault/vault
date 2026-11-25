@@ -1580,6 +1580,10 @@ async def list_my_identities(
         out["unlink_refusal"] = {"reason": refusal[0], "message": refusal[1]} if refusal is not None else None
         # Whether this session came through it: its unlink signs the person out here too, which the page says first.
         out["this_session"] = came is not None and came == (str(identity.provider_id), identity.subject)
+        # Whether its unlink lets the account hold a password again (it has none yet), by the rule the unlink
+        # settles the account with (sso_only.settle): the page says so before the unlink.
+        out["restores_password"] = (bool(getattr(current_user, "sso_only", False))
+                                    and not sso_only.should_be_sso_only(db, current_user, without=identity))
         return out
     from app.core import privileged_accounts
     # An administrator's or auditor's account keeps a password of its own: a provider whose people hold none never

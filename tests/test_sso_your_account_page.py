@@ -227,3 +227,42 @@ out({ confirms, logouts, asked, flow: { label: flow.label, then: flow.then }, le
 def test_the_page_back_from_the_provider_hands_the_providers_name_to_the_unlink():
     source = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
     assert "await Sso.unlinkConfirmed(out.then.slice('unlink:'.length), out.label);" in source
+
+
+MAY_HOLD_A_PASSWORD = (' Your account may then hold a password again, but has none yet: ask an administrator for a reset '
+                       'link, or use "Forgot your password?" on the sign-in page where it is shown.')
+UNLINKED_PASSWORD_BACK = ('Unlinked. Your account may hold a password again and has none yet: ask an administrator for a '
+                          'reset link, or use "Forgot your password?" on the sign-in page where it is shown.')
+
+
+def test_an_unlink_that_gives_the_account_its_password_back_says_so_before_and_after():
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+answers['DELETE /users/me/identities/i-1'] = { removed: true, sessions_ended: 0, may_set_password: true,
+                                               ended_this_session: false };
+await window.Sso.renderAccount();
+button('Unlink').click();
+await settle();
+const direct = { confirms: confirms.slice(), successes: successes.slice() };
+confirms.length = 0; successes.length = 0;
+await window.Sso.unlinkConfirmed('i-1', 'Contoso');
+await settle();
+out({ direct, confirmed: { successes }, logouts });
+""".replace("LISTED", _list(_identity(restores_password=True))))
+    assert got["direct"]["confirms"][0]["message"] == ("Unlink Contoso? You will no longer sign in through it."
+                                                       + MAY_HOLD_A_PASSWORD)
+    assert got["direct"]["successes"] == [UNLINKED_PASSWORD_BACK]
+    assert got["confirmed"]["successes"] == [UNLINKED_PASSWORD_BACK]
+    assert got["logouts"] == []
+
+
+def test_an_unlink_confirmed_at_the_provider_that_gives_the_password_back_says_so_before_it_leaves():
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+answers['POST /users/me/identities/p-1/reauth'] = { authorization_url: 'https://idp.example.test/authorize' };
+await window.Sso.renderAccount();
+button('Unlink').click();
+await settle();
+out({ confirms });
+""".replace("LISTED", _list(_identity(restores_password=True, unlink_asks_provider=True))))
+    assert got["confirms"][0]["message"].endswith("asks you to sign in there once more first." + MAY_HOLD_A_PASSWORD)
