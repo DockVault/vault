@@ -1525,8 +1525,22 @@ async def unlink_my_identity(
     _refuse_temp(current_user)
     api._enforce_step_up(db, current_user, request, "account.second_factor")
     # The account's turn before its identities are read: two unlinks sent at once would each count the other's
-    # identity as the way in that is left, and both would go through.
-    api._sessions_turn(db, current_user.id)
+    # identity as the way in that is left, and both would go through. Waited for as a link waits (the short wait
+    # of where a sign-in is written): this route runs on the server's one loop, and a change that settles the
+    # account holds its turn until it commits. A turn still held is answered as busy. Nothing was changed; the
+    # step-up the request came with is used, so the person gives it again with the next try.
+    from sqlalchemy.exc import OperationalError
+    from app.services import sign_in as _sign_in
+    try:
+        _sign_in.with_a_short_wait(db, lambda: api._sessions_turn(db, current_user.id))
+    except OperationalError as waited:
+        if getattr(getattr(waited, "orig", None), "pgcode", None) != LOCK_NOT_AVAILABLE:
+            raise
+        db.rollback()
+        from app.core import sign_in_lockout
+        raise HTTPException(status_code=503, headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)},
+                            detail={"reason": sso.BUSY, "message": (
+                                "Your account is being changed right now. Try again in a moment.")}) from None
     identity = db.query(ExternalIdentity).filter(ExternalIdentity.id == identity_id,
                                                  ExternalIdentity.user_id == current_user.id).first()
     if identity is None:

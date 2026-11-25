@@ -556,3 +556,41 @@ def test_the_owner_is_advised_by_who_made_the_change(monkeypatch):
     assert said == ["You unlinked your account from Contoso. If you did not do this, remove it and change your password.",
                     "root unlinked your account from Contoso. If you did not expect this, ask an administrator.",
                     "You linked Contoso. If you did not do this, tell an administrator at once."]
+
+
+def test_the_owners_unlink_waits_a_short_time_for_the_accounts_turn_and_is_answered_as_busy(monkeypatch):
+    """The owner's unlink runs on the server's one loop. A change that settles the account holds its turn until
+    it commits: the unlink waits for it as a link does, and a turn still held is answered as busy, with nothing
+    unlinked. Another failure of the database is not taken for a held turn."""
+    from sqlalchemy.exc import OperationalError
+    from app.core import sign_in_lockout
+    from app.services import sign_in
+    alice, p = _user(), _provider(policy={"sso_lapse_ends_sign_in": False})     # an unlink in one step
+    identity = _identity(alice, p, last_sign_in_at=datetime.utcnow())
+    h = Harness(monkeypatch, [alice], [p], identities=[identity])
+    asked, real = [], sign_in.with_a_short_wait
+
+    def the_short_wait(db, take):
+        asked.append("the short wait")
+        return real(db, take)
+    code = ["55P03"]
+
+    def still_held(db, owner):
+        asked.append(("the turn", str(owner)))
+        raise OperationalError("SELECT 1 FOR UPDATE", {}, types.SimpleNamespace(pgcode=code[0]))
+    monkeypatch.setattr(sign_in, "with_a_short_wait", the_short_wait)
+    monkeypatch.setattr(h.S, "_sessions_turn", still_held)
+    rolled_back = h.db.log.count(("rollback",))
+    status, body, headers = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+    assert status == 503 and headers.get("retry-after") == str(sign_in_lockout.BUSY_RETRY_SECONDS), (body, headers)
+    assert body["detail"] == {"reason": "busy", "message": "Your account is being changed right now. Try again in a moment."}
+    assert asked == ["the short wait", ("the turn", str(alice.id))]
+    assert h.db.log.count(("rollback",)) == rolled_back + 1 and identity in h.identities()
+    assert not [a for a in h.audits if a[0] == "sso_identity_unlinked"]
+    code[0] = "40P01"                                           # a deadlock is not a turn that is held
+    status, body, headers = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+    assert status == 500 and "retry-after" not in headers, body          # the server's own error, not "busy"
+    assert identity in h.identities()
+    # Let go, the same request unlinks.
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: None)
+    assert _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")[0] == 200 and identity not in h.identities()

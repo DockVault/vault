@@ -473,6 +473,12 @@ elif pair.startswith("unlinked by "):
     if pair.endswith("while a sign-in is written"):
         out = together(writer=through_the_provider(alice, contoso, "s-1", pause=1.6),
                        ender=after_the_turn_is_held(unlink))
+        if not by_an_administrator:
+            # The owner's route waits a short time only: it is tried again once the sign-in is written.
+            try:
+                out["again"] = ["ok", unlink()]
+            except Exception as exc:  # noqa: BLE001
+                out["again"] = ["error", type(exc).__name__, str(getattr(exc, "status_code", ""))]
     else:
         out = {"ender": ["ok", unlink()]}
         out.update(together(writer=through_the_provider(alice, contoso, "s-1")))
@@ -591,10 +597,19 @@ def test_a_save_that_comes_while_a_reset_link_is_used_waits_and_leaves_the_passw
 
 @pytest.mark.parametrize("by", ["an administrator", "its owner"])
 def test_an_identity_unlinked_while_a_sign_in_through_it_is_written_waits_and_ends_its_session(db_name, by):
+    """Both unlinks take the account's turn before they read its identities. The administrator's waits for the
+    sign-in that holds it and then ends the session it wrote. The owner's runs on the server's one loop and waits
+    a short time only: it is answered as busy with nothing unlinked, and tried again it ends the session."""
     out = run_in(db_name, SCENARIO, env={"PAIR": f"unlinked by {by} while a sign-in is written"})
     assert out["writer"] == ["ok", "signed in"], out
-    assert out["ender"] == ["ok", 1], out                    # the session the sign-in wrote, ended by the unlink
-    assert out["the turn was held"] is True and out["ender seconds"] >= 1.0, out      # it waited for the turn
+    assert out["the turn was held"] is True, out
+    if by == "an administrator":
+        assert out["ender"] == ["ok", 1], out                # the session the sign-in wrote, ended by the unlink
+        assert out["ender seconds"] >= 1.0, out              # it waited for the turn
+    else:
+        assert out["ender"][:3] == ["error", "HTTPException", "503"], out
+        assert out["ender seconds"] < 1.5, out               # a link's short wait, not the sign-in's time
+        assert out["again"] == ["ok", 1], out                # tried again: the session the sign-in wrote, ended
     after = out["after"]
     assert after["links"] == 0 and after["sessions"] == [[False, True]], out
 
