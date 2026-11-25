@@ -175,3 +175,30 @@ def test_the_link_by_address_tells_that_the_password_stopped_from_the_flag_as_co
     db.commit()
     assert found.linked_now is True and found.password_stopped is True
     assert _as_left(db, alice) == (True, 2)
+
+
+def test_the_link_reads_again_the_flag_and_the_role_and_never_what_its_caller_has_just_set(db, world, monkeypatch):
+    """What a link is decided on, read again in the turn: the flag and the role, and nothing else of the account
+    (the password's mark is read again where the flag is settled, when a change is due). Each is left alone when
+    the caller has set it and not written it yet: read again, the caller's change would be undone with no word."""
+    import inspect
+    from app.core import sso_only
+    from app.core.models import RoleEnum, User
+    from app.services import sso_sign_in as sso
+    source = inspect.getsource(sso.decide_in_the_accounts_turn)
+    assert 'sso_only.read_again(db, user, ["sso_only", "role"])' in source and "refresh(" not in source
+    assert 'read_again(db, user, ["sso_only", "role", "password_hash", "password_nobody_knows", '            '"had_a_password_at"])' in inspect.getsource(sso_only.settle)
+    alice = _user(db, "alice")
+    db.commit()
+    me = db.query(User).filter(User.id == alice.id).first()
+    monkeypatch.setattr(api, "_sessions_turn", lambda session, owner: None)
+    other = _another(db)
+    theirs = other.get(User, alice.id)
+    theirs.sso_only, theirs.role = True, RoleEnum.EXTERNAL
+    other.commit()
+    other.close()
+    sso.decide_in_the_accounts_turn(db, me)
+    assert me.sso_only is True and me.role == RoleEnum.EXTERNAL            # both as committed
+    me.role = RoleEnum.ADMIN                                               # the caller's change, not written yet
+    sso.decide_in_the_accounts_turn(db, me)
+    assert me.role == RoleEnum.ADMIN and me.sso_only is True

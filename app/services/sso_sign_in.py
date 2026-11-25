@@ -1012,7 +1012,11 @@ ACCOUNT_BUSY = "account_busy"
 
 def decide_in_the_accounts_turn(db, user) -> None:
     """Take ``user``'s turn at its sessions, and read again what a link is decided on, as it is committed: the
-    account's flag, its role and whether its password is one nobody knows.
+    account's flag and its role. The role decides whether a provider whose people hold no password takes the
+    account at all; the flag is what the link's answer and notice are told from. Whether the account's password
+    is one nobody knows decides for an account made at a first sign-in, and is not read here: where the flag is
+    settled (app/core/sso_only.settle) it is read again in this same turn whenever a change is due, and no state
+    exists in which a mark read earlier would hide a change that is due.
 
     What changes any of them takes the same turn: a provider's save that lets the account hold a password again,
     a provider's removal, an unlink, a promotion. A link decided on what was read a moment before such a change
@@ -1035,10 +1039,10 @@ def decide_in_the_accounts_turn(db, user) -> None:
         if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
             raise
         raise Refusal(BUSY, ACCOUNT_BUSY) from None
-    refresh = getattr(db, "refresh", None)
-    if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
-        refresh(user, attribute_names=["sso_only", "role", "password_hash", "password_nobody_knows",
-                                       "had_a_password_at"])
+    # Each unless the caller has set it on the account and not written it yet: read again, such a value would
+    # be put back to what the database still holds (app/core/sso_only.read_again).
+    from app.core import sso_only
+    sso_only.read_again(db, user, ["sso_only", "role"])
 
 
 def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str, keep_session=None):
