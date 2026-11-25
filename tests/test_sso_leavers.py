@@ -401,6 +401,31 @@ def test_what_the_administrators_are_told_about_the_password_when_a_provider_ref
     assert "an administrator or an auditor keeps a password of their own" in F.password_after_a_refusal(db2, root)
 
 
+def test_a_sign_in_that_would_link_a_busy_account_says_that_signing_in_is_busy(monkeypatch):
+    """A sign-in through a provider that would link the account by its address, while the account's turn is held
+    by a change of it: the provider was reached and answered. The person is told that signing in is busy, in the
+    words every other door uses, not that the provider could not be reached; nothing is linked."""
+    from test_sso_sign_in import _call
+    from app.services import oidc_client as oc
+    from app.services import sign_in
+    from app.services import sso_sign_in as sso
+    bob = _user("bob")
+    other = _provider(name="fabrikam", label="Sign in with Fabrikam",
+                      policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [bob], [other])
+
+    def busy(db, user):
+        raise sso.Refusal(sso.BUSY, sso.ACCOUNT_BUSY)
+    monkeypatch.setattr(sso, "decide_in_the_accounts_turn", busy)
+    location, _ = _sign_in(h, other, sub="bob-at-fabrikam", email="bob@example.test")
+    assert location == "/#sso-error=busy", location
+    assert len(h.identities()) == 0
+    assert [a for a in h.audits if a[0] == "sso_sign_in_refused"][-1][2]["reason"] == "busy"
+    _status, body, _headers = _call(h.S, "GET", "/auth/sso/reasons")
+    assert body["reasons"]["busy"] == sign_in.BUSY == "Signing in is busy right now. Try again in a moment."
+    assert body["reasons"][oc.TEMPORARILY_UNAVAILABLE] == "The provider could not be reached. Try again in a moment."
+
+
 def test_a_held_account_is_not_linked_by_its_verified_email_at_another_provider(monkeypatch):
     """A second provider that links by a verified address would give a held account a way back in: the sign-in
     that made the link would finish as a provider's own. Refused where the link is decided, as the link from Your

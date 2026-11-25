@@ -630,8 +630,9 @@ def test_a_link_needs_a_session_that_proved_the_password_and_the_factor(monkeypa
 
 
 def test_a_link_met_by_a_change_of_the_account_is_answered_as_busy_and_links_nothing(monkeypatch):
-    """The account's turn was held for longer than a link waits: said as busy with the wait to try again after,
-    not as a refusal of the identity."""
+    """The account's turn was held for longer than a link waits: said as busy, by a reason of its own, not as a
+    refusal of the identity and not as a provider that could not be reached. The one-time code is spent by then,
+    so the answer names no time to send it again after: the sentence says to start the link again."""
     from app.services import oidc_client as oc
     from app.services import sso_sign_in as sso
     alice, p = _user(), _provider()
@@ -642,15 +643,18 @@ def test_a_link_met_by_a_change_of_the_account_is_answered_as_busy_and_links_not
     assert location.startswith("/#sso-linked=")
 
     def busy(db, user):
-        raise sso.Refusal(oc.TEMPORARILY_UNAVAILABLE, sso.ACCOUNT_BUSY)
+        raise sso.Refusal(sso.BUSY, sso.ACCOUNT_BUSY)
     monkeypatch.setattr(sso, "decide_in_the_accounts_turn", busy)
-    from app.core import sign_in_lockout
     code = parse_qs(location.split("#", 1)[1])["sso-linked"][0]
     status, body, headers = _call(h.S, "POST", "/users/me/identities/finish", {"code": code, "verifier": "link-tab"})
-    assert status == 503 and headers.get("retry-after") == str(sign_in_lockout.BUSY_RETRY_SECONDS), (body, headers)
-    assert body["detail"] == {"reason": "temporarily_unavailable",
+    assert status == 503 and "retry-after" not in headers, (body, headers)
+    assert body["detail"] == {"reason": "busy",
                               "message": "Your account is being changed right now. Start the link again in a moment."}
     assert len(h.identities()) == 0
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "busy" for a in h.audits), h.audits
+    # The same code spent: the request sent again finds nothing to finish.
+    assert _call(h.S, "POST", "/users/me/identities/finish", {"code": code, "verifier": "link-tab"})[0] != 200
+    assert oc.TEMPORARILY_UNAVAILABLE != sso.BUSY
 
 
 def test_an_identity_already_on_another_account_is_not_linked_twice(monkeypatch):

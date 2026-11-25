@@ -251,7 +251,7 @@ def _refused_start(exc) -> HTTPException:
     else:
         code = oc.PROVIDER_ERROR
     log.info("sso start refused: %s", exc)
-    http = 404 if code == sso.PROVIDER_DISABLED else 503 if code == oc.TEMPORARILY_UNAVAILABLE else 409
+    http = 404 if code == sso.PROVIDER_DISABLED else 503 if code in (oc.TEMPORARILY_UNAVAILABLE, sso.BUSY) else 409
     return HTTPException(status_code=http, detail={"reason": code, "message": sso.reason_text(code)})
 
 
@@ -1161,12 +1161,12 @@ async def finish_link(
         code = exc.code if isinstance(exc, sso.Refusal) else sso.ALREADY_LINKED      # a second writer got there first
         _audit(db, "sso_sign_in_refused", user=current_user, ip=client_ip, status_="failure",
                details={"provider_id": str(row.id), "purpose": sso_state.LINK, "reason": code})
-        if code == oc.TEMPORARILY_UNAVAILABLE:
-            # The account's turn was held: a change of the account was being written. Nothing was linked.
-            from app.core import sign_in_lockout
-            raise HTTPException(status_code=503, headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)},
-                                detail={"reason": code, "message": (
-                                    "Your account is being changed right now. Start the link again in a moment.")})
+        if code == sso.BUSY:
+            # The account's turn was held: a change of the account was being written. Nothing was linked. The
+            # one-time code this request came with is spent, so no Retry-After is sent: sending the same request
+            # again could not work, and the sentence says to start the link again.
+            raise HTTPException(status_code=503, detail={"reason": code, "message": (
+                "Your account is being changed right now. Start the link again in a moment.")})
         raise HTTPException(status_code=409, detail={"reason": code, "message": sso.reason_text(code)})
     _audit(db, "sso_identity_linked", user=current_user, ip=client_ip,
            details={"provider_id": str(row.id), "purpose": sso_state.LINK, "identity_id": str(identity.id),

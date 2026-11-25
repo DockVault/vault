@@ -60,6 +60,9 @@ USERNAME_UNAVAILABLE = "username_unavailable"
 USERNAME_MIN, USERNAME_MAX = 3, 50          # the account rules (the creation and invitation schemas)
 
 # What a person is told for each reason, in words (the admin page and the sign-in page show these).
+# The vault's own account was busy (its turn was held by a change of it): nothing of the provider's.
+BUSY = "busy"
+
 REASON_TEXTS = {
     oc.PROVIDER_ERROR: "Your organisation's sign-in did not complete. Try again, or contact your administrator.",
     oc.ISSUER_MISMATCH: "The sign-in answer did not come from the configured provider.",
@@ -67,6 +70,8 @@ REASON_TEXTS = {
     oc.NONCE_MISMATCH: "The sign-in answer did not belong to this sign-in. Start again.",
     oc.ENDPOINT_REFUSED: "The provider's address is not one the vault may call. Contact your administrator.",
     oc.TEMPORARILY_UNAVAILABLE: "The provider could not be reached. Try again in a moment.",
+    # The provider was reached; the vault's own account was being changed (app/services/sign_in.py, BUSY).
+    BUSY: "Signing in is busy right now. Try again in a moment.",
     oc.DISCOVERY_INVALID: "The provider's configuration could not be read. Contact your administrator.",
     STATE_UNKNOWN: "This sign-in is unknown or has expired. Start again.",
     PROVIDER_MIX_UP: "The sign-in answer came back for another provider. Start again.",
@@ -1000,7 +1005,8 @@ def link_refusal(db, row, user, answer: ProviderAnswer) -> None:
         raise Refusal(NOT_THIS_ACCOUNT, "this account already has an identity on the provider")
 
 
-# The detail of a link refused because the account's turn was held for longer than a link waits.
+# The detail of a link refused because the account's turn was held for longer than a link waits. Its reason is
+# BUSY, not the provider's "could not be reached": the provider answered, and it is the account that was busy.
 ACCOUNT_BUSY = "account_busy"
 
 
@@ -1028,7 +1034,7 @@ def decide_in_the_accounts_turn(db, user) -> None:
     except OperationalError as waited:
         if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
             raise
-        raise Refusal(oc.TEMPORARILY_UNAVAILABLE, ACCOUNT_BUSY) from None
+        raise Refusal(BUSY, ACCOUNT_BUSY) from None
     refresh = getattr(db, "refresh", None)
     if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
         refresh(user, attribute_names=["sso_only", "role", "password_hash", "password_nobody_knows",

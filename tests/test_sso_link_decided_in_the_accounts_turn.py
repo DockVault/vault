@@ -140,7 +140,8 @@ def test_a_turn_held_for_longer_than_a_link_waits_refuses_the_link_as_busy(db, w
     monkeypatch.setattr(api, "_sessions_turn", held("55P03"))                    # lock_not_available
     with pytest.raises(sso.Refusal) as refused:
         sso.link_identity(db, db.get(SsoProvider, fabrikam.id), me, _answer(fabrikam), linked_by="self")
-    assert (refused.value.code, refused.value.detail) == (oc.TEMPORARILY_UNAVAILABLE, "account_busy")
+    assert (refused.value.code, refused.value.detail) == ("busy", "account_busy")
+    assert sso.BUSY == "busy" != oc.TEMPORARILY_UNAVAILABLE
     db.rollback()
     assert _as_left(db, alice) == (False, 0)
     # Anything else the database says is not a busy turn.
