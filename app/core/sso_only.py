@@ -374,6 +374,8 @@ def settle_when_a_privilege_ends(db, user, *, standing: str) -> Optional[str]:
     if not has_table(db, ExternalIdentity.__tablename__):
         return None                 # a database built without the identity tables links nobody to a provider
     outcome = settle(db, user)
+    if outcome == MADE:
+        _record_held_again(db, user, standing)
     # Told only where the account can sign in: one that is turned off is settled all the same, and told nothing
     # (it signs in nowhere, and its address is often a former employee's own).
     if outcome == MADE and getattr(db, "info", None) is not None and getattr(user, "is_active", True):
@@ -384,6 +386,31 @@ def settle_when_a_privilege_ends(db, user, *, standing: str) -> Optional[str]:
             f"Your account {standing}. It signs in only through {through} from now on: its password and its "
             "SFTP password sign-in no longer work.")))
     return outcome
+
+
+DEMOTED, AUDITOR_RIGHT_ENDED = "demoted", "auditor_right_ended"
+
+
+def _record_held_again(db, user, standing: str) -> None:
+    """The record of an account that signs in only through its provider again because it lost a standing, in the
+    transaction that settles it. The settling replaces the account's password, turns its SFTP password sign-in
+    off and ends the sessions no provider made. The demotion's own records name the role alone, and the end of an
+    auditor grant settles in a transaction of its own that wrote nothing: Activity showed a role change, or a
+    grant revoked, beside an account whose password had stopped. Every other path that makes an account
+    provider-only records it (``made_sso_only``). A record that cannot be written leaves the settling as it is,
+    and is logged."""
+    import logging
+    try:
+        from app.services.audit_logger import AuditLogger
+        with db.begin_nested():
+            db.add(AuditLogger(db).build_row(
+                action="user_updated", status="success", resource_type="user", resource_id=str(user.id),
+                details={"updated_username": user.username, "made_sso_only": True,
+                         "reason": AUDITOR_RIGHT_ENDED if standing == HELD_THE_AUDITOR_RIGHT else DEMOTED}))
+            db.flush()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("an account held to its provider again was not recorded: %s",
+                                            type(exc).__name__)
 
 
 def after_a_grant_ended(db, user_id) -> None:

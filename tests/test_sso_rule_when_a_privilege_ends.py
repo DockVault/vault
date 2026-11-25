@@ -63,6 +63,18 @@ def _as_it_stands(db, account_id):
         after.close()
 
 
+def _held_again_records(db, account_id) -> list:
+    """What Activity holds of an account made to sign in only through its provider by a lost standing."""
+    from app.core.models import AuditLog
+    after = _another(db)
+    try:
+        rows = after.query(AuditLog).filter(AuditLog.action == "user_updated",
+                                            AuditLog.resource_id == str(account_id)).all()
+        return [dict(row.details) for row in rows if (row.details or {}).get("made_sso_only")]
+    finally:
+        after.close()
+
+
 def test_a_demotion_holds_an_account_made_at_a_first_sign_in_to_its_provider_again_and_the_role_stays(
         db, world, monkeypatch):
     from app.core import sso_only
@@ -76,6 +88,7 @@ def test_a_demotion_holds_an_account_made_at_a_first_sign_in_to_its_provider_aga
     assert told == []                                                    # told once it is committed, not before
     db.commit()
     assert _as_it_stands(db, jay.id) == ("user", True, True, False)      # demoted, and held to Contoso again
+    assert _held_again_records(db, jay.id) == [{"updated_username": "jay", "made_sso_only": True, "reason": "demoted"}]
     assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through contoso", (
         "Your account is no longer an administrator. It signs in only through contoso from now on: its password "
         "and its SFTP password sign-in no longer work."))]
@@ -105,6 +118,7 @@ def test_a_demotion_that_is_rolled_back_changes_nothing_and_tells_nobody(db, wor
     api._set_role(db, target, RoleEnum.USER, actor=None)
     db.rollback()
     assert _as_it_stands(db, jay.id)[:3] == ("admin", False, True) and told == []
+    assert _held_again_records(db, jay.id) == []
 
 
 @pytest.mark.parametrize("case", ["a password of its own", "the provider lets it set one", "linked by its owner",
@@ -213,8 +227,11 @@ def test_an_auditor_grant_that_is_no_longer_open_has_the_rule_settled_once_it_is
     assert grant.status == how
     assert after_commit.pending(db, sso_only._GRANT_ENDED) == [str(jay.id)]
     assert _as_it_stands(db, jay.id)[:2] == ("user", False) and told == []      # nothing before the commit
+    assert _held_again_records(db, jay.id) == []
     db.commit()
     assert _as_it_stands(db, jay.id) == ("user", True, True, False)
+    assert _held_again_records(db, jay.id) == [
+        {"updated_username": "jay", "made_sso_only": True, "reason": "auditor_right_ended"}]
     assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through contoso", (
         "Your account no longer holds the auditor right. It signs in only through contoso from now on: its "
         "password and its SFTP password sign-in no longer work."))]
@@ -229,6 +246,7 @@ def test_an_administrator_whose_auditor_grant_ends_keeps_its_password(db, world,
     rights.revoke(db, grant, actor=None)
     db.commit()
     assert _as_it_stands(db, jay.id)[:3] == ("admin", False, True) and told == []
+    assert _held_again_records(db, jay.id) == []
 
 
 def test_a_grant_whose_end_is_rolled_back_settles_nothing(db, world, monkeypatch, settled_after):
@@ -292,5 +310,30 @@ def test_what_signs_in_between_a_grants_end_and_its_settling_is_settled_with_the
     monkeypatch.setattr(api, "_revoke_sessions", lambda session, **kw: ended.extend(kw.get("session_ids") or []) or 0)
     sso_only._settle_after_a_grant_ended(waiting)
     assert _as_it_stands(db, jay.id) == ("user", True, True, False)
+    assert _held_again_records(db, jay.id) == [
+        {"updated_username": "jay", "made_sso_only": True, "reason": "auditor_right_ended"}]
     assert ended == [ids["by a password"]]
     assert [title for _users, title, _change in told] == ["Your account signs in only through contoso"]
+
+
+def test_a_record_that_cannot_be_written_leaves_the_settling_as_it_is(db, world, monkeypatch):
+    """The audit log cannot take the row. The account is held to its provider again all the same, and told: a
+    lost standing is never left with a password of its own because its record failed."""
+    from app.core import sso_only
+    from app.core.models import RoleEnum, User
+    from app.services import audit_logger
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.ADMIN)
+    root = _user(db, "root", RoleEnum.ADMIN)
+    target = db.query(User).filter(User.id == jay.id).first()
+
+    class Down:
+        def __init__(self, db_):
+            raise RuntimeError("the audit log is down")
+    monkeypatch.setattr(audit_logger, "AuditLogger", Down)
+    assert sso_only.settle_when_a_privilege_ends.__name__ == "settle_when_a_privilege_ends"
+    target.role = RoleEnum.USER
+    assert sso_only.settle_when_a_privilege_ends(db, target, standing=sso_only.WAS_AN_ADMINISTRATOR) == sso_only.MADE
+    db.commit()
+    assert _as_it_stands(db, jay.id)[1:] == (True, True, False) and len(told) == 1
+    assert sso_only.DEMOTED == "demoted" and sso_only.AUDITOR_RIGHT_ENDED == "auditor_right_ended"
