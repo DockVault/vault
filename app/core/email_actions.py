@@ -123,7 +123,8 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p>Hi {{user.username}},</p>"
             "<p>Your <strong>{{vault.name}}</strong> account was signed in to on {{current_datetime}} (UTC).</p>"
             "<p>If this was you, no action is needed. If you don't recognize this sign-in, change your "
-            "password right away.</p>"
+            "password right away, or tell your administrator at once if you sign in only through your "
+            "organisation.</p>"
             "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
             "<hr>"
             "<p><small>Sent by {{vault.name}}.</small></p>"
@@ -394,9 +395,9 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Optional — notify a user when their account signs in.", OPTIONAL),
     ("sign_in_method_changed", "Sign-in method changed",
      "Sent to a user when a passkey is added to or removed from their own account, an authenticator app is "
-     "set up for it, or the way it signs in through a single sign-on provider changes (an identity linked or "
-     "unlinked, by the user or an administrator), or an administrator changes a single sign-on provider the "
-     "account is linked to (points it elsewhere, turns its password sign-in off or on, changes its rule for the "
+     "set up for it or turned off, or the way it signs in through a single sign-on provider changes (an identity "
+     "linked or unlinked, by the user or an administrator), or an administrator changes a single sign-on provider "
+     "the account is linked to (points it elsewhere, turns its password sign-in off or on, changes its rule for the "
      "accounts it makes or how long it waits for a sign-in, holds the account's keys before removing it, or "
      "removes it), or the account stops being an administrator or holding the auditor right and signs in only "
      "through its provider again, or the vault gives an administrator's or auditor's account its password sign-in "

@@ -499,6 +499,24 @@ def test_the_owner_is_advised_by_what_was_done_and_by_whether_the_account_has_a_
     assert "remove what you do not recognize" not in said
 
 
+def test_turning_the_authenticator_app_off_is_told_to_the_owner_in_the_app_and_by_email(monkeypatch):
+    """Turned off, the account's authenticator app and its recovery codes no longer work: its owner learns of it as
+    of a passkey removed, from wherever it was done."""
+    from app.core.models import SecondFactorEnrollment
+    h = Harness(monkeypatch, _user(), totp=True)
+    monkeypatch.setattr(h.S, "_second_factor_effective", lambda db, user: {"required": False})
+    status, out = _call(h.S, "DELETE", "/users/me/second-factor", None, {"X-Second-Factor": "ok"})
+    assert status == 200 and out == {"disabled": True}, out
+    assert h.db.rows_of(SecondFactorEnrollment) == []
+    (notice,) = h.notices
+    assert notice["type"] == "account_changed" and notice["ids"] == [str(h.user.id)]
+    assert notice["title"] == "The authenticator app was removed from your account"
+    assert notice["body"] == ("You turned off your account's authenticator app; its recovery codes no longer work. "
+                              "If you did not do this, change your password and tell an administrator at once.")
+    (email,) = h.emails
+    assert email["key"] == "sign_in_method_changed" and email["context"]["change"] == notice["body"]
+
+
 def test_the_last_factor_of_a_required_or_sso_only_account_stays(monkeypatch):
     from app.core.models import SystemSetting
     h = Harness(monkeypatch, _user())

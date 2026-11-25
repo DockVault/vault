@@ -160,3 +160,28 @@ def test_a_removal_is_told_with_the_advice_for_an_administrators_change_in_the_a
     assert (key, email) == ("sign_in_method_changed", "alice@example.test")
     assert context["change"].endswith(" If you did not expect this, ask an administrator.")
     assert notices == [("account_changed", "A sign-in method was removed from your account", context["change"])]
+
+
+def test_an_account_held_before_a_removal_is_told_its_password_signs_it_in_only_where_it_has_one(monkeypatch):
+    """The removal holds the people whose days ran out while the provider was off. One with a password is told it
+    signs them in as before; one that signs in only through another provider has no password anybody types, and is
+    not told that one does."""
+    from datetime import datetime, timedelta
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    other = _provider(name="Northwind", label="Sign in with Northwind", state="enabled")
+    other.policy = {"sso_password_login": "disabled"}
+    alice, bob = _user("alice"), _user("bob", sso_only=True)
+    now = datetime.utcnow()
+    long_ago = dict(last_sign_in_at=now - timedelta(days=30), linked_at=now - timedelta(days=60), refused_at=None)
+    h = Admin(monkeypatch, [row, other], users=[alice, bob],
+              identities=[_identity(alice, row, **long_ago), _identity(bob, row, subject="s-bob", **long_ago),
+                          _identity(bob, other, subject="s-bob-there", last_sign_in_at=now)])
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["reason"] == "refusals_in_force", out
+    told = {tuple(names): text for names, _title, text in h.accounts_told}
+    assert sorted(told) == [("alice",), ("bob",)], h.accounts_told
+    assert told[("alice",)].endswith("stay paused until an administrator lifts that. Your password signs you in as "
+                                     "before.")
+    assert told[("bob",)].endswith("stay paused until an administrator lifts that.")
+    assert "password" not in told[("bob",)]

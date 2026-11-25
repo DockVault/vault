@@ -12117,6 +12117,11 @@ async def disable_second_factor(
                                    ip_address=get_client_ip(request), details={})
     except Exception:  # noqa: BLE001
         pass
+    # The owner is told, as of a passkey removed: whoever held the account's password and its factor could have
+    # turned it off.
+    _passkey_notice(db, current_user, "The authenticator app was removed from your account",
+                    "You turned off your account's authenticator app; its recovery codes no longer work.",
+                    removed=True)
     return {"disabled": True}
 
 
