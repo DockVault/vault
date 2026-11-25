@@ -310,6 +310,51 @@ def test_the_host_tool_loads_the_settings_before_the_action_and_once(tmp_path, m
     capsys.readouterr()
 
 
+class _DriverError(Exception):
+    """What the database driver raises, carrying PostgreSQL's code for the error as psycopg2 does."""
+
+    def __init__(self, pgcode):
+        super().__init__("canceling statement")
+        self.pgcode = pgcode
+
+
+def _database_refuses(monkeypatch, pgcode):
+    from sqlalchemy.exc import OperationalError
+    from app.core import host_operator
+
+    def refused(args, api):
+        raise OperationalError("UPDATE users SET is_locked=false WHERE users.id = %(id)s", {},
+                               _DriverError(pgcode))
+    monkeypatch.setattr(host_operator, "_run", refused)
+    # The stored settings are read before any action; here they read as nothing saved, so the action is reached.
+    monkeypatch.setattr(host_operator, "load_the_stored_settings", lambda: None)
+    return host_operator
+
+
+def test_the_host_tool_answers_busy_when_it_waits_too_long_for_an_account(monkeypatch, capsys):
+    # Its changes take the account's turn on the same connections as the web app, with the same lock wait
+    # (5 s). When the wait ran out, the web app answered "busy" and the tool answered that it stopped, with
+    # exit status 1 and a traceback. Now it is refused the way the web app is: try again in a moment.
+    import json
+    host_operator = _database_refuses(monkeypatch, "55P03")
+    code = host_operator.run(["unlock", "--username", "alice", "--confirm-username", "alice"])
+    out, err = capsys.readouterr()
+    assert code == 2
+    assert [json.loads(line) for line in out.splitlines() if line.strip()] == [
+        {"ok": False, "busy": True, "error": "The vault is busy with this right now. Try again in a moment."}]
+    assert "Traceback" not in err
+
+
+def test_the_host_tool_still_stops_on_any_other_database_error(monkeypatch, capsys):
+    import json
+    host_operator = _database_refuses(monkeypatch, "08006")   # connection_failure
+    code = host_operator.run(["unlock", "--username", "alice", "--confirm-username", "alice"])
+    out, err = capsys.readouterr()
+    assert code == 1
+    assert [json.loads(line) for line in out.splitlines() if line.strip()] == [STOPPED]
+    assert "Traceback" in err and "OperationalError" in err
+
+
 def test_the_host_tool_counts_a_passkey_as_a_second_factor_as_the_web_does():
     # `dockvault.py accounts` showed the second factor from the authenticator alone, so an account that set up a
     # passkey and nothing else was shown with none. A passkey that was not retired counts, whether or not passkeys are

@@ -33,8 +33,9 @@ Safety:
     logged, stored in plain text, or put in the audit log.
 
 Answers are one JSON object on standard output; the exit status is 0 when it succeeded, 2 when it was
-refused (the answer's ``error`` says why), and 1 when something unexpected stopped it (the answer says
-it stopped; what happened is on standard error).
+refused (the answer's ``error`` says why; ``busy`` is true when another change held what it needed for
+longer than it waits, which the web app answers busy too, and the operator tries again in a moment), and
+1 when something unexpected stopped it (the answer says it stopped; what happened is on standard error).
 """
 import argparse
 import json
@@ -392,12 +393,21 @@ def run(argv=None) -> int:
             # server does, from this container's own environment. Threads it starts on import are its
             # own; only those this run starts afterwards (the emails) are waited for.
             import app.api.api_server as api
+            from sqlalchemy.exc import OperationalError
             started_before = set(threading.enumerate())
             try:
                 load_the_stored_settings()
                 _run(args, api)
             except _Answer as done:
                 answer, code = done.obj, done.code
+            except OperationalError as exc:
+                # A change here takes the account's turn on the same connections as the web app, with the same
+                # lock wait (app/core/database.py). When that wait ran out, the statement that waited failed and
+                # wrote nothing, and the open transaction is rolled back: refused as busy, in the web app's words,
+                # for the operator to try again. Any other database error is unexpected, as before.
+                if getattr(getattr(exc, "orig", None), "pgcode", None) != api.LOCK_WAIT_RAN_OUT:
+                    raise
+                answer, code = {"ok": False, "busy": True, "error": api.BUSY_TRY_AGAIN}, 2
             finally:
                 _wait_for_background_work(started_before)
         except (Exception, SystemExit):  # noqa: BLE001 - whatever stopped it, the caller still gets one answer
