@@ -1412,14 +1412,34 @@ def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime]
             "it is not unlinked here. Ask an administrator."))
     standing = sso_freshness.deadline_of(identity, row)
     if standing is not None and (standing.refused or standing.due <= now):
-        return (UNLINK_LAPSED, (
-            # True of both holds a row can carry: the provider's refusal, and the vault's own, written when the
-            # person's days had run out and the provider was turned off. A sign-in the provider admits lifts either.
-            f"Your account is held to a sign-in through {standing.provider_name}: sign in there again, or ask an "
-            "administrator to lift the hold, before you unlink it."
-            if standing.refused else
-            f"Sign in through {standing.provider_name} again before you unlink it."))
+        return (UNLINK_LAPSED, _what_unblocks_an_unlink(standing, now))
     return None
+
+
+def _what_unblocks_an_unlink(standing, now: datetime) -> str:
+    """What the owner is told when their provider's hold, or its days, stand in the way of an unlink: what would
+    let the unlink through, and nothing that would not.
+
+    - The provider is turned off: nobody signs in through it, so "sign in there again" led nowhere (it has no
+      button), and after an administrator lifted a hold the next try was refused for the days. Only an
+      administrator's unlink works: said as that.
+    - It is on, and a hold is on record: a sign-in it admits lifts the hold and gives new days. An
+      administrator's lift helps only while the days have not run out as well; where they have, it is not named.
+    - It is on and the days have run out: a sign-in through it."""
+    name = standing.provider_name
+    if not standing.provider_on:
+        return (f"{name} is turned off on this vault, so you cannot sign in through it, and it is not unlinked "
+                "here. Ask an administrator to unlink it for you.")
+    days_ran_out = standing.window_days > 0 and standing.due <= now
+    if standing.refused and days_ran_out:
+        return (f"Your account is held to a sign-in through {name}: sign in there again before you unlink it. If "
+                f"{name} does not admit you, ask an administrator to unlink it for you.")
+    if standing.refused:
+        # True of both holds a row can carry: the provider's refusal, and the vault's own. A sign-in the provider
+        # admits lifts either.
+        return (f"Your account is held to a sign-in through {name}: sign in there again, or ask an "
+                "administrator to lift the hold, before you unlink it.")
+    return f"Sign in through {name} again before you unlink it."
 
 
 def owners_unlink_text(username: str, label: str, *, asked: bool, linked_by, standing, policy, reached: bool,

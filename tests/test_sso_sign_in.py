@@ -1326,7 +1326,10 @@ def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_own
         p.state = state
         status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
         assert status == 409 and out["detail"]["reason"] == "sso_freshness_lapsed", out
-        assert "ask an administrator to lift the hold" in out["detail"]["message"]
+        # Refused whatever the provider's state; what is said to unblock it is what can: while the provider is
+        # on, a sign-in it admits or an administrator's lift; turned off, an administrator's unlink.
+        assert ("ask an administrator to lift the hold" if state == "enabled" else
+                "Ask an administrator to unlink it for you.") in out["detail"]["message"]
     p.state = "enabled"
     identity.refused_at, identity.last_sign_in_at = None, datetime.utcnow() - timedelta(days=31)
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")

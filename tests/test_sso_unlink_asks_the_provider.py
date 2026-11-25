@@ -698,6 +698,28 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
     for name in ("lapsed", "refusing"):
         status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{rows[name].id}")
         assert status == 409 and body["detail"] == said[str(rows[name].provider_id)], body
+    # Refused, and the days have run out as well: an administrator's lift would leave the days in the way, so
+    # it is not named. A sign-in the provider admits answers both.
+    rows["refusing"].last_sign_in_at = datetime.utcnow() - timedelta(days=40)
+    rows["refusing"].refused_at = datetime.utcnow()
+    assert told()[str(refusing.id)]["message"] == (
+        "Your account is held to a sign-in through refusing: sign in there again before you unlink it. If "
+        "refusing does not admit you, ask an administrator to unlink it for you.")
+    # The provider is turned off: nobody signs in through it, whatever stands in the way. Sent to "sign in
+    # through it again", the person found no button for it; and after a lift, the days.
+    for off in (lapsed, refusing):
+        off.state = "disabled"
+    said = told()
+    for off in (lapsed, refusing):
+        assert said[str(off.id)] == {"reason": "sso_freshness_lapsed", "message": (
+            f"{off.name} is turned off on this vault, so you cannot sign in through it, and it is not unlinked "
+            "here. Ask an administrator to unlink it for you.")}
+    for name in ("lapsed", "refusing"):
+        status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{rows[name].id}")
+        assert status == 409 and body["detail"] == said[str(rows[name].provider_id)], body
+    # A provider that asks no days and refused the person: the lift is what an administrator can do.
+    refusing.state, refusing.policy = "enabled", {"sso_freshness_days": 0}
+    assert "or ask an administrator to lift the hold, before you unlink it." in told()[str(refusing.id)]["message"]
     # The identity the account was made with, on a provider that holds such accounts to no password.
     from app.core.models import ExternalIdentity
     password_origin.mark_nobody_knows(alice)
