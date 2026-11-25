@@ -248,6 +248,12 @@
         const head = last.outcome === 'ok' ? 'The last test sign-in passed' : 'The last test sign-in did not pass';
         box.appendChild(_el('p', 'text-sm font-bold', head + (last.tester ? ` (${last.tester})` : '') + '.'
             + (provider.tested ? '' : ' The connection changed since: test again.')));
+        if (last.outcome !== 'ok') {
+            // A test that did not pass says why, in words for the one who can change the settings; nothing the
+            // provider sent is shown, because nothing it sent was accepted.
+            box.appendChild(_el('p', 'text-sm text-error', last.message || 'The test sign-in did not pass.'));
+            return box;
+        }
         const list = _el('ul', 'text-sm');
         const add = (text) => list.appendChild(_el('li', null, text));
         if (last.would) add('What the vault would do with this person: ' + last.would + '.');

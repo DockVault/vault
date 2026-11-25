@@ -1095,6 +1095,39 @@ def test_summary(db, row, answer: ProviderAnswer, tester, tested=None) -> dict:
     }
 
 
+# What an administrator reads when a test sign-in did not pass: the reason a person's sign-in is refused for, said
+# for the one who can change the provider's settings (a person is told to contact their administrator).
+TEST_FAILED_TEXTS = {
+    oc.PROVIDER_ERROR: ("The provider sent the browser back with an error, or with no code. Its own sign-in log "
+                        "says why: often the redirect address is not registered there, or the test was cancelled."),
+    oc.ISSUER_MISMATCH: ("The answer named another issuer than the one entered here. Check the issuer on the "
+                         "Connection page against the provider's own."),
+    oc.TOKEN_INVALID: ("The provider's token could not be verified: the token endpoint refused the client id or "
+                       "secret, or the token's signature, audience or times did not check. Enter the client "
+                       "secret again, and check the client id and how the secret is sent."),
+    oc.NONCE_MISMATCH: "The provider's token did not belong to this test. Run the test again.",
+    oc.ENDPOINT_REFUSED: ("An address of the provider is not one the vault may call: it is inside the network, or "
+                          "not https. Turn on “Inside the network” for a provider there, or correct the address."),
+    oc.TEMPORARILY_UNAVAILABLE: ("The provider did not answer in time. Check that the vault's server can reach the "
+                                 "issuer's address, then run the test again."),
+    oc.DISCOVERY_INVALID: ("The provider's discovery document could not be read at the issuer's address. Check the "
+                           "issuer, or enter the discovery address itself."),
+}
+
+
+def test_failure_text(code: str) -> str:
+    """The administrator's sentence for a test sign-in refused as ``code``."""
+    return TEST_FAILED_TEXTS.get(code) or ("The test sign-in did not pass: " + reason_text(code))
+
+
+def failed_test_summary(row, tester_name: str, code: str) -> dict:
+    """What is kept of a test sign-in that did not pass: the reason, in an administrator's words, who ran it and
+    when, and the connection it was run with (a provider is turned on only after a test that passed)."""
+    from app.services import sso_providers
+    return {"outcome": code, "at": datetime.utcnow().isoformat() + "Z", "tester": tester_name,
+            "message": test_failure_text(code), "config": sso_providers.fingerprint(row)}
+
+
 def _group_names(row, answer: ProviderAnswer) -> list:
     return sorted(answer.groups or [])[:200]
 

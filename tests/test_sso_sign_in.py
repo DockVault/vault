@@ -1415,3 +1415,98 @@ def test_the_record_of_a_sign_in_says_which_provider_it_came_through():
                      {"is_temporary": False, "methods": ["pwd"]},
                      {"is_temporary": False}]
     assert all(row["action"] == "login_success" and row["user"] is user for row in logged)
+
+
+@pytest.mark.parametrize("fault, reason", [("the provider's error", "provider_error"), ("a token refused", "provider_error"),
+                                             ("a token that is another sign-in's", "nonce_mismatch"),
+                                             ("another issuer in the answer", "issuer_mismatch")])
+def test_a_test_sign_in_that_does_not_pass_comes_back_as_a_test_and_is_written_and_recorded(monkeypatch, fault, reason):
+    """An administrator tests a provider whose settings are wrong. The refusal used to come back as a person's
+    reason ("contact your administrator"), nothing was written, and the provider went on showing its last test.
+    It comes back as a test's answer: claimed by the tab that started it, written on the provider as a test that
+    did not pass, recorded as a failure, and said in words for the one who can change the settings."""
+    from app.core import sso_state
+    from app.services import sso_sign_in as sso
+    root, p = _user("root", role="admin"), _provider(state="tested")
+    h = Harness(monkeypatch, [root], [p])
+    h.current_user = root
+    url = sso.start(p, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
+                    user_id=root.id, session_hash="sess-hash")
+    state, _ = h.state_of(url)
+    kwargs, code = {}, "c0de"
+    if fault == "the provider's error":
+        kwargs, code = {"error": "access_denied"}, None
+    elif fault == "a token refused":
+        h.token_answer = {"error": "invalid_client"}
+    elif fault == "a token that is another sign-in's":
+        h.claims_override = {"nonce": "other"}
+    else:
+        kwargs = {"iss": "https://evil.example.com"}
+    status, location, _ = h.callback(p, state, code=code, **kwargs)
+    assert status == 302 and location.startswith("/#sso-test="), location
+    assert p.last_test is None                                    # nothing written at the callback
+    # Another tab cannot claim it; the tab that started the test does.
+    assert h.finish_test(p, location, verifier="other")[0] == 409 and p.last_test is None
+    url = sso.start(p, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
+                    user_id=root.id, session_hash="sess-hash")
+    state, _ = h.state_of(url)
+    status, location, _ = h.callback(p, state, code=code, **kwargs)
+    status, out = h.finish_test(p, location)
+    assert status == 200 and out["tested"] is False, out
+    summary = out["summary"]
+    assert summary["outcome"] == reason and summary["tester"] == "root" and summary["at"].endswith("Z")
+    assert summary["message"] == sso.TEST_FAILED_TEXTS[reason] and "config" not in summary
+    assert "contact your administrator" not in summary["message"].lower()
+    # Written on the provider, with the connection it was run with; such a test does not let it be turned on.
+    from app.services import sso_providers
+    assert p.last_test["outcome"] == reason and p.last_test["config"] == sso_providers.fingerprint(p)
+    assert sso_providers.tested(p) is False
+    assert sso_providers.public(h.db, p)["last_test"]["message"] == sso.TEST_FAILED_TEXTS[reason]
+    # Recorded as a test that failed, by the administrator who ran it.
+    tested = [a for a in h.audits if a[0] == "sso_provider_tested"]
+    assert tested == [("sso_provider_tested", "failure", {"provider_id": str(p.id), "purpose": "test", "outcome": reason})]
+    assert ("sso_provider_tested", "root") in h.audit_who
+
+
+def test_a_persons_refusal_still_comes_back_as_its_reason_and_a_tests_sentences_are_an_administrators(monkeypatch):
+    """Only a test is answered as a test. A sign-in, a link and a confirmation that are refused go back with the
+    reason, as before. Every reason a test can be refused for has words for an administrator."""
+    from app.core import sso_state
+    from app.services import oidc_client as oc
+    from app.services import sso_sign_in as sso
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p])
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state, code=None, error="access_denied")
+    assert location == "/#sso-error=provider_error"
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state, code=None, error="access_denied")
+    assert location == "/#sso-error=provider_error"
+    for code in (oc.PROVIDER_ERROR, oc.ISSUER_MISMATCH, oc.TOKEN_INVALID, oc.NONCE_MISMATCH, oc.ENDPOINT_REFUSED,
+                 oc.TEMPORARILY_UNAVAILABLE, oc.DISCOVERY_INVALID):
+        said = sso.test_failure_text(code)
+        assert said == sso.TEST_FAILED_TEXTS[code] and said != sso.reason_text(code)
+        assert "contact your administrator" not in said.lower() and "your organisation" not in said.lower()
+    # A reason with no sentence of its own is still said as a failed test.
+    assert sso.test_failure_text(sso.PROVIDER_DISABLED) == "The test sign-in did not pass: " + sso.reason_text(sso.PROVIDER_DISABLED)
+    # A state with nobody to hand the answer to (no account named) goes back as a reason.
+    from app.api import sso_router
+    login = types.SimpleNamespace(purpose=sso_state.TEST, user_id=None, provider_id=str(p.id), session_hash="s",
+                                  verifier_hash=_h("t"))
+    assert sso_router._refused_at_the_callback(h.db, login, p, "provider_error").headers["location"] == "/#sso-error=provider_error"
+    assert sso_router._refused_at_the_callback(h.db, None, p, "state_unknown").headers["location"] == "/#sso-error=state_unknown"
+    login.user_id = str(alice.id)
+    assert sso_router._refused_at_the_callback(h.db, login, None, "provider_disabled").headers["location"] == "/#sso-error=provider_disabled"
+    # The store down: the reason, as before.
+    monkeypatch.setattr(sso_state, "store_handover", lambda record: (_ for _ in ()).throw(sso_state.Unavailable("down")))
+    assert sso_router._refused_at_the_callback(h.db, login, p, "provider_error").headers["location"] == "/#sso-error=provider_error"
+
+
+def test_the_settings_page_shows_a_failed_test_as_its_sentence():
+    from pathlib import Path
+    page = (Path(__file__).resolve().parents[1] / "static" / "js" / "settings-sso.js").read_text(encoding="utf-8")
+    block = page[page.index("function testSummary(provider) {"):page.index("function connectionPage(provider) {")]
+    assert block.index("if (last.outcome !== 'ok') {") < block.index("const list = _el('ul', 'text-sm');")
+    assert "last.message || 'The test sign-in did not pass.'" in block

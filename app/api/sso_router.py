@@ -267,6 +267,28 @@ def _redirect(fragment: str) -> RedirectResponse:
     return RedirectResponse(url="/#" + fragment, status_code=302)
 
 
+def _refused_at_the_callback(db, login, row, code: str) -> RedirectResponse:
+    """Where a refusal leaves the callback. A person's sign-in, link or confirmation goes back to the page with
+    the reason. An administrator's test sign-in that did not pass goes back as a test's answer: what did not
+    pass waits under a one-time code, as a test that passed does, for the tab that started it to claim. Claimed,
+    it is written on the provider and recorded, and the administrator reads it where the test was run, in words
+    for the one who can change the settings. With the reason alone the page showed a person's sentence
+    ("contact your administrator") and the provider went on showing its last test."""
+    if login is None or login.purpose != sso_state.TEST or row is None or not login.user_id:
+        return _redirect("sso-error=" + code)
+    try:
+        tester = db.query(User).filter(User.id == uuid.UUID(str(login.user_id))).first()
+        record = {"purpose": sso_state.TEST, "provider_id": login.provider_id, "user_id": login.user_id,
+                  "session_hash": login.session_hash, "verifier_hash": login.verifier_hash,
+                  # No identity answered: the record names the provider's issuer, and nobody.
+                  "subject": "-", "issuer": (getattr(row, "issuer", None) or "-"),
+                  "summary": sso.failed_test_summary(row, getattr(tester, "username", None) or "", code)}
+        return _redirect("sso-test=" + sso_state.store_handover(record))
+    except Exception as exc:  # noqa: BLE001 -- the refusal stands as a reason
+        log.info("a failed test sign-in was not handed to its tab: %s", type(exc).__name__)
+        return _redirect("sso-error=" + code)
+
+
 def _invitation_for_start(db, token: str, client_ip: str):
     """The pending invitation a token names, for a sign-in that accepts it through a provider: looked up as the
     password acceptance looks it up (the same limiter per token prefix, the same checks, the same generic
@@ -458,11 +480,11 @@ async def sign_in_callback(
         # Unsigned: anyone can send it. A reason, a row, and nothing else.
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": oc.PROVIDER_ERROR})
         log.info("sso callback error for provider %s: %s", login.provider_id, _logged_error(error))
-        return _redirect("sso-error=" + oc.PROVIDER_ERROR)
+        return _refused_at_the_callback(db, login, row, oc.PROVIDER_ERROR)
     why = sso.usable_for(row, login.purpose)
     if why is not None:
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": why})
-        return _redirect("sso-error=" + why)
+        return _refused_at_the_callback(db, login, row, why)
     # RFC 9207: a provider that advertises the iss parameter must send it, and it must be the issuer; one that
     # does not advertise it is held to it whenever it does send it.
     # The provider's part, off the event loop, bounded together.
@@ -473,16 +495,16 @@ async def sign_in_callback(
         discovery = await _provider_call(lambda: oc.discover(sso.provider_config(view)), deadline=deadline)
     except (sso.Refusal, oc.OidcError) as exc:
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
-        return _redirect("sso-error=" + exc.code)
+        return _refused_at_the_callback(db, login, row, exc.code)
     if (iss is not None and iss != view.issuer) or (iss is None and discovery.iss_in_callback):
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": oc.ISSUER_MISMATCH})
-        return _redirect("sso-error=" + oc.ISSUER_MISMATCH)
+        return _refused_at_the_callback(db, login, row, oc.ISSUER_MISMATCH)
     try:
         answer = await _provider_call(sso.verified_answer, view, login, code=code, deadline=deadline)
     except (sso.Refusal, oc.OidcError) as exc:
         log.info("sso callback refused for provider %s: %s", login.provider_id, exc)
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
-        return _redirect("sso-error=" + exc.code)
+        return _refused_at_the_callback(db, login, row, exc.code)
     # The provider's answer took its time (up to the whole wait). The row is read again as it stands, and held:
     # a provider turned off meanwhile, by an administrator or by a change to its connection, links nobody, makes
     # no account and applies no password rule on the strength of an answer it gave before.
@@ -492,12 +514,12 @@ async def sign_in_callback(
         # A save of this provider is under way and holds its row: nothing was written, the person starts again.
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure",
                details={**details, "reason": oc.TEMPORARILY_UNAVAILABLE})
-        return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
+        return _refused_at_the_callback(db, login, row, oc.TEMPORARILY_UNAVAILABLE)
     why = sso.usable_for(row, login.purpose) if row is not None else sso.PROVIDER_DISABLED
     if why is not None:
         db.rollback()
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": why})
-        return _redirect("sso-error=" + why)
+        return _refused_at_the_callback(db, login, row, why)
     # The provider's restriction (tenant, domain, group, the sign-up domain list) is judged before who the person
     # is, known identity included; a test reports it instead of refusing.
     if login.purpose != sso_state.TEST:
@@ -514,7 +536,7 @@ async def sign_in_callback(
                     log.error("sso refusal could not end access for provider %s: %s", login.provider_id,
                               type(end_exc).__name__)
             _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": exc.code})
-            return _redirect("sso-error=" + exc.code)
+            return _refused_at_the_callback(db, login, row, exc.code)
 
     if login.purpose in (sso_state.SIGN_IN, sso_state.APP):
         invitation_id = login.extras.get("invitation_id") if isinstance(login.extras, dict) else None
@@ -544,7 +566,7 @@ async def sign_in_callback(
                 api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip,
                                           reason=exc.detail or exc.code)
             _tell_of_a_sign_in_kept_out(db, row, exc)
-            return _redirect("sso-error=" + exc.code)
+            return _refused_at_the_callback(db, login, row, exc.code)
         from app.core import sign_in_codes
         if holds_invitation:
             try:
@@ -554,7 +576,7 @@ async def sign_in_callback(
                     code_challenge=login.code_challenge,
                     purpose="app" if login.purpose == sso_state.APP else "sign_in"))
             except sign_in_codes.Unavailable:
-                return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
+                return _refused_at_the_callback(db, login, row, oc.TEMPORARILY_UNAVAILABLE)
             db.rollback()          # nothing was written, and nothing is until the code is redeemed
             return _redirect(_sign_in_fragment(handover_code, login))
         user = found.user
@@ -574,7 +596,7 @@ async def sign_in_callback(
                 _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": code_})
                 if invitation_id:
                     api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip, reason="commit_conflict")
-                return _redirect("sso-error=" + code_)
+                return _refused_at_the_callback(db, login, row, code_)
             if found.created or found.linked_now:
                 _record_resolution(db, row, found, client_ip=client_ip, details=details)
         sso_groups.tell(db, row, user, applied, client_ip=client_ip)
@@ -585,7 +607,7 @@ async def sign_in_callback(
                 result, verifier_hash=login.verifier_hash, code_challenge=login.code_challenge,
                 purpose="app" if login.purpose == sso_state.APP else "sign_in"))
         except sign_in_codes.Unavailable:
-            return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
+            return _refused_at_the_callback(db, login, row, oc.TEMPORARILY_UNAVAILABLE)
         db.commit()        # a tenant learnt at this sign-in; the identity's last sign-in is stamped by the finish
         return _redirect(_sign_in_fragment(handover_code, login))
 
@@ -596,12 +618,12 @@ async def sign_in_callback(
     user = db.query(User).filter(User.id == uuid.UUID(login.user_id)).first() if login.user_id else None
     if not sso.account_usable(user):
         _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure", details={**details, "reason": sso.ACCOUNT_DISABLED})
-        return _redirect("sso-error=" + sso.ACCOUNT_DISABLED)
+        return _refused_at_the_callback(db, login, row, sso.ACCOUNT_DISABLED)
     if login.purpose not in (sso_state.LINK, sso_state.TEST, sso_state.STEP_UP) or not login.verifier_hash \
             or not login.session_hash:
         _audit(db, "sso_sign_in_refused", user=user, ip=client_ip, status_="failure",
                details={**details, "reason": sso.PURPOSE_NOT_READY})
-        return _redirect("sso-error=" + sso.PURPOSE_NOT_READY)
+        return _refused_at_the_callback(db, login, row, sso.PURPOSE_NOT_READY)
     if login.purpose == sso_state.STEP_UP:
         # A fresh sign-in of the account's own identity, within the minute, with the provider's MFA when trusted.
         try:
@@ -609,9 +631,9 @@ async def sign_in_callback(
         except sso.Refusal as exc:
             _audit(db, "sso_sign_in_refused", user=user, ip=client_ip, status_="failure",
                    details={**details, "reason": exc.code, "step_up": login.step_up_action})
-            return _redirect("sso-error=" + exc.code)
+            return _refused_at_the_callback(db, login, row, exc.code)
         if not login.step_up_action:
-            return _redirect("sso-error=" + sso.PURPOSE_NOT_READY)
+            return _refused_at_the_callback(db, login, row, sso.PURPOSE_NOT_READY)
     if login.purpose == sso_state.LINK:
         # Refusals that need no claim are given now, so the person is told at once. First that the provider did
         # sign the person in for this link, where it says when it did.
@@ -621,7 +643,7 @@ async def sign_in_callback(
         except sso.Refusal as exc:
             _audit(db, "sso_sign_in_refused", user=user, ip=client_ip, status_="failure",
                    details={**details, "reason": exc.code})
-            return _redirect("sso-error=" + exc.code)
+            return _refused_at_the_callback(db, login, row, exc.code)
     record = {"purpose": login.purpose, "provider_id": login.provider_id, "user_id": login.user_id,
               "session_hash": login.session_hash, "verifier_hash": login.verifier_hash, **sso.answer_record(answer)}
     if login.purpose == sso_state.TEST:
@@ -631,7 +653,7 @@ async def sign_in_callback(
     try:
         handover = sso_state.store_handover(record)
     except sso_state.Unavailable:
-        return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
+        return _refused_at_the_callback(db, login, row, oc.TEMPORARILY_UNAVAILABLE)
     fragment = {sso_state.LINK: "sso-linked=", sso_state.TEST: "sso-test=", sso_state.STEP_UP: "sso-stepup="}[login.purpose]
     return _redirect(fragment + handover)
 
@@ -1214,9 +1236,13 @@ async def finish_test(
         raise HTTPException(status_code=404, detail="Unknown provider.")
     row.last_test = record.get("summary") or {}
     db.commit()
-    _audit(db, "sso_provider_tested", user=current_user, ip=client_ip,
-           details={"provider_id": str(row.id), "purpose": sso_state.TEST, "outcome": "ok"})
-    return {"tested": True, "summary": row.last_test}
+    outcome = str((row.last_test or {}).get("outcome") or "")
+    passed = outcome == "ok"
+    # A test that did not pass is recorded as one: who ran it, and the reason.
+    _audit(db, "sso_provider_tested", user=current_user, ip=client_ip, status_="success" if passed else "failure",
+           details={"provider_id": str(row.id), "purpose": sso_state.TEST, "outcome": outcome or "unknown"})
+    shown = {key: value for key, value in (row.last_test or {}).items() if key != "config"}
+    return {"tested": passed, "summary": shown if not passed else row.last_test}
 
 
 # --------------------------------------------------------------------------- the person's own identities
