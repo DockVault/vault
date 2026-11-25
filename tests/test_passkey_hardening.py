@@ -215,7 +215,9 @@ def test_a_provisional_key_is_confirmed_only_by_something_older_than_it(monkeypa
     alice = _user()
     h = Harness(monkeypatch, [alice])
     from app.core.models import SecondFactorEnrollment
-    h.db.rows_of(SecondFactorEnrollment).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, method="totp", status="active"))
+    long_ago = datetime.utcnow() - timedelta(days=60)          # set up before either key
+    h.db.rows_of(SecondFactorEnrollment).append(types.SimpleNamespace(
+        id=uuid.uuid4(), user_id=alice.id, method="totp", status="active", created_at=long_ago, confirmed_at=long_ago))
     auth1, p1 = h.enroll(alice, provisional=True, label="p1")
     auth2, p2 = h.enroll(alice, provisional=True, label="p2")
     p2.created_at = p1.created_at + timedelta(seconds=5)

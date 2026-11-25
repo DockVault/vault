@@ -102,7 +102,10 @@ class Harness:
         self.S = S = _api()
         self.user = user
         self.redis = FakeRedis()
-        enrollments = [types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, method="totp", status="active")] if totp else []
+        # An authenticator app the account set up long ago (older than any passkey a test here registers).
+        enrollments = [types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, method="totp", status="active",
+                                             created_at=datetime.utcnow() - timedelta(days=90),
+                                             confirmed_at=datetime.utcnow() - timedelta(days=90))] if totp else []
         # The session the caller acts from: a factor is written from it only while it stands.
         self.session = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, is_active=True, revoked=False,
                                              session_token=S.hash_session_token("the-session"))
@@ -364,6 +367,51 @@ def test_a_passkey_added_soon_after_an_administrators_change_is_provisional_unti
     assert status == 200 and out["provisional"] is False
 
 
+@pytest.mark.parametrize("set_up, vouches", [("before the key", True), ("after the key", False),
+                                             ("at no time on record", False), ("only begun before the key", False),
+                                             ("at the key's own moment", False)])
+def test_only_an_authenticator_app_older_than_the_key_vouches_for_a_provisional_passkey(monkeypatch, set_up, vouches):
+    """A passkey is provisional when it is added soon after somebody else changed the account's sign-in details.
+    Whoever holds the account then can add an authenticator app as well (with the password alone, or at a held
+    sign-in), and prove the step-up with it. The route promised that only a factor older than the key vouches,
+    and compared the age for a passkey alone: an app set up after the key confirmed it. Its age is read now, and
+    a recovery code vouches only as its app does."""
+    from app.core import credential_changes as cc
+    from app.core import second_factor as sf
+    from app.core.models import SecondFactorEnrollment
+    user = _user()
+    change = types.SimpleNamespace(id=uuid.uuid4(), target_user_id=user.id, status=cc.MADE,
+                                   applied_at=datetime.utcnow() - timedelta(days=1), kind=cc.PASSWORD)
+    h = Harness(monkeypatch, user, changes=[change])
+    status, shown, _ = h.register(label="new")
+    assert status == 201 and shown["provisional"] is True
+    (row,) = h.rows()
+    times = {"before the key": dict(created_at=row.created_at - timedelta(days=40), confirmed_at=row.created_at - timedelta(days=40)),
+             "after the key": dict(created_at=row.created_at + timedelta(minutes=5), confirmed_at=row.created_at + timedelta(minutes=5)),
+             "at no time on record": dict(created_at=None, confirmed_at=None),
+             "at the key's own moment": dict(created_at=row.created_at, confirmed_at=row.created_at),
+             # Begun before the key, its code confirmed only after it: set up after the key.
+             "only begun before the key": dict(created_at=row.created_at - timedelta(days=1),
+                                               confirmed_at=row.created_at + timedelta(minutes=5))}[set_up]
+    h.db.rows_of(SecondFactorEnrollment).append(
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, method="totp", status="active", **times))
+    assert h.S._authenticator_app_older_than(h.db, user.id, row.created_at) is vouches
+    for marker in ("totp", "recovery"):
+        row.provisional_until = datetime.utcnow() + timedelta(days=10)
+        monkeypatch.setattr(sf, "consume_step_up_receipt_detail",
+                            lambda db, *, user, action, receipt, session_hash, redis=None, m=marker: m)
+        status, out = _call(h.S, "POST", f"/users/me/passkeys/{row.id}/confirm", None, {"X-Second-Factor": "ok"})
+        if vouches:
+            assert status == 200 and out["provisional"] is False and row.provisional_until is None, (marker, out)
+        else:
+            assert status == 409 and "Nothing older can vouch for this passkey" in out["detail"], (marker, out)
+            assert "no authenticator app set up before it" in out["detail"] and row.provisional_until is not None
+    # An app that is not in use (never confirmed to the end) vouches for nothing, whatever its age.
+    for enrollment in h.db.rows_of(SecondFactorEnrollment):
+        enrollment.status = "unconfirmed"
+    assert h.S._authenticator_app_older_than(h.db, user.id, row.created_at) is False
+
+
 def test_nothing_older_cannot_vouch_for_a_provisional_passkey(monkeypatch):
     from app.core import credential_changes as cc
     user = _user()
@@ -380,6 +428,13 @@ def test_nothing_older_cannot_vouch_for_a_provisional_passkey(monkeypatch):
                                   created_at=row.created_at - timedelta(days=30), transports=None, label="old",
                                   backup_eligible=False, cose_alg=-7, last_used_at=None)
     h.rows().append(older)
+    # ...when the step-up was proved with that passkey. A receipt earned with an authenticator code vouches for
+    # nothing here: the account has no authenticator app set up before the key.
+    status, out = _call(h.S, "POST", f"/users/me/passkeys/{row.id}/confirm", None, {"X-Second-Factor": "ok"})
+    assert status == 409 and "only with a factor older than it" in out["detail"]
+    from app.core import second_factor as sf
+    monkeypatch.setattr(sf, "consume_step_up_receipt_detail",
+                        lambda db, *, user, action, receipt, session_hash, redis=None: f"passkey:{older.id}")
     status, out = _call(h.S, "POST", f"/users/me/passkeys/{row.id}/confirm", None, {"X-Second-Factor": "ok"})
     assert status == 200 and out["provisional"] is False
 

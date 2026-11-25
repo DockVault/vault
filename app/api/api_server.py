@@ -12085,6 +12085,21 @@ async def remove_my_passkey(
     return {"removed": True}
 
 
+def _authenticator_app_older_than(db, user_id, moment) -> bool:
+    """Whether the account's authenticator app in use was set up before ``moment`` (when a passkey was
+    registered). A provisional passkey is one added soon after somebody else changed the account's sign-in
+    details: whoever holds the account then can add an authenticator app as well, with the password alone or at a
+    held sign-in, and an app younger than the key says no more for the key than the key says for itself. An
+    enrollment with no time on record vouches for nothing."""
+    from app.core.models import SecondFactorEnrollment
+    app = db.query(SecondFactorEnrollment).filter(SecondFactorEnrollment.user_id == user_id,
+                                                  SecondFactorEnrollment.status == "active").first()
+    since = (getattr(app, "confirmed_at", None) or getattr(app, "created_at", None)) if app is not None else None
+    if since is None or moment is None:
+        return False
+    return since.replace(tzinfo=None) < moment.replace(tzinfo=None)
+
+
 @app.post("/users/me/passkeys/{passkey_id}/confirm")
 async def confirm_my_passkey(
     passkey_id: uuid.UUID,
@@ -12097,7 +12112,6 @@ async def confirm_my_passkey(
     The receipt says which factor vouched; the provisional key itself never does. Refused (409) when the
     account holds nothing older to confirm it with."""
     from app.core import second_factor as sf
-    from app.core.active_factors import active_factors
     _passkey_refuse_temp(current_user)
     row = _passkey_of(db, current_user.id, passkey_id)
     now = datetime.utcnow()
@@ -12117,14 +12131,15 @@ async def confirm_my_passkey(
     older = [k for k in _passkeys_of(db, current_user.id)
              if k.id != row.id and k.created_at and k.created_at < row.created_at
              and not (k.provisional_until and k.provisional_until > now)]
-    factors = active_factors(db, current_user.id)
-    if not factors.code and not older:
+    app_is_older = _authenticator_app_older_than(db, current_user.id, row.created_at)
+    if not app_is_older and not older:
         raise HTTPException(status_code=409, detail=(
-            "Nothing older can vouch for this passkey: your account has no authenticator app and no earlier "
-            "passkey. It becomes ordinary on its own when its provisional period ends."))
-    # Only a factor older than this key vouches: the authenticator app, a recovery code, or an ordinary passkey
-    # registered before it. The key itself, another provisional key, or an email code never does.
-    vouches = marker in ("totp", "recovery") or (
+            "Nothing older can vouch for this passkey: your account has no authenticator app set up before it and "
+            "no earlier passkey. It becomes ordinary on its own when its provisional period ends."))
+    # Only a factor older than this key vouches: the authenticator app set up before it (or one of that app's
+    # recovery codes), or an ordinary passkey registered before it. The key itself, another provisional key, an
+    # authenticator app set up after the key, or an email code never does.
+    vouches = (marker in ("totp", "recovery") and app_is_older) or (
         marker.startswith("passkey:") and any(marker == f"passkey:{k.id}" for k in older))
     if not vouches:
         raise HTTPException(status_code=409, detail=(
