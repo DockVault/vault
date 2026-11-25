@@ -1514,3 +1514,33 @@ def test_the_settings_page_shows_a_failed_test_as_its_sentence():
     block = page[page.index("function testSummary(provider) {"):page.index("function connectionPage(provider) {")]
     assert block.index("if (last.outcome !== 'ok') {") < block.index("const list = _el('ul', 'text-sm');")
     assert "last.message || 'The test sign-in did not pass.'" in block
+
+
+def test_a_link_from_the_profile_that_meets_the_identity_linked_by_address_makes_it_the_owners(monkeypatch):
+    """The owner links the provider under Your account. While they are at the provider, a sign-in there puts the
+    same identity on the account by its address. The owner's link finds it and makes it theirs: left as the
+    provider's, the link they had just made themselves stayed one click to remove, and the provider's second
+    factor went on not counting. An identity linked by address that the owner did not link stays as it is."""
+    from app.core.models import ExternalIdentity
+    from app.services import sso_sign_in as sso
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p])
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-linked=")
+    by_address = _identity(alice, p, linked_by="email")
+    h.db.rows_of(ExternalIdentity).append(by_address)
+    status, body = h.finish_link(location)
+    assert status == 200, body
+    assert h.identities() == [by_address] and by_address.linked_by == "self"
+    # The rule, asked directly: only the owner's own link adopts, and only an identity linked by address.
+    answer = types.SimpleNamespace(issuer=by_address.issuer, subject=by_address.subject, tenant_id=None, email=None,
+                                   display_name=None)
+    monkeypatch.setattr(sso, "decide_in_the_accounts_turn", lambda db, user: None)
+    monkeypatch.setattr(sso, "_password_less_refusal", lambda db, row, user: None)
+    for was, by, becomes in (("email", "email", "email"), ("email", "invitation", "email"), ("jit", "self", "jit"),
+                             ("email", "self", "self")):
+        by_address.linked_by = was
+        assert sso.link_identity(h.db, p, alice, answer, linked_by=by) is by_address
+        assert by_address.linked_by == becomes, (was, by)

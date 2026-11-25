@@ -1060,6 +1060,13 @@ def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str, keep
     existing = subject_owner(db, row, answer)
     if existing is not None:
         if existing.user_id == user.id and known_identity(db, row, answer) is not None:
+            if linked_by == "self" and getattr(existing, "linked_by", None) == LINKED_BY_EMAIL:
+                # The owner linked the provider from their own profile, under their own sign-in, and came back
+                # as the identity the provider had meanwhile put on the account by its address: it is the
+                # owner's own link from now on (its unlink asks the provider where the provider can hold the
+                # account, and the provider's second factor counts again). Left as the provider's, the link
+                # the owner had just made themselves stayed one click to remove.
+                existing.linked_by = linked_by
             return existing
         raise Refusal(ALREADY_LINKED)         # another account's, or this account's under another tenant
     mine = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id,
@@ -1155,7 +1162,11 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     second factor only by that account, from its profile (:func:`_email_match`, :func:`set_up_its_own_factor`).
     One linked by email before the account set a factor up stays linked; while the account holds a factor it can
     give, the provider's MFA does not stand in for it at sign-ins through that identity, and the account's
-    factor is asked. Its owner makes the link their own by linking the provider again from Your account.
+    factor is asked. Its owner makes the link their own under Your account: they unlink the identity (one step:
+    it was the provider's link, not theirs) and link the provider again. A provider the account is already
+    linked to is not linked a second time, so there is no shorter way; the one case in which the owner's own
+    link meets the identity (it was put on the account by its address while the owner was at the provider)
+    makes it theirs on the spot (:func:`link_identity`).
 
     The rule is :func:`linked_on_the_providers_word`: a factor it can give now, or one it is to set up again
     (after a reset, a removed last passkey, a key that can no longer be used: the sign-in is then held for that
