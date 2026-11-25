@@ -625,3 +625,76 @@ out({ offered, on, already, draft: byId('sso-end-sessions') !== null, title: byI
                          "end": False}
     assert got["already"] == {"toast": ["It was already off.", "success"], "end": True, "line": False}
     assert got["title"] == "draft" and got["draft"] is False
+
+
+SAVE = r"""
+const READ = answers['/admin/sso/providers/p-1'];
+let patched = null;
+answers['/admin/sso/providers/p-1'] = () => asked[asked.length - 1].method === 'PATCH' ? patched : READ;
+const answer = (more) => Object.assign({ provider: PROVIDER, changed: ['name'], connection_changed: false,
+    turned_off: false, secret_cleared: false, made_sso_only: [], restored: [], sessions_ended: 0,
+    sessions_not_ended: 0, held: 0, owners_told: 0, held_by_its_days: 0, newly_held: 0 }, more);
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+async function save(field, value, more) {
+    patched = answer(more);
+    byId(field).value = value;
+    byId('sso-save').click();
+    await tick(); await tick(); await tick();
+    return toasts[toasts.length - 1];
+}
+"""
+
+
+def test_a_save_that_turned_the_provider_off_says_what_it_ended_held_left_standing_and_told():
+    """PATCH answers what a change of the connection did to a provider that was on: the sessions it ended, those it
+    could not end, the accounts whose days had run out that stay held, and the linked accounts told it was pointed
+    somewhere else. What still stands is said on the dialog until it is ended; a later save, which turns nothing
+    off, does not take that away."""
+    got = _node(SAVE + r"""
+const OFF = Object.assign({}, PROVIDER, { state: 'disabled' });
+const first = await save('sso-issuer', 'https://elsewhere.example.test', { provider: OFF, changed: ['issuer'],
+    connection_changed: true, turned_off: true, sessions_ended: 2, sessions_not_ended: 1, held: 1, owners_told: 2 });
+const line = () => byId('sso-sessions-standing');
+const after = { line: line() && line().textContent, end: byId('sso-end-sessions') !== null };
+const second = await save('sso-name', 'contoso-2', { provider: OFF });
+out({ first, after, second, still: line() && line().textContent });
+""")
+    toast, kind = got["first"]
+    assert kind == "warning"
+    assert toast == ("Saved. The connection changed, so the provider was turned off: run a test sign-in, then turn it "
+                     "on again. 2 session(s) that came through it were ended. 1 account(s) whose days there had run "
+                     "out stay held: lift each on the Identities page when it should have its keys back. "
+                     + STANDS.format(n="1 session(s)", it="it")
+                     + " The 2 account(s) linked to it were told it was pointed somewhere else.")
+    assert got["after"] == {"line": STANDS.format(n="1 session(s)", it="this provider"), "end": True}
+    assert got["second"] == ["Saved.", "success"]
+    assert got["still"] == STANDS.format(n="1 session(s)", it="this provider")
+
+
+def test_a_save_whose_sessions_could_not_be_counted_says_so():
+    got = _node(SAVE + r"""
+out(await save('sso-issuer', 'https://elsewhere.example.test', { provider: Object.assign({}, PROVIDER, { state: 'disabled' }),
+    changed: ['issuer'], connection_changed: true, turned_off: true, sessions_not_ended: null }));
+""")
+    assert got == ["Saved. The connection changed, so the provider was turned off: run a test sign-in, then turn it on "
+                   "again. " + STANDS.format(n="Sessions", it="it"), "warning"]
+
+
+def test_a_save_of_the_days_says_whom_they_hold_now():
+    """A save of the provider's days, or of what they end, answers how many linked accounts it holds from now on and
+    how many its days hold in all: the administrator is told both, as the other administrators are."""
+    got = _node(SAVE + r"""
+byId('sso-tab-sessions').click();
+await tick();
+const more = await save('sso-freshness', '30', { changed: ['policy.sso_freshness_days'], held_by_its_days: 3,
+                                                 newly_held: 2 });
+const none = await save('sso-freshness', '60', { changed: ['policy.sso_freshness_days'], held_by_its_days: 3,
+                                                 newly_held: 0 });
+out({ more, none });
+""")
+    assert got["more"] == ["Saved. 2 more linked account(s) have not signed in through it within its days as they are "
+                           "now: their password and passkeys do not sign them in until they have. They were told. 3 "
+                           "account(s) are held so in all.", "success"]
+    assert got["none"] == ["Saved. 3 linked account(s) are held to a sign-in through it by its days.", "success"]

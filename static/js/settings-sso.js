@@ -12,9 +12,9 @@
  * its own words. The client secret is typed, sent, and never shown again. A fifth page, Identities, lists the
  * accounts linked to the provider (GET /admin/sso/providers/{id}/identities) and where each stands, lifts a
  * refusal or a hold (POST /admin/sso/identities/{id}/clear-refusal) and unlinks an account (DELETE
- * /admin/sso/identities/{id}), each under the same step-up as a change. A turn-on or a turn-off says what it did
- * to the sessions and the accounts linked to the provider, as the server answers it; sessions a turn-off could not
- * end are said on the dialog until "Turn off again" (a provider that is off) has ended them.
+ * /admin/sso/identities/{id}), each under the same step-up as a change. A save, a turn-on or a turn-off says what
+ * it did to the sessions and the accounts linked to the provider, as the server answers it; sessions a turn-off
+ * could not end are said on the dialog until "Turn off again" (a provider that is off) has ended them.
  *
  * When the deployment locks single sign-on (SETTINGS_LOCKED_KEYS naming sso or *), the server refuses every change
  * to a provider, and the card and the dialog say so in the server's words (`locked_message`) and offer none: no "Add
@@ -244,20 +244,45 @@
                 const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(saved)}`, {
                     method: 'PATCH', body: JSON.stringify(body), silent: true,
                 });
+                // Sessions a turn-off by this save could not end are said on the dialog until they are ended.
+                if (out.turned_off) noteStanding(saved, 'disabled', out);
                 // An answer that comes after the dialog was closed, or opened on another provider, draws nothing
                 // into it: the list is read again and says what was saved.
                 if (!open || open.id !== saved) { load(); return; }
                 open = out.provider;
                 let told = 'Saved.';
                 if (out.connection_changed && open.state !== 'enabled') told = 'Saved. Run a test sign-in before turning it on.';
-                if (out.turned_off) told = 'Saved. The connection changed, so the provider was turned off: run a test sign-in, then turn it on again.';
+                if (out.turned_off) {
+                    told = 'Saved. The connection changed, so the provider was turned off: run a test sign-in, then '
+                        + 'turn it on again.';
+                    if (out.sessions_ended) {
+                        told += ` ${out.sessions_ended} session(s) that came through it were ended.`;
+                    }
+                    if (out.held) {
+                        told += ` ${out.held} account(s) whose days there had run out stay held: lift each on the `
+                            + 'Identities page when it should have its keys back.';
+                    }
+                    const left = standingSaid(out.sessions_not_ended, 'it');
+                    if (left) told += ' ' + left;
+                }
                 if (out.secret_cleared) told += ' Enter the client secret again: it is kept only for the address it was entered for.';
                 if ((out.made_sso_only || []).length) told += ` ${out.made_sso_only.length} linked account(s) now sign in only through it.`;
                 if ((out.restored || []).length) {
                     told += ` ${out.restored.length} linked account(s) may hold a password again: each asks for a reset `
                         + 'link on the sign-in page, or you make one for them on the Users page.';
                 }
-                showToast(told, 'success');
+                if (out.owners_told) {
+                    told += ` The ${out.owners_told} account(s) linked to it were told it was pointed somewhere else.`;
+                }
+                // Whom the provider's days hold now that they changed (the other administrators are told the same).
+                if (out.newly_held) {
+                    told += ` ${out.newly_held} more linked account(s) have not signed in through it within its days `
+                        + 'as they are now: their password and passkeys do not sign them in until they have. They were '
+                        + `told. ${out.held_by_its_days} account(s) are held so in all.`;
+                } else if (out.held_by_its_days) {
+                    told += ` ${out.held_by_its_days} linked account(s) are held to a sign-in through it by its days.`;
+                }
+                showToast(told, out.turned_off && standsIn(out) ? 'warning' : 'success');
                 delete drafts[page];                       // this page was saved; the others keep what was typed
                 drawDialog({ keep: false, focus: 'sso-save' });
                 load();
