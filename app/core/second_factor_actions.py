@@ -84,6 +84,10 @@ FIXED_STEP_UP_ACTIONS: dict = {
     # How people sign in (app/api/sign_in_settings_router.py): the passkey settings, and the single sign-on
     # settings when they land; the password every time plus any second factor the account has enrolled.
     "admin.auth_policy.write": ("Change how people sign in", "password_always"),
+    # Where the vault's mail goes, and with which password (app/core/mail_relay.py): a sending profile's create,
+    # save, delete and test send, a save of the older SMTP settings in the general settings, and their test send.
+    # The password every time plus any second factor the account has enrolled, as for how people sign in.
+    "admin.mail_relay.write": ("Change or test the mail server settings", "password_always"),
 }
 
 # The steps of compliance access (app/api/compliance_router.py), each under the compliance policy: the password

@@ -184,6 +184,9 @@ from fastapi import HTTPException
 from app.api import api_server as api
 from app.core.database import get_db_context
 from app.core.models import User
+# Called here as a function, not through a request: the administrator's password step-up the route asks for
+# first is not what this measures (the trust store is), so it is passed.
+api._mail_relay_step_up = lambda db, user, request: None
 with get_db_context() as db:
     user = db.query(User).filter(User.username == USERNAME).one()
     request = SimpleNamespace(headers={}, client=SimpleNamespace(host="192.0.2.11"))

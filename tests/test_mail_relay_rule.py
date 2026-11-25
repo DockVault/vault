@@ -5,6 +5,8 @@ a stored password, must carry the password (app/core/mail_relay.py). A sending p
 and a save of the older SMTP settings held with the general settings, are refused without it (400, reason
 ``smtp_password_required``), with nothing saved or sent and the refusal in the audit log; with it they go ahead and
 the change is recorded. A request that changes none of these keeps the stored password, as before.
+
+The step-up these routes also ask for is passed here; test_mail_relay_step_up.py holds it.
 """
 import tempfile
 import uuid
@@ -67,6 +69,9 @@ def quiet(monkeypatch):
     from app.core import rate_limiter
     monkeypatch.setattr(rate_limiter.rate_limiter, "check_rate_limit", lambda **kw: (True, 0, 0))
     monkeypatch.setattr(api, "_enforce_step_up", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_refuse_if_must_enroll", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_mail_relay_step_up", lambda db, user, request: None)
+    monkeypatch.setattr(studio, "_step_up", lambda db, user, request: None)
 
 
 @pytest.fixture

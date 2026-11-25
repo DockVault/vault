@@ -2,7 +2,10 @@
 
 All routes are gated by ``require_interactive_admin`` (the same surface as Settings): an admin-minted
 temporary credential must not manage sending identities, templates, or the private resource folder.
-Kept in its own module so the bulk of this feature stays out of api_server.py.
+A sending profile's create, save, delete and test send also ask for the administrator's password every time
+(the fixed step-up admin.mail_relay.write), and its stored SMTP password goes only to the server it was
+entered for (app/core/mail_relay.py). Kept in its own module so the bulk of this feature stays out of
+api_server.py.
 
 This module currently registers the router with the shared dynamic-action catalog; the profile,
 template, resource, and sending endpoints fill in the rest of the CRUD.
@@ -25,7 +28,7 @@ from sqlalchemy.orm import Session, defer, joinedload
 
 from app.core.database import get_db
 from app.core.models import EmailAction, EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
-from app.core import email_sanitize, email_send, mail_relay
+from app.core import email_sanitize, email_send, fixed_step_up, mail_relay
 from app.core.mail_relay import REFUSED_ACTION as RELAY_CHANGE_REFUSED
 from app.core.email_actions import LOCKED, SPEC_BY_KEY
 from app.core.security import decrypt_secret, encrypt_secret
@@ -81,6 +84,11 @@ async def require_interactive_admin(
 # Router-level gate: EVERY route below requires an interactive admin session. Individual routes that
 # need the admin User object still add `Depends(require_interactive_admin)` as a parameter.
 router = APIRouter(tags=["Email Studio"], dependencies=[Depends(require_interactive_admin)])
+
+# Creating, saving, deleting or testing a sending profile is under a step-up the matrix cannot switch off: the
+# administrator's password every time, and their second factor when they have one (app/core/mail_relay.py).
+# Called in each route's body, after its own refusals and before it changes or sends anything.
+_step_up = fixed_step_up.guard(mail_relay.STEP_UP_ACTION)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -241,6 +249,7 @@ async def create_profile(payload: ProfileIn, request: Request,
                          admin: User = Depends(require_interactive_admin),
                          db: Session = Depends(get_db)):
     _validate_profile_fields(payload)
+    _step_up(db, admin, request)
     # The first profile is always the default; otherwise honor the flag. Clearing any existing
     # default first keeps the partial-unique index satisfied within one transaction.
     make_default = bool(payload.is_default) or db.query(EmailProfile.id).first() is None
@@ -289,6 +298,7 @@ async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Req
                                password_kept=not payload.smtp_password)
     if moved:
         _refuse_relay_change(db, request, admin, "profile_update", moved, profile_id=p.id)
+    _step_up(db, admin, request)       # may commit (a receipt is used once): nothing is changed before it
     relay_changes = mail_relay.changes(before, after)
     if payload.smtp_password:
         relay_changes[mail_relay.PASSWORD] = {"old": "(set)" if p.smtp_password else None, "new": "(set)"}
@@ -329,6 +339,7 @@ async def delete_profile(profile_id: uuid.UUID, request: Request,
     p = db.get(EmailProfile, profile_id)
     if p is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
+    _step_up(db, admin, request)
     name = p.name
     was_default = p.is_default
     db.delete(p)  # templates referencing it have profile_id set to NULL (FK ondelete=SET NULL)
@@ -410,6 +421,7 @@ async def test_profile(payload: ProfileTestIn, request: Request,
         if value and _CTRL_RE.search(str(value)):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail=f"{label} contains invalid control characters.")
+    _step_up(db, admin, request)
     try:
         msg = email_send.build_message(
             cfg, to_addr=to_addr, subject="DockVault test email",

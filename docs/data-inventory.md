@@ -714,3 +714,6 @@ The stored SMTP password:
   naming where (`surface`), the profile's id, and the server, port, username or certificate check it would have
   changed, before and after; `email_profile_updated` and `email_profile_test_sent` name the same fields when a
   save or a test send changes them, and whether a save replaced the password (never the password itself).
+- Creating, saving, deleting or testing a sending profile, a save that changes the older SMTP settings, and
+  their test send ask for the administrator's password every time, and the second factor when they have one,
+  as a fixed step-up (`admin.mail_relay.write`); the step-up and the change are recorded as any other.

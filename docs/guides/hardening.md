@@ -31,8 +31,11 @@ Treat `.env` and the backups as the most sensitive things you hold.
   authenticator or recovery code whatever the step-up settings say, but the rest of an administrator's work follows
   the step-up matrix in Settings. A few changes always ask for the password, and the second factor when the
   administrator has one, whatever the matrix says: how long records are kept, what the audit log records,
-  acknowledging its integrity warnings, and letting a sign-in last longer (a longer session timeout or "Stay
-  signed in" limit).
+  acknowledging its integrity warnings, letting a sign-in last longer (a longer session timeout or "Stay
+  signed in" limit), how people sign in, and changing or testing the mail server settings (a sending profile,
+  or the SMTP settings saved with the general settings). The stored SMTP password goes only to the server it
+  was entered for: pointing it at another server, port or username, or turning the certificate check off,
+  needs the SMTP password entered again.
 - **Keep sign-ins short.** Session Timeout is how long a sign-in lasts before the page asks whether to stay
   signed in; "Stay signed in for at most" (24 hours by default) is how long staying can keep one sign-in going.
 - **Configure email.** Owners are told of access to their vaults in the app always, and by email only when the

@@ -4808,6 +4808,10 @@ def _loosens_session_limits(stored: dict, payload: dict) -> bool:
 from app.core import mail_relay as _mail_relay  # noqa: E402
 from app.core.mail_relay import REFUSED_ACTION as _MAIL_RELAY_CHANGE_REFUSED  # noqa: E402
 
+# A save of the SMTP settings held with the general settings, and their test send, ask for the administrator's
+# password every time, whatever the matrix says (app/core/mail_relay.py), as a sending profile's do.
+_mail_relay_step_up = _fixed_step_up.guard(_mail_relay.STEP_UP_ACTION)
+
 
 def _mail_relay_moved(stored: dict, payload) -> dict:
     """What a settings save would move of where the stored SMTP password goes, without carrying the password
@@ -4857,12 +4861,19 @@ async def update_settings(
     #  * a save that LOOSENS how long a sign-in may last (a longer session timeout or renewal limit, set or
     #    cleared to a longer default) requires admin.session_limits.write instead: the password every
     #    time, and the second factor whenever the account has one. Tightening needs nothing more.
+    #  * a save that changes the SMTP settings (the server, port, username, certificate check, or any
+    #    password sent) requires admin.mail_relay.write instead, on the same terms. A whole-page save sends
+    #    them back as they are stored, which changes nothing.
     stored_settings = _global_settings_blob(db)
     changes_second_factor = _changes_second_factor_policy(stored_settings, payload)
     loosens_sessions = _loosens_session_limits(stored_settings, payload)
+    changes_mail_relay = _mail_relay.settings_change(stored_settings, payload)
     if changes_second_factor and loosens_sessions:
         raise HTTPException(status_code=400, detail=(
             "Save the second-factor policy and the session limits separately: each needs its own confirmation."))
+    if changes_mail_relay and (changes_second_factor or loosens_sessions):
+        raise HTTPException(status_code=400, detail=(
+            "Save the mail server settings on their own: they need their own confirmation."))
     # The stored SMTP password goes to no other server, and loses no certificate check, unless the save carries
     # it (app/core/mail_relay.py). Refused before any step-up is spent.
     relay_moved = _mail_relay_moved(stored_settings, payload)
@@ -4875,6 +4886,10 @@ async def update_settings(
         # ordinary save still holds: an administrator who must set up a second factor first is refused here.
         _refuse_if_must_enroll(db, current_user, "admin.settings.write")
         _session_limits_step_up(db, current_user, request)
+    elif changes_mail_relay:
+        # As for the session limits: the save may hold other settings, so the matrix's enrolment rule holds too.
+        _refuse_if_must_enroll(db, current_user, "admin.settings.write")
+        _mail_relay_step_up(db, current_user, request)
     else:
         _enforce_step_up(db, current_user, request, "admin.settings.write")
     _validate_settings_payload(payload, db)
@@ -5043,6 +5058,7 @@ async def send_test_email(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="SMTP is not configured. Set the SMTP server and From address in Settings → Email first.",
         )
+    _mail_relay_step_up(db, current_user, request)
 
     to_addr = (current_user.email or "").strip() or from_email
     try:

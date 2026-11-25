@@ -3,6 +3,10 @@
 Profiles are cards (title + description + Edit/Delete), with a trailing "+ Create profile" card; the
 modal lays Server|Port and Username|Password on single rows, keeps Send-test + Save side by side and
 in view without scrolling, and saves each profile on its own (no central Save).
+
+Saving, deleting and testing a profile ask for the administrator's password every time (the mail server
+settings' step-up): the page's prompt is answered with it. The tests sign in as an administrator of their
+own, so the step-ups they make are counted apart from the suite's administrator's.
 """
 import os
 import re
@@ -35,9 +39,31 @@ def _open_email_tab(page: Page):
 
 
 @pytest.fixture
-def admin_page(page: Page, admin_creds):
-    _login(page, admin_creds["username"], admin_creds["password"])
+def boss(admin):
+    """An administrator of the test's own: every save here asks the step-up, whose budget is kept per account."""
+    made = admin.create_user(role="admin")
+    yield {"username": made["_username"], "password": made["_password"]}
+    admin.delete_user(made["id"])
+
+
+@pytest.fixture
+def admin_page(page: Page, boss):
+    _login(page, boss["username"], boss["password"])
+    page.boss_password = boss["password"]
     return page
+
+
+def _with_the_password(page: Page):
+    """Answer the step-up prompt the save, delete or test send opened, with the administrator's password."""
+    expect(page.locator("#stepup-modal.active")).to_be_visible(timeout=10000)
+    page.fill("#stepup-password-input", page.boss_password)
+    page.locator("#stepup-modal-body .btn-primary").click()
+    expect(page.locator("#stepup-modal.active")).to_be_hidden(timeout=10000)
+
+
+def _save(page: Page):
+    page.click("#ep-save")
+    _with_the_password(page)
 
 
 @pytest.fixture(autouse=True)
@@ -94,7 +120,7 @@ def test_create_edit_delete_profile_roundtrip(admin_page: Page, admin):
     _open_email_tab(page)
     page.click("#email-profile-add")
     _fill_profile(page, name="Primary")
-    page.click("#ep-save")
+    _save(page)
     card = page.locator('.email-profile-card:has-text("Primary")')
     expect(card).to_be_visible(timeout=10000)
     assert len(admin.get("/email/profiles").json()["profiles"]) == 1
@@ -102,11 +128,12 @@ def test_create_edit_delete_profile_roundtrip(admin_page: Page, admin):
     card.locator(".epc-edit").click()
     expect(page.locator("#email-profile-modal-title")).to_have_text("Edit sending profile")
     page.fill("#ep-name", "Renamed")
-    page.click("#ep-save")
+    _save(page)
     expect(page.locator('.email-profile-card:has-text("Renamed")')).to_be_visible(timeout=10000)
 
     page.locator('.email-profile-card:has-text("Renamed") .epc-delete').click()
     page.click("#confirm-modal-confirm-btn")         # themed confirm for the delete
+    _with_the_password(page)
     expect(page.locator('.email-profile-card:has-text("Renamed")')).to_have_count(0, timeout=10000)
     assert admin.get("/email/profiles").json()["profiles"] == []
 
@@ -129,7 +156,7 @@ def test_profile_saves_individually_not_central(admin_page: Page):
     _fill_profile(page, name="Solo")
     seen = []
     page.on("request", lambda r: seen.append((r.method, r.url)))
-    page.click("#ep-save")
+    _save(page)
     expect(page.locator('.email-profile-card:has-text("Solo")')).to_be_visible(timeout=10000)
     assert any(m == "POST" and "/email/profiles" in u for m, u in seen), seen
     # ...and the central settings save (PUT /settings) is NOT invoked.
@@ -142,7 +169,7 @@ def test_card_shows_description_and_default_badge(admin_page: Page):
     page.click("#email-profile-add")
     _fill_profile(page, name="Described")
     page.fill("#ep-description", "The support desk sender")
-    page.click("#ep-save")   # first profile -> becomes default
+    _save(page)   # first profile -> becomes default
     card = page.locator('.email-profile-card:has-text("Described")')
     expect(card).to_be_visible(timeout=10000)
     expect(card.locator(".epc-desc")).to_have_text("The support desk sender")
@@ -152,14 +179,14 @@ def test_card_shows_description_and_default_badge(admin_page: Page):
 def test_default_badge_moves_when_another_marked_default(admin_page: Page):
     page = admin_page
     _open_email_tab(page)
-    page.click("#email-profile-add"); _fill_profile(page, name="First"); page.click("#ep-save")
+    page.click("#email-profile-add"); _fill_profile(page, name="First"); _save(page)
     expect(page.locator('.email-profile-card:has-text("First")')).to_be_visible(timeout=10000)
-    page.click("#email-profile-add"); _fill_profile(page, name="Second"); page.click("#ep-save")
+    page.click("#email-profile-add"); _fill_profile(page, name="Second"); _save(page)
     expect(page.locator('.email-profile-card:has-text("Second")')).to_be_visible(timeout=10000)
     # promote Second
     page.locator('.email-profile-card:has-text("Second") .epc-edit').click()
     page.check("#ep-default")
-    page.click("#ep-save")
+    _save(page)
     expect(page.locator('.email-profile-card:has-text("Second") .epc-badge')).to_have_text("Default", timeout=10000)
     expect(page.locator('.email-profile-card:has-text("First") .epc-badge')).to_have_count(0)
 
@@ -199,15 +226,17 @@ def test_modal_scrolls_on_a_short_viewport(admin_page: Page):
     expect(page.locator("#ep-save")).to_be_in_viewport()
 
 
-def test_no_console_errors_on_email_tab(page: Page, admin_creds):
+def test_no_console_errors_on_email_tab(admin_page: Page):
+    page = admin_page
     errors = []
-    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    # The browser logs the step-up's refusal (403) as a resource that failed to load: that is the prompt's cue.
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error"
+            and "Failed to load resource" not in m.text else None)
     page.on("pageerror", lambda e: errors.append(str(e)))
-    _login(page, admin_creds["username"], admin_creds["password"])
     _open_email_tab(page)
     page.click("#email-profile-add")
     _fill_profile(page, name="Quiet")
-    page.click("#ep-save")
+    _save(page)
     expect(page.locator('.email-profile-card:has-text("Quiet")')).to_be_visible(timeout=10000)
     assert errors == [], errors
 
@@ -222,6 +251,7 @@ def test_send_test_delivers_without_saving(admin_page: Page, admin):
     _fill_profile(page, name="Mailpit", server=MAILPIT_SMTP_HOST, port=str(MAILPIT_SMTP_PORT),
                   from_email="tester@example.com")
     page.click("#ep-send-test")
+    _with_the_password(page)
     expect(page.locator("#email-profile-result")).to_contain_text("✓", timeout=15000)
     assert admin.get("/email/profiles").json()["profiles"] == []   # Send test did NOT save
     deadline, seen = time.time() + 15, False

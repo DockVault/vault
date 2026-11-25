@@ -80,6 +80,25 @@ def unique(prefix: str = "t") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+# The step-up that changing or testing the mail server settings asks for (app/core/mail_relay.py), and the
+# routes that test-send through them.
+MAIL_RELAY_STEP_UP = "admin.mail_relay.write"
+MAIL_RELAY_TEST_SENDS = ("/email/profiles/test", "/settings/test-email")
+
+
+def asks_for_the_mail_relay_step_up(response) -> bool:
+    """Whether ``response`` is the refusal that asks for the mail server settings' step-up."""
+    if response.status_code != 403:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return (isinstance(detail, dict) and detail.get("action") == MAIL_RELAY_STEP_UP
+            and detail.get("reason") == "step_up_required")
+
+
 def skip_for_older_deployment(reason: str) -> None:
     """Keep compatibility skips local-only; same-commit CI must test the new image."""
     if os.environ.get("VAULT_SAME_COMMIT_CI", "").lower() in {"1", "true", "yes"}:
@@ -439,19 +458,72 @@ class ApiClient:
 
     def post(self, path, **kw):
         self._renew_if_stale()
-        return self.session.post(self._url(path), timeout=60, **kw)
+        return self._answered("post", path, 60, kw)
 
     def put(self, path, **kw):
         self._renew_if_stale()
-        return self.session.put(self._url(path), timeout=30, **kw)
+        return self._answered("put", path, 30, kw)
 
     def patch(self, path, **kw):
         self._renew_if_stale()
-        return self.session.patch(self._url(path), timeout=30, **kw)
+        return self._answered("patch", path, 30, kw)
 
     def delete(self, path, **kw):
         self._renew_if_stale()
-        return self.session.delete(self._url(path), timeout=30, **kw)
+        return self._answered("delete", path, 30, kw)
+
+    # -- the mail server settings' step-up ---------------------------------
+    # Changing or testing the mail server settings asks for the administrator's password every time (the
+    # fixed step-up admin.mail_relay.write), and many tests point the vault at a test mail server. A client
+    # signed in with a password answers that step-up as a person answers the page's prompt: it confirms with
+    # its password and sends the same request once more with the receipt. A test send is confirmed before it is
+    # sent instead: each test-send route counts the sends that reach its own limit before it asks for the
+    # step-up, and a send made twice would be counted twice. Only that refusal is answered; every other answer,
+    # a 401 or another step-up included, reaches the test as it came, and a request that carries its own receipt
+    # is left alone. A test that wants to see the refusal sets ``answers_mail_relay_step_up`` to False.
+    answers_mail_relay_step_up = True
+
+    def _answered(self, verb, path, timeout, kw):
+        answering = bool(self.answers_mail_relay_step_up and self._credentials
+                         and "X-Second-Factor" not in (kw.get("headers") or {}))
+        if answering and verb == "post" and path in MAIL_RELAY_TEST_SENDS:
+            confirmed = self._with_the_mail_relay_receipt(verb, path, timeout, kw)
+            if confirmed is not None:
+                return confirmed
+            answering = False       # the password was refused: the request goes as it is, and its answer stands
+        r = getattr(self.session, verb)(self._url(path), timeout=timeout, **kw)
+        if answering and asks_for_the_mail_relay_step_up(r):
+            return self._with_the_mail_relay_receipt(verb, path, timeout, kw) or r
+        return r
+
+    def _with_the_mail_relay_receipt(self, verb, path, timeout, kw):
+        """The request sent with a receipt this client earned with its password, or None when the password is
+        refused. A step-up is limited to ten an account in five minutes: when that limit answers, the request
+        is made by a short-lived second administrator confirming with its own password, as
+        _sf_helpers.put_settings_with_password does for a longer sign-in."""
+        step = self.session.post(self._url("/auth/second-factor/step-up"), timeout=30, json={
+            "action": MAIL_RELAY_STEP_UP, "method": "password", "code": self._credentials[1]})
+        if step.status_code == 429:
+            return self._as_a_second_administrator(verb, path, kw)
+        if step.status_code != 200:
+            return None
+        headers = {**(kw.get("headers") or {}), "X-Second-Factor": step.json()["receipt"]}
+        return getattr(self.session, verb)(self._url(path), timeout=timeout, **{**kw, "headers": headers})
+
+    def _as_a_second_administrator(self, verb, path, kw):
+        other = self.create_user(role="admin")
+        done = False
+        try:
+            second = ApiClient(self.base_url)
+            second.login(other["_username"], other["_password"])
+            answer = getattr(second, verb)(path, **kw)
+            done = True
+            return answer
+        finally:
+            gone = self.delete_user(other["id"])
+            # Checked only when nothing else went wrong, so the first failure is the one reported.
+            if done:
+                assert gone.status_code in (200, 204), f"the second administrator was not removed: {gone.text}"
 
     # -- high-level helpers used by fixtures/tests -----------------------
     def create_vault(self, name=None, password=None, description="created by tests",

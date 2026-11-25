@@ -61,6 +61,8 @@ def admin(db):
 def no_rate_limit(monkeypatch):
     from app.core import rate_limiter
     monkeypatch.setattr(rate_limiter.rate_limiter, "check_rate_limit", lambda **kw: (True, 0, 0))
+    # The administrator's password step-up the test send asks for first (test_mail_relay_step_up.py holds it).
+    monkeypatch.setattr(api, "_mail_relay_step_up", lambda db, user, request: None)
 
 
 @pytest.fixture

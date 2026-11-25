@@ -255,14 +255,17 @@ def test_test_send_is_rate_limited(admin, clean_profiles):
     fresh = admin.create_user(role="admin")
     c = admin.clone_anonymous()
     c.login(fresh["_username"], fresh["_password"])
+    # The cap counts every test send that reaches it, before the password step-up each one then asks for: the
+    # step-up is left unanswered here, so no more than ten step-ups an account in five minutes limit the run.
+    c.answers_mail_relay_step_up = False
     try:
         codes = [c.post("/email/profiles/test", json={
             "smtp_server": "127.0.0.1", "smtp_port": 1,
             "from_email": "x@example.com", "to_addr": "y@example.com"}).status_code
             for _ in range(34)]                      # > the 30/60s courtesy cap
-        # Pin the RAISED cap, not merely "some cap": the first 25 (well under 30) must pass, and the
-        # limit must bite past 30. (25/30 leaves slack for the limiter's inclusive/exclusive edge.)
-        assert 429 not in codes[:25], codes
+        # Pin the RAISED cap, not merely "some cap": the first 25 (well under 30) must pass it (and stop at
+        # the step-up), and the limit must bite past 30. (25/30 leaves slack for the limiter's edge.)
+        assert set(codes[:25]) == {403}, codes
         assert 429 in codes[30:], codes
     finally:
         admin.delete_user(fresh["id"])
