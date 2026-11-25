@@ -8,14 +8,16 @@ The order (app/services/sign_in.py, "The order of the locks"):
 2. a provider's row (``sso_providers``, read under a lock or written);
 3. the account's turn at its sessions (a transaction-scoped advisory lock);
 4. the account's row (``users``, read under a lock or written);
-5. a row of ``credential_changes`` (read under a lock or written).
+5. a row of ``credential_changes`` or of ``auditor_grants`` (read under a lock or written).
 
 A transaction may skip any of them and may take one it already holds again. It is out of order when it takes
 
 - the turn at signing in of an account whose turn at its sessions or whose row it holds, or after a provider's row;
-- a provider's row after any turn at sessions, any account's row or any row of ``credential_changes``;
-- the turn at its sessions of an account whose row it holds, or after a row of ``credential_changes``;
-- an account's row it does not hold yet after a row of ``credential_changes``.
+- a provider's row after any turn at sessions, any account's row or any row of ``credential_changes`` or
+  ``auditor_grants``;
+- the turn at its sessions of an account whose row it holds, or after a row of ``credential_changes`` or
+  ``auditor_grants``;
+- an account's row it does not hold yet after a row of ``credential_changes`` or ``auditor_grants``.
 
 Two transactions that each keep to this cannot wait for each other in a ring over these locks. The rows a foreign
 key reads when a row that names an account is inserted are not counted: they wait for nothing here, because every
@@ -45,7 +47,8 @@ ADVISORY = {0x5349: SIGN_IN_TURN, 0x5354: SESSIONS_TURN}
 ANY = "*"                        # a lock whose row the statement does not name: it stands for every row
 
 _LOCKING_READ = re.compile(r"\bFOR\s+(NO\s+KEY\s+UPDATE|UPDATE|SHARE)\b", re.I)
-_TABLES = (("users", ACCOUNT_ROW), ("sso_providers", PROVIDER_ROW), ("credential_changes", CHANGE_ROW))
+_TABLES = (("users", ACCOUNT_ROW), ("sso_providers", PROVIDER_ROW), ("credential_changes", CHANGE_ROW),
+           ("auditor_grants", CHANGE_ROW))
 
 
 def _key(value) -> str:

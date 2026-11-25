@@ -567,6 +567,16 @@ async def update_user(
     # committed unless every check passes.
     if update_data.is_active is False and user.is_active:
         _blacklist_user_vault_keys(db, user.id, current_user.id)
+    # The account's turn at its sessions, once, before anything below locks a row that names the account (the
+    # order of the locks, app/services/sign_in.py). Where the account loses its standing its auditor right and
+    # its open requests are locked, and its sessions are ended after that: taken only there, the turn was asked
+    # for by a request that already held those rows, while PATCH /users/{id}, which takes the turn first, waited
+    # for them, and the database ended one of the two.
+    # After the vault rows above, which are always locked first; none for the caller's own account, which
+    # this route neither demotes nor turns off.
+    if current_user.id != user_id:
+        from app.api.api_server import _sessions_turn
+        _sessions_turn(db, user.id)
     if user.role == RoleEnum.ADMIN and (changes_role or update_data.is_active is False):
         if removes_last_admin(db, user):
             raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
@@ -727,6 +737,15 @@ async def toggle_user_active(
     if user.is_active:
         _blacklist_user_vault_keys(db, user.id, current_user.id)
 
+    # The account's turn at its sessions, once, before anything below locks a row that names the account (the
+    # order of the locks, app/services/sign_in.py). Where the account loses its standing its auditor right and
+    # its open requests are locked, and its sessions are ended after that: taken only there, the turn was asked
+    # for by a request that already held those rows, while PATCH /users/{id}, which takes the turn first, waited
+    # for them, and the database ended one of the two.
+    # After the vault rows above, which are always locked first.
+    from app.api.api_server import _sessions_turn
+    _sessions_turn(db, user.id)
+
     # Never deactivate the last administrator who can act (see app/core/last_admin.py).
     if user.is_active and user.role == RoleEnum.ADMIN and removes_last_admin(db, user):
         raise HTTPException(status_code=400, detail=LAST_ADMIN_DETAIL)
@@ -792,6 +811,14 @@ async def toggle_user_locked(
     # Prevent self-locking
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot lock your own account")
+
+    # The account's turn at its sessions, once, before anything below locks a row that names the account (the
+    # order of the locks, app/services/sign_in.py). Where the account loses its standing its auditor right and
+    # its open requests are locked, and its sessions are ended after that: taken only there, the turn was asked
+    # for by a request that already held those rows, while PATCH /users/{id}, which takes the turn first, waited
+    # for them, and the database ended one of the two.
+    from app.api.api_server import _sessions_turn
+    _sessions_turn(db, user.id)
 
     # Never lock the last administrator who can act (see app/core/last_admin.py).
     if not user.is_locked and user.role == RoleEnum.ADMIN and removes_last_admin(db, user):

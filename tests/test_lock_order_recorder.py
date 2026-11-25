@@ -112,3 +112,26 @@ def test_the_report_adds_up_what_the_processes_wrote(tmp_path, capsys, monkeypat
     said = capsys.readouterr().out
     assert "out of order: 1" in said and "took sessions turn while holding account row" in said
     assert "app/api/api_server.py:1 route" in said
+
+
+def test_a_row_of_an_auditor_right_stands_where_a_row_of_a_change_does():
+    """An account that loses its standing has its auditor right locked. That row is taken after the account's
+    turn at its sessions, as a row of a change to its sign-in details is: the turn asked for after it is out of
+    order, whichever account the turn is."""
+    from _lock_order_recorder import CHANGE_ROW, SESSIONS_TURN, Held, locks_of
+    read = ("SELECT auditor_grants.id FROM auditor_grants WHERE auditor_grants.user_id = %(user_id_1)s "
+            "AND auditor_grants.status IN (%(status_1_1)s) FOR UPDATE")
+    assert [kind for kind, _key in locks_of(read, {"user_id_1": "u1", "status_1_1": "active"})] == [CHANGE_ROW]
+    assert [kind for kind, _key in locks_of("UPDATE auditor_grants SET status=%(status)s WHERE auditor_grants.id = "
+                                            "%(auditor_grants_id)s", {"status": "suspended",
+                                                                      "auditor_grants_id": "g1"})] == [CHANGE_ROW]
+    assert locks_of("SELECT auditor_grants.id FROM auditor_grants WHERE auditor_grants.user_id = %(u)s", {"u": "u1"}) == []
+    assert locks_of("INSERT INTO auditor_grants (id) VALUES (%(id)s)", {"id": "g1"}) == []
+    held = Held()
+    for kind, key in locks_of(read, {"user_id_1": "u1", "status_1_1": "active"}):
+        assert held.take(kind, key) == []
+    assert held.take(SESSIONS_TURN, "u1") != [], "the turn after the row of the auditor right is out of order"
+    in_order = Held()
+    assert in_order.take(SESSIONS_TURN, "u1") == []
+    for kind, key in locks_of(read, {"user_id_1": "u1", "status_1_1": "active"}):
+        assert in_order.take(kind, key) == []

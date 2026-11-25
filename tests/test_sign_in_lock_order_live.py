@@ -18,6 +18,11 @@ application's own functions, the meeting forced with events.
 - A sign-in that finds the account's turn held for longer than it waits where it is written: answered as busy
   after a short wait, with nothing written, and not after the connection's own, longer wait (the routes that
   finish a sign-in are answered on the server's one loop).
+- Two administrators who lock, or turn off, one account that holds the auditor right, one from the Users page
+  and one by another route (the switch that locks, the switch that turns off, PUT /api/user-management/users/{id}).
+  The Users page's request takes the account's turn first and then locks the account's auditor right; the other
+  routes locked that row first and asked for the turn where they end the sessions, and the database ended one of
+  the two. They take the turn first now: both finish.
 - A held sign-in that goes on (to a session, or to a further hold) and an administrator's deletion of the account
   at that moment: the sign-in has spent its held row and holds the account's turn; the deletion's removal of the
   account's held sign-ins and the sign-in's next write waited for each other, and the database ended one of the
@@ -380,6 +385,65 @@ elif pair in ("a deletion and a held sign-in that becomes a session", "a deletio
     with SessionLocal() as s:
         out["the account is there"] = s.get(User, alice) is not None
     out["sessions"], out["held"], out["the sign-in stayed"] = sessions(alice), held_open(alice), spent.is_set()
+elif pair.startswith("the Users page and "):
+    from datetime import datetime
+    from app.api import user_management_api as um
+    from app.core.models import AuditorGrant
+    api._notify_account_status_changes = lambda *a, **k: None
+    api._announce_lost_standing = lambda *a, **k: None
+    api._notify_users = lambda *a, **k: []
+
+    async def no_detail(**kw):
+        return {}
+    um.get_user_detail = no_detail
+    # The account holds the auditor right: where it loses its standing, that row is locked.
+    with SessionLocal() as s:
+        s.add(AuditorGrant(user_id=alice, username_at_grant=alice_name, status="active", proposed_by=ada,
+                           proposed_by_username="ada", approved_by=bea, approved_by_username="bea",
+                           approved_at=datetime.utcnow(), credential_changers=[]))
+        s.commit()
+    # The other route stays, once the account has lost its standing there (its auditor right locked), until the
+    # Users page's request holds the account's turn, or for a while when it never does.
+    lost, standing_lost = api._account_lost_standing, threading.Event()
+
+    def lost_and_stay(db, user, *, actor, because):
+        told = lost(db, user, actor=actor, because=because)
+        pause = getattr(here, "stay_after_standing", 0)
+        if pause:
+            here.stay_after_standing = 0
+            standing_lost.set()
+            if in_turn.wait(pause):
+                time.sleep(0.5)                    # the Users page's request is at the row held here by now
+        return told
+    api._account_lost_standing = lost_and_stay
+    locks = pair.endswith("locks")
+
+    def the_other_route():
+        here.stay_after_standing = 2.5
+        with SessionLocal() as s:
+            admin = s.get(User, bea)
+            if pair.endswith("the switch that locks"):
+                asyncio.run(um.toggle_user_locked(user_id=alice, current_user=admin, db=s, request=REQUEST))
+            elif pair.endswith("the switch that turns off"):
+                asyncio.run(um.toggle_user_active(user_id=alice, current_user=admin, db=s, request=REQUEST))
+            else:
+                asyncio.run(um.update_user(user_id=alice, update_data=um.UserUpdateRequest(is_active=False),
+                                           request=REQUEST, current_user=admin, db=s))
+            return "done"
+
+    def the_users_page():
+        standing_lost.wait(15)
+        here.stay = 0.05
+        change = api.UserUpdate(is_locked=True) if locks else api.UserUpdate(is_active=False)
+        with SessionLocal() as s:
+            asyncio.run(api.update_user(user_id=alice, user_update=change, current_user=s.get(User, ada), db=s,
+                                        request=REQUEST))
+            return "done"
+    out = together(other=the_other_route, page=the_users_page)
+    with SessionLocal() as s:
+        user = s.get(User, alice)
+        out["locked"], out["active"] = bool(user.is_locked), bool(user.is_active)
+        out["right"] = [g.status for g in s.query(AuditorGrant).filter(AuditorGrant.user_id == alice)]
 elif pair == "a turn held for longer than a sign-in waits":
     out = together(holder=a_turn_held(alice, 2.5), writer=a_sign_in_that_comes_meanwhile(alice))
     out["sessions"], out["the sign-in waited"] = sessions(alice), waited
@@ -454,3 +518,14 @@ def test_a_sign_in_waits_a_short_time_for_a_turn_that_is_held_and_is_answered_as
     (waited,) = out["the sign-in waited"]
     assert 0.3 <= waited < 1.5, out                          # its own short wait: not the 2.5 s, nor the connection's 5
     assert out["sessions"] == [], out
+
+
+@pytest.mark.parametrize("other", ["the switch that locks", "the switch that turns off",
+                                   "PUT /users/{id} that turns off"])
+def test_two_administrators_who_lock_or_turn_off_an_auditors_account_by_two_routes_both_finish(db_name, other):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "the Users page and " + other})
+    assert out["other"] == ["ok", "done"], out               # not ended by the database as one of a ring of waiters
+    assert out["page"] == ["ok", "done"], out
+    assert out["page seconds"] >= 2.0, out                   # the Users page waited for the turn the other one held
+    assert out["right"] == ["suspended"], out                # the right was suspended once, and stands so
+    assert (out["locked"], out["active"]) == ((True, True) if other.endswith("locks") else (False, False)), out

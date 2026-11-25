@@ -558,3 +558,36 @@ def test_a_sign_in_waits_a_short_time_for_its_turn_and_the_transaction_gets_its_
     source = inspect.getsource(sign_in.in_the_accounts_turn)
     assert "with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))" in source
     assert source.count("_sessions_turn(") == 1
+
+
+@pytest.mark.parametrize("route, first", [
+    ("update_user", "_blacklist_user_vault_keys(db, user.id, current_user.id)"),
+    ("toggle_user_active", "_blacklist_user_vault_keys(db, user.id, current_user.id)"),
+    ("toggle_user_locked", 'raise HTTPException(status_code=400, detail="Cannot lock your own account")')])
+def test_the_other_routes_that_lock_or_turn_off_an_account_take_its_turn_before_its_rows(route, first):
+    """PUT /api/user-management/users/{id} and the two switches: the vault rows a deactivation locks come first,
+    then the account's turn, then the administrators' rows, then the rows that go with the account's standing (its
+    auditor right, its open requests), then the ending of its sessions. Taken where the sessions are ended, the
+    turn came after those rows, and a request from the Users page, which takes the turn first, waited for them."""
+    import inspect
+    from app.api import user_management_api as um
+    source = inspect.getsource(getattr(um, route))
+    steps = (first, "_sessions_turn(db, user.id)", "removes_last_admin(db, user)",
+             "_account_lost_standing(db, user, actor=current_user, because=", "_revoke_sessions(db, user_id=user.id")
+    assert all(step in source for step in steps), [step for step in steps if step not in source]
+    order = [source.index(step) for step in steps]
+    assert order == sorted(order), order
+    assert source.count("_sessions_turn(db, user.id)") == 1
+    # Not for the caller's own account in the route that may be called for it (it changes nothing of its standing).
+    if route == "update_user":
+        assert "    if current_user.id != user_id:\n        from app.api.api_server import _sessions_turn\n" \
+               "        _sessions_turn(db, user.id)" in source
+
+
+def test_the_order_of_the_locks_names_the_rows_of_an_auditor_right_after_the_turn():
+    from pathlib import Path
+    from app.services import sign_in
+    text = Path(sign_in.__file__).read_text(encoding="utf-8")
+    table = text[text.index("# The order of the locks."):text.index("# Any of them may be skipped")]
+    assert table.index("3. the account's turn at its sessions") < table.index("4. the account's row") \
+        < table.index("5. a row of credential_changes or of auditor_grants")

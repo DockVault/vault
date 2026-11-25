@@ -82,7 +82,8 @@ EXPIRED = "This login attempt has expired; start again."
 #   2. a provider's row (sso_providers), read under a lock or written;
 #   3. the account's turn at its sessions (take_sessions_turn there; api_server._sessions_turn);
 #   4. the account's row (users), read under a lock or written;
-#   5. a row of credential_changes, read under a lock or written.
+#   5. a row of credential_changes or of auditor_grants, read under a lock or written (an account that loses
+#      its standing has its open requests and its auditor right locked: after its turn, on every route).
 #
 # Any of them may be skipped, and one already held may be taken again. The turns are an account's own: another
 # account's row may be held when a turn is taken. A lock the application takes on an account's row under a turn
