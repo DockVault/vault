@@ -550,7 +550,7 @@ def test_the_owners_unlink_records_how_the_identity_was_linked_and_tells_the_adm
     (ids, title), = [(ids, title) for ids, title in h.notices if title == "alice unlinked " + (p.label or p.name)]
     assert sorted(ids) == sorted([str(ada.id), str(root.id)])
     from app.core import setting_changes
-    (key, names, context), = [m for m in mailed if m[0] == setting_changes.EMAIL_ACTION]
+    (key, names, context), = [m for m in mailed if m[0] == setting_changes.SIGN_IN_EMAIL_ACTION]
     assert names == ["ada", "root"] and context["by"] == "alice"
     assert "by its email address, so no fresh sign-in" in context["change"]
     assert "and the account had been warned of it" in context["change"]
@@ -641,8 +641,8 @@ def test_the_administrators_are_emailed_of_an_owners_unlink_only_where_the_provi
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
     assert status == 200 and out["removed"] is True, out
     assert [ids for ids, title in h.notices if title == "alice unlinked " + (p.label or p.name)] == [[str(root.id)]]
-    assert [s for s in sent if s[0] == setting_changes.EMAIL_ACTION] == ([(setting_changes.EMAIL_ACTION, ["root"])]
-                                                                          if mailed else [])
+    action = setting_changes.SIGN_IN_EMAIL_ACTION
+    assert [s for s in sent if s[0] == action] == ([(action, ["root"])] if mailed else [])
 
 
 def test_no_email_goes_out_for_the_unlink_of_an_account_no_hold_reaches(monkeypatch):
@@ -659,7 +659,7 @@ def test_no_email_goes_out_for_the_unlink_of_an_account_no_hold_reaches(monkeypa
     monkeypatch.setattr(h.S, "_fire_action_email_bulk", lambda db, key, recipients, context=None: sent.append(key))
     assert sso.provider_can_hold(h.db, alice, p) is False and sso.provider_can_hold(h.db, alice, None) is False
     assert _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")[0] == 200
-    assert setting_changes.EMAIL_ACTION not in sent
+    assert setting_changes.SIGN_IN_EMAIL_ACTION not in sent
     assert [ids for ids, title in h.notices if title == "alice unlinked " + (p.label or p.name)] == [[str(root.id)]]
 
 

@@ -79,7 +79,8 @@ def _recorded_changes(before: dict, row, changed) -> dict:
 
 def _tell_administrators(by: str, title: str, body: str) -> None:
     """Tell every active administrator of a change to the providers, in the app and by email, after the commit, as a
-    change of a managed setting is told. Never raises."""
+    change of a passkey setting is told: the notice opens the Sign-in methods page, and the email is the system email
+    about how people sign in. Never raises."""
     try:
         from app.core import setting_changes
         from app.core.database import get_db_context
@@ -87,9 +88,10 @@ def _tell_administrators(by: str, title: str, body: str) -> None:
         api = _api()
         with get_db_context() as db:
             admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
-            api._notify_users([str(a.id) for a in admins], setting_changes.NOTICE_TYPE, title=title, body=body,
-                              target="#settings")
-            api._fire_action_email_bulk(db, setting_changes.EMAIL_ACTION, [(a.email, a.username) for a in admins],
+            api._notify_users([str(a.id) for a in admins], setting_changes.SIGN_IN_NOTICE_TYPE, title=title,
+                              body=body, target=setting_changes.SIGN_IN_TARGET)
+            api._fire_action_email_bulk(db, setting_changes.SIGN_IN_EMAIL_ACTION,
+                                        [(a.email, a.username) for a in admins],
                                         {"change": body, "by": by or "", "when": api._change_time_text()})
     except Exception as exc:  # noqa: BLE001
         log.info("sso provider notice skipped: %s", type(exc).__name__)

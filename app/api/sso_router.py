@@ -1348,7 +1348,7 @@ def _tell_of_a_held_account_kept_out(db, row, user, label: str, key: str) -> Non
     # (The held account is never one of them: an administrator is not held.)
     admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all() if a.is_active]
     if admins:
-        api._notify_users(admins, setting_changes.NOTICE_TYPE,
+        api._notify_users(admins, setting_changes.SIGN_IN_NOTICE_TYPE,
                           title=f"A sign-in through {label} tried to reach {user.username}'s account",
                           body=(f"A sign-in through {label} carried the email address of {user.username}, whose "
                                 f"account signs in only through {holding} until it has signed in there again (its "
@@ -1394,7 +1394,7 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
             from app.core.models import RoleEnum
             admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all() if a.is_active]
             if admins:
-                api._notify_users(admins, setting_changes.NOTICE_TYPE,
+                api._notify_users(admins, setting_changes.SIGN_IN_NOTICE_TYPE,
                                   title=f"A first sign-in through {label} made no account",
                                   body=(f"Someone signed in through {label} for the first time with an email address "
                                         f"that is written on {user.username}'s account, which never confirmed it. No "
@@ -1409,7 +1409,7 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
             others = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all()
                       if a.is_active and a.id != user.id]
             if others:
-                api._notify_users(others, setting_changes.NOTICE_TYPE,
+                api._notify_users(others, setting_changes.SIGN_IN_NOTICE_TYPE,
                                   title=f"A sign-in through {label} tried to reach {user.username}'s account",
                                   body=(f"A sign-in through {label} carried the email address of {user.username}, an "
                                         "account that is never linked to a provider by its address. Nobody was signed "
@@ -1868,7 +1868,7 @@ async def unlink_my_identity(
                           title=f"{current_user.username} unlinked {label}", body=told, target="#users")
         if could_hold:
             from app.core import setting_changes
-            api._fire_action_email_bulk(db, setting_changes.EMAIL_ACTION, [(a.email, a.username) for a in admins],
+            api._fire_action_email_bulk(db, setting_changes.SIGN_IN_EMAIL_ACTION, [(a.email, a.username) for a in admins],
                                         {"change": told, "by": current_user.username,
                                          "when": api._change_time_text()})
     except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notice
