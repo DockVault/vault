@@ -289,3 +289,45 @@ def test_setup_warns_and_starts_when_the_container_cannot_read_only_the_attestat
     out = " ".join(capsys.readouterr().out.split())
     assert "Passkeys: WEBAUTHN_ATTESTATION_ROOTS names /app/certs/roots.pem, and certs/roots.pem does not exist" in out
     assert probed == [()], probed
+
+
+# --------------------------------------------------------------------------- the summary setup ends with
+
+def _summary_lines(monkeypatch, summary):
+    tool = dv.DockVault(dv.Palette(False), root=".")
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    tool._print_setup_summary(summary, True)
+    return printed
+
+
+def test_the_summary_gives_the_address_people_open_first_and_the_published_port_as_the_direct_one(monkeypatch):
+    printed = _summary_lines(monkeypatch, {"server_name": "vault.internal", "web_host_port": 8443,
+                                           "open_at": "https://vault.example.com"})
+    first = next(i for i, line in enumerate(printed) if "https://vault.example.com/" in line)
+    direct = next(i for i, line in enumerate(printed) if "https://vault.internal:8443/" in line)
+    assert first < direct, printed
+    assert printed[first].startswith(" Web UI / API : https://vault.example.com/   (the first ALLOWED_HOSTS entry: "
+                                     "emailed links, passkeys and single sign-on use this address)"), printed[first]
+    assert printed[direct] == " Direct       : https://vault.internal:8443/   (host port 8443)", printed[direct]
+    # The same address, or none known: one line, as before.
+    for open_at in ("https://vault.internal:8443", "https://Vault.Internal:8443/", "", None):
+        printed = _summary_lines(monkeypatch, {"server_name": "vault.internal", "web_host_port": 8443,
+                                               "open_at": open_at})
+        lines = [line for line in printed if "vault.internal" in line.lower()]
+        assert lines == [" Web UI / API : https://vault.internal:8443/          (host port 8443)"], (open_at, printed)
+        assert not [line for line in printed if line.startswith(" Direct")], printed
+
+
+def test_setup_hands_the_summary_the_first_allowed_hosts_entry(tmp_path, monkeypatch):
+    _reusable_env(tmp_path, web_public_address="https://vault.example.com", web_host_port=8443)
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ALLOWED_HOSTS"].startswith(
+        "https://vault.example.com")
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    _start_ready(tool, monkeypatch)
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)
+    summaries = []
+    monkeypatch.setattr(tool, "_print_setup_summary",
+                        lambda summary, healthy, logs_shown=False: summaries.append(dict(summary)))
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    assert summaries and summaries[-1]["open_at"] == "https://vault.example.com", summaries

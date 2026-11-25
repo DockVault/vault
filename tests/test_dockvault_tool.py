@@ -1074,6 +1074,8 @@ def test_setup_refreshes_profile_and_ports_after_guard_replaces_env(tmp_path, mo
         "run_sftp": True,
         "web_host_port": 9443,
         "sftp_host_port": 3322,
+        # the replaced .env's first ALLOWED_HOSTS entry, the address the summary gives first
+        "open_at": "https://replacement.example.com:9443",
         "admin_password": None,
     }]
 

@@ -5955,6 +5955,8 @@ class DockVault:
             ),
             "web_host_port": _port_or(env_now.get("WEB_HOST_PORT"), 443),
             "sftp_host_port": _port_or(env_now.get("SFTP_HOST_PORT"), 2322),
+            # The address people open: the base of emailed links, and of passkeys and single sign-on.
+            "open_at": _allowed_hosts_link_base(env_now.get("ALLOWED_HOSTS")),
             "admin_password": (
                 generated_password
                 if generated_password and env_now.get("ADMIN_PASSWORD") == generated_password
@@ -7153,7 +7155,15 @@ class DockVault:
             return
         webp = summary.get("web_host_port") or 443
         url = "https://%s/" % name if webp == 443 else "https://%s:%d/" % (name, webp)
-        print(pal.paint(" Web UI / API : %s          (host port %d)" % (url, webp), "bold", "green"))
+        # Behind a reverse proxy or port forwarding, the first ALLOWED_HOSTS entry is the address people open, and the
+        # only one passkeys and single sign-on work at: it comes first, and the published port is the direct one.
+        open_at = str(summary.get("open_at") or "").strip().rstrip("/")
+        if open_at and open_at.lower() != url.rstrip("/").lower():
+            print(pal.paint(" Web UI / API : %s/   (the first ALLOWED_HOSTS entry: emailed links, passkeys and single "
+                            "sign-on use this address)" % open_at, "bold", "green"))
+            print(" Direct       : %s   (host port %d)" % (url, webp))
+        else:
+            print(pal.paint(" Web UI / API : %s          (host port %d)" % (url, webp), "bold", "green"))
         if summary.get("run_sftp"):
             print(" SFTP (SSH)   : %s port %d" % (name, summary.get("sftp_host_port") or 2322))
         if summary.get("admin_username"):
