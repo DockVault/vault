@@ -7130,11 +7130,24 @@ def _mask_email(address) -> str:
     return f"{local[:1]}***@{domain}"
 
 
-def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=False, own_password=True):
+def _holds_a_key_envelope(db, user) -> bool:
+    """Whether the account keeps its key for zero-knowledge vaults on the server, sealed under its passphrase: the
+    envelope the hold after an administrator's change keeps from its sessions (app/core/envelope_hold.py). An
+    account without one has nothing held."""
+    from app.core.models import UserKeyPair
+    sealed = db.query(UserKeyPair.encrypted_private_key).filter(UserKeyPair.user_id == user.id).first()
+    return bool(sealed and sealed[0])
+
+
+def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=False, own_password=True,
+                              can_send_code=True, holds_a_key_envelope=True):
     """(title, sentence) for a credential change that was made, from what applying it returned. With
     ``mask_new_email``, an email change names the new address masked (the email to the old address).
     ``own_password``: whether the account has a password somebody can type (a reset's notice says how the next
-    factor is set up)."""
+    factor is set up). A confirmation of the address holds the account's key for zero-knowledge vaults
+    (app/core/envelope_hold.py): ``holds_a_key_envelope`` says whether the account has one to hold, and
+    ``can_send_code`` whether the code that releases it can be emailed (mail, and an address to send it to);
+    without it, only the server's operator releases the key before its days are over."""
     from app.core import credential_changes as cc
     who = "The server's operator" if by_host else "An administrator"
     result = result or {}
@@ -7155,9 +7168,16 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
     if kind == cc.EMAIL and result.get("confirmed_only"):
         from app.core import envelope_hold
         days = envelope_hold.hold_days()
-        hold = ("" if days <= 0 else
-                " As after any change an administrator makes to your sign-in details, your zero-knowledge vaults "
-                f"ask for a code sent by email for the next {days} day{'' if days == 1 else 's'}.")
+        for_days = f"for the next {days} day{'' if days == 1 else 's'}"
+        if days <= 0 or not holds_a_key_envelope:
+            hold = ""
+        elif can_send_code:
+            hold = (" As after any change an administrator makes to your sign-in details, your zero-knowledge vaults "
+                    f"ask for a code sent by email {for_days}.")
+        else:
+            hold = (" As after any change an administrator makes to your sign-in details, your encryption key for "
+                    f"zero-knowledge vaults stays locked {for_days}: this vault cannot email you the code that "
+                    "releases it, so ask the person who runs the server to release it if you need it sooner.")
         return ("Your email address was confirmed",
                 f"{who} confirmed that {result.get('new_email')} is your email address. Your organisation's "
                 f"sign-in can now find your account by it.{hold}")
@@ -7191,8 +7211,16 @@ def _notify_credential_change(db, kind, target, result, *, by_name, approved_by=
                               ntype="account_changed") -> None:
     """The notice for a credential change that was made. An email change is told to the OLD address."""
     from app.core import credential_changes as cc
+    hold = {}
+    if kind == cc.EMAIL and (result or {}).get("confirmed_only"):
+        # The confirmation holds the account's key for zero-knowledge vaults. Said only where there is a key to
+        # hold; and the code that releases it is promised only where one can be emailed: the vault refuses to send
+        # it without mail or without an address to send it to, and then only the server's operator releases it.
+        from app.core import envelope_hold
+        hold = {"holds_a_key_envelope": _holds_a_key_envelope(db, target),
+                "can_send_code": bool(_smtp_configured(db) and envelope_hold.code_destination(db, target))}
     title, change = _credential_change_notice(kind, result, by_host=(by_name == cc.HOST_OPERATOR),
-                                              own_password=sign_in.has_a_password_it_can_type(target))
+                                              own_password=sign_in.has_a_password_it_can_type(target), **hold)
     by = _actor_text(by_name)
     if approved_by:
         by += f", approved by {_actor_text(approved_by)}"
@@ -7202,7 +7230,7 @@ def _notify_credential_change(db, kind, target, result, *, by_name, approved_by=
         # The old mailbox may now belong to someone else (a former employer, a recycled address), who
         # should not learn where the person went. The in-app notice keeps the address in full.
         email_change = _credential_change_notice(kind, result, by_host=(by_name == cc.HOST_OPERATOR),
-                                                 mask_new_email=True)[1]
+                                                 mask_new_email=True, **hold)[1]
     _notify_account_change(db, target, ntype=ntype, title=title, change=change, by=by,
                            email=(old_email or "") if kind == cc.EMAIL else None, email_change=email_change)
 

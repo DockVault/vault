@@ -17,9 +17,13 @@ from _async_run import run_coroutine
 from test_password_origin import _request, _user, api, cc, db, world  # noqa: F401  (the fixtures are used by name)
 
 from app.core import email_confirmation  # noqa: E402
-from app.core.models import AuditLog, CredentialChange, RoleEnum  # noqa: E402
+from app.core.models import AuditLog, CredentialChange, RoleEnum, UserKeyPair  # noqa: E402
 
 pytestmark = pytest.mark.unit
+
+# The fixture ``world`` stands a recorder in for the notice of a credential change; the tests of what the notice
+# itself says call the function it replaces.
+_NOTIFY_CREDENTIAL_CHANGE = api._notify_credential_change
 
 
 def _patch(db, actor, target, **fields):
@@ -107,13 +111,13 @@ def test_no_confirmation_is_made_for_an_account_that_is_never_linked_by_its_addr
 
 def test_what_the_owner_and_a_second_administrator_read_of_a_confirmation():
     title, text = api._credential_change_notice(cc.EMAIL, {"old_email": "bob@example.com", "new_email": "bob@example.com",
-                                                           "confirmed_only": True})
+                                                           "confirmed_only": True}, can_send_code=True)
     assert title == "Your email address was confirmed"
     assert text.startswith("An administrator confirmed that bob@example.com is your email address.")
     assert "your zero-knowledge vaults ask for a code sent by email for the next 14 days." in text
     # The copy sent by email goes to that very address: nothing in it is masked.
     assert api._credential_change_notice(cc.EMAIL, {"new_email": "bob@example.com", "confirmed_only": True},
-                                         mask_new_email=True)[1] == text
+                                         mask_new_email=True, can_send_code=True)[1] == text
     assert "was changed" in api._credential_change_notice(cc.EMAIL, {"old_email": "a@example.com",
                                                                      "new_email": "b@example.com"})[0]
 
@@ -125,12 +129,79 @@ def test_the_owners_notice_states_the_hold_this_vault_has(monkeypatch, days, sai
     of a confirmation states the hold this vault has, and none where it has none."""
     from app.core import envelope_hold
     monkeypatch.setattr(envelope_hold, "hold_days", lambda: days)
-    _title, text = api._credential_change_notice(cc.EMAIL, {"new_email": "bob@example.com", "confirmed_only": True})
+    _title, text = api._credential_change_notice(cc.EMAIL, {"new_email": "bob@example.com", "confirmed_only": True},
+                                                 can_send_code=True)
     assert "Your organisation's sign-in can now find your account by it." in text
     if said is None:
         assert "zero-knowledge" not in text and text.endswith("can now find your account by it.")
     else:
         assert text.endswith("your zero-knowledge vaults ask for a code sent by email " + said)
+
+
+@pytest.mark.parametrize("days, said", [(14, "for the next 14 days:"), (1, "for the next 1 day:"), (0, None)])
+def test_where_no_code_can_be_emailed_the_owner_is_told_who_releases_the_key(monkeypatch, days, said):
+    """The confirmation is offered to people on a vault that sends no email, so that is where it is mostly made. No
+    code that releases the key comes there (the vault refuses to send one), and only the server's operator releases
+    it before its days are over: the notice says so, and promises no emailed code."""
+    from app.core import envelope_hold
+    monkeypatch.setattr(envelope_hold, "hold_days", lambda: days)
+    confirmed = {"new_email": "bob@example.com", "confirmed_only": True}
+    _title, text = api._credential_change_notice(cc.EMAIL, confirmed, can_send_code=False)
+    assert "Your organisation's sign-in can now find your account by it." in text
+    assert "code sent by email" not in text
+    if said is None:
+        assert "zero-knowledge" not in text and text.endswith("can now find your account by it.")
+    else:
+        assert ("your encryption key for zero-knowledge vaults stays locked " + said) in text
+        assert text.endswith("this vault cannot email you the code that releases it, so ask the person who runs "
+                             "the server to release it if you need it sooner.")
+    # An account that holds no key for zero-knowledge vaults has nothing held: neither sentence is said.
+    for can in (True, False):
+        _title, text = api._credential_change_notice(cc.EMAIL, confirmed, can_send_code=can,
+                                                     holds_a_key_envelope=False)
+        assert "zero-knowledge" not in text and text.endswith("can now find your account by it.")
+
+
+def test_the_notice_of_a_confirmation_reads_whether_a_code_can_be_sent_and_whether_a_key_is_held(db, world,
+                                                                                                monkeypatch):
+    """What the owner reads, in the app and by email, follows the vault: mail and an address to send the code to, or
+    neither; and the account: a key for zero-knowledge vaults that the confirmation holds, or none."""
+    from app.core import envelope_hold
+    UserKeyPair.__table__.create(db.get_bind())
+    ada, bob = _user(db, "ada", RoleEnum.ADMIN), _user(db, "bob")
+    pair = UserKeyPair(user_id=bob.id, public_key="pk", fingerprint="f" * 64, encrypted_private_key="sealed")
+    db.add(pair)
+    db.commit()
+    _patch(db, ada, bob, confirm_email="bob@example.com")              # applied: the hold starts
+    confirmed = {"old_email": "bob@example.com", "new_email": "bob@example.com", "confirmed_only": True}
+    told = []
+    monkeypatch.setattr(api, "_notify_account_change",
+                        lambda db, user, **kw: told.append((kw["change"], kw.get("email_change"))))
+
+    def notice():
+        del told[:]
+        _NOTIFY_CREDENTIAL_CHANGE(db, cc.EMAIL, bob, dict(confirmed), by_name="ada")
+        ((in_app, by_email),) = told
+        assert by_email == in_app                                       # the same words go by email
+        return in_app
+
+    world.smtp = False                                                   # no mail on this vault
+    text = notice()
+    assert "this vault cannot email you the code that releases it" in text and "code sent by email" not in text
+    world.smtp = True
+    assert envelope_hold.code_destination(db, bob) == "bob@example.com"
+    text = notice()
+    assert "ask for a code sent by email for the next 14 days." in text and "cannot email you" not in text
+    # Mail, and no address the code may go to (the change that holds the key left none): no code either.
+    monkeypatch.setattr(envelope_hold, "code_destination", lambda db, user, now=None: None)
+    assert "this vault cannot email you the code that releases it" in notice()
+    # No key to hold: nothing about one.
+    pair.encrypted_private_key = None
+    db.commit()
+    for smtp in (True, False):
+        world.smtp = smtp
+        text = notice()
+        assert "zero-knowledge" not in text and text.endswith("can now find your account by it.")
 
 
 def test_a_confirmation_is_told_as_one_and_moves_no_reset_link(db, world):
