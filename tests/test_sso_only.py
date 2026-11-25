@@ -469,6 +469,11 @@ def test_the_privileged_accounts_are_settled_at_start_recorded_and_told(monkeypa
     monkeypatch.setattr(providers_router, "_tell_accounts", lambda users, title, change: told.append(("owners", users, title, change)))
     monkeypatch.setattr(providers_router, "_tell_administrators", lambda by, title, body: told.append(("administrators", by, title, body)))
     one, two = uuid.uuid4(), uuid.uuid4()
+    # "Forgot your password?" sends a link here: switched on, email configured, the public address set.
+    from app.core import config
+    monkeypatch.setattr(api, "_account_policy", lambda db: {"password_reset_enabled": True})
+    monkeypatch.setattr(api, "_smtp_configured", lambda db: True)
+    monkeypatch.setattr(config.settings, "allowed_hosts", "vault.example.test", raising=False)
     monkeypatch.setattr(sso_only, "settle_privileged", lambda db: [
         (one, "zoe", "zoe@example.test", "an administrator"), (two, "amy", None, "a holder of the auditor right")])
     api._settle_privileged_provider_only_accounts()
@@ -476,9 +481,11 @@ def test_the_privileged_accounts_are_settled_at_start_recorded_and_told(monkeypa
         ("sso_password_sign_in_restored", str(one), "zoe", "an administrator"),
         ("sso_password_sign_in_restored", str(two), "amy", "a holder of the auditor right")]
     assert committed == [2]
-    owners, administrators = told
-    assert owners[1] == [(one, "zoe", "zoe@example.test"), (two, "amy", None)]
-    assert "may hold a password again" in owners[2] and "Forgot password" in owners[3]
+    with_address, without, administrators = told
+    assert with_address[1] == [(one, "zoe", "zoe@example.test")] and without[1] == [(two, "amy", None)]
+    assert "may hold a password again" in with_address[2] and "\"Forgot your password?\"" in with_address[3]
+    # The sign-in page sends a link only to an address: an account without one asks an administrator.
+    assert without[3].endswith("Your account has no password yet: ask an administrator for a reset link.")
     assert administrators[0] == "administrators" and "amy, zoe" in administrators[3] and "reset link" in administrators[3]
     assert audit_catalog.lookup("sso_password_sign_in_restored").severity == "warning"
     # None to settle: nothing recorded beyond the empty commit, nobody told.
@@ -522,7 +529,8 @@ def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatc
                                      "ended_this_session": False}, out
     assert alice.sso_only is False and h.identities() == [on_b]
     said = [body for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
-    assert "may hold a password again" in said[-1] and "Forgot password" in said[-1]
+    assert "may hold a password again" in said[-1] and "ask an administrator for a reset link." in said[-1]
+    assert "Forgot" not in said[-1]                     # self-service reset is off here
     # Linked to two that hold their people to no password: allowing passwords at one lifts nothing.
     from app.core.models import ExternalIdentity
     on_a2, on_c = _identity(alice, a, subject="s-a"), _identity(alice, c, subject="s-c")

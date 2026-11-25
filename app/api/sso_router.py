@@ -1465,13 +1465,18 @@ def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime]
     from app.services import sign_in
     now = now or datetime.utcnow()
     if not sign_in.has_a_password_it_can_type(account) and not sso_only.another_way_in(db, account, without=identity):
+        if getattr(account, "sso_only", False):
+            return (UNLINK_NO_WAY_IN, (
+                "Your account signs in only through single sign-on, and no other identity on a provider that is "
+                "on can sign you in now. Ask an administrator for a password first."))
+        from app.api import sso_providers_router
+        has_address = bool((getattr(account, "email", None) or "").strip())
+        how = ("\"Forgot your password?\" on the sign-in page, or ask an administrator for a reset link"
+               if sso_providers_router.self_service_reset(db, has_address=has_address)
+               else "ask an administrator for a reset link")
         return (UNLINK_NO_WAY_IN, (
-            "Your account signs in only through single sign-on, and no other identity on a provider that is "
-            "on can sign you in now. Ask an administrator for a password first."
-            if getattr(account, "sso_only", False) else
             "Your account has no password of its own, and no other identity on a provider that is on can sign "
-            "you in now: without this one nothing would sign you in. Set a password first (\"Forgot password\" "
-            "on the sign-in page, or ask an administrator for a reset link), then unlink."))
+            f"you in now: without this one nothing would sign you in. Set a password first ({how}), then unlink."))
     linked_by = getattr(identity, "linked_by", None)
     if row is not None and linked_by in sso_only.MADE_THROUGH_THE_PROVIDER \
             and sso_only.holds_to_no_password(row, account, linked_by):
@@ -1547,6 +1552,13 @@ def owners_unlink_text(username: str, label: str, *, asked: bool, linked_by, sta
     else:
         said += f" {label} asked nothing of this account's other ways in, so nothing else changes."
     return said + " Check the Users page if you did not expect this."
+
+
+def _how_to_set_a_password(db, user) -> str:
+    """How ``user``, which may hold a password and has none anybody can type, gets one on this vault."""
+    from app.api import sso_providers_router
+    return sso_providers_router.how_to_set_a_password(
+        db, has_address=bool((getattr(user, "email", None) or "").strip()))
 
 
 # What an account's owner is advised when an administrator, not the owner, changed how the account signs in.
@@ -1900,8 +1912,8 @@ async def unlink_my_identity(
         log.info("sso unlink notice to administrators skipped: %s", type(exc).__name__)
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",
                 f"You unlinked your account from {label}: it can no longer sign in through it."
-                + (" Your account may hold a password again and has none yet: set one with \"Forgot password\" on the "
-                   "sign-in page, or ask an administrator for a reset link." if may_set_password else ""))
+                + (" Your account may hold a password again and has none yet: "
+                   + _how_to_set_a_password(db, current_user) if may_set_password else ""))
     answer = {"removed": True, "sessions_ended": ended}
     if may_set_password:
         answer["may_set_password"] = True

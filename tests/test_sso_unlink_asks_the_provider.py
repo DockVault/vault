@@ -225,8 +225,10 @@ def test_an_administrator_unlinks_an_identity_for_somebody_under_the_step_up_and
     assert made.sso_only is False and "The account may hold a password again." in told[-1][2]
     # This identity alone held the account to no password: the unlink is what lets it set one, so it goes
     # through, and the administrators read that the account has none anybody can type until it does.
-    assert "It has none anybody can type until it sets one" in told[-1][2] and "you make one for it (Users)" in told[-1][2]
-    assert "Forgot password" in owners[-1][1]
+    # Self-service reset is off here: the reset link is the administrators' to make, and the owner asks for one.
+    assert told[-1][2].endswith("It has none anybody can type until you make a reset link for it (Users, Copy reset "
+                                "link).")
+    assert owners[-1][1].endswith("Your account has no password yet: ask an administrator for a reset link.")
     unlinked = [a[2] for a in h.audits if a[0] == "sso_identity_unlinked"][-1]
     assert unlinked["held"] is False and unlinked["restored"] is True
     assert len([a for a in h.audits if a[0] == "sso_refusal_cleared"]) == 1          # no refusal held this one

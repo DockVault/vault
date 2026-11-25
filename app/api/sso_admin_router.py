@@ -435,11 +435,17 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
     may_set_password = settled == sso_only.RESTORED
     try:
         from app.api import sso_providers_router
+        has_address = bool((user.email or "").strip())
         sso_router._tell_owner(
             db, user, provider, "A sign-in method was removed from your account",
             f"{current_user.username} unlinked your account from {label}: it can no longer sign in through it."
-            + (" " + sso_providers_router.SET_A_PASSWORD if may_set_password else ""),
+            + (" " + sso_providers_router.set_a_password(db, has_address=has_address) if may_set_password else ""),
             advice=sso_router.BY_AN_ADMINISTRATOR)
+        # Who can give the account a password: the person from the sign-in page where it sends them a link, and
+        # always an administrator, with a reset link from the Users page.
+        until = (" it sets one with \"Forgot your password?\" on the sign-in page, or you make a reset link for it "
+                 "(Users)." if sso_providers_router.self_service_reset(db, has_address=has_address) else
+                 " you make a reset link for it (Users, Copy reset link).")
         sso_providers_router._tell_administrators(
             current_user.username, "An identity was unlinked by an administrator",
             f"{current_user.username} unlinked {user.username} from {label}."
@@ -447,9 +453,8 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
                "the hold ended with the identity." if held else "")
             + (f" {label} had paused that account's SSH keys, temporary credentials and devices (a refusal, or "
                "days without a sign-in there): the pause ended with the identity." if paused else "")
-            + (" The account may hold a password again. It has none anybody can type until it sets one: it "
-               "asks for a reset link on the sign-in page, or you make one for it (Users)." if may_set_password
-               else ""))
+            + (" The account may hold a password again. It has none anybody can type until" + until
+               if may_set_password else ""))
     except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notices
         log.info("sso unlink notices skipped: %s", type(exc).__name__)
     answer = {"removed": True, "sessions_ended": ended, "held": held, "keys_paused": paused}

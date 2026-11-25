@@ -30109,14 +30109,15 @@ def _settle_privileged_provider_only_accounts():
                     resource_type="user", resource_id=str(user_id),
                     details={"username": username, "reason": what}))
             db.commit()
-        if not restored:
-            return
-        from app.api import sso_providers_router as providers_router
-        providers_router._tell_accounts(
-            [(user_id, username, email) for user_id, username, email, _what in restored],
-            "Your account may hold a password again",
-            "Your account signed in only through your organisation's sign-in, and it is one that always keeps a "
-            "password of its own. " + providers_router.SET_A_PASSWORD)
+            if not restored:
+                return
+            from app.api import sso_providers_router as providers_router
+            # Told how to set one in the words that hold on this vault, read from its settings here.
+            providers_router._tell_how_to_set_a_password(
+                db, [(user_id, username, email) for user_id, username, email, _what in restored],
+                "Your account may hold a password again",
+                lambda set_one: "Your account signed in only through your organisation's sign-in, and it is one "
+                                "that always keeps a password of its own. " + set_one)
         names = ", ".join(sorted(username for _id, username, _email, _what in restored))
         providers_router._tell_administrators(
             "the vault", "Accounts were given their password sign-in back",

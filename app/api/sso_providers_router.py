@@ -325,8 +325,41 @@ def _accounts_linked(db, row, *, but=None) -> list:
     return [(u.id, u.username, u.email) for u in db.query(User).filter(User.id.in_(ids)).all() if u.is_active]
 
 
-SET_A_PASSWORD = ("Your account has no password yet: set one with \"Forgot password\" on the sign-in page, or ask an "
-                  "administrator for a reset link.")
+def self_service_reset(db, *, has_address: bool = True) -> bool:
+    """Whether a person can get a reset link from the sign-in page themselves: "Forgot your password?" shows only
+    while self-service reset is on, and sends a link only with email configured, the vault's public address set
+    (api_server.forgot_password) and an address on the account (``has_address``). A setting that cannot be read
+    answers no: the administrator's reset link is the way that always works."""
+    if not has_address:
+        return False
+    api = _api()
+    try:
+        return bool(api._password_reset_policy(db)[0] and api._smtp_configured(db) and api._public_base_url())
+    except Exception:  # noqa: BLE001 -- the words of a notice never stand in the way of its change
+        return False
+
+
+def how_to_set_a_password(db, *, has_address: bool = True) -> str:
+    """How an account that may hold a password and has none anybody can type gets one, on this vault."""
+    if self_service_reset(db, has_address=has_address):
+        return ("set one with \"Forgot your password?\" on the sign-in page, or ask an administrator for a reset "
+                "link.")
+    return "ask an administrator for a reset link."
+
+
+def set_a_password(db, *, has_address: bool = True) -> str:
+    """What an account that may hold a password again, and has none anybody can type, is told to do."""
+    return "Your account has no password yet: " + how_to_set_a_password(db, has_address=has_address)
+
+
+def _tell_how_to_set_a_password(db, people, title: str, said, **how) -> None:
+    """Tell ``people`` ((id, username, email)), who may hold a password and have none anybody can type, what
+    ``said`` builds around set_a_password: the way that works for each, by whether a reset link from the sign-in
+    page could reach their address."""
+    for has_address in (True, False):
+        group = [person for person in people if bool((person[2] or "").strip()) is has_address]
+        if group:
+            _tell_accounts(group, title, said(set_a_password(db, has_address=has_address)), **how)
 
 
 def _refused(exc) -> HTTPException:
@@ -412,7 +445,7 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         raise _refused(exc)
     if not changes:
         return {"provider": providers.public(db, row), "changed": [], "connection_changed": False,
-                "made_sso_only": [], "restored": []}
+                "made_sso_only": [], "restored": [], "self_service_reset": self_service_reset(db)}
     _step_up(db, current_user, request)        # may commit (a receipt is used once)
     # A change of the policy may replace the password of every linked account. The one hash for them is made
     # here, before the row is taken: sign-ins through the provider wait for that row, and hashing is slow.
@@ -526,17 +559,17 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         _tell_accounts(made, "Your password no longer works on this vault", (
             f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
             "its password and its SFTP password sign-in no longer work." + ("" if is_on else while_off)))
-        _tell_accounts(restored, "You can set a password again", (
-            f"An administrator allowed password sign-in again for accounts linked to {label}. {SET_A_PASSWORD}"
+        _tell_how_to_set_a_password(db, restored, "You can set a password again", lambda set_one: (
+            f"An administrator allowed password sign-in again for accounts linked to {label}. {set_one}"
             + (f" You can still sign in through {label}." if is_on else while_off)))
     else:
         # The rule for the accounts the provider made at a first sign-in changed, and nothing else that settles.
         _tell_accounts(made, f"Your account signs in only through {label}", (
             f"An administrator no longer lets accounts made at their first sign-in through {label} set a password. "
             f"Your account has none of its own, and signs in only through {label}." + ("" if is_on else while_off)))
-        _tell_accounts(restored, "You can set a password", (
+        _tell_how_to_set_a_password(db, restored, "You can set a password", lambda set_one: (
             f"An administrator now lets accounts made at their first sign-in through {label} set a password. "
-            f"{SET_A_PASSWORD}" + (f" You can still sign in through {label}." if is_on else while_off)))
+            f"{set_one}" + (f" You can still sign in through {label}." if is_on else while_off)))
     if outcome["changed"]:
         said = f"{current_user.username} changed the single sign-on provider {row.name} ({', '.join(outcome['changed'])})."
         if outcome["made_sso_only"]:
@@ -567,7 +600,9 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
                          "Identities page when it should have its keys back.")
             said += _said_of_sessions_standing(standing)
         _tell_administrators(current_user.username, "A single sign-on provider was changed", said)
-    return {"provider": providers.public(db, row), **outcome}
+    # Whether the accounts that may hold a password again can get a reset link from the sign-in page themselves,
+    # for the page that tells the administrator what those accounts do next.
+    return {"provider": providers.public(db, row), **outcome, "self_service_reset": self_service_reset(db)}
 
 
 @router.post("/admin/sso/providers/{provider_id}/state")
@@ -752,7 +787,8 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     db.commit()
     removed = f"An administrator removed {label} from this vault: your account can no longer sign in through it."
     _tell_accounts(kept, "A sign-in method was removed from your account", removed)
-    _tell_accounts(may_set, "A sign-in method was removed from your account", f"{removed} {SET_A_PASSWORD}")
+    _tell_how_to_set_a_password(db, may_set, "A sign-in method was removed from your account",
+                                lambda set_one: f"{removed} {set_one}")
     _tell_accounts(to_ask, "A sign-in method was removed from your account", f"{removed} {sso_only.NO_PROVIDER_ON}")
     _tell_administrators(current_user.username, "A single sign-on provider was removed",
                          f"{current_user.username} removed the single sign-on provider {gone['name']}"

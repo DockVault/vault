@@ -216,7 +216,7 @@ def test_the_setting_for_accounts_made_at_a_first_sign_in_tells_them_in_its_own_
     assert h.accounts_told == [(["made"], "You can set a password", h.accounts_told[0][2])]
     assert h.accounts_told[0][2].startswith(
         f"An administrator now lets accounts made at their first sign-in through {label} set a password. ")
-    assert "Forgot password" in h.accounts_told[0][2]
+    assert "Your account has no password yet: ask an administrator for a reset link." in h.accounts_told[0][2]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_jit_password": False}})
     assert status == 200 and out["made_sso_only"] == ["made"] and made.sso_only is True and linked.sso_only is False
     assert h.accounts_told[1][:2] == (["made"], f"Your account signs in only through {label}")
@@ -247,9 +247,10 @@ def test_turning_password_sign_in_off_names_the_accounts_and_says_so_to_the_admi
         "its password and its SFTP password sign-in no longer work."))]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_password_login": "allowed"}})
     assert status == 200 and out["restored"] == ["alice", "bob"] and alice.sso_only is False
-    assert "reset" not in str(out).lower() and h.told[1][2].endswith("2 linked account(s) may hold a password again.")
+    assert "reset" not in str({k: v for k, v in out.items() if k != "self_service_reset"}).lower()          # no link made
+    assert h.told[1][2].endswith("2 linked account(s) may hold a password again.")
     assert len(h.accounts_told) == 2 and h.accounts_told[1][:2] == (["alice", "bob"], "You can set a password again")
-    assert "Forgot password" in h.accounts_told[1][2] and f"still sign in through {label}" in h.accounts_told[1][2]
+    assert "no password yet: ask an administrator for a reset link." in h.accounts_told[1][2] and f"still sign in through {label}" in h.accounts_told[1][2]
     # An administrator linked to it keeps the setting from being turned off at all.
     h.db.rows_of(type(_identity(h.root, row))).clear()
     from app.core.models import ExternalIdentity
@@ -347,7 +348,7 @@ def test_a_removal_tells_an_account_left_with_no_way_in_how_to_get_a_password(mo
     removed = f"An administrator removed {row.label or row.name} from this vault: your account can no longer sign in through it."
     told = {tuple(names): text for names, _title, text in h.accounts_told}
     assert told[("alice", "erin")] == removed
-    assert told[("dana", "gina")] == f"{removed} {router.SET_A_PASSWORD}"
+    assert told[("dana", "gina")] == f"{removed} {router.set_a_password(h.db)}"
     assert told[("frank",)] == f"{removed} {sso_only.NO_PROVIDER_ON}" and frank.sso_only is True
     assert "Ask your administrator" in sso_only.NO_PROVIDER_ON and len(told) == 3
 
