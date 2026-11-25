@@ -81,8 +81,13 @@ REASON_TEXTS = {
     STATE_UNKNOWN: "This sign-in is unknown or has expired. Start again.",
     PROVIDER_MIX_UP: "The sign-in answer came back for another provider. Start again.",
     PROVIDER_DISABLED: "This sign-in method is not available.",
-    NO_ACCOUNT: ("Your organisation's sign-in worked, but there is no account for you here. Ask an administrator to "
-                 "invite you."),
+    # Said for every refusal with no account linked (the provider makes no accounts and nobody invited the person, or
+    # the account with the address never had it confirmed), so it says nothing of whether an account exists. An
+    # invitation for an address already in use is refused: someone with an account links from it instead, which
+    # needs no confirmed address.
+    NO_ACCOUNT: ("Your organisation's sign-in worked, but no account here is linked to it. If you already have an "
+                 "account on this vault, sign in to it the way you usually do and link your organisation's sign-in "
+                 "under Your account (Single sign-on). Otherwise ask an administrator to invite you."),
     ACCOUNT_DISABLED: "Your account cannot sign in. Contact your administrator.",
     ALREADY_LINKED: "That organisation identity is already linked to an account.",
     LINK_FROM_PROFILE: ("An account with your address is protected by its own second factor, so it is not linked on "

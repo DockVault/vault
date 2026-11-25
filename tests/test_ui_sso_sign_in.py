@@ -123,7 +123,8 @@ def test_a_sign_in_through_a_provider_leaves_the_page_and_comes_back_into_the_ap
 
 def test_a_refusal_is_said_in_the_servers_words_for_its_reason_and_an_unknown_one_in_general_words(page: Page, base_url):
     reasons = requests.get(f"{base_url}/auth/sso/reasons", timeout=15).json()["reasons"]
-    assert "no account for you here" in reasons["no_account"]
+    assert "no account here is linked to it" in reasons["no_account"]
+    assert "link your organisation's sign-in under Your account" in reasons["no_account"]
     Stand(page, base_url)
     page.goto("/#sso-error=no_account")
     note = page.locator("#login-error")
